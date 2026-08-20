@@ -1,9 +1,10 @@
-//! fasts3d 入口(M0:引擎 PoC 的 CLI 形态)。
+//! fasts3d 入口(M0 引擎 PoC + M1 S3 协议层)。
 //!
-//! 命令:init / put / get / del / ls / check / checkpoint / bench。
+//! 命令:init / put / get / del / ls / check / checkpoint / bench / serve。
 //! 支持 `--config fasts3.toml`(设计 §10 配置的子集)。
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use fs3_engine::{Engine, EngineConfig};
@@ -106,6 +107,21 @@ enum Cmd {
     Checkpoint {},
     /// 引擎级基准(设备层直测,不经协议)
     Bench(bench::BenchArgs),
+    /// 启动 S3 数据面 HTTP 服务
+    Serve {
+        /// 监听地址(如 0.0.0.0:9000)
+        #[arg(long)]
+        listen: Option<String>,
+        /// worker 数(0 = 自动)
+        #[arg(long)]
+        workers: Option<usize>,
+        /// 访问密钥(access:secret;可重复)
+        #[arg(long)]
+        key: Vec<String>,
+        /// 允许匿名 GET/HEAD
+        #[arg(long)]
+        allow_anonymous: bool,
+    },
 }
 
 fn main() {
@@ -128,7 +144,7 @@ fn main() {
 
 fn run(cli: Cli) -> fs3_core::Result<()> {
     let cfg = load_config(cli.config.as_deref())?;
-    let storage = cfg.storage;
+    let storage = cfg.storage.clone();
 
     // 命令行覆盖配置
     let device = cli.device.or(storage.devices.first().cloned());
@@ -236,7 +252,87 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
             )?;
             bench::run(&engine_cfg, args)
         }
+        Cmd::Serve {
+            listen,
+            workers,
+            key,
+            allow_anonymous,
+        } => {
+            let engine_cfg = engine_config(
+                device,
+                meta_dir,
+                sync_mode,
+                cli.group_commit_ms.or(storage.group_commit_ms),
+                cli.checkpoint_interval.or(storage.checkpoint_interval),
+                cli.no_uring,
+            )?;
+            cmd_serve(&engine_cfg, &cfg, listen, workers, key, allow_anonymous)
+        }
     }
+}
+
+/// 启动 S3 服务:引擎 + S3Service + hyper 多 worker 监听。
+fn cmd_serve(
+    engine_cfg: &EngineConfig,
+    cfg: &config::RootConfig,
+    listen: Option<String>,
+    workers: Option<usize>,
+    cli_keys: Vec<String>,
+    cli_allow_anonymous: bool,
+) -> fs3_core::Result<()> {
+    let engine = Arc::new(std::sync::Mutex::new(Engine::open(engine_cfg)?));
+
+    // 密钥:CLI --key access:secret 优先,否则配置文件
+    let mut keys: Vec<fs3_s3::auth::Credentials> = Vec::new();
+    for k in &cli_keys {
+        let (a, s) = k.split_once(':').ok_or_else(|| {
+            fs3_core::Error::InvalidArgument(format!("bad --key {k} (expect access:secret)"))
+        })?;
+        keys.push(fs3_s3::auth::Credentials {
+            access_key: a.to_string(),
+            secret_key: s.to_string(),
+        });
+    }
+    if keys.is_empty() {
+        for k in &cfg.auth.keys {
+            keys.push(fs3_s3::auth::Credentials {
+                access_key: k.access_key.clone(),
+                secret_key: k.secret_key.clone(),
+            });
+        }
+    }
+    if keys.is_empty() {
+        // 开发默认(与文档示例一致);生产必须显式配置
+        tracing::warn!("no access keys configured; using development default fasts3dev/fasts3dev");
+        keys.push(fs3_s3::auth::Credentials {
+            access_key: "fasts3dev".into(),
+            secret_key: "fasts3dev".into(),
+        });
+    }
+
+    let region = cfg
+        .auth
+        .region
+        .clone()
+        .unwrap_or_else(|| "us-east-1".into());
+    let allow_anonymous = cli_allow_anonymous || cfg.auth.allow_anonymous;
+    let service = Arc::new(fs3_s3::S3Service::new(
+        engine,
+        keys,
+        region,
+        allow_anonymous,
+    ));
+
+    let addr: std::net::SocketAddr = listen
+        .or_else(|| cfg.server.listen.clone())
+        .unwrap_or_else(|| "0.0.0.0:9000".into())
+        .parse()
+        .map_err(|e| fs3_core::Error::InvalidArgument(format!("bad listen addr: {e}")))?;
+    let http_cfg = fs3_http::HttpServerConfig {
+        listen: addr,
+        workers: workers.or(cfg.server.workers).unwrap_or(0),
+    };
+    fs3_http::serve(service, &http_cfg).map_err(fs3_core::Error::Io)
 }
 
 fn engine_config(
@@ -268,6 +364,7 @@ fn engine_config(
         verify_reads: false,
         io_uring: !no_uring,
         read_only: false,
+        small_object_limit: fs3_core::SMALL_OBJECT_LIMIT,
     })
 }
 

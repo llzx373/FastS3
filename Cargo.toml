@@ -8,6 +8,8 @@ members = [
     "crates/fs3-alloc",
     "crates/fs3-meta",
     "crates/fs3-engine",
+    "crates/fs3-s3",
+    "crates/fs3-http",
     "crates/fs3d",
 ]
 
@@ -23,6 +25,8 @@ fs3-device = { path = "crates/fs3-device" }
 fs3-alloc = { path = "crates/fs3-alloc" }
 fs3-meta = { path = "crates/fs3-meta" }
 fs3-engine = { path = "crates/fs3-engine" }
+fs3-s3 = { path = "crates/fs3-s3" }
+fs3-http = { path = "crates/fs3-http" }
 
 # —— 依赖最小化原则(ROADMAP §2 / 风险 R9):新增依赖须说明理由 ——
 thiserror = "2.0"
@@ -32,6 +36,11 @@ serde = { version = "1.0", features = ["derive"] }
 postcard = { version = "1.1", features = ["use-std"] }
 io-uring = "0.7"
 md-5 = "0.10"
+quick-xml = "0.41"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 toml = "0.8"
 tracing = "0.1"

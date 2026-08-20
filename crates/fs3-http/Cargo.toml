@@ -1,0 +1,30 @@
+[package]
+name = "fs3-http"
+description = "FastS3 HTTP 接入:hyper + SO_REUSEPORT、流式请求/响应"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dev-dependencies]
+fs3-core.workspace = true
+fs3-device.workspace = true
+fs3-engine.workspace = true
+fs3-s3.workspace = true
+md-5.workspace = true
+sha2.workspace = true
+hex.workspace = true
+tempfile.workspace = true
+
+[dependencies]
+fs3-core.workspace = true
+fs3-s3.workspace = true
+fs3-engine.workspace = true
+hyper = { version = "1.5", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+http-body-util = "0.1"
+tokio = { version = "1.40", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
+tokio-stream = "0.1"
+bytes = "1"
+libc.workspace = true
+tracing.workspace = true

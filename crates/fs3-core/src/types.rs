@@ -39,17 +39,22 @@ impl AllocRecord {
     }
 }
 
-/// 对象元数据(键 `o:{bucket}\0{key}`,值 bincode 序列化)。
+/// 对象元数据(键 `o:{bucket}\0{key}`,值 postcard 序列化)。
+///
+/// > v0.1 演进说明(M1):新增 `inline` 字段承载 E3 小对象内联;旧格式
+/// > 记录无法解码,属预期(未发布版本无迁移义务)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectMeta {
     pub size: u64,
-    /// ETag = MD5 摘要(M1 起对齐 AWS;M0 由引擎计算)。
+    /// ETag = MD5 摘要(与 AWS 对齐)。
     pub etag: [u8; 16],
     pub mtime: i64,
-    /// 大对象跨 extent 列表(小对象内联留 M1/E3)。
+    /// 大对象跨 extent 列表(小对象内联时为空)。
     pub extents: Vec<ExtentRef>,
     pub content_type: String,
     pub user_meta: Vec<(String, String)>,
+    /// 小对象内联数据(E3:size ≤ small_object_limit 时零设备 I/O)。
+    pub inline: Option<Vec<u8>>,
 }
 
 impl ObjectMeta {

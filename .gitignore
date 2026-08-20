@@ -6,3 +6,4 @@ web/**/dist/
 /tests/bench/results/
 /tests/bench/archive/
 /tests/crash/run/
+__pycache__/

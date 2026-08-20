@@ -38,6 +38,8 @@ pub struct EngineConfig {
     pub io_uring: bool,
     /// 只读打开(供 check 等只读工具)。
     pub read_only: bool,
+    /// 小对象内联阈值(E3;≤ 该值的数据存元数据,零设备 I/O)。
+    pub small_object_limit: usize,
 }
 
 impl Default for EngineConfig {
@@ -51,6 +53,7 @@ impl Default for EngineConfig {
             verify_reads: false,
             io_uring: true,
             read_only: false,
+            small_object_limit: fs3_core::SMALL_OBJECT_LIMIT,
         }
     }
 }
@@ -92,6 +95,7 @@ pub struct Engine {
     chunk_size: usize,
     verify_reads: bool,
     read_only: bool,
+    small_object_limit: usize,
     checkpoint: std::sync::Mutex<CheckpointState>,
     checkpoint_tick: Receiver<()>,
     _checkpoint_thread: Option<std::thread::JoinHandle<()>>,
@@ -166,6 +170,7 @@ impl Engine {
             chunk_size: fs3_core::DEFAULT_CHUNK_SIZE,
             verify_reads: cfg.verify_reads,
             read_only: cfg.read_only,
+            small_object_limit: cfg.small_object_limit,
             checkpoint: std::sync::Mutex::new(CheckpointState {
                 seq: cp.seq.max(last_seq),
                 alloc_since: 0,
@@ -279,32 +284,126 @@ impl Engine {
         self.meta.list_objects(bucket, prefix)
     }
 
+    /// 分页列举(前缀 + delimiter 分组 + 游标;ListObjectsV1/V2 用)。
+    pub fn list_objects_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        after: Option<&str>,
+        max: usize,
+    ) -> Result<fs3_meta::ListPage> {
+        self.meta
+            .list_objects_page(bucket, prefix, delimiter, after, max)
+    }
+
     // ─────────────────────────── PUT ───────────────────────────
 
-    /// 流式 PUT:数据先落盘,元数据后提交(DESIGN §4.5)。
-    ///
-    /// 客户端中断(reader 返回错误)→ 不提交事务,已分配 extent 回滚。
-    ///
-    /// 写入按 extent/chunk 边界切分:chunk(64KiB)是 CRC 单元,与 extent
-    /// 载荷 64KiB 对齐;跨 extent 的输入流在边界处拆分,绝不超过 extent
-    /// 容量(防越界写坏下一个 extent 的头)。
+    /// 流式 PUT(便捷入口:默认无自定义头)。
     pub fn put(&mut self, bucket: &str, key: &str, reader: &mut dyn Read) -> Result<ObjectMeta> {
+        self.put_with_meta(bucket, key, reader, None, Vec::new())
+    }
+
+    /// PUT 全路径:先读前缀判定内联(E3);超过阈值走 extent 流水线。
+    ///
+    /// 时序保证(DESIGN §4.5):数据先落盘、元数据后提交;任何错误回滚
+    /// 已暂存分配;客户端中断 → 不提交事务、extent 释放。
+    pub fn put_with_meta(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        reader: &mut dyn Read,
+        content_type: Option<&str>,
+        user_meta: Vec<(String, String)>,
+    ) -> Result<ObjectMeta> {
         if self.meta.get_bucket(bucket)?.is_none() {
             return Err(Error::NotFound(format!("bucket {bucket}")));
         }
-        // 旧对象(覆盖语义:释放旧 extent,新分配同事务)
         let old = self.meta.get_object(bucket, key)?;
         let old_ids: Vec<u64> = old
             .as_ref()
             .map(|o| o.extents.iter().map(|e| e.extent_id).collect())
             .unwrap_or_default();
+        let old_size = old.as_ref().map(|o| o.size as i64).unwrap_or(0);
 
+        // 1) 读前缀(≤ small_object_limit+1 字节)判定内联
+        let limit = self.small_object_limit;
+        let mut prefix: Vec<u8> = Vec::with_capacity(limit + 1);
+        let mut buf = [0u8; 8192];
+        loop {
+            if prefix.len() > limit {
+                break;
+            }
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            prefix.extend_from_slice(&buf[..n]);
+            if prefix.len() > limit {
+                break;
+            }
+        }
+
+        if prefix.len() <= limit {
+            // —— 内联路径(E3):零设备 I/O,一条 sled 事务 ——
+            let size = prefix.len() as u64;
+            let etag: [u8; 16] = md5::Md5::digest(&prefix).into();
+            let meta = ObjectMeta {
+                size,
+                etag,
+                mtime: now_ts(),
+                extents: Vec::new(),
+                content_type: content_type
+                    .unwrap_or("application/octet-stream")
+                    .to_string(),
+                user_meta,
+                inline: Some(prefix),
+            };
+            if !old_ids.is_empty() {
+                self.alloc.release(&old_ids);
+            }
+            let draft = self.alloc.take_draft();
+            let delta = StatsDelta {
+                objects: if old_ids.is_empty() { 1 } else { 0 },
+                bytes: size as i64 - old_size,
+            };
+            return match self.meta.commit_object_put(
+                bucket,
+                key,
+                &meta,
+                to_alloc_draft(&draft),
+                delta,
+            ) {
+                Ok(_) => {
+                    self.alloc.confirm_draft();
+                    self.maybe_checkpoint()?;
+                    Ok(meta)
+                }
+                Err(e) => {
+                    self.alloc.rollback_draft(&draft);
+                    Err(e)
+                }
+            };
+        }
+
+        // —— extent 路径:前缀先写入,再续流 ——
         let mut owner_id = [0u8; 16];
         random_bytes(&mut owner_id)?;
-
-        // 数据流写盘;任何错误 → 回滚已暂存的分配
-        let old_size = old.as_ref().map(|o| o.size as i64).unwrap_or(0);
-        let result = self.put_stream(bucket, key, reader, owner_id, old_size, old_ids);
+        let mut prefixed = PrefixedReader {
+            prefix,
+            pos: 0,
+            inner: reader,
+        };
+        let result = self.put_stream(PutCtx {
+            bucket,
+            key,
+            reader: &mut prefixed,
+            owner_id,
+            old_size,
+            old_ids,
+            content_type,
+            user_meta,
+        });
         match result {
             Ok(meta) => {
                 self.alloc.confirm_draft();
@@ -319,16 +418,22 @@ impl Engine {
         }
     }
 
-    /// put 的数据流水线(独立出来以便统一回滚)。
-    fn put_stream(
-        &mut self,
-        bucket: &str,
-        key: &str,
-        reader: &mut dyn Read,
-        owner_id: [u8; 16],
-        old_size: i64,
-        old_ids: Vec<u64>,
-    ) -> Result<ObjectMeta> {
+    /// extent 写路径流水线:64KiB chunk 攒批 → O_DIRECT 写;数据先落盘。
+    ///
+    /// 输入流按 extent/chunk 边界切分:chunk(64KiB)是 CRC 单元,与 extent
+    /// 载荷 64KiB 对齐;跨 extent 的输入在边界拆分,绝不超过 extent 容量
+    /// (防越界写坏下一个 extent 的头)。
+    fn put_stream(&mut self, ctx: PutCtx) -> Result<ObjectMeta> {
+        let PutCtx {
+            bucket,
+            key,
+            reader,
+            owner_id,
+            old_size,
+            old_ids,
+            content_type,
+            user_meta,
+        } = ctx;
         let chunk_size = self.chunk_size;
         let mut inbuf = fs3_device::AlignedBuffer::new(chunk_size)?;
         let mut acc = fs3_device::AlignedBuffer::new(chunk_size)?;
@@ -404,8 +509,11 @@ impl Engine {
             etag,
             mtime,
             extents,
-            content_type: "application/octet-stream".into(),
-            user_meta: vec![],
+            content_type: content_type
+                .unwrap_or("application/octet-stream")
+                .to_string(),
+            user_meta,
+            inline: None,
         };
 
         // 覆盖:旧 extent 释放记录进同一事务
@@ -511,6 +619,13 @@ impl Engine {
             return Ok(0);
         }
 
+        // 内联对象:直接拷贝(E3)
+        if let Some(inline) = &meta.inline {
+            let len = (end - start) as usize;
+            out.write_all(&inline[start as usize..start as usize + len])?;
+            return Ok(len as u64);
+        }
+
         let mut written = 0u64;
         // 对象内累积偏移:extent 数据按序拼接
         let mut obj_pos = 0u64;
@@ -611,6 +726,71 @@ impl Engine {
     /// 读对象元数据。
     pub fn head(&self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>> {
         self.meta.get_object(bucket, key)
+    }
+
+    /// 对象顺序读原语:从 `offset` 读至多 `buf.len()` 字节,返回实际字节数。
+    ///
+    /// 内联对象直接拷贝;extent 对象按 4KiB 对齐块读取后裁剪。供 HTTP
+    /// 层边读边发(每 chunk 上锁,见 fs3-s3/fs3-http)。verify_reads 校验
+    /// 走 get_to(整段路径)。
+    pub fn read_at(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<usize> {
+        let meta = self
+            .meta
+            .get_object(bucket, key)?
+            .ok_or_else(|| Error::NotFound(format!("object {bucket}/{key}")))?;
+        if offset >= meta.size || buf.is_empty() {
+            return Ok(0);
+        }
+        let want = ((meta.size - offset) as usize).min(buf.len());
+
+        if let Some(inline) = &meta.inline {
+            let start = offset as usize;
+            buf[..want].copy_from_slice(&inline[start..start + want]);
+            return Ok(want);
+        }
+
+        // extent 路径:定位 offset 所在 extent(对象内偏移连续)
+        let mut obj_pos = 0u64;
+        let mut done = 0usize;
+        for ext in &meta.extents {
+            let ext_begin = obj_pos;
+            let ext_end = obj_pos + ext.len as u64;
+            obj_pos = ext_end;
+            if offset >= ext_end || offset < ext_begin {
+                continue;
+            }
+            let in_ext = offset - ext_begin;
+            let avail = (ext_end - offset) as usize;
+            let take = want.min(avail);
+            let dev_base = self.extent_data_offset(ext.extent_id) + in_ext;
+            let mut got = 0usize;
+            while got < take {
+                let cur = dev_base + got as u64;
+                let block_off = cur - (cur % SECTOR_SIZE);
+                let skip = (cur - block_off) as usize;
+                let step = (take - got + skip).min(self.chunk_size);
+                let read_len = align_up(step as u64, SECTOR_SIZE) as usize;
+                let mut rbuf = fs3_device::AlignedBuffer::new(read_len)?;
+                read_exact(
+                    &mut *self.io,
+                    self.device.raw_fd(),
+                    rbuf.as_mut_slice(),
+                    block_off,
+                )?;
+                let usable = &rbuf.as_slice()[skip..skip + (take - got).min(step - skip)];
+                buf[done..done + usable.len()].copy_from_slice(usable);
+                got += usable.len();
+                done += usable.len();
+            }
+            break;
+        }
+        Ok(done)
     }
 
     // ─────────────────────────── DELETE ───────────────────────────
@@ -714,6 +894,37 @@ impl Drop for Engine {
         if !self.closed {
             let _ = self.close();
         }
+    }
+}
+
+/// put_stream 参数包(避免超长参数列表)。
+struct PutCtx<'a> {
+    bucket: &'a str,
+    key: &'a str,
+    reader: &'a mut dyn Read,
+    owner_id: [u8; 16],
+    old_size: i64,
+    old_ids: Vec<u64>,
+    content_type: Option<&'a str>,
+    user_meta: Vec<(String, String)>,
+}
+
+/// 前缀 + 原 reader 拼接(内联判定后的流续接)。
+struct PrefixedReader<'a> {
+    prefix: Vec<u8>,
+    pos: usize,
+    inner: &'a mut dyn Read,
+}
+
+impl Read for PrefixedReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos < self.prefix.len() {
+            let n = (self.prefix.len() - self.pos).min(buf.len());
+            buf[..n].copy_from_slice(&self.prefix[self.pos..self.pos + n]);
+            self.pos += n;
+            return Ok(n);
+        }
+        self.inner.read(buf)
     }
 }
 
@@ -863,12 +1074,12 @@ mod tests {
     fn overwrite_releases_old_extents() {
         let (_d, cfg) = setup();
         let mut e = open_engine(&cfg);
-        let d1 = vec![1u8; 1000];
-        let d2 = vec![2u8; 2000];
+        let d1 = vec![1u8; 100_000];
+        let d2 = vec![2u8; 200_000];
         e.put("b1", "k", &mut Cursor::new(d1)).unwrap();
         e.put("b1", "k", &mut Cursor::new(d2.clone())).unwrap();
         let m = e.head("b1", "k").unwrap().unwrap();
-        assert_eq!(m.size, 2000);
+        assert_eq!(m.size, 200_000);
         assert_eq!(e.allocator().allocated_count(), 1);
         let mut out = Vec::new();
         e.get_to("b1", "k", 0..u64::MAX, &mut out).unwrap();
@@ -989,7 +1200,7 @@ mod tests {
     #[test]
     fn checkpoint_rolls_bitmap() {
         let (_d, cfg) = setup();
-        let data = vec![7u8; 4096];
+        let data = vec![7u8; 100_000];
         {
             let mut e = open_engine(&cfg);
             e.put("b1", "k", &mut Cursor::new(data)).unwrap();
@@ -1044,6 +1255,77 @@ mod tests {
         let mut out = Vec::new();
         e.get_to("b1", "big3", 0..u64::MAX, &mut out).unwrap();
         assert_eq!(out, data, "3-extent object must roundtrip exactly");
+        e.close().unwrap();
+    }
+
+    #[test]
+    fn inline_small_objects_zero_device_io() {
+        // E3:≤ small_object_limit 的对象内联进元数据,零设备 I/O
+        let (_d, cfg) = setup();
+        let mut e = open_engine(&cfg);
+        let data: Vec<u8> = (0..30_000u32).map(|i| (i % 251) as u8).collect();
+        let m = e
+            .put("b1", "small", &mut Cursor::new(data.clone()))
+            .unwrap();
+        assert_eq!(m.size, data.len() as u64);
+        assert!(m.extents.is_empty(), "inline object must not use extents");
+        assert_eq!(m.inline.as_ref().unwrap(), &data);
+        assert_eq!(e.allocator().allocated_count(), 0, "zero device allocation");
+
+        // 读回
+        let mut out = Vec::new();
+        e.get_to("b1", "small", 0..u64::MAX, &mut out).unwrap();
+        assert_eq!(out, data);
+        // read_at 原语同样支持内联
+        let mut buf = vec![0u8; 1024];
+        let n = e.read_at("b1", "small", 100, &mut buf).unwrap();
+        assert_eq!(n, 1024);
+        assert_eq!(&buf[..1024], &data[100..1124]);
+        e.close().unwrap();
+    }
+
+    #[test]
+    fn inline_threshold_boundary() {
+        // 阈值边界:limit 内内联,limit+1 落盘
+        let (_d, mut cfg) = setup();
+        cfg.small_object_limit = 4096;
+        let mut e = Engine::open(&cfg).unwrap();
+        e.ensure_bucket("b1").unwrap();
+
+        let exact = vec![0xAAu8; 4096];
+        let m = e.put("b1", "exact", &mut Cursor::new(exact)).unwrap();
+        assert!(m.inline.is_some());
+        assert!(m.extents.is_empty());
+
+        let over = vec![0xBBu8; 4097];
+        let m = e.put("b1", "over", &mut Cursor::new(over.clone())).unwrap();
+        assert!(m.inline.is_none());
+        assert_eq!(m.extents.len(), 1);
+        assert_eq!(e.allocator().allocated_count(), 1);
+
+        // 读回一致
+        let mut out = Vec::new();
+        e.get_to("b1", "over", 0..u64::MAX, &mut out).unwrap();
+        assert_eq!(out, over);
+        e.close().unwrap();
+    }
+
+    #[test]
+    fn inline_with_meta_headers() {
+        let (_d, cfg) = setup();
+        let mut e = open_engine(&cfg);
+        let data = vec![9u8; 100];
+        let m = e
+            .put_with_meta(
+                "b1",
+                "k",
+                &mut Cursor::new(data),
+                Some("text/plain"),
+                vec![("x-amz-meta-foo".into(), "bar".into())],
+            )
+            .unwrap();
+        assert_eq!(m.content_type, "text/plain");
+        assert_eq!(m.user_meta, vec![("x-amz-meta-foo".into(), "bar".into())]);
         e.close().unwrap();
     }
 

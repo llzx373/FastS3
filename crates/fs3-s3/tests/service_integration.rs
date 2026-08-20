@@ -1,0 +1,562 @@
+//! S3Service 直接集成测试(不经 HTTP;覆盖错误路径与边界)。
+
+use fs3_engine::Engine;
+use fs3_s3::auth::{self, Credentials, PayloadHash};
+use fs3_s3::{ResponseBody, S3Request, S3Service, ServiceResponse};
+use sha2::{Digest, Sha256};
+
+fn setup() -> (tempfile::TempDir, S3Service) {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("disk.img");
+    std::fs::File::create(&img)
+        .unwrap()
+        .set_len(128 * 1024 * 1024)
+        .unwrap();
+    fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
+    let cfg = fs3_engine::EngineConfig {
+        device: img,
+        meta_dir: dir.path().join("meta"),
+        ..Default::default()
+    };
+    let engine = Arc::new(std::sync::Mutex::new(Engine::open(&cfg).unwrap()));
+    let svc = S3Service::new(
+        engine,
+        vec![Credentials {
+            access_key: "test".into(),
+            secret_key: "secret123".into(),
+        }],
+        "us-east-1".into(),
+        false,
+    );
+    (dir, svc)
+}
+
+use std::sync::Arc;
+
+/// 构造已签名请求。
+fn req(method: &str, path: &str, body: Vec<u8>) -> S3Request {
+    req_q(method, path, &[], body)
+}
+
+/// 带 query 的已签名请求。
+fn req_q(method: &str, path: &str, query: &[(&str, &str)], body: Vec<u8>) -> S3Request {
+    let amz_date = auth::now_amz();
+    let hash = hex::encode(Sha256::digest(&body));
+    let query: Vec<(String, String)> = query
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let mut headers: Vec<(String, String)> = vec![
+        ("host".into(), "localhost:9000".into()),
+        ("x-amz-date".into(), amz_date.clone()),
+        ("x-amz-content-sha256".into(), hash.clone()),
+    ];
+    let cred = Credentials {
+        access_key: "test".into(),
+        secret_key: "secret123".into(),
+    };
+    let auth_hdr = auth::sign_request(
+        &cred,
+        "us-east-1",
+        method,
+        path,
+        &query,
+        &headers,
+        &amz_date,
+        &PayloadHash::HexSha256(hash),
+    )
+    .unwrap();
+    headers.push(("authorization".into(), auth_hdr));
+    S3Request {
+        method: method.into(),
+        raw_path: path.into(),
+        decoded_path: path.into(),
+        host: "localhost".into(),
+        query,
+        headers,
+        body,
+    }
+}
+
+fn status(r: &Result<ServiceResponse, fs3_s3::S3Error>) -> u16 {
+    match r {
+        Ok(x) => x.status,
+        Err(e) => e.status(),
+    }
+}
+
+fn err_code(r: &Result<ServiceResponse, fs3_s3::S3Error>) -> String {
+    match r {
+        Ok(_) => "OK".into(),
+        Err(e) => format!("{:?}", e.code),
+    }
+}
+
+#[test]
+fn bucket_and_object_flow() {
+    let (_d, svc) = setup();
+
+    // CreateBucket
+    let r = svc.handle(&req("PUT", "/bkt1", vec![]));
+    assert_eq!(status(&r), 200, "{:?}", r);
+    // 重复创建 → 409 BucketAlreadyOwnedByYou
+    let r = svc.handle(&req("PUT", "/bkt1", vec![]));
+    assert_eq!(err_code(&r), "BucketAlreadyOwnedByYou");
+    // 非法桶名
+    let r = svc.handle(&req("PUT", "/Bad_Name!", vec![]));
+    assert_eq!(err_code(&r), "InvalidBucketName");
+    // HeadBucket
+    let r = svc.handle(&req("HEAD", "/bkt1", vec![]));
+    assert_eq!(status(&r), 200);
+    let r = svc.handle(&req("HEAD", "/nope", vec![]));
+    assert_eq!(err_code(&r), "NoSuchBucket");
+    // location/versioning
+    let r = svc.handle(&req("GET", "/bkt1", vec![]));
+    assert!(status(&r) == 200);
+    let r = svc.handle(&req("GET", "/bkt1", vec![]));
+    assert!(status(&r) == 200);
+
+    // PutObject(小 → 内联)
+    let data = b"hello inline object".to_vec();
+    let mut rq = req("PUT", "/bkt1/k1", data.clone());
+    rq.headers
+        .push(("content-type".into(), "text/plain".into()));
+    rq.headers.push(("x-amz-meta-owner".into(), "alice".into()));
+    let r = svc.handle(&rq);
+    assert_eq!(status(&r), 200, "{:?}", r);
+    let etag = r
+        .unwrap()
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("etag"))
+        .unwrap()
+        .1
+        .clone();
+
+    // GetObject(内联)
+    let r = svc.handle(&req("GET", "/bkt1/k1", vec![]));
+    match &r.as_ref().unwrap().body {
+        ResponseBody::ObjectStream { length, .. } => assert_eq!(*length, data.len() as u64),
+        other => panic!("expected stream: {other:?}"),
+    }
+    // 自定义元数据/Content-Type 回显
+    let resp = r.unwrap();
+    assert!(resp
+        .headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("x-amz-meta-owner") && v == "alice"));
+    assert!(resp
+        .headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v == "text/plain"));
+
+    // 条件头
+    let mut rq = req("GET", "/bkt1/k1", vec![]);
+    rq.headers.push(("if-none-match".into(), etag.clone()));
+    let r = svc.handle(&rq);
+    assert_eq!(err_code(&r), "NotModified");
+    let mut rq = req("GET", "/bkt1/k1", vec![]);
+    rq.headers.push(("if-match".into(), "\"deadbeef\"".into()));
+    let r = svc.handle(&rq);
+    assert_eq!(err_code(&r), "PreconditionFailed");
+
+    // 大对象(流式)
+    let big = vec![0xCDu8; 10 * 1024 * 1024];
+    let r = svc.handle(&req("PUT", "/bkt1/big", big.clone()));
+    assert_eq!(status(&r), 200, "{:?}", r);
+    // 通过 read_stream_chunk 读回
+    let mut pos = 0u64;
+    let mut got = Vec::new();
+    let mut buf = vec![0u8; 65536];
+    loop {
+        let n = svc
+            .read_stream_chunk("bkt1", "big", 0, big.len() as u64, &mut pos, &mut buf)
+            .unwrap();
+        if n == 0 {
+            break;
+        }
+        got.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(got, big);
+
+    // Range 语义
+    let mut rq = req("GET", "/bkt1/k1", vec![]);
+    rq.headers.push(("range".into(), "bytes=2-5".into()));
+    let r = svc.handle(&rq);
+    let resp = r.unwrap();
+    assert_eq!(resp.status, 206);
+    assert!(resp
+        .headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("content-range") && v == "bytes 2-5/19"));
+    // 不可满足 range → 416 InvalidRange
+    let mut rq = req("GET", "/bkt1/k1", vec![]);
+    rq.headers.push(("range".into(), "bytes=9999-".into()));
+    let r = svc.handle(&rq);
+    assert_eq!(err_code(&r), "InvalidRange");
+
+    // 列表
+    for k in ["a/1", "a/2", "b/1"] {
+        svc.handle(&req("PUT", &format!("/bkt1/{k}"), vec![1u8; 10]))
+            .unwrap();
+    }
+    let r = svc.handle(&req("GET", "/bkt1", vec![]));
+    let xml = match r.unwrap().body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!(),
+    };
+    assert!(xml.contains("<Key>a/1</Key>") && xml.contains("<Key>b/1</Key>"));
+    // V2 + delimiter
+    let mut rq = req("GET", "/bkt1", vec![]);
+    rq.query = vec![
+        ("list-type".into(), "2".into()),
+        ("prefix".into(), "a/".into()),
+        ("delimiter".into(), "/".into()),
+    ];
+    // 签名基于 query:重建(带 query 的签名)
+    let amz_date = auth::now_amz();
+    let mut headers = vec![
+        ("host".into(), "localhost:9000".into()),
+        ("x-amz-date".into(), amz_date.clone()),
+        (
+            "x-amz-content-sha256".into(),
+            hex::encode(Sha256::digest(b"")),
+        ),
+    ];
+    let cred = Credentials {
+        access_key: "test".into(),
+        secret_key: "secret123".into(),
+    };
+    let auth_hdr = auth::sign_request(
+        &cred,
+        "us-east-1",
+        "GET",
+        "/bkt1",
+        &rq.query,
+        &headers,
+        &amz_date,
+        &PayloadHash::HexSha256(hex::encode(Sha256::digest(b""))),
+    )
+    .unwrap();
+    headers.push(("authorization".into(), auth_hdr));
+    rq.headers = headers;
+    let r = svc.handle(&rq);
+    let xml = match r.unwrap().body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!(),
+    };
+    assert!(
+        xml.contains("<Key>a/1</Key>") && xml.contains("<Key>a/2</Key>"),
+        "{xml}"
+    );
+
+    // DeleteObjects
+    let body = b"<Delete><Object><Key>a/1</Key></Object><Object><Key>nope</Key></Object></Delete>"
+        .to_vec();
+    let r = svc.handle(&req_q("POST", "/bkt1", &[("delete", "")], body));
+    let xml = match r.unwrap().body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!(),
+    };
+    assert!(xml.contains("<Deleted><Key>a/1</Key></Deleted>"), "{xml}");
+
+    // 错误语义
+    let r = svc.handle(&req("GET", "/no-such-bucket/k", vec![]));
+    assert_eq!(err_code(&r), "NoSuchBucket");
+    let r = svc.handle(&req("GET", "/bkt1/missing", vec![]));
+    assert_eq!(err_code(&r), "NoSuchKey");
+    let r = svc.handle(&req("DELETE", "/bkt1", vec![]));
+    assert_eq!(err_code(&r), "BucketNotEmpty");
+
+    // 删桶
+    for k in ["a/2", "b/1", "k1", "big"] {
+        svc.handle(&req("DELETE", &format!("/bkt1/{k}"), vec![]))
+            .unwrap();
+    }
+    let r = svc.handle(&req("DELETE", "/bkt1", vec![]));
+    assert_eq!(status(&r), 204);
+
+    // ListBuckets 空
+    let r = svc.handle(&req("GET", "/", vec![]));
+    let xml = match r.unwrap().body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!(),
+    };
+    assert!(xml.contains("<ListAllMyBucketsResult"));
+}
+
+#[test]
+fn list_versions_and_versioned_delete() {
+    let (_d, svc) = setup();
+    svc.handle(&req("PUT", "/bkt1", vec![])).unwrap();
+    for k in ["a/1", "a/2", "b/1"] {
+        svc.handle(&req("PUT", &format!("/bkt1/{k}"), vec![7u8; 10]))
+            .unwrap();
+    }
+
+    // 未启用版本:每个对象一个 Version 条目(VersionId=null, IsLatest=true)
+    let r = svc
+        .handle(&req_q("GET", "/bkt1", &[("versions", "")], vec![]))
+        .unwrap();
+    let xml = match r.body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!(),
+    };
+    assert!(xml.contains("<ListVersionsResult"), "{xml}");
+    assert!(
+        xml.contains("<Version><Key>a/1</Key><VersionId>null</VersionId><IsLatest>true</IsLatest>"),
+        "{xml}"
+    );
+    assert!(xml.contains("<Version><Key>b/1</Key>"), "{xml}");
+    assert!(xml.contains("<IsTruncated>false</IsTruncated>"), "{xml}");
+
+    // KeyMarker 分页
+    let r = svc
+        .handle(&req_q(
+            "GET",
+            "/bkt1",
+            &[("versions", ""), ("key-marker", "a/1"), ("max-keys", "1")],
+            vec![],
+        ))
+        .unwrap();
+    let xml = match r.body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!(),
+    };
+    assert!(xml.contains("<Key>a/2</Key>"), "{xml}");
+    assert!(!xml.contains("<Key>a/1</Key>"), "{xml}");
+    assert!(xml.contains("<IsTruncated>true</IsTruncated>"), "{xml}");
+    assert!(
+        xml.contains(
+            "<NextKeyMarker>a/2</NextKeyMarker><NextVersionIdMarker>null</NextVersionIdMarker>"
+        ),
+        "{xml}"
+    );
+
+    // version-id-marker 无 key-marker → InvalidArgument
+    let r = svc.handle(&req_q(
+        "GET",
+        "/bkt1",
+        &[("versions", ""), ("version-id-marker", "null")],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "InvalidArgument");
+
+    // prefix 过滤
+    let r = svc
+        .handle(&req_q(
+            "GET",
+            "/bkt1",
+            &[("versions", ""), ("prefix", "a/")],
+            vec![],
+        ))
+        .unwrap();
+    let xml = match r.body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!(),
+    };
+    assert!(
+        xml.contains("<Key>a/1</Key>") && xml.contains("<Key>a/2</Key>"),
+        "{xml}"
+    );
+    assert!(!xml.contains("<Key>b/1</Key>"), "{xml}");
+
+    // DeleteObjects 带 VersionId=null(s3-tests 清理路径)→ 正常删除
+    let body =
+        b"<Delete><Object><Key>a/1</Key><VersionId>null</VersionId></Object></Delete>".to_vec();
+    let r = svc
+        .handle(&req_q("POST", "/bkt1", &[("delete", "")], body))
+        .unwrap();
+    let xml = match r.body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!(),
+    };
+    assert!(xml.contains("<Deleted><Key>a/1</Key></Deleted>"), "{xml}");
+    let r = svc.handle(&req("GET", "/bkt1/a/1", vec![]));
+    assert_eq!(err_code(&r), "NoSuchKey");
+
+    // 非 null 版本 ID → InvalidArgument 条目(不误删)
+    let body =
+        b"<Delete><Object><Key>a/2</Key><VersionId>v1</VersionId></Object></Delete>".to_vec();
+    let r = svc
+        .handle(&req_q("POST", "/bkt1", &[("delete", "")], body))
+        .unwrap();
+    let xml = match r.body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!(),
+    };
+    assert!(xml.contains("InvalidArgument"), "{xml}");
+    let r = svc.handle(&req("GET", "/bkt1/a/2", vec![]));
+    assert_eq!(status(&r), 200);
+
+    // 清理后 ListObjectVersions 只剩 b/1
+    svc.handle(&req("DELETE", "/bkt1/a/2", vec![])).unwrap();
+    let r = svc
+        .handle(&req_q("GET", "/bkt1", &[("versions", "")], vec![]))
+        .unwrap();
+    let xml = match r.body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!(),
+    };
+    assert!(!xml.contains("<Key>a/"), "{xml}");
+    assert!(xml.contains("<Key>b/1</Key>"), "{xml}");
+}
+
+#[test]
+fn list_v2_startafter_and_maxkeys_zero() {
+    let (_d, svc) = setup();
+    svc.handle(&req("PUT", "/bkt1", vec![])).unwrap();
+    for k in ["bar", "baz", "foo", "quxx"] {
+        svc.handle(&req("PUT", &format!("/bkt1/{k}"), vec![1u8; 4]))
+            .unwrap();
+    }
+
+    // StartAfter=bar → 严格大于:['baz','foo','quxx'],回显 StartAfter
+    let r = svc
+        .handle(&req_q(
+            "GET",
+            "/bkt1",
+            &[("list-type", "2"), ("start-after", "bar")],
+            vec![],
+        ))
+        .unwrap();
+    let xml = match r.body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!(),
+    };
+    assert!(xml.contains("<StartAfter>bar</StartAfter>"), "{xml}");
+    assert!(xml.contains("<Key>baz</Key>"), "{xml}");
+    assert!(!xml.contains("<Key>bar</Key>"), "{xml}");
+
+    // StartAfter 不在列表 → 从其字典序位置开始
+    let r = svc
+        .handle(&req_q(
+            "GET",
+            "/bkt1",
+            &[("list-type", "2"), ("start-after", "blah")],
+            vec![],
+        ))
+        .unwrap();
+    let xml = match r.body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!(),
+    };
+    assert!(
+        xml.contains("<Key>foo</Key>") && xml.contains("<Key>quxx</Key>"),
+        "{xml}"
+    );
+
+    // StartAfter 超出列表 → 空
+    let r = svc
+        .handle(&req_q(
+            "GET",
+            "/bkt1",
+            &[("list-type", "2"), ("start-after", "zzz")],
+            vec![],
+        ))
+        .unwrap();
+    let xml = match r.body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!(),
+    };
+    assert!(!xml.contains("<Key>"), "{xml}");
+    assert!(xml.contains("<IsTruncated>false</IsTruncated>"), "{xml}");
+
+    // MaxKeys=0 → 空且不截断(v1 与 v2)
+    for q in [
+        vec![("max-keys", "0")],
+        vec![("list-type", "2"), ("max-keys", "0")],
+    ] {
+        let r = svc.handle(&req_q("GET", "/bkt1", &q, vec![])).unwrap();
+        let xml = match r.body {
+            ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+            _ => panic!(),
+        };
+        assert!(!xml.contains("<Key>"), "{xml}");
+        assert!(xml.contains("<IsTruncated>false</IsTruncated>"), "{xml}");
+    }
+
+    // 空 delimiter:不回显 Delimiter 元素
+    let r = svc
+        .handle(&req_q("GET", "/bkt1", &[("delimiter", "")], vec![]))
+        .unwrap();
+    let xml = match r.body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!(),
+    };
+    assert!(!xml.contains("Delimiter"), "{xml}");
+    assert!(xml.contains("<Key>bar</Key>"), "{xml}");
+}
+
+#[test]
+fn acl_and_list_owner() {
+    let (_d, svc) = setup();
+    svc.handle(&req("PUT", "/bkt1", vec![])).unwrap();
+    svc.handle(&req("PUT", "/bkt1/k1", vec![1u8; 3])).unwrap();
+
+    // GetObjectAcl:owner(test) FULL_CONTROL
+    let r = svc
+        .handle(&req_q("GET", "/bkt1/k1", &[("acl", "")], vec![]))
+        .unwrap();
+    let xml = match r.body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!(),
+    };
+    assert!(xml.contains("<AccessControlPolicy"), "{xml}");
+    assert!(
+        xml.contains("<Owner><ID>test</ID><DisplayName>test</DisplayName></Owner>"),
+        "{xml}"
+    );
+    assert!(
+        xml.contains("<Permission>FULL_CONTROL</Permission>"),
+        "{xml}"
+    );
+
+    // 列表 Contents 带 Owner(与 ACL 一致)
+    let r = svc.handle(&req("GET", "/bkt1", vec![])).unwrap();
+    let xml = match r.body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!(),
+    };
+    assert!(
+        xml.contains("<Owner><ID>test</ID><DisplayName>test</DisplayName></Owner>"),
+        "{xml}"
+    );
+
+    // 不存在对象 → NoSuchKey
+    let r = svc.handle(&req_q("GET", "/bkt1/nope", &[("acl", "")], vec![]));
+    assert_eq!(err_code(&r), "NoSuchKey");
+    // PutObjectAcl → NotImplemented
+    let r = svc.handle(&req_q("PUT", "/bkt1/k1", &[("acl", "")], vec![]));
+    assert_eq!(err_code(&r), "NotImplemented");
+}
+
+#[test]
+fn auth_and_errors() {
+    let (_d, svc) = setup();
+    // 无签名 → AccessDenied
+    let rq = S3Request {
+        method: "GET".into(),
+        raw_path: "/".into(),
+        decoded_path: "/".into(),
+        host: "localhost".into(),
+        query: vec![],
+        headers: vec![("host".into(), "localhost".into())],
+        body: vec![],
+    };
+    let r = svc.handle(&rq);
+    assert_eq!(err_code(&r), "AccessDenied");
+
+    // 坏签名 → SignatureDoesNotMatch
+    let mut rq = req("GET", "/", vec![]);
+    let last = rq.headers.len() - 1;
+    rq.headers[last].1.push('0');
+    let r = svc.handle(&rq);
+    assert_eq!(err_code(&r), "SignatureDoesNotMatch");
+
+    // 未实现子资源 → NotImplemented
+    let r = svc.handle(&req_q("GET", "/bkt1", &[("policy", "")], vec![]));
+    assert_eq!(err_code(&r), "NotImplemented");
+    let r = svc.handle(&req_q("GET", "/bkt1", &[("uploads", "")], vec![]));
+    assert_eq!(err_code(&r), "NotImplemented");
+}

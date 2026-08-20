@@ -213,6 +213,15 @@ M0 实现将以下设计点具体化,经 50 轮 kill -9 崩溃 harness 验证(AD
 4. **系统键 `s:seq`**(键表新增):每个事务读 `s:seq` 写 `s:seq+1`,作为单点序列化与 `a:`/`t:` 记录序号来源(事务冲突自动重试)。
 5. **值序列化用 postcard**:bincode 已无人维护(RUSTSEC-2025-0141),postcard(serde 原生、积极维护)替代;键布局不受影响。剩余 audit 告警均为 sled/postcard 传递依赖的"unmaintained"信息级告警,无实际漏洞。
 
+#### ADR-6(M1 实现确认):列表游标语义、未启用版本的 ListObjectVersions 与最小 ACL
+
+M1 实现将以下协议语义具体化,经 CEPH s3-tests 核心子集 68/68 验证:
+
+1. **列表游标是"条目级"的**:带 delimiter 时,输出条目 = Contents 键或公共前缀串;游标(NextMarker / NextContinuationToken / KeyMarker)必须**严格大于**且按条目比较 —— 游标为公共前缀(如 `boo/`)时,该组全部键(条目 ≤ 游标)整组跳过,与 AWS 分页语义一致;截断页的游标 = 本页最后**已发出**的条目(而非首个未发键,否则续页跳一条)。NextMarker 仅在指定 delimiter 时返回(AWS 文档语义)。
+2. **未启用版本的 ListObjectVersions 返回每对象一个 `<Version>` 条目(VersionId=null, IsLatest=true)**,而非空列表:botocore 的 `list_object_versions` 与 s3-tests `nuke_bucket` 依赖它枚举对象做清理;`DeleteObjects` 接受 `VersionId=null`(等价无版本删除),非 null 版本 ID → InvalidArgument。KeyMarker/VersionIdMarker 分页同条目语义。
+3. **Owner/ACL 最小实现**:单机单账号模型下,CanonicalUser ID = DisplayName = 首个配置凭据的 access key;GetObjectAcl 返回 owner FULL_CONTROL 的私有默认 ACL;ListObjectsV1/V2 的 Contents 含 Owner(与 AWS V1 一致)。完整 ACL/策略为 M2+ 范围。
+4. **对象级 `?acl` 子资源**:GET 实现(见 3);PUT(PutObjectAcl)→ NotImplemented。
+
 ---
 
 ## 4. 存储引擎设计(Rust)

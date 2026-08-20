@@ -7,9 +7,38 @@ use fs3_core::{Error, Result};
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct RootConfig {
     pub storage: StorageConfig,
+    #[serde(default)]
+    pub server: ServerConfig,
+    #[serde(default)]
+    pub auth: AuthConfig,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
+pub struct ServerConfig {
+    /// 监听地址,如 "0.0.0.0:9000"。
+    pub listen: Option<String>,
+    /// worker 数(0 = 自动)。
+    pub workers: Option<usize>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct AuthConfig {
+    /// SigV4 区域(默认 us-east-1)。
+    pub region: Option<String>,
+    /// 允许匿名 GET/HEAD。
+    pub allow_anonymous: bool,
+    /// 访问密钥表。
+    #[serde(default)]
+    pub keys: Vec<AuthKey>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct AuthKey {
+    pub access_key: String,
+    pub secret_key: String,
+}
+
+#[derive(Debug, Default, Clone, serde::Deserialize)]
 pub struct StorageConfig {
     pub devices: Vec<std::path::PathBuf>,
     #[allow(dead_code)] // init 命令使用(extent 大小)

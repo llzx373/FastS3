@@ -69,7 +69,9 @@ FastS3 的对策:**不做底层已经做过的事**。工程力量全部投入�
 
 ## 当前状态
 
-✅ **M0 引擎 PoC 完成(v0.1)。** 裸设备/镜像文件 PUT/GET 全链路、位图分配器、检查点双缓冲与崩溃恢复、sled 事务/组提交、引擎基准回路;kill -9 崩溃 harness 50 轮零失败。下一步:M1 S3 核心语义。
+✅ **M0 引擎 PoC 完成(v0.1)。** 裸设备/镜像文件 PUT/GET 全链路、位图分配器、检查点双缓冲与崩溃恢复、sled 事务/组提交、引擎基准回路;kill -9 崩溃 harness 50 轮零失败。
+
+✅ **M1 S3 核心语义完成(v0.2)。** S3 协议面:路径/虚拟主机路由、SigV4 header + 预签名认证、桶/对象 CRUD、ListObjectsV1/V2(分页/StartAfter/delimiter)、Range 与条件头、DeleteObjects、小对象内联(E3)、hyper + SO_REUSEPORT 流式接入;门禁全过:aws cli / boto3 / mc / rclone 4 客户端冒烟 ✅、CEPH s3-tests 核心子集 68/68 ✅(两例排除见 TODO.md)、HTTP 崩溃 harness 100 轮 + CLI 50 轮零撕裂 ✅、覆盖率 ≥60%(实测 ~76%)✅、cargo audit 漏洞清零 ✅。下一步:M2 高级语义与零拷贝。
 
 | 文档 | 内容 |
 | --- | --- |
@@ -79,7 +81,26 @@ FastS3 的对策:**不做底层已经做过的事**。工程力量全部投入�
 
 路线图:9 个里程碑(M0~M8,合计约 7 个月)→ v1.0 GA;v0.1 起逐版本发布(引擎 PoC → S3 核心 → 高级语义 → 管理面 → 加固 → 性能冲刺 → 打包开箱 → 文档与 Beta → GA)。
 
-## M0 引擎 PoC(当前)
+## M1 S3 核心(当前)
+
+```bash
+cargo build --release -p fs3d
+
+# 初始化 1GiB 镜像并启动 S3 服务(裸设备传 /dev/nvme0n1 即可)
+target/release/fasts3d init --device /var/lib/fasts3/disk.img --size 1GiB
+target/release/fasts3d serve --device /var/lib/fasts3/disk.img --meta-dir /var/lib/fasts3/meta \
+  --listen 127.0.0.1:9000 --key test:secret123
+
+# 任意 S3 客户端(aws cli / boto3 / mc / rclone):
+aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://b1
+aws --endpoint-url http://127.0.0.1:9000 s3 cp data.bin s3://b1/data.bin
+aws --endpoint-url http://127.0.0.1:9000 s3 cp s3://b1/data.bin out.bin
+
+# 一致性校验(位图/元数据):
+target/release/fasts3d check --device disk.img --meta-dir meta
+```
+
+验证回路:单元测试 `cargo test --workspace`;协议冒烟 `tests/smoke/`;崩溃 harness `tests/crash/`;CEPH s3-tests 见 `TODO.md` M1 门禁。
 
 ```bash
 cargo build --release -p fs3d

@@ -125,6 +125,16 @@ fn decode_alloc(v: &[u8]) -> Result<AllocRecord> {
     decode(v).map_err(|e| Error::Corrupt(format!("alloc record: {e}")))
 }
 
+/// 分页列举结果(delimiter 分组后;`last_scanned` 为游标,供续扫)。
+#[derive(Debug, Clone, Default)]
+pub struct ListPage {
+    pub items: Vec<(String, ObjectMeta)>,
+    pub common_prefixes: Vec<String>,
+    pub truncated: bool,
+    /// 最后一个被扫描到的原始键(续扫游标,严格大于)。
+    pub last_scanned: Option<String>,
+}
+
 impl MetaStore {
     pub fn open(dir: &Path, cfg: &MetaConfig) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
@@ -196,6 +206,95 @@ impl MetaStore {
             }
         }
         Ok(out)
+    }
+
+    /// 分页列举:前缀 + 可选 delimiter 分组 + after 游标 + max 条目数。
+    ///
+    /// 条目 = 对象 + 公共前缀,均计入 max;截断时 last_scanned 为最后
+    /// **已发出**的条目(Contents 键或公共前缀串;严格大于它即可续扫
+    /// 不重不漏,与 AWS NextMarker/NextContinuationToken 语义一致)。
+    pub fn list_objects_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        after: Option<&str>,
+        max: usize,
+    ) -> Result<ListPage> {
+        let mut page = ListPage::default();
+        let base = object_prefix(bucket);
+        let after_esc = after.map(|a| escape(a.as_bytes()));
+        let start: sled::IVec = match &after_esc {
+            Some(a) => {
+                let mut k = base.clone();
+                k.extend_from_slice(a);
+                k.into()
+            }
+            None => base.clone().into(),
+        };
+        // 注意:游标过滤在条目空间进行(见下),range 起点仅作扫描优化;
+        // 裸键与完整键的字节比较不一致会导致游标失效,故不再直接比较 k。
+        let mut entries = 0usize;
+        // 本页最后"已发出"的条目(Contents 键或公共前缀串)。注意必须在
+        // max 检查之后才记录:截断时 last_scanned 若记录到首个未发键,
+        // 续页会跳过一条(s3-tests: test_bucket_listv2_continuationtoken)。
+        let mut last_emitted: Option<String> = None;
+        let mut last_entry: Option<String> = None;
+        for item in self.db.range(start..) {
+            let (k, v) = item.map_err(sled_err)?;
+            if !k.starts_with(&base) {
+                break;
+            }
+            let (b, key) = parse_object_key(&k)?;
+            debug_assert_eq!(b, bucket);
+            if !prefix.is_empty() && !key.starts_with(prefix) {
+                continue;
+            }
+            // 条目化:键 → 输出条目。带 delimiter 时,键在 prefix 之后首个
+            // delimiter 之前的段归组为公共前缀条目;键自身等于公共前缀
+            // (如 "boo/")或不含 delimiter 时,条目即键本身。
+            let entry: String = match delimiter {
+                Some(d) if !d.is_empty() => {
+                    let rest = &key[prefix.len().min(key.len())..];
+                    match rest.find(d) {
+                        Some(i) if i + d.len() < rest.len() => {
+                            let mut c = String::with_capacity(prefix.len() + i + d.len());
+                            c.push_str(prefix);
+                            c.push_str(&rest[..i + d.len()]);
+                            c
+                        }
+                        _ => key.clone(),
+                    }
+                }
+                _ => key.clone(),
+            };
+            // 条目级严格大于游标:游标为公共前缀(如 "boo/")时,该组全部
+            // 键(boo/bar、boo/baz/…)的条目 ≤ 游标,整组跳过 —— 与
+            // AWS NextMarker 语义一致(s3-tests: test_bucket_list_delimiter_prefix)。
+            if let Some(m) = after {
+                if entry.as_str() <= m {
+                    continue;
+                }
+            }
+            // 分组去重:同一条目只发一次
+            if last_entry.as_deref() == Some(entry.as_str()) {
+                continue;
+            }
+            if entries >= max {
+                page.truncated = true;
+                break;
+            }
+            if entry == key {
+                page.items.push((key, decode_object(&v)?));
+            } else {
+                page.common_prefixes.push(entry.clone());
+            }
+            last_entry = Some(entry.clone());
+            last_emitted = Some(entry);
+            entries += 1;
+        }
+        page.last_scanned = last_emitted;
+        Ok(page)
     }
 
     /// 列出 seq > after 的全部分配记录(恢复重放)。
@@ -441,6 +540,7 @@ mod tests {
             extents: vec![],
             content_type: "application/octet-stream".into(),
             user_meta: vec![],
+            inline: None,
         }
     }
 
@@ -594,5 +694,134 @@ mod tests {
         .unwrap();
         assert!(s.list_objects("b2", "").unwrap().is_empty());
         assert_eq!(s.list_objects("b", "").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn list_page_after_marker_is_exclusive() {
+        // 回归:s3-tests test_bucket_list_many — 游标必须严格排除 marker 自身,
+        // 且比较用完整键(base+escape),不能拿裸 marker 与完整键比较。
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        for k in ["bar", "baz", "foo", "quxx"] {
+            s.commit_object_put(
+                "b1",
+                k,
+                &object_meta(1),
+                AllocDraft::default(),
+                StatsDelta::default(),
+            )
+            .unwrap();
+        }
+        // 无游标:前 2 个
+        let p = s.list_objects_page("b1", "", None, None, 2).unwrap();
+        let keys: Vec<&str> = p.items.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["bar", "baz"]);
+        assert!(p.truncated);
+        // Marker=baz → 严格大于:foo,quxx(不得含 baz)
+        let p = s
+            .list_objects_page("b1", "", None, Some("baz"), 100)
+            .unwrap();
+        let keys: Vec<&str> = p.items.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["foo", "quxx"]);
+        assert!(!p.truncated);
+        // 不存在的 marker(blah)→ bar..foo 之间:foo,quxx
+        let p = s
+            .list_objects_page("b1", "", None, Some("blah"), 100)
+            .unwrap();
+        let keys: Vec<&str> = p.items.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["foo", "quxx"]);
+        // marker 超出列表 → 空
+        let p = s
+            .list_objects_page("b1", "", None, Some("zzz"), 100)
+            .unwrap();
+        assert!(p.items.is_empty() && !p.truncated);
+        // 含分隔符键的游标同样严格
+        s.commit_object_put(
+            "b1",
+            "a/b",
+            &object_meta(1),
+            AllocDraft::default(),
+            StatsDelta::default(),
+        )
+        .unwrap();
+        let p = s
+            .list_objects_page("b1", "", None, Some("a/b"), 100)
+            .unwrap();
+        let keys: Vec<&str> = p.items.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["bar", "baz", "foo", "quxx"]);
+    }
+
+    #[test]
+    fn list_page_cursor_is_last_emitted() {
+        // 回归:s3-tests test_bucket_listv2_continuationtoken — 截断页的
+        // 游标必须是最后发出的条目,而非首个未发键(否则续页跳一条)。
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        for k in ["bar", "baz", "foo", "quxx"] {
+            s.commit_object_put(
+                "b1",
+                k,
+                &object_meta(1),
+                AllocDraft::default(),
+                StatsDelta::default(),
+            )
+            .unwrap();
+        }
+        let p = s.list_objects_page("b1", "", None, None, 1).unwrap();
+        assert_eq!(p.last_scanned.as_deref(), Some("bar"));
+        assert!(p.truncated);
+        // 续页:严格大于 bar → baz,foo,quxx 全量,无跳漏
+        let p = s
+            .list_objects_page("b1", "", None, Some("bar"), 100)
+            .unwrap();
+        let keys: Vec<&str> = p.items.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["baz", "foo", "quxx"]);
+        assert!(!p.truncated);
+    }
+
+    #[test]
+    fn list_page_cursor_with_delimiter_is_common_prefix() {
+        // 回归:s3-tests test_bucket_list_delimiter_prefix — 截断页最后条目
+        // 为公共前缀时,游标 = 公共前缀串(AWS NextMarker 语义)。
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        for k in [
+            "asdf",
+            "boo/bar",
+            "boo/baz/xyzzy",
+            "cquux/thud",
+            "cquux/bla",
+        ] {
+            s.commit_object_put(
+                "b1",
+                k,
+                &object_meta(1),
+                AllocDraft::default(),
+                StatsDelta::default(),
+            )
+            .unwrap();
+        }
+        // 第一页:Contents [asdf],游标 asdf
+        let p = s.list_objects_page("b1", "", Some("/"), None, 1).unwrap();
+        assert_eq!(p.items.len(), 1);
+        assert_eq!(p.items[0].0, "asdf");
+        assert_eq!(p.last_scanned.as_deref(), Some("asdf"));
+        assert!(p.truncated);
+        // 第二页:公共前缀 [boo/],游标 = "boo/"(而非键 boo/bar)
+        let p = s
+            .list_objects_page("b1", "", Some("/"), Some("asdf"), 1)
+            .unwrap();
+        assert!(p.items.is_empty());
+        assert_eq!(p.common_prefixes, ["boo/"]);
+        assert_eq!(p.last_scanned.as_deref(), Some("boo/"));
+        assert!(p.truncated);
+        // 第三页:严格大于 "boo/" → 公共前缀 [cquux/],不再截断
+        let p = s
+            .list_objects_page("b1", "", Some("/"), Some("boo/"), 1)
+            .unwrap();
+        assert!(p.items.is_empty());
+        assert_eq!(p.common_prefixes, ["cquux/"]);
+        assert_eq!(p.last_scanned.as_deref(), Some("cquux/"));
+        assert!(!p.truncated);
     }
 }
