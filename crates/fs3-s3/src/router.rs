@@ -52,6 +52,72 @@ pub enum Operation {
         max_keys: u32,
         delimiter: Option<String>,
     },
+    // —— 复制(F6)/分片复制 ——
+    CopyObject {
+        bucket: String,
+        key: String,
+        copy_source: crate::xml::CopySource,
+        metadata_directive: Option<String>,
+        copy_source_if_match: Option<String>,
+        copy_source_if_none_match: Option<String>,
+        copy_source_if_unmodified_since: Option<String>,
+        copy_source_if_modified_since: Option<String>,
+    },
+    UploadPartCopy {
+        bucket: String,
+        key: String,
+        part_number: u32,
+        upload_id: String,
+        copy_source: crate::xml::CopySource,
+        copy_source_range: Option<String>,
+    },
+    // —— multipart(F5) ——
+    CreateMultipartUpload {
+        bucket: String,
+        key: String,
+    },
+    UploadPart {
+        bucket: String,
+        key: String,
+        part_number: u32,
+        upload_id: String,
+    },
+    CompleteMultipartUpload {
+        bucket: String,
+        key: String,
+        upload_id: String,
+        /// 客户端声明的 (part_no, etag hex)。
+        parts: Vec<(u32, String)>,
+    },
+    AbortMultipartUpload {
+        bucket: String,
+        key: String,
+        upload_id: String,
+    },
+    ListMultipartUploads {
+        bucket: String,
+        prefix: String,
+        key_marker: Option<String>,
+        upload_id_marker: Option<String>,
+        max_uploads: u32,
+    },
+    ListParts {
+        bucket: String,
+        key: String,
+        upload_id: String,
+        part_number_marker: Option<u32>,
+        max_parts: u32,
+    },
+    GetObjectPart {
+        bucket: String,
+        key: String,
+        part_number: u32,
+    },
+    HeadObjectPart {
+        bucket: String,
+        key: String,
+        part_number: u32,
+    },
     // —— 对象级 ——
     PutObject {
         bucket: String,
@@ -96,6 +162,46 @@ impl Router {
         }
     }
 
+    /// 解析 host + 路径为 (桶, 键):虚拟主机风格时桶在 Host,路径即键。
+    fn bucket_of<'p>(
+        &self,
+        host: &str,
+        path: &'p str,
+    ) -> Result<(Option<String>, &'p str), S3Error> {
+        let host_clean = host.trim_end_matches('.').to_lowercase();
+        let path_style = self.path_style_bases.contains(&host_clean);
+        let vh_bucket = if path_style {
+            None
+        } else {
+            let first_dot = host_clean.find('.').unwrap_or(host_clean.len());
+            let maybe_bucket = &host_clean[..first_dot];
+            let rest = &host_clean[first_dot..];
+            if maybe_bucket.is_empty()
+                || rest.is_empty()
+                || maybe_bucket.contains(':')
+                // 整个 host 是 IP(或首标签含非桶名字符)时按路径风格
+                || host_clean.parse::<std::net::IpAddr>().is_ok()
+                || maybe_bucket
+                    .chars()
+                    .any(|c| !(c.is_ascii_alphanumeric() || c == '-' || c == '.'))
+            {
+                None
+            } else {
+                Some(maybe_bucket.to_string())
+            }
+        };
+        let trimmed = path.trim_start_matches('/');
+        if let Some(vh) = vh_bucket {
+            Ok((Some(vh), trimmed))
+        } else if trimmed.is_empty() {
+            Ok((None, ""))
+        } else {
+            let mut it = trimmed.splitn(2, '/');
+            let b = it.next().unwrap_or("");
+            Ok((Some(b.to_string()), it.next().unwrap_or("")))
+        }
+    }
+
     /// 解析 host + 路径 + query + 方法为 Operation。
     ///
     /// - `host` 来自 Host 头(不含端口)。
@@ -108,48 +214,12 @@ impl Router {
         query: &[(String, String)],
         body: &[u8],
     ) -> Result<Operation, S3Error> {
-        // 虚拟主机风格:host 首标签不是路径风格基准 → bucket.host
-        let host_clean = host.trim_end_matches('.').to_lowercase();
-        let path_style = self.path_style_bases.contains(&host_clean);
-        let (bucket, _rest_path) = if path_style {
-            (None, path)
-        } else {
-            let first_dot = host_clean.find('.').unwrap_or(host_clean.len());
-            let maybe_bucket = &host_clean[..first_dot];
-            let rest = &host_clean[first_dot..];
-            if maybe_bucket.is_empty()
-                || rest.is_empty()
-                || maybe_bucket.contains(':')
-                // 整个 host 是 IP(或首标签含非桶名字符)时按路径风格
-                || host_clean.parse::<std::net::IpAddr>().is_ok()
-                || maybe_bucket.chars().any(|c| !(c.is_ascii_alphanumeric() || c == '-' || c == '.'))
-            {
-                (None, path)
-            } else {
-                (Some(maybe_bucket.to_string()), path)
-            }
-        };
-
-        // 路径 → (桶, 对象键);URL 解码已由 HTTP 层完成(path 为解码后)。
-        // 虚拟主机风格时路径首段是对象键的一部分(桶在 Host 里)。
-        let trimmed = path.trim_start_matches('/');
-        let (p_bucket, key): (Option<String>, &str) = if let Some(vh) = bucket.clone() {
-            (Some(vh), trimmed)
-        } else if trimmed.is_empty() {
-            (None, "")
-        } else {
-            let mut it = trimmed.splitn(2, '/');
-            let b = it.next().unwrap_or("");
-            (Some(b.to_string()), it.next().unwrap_or(""))
-        };
-        let bucket = match (bucket, p_bucket) {
-            (Some(vh), Some(ps)) if vh != ps => {
-                return Err(S3Error::new(S3ErrorCode::InvalidRequest)
-                    .with_message("host and path disagree on bucket name"))
-            }
-            (Some(vh), _) => Some(vh),
-            (None, Some(ps)) => Some(ps),
-            (None, None) => None,
+        // 虚拟主机风格:host 首标签不是路径风格基准 → bucket.host(路径即键)。
+        // 路径风格:路径首段 = 桶。
+        let (vh_bucket, key) = self.bucket_of(host, path)?;
+        let bucket = match vh_bucket {
+            Some(vh) => Some(vh),
+            None => p_bucket_of_path(path),
         };
 
         // 子资源/查询参数 → 操作
@@ -286,6 +356,73 @@ impl Router {
 
         // 对象级
         let key = key.to_string();
+
+        // 分片/会话查询参数(优先级高于普通对象操作)
+        if let Some(uid) = get_q("uploadId") {
+            if let Some(pn) = get_q("partNumber") {
+                let part_number = pn.parse::<u32>().map_err(|_| {
+                    S3Error::new(S3ErrorCode::InvalidArgument)
+                        .with_message("partNumber must be a positive integer")
+                })?;
+                return match method {
+                    "PUT" => Ok(Operation::UploadPart {
+                        bucket,
+                        key,
+                        part_number,
+                        upload_id: uid.to_string(),
+                    }),
+                    _ => Err(S3Error::new(S3ErrorCode::MethodNotAllowed)),
+                };
+            }
+            return match method {
+                "POST" => Ok(Operation::CompleteMultipartUpload {
+                    bucket,
+                    key,
+                    upload_id: uid.to_string(),
+                    parts: crate::xml::parse_complete_multipart(body)
+                        .map_err(|msg| S3Error::new(S3ErrorCode::MalformedXML).with_message(msg))?,
+                }),
+                "DELETE" => Ok(Operation::AbortMultipartUpload {
+                    bucket,
+                    key,
+                    upload_id: uid.to_string(),
+                }),
+                "GET" => Ok(Operation::ListParts {
+                    bucket,
+                    key,
+                    upload_id: uid.to_string(),
+                    part_number_marker: get_q("part-number-marker").and_then(|v| v.parse().ok()),
+                    max_parts: parse_max_keys(get_q("max-parts").as_deref())?,
+                }),
+                _ => Err(S3Error::new(S3ErrorCode::MethodNotAllowed)),
+            };
+        }
+        if has_q("uploads") {
+            if method != "POST" {
+                return Err(S3Error::new(S3ErrorCode::MethodNotAllowed));
+            }
+            return Ok(Operation::CreateMultipartUpload { bucket, key });
+        }
+        if let Some(pn) = get_q("partNumber") {
+            let part_number = pn.parse::<u32>().map_err(|_| {
+                S3Error::new(S3ErrorCode::InvalidArgument)
+                    .with_message("partNumber must be a positive integer")
+            })?;
+            return match method {
+                "GET" => Ok(Operation::GetObjectPart {
+                    bucket,
+                    key,
+                    part_number,
+                }),
+                "HEAD" => Ok(Operation::HeadObjectPart {
+                    bucket,
+                    key,
+                    part_number,
+                }),
+                _ => Err(S3Error::new(S3ErrorCode::MethodNotAllowed)),
+            };
+        }
+
         match method {
             "PUT" => {
                 if has_q("acl") {
@@ -300,6 +437,40 @@ impl Router {
             "DELETE" => Ok(Operation::DeleteObject { bucket, key }),
             _ => Err(S3Error::new(S3ErrorCode::MethodNotAllowed)),
         }
+    }
+
+    /// 桶级 ListMultipartUploads(GET /bucket?uploads;路径必为桶级)。
+    pub fn route_list_uploads(
+        &self,
+        host: &str,
+        path: &str,
+        query: &[(String, String)],
+    ) -> Result<(String, Option<String>, Option<String>, u32), S3Error> {
+        let get_q = |k: &str| query.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone());
+        let (bucket, key) = self.bucket_of(host, path)?;
+        let bucket = bucket.ok_or_else(|| {
+            S3Error::new(S3ErrorCode::InvalidRequest).with_message("missing bucket name")
+        })?;
+        if !key.is_empty() {
+            return Err(S3Error::new(S3ErrorCode::InvalidRequest)
+                .with_message("ListMultipartUploads requires a bucket-level path"));
+        }
+        Ok((
+            bucket,
+            get_q("key-marker"),
+            get_q("upload-id-marker"),
+            parse_max_keys(get_q("max-uploads").as_deref())?,
+        ))
+    }
+}
+
+/// 路径首段 = 桶(路径风格)。
+fn p_bucket_of_path(path: &str) -> Option<String> {
+    let trimmed = path.trim_start_matches('/');
+    if trimmed.is_empty() {
+        None
+    } else {
+        trimmed.split('/').next().map(|b| b.to_string())
     }
 }
 
@@ -415,6 +586,170 @@ mod tests {
         let q = vec![("max-keys".into(), "10".into())];
         let op = r.route("GET", "localhost", "/b1", &q, b"").unwrap();
         assert!(matches!(op, Operation::ListObjectsV1 { max_keys: 10, .. }));
+    }
+
+    #[test]
+    fn multipart_routing() {
+        let r = router();
+        // 创建上传
+        let op = r
+            .route(
+                "POST",
+                "localhost",
+                "/b1/k1",
+                &[("uploads".into(), "".into())],
+                b"",
+            )
+            .unwrap();
+        assert!(
+            matches!(op, Operation::CreateMultipartUpload { bucket, key } if bucket == "b1" && key == "k1")
+        );
+        // 上传分片
+        let op = r
+            .route(
+                "PUT",
+                "localhost",
+                "/b1/k1",
+                &[
+                    ("partNumber".into(), "2".into()),
+                    ("uploadId".into(), "u1".into()),
+                ],
+                b"",
+            )
+            .unwrap();
+        assert!(
+            matches!(op, Operation::UploadPart { part_number: 2, upload_id, .. } if upload_id == "u1")
+        );
+        // 完成
+        let body = b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>";
+        let op = r
+            .route(
+                "POST",
+                "localhost",
+                "/b1/k1",
+                &[("uploadId".into(), "u1".into())],
+                body,
+            )
+            .unwrap();
+        match op {
+            Operation::CompleteMultipartUpload {
+                parts, upload_id, ..
+            } => {
+                assert_eq!(parts, vec![(1, "a".to_string())]);
+                assert_eq!(upload_id, "u1");
+            }
+            other => panic!("{other:?}"),
+        }
+        // 中止
+        let op = r
+            .route(
+                "DELETE",
+                "localhost",
+                "/b1/k1",
+                &[("uploadId".into(), "u1".into())],
+                b"",
+            )
+            .unwrap();
+        assert!(
+            matches!(op, Operation::AbortMultipartUpload { upload_id, .. } if upload_id == "u1")
+        );
+        // 分片读取
+        let op = r
+            .route(
+                "GET",
+                "localhost",
+                "/b1/k1",
+                &[("partNumber".into(), "1".into())],
+                b"",
+            )
+            .unwrap();
+        assert!(matches!(
+            op,
+            Operation::GetObjectPart { part_number: 1, .. }
+        ));
+        let op = r
+            .route(
+                "HEAD",
+                "localhost",
+                "/b1/k1",
+                &[("partNumber".into(), "1".into())],
+                b"",
+            )
+            .unwrap();
+        assert!(matches!(
+            op,
+            Operation::HeadObjectPart { part_number: 1, .. }
+        ));
+        // 坏 partNumber
+        let e = r
+            .route(
+                "GET",
+                "localhost",
+                "/b1/k1",
+                &[("partNumber".into(), "x".into())],
+                b"",
+            )
+            .unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::InvalidArgument);
+        // ListParts / 桶级 uploads 校验
+        let op = r
+            .route(
+                "GET",
+                "localhost",
+                "/b1/k1",
+                &[("uploadId".into(), "u1".into())],
+                b"",
+            )
+            .unwrap();
+        assert!(matches!(op, Operation::ListParts { upload_id, .. } if upload_id == "u1"));
+        let (b, km, um, mx) = r
+            .route_list_uploads(
+                "localhost",
+                "/b1",
+                &[
+                    ("uploads".into(), "".into()),
+                    ("max-uploads".into(), "5".into()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(b, "b1");
+        assert_eq!(mx, 5);
+        assert!(km.is_none() && um.is_none());
+    }
+
+    #[test]
+    fn copy_source_header_parse() {
+        use crate::xml::parse_copy_source;
+        let cs = parse_copy_source("/b1/k%20x").unwrap();
+        assert_eq!(
+            cs,
+            crate::xml::CopySource {
+                bucket: "b1".into(),
+                key: "k x".into()
+            }
+        );
+        let cs = parse_copy_source("b1/a%2Fb").unwrap();
+        assert_eq!(
+            cs,
+            crate::xml::CopySource {
+                bucket: "b1".into(),
+                key: "a/b".into()
+            }
+        );
+        let cs = parse_copy_source("/b1/%3FversionId").unwrap();
+        assert_eq!(
+            cs,
+            crate::xml::CopySource {
+                bucket: "b1".into(),
+                key: "?versionId".into()
+            }
+        );
+        // versionId 查询 → NotImplemented
+        let e = parse_copy_source("/b1/k?versionId=abc").unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::NotImplemented);
+        // 缺桶 → InvalidArgument
+        let e = parse_copy_source("/k").unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::InvalidArgument);
     }
 
     #[test]

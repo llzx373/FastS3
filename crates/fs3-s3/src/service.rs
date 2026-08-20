@@ -5,7 +5,7 @@
 //! `read_stream_chunk` 逐块拉取(每块上锁,见 fs3-http)。
 
 use std::io::Read;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use fs3_core::{BucketMeta, Error as CoreError};
 use fs3_engine::Engine;
@@ -46,7 +46,9 @@ pub struct ServiceResponse {
 pub enum ResponseBody {
     Empty,
     Bytes(Vec<u8>),
-    /// 对象数据流:HTTP 层按块拉取(range 已裁剪,offset/length 为实际区间)。
+    /// 对象数据流:HTTP 层按块拉取或零拷贝发送(range 已裁剪,
+    /// offset/length 为实际区间;zc_segments 由服务层在同一锁内算好,
+    /// 避免 HTTP 层再次取锁)。
     ObjectStream {
         bucket: String,
         key: String,
@@ -54,6 +56,12 @@ pub enum ResponseBody {
         offset: u64,
         /// 数据长度。
         length: u64,
+        /// 零拷贝数据段(设备偏移+长度;None = 不可用,走块读取)。
+        zc_segments: Option<Vec<fs3_engine::Segment>>,
+        /// 零拷贝 fd(无 O_DIRECT)。
+        zc_fd: Option<i32>,
+        /// 读校验开关(开启时禁零拷贝)。
+        zc_verify: bool,
     },
 }
 
@@ -62,7 +70,7 @@ pub enum ResponseBody {
 pub const BUFFERED_PUT_LIMIT: usize = 8 * 1024 * 1024;
 
 pub struct S3Service {
-    engine: Arc<Mutex<Engine>>,
+    engine: Arc<parking_lot::RwLock<Engine>>,
     auth: Authenticator,
     router: Router,
     allow_anonymous: bool,
@@ -81,7 +89,7 @@ fn header<'a>(req: &'a S3Request, name: &str) -> Option<&'a str> {
 
 impl S3Service {
     pub fn new(
-        engine: Arc<Mutex<Engine>>,
+        engine: Arc<parking_lot::RwLock<Engine>>,
         keys: Vec<Credentials>,
         region: String,
         allow_anonymous: bool,
@@ -102,8 +110,38 @@ impl S3Service {
         }
     }
 
-    pub fn engine(&self) -> &Arc<Mutex<Engine>> {
+    pub fn engine(&self) -> &Arc<parking_lot::RwLock<Engine>> {
         &self.engine
+    }
+
+    /// 对象数据段(设备偏移+长度;内联/空对象 → Some(vec![]);缺失 → None)。
+    /// 零拷贝读路径用(B3/D2)。
+    pub fn object_segments(
+        &self,
+        bucket: &str,
+        key: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<Option<Vec<fs3_engine::Segment>>, S3Error> {
+        let engine = self.engine.read();
+        engine
+            .object_segments(bucket, key, offset, length)
+            .map_err(|e| map_engine_error(e, bucket, key))
+    }
+
+    /// 设备 fd(零拷贝 sendfile/splice)。
+    pub fn device_fd(&self) -> i32 {
+        self.engine.read().device_fd()
+    }
+
+    /// 读校验开关(开启时禁零拷贝,须逐块校验)。
+    pub fn verify_reads_enabled(&self) -> bool {
+        self.engine.read().verify_reads_enabled()
+    }
+
+    /// 零拷贝 fd(无 O_DIRECT;sendfile/splice 用)。
+    pub fn zc_fd(&self) -> Option<i32> {
+        self.engine.read().zc_fd()
     }
 
     fn new_request_id(&self) -> String {
@@ -182,13 +220,56 @@ impl S3Service {
 
     /// 处理非流式请求(小 PUT / XML / 桶操作 / 列表)。
     pub fn handle(&self, req: &S3Request) -> Result<ServiceResponse, S3Error> {
-        let op = self.router.route(
+        let mut op = self.router.route(
             &req.method,
             &req.host,
             &req.decoded_path,
             &req.query,
             &req.body,
         )?;
+        // CopyObject / UploadPartCopy:x-amz-copy-source 头覆盖路由
+        if req.method == "PUT" {
+            if let Some(src) = header(req, "x-amz-copy-source") {
+                let parsed = crate::xml::parse_copy_source(src)?;
+                op = match op {
+                    Operation::UploadPart {
+                        bucket,
+                        key,
+                        part_number,
+                        upload_id,
+                    } => Operation::UploadPartCopy {
+                        bucket,
+                        key,
+                        part_number,
+                        upload_id,
+                        copy_source: parsed,
+                        copy_source_range: header(req, "x-amz-copy-source-range").map(String::from),
+                    },
+                    Operation::PutObject { bucket, key } => Operation::CopyObject {
+                        bucket,
+                        key,
+                        copy_source: parsed,
+                        metadata_directive: header(req, "x-amz-metadata-directive")
+                            .map(|s| s.to_ascii_uppercase()),
+                        copy_source_if_match: header(req, "x-amz-copy-source-if-match")
+                            .map(String::from),
+                        copy_source_if_none_match: header(req, "x-amz-copy-source-if-none-match")
+                            .map(String::from),
+                        copy_source_if_unmodified_since: header(
+                            req,
+                            "x-amz-copy-source-if-unmodified-since",
+                        )
+                        .map(String::from),
+                        copy_source_if_modified_since: header(
+                            req,
+                            "x-amz-copy-source-if-modified-since",
+                        )
+                        .map(String::from),
+                    },
+                    other => other,
+                };
+            }
+        }
         self.require_auth(req)?;
         let mut headers = self.base_headers();
         let resp = match op {
@@ -236,6 +317,100 @@ impl S3Service {
                 max_keys,
                 delimiter.as_deref(),
             )?),
+            Operation::CreateMultipartUpload { bucket, key } => {
+                Ok(self.op_create_multipart_upload(req, &bucket, &key)?)
+            }
+            Operation::UploadPart {
+                bucket,
+                key,
+                part_number,
+                upload_id,
+            } => Ok(self.op_upload_part(req, &bucket, &key, part_number, &upload_id)?),
+            Operation::UploadPartCopy {
+                bucket,
+                key,
+                part_number,
+                upload_id,
+                copy_source,
+                copy_source_range,
+            } => Ok(self.op_upload_part_copy(
+                req,
+                &bucket,
+                &key,
+                part_number,
+                &upload_id,
+                &copy_source,
+                copy_source_range.as_deref(),
+            )?),
+            Operation::CompleteMultipartUpload {
+                bucket,
+                key,
+                upload_id,
+                parts,
+            } => Ok(self.op_complete_multipart_upload(req, &bucket, &key, &upload_id, &parts)?),
+            Operation::AbortMultipartUpload {
+                bucket,
+                key,
+                upload_id,
+            } => Ok(self.op_abort_multipart_upload(req, &bucket, &key, &upload_id)?),
+            Operation::ListMultipartUploads {
+                bucket,
+                prefix,
+                key_marker,
+                upload_id_marker,
+                max_uploads,
+            } => Ok(self.op_list_multipart_uploads(
+                req,
+                &bucket,
+                &prefix,
+                key_marker.as_deref(),
+                upload_id_marker.as_deref(),
+                max_uploads,
+            )?),
+            Operation::ListParts {
+                bucket,
+                key,
+                upload_id,
+                part_number_marker,
+                max_parts,
+            } => Ok(self.op_list_parts(
+                req,
+                &bucket,
+                &key,
+                &upload_id,
+                part_number_marker,
+                max_parts,
+            )?),
+            Operation::GetObjectPart {
+                bucket,
+                key,
+                part_number,
+            } => Ok(self.op_get_object_part(req, &bucket, &key, part_number)?),
+            Operation::HeadObjectPart {
+                bucket,
+                key,
+                part_number,
+            } => Ok(self.op_get_object_part(req, &bucket, &key, part_number)?),
+            Operation::CopyObject {
+                bucket,
+                key,
+                copy_source,
+                metadata_directive,
+                copy_source_if_match,
+                copy_source_if_none_match,
+                copy_source_if_unmodified_since,
+                copy_source_if_modified_since,
+            } => Ok(self.op_copy_object(
+                req,
+                &bucket,
+                &key,
+                &copy_source,
+                metadata_directive.as_deref(),
+                copy_source_if_match.as_deref(),
+                copy_source_if_none_match.as_deref(),
+                copy_source_if_unmodified_since.as_deref(),
+                copy_source_if_modified_since.as_deref(),
+            )?),
             Operation::PutObject { bucket, key } => {
                 Ok(self.op_put_object_buffered(req, &bucket, &key)?)
             }
@@ -274,26 +449,54 @@ impl S3Service {
             &req.query,
             &req.body,
         )?;
-        let (bucket, key) = match op {
-            Operation::PutObject { bucket, key } => (bucket, key),
+        // 流式路径支持:PutObject 与 UploadPart(大分片)
+        enum StreamTarget {
+            Object {
+                bucket: String,
+                key: String,
+            },
+            Part {
+                bucket: String,
+                key: String,
+                part_number: u32,
+                upload_id: String,
+            },
+        }
+        let target = match op {
+            Operation::PutObject { bucket, key } => StreamTarget::Object { bucket, key },
+            Operation::UploadPart {
+                bucket,
+                key,
+                part_number,
+                upload_id,
+            } => StreamTarget::Part {
+                bucket,
+                key,
+                part_number,
+                upload_id,
+            },
             _ => {
                 return Err(S3Error::new(S3ErrorCode::InvalidRequest)
-                    .with_message("streaming path only supports PUT object"))
+                    .with_message("streaming path only supports PUT object / upload part"))
             }
         };
         let _access = self.require_auth(req)?;
 
         // 桶必须存在(AWS:NoSuchBucket)
+        let bucket_name = match &target {
+            StreamTarget::Object { bucket, .. } => bucket.as_str(),
+            StreamTarget::Part { bucket, .. } => bucket.as_str(),
+        };
         {
-            let engine = self.engine.lock().unwrap();
+            let engine = self.engine.write();
             if engine
                 .meta()
-                .get_bucket(&bucket)
-                .map_err(|e| map_engine_error(e, &bucket, ""))?
+                .get_bucket(bucket_name)
+                .map_err(|e| map_engine_error(e, bucket_name, ""))?
                 .is_none()
             {
                 return Err(
-                    S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", &bucket)
+                    S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket_name)
                 );
             }
         }
@@ -312,38 +515,62 @@ impl S3Service {
             AuthOutcome::Anonymous => return Err(S3Error::new(S3ErrorCode::AccessDenied)),
         };
 
-        let mut engine = self.engine.lock().unwrap();
-        let meta = match payload_hash {
+        let mut engine = self.engine.write();
+        // 统一收口:执行写入(对象或分片),返回 (etag, 删除回滚闭包)。
+        let write_once = |engine: &mut Engine,
+                          reader: &mut dyn Read,
+                          content_type: Option<&str>,
+                          user_meta: Vec<(String, String)>|
+         -> Result<[u8; 16], S3Error> {
+            match &target {
+                StreamTarget::Object { bucket, key } => engine
+                    .put_with_meta(bucket, key, reader, content_type, user_meta)
+                    .map(|m| m.etag)
+                    .map_err(|e| map_engine_error(e, bucket, key)),
+                StreamTarget::Part {
+                    bucket,
+                    key,
+                    part_number,
+                    upload_id,
+                } => {
+                    let _ = (bucket, key);
+                    engine
+                        .upload_part(upload_id, *part_number, reader)
+                        .map(|p| p.etag)
+                        .map_err(|e| map_engine_error(e, bucket, key))
+                }
+            }
+        };
+        let rollback = |engine: &mut Engine| {
+            if let StreamTarget::Object { bucket, key } = &target {
+                let _ = engine.delete(bucket, key);
+            }
+        };
+        let etag = match payload_hash {
             PayloadHash::HexSha256(expected) => {
-                // 流式校验:边读边算,PUT 后比对,不匹配删除
+                // 流式校验:边读边算,写后比对,不匹配删除
                 let mut hashing = HashingReader::new(reader);
-                let meta = engine
-                    .put_with_meta(
-                        &bucket,
-                        &key,
-                        &mut hashing,
-                        header(req, "content-type"),
-                        user_meta(req),
-                    )
-                    .map_err(|e| map_engine_error(e, &bucket, &key))?;
+                let etag = write_once(
+                    &mut engine,
+                    &mut hashing,
+                    header(req, "content-type"),
+                    user_meta(req),
+                )?;
                 let actual = hex::encode(hashing.finalize());
                 if !actual.eq_ignore_ascii_case(&expected) {
-                    let _ = engine.delete(&bucket, &key);
+                    rollback(&mut engine);
                     return Err(S3Error::new(S3ErrorCode::BadDigest).with_message(
                         "The Content-SHA256 you specified did not match what we received.",
                     ));
                 }
-                meta
+                etag
             }
-            PayloadHash::Unsigned => engine
-                .put_with_meta(
-                    &bucket,
-                    &key,
-                    reader,
-                    header(req, "content-type"),
-                    user_meta(req),
-                )
-                .map_err(|e| map_engine_error(e, &bucket, &key))?,
+            PayloadHash::Unsigned => write_once(
+                &mut engine,
+                reader,
+                header(req, "content-type"),
+                user_meta(req),
+            )?,
             PayloadHash::Streaming => {
                 // aws-chunked:逐 chunk 校验签名后解码为原始流
                 let date = &amz_date[0..8];
@@ -356,16 +583,12 @@ impl S3Service {
                     seed_sig.as_deref().unwrap_or_default(),
                     &amz_date,
                 );
-                let meta = engine
-                    .put_with_meta(
-                        &bucket,
-                        &key,
-                        &mut chunked,
-                        header(req, "content-type"),
-                        user_meta(req),
-                    )
-                    .map_err(|e| map_engine_error(e, &bucket, &key))?;
-                meta
+                write_once(
+                    &mut engine,
+                    &mut chunked,
+                    header(req, "content-type"),
+                    user_meta(req),
+                )?
             }
         };
 
@@ -374,8 +597,8 @@ impl S3Service {
             let expected =
                 base64::Engine::decode(&base64::engine::general_purpose::STANDARD, md5_b64)
                     .map_err(|_| S3Error::new(S3ErrorCode::InvalidDigest))?;
-            if expected != meta.etag {
-                let _ = engine.delete(&bucket, &key);
+            if expected != etag {
+                rollback(&mut engine);
                 return Err(S3Error::new(S3ErrorCode::BadDigest).with_message(
                     "The Content-MD5 you specified did not match what we received.",
                 ));
@@ -383,7 +606,7 @@ impl S3Service {
         }
 
         let mut headers = self.base_headers();
-        headers.push(("ETag".into(), format!("\"{}\"", meta.etag_hex())));
+        headers.push(("ETag".into(), format!("\"{}\"", hex::encode(etag))));
         Ok(ServiceResponse {
             status: 200,
             headers,
@@ -405,7 +628,7 @@ impl S3Service {
             return Ok(0);
         }
         let want = ((length - *pos) as usize).min(buf.len());
-        let mut engine = self.engine.lock().unwrap();
+        let mut engine = self.engine.write();
         engine
             .read_at(bucket, key, offset + *pos, &mut buf[..want])
             .map(|n| {
@@ -417,7 +640,7 @@ impl S3Service {
 
     /// 对象大小(流头部计算 Content-Length 用)。
     pub fn object_size(&self, bucket: &str, key: &str) -> Result<u64, S3Error> {
-        let engine = self.engine.lock().unwrap();
+        let engine = self.engine.write();
         match engine
             .head(bucket, key)
             .map_err(|e| map_engine_error(e, bucket, key))?
@@ -430,7 +653,7 @@ impl S3Service {
     // ─────────────────────────── 桶操作 ───────────────────────────
 
     fn op_list_buckets(&self) -> ServiceResponse {
-        let engine = self.engine.lock().unwrap();
+        let engine = self.engine.read();
         let buckets = engine.list_buckets().unwrap_or_default();
         let owner = "fasts3";
         let xml = xml::render_list_buckets(owner, &buckets);
@@ -458,7 +681,7 @@ impl S3Service {
                     )));
             }
         }
-        let engine = self.engine.lock().unwrap();
+        let engine = self.engine.write();
         if engine
             .meta()
             .get_bucket(bucket)
@@ -487,7 +710,7 @@ impl S3Service {
     }
 
     fn op_delete_bucket(&self, bucket: &str) -> Result<ServiceResponse, S3Error> {
-        let engine = self.engine.lock().unwrap();
+        let engine = self.engine.write();
         if engine
             .meta()
             .get_bucket(bucket)
@@ -514,7 +737,7 @@ impl S3Service {
     }
 
     fn op_head_bucket(&self, bucket: &str) -> Result<ServiceResponse, S3Error> {
-        let engine = self.engine.lock().unwrap();
+        let engine = self.engine.read();
         match engine
             .meta()
             .get_bucket(bucket)
@@ -530,7 +753,7 @@ impl S3Service {
     }
 
     fn op_get_bucket_location(&self, bucket: &str) -> Result<ServiceResponse, S3Error> {
-        let engine = self.engine.lock().unwrap();
+        let engine = self.engine.read();
         if engine
             .meta()
             .get_bucket(bucket)
@@ -551,7 +774,7 @@ impl S3Service {
     }
 
     fn op_get_bucket_versioning(&self, bucket: &str) -> Result<ServiceResponse, S3Error> {
-        let engine = self.engine.lock().unwrap();
+        let engine = self.engine.read();
         if engine
             .meta()
             .get_bucket(bucket)
@@ -581,7 +804,7 @@ impl S3Service {
         key_marker: &str,
         max_keys: u32,
     ) -> Result<ServiceResponse, S3Error> {
-        let engine = self.engine.lock().unwrap();
+        let engine = self.engine.read();
         if engine
             .meta()
             .get_bucket(bucket)
@@ -631,7 +854,7 @@ impl S3Service {
         max_keys: u32,
         delimiter: Option<&str>,
     ) -> Result<ServiceResponse, S3Error> {
-        let engine = self.engine.lock().unwrap();
+        let engine = self.engine.read();
         if engine
             .meta()
             .get_bucket(bucket)
@@ -689,7 +912,7 @@ impl S3Service {
         max_keys: u32,
         delimiter: Option<&str>,
     ) -> Result<ServiceResponse, S3Error> {
-        let engine = self.engine.lock().unwrap();
+        let engine = self.engine.read();
         if engine
             .meta()
             .get_bucket(bucket)
@@ -814,7 +1037,7 @@ impl S3Service {
 
         // 桶必须存在(AWS:NoSuchBucket;引擎报 NotFound 会被映射成 NoSuchKey)
         {
-            let engine = self.engine.lock().unwrap();
+            let engine = self.engine.write();
             if engine
                 .meta()
                 .get_bucket(bucket)
@@ -827,7 +1050,7 @@ impl S3Service {
             }
         }
 
-        let mut engine = self.engine.lock().unwrap();
+        let mut engine = self.engine.write();
         let meta = engine
             .put_with_meta(
                 bucket,
@@ -844,7 +1067,7 @@ impl S3Service {
         }
         Ok(ServiceResponse {
             status: 200,
-            headers: vec![("ETag".into(), format!("\"{}\"", meta.etag_hex()))],
+            headers: vec![("ETag".into(), format!("\"{}\"", meta.etag_full()))],
             body: ResponseBody::Empty,
         })
     }
@@ -856,7 +1079,7 @@ impl S3Service {
         key: &str,
         head_only: bool,
     ) -> Result<ServiceResponse, S3Error> {
-        let engine = self.engine.lock().unwrap();
+        let engine = self.engine.read();
         if engine
             .meta()
             .get_bucket(bucket)
@@ -876,7 +1099,7 @@ impl S3Service {
         // 条件头:先 412 组,后 304 组(AWS 顺序)
         if let Some(etag) = header(req, "if-match") {
             let etag = etag.trim().trim_matches('"').to_string();
-            if etag != "*" && etag != meta.etag_hex() {
+            if etag != "*" && etag != meta.etag_full() {
                 return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
             }
         }
@@ -889,7 +1112,7 @@ impl S3Service {
         }
         if let Some(etag) = header(req, "if-none-match") {
             let etag = etag.trim().trim_matches('"').to_string();
-            if etag == "*" || etag == meta.etag_hex() {
+            if etag == "*" || etag == meta.etag_full() {
                 return Err(S3Error::new(S3ErrorCode::NotModified));
             }
         }
@@ -926,8 +1149,8 @@ impl S3Service {
                 }
             }
         }
-        if start >= meta.size {
-            // 空对象 + 非 suffix range → 416
+        if start >= meta.size && is_range {
+            // 空对象(或 range 起点越界)+ 显式 range → 416
             let mut headers = self.base_headers();
             headers.push(("Content-Range".into(), format!("bytes */{}", meta.size)));
             return Err(S3Error::new(S3ErrorCode::InvalidRange)
@@ -937,7 +1160,7 @@ impl S3Service {
 
         let mut headers = Vec::new();
         headers.push(("Content-Type".into(), meta.content_type.clone()));
-        headers.push(("ETag".into(), format!("\"{}\"", meta.etag_hex())));
+        headers.push(("ETag".into(), format!("\"{}\"", meta.etag_full())));
         headers.push(("Last-Modified".into(), xml::http_date(meta.mtime)));
         headers.push(("Accept-Ranges".into(), "bytes".into()));
         headers.push(("Content-Length".into(), content_length.to_string()));
@@ -960,6 +1183,13 @@ impl S3Service {
             });
         }
 
+        // 零拷贝段(同一锁内算好,避免 HTTP 层重复取锁)
+        let zc_segments = engine
+            .object_segments(bucket, key, start, content_length)
+            .ok()
+            .flatten();
+        let zc_fd = engine.zc_fd();
+        let zc_verify = engine.verify_reads_enabled();
         Ok(ServiceResponse {
             status: if is_range { 206 } else { 200 },
             headers,
@@ -968,13 +1198,16 @@ impl S3Service {
                 key: key.to_string(),
                 offset: start,
                 length: content_length,
+                zc_segments,
+                zc_fd,
+                zc_verify,
             },
         })
     }
 
     /// GetObjectAcl(M1:对象私有默认 ACL,owner 全权)。
     fn op_get_object_acl(&self, bucket: &str, key: &str) -> Result<ServiceResponse, S3Error> {
-        let engine = self.engine.lock().unwrap();
+        let engine = self.engine.read();
         if engine
             .meta()
             .get_bucket(bucket)
@@ -1001,8 +1234,505 @@ impl S3Service {
         })
     }
 
+    // ─────────────────────────── multipart(F5) ───────────────────────────
+
+    fn op_create_multipart_upload(
+        &self,
+        req: &S3Request,
+        bucket: &str,
+        key: &str,
+    ) -> Result<ServiceResponse, S3Error> {
+        let mut engine = self.engine.write();
+        if engine
+            .meta()
+            .get_bucket(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?
+            .is_none()
+        {
+            return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
+        }
+        // 惰性过期回收(每次创建顺带扫一遍,成本可忽略的规模)
+        let _ = engine.sweep_expired_sessions(fs3_core::MULTIPART_TTL_SECS);
+        let uid = engine
+            .create_multipart(bucket, key, header(req, "content-type"), user_meta(req))
+            .map_err(|e| map_engine_error(e, bucket, key))?;
+        let xml = xml::render_initiate_multipart(bucket, key, &uid);
+        Ok(ServiceResponse {
+            status: 200,
+            headers: vec![
+                ("Content-Type".into(), "application/xml".into()),
+                ("Content-Length".into(), xml.len().to_string()),
+            ],
+            body: ResponseBody::Bytes(xml.into_bytes()),
+        })
+    }
+
+    /// 缓冲分片上传(小分片;大分片走 put_object_stream)。
+    fn op_upload_part(
+        &self,
+        req: &S3Request,
+        bucket: &str,
+        key: &str,
+        part_number: u32,
+        upload_id: &str,
+    ) -> Result<ServiceResponse, S3Error> {
+        let mut engine = self.engine.write();
+        if engine
+            .meta()
+            .get_bucket(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?
+            .is_none()
+        {
+            return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
+        }
+        let part = engine
+            .upload_part(
+                upload_id,
+                part_number,
+                &mut std::io::Cursor::new(req.body.clone()),
+            )
+            .map_err(|e| map_engine_error(e, bucket, key))?;
+        Ok(ServiceResponse {
+            status: 200,
+            headers: vec![("ETag".into(), format!("\"{}\"", part.etag_hex()))],
+            body: ResponseBody::Empty,
+        })
+    }
+
+    /// UploadPartCopy:源对象 range 直灌分片(F6 引擎级零缓冲)。
+    #[allow(clippy::too_many_arguments)]
+    fn op_upload_part_copy(
+        &self,
+        _req: &S3Request,
+        bucket: &str,
+        _key: &str,
+        part_number: u32,
+        upload_id: &str,
+        copy_source: &xml::CopySource,
+        copy_source_range: Option<&str>,
+    ) -> Result<ServiceResponse, S3Error> {
+        let mut engine = self.engine.write();
+        if engine
+            .meta()
+            .get_bucket(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?
+            .is_none()
+        {
+            return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
+        }
+        if engine
+            .meta()
+            .get_bucket(&copy_source.bucket)
+            .map_err(|e| map_engine_error(e, &copy_source.bucket, ""))?
+            .is_none()
+        {
+            return Err(S3Error::new(S3ErrorCode::NoSuchBucket)
+                .with_extra("BucketName", &copy_source.bucket));
+        }
+        // 源大小(范围校验用)
+        let src_meta = engine
+            .head(&copy_source.bucket, &copy_source.key)
+            .map_err(|e| map_engine_error(e, &copy_source.bucket, &copy_source.key))?
+            .ok_or_else(|| {
+                S3Error::new(S3ErrorCode::NoSuchKey).with_extra("Key", &copy_source.key)
+            })?;
+        let range = match copy_source_range {
+            Some(r) => parse_copy_range(r, src_meta.size)?,
+            None => 0..src_meta.size,
+        };
+        let part = engine
+            .upload_part_copy(
+                upload_id,
+                part_number,
+                &copy_source.bucket,
+                &copy_source.key,
+                range,
+            )
+            .map_err(|e| map_engine_error(e, &copy_source.bucket, &copy_source.key))?;
+        let xml = xml::render_copy_part(&part.etag_hex(), &xml::ts_to_rfc3339(part.mtime));
+        Ok(ServiceResponse {
+            status: 200,
+            headers: vec![
+                ("Content-Type".into(), "application/xml".into()),
+                ("Content-Length".into(), xml.len().to_string()),
+            ],
+            body: ResponseBody::Bytes(xml.into_bytes()),
+        })
+    }
+
+    fn op_complete_multipart_upload(
+        &self,
+        req: &S3Request,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        parts: &[(u32, String)],
+    ) -> Result<ServiceResponse, S3Error> {
+        if parts.is_empty() {
+            // AWS:空分片列表 → MalformedXML(400)
+            return Err(S3Error::new(S3ErrorCode::MalformedXML)
+                .with_message("The XML you provided was not well-formed or did not validate against our published schema"));
+        }
+        let mut engine = self.engine.write();
+        let meta = engine
+            .complete_multipart(bucket, key, upload_id, parts)
+            .map_err(|e| map_engine_error(e, bucket, key))?;
+        let xml = xml::render_complete_multipart(
+            &format!("http://{}/{}/{}", req.host, bucket, key),
+            bucket,
+            key,
+            &format!("\"{}\"", meta.etag_full()),
+        );
+        Ok(ServiceResponse {
+            status: 200,
+            headers: vec![
+                ("Content-Type".into(), "application/xml".into()),
+                ("Content-Length".into(), xml.len().to_string()),
+                ("ETag".into(), format!("\"{}\"", meta.etag_full())),
+            ],
+            body: ResponseBody::Bytes(xml.into_bytes()),
+        })
+    }
+
+    fn op_abort_multipart_upload(
+        &self,
+        req: &S3Request,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<ServiceResponse, S3Error> {
+        let _ = (req, key);
+        let mut engine = self.engine.write();
+        engine
+            .abort_multipart(upload_id)
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        Ok(ServiceResponse {
+            status: 204,
+            headers: vec![],
+            body: ResponseBody::Empty,
+        })
+    }
+
+    fn op_list_multipart_uploads(
+        &self,
+        req: &S3Request,
+        bucket: &str,
+        prefix: &str,
+        key_marker: Option<&str>,
+        upload_id_marker: Option<&str>,
+        max_uploads: u32,
+    ) -> Result<ServiceResponse, S3Error> {
+        let _ = req;
+        let engine = self.engine.read();
+        if engine
+            .meta()
+            .get_bucket(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?
+            .is_none()
+        {
+            return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
+        }
+        let max = (max_uploads.min(1000)) as usize;
+        let uploads = engine
+            .list_multipart_uploads(bucket, prefix, key_marker, upload_id_marker, max)
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        let truncated = uploads.len() == max;
+        let (next_key, next_uid) = if truncated {
+            uploads
+                .last()
+                .map(|(uid, s)| (Some(s.key.clone()), Some(uid.clone())))
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
+        let items: Vec<(String, String, i64)> = uploads
+            .into_iter()
+            .map(|(uid, s)| (s.key, uid, s.created))
+            .collect();
+        let xml = xml::render_list_multipart_uploads(
+            bucket,
+            prefix,
+            key_marker,
+            upload_id_marker,
+            max_uploads.min(1000),
+            &self.owner,
+            &items,
+            truncated,
+            next_key.as_deref(),
+            next_uid.as_deref(),
+        );
+        Ok(ServiceResponse {
+            status: 200,
+            headers: vec![
+                ("Content-Type".into(), "application/xml".into()),
+                ("Content-Length".into(), xml.len().to_string()),
+            ],
+            body: ResponseBody::Bytes(xml.into_bytes()),
+        })
+    }
+
+    fn op_list_parts(
+        &self,
+        req: &S3Request,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number_marker: Option<u32>,
+        max_parts: u32,
+    ) -> Result<ServiceResponse, S3Error> {
+        let _ = (req, key);
+        let engine = self.engine.read();
+        if engine
+            .meta()
+            .get_bucket(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?
+            .is_none()
+        {
+            return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
+        }
+        if engine
+            .meta()
+            .get_multipart(upload_id)
+            .map_err(|e| map_engine_error(e, bucket, ""))?
+            .is_none()
+        {
+            return Err(S3Error::new(S3ErrorCode::NoSuchUpload).with_extra("UploadId", upload_id));
+        }
+        let max = max_parts.min(1000) as usize;
+        let all = engine
+            .list_parts(upload_id)
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        let iter = all.iter().filter(|(no, _)| match part_number_marker {
+            Some(m) => *no > m,
+            None => true,
+        });
+        let filtered: Vec<(u32, u64, String, i64)> = iter
+            .map(|(no, p)| (*no, p.size, format!("\"{}\"", p.etag_hex()), p.mtime))
+            .collect();
+        let truncated = filtered.len() > max;
+        let page: Vec<(u32, u64, String, i64)> = filtered.into_iter().take(max).collect();
+        let next = if truncated {
+            page.last().map(|(no, ..)| *no)
+        } else {
+            None
+        };
+        let xml = xml::render_list_parts(
+            bucket,
+            key,
+            upload_id,
+            part_number_marker,
+            max_parts.min(1000),
+            &page,
+            truncated,
+            next,
+        );
+        Ok(ServiceResponse {
+            status: 200,
+            headers: vec![
+                ("Content-Type".into(), "application/xml".into()),
+                ("Content-Length".into(), xml.len().to_string()),
+            ],
+            body: ResponseBody::Bytes(xml.into_bytes()),
+        })
+    }
+
+    /// GET/HEAD ?partNumber:返回分片数据(响应带 x-amz-mp-parts-count)。
+    fn op_get_object_part(
+        &self,
+        req: &S3Request,
+        bucket: &str,
+        key: &str,
+        part_number: u32,
+    ) -> Result<ServiceResponse, S3Error> {
+        let engine = self.engine.read();
+        if engine
+            .meta()
+            .get_bucket(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?
+            .is_none()
+        {
+            return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
+        }
+        let meta = match engine
+            .head(bucket, key)
+            .map_err(|e| map_engine_error(e, bucket, key))?
+        {
+            Some(m) => m,
+            None => return Err(S3Error::new(S3ErrorCode::NoSuchKey).with_extra("Key", key)),
+        };
+        let part_count = meta.parts.len() as u32;
+        let (start, length) = if meta.parts.is_empty() {
+            // 非 multipart 对象:PartNumber=1 返回整个对象,>1 → InvalidPart
+            if part_number != 1 {
+                return Err(S3Error::new(S3ErrorCode::InvalidPart)
+                    .with_message("The requested partnumber is not satisfiable"));
+            }
+            (0u64, meta.size)
+        } else if part_number as usize > meta.parts.len() {
+            return Err(S3Error::new(S3ErrorCode::InvalidPart)
+                .with_message("The requested partnumber is not satisfiable"));
+        } else {
+            let before: u64 = meta.parts[..part_number as usize - 1].iter().sum();
+            (before, meta.parts[part_number as usize - 1])
+        };
+        let head_only = req.method == "HEAD";
+        let mut headers = self.base_headers();
+        headers.push(("ETag".into(), format!("\"{}\"", meta.etag_full())));
+        headers.push(("x-amz-mp-parts-count".into(), part_count.to_string()));
+        headers.push(("Content-Type".into(), meta.content_type.clone()));
+        headers.push(("Last-Modified".into(), xml::http_date(meta.mtime)));
+        headers.push(("Content-Length".into(), length.to_string()));
+        if length == 0 {
+            return Ok(ServiceResponse {
+                status: 200,
+                headers,
+                body: ResponseBody::Empty,
+            });
+        }
+        if head_only {
+            return Ok(ServiceResponse {
+                status: 200,
+                headers,
+                body: ResponseBody::Empty,
+            });
+        }
+        let zc_segments = engine
+            .object_segments(bucket, key, start, length)
+            .ok()
+            .flatten();
+        let zc_fd = engine.zc_fd();
+        let zc_verify = engine.verify_reads_enabled();
+        Ok(ServiceResponse {
+            status: 200,
+            headers,
+            body: ResponseBody::ObjectStream {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                offset: start,
+                length,
+                zc_segments,
+                zc_fd,
+                zc_verify,
+            },
+        })
+    }
+
+    // ─────────────────────────── CopyObject(F6) ───────────────────────────
+
+    #[allow(clippy::too_many_arguments)]
+    fn op_copy_object(
+        &self,
+        req: &S3Request,
+        bucket: &str,
+        key: &str,
+        copy_source: &xml::CopySource,
+        metadata_directive: Option<&str>,
+        if_match: Option<&str>,
+        if_none_match: Option<&str>,
+        if_unmodified_since: Option<&str>,
+        if_modified_since: Option<&str>,
+    ) -> Result<ServiceResponse, S3Error> {
+        let directive = match metadata_directive {
+            None | Some("COPY") => "COPY",
+            Some("REPLACE") => "REPLACE",
+            Some(other) => {
+                return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                    .with_message(format!("Unknown metadata directive: {other}")))
+            }
+        };
+        // 复制到自身:必须 REPLACE(否则 InvalidRequest)
+        if directive == "COPY" && copy_source.bucket == bucket && copy_source.key == key {
+            return Err(S3Error::new(S3ErrorCode::InvalidRequest)
+                .with_message("This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes."));
+        }
+        let mut engine = self.engine.write();
+        if engine
+            .meta()
+            .get_bucket(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?
+            .is_none()
+        {
+            return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
+        }
+        if engine
+            .meta()
+            .get_bucket(&copy_source.bucket)
+            .map_err(|e| map_engine_error(e, &copy_source.bucket, ""))?
+            .is_none()
+        {
+            return Err(S3Error::new(S3ErrorCode::NoSuchBucket)
+                .with_extra("BucketName", &copy_source.bucket));
+        }
+        let src_meta = engine
+            .head(&copy_source.bucket, &copy_source.key)
+            .map_err(|e| map_engine_error(e, &copy_source.bucket, &copy_source.key))?
+            .ok_or_else(|| {
+                S3Error::new(S3ErrorCode::NoSuchKey).with_extra("Key", &copy_source.key)
+            })?;
+        // 复制条件头(412 PreconditionFailed)
+        if let Some(em) = if_match {
+            if !etag_matches(&src_meta.etag_full(), em) {
+                return Err(S3Error::new(S3ErrorCode::PreconditionFailed).with_message(
+                    "At least one of the pre-conditions you specified did not hold",
+                ));
+            }
+        }
+        if let Some(enm) = if_none_match {
+            if etag_matches(&src_meta.etag_full(), enm) {
+                return Err(S3Error::new(S3ErrorCode::PreconditionFailed).with_message(
+                    "At least one of the pre-conditions you specified did not hold",
+                ));
+            }
+        }
+        if let Some(us) = if_unmodified_since {
+            if let Some(t) = parse_http_date(us) {
+                if src_meta.mtime > t {
+                    return Err(S3Error::new(S3ErrorCode::PreconditionFailed).with_message(
+                        "At least one of the pre-conditions you specified did not hold",
+                    ));
+                }
+            }
+        }
+        if let Some(ms) = if_modified_since {
+            if let Some(t) = parse_http_date(ms) {
+                if src_meta.mtime <= t {
+                    return Err(S3Error::new(S3ErrorCode::PreconditionFailed).with_message(
+                        "At least one of the pre-conditions you specified did not hold",
+                    ));
+                }
+            }
+        }
+        let (ct, um) = if directive == "REPLACE" {
+            (
+                Some(header(req, "content-type").unwrap_or("application/octet-stream")),
+                Some(user_meta(req)),
+            )
+        } else {
+            (None, None)
+        };
+        let meta = engine
+            .copy_object(
+                &copy_source.bucket,
+                &copy_source.key,
+                bucket,
+                key,
+                ct,
+                um.as_deref(),
+            )
+            .map_err(|e| map_engine_error(e, &copy_source.bucket, &copy_source.key))?;
+        let xml = xml::render_copy_object(&meta.etag_full(), &xml::ts_to_rfc3339(meta.mtime));
+        Ok(ServiceResponse {
+            status: 200,
+            headers: vec![
+                ("Content-Type".into(), "application/xml".into()),
+                ("Content-Length".into(), xml.len().to_string()),
+            ],
+            body: ResponseBody::Bytes(xml.into_bytes()),
+        })
+    }
+
     fn op_delete_object(&self, bucket: &str, key: &str) -> Result<ServiceResponse, S3Error> {
-        let mut engine = self.engine.lock().unwrap();
+        let mut engine = self.engine.write();
         // S3 语义:删除不存在的对象返回 204(幂等)
         let _ = engine
             .delete(bucket, key)
@@ -1020,7 +1750,7 @@ impl S3Service {
         quiet: bool,
         keys: &[(String, Option<String>)],
     ) -> Result<ServiceResponse, S3Error> {
-        let mut engine = self.engine.lock().unwrap();
+        let mut engine = self.engine.write();
         if engine
             .meta()
             .get_bucket(bucket)
@@ -1103,6 +1833,40 @@ fn rand_hex() -> u64 {
 }
 
 /// 收集 x-amz-meta-* 自定义元数据头。
+/// 解析 CopySourceRange:`bytes=start-end`(闭区间)。格式错误 → InvalidArgument;
+/// 越界/起点在末尾之后 → InvalidRange(s3-tests 允许 400/416)。
+fn parse_copy_range(raw: &str, src_size: u64) -> Result<std::ops::Range<u64>, S3Error> {
+    let body = raw.strip_prefix("bytes=").ok_or_else(|| {
+        S3Error::new(S3ErrorCode::InvalidArgument).with_message("Invalid copy source range")
+    })?;
+    let (s, e) = body.split_once('-').ok_or_else(|| {
+        S3Error::new(S3ErrorCode::InvalidArgument).with_message("Invalid copy source range")
+    })?;
+    if s.is_empty() || e.is_empty() {
+        return Err(
+            S3Error::new(S3ErrorCode::InvalidArgument).with_message("Invalid copy source range")
+        );
+    }
+    let start: u64 = s.parse().map_err(|_| {
+        S3Error::new(S3ErrorCode::InvalidArgument).with_message("Invalid copy source range")
+    })?;
+    let end: u64 = e.parse().map_err(|_| {
+        S3Error::new(S3ErrorCode::InvalidArgument).with_message("Invalid copy source range")
+    })?;
+    // AWS:结束偏移(闭区间)越界 → InvalidRange
+    if start > end || start >= src_size || end >= src_size {
+        return Err(S3Error::new(S3ErrorCode::InvalidRange)
+            .with_message("The requested range is not satisfiable"));
+    }
+    Ok(start..(end + 1).min(src_size))
+}
+
+/// ETag 条件头匹配(去引号;`*` 通配)。
+fn etag_matches(actual_hex: &str, header_value: &str) -> bool {
+    let h = header_value.trim().trim_matches('"');
+    h == "*" || h.eq_ignore_ascii_case(actual_hex)
+}
+
 fn user_meta(req: &S3Request) -> Vec<(String, String)> {
     req.headers
         .iter()
@@ -1235,6 +1999,7 @@ fn parse_http_date(s: &str) -> Option<i64> {
 }
 
 /// 引擎错误 → S3 错误。
+/// 解析 HTTP-date(IMF-fixdate / RFC 850 / asctime)→ Unix 秒。
 fn map_engine_error(e: CoreError, bucket: &str, key: &str) -> S3Error {
     match e {
         CoreError::NotFound(msg) => {
@@ -1249,6 +2014,14 @@ fn map_engine_error(e: CoreError, bucket: &str, key: &str) -> S3Error {
         CoreError::NoSpace => S3Error::new(S3ErrorCode::InternalError)
             .with_message("We encountered an internal error. Please try again."),
         CoreError::InvalidArgument(m) => S3Error::new(S3ErrorCode::InvalidArgument).with_message(m),
+        CoreError::InvalidPart(m) => S3Error::new(S3ErrorCode::InvalidPart).with_message(m),
+        CoreError::InvalidPartOrder(m) => {
+            S3Error::new(S3ErrorCode::InvalidPartOrder).with_message(m)
+        }
+        CoreError::PartTooSmall(m) => S3Error::new(S3ErrorCode::EntityTooSmall).with_message(m),
+        CoreError::NoSuchUpload(m) => {
+            S3Error::new(S3ErrorCode::NoSuchUpload).with_extra("UploadId", &m)
+        }
         other => {
             S3Error::new(S3ErrorCode::InternalError).with_message(format!("engine error: {other}"))
         }

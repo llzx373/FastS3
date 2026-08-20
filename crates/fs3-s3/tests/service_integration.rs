@@ -18,7 +18,7 @@ fn setup() -> (tempfile::TempDir, S3Service) {
         meta_dir: dir.path().join("meta"),
         ..Default::default()
     };
-    let engine = Arc::new(std::sync::Mutex::new(Engine::open(&cfg).unwrap()));
+    let engine = Arc::new(parking_lot::RwLock::new(Engine::open(&cfg).unwrap()));
     let svc = S3Service::new(
         engine,
         vec![Credentials {
@@ -529,6 +529,306 @@ fn acl_and_list_owner() {
     // PutObjectAcl → NotImplemented
     let r = svc.handle(&req_q("PUT", "/bkt1/k1", &[("acl", "")], vec![]));
     assert_eq!(err_code(&r), "NotImplemented");
+}
+
+#[test]
+fn multipart_flow_over_service() {
+    let (_d, svc) = setup();
+    svc.handle(&req("PUT", "/bkt1", vec![])).unwrap();
+
+    // CreateMultipartUpload
+    let mut rq = req("POST", "/bkt1/k1", vec![]);
+    rq.query = vec![("uploads".into(), "".into())];
+    rq.headers = sign_headers("POST", "/bkt1/k1", &rq.query, b"");
+    let r = svc.handle(&rq).unwrap();
+    let xml = match r.body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!(),
+    };
+    assert!(xml.contains("<UploadId>"), "{xml}");
+    let uid = xml
+        .split("<UploadId>")
+        .nth(1)
+        .unwrap()
+        .split("</UploadId>")
+        .next()
+        .unwrap()
+        .to_string();
+
+    // 分片 1(5MiB,extent)+ 分片 2(小,内联)
+    let body = vec![0x41u8; 5 * 1024 * 1024];
+    let rq = req_q(
+        "PUT",
+        "/bkt1/k1",
+        &[("partNumber", "1"), ("uploadId", &uid)],
+        body.clone(),
+    );
+    let r = svc.handle(&rq).unwrap();
+    let etag1 = r
+        .headers
+        .iter()
+        .find(|(k, _)| k == "ETag")
+        .unwrap()
+        .1
+        .clone();
+    let rq = req_q(
+        "PUT",
+        "/bkt1/k1",
+        &[("partNumber", "2"), ("uploadId", &uid)],
+        vec![0x42u8; 50],
+    );
+    let r = svc.handle(&rq).unwrap();
+    let etag2 = r
+        .headers
+        .iter()
+        .find(|(k, _)| k == "ETag")
+        .unwrap()
+        .1
+        .clone();
+
+    // ListParts
+    let rq = req_q("GET", "/bkt1/k1", &[("uploadId", &uid)], vec![]);
+    let r = svc.handle(&rq).unwrap();
+    let xml = match r.body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!(),
+    };
+    assert!(
+        xml.contains("<PartNumber>1</PartNumber>") && xml.contains("<PartNumber>2</PartNumber>"),
+        "{xml}"
+    );
+
+    // Complete(混合内联分片 → 数据组合路径)
+    let body = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag1}</ETag></Part>\
+         <Part><PartNumber>2</PartNumber><ETag>{etag2}</ETag></Part></CompleteMultipartUpload>"
+    )
+    .into_bytes();
+    let rq = req_q("POST", "/bkt1/k1", &[("uploadId", &uid)], body);
+    let r = svc.handle(&rq).unwrap();
+    let xml = match r.body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!(),
+    };
+    assert!(xml.contains("<CompleteMultipartUploadResult"), "{xml}");
+    let etag_full = xml
+        .split("<ETag>")
+        .nth(1)
+        .unwrap()
+        .split("</ETag>")
+        .next()
+        .unwrap()
+        .replace("&quot;", "\"")
+        .to_string();
+    assert!(etag_full.ends_with("-2\""), "{etag_full}");
+
+    // 内容校验
+    let r = svc.handle(&req("GET", "/bkt1/k1", vec![])).unwrap();
+    match r.body {
+        ResponseBody::ObjectStream { length, .. } => assert_eq!(length, 5 * 1024 * 1024 + 50),
+        _ => panic!(),
+    }
+    // PartNumber GET
+    let rq = req_q("GET", "/bkt1/k1", &[("partNumber", "1")], vec![]);
+    let r = svc.handle(&rq).unwrap();
+    assert_eq!(
+        r.headers
+            .iter()
+            .find(|(k, _)| k == "x-amz-mp-parts-count")
+            .unwrap()
+            .1,
+        "2"
+    );
+    match r.body {
+        ResponseBody::ObjectStream { length, .. } => assert_eq!(length, 5 * 1024 * 1024),
+        _ => panic!(),
+    }
+    // 越界 part → InvalidPart
+    let rq = req_q("GET", "/bkt1/k1", &[("partNumber", "9")], vec![]);
+    let r = svc.handle(&rq);
+    assert_eq!(err_code(&r), "InvalidPart");
+
+    // 二次 Complete 幂等
+    let body = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag1}</ETag></Part>\
+         <Part><PartNumber>2</PartNumber><ETag>{etag2}</ETag></Part></CompleteMultipartUpload>"
+    )
+    .into_bytes();
+    let rq = req_q("POST", "/bkt1/k1", &[("uploadId", &uid)], body);
+    let r = svc.handle(&rq).unwrap();
+    let xml = match r.body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!(),
+    };
+    assert!(xml.contains(&etag_full.replace('\"', "&quot;")), "{xml}");
+
+    // Abort 未知 → NoSuchUpload
+    let r = svc.handle(&req_q(
+        "DELETE",
+        "/bkt1/k1",
+        &[("uploadId", "nope")],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "NoSuchUpload");
+}
+
+#[test]
+fn multipart_errors_and_abort() {
+    let (_d, svc) = setup();
+    svc.handle(&req("PUT", "/bkt1", vec![])).unwrap();
+    // complete without create → NoSuchUpload(404)
+    let body = b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>x</ETag></Part></CompleteMultipartUpload>".to_vec();
+    let r = svc.handle(&req_q("POST", "/bkt1/k1", &[("uploadId", "abc")], body));
+    assert_eq!(err_code(&r), "NoSuchUpload");
+    // 空 parts → MalformedXML(400)(会话存在时)
+    let mut rq = req("POST", "/bkt1/emptyparts", vec![]);
+    rq.query = vec![("uploads".into(), "".into())];
+    rq.headers = sign_headers("POST", "/bkt1/emptyparts", &rq.query, b"");
+    let r = svc.handle(&rq).unwrap();
+    let xml = match r.body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!(),
+    };
+    let uid2 = xml
+        .split("<UploadId>")
+        .nth(1)
+        .unwrap()
+        .split("</UploadId>")
+        .next()
+        .unwrap()
+        .to_string();
+    let r = svc.handle(&req_q(
+        "POST",
+        "/bkt1/emptyparts",
+        &[("uploadId", &uid2)],
+        b"<CompleteMultipartUpload></CompleteMultipartUpload>".to_vec(),
+    ));
+    assert_eq!(err_code(&r), "MalformedXML");
+    // 创建 + 上传 + abort
+    let mut rq = req("POST", "/bkt1/k1", vec![]);
+    rq.query = vec![("uploads".into(), "".into())];
+    rq.headers = sign_headers("POST", "/bkt1/k1", &rq.query, b"");
+    let r = svc.handle(&rq).unwrap();
+    let xml = match r.body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!(),
+    };
+    let uid = xml
+        .split("<UploadId>")
+        .nth(1)
+        .unwrap()
+        .split("</UploadId>")
+        .next()
+        .unwrap()
+        .to_string();
+    let rq = req_q(
+        "PUT",
+        "/bkt1/k1",
+        &[("partNumber", "1"), ("uploadId", &uid)],
+        vec![0u8; 10],
+    );
+    svc.handle(&rq).unwrap();
+    let r = svc.handle(&req_q("DELETE", "/bkt1/k1", &[("uploadId", &uid)], vec![]));
+    assert_eq!(status(&r), 204);
+    // abort 后再操作 → NoSuchUpload
+    let rq = req_q(
+        "PUT",
+        "/bkt1/k1",
+        &[("partNumber", "1"), ("uploadId", &uid)],
+        vec![0u8; 10],
+    );
+    let r = svc.handle(&rq);
+    assert_eq!(err_code(&r), "NoSuchUpload");
+    // 不存在的桶 → NoSuchBucket
+    let rq = req_q("POST", "/nobucket/k", &[("uploads", "")], vec![]);
+    let r = svc.handle(&rq);
+    assert_eq!(err_code(&r), "NoSuchBucket");
+}
+
+#[test]
+fn copy_object_over_service() {
+    let (_d, svc) = setup();
+    svc.handle(&req("PUT", "/bkt1", vec![])).unwrap();
+    svc.handle(&req("PUT", "/bkt2", vec![])).unwrap();
+    svc.handle(&req("PUT", "/bkt1/src", vec![7u8; 1000]))
+        .unwrap();
+
+    // copy 同桶
+    let mut rq = req("PUT", "/bkt1/dst", vec![]);
+    rq.headers
+        .push(("x-amz-copy-source".into(), "/bkt1/src".into()));
+    let r = svc.handle(&rq).unwrap();
+    let xml = match r.body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!(),
+    };
+    assert!(xml.contains("<CopyObjectResult"), "{xml}");
+    let r = svc.handle(&req("GET", "/bkt1/dst", vec![])).unwrap();
+    match r.body {
+        ResponseBody::ObjectStream { length, .. } => assert_eq!(length, 1000),
+        _ => panic!(),
+    }
+    // 跨桶 copy + REPLACE 元数据
+    let mut rq = req("PUT", "/bkt2/dst2", vec![]);
+    rq.headers
+        .push(("x-amz-copy-source".into(), "/bkt1/src".into()));
+    rq.headers
+        .push(("x-amz-metadata-directive".into(), "REPLACE".into()));
+    rq.headers.push(("content-type".into(), "text/x".into()));
+    let r = svc.handle(&rq).unwrap();
+    assert_eq!(r.status, 200);
+    // 复制到自身(无 REPLACE)→ InvalidRequest
+    let mut rq = req("PUT", "/bkt1/src", vec![]);
+    rq.headers
+        .push(("x-amz-copy-source".into(), "/bkt1/src".into()));
+    let r = svc.handle(&rq);
+    assert_eq!(err_code(&r), "InvalidRequest");
+    // 源缺失 → NoSuchKey
+    let mut rq = req("PUT", "/bkt1/dst3", vec![]);
+    rq.headers
+        .push(("x-amz-copy-source".into(), "/bkt1/nope".into()));
+    let r = svc.handle(&rq);
+    assert_eq!(err_code(&r), "NoSuchKey");
+    // 条件复制:if-match 匹配 → 成功;不匹配 → 412
+    let mut rq = req("PUT", "/bkt1/dst4", vec![]);
+    rq.headers
+        .push(("x-amz-copy-source".into(), "/bkt1/src".into()));
+    rq.headers
+        .push(("x-amz-copy-source-if-match".into(), "\"deadbeef\"".into()));
+    let r = svc.handle(&rq);
+    assert_eq!(err_code(&r), "PreconditionFailed");
+}
+
+fn sign_headers(
+    method: &str,
+    path: &str,
+    query: &[(String, String)],
+    body: &[u8],
+) -> Vec<(String, String)> {
+    let amz_date = auth::now_amz();
+    let hash = hex::encode(Sha256::digest(body));
+    let mut headers: Vec<(String, String)> = vec![
+        ("host".into(), "localhost:9000".into()),
+        ("x-amz-date".into(), amz_date.clone()),
+        ("x-amz-content-sha256".into(), hash.clone()),
+    ];
+    let cred = Credentials {
+        access_key: "test".into(),
+        secret_key: "secret123".into(),
+    };
+    let auth_hdr = auth::sign_request(
+        &cred,
+        "us-east-1",
+        method,
+        path,
+        query,
+        &headers,
+        &amz_date,
+        &PayloadHash::HexSha256(hash),
+    )
+    .unwrap();
+    headers.push(("authorization".into(), auth_hdr));
+    headers
 }
 
 #[test]

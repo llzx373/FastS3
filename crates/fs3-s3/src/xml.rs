@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 
 use fs3_core::{BucketMeta, ObjectMeta};
 
-use crate::error::escape_xml;
+use crate::error::{escape_xml, S3Error, S3ErrorCode};
 
 pub const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
@@ -128,6 +128,314 @@ pub fn parse_delete_objects_full(body: &[u8]) -> Result<DeleteObjectsRequest, St
     Ok(DeleteObjectsRequest { quiet, keys })
 }
 
+/// 解析 CompleteMultipartUpload 请求体 → [(PartNumber, ETag hex 去引号)]。
+pub fn parse_complete_multipart(body: &[u8]) -> Result<Vec<(u32, String)>, String> {
+    let mut reader = quick_xml::Reader::from_reader(body);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut parts: Vec<(u32, String)> = Vec::new();
+    let mut in_part = false;
+    let mut saw_complete = false;
+    let mut cur_no: Option<u32> = None;
+    let mut cur_etag: Option<String> = None;
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(quick_xml::events::Event::Start(e)) => {
+                let name = e.name().as_ref().to_vec();
+                match name.as_slice() {
+                    b"CompleteMultipartUpload" => saw_complete = true,
+                    b"Part" => {
+                        in_part = true;
+                        cur_no = None;
+                        cur_etag = None;
+                    }
+                    b"PartNumber" if in_part => {
+                        let raw = reader
+                            .read_text(e.name())
+                            .map_err(|err| format!("malformed XML: {err}"))?;
+                        let txt = unescape_text(raw.as_ref())?;
+                        cur_no = Some(
+                            txt.trim()
+                                .parse::<u32>()
+                                .map_err(|_| format!("malformed XML: bad PartNumber {txt:?}"))?,
+                        );
+                    }
+                    b"ETag" if in_part => {
+                        let raw = reader
+                            .read_text(e.name())
+                            .map_err(|err| format!("malformed XML: {err}"))?;
+                        cur_etag = Some(
+                            unescape_text(raw.as_ref())?
+                                .trim()
+                                .trim_matches('"')
+                                .to_string(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            Ok(quick_xml::events::Event::Empty(e)) => {
+                let name = e.name().as_ref().to_vec();
+                match name.as_slice() {
+                    b"Part" => {
+                        // 空 <Part/> 无意义,忽略
+                    }
+                    b"PartNumber" if in_part => cur_no = Some(0),
+                    b"ETag" if in_part => cur_etag = Some(String::new()),
+                    _ => {}
+                }
+            }
+            Ok(quick_xml::events::Event::End(e)) => {
+                let name = e.name().as_ref().to_vec();
+                if name == b"Part" {
+                    in_part = false;
+                    let no = cur_no
+                        .take()
+                        .ok_or_else(|| "malformed XML: Part missing PartNumber".to_string())?;
+                    let etag = cur_etag
+                        .take()
+                        .ok_or_else(|| "malformed XML: Part missing ETag".to_string())?;
+                    parts.push((no, etag));
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Err(e) => return Err(format!("malformed XML: {e}")),
+            _ => {}
+        }
+        buf.clear();
+    }
+    if !saw_complete {
+        return Err("malformed XML: missing <CompleteMultipartUpload>".into());
+    }
+    Ok(parts)
+}
+
+/// 解析后的 CopySource(头 x-amz-copy-source 值)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopySource {
+    pub bucket: String,
+    pub key: String,
+}
+
+/// 解析 x-amz-copy-source:格式 `/bucket/key` 或 `bucket/key`(URL 编码,
+/// 可能带 `?versionId=...` 后缀)。版本 ID 查询参数 → NotImplemented(版本未启用)。
+pub fn parse_copy_source(raw: &str) -> Result<CopySource, S3Error> {
+    let raw = raw.trim();
+    let (path_part, query_part) = match raw.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (raw, None),
+    };
+    if let Some(q) = query_part {
+        if q.split('&').any(|kv| kv.starts_with("versionId=")) {
+            return Err(S3Error::new(S3ErrorCode::NotImplemented)
+                .with_message("copy from a specific version is not supported"));
+        }
+    }
+    let path_part = path_part.trim_start_matches('/');
+    let mut it = path_part.splitn(2, '/');
+    let bucket = it.next().unwrap_or("").to_string();
+    let key_raw = it.next().unwrap_or("");
+    if bucket.is_empty() || key_raw.is_empty() {
+        return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+            .with_message("The copy source must be of the form /bucket/key or bucket/key"));
+    }
+    let key = percent_decode(key_raw);
+    Ok(CopySource { bucket, key })
+}
+
+/// CreateMultipartUpload 响应。
+pub fn render_initiate_multipart(bucket: &str, key: &str, upload_id: &str) -> String {
+    format!(
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+            "<InitiateMultipartUploadResult xmlns=\"{}\"\n  ><Bucket>{}</Bucket><Key>{}</Key>",
+            "<UploadId>{}</UploadId></InitiateMultipartUploadResult>"
+        ),
+        XMLNS,
+        escape_xml(bucket),
+        escape_xml(key),
+        escape_xml(upload_id)
+    )
+}
+
+/// CompleteMultipartUpload 响应。
+pub fn render_complete_multipart(location: &str, bucket: &str, key: &str, etag: &str) -> String {
+    format!(
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+            "<CompleteMultipartUploadResult xmlns=\"{}\"\n  ><Location>{}</Location>",
+            "<Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag>",
+            "</CompleteMultipartUploadResult>"
+        ),
+        XMLNS,
+        escape_xml(location),
+        escape_xml(bucket),
+        escape_xml(key),
+        escape_xml(etag)
+    )
+}
+
+/// CopyObject 响应。
+pub fn render_copy_object(etag_hex: &str, last_modified_rfc3339: &str) -> String {
+    format!(
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+            "<CopyObjectResult xmlns=\"{}\"\n  ><LastModified>{}</LastModified>",
+            "<ETag>\"{}\"</ETag></CopyObjectResult>"
+        ),
+        XMLNS, last_modified_rfc3339, etag_hex
+    )
+}
+
+/// UploadPartCopy 响应。
+pub fn render_copy_part(etag_hex: &str, last_modified_rfc3339: &str) -> String {
+    format!(
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+            "<CopyPartResult xmlns=\"{}\"\n  ><LastModified>{}</LastModified>",
+            "<ETag>\"{}\"</ETag></CopyPartResult>"
+        ),
+        XMLNS, last_modified_rfc3339, etag_hex
+    )
+}
+
+/// ListParts 响应。
+#[allow(clippy::too_many_arguments)]
+pub fn render_list_parts(
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number_marker: Option<u32>,
+    max_parts: u32,
+    parts: &[(u32, u64, String, i64)],
+    is_truncated: bool,
+    next_part_number_marker: Option<u32>,
+) -> String {
+    let mut xml = String::with_capacity(1024);
+    let _ = write!(
+        xml,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListPartsResult xmlns=\"{}\"\n  ><Bucket>{}</Bucket><Key>{}</Key>",
+        XMLNS,
+        escape_xml(bucket),
+        escape_xml(key)
+    );
+    let _ = write!(xml, "<UploadId>{}</UploadId>", escape_xml(upload_id));
+    if let Some(m) = part_number_marker {
+        let _ = write!(xml, "<PartNumberMarker>{m}</PartNumberMarker>");
+    } else {
+        xml.push_str("<PartNumberMarker>0</PartNumberMarker>");
+    }
+    let _ = write!(xml, "<MaxParts>{max_parts}</MaxParts>");
+    xml.push_str("<IsTruncated>");
+    xml.push_str(if is_truncated { "true" } else { "false" });
+    xml.push_str("</IsTruncated>");
+    for (no, size, etag, mtime) in parts {
+        let _ = write!(
+            xml,
+            "<Part><PartNumber>{no}</PartNumber><LastModified>{}</LastModified><ETag>\"{}\"</ETag><Size>{size}</Size></Part>",
+            ts_to_rfc3339(*mtime),
+            escape_xml(etag)
+        );
+    }
+    if let Some(n) = next_part_number_marker {
+        let _ = write!(xml, "<NextPartNumberMarker>{n}</NextPartNumberMarker>");
+    }
+    xml.push_str("</ListPartsResult>");
+    xml
+}
+
+/// ListMultipartUploads 响应。
+#[allow(clippy::too_many_arguments)]
+pub fn render_list_multipart_uploads(
+    bucket: &str,
+    prefix: &str,
+    key_marker: Option<&str>,
+    upload_id_marker: Option<&str>,
+    max_uploads: u32,
+    owner: &str,
+    uploads: &[(String, String, i64)],
+    is_truncated: bool,
+    next_key_marker: Option<&str>,
+    next_upload_id_marker: Option<&str>,
+) -> String {
+    let mut xml = String::with_capacity(1024);
+    let _ = write!(
+        xml,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListMultipartUploadsResult xmlns=\"{}\"\n  ><Bucket>{}</Bucket><KeyMarker>{}</KeyMarker>",
+        XMLNS,
+        escape_xml(bucket),
+        escape_xml(key_marker.unwrap_or(""))
+    );
+    if let Some(m) = upload_id_marker {
+        let _ = write!(xml, "<UploadIdMarker>{}</UploadIdMarker>", escape_xml(m));
+    } else {
+        xml.push_str("<UploadIdMarker></UploadIdMarker>");
+    }
+    let _ = write!(xml, "<MaxUploads>{max_uploads}</MaxUploads>");
+    xml.push_str("<IsTruncated>");
+    xml.push_str(if is_truncated { "true" } else { "false" });
+    xml.push_str("</IsTruncated>");
+    let _ = write!(xml, "<Prefix>{}</Prefix>", escape_xml(prefix));
+    for (key, uid, created) in uploads {
+        let _ = write!(
+            xml,
+            "<Upload><Key>{}</Key><UploadId>{}</UploadId>",
+            escape_xml(key),
+            escape_xml(uid)
+        );
+        let _ = write!(
+            xml,
+            "<Initiator><ID>{}</ID><DisplayName>{}</DisplayName></Initiator>",
+            escape_xml(owner),
+            escape_xml(owner)
+        );
+        let _ = write!(
+            xml,
+            "<Owner><ID>{}</ID><DisplayName>{}</DisplayName></Owner>",
+            escape_xml(owner),
+            escape_xml(owner)
+        );
+        let _ = write!(
+            xml,
+            "<StorageClass>STANDARD</StorageClass><Initiated>{}</Initiated></Upload>",
+            ts_to_rfc3339(*created)
+        );
+    }
+    if let Some(n) = next_key_marker {
+        let _ = write!(xml, "<NextKeyMarker>{}</NextKeyMarker>", escape_xml(n));
+    }
+    if let Some(n) = next_upload_id_marker {
+        let _ = write!(
+            xml,
+            "<NextUploadIdMarker>{}</NextUploadIdMarker>",
+            escape_xml(n)
+        );
+    }
+    xml.push_str("</ListMultipartUploadsResult>");
+    xml
+}
+
+/// 百分号解码(%XX;'+' 保持字面)。
+pub fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let h = (bytes[i + 1] as char).to_digit(16);
+            let l = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (h, l) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// 实体还原:&amp; &lt; &gt; &quot; &apos; 与 &#NN; / &#xHH;。
 fn unescape_text(raw: &[u8]) -> Result<String, String> {
     let s = std::str::from_utf8(raw).map_err(|e| format!("malformed UTF-8: {e}"))?;
@@ -138,7 +446,7 @@ fn unescape_text(raw: &[u8]) -> Result<String, String> {
 
 // ─────────────────────────── 响应生成 ───────────────────────────
 
-fn ts_to_rfc3339(ts: i64) -> String {
+pub fn ts_to_rfc3339(ts: i64) -> String {
     // AWS 用 UTC RFC3339 毫秒格式:2024-08-20T12:00:00.000Z
     let secs = if ts < 0 { 0 } else { ts as u64 };
     chrono_like::DateTime::from_unix(secs).to_rfc3339_millis()
@@ -230,7 +538,7 @@ fn render_contents(xml: &mut String, owner: &str, key: &str, meta: &ObjectMeta) 
          <Owner><ID>{}</ID><DisplayName>{}</DisplayName></Owner></Contents>",
         escape_xml(key),
         ts_to_rfc3339(meta.mtime),
-        meta.etag_hex(),
+        meta.etag_full(),
         meta.size,
         escape_xml(owner),
         escape_xml(owner)
@@ -378,7 +686,7 @@ pub fn render_list_object_versions(
              <StorageClass>STANDARD</StorageClass></Version>",
             escape_xml(key),
             ts_to_rfc3339(meta.mtime),
-            meta.etag_hex(),
+            meta.etag_full(),
             meta.size
         );
     }
@@ -546,6 +854,7 @@ mod tests {
             content_type: "text/plain".into(),
             user_meta: vec![],
             inline: None,
+            parts: vec![],
         };
         let xml = render_list_objects_v2(
             "owner1",
@@ -625,6 +934,7 @@ mod tests {
                     content_type: "text/plain".into(),
                     user_meta: vec![],
                     inline: None,
+                    parts: vec![],
                 },
             )
         };

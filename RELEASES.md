@@ -1,5 +1,31 @@
 # FastS3 发布记录
 
+## v0.3 — M2 高级语义与零拷贝(2026-08-20)
+
+### 新能力
+
+- **F5 Multipart**:CreateMultipartUpload(128 位 uploadId;Content-Type/元数据随会话)、UploadPart(重传覆盖/reactivate)、ListParts、ListMultipartUploads、CompleteMultipartUpload(全 extent 分片零数据搬运组合;ETag = MD5(各分片 ETag 十六进制拼接)+"-N";二次 Complete 幂等)、Abort + 7 天会话超时回收;限额对齐 AWS(5MiB~5GiB、≤10000 parts),EntityTooSmall/InvalidPart/NoSuchUpload/MalformedXML 错误语义。
+- **F6 CopyObject COW**:同设备复制 = 元数据操作(extent 引用计数 +1,零数据 I/O);覆盖/删除共享 extent 按引用计数递减,归零才回位图;UploadPartCopy(源 range 直灌分片流水线);复制条件头(412)与 MetadataDirective(COPY/REPLACE)。
+- **F7 流式编码**:Expect: 100-continue、Transfer-Encoding: chunked 验证通过(aws-chunked 于 M1 落地)。
+- **B3/D2 零拷贝读路径**:h1 连接经"标记帧"协议在 hyper 写路径内直接 sendfile(镜像)/splice(裸设备)—— 数据零用户态拷贝;能力探测(fstat 选路)+ fd 白名单;跨 extent 多段拼接;IOURING_REGISTER_BUFFERS 注册缓冲池(16×256KiB)+ READ_FIXED/WRITE_FIXED;h2/verify_reads 自动降级缓冲路径。
+- **G2 HTTP/2**:h2c(prior-knowledge)经 hyper auto builder 接入,SigV4 host 合成;流式 10MiB PUT/GET + 并发小对象验证通过。
+- **G3 背压**:全局在途字节准入(max_inflight_bytes,默认 16GiB)+ 每流有界通道;超限 503 SlowDown + Retry-After,内存硬性封顶。
+- **A4 loadgen**:`fasts3d loadgen`(对象大小/并发/Range 分布可控,SigV4 客户端);协议层基准与混载无 OOM 验证见 docs/perf-M2.md。
+- **引擎**:`parking_lot::RwLock`(读并发/写串行);multipart 会话/分片键布局(`u:`/`p:`/`m:`)。
+
+### 验证(门禁)
+
+- CEPH s3-tests M1+M2 合并 **107/107**(multipart/copy 子集 39/39)。
+- 崩溃 harness:HTTP 100 轮 kill -9 零撕裂、位图一致、零泄漏。
+- 覆盖率 **73.9%**(≥60%);cargo audit 0 漏洞;clippy 0 警告;fmt 干净。
+- 混载(64 并发 put/get/range 25s)RSS 平稳 ≤253MiB,无 OOM。
+- 零拷贝:单连接 10MiB GET ~200MB/s;128KiB GET 64 并发 ~10.7k ops/s(≈1.34GB/s;目标表为 Gen4 NVMe,基线见 docs/perf-M2.md)。
+- ADR-7:multipart 组合语义、h1 零拷贝标记协议、读写锁。
+
+### 已知限制(递延)
+
+- 多设备池(D5)顺延 M4;thread-per-core 每核 sled 视图 + 进一步零拷贝为 M5 性能冲刺;TLS/h2 经 ALPN 为 M4。
+
 ## v0.2 — M1 S3 核心语义(2026-08-20)
 
 S3 协议面完成:单机高性能 S3 服务可经标准客户端接入。

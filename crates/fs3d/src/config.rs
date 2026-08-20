@@ -19,6 +19,8 @@ pub struct ServerConfig {
     pub listen: Option<String>,
     /// worker 数(0 = 自动)。
     pub workers: Option<usize>,
+    /// 全局在途字节上限(G3;默认 16GiB;超限 503 SlowDown)。
+    pub max_inflight_bytes: Option<u64>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]

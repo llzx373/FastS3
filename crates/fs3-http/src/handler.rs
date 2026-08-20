@@ -18,12 +18,24 @@ use tokio::net::TcpStream;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
-/// 单连接服务(hyper auto builder,HTTP/1.1 keep-alive)。
-pub async fn serve_connection(service: Arc<S3Service>, stream: TcpStream) -> std::io::Result<()> {
-    let io = TokioIo::new(stream);
+/// 单连接服务(hyper auto builder,HTTP/1.1 keep-alive;h2 prior-knowledge)。
+pub async fn serve_connection(
+    service: Arc<S3Service>,
+    admission: Arc<crate::Admission>,
+    stream: TcpStream,
+) -> std::io::Result<()> {
+    // 零拷贝(B3/D2):注册设备 fd 白名单,包裹 socket 识别标记帧
+    crate::zero_copy::register_trusted_fd(service.device_fd());
+    if let Some(fd) = service.zc_fd() {
+        crate::zero_copy::register_trusted_fd(fd);
+    }
+    let zc_ctx = crate::zero_copy::ZeroCtx::new();
+    let io = TokioIo::new(crate::zero_copy::ZeroCopyIo::new(stream, &zc_ctx));
     let service_fn = hyper::service::service_fn(move |req| {
         let service = service.clone();
-        async move { handle(service, req).await }
+        let admission = admission.clone();
+        let zc_ctx = zc_ctx;
+        async move { handle(service, admission, zc_ctx, req).await }
     });
     hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
         .serve_connection(io, service_fn)
@@ -44,6 +56,24 @@ fn bytes_body(b: Vec<u8>) -> RespBody {
     Full::new(Bytes::from(b))
         .map_err(|e| std::io::Error::other(e.to_string()))
         .boxed()
+}
+
+/// RAII 释放准入(流式 PUT 用;响应返回后 guard 析构释放)。
+struct AdmitGuard {
+    admission: Arc<crate::Admission>,
+    n: u64,
+}
+
+impl AdmitGuard {
+    fn new(admission: Arc<crate::Admission>, n: u64) -> Self {
+        AdmitGuard { admission, n }
+    }
+}
+
+impl Drop for AdmitGuard {
+    fn drop(&mut self) {
+        self.admission.release(self.n);
+    }
 }
 
 fn error_response(e: &S3Error, host_id: &str) -> Response<RespBody> {
@@ -67,18 +97,24 @@ fn rand_u64() -> u64 {
 
 async fn handle(
     service: Arc<S3Service>,
+    admission: Arc<crate::Admission>,
+    zc_ctx: crate::zero_copy::ZeroCtx,
     req: Request<Incoming>,
 ) -> Result<Response<RespBody>, std::convert::Infallible> {
     let host_id = "fasts3";
     let method = req.method().as_str().to_string();
     let uri = req.uri().clone();
     let raw_path = uri.path().to_string();
-    let host = req
+    // h1:Host 头;h2::authority 由 hyper 合成进 uri(uri().authority())。
+    // 路由用去端口 host;h2 缺 Host 头时按原始 authority 合成签名用 host。
+    let host_raw = req
         .headers()
         .get("host")
         .and_then(|v| v.to_str().ok())
-        .map(|h| strip_port(h).to_string())
+        .map(|h| h.to_string())
+        .or_else(|| req.uri().authority().map(|a| a.as_str().to_string()))
         .unwrap_or_else(|| "localhost".into());
+    let host = strip_port(&host_raw).to_string();
     let query: Vec<(String, String)> = match uri.query() {
         Some(q) if !q.is_empty() => q
             .split('&')
@@ -91,7 +127,7 @@ async fn handle(
         _ => vec![],
     };
     let decoded_path = percent_decode(&raw_path);
-    let headers: Vec<(String, String)> = req
+    let mut headers: Vec<(String, String)> = req
         .headers()
         .iter()
         .map(|(k, v)| {
@@ -101,6 +137,10 @@ async fn handle(
             )
         })
         .collect();
+    // h2 无 Host 头:SigV4 canonical request 需要 host,补合成值(含端口)
+    if !headers.iter().any(|(k, _)| k == "host") {
+        headers.push(("host".into(), host_raw.clone()));
+    }
 
     let s3req = S3Request {
         method: method.clone(),
@@ -129,8 +169,20 @@ async fn handle(
                 .unwrap_or(true));
 
     if streaming_put {
-        // 泵:hyper body → 同步 channel reader
-        let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<Vec<u8>>>();
+        // 全局准入:按 Content-Length(未知则按每流窗口上限 64MiB)
+        let inflight = content_length.unwrap_or(64 * 1024 * 1024);
+        if !admission.try_acquire(inflight) {
+            let err = S3Error::new(fs3_s3::S3ErrorCode::SlowDown)
+                .with_message("Reduce your request rate.");
+            let mut resp = error_response(&err, "fasts3");
+            resp.headers_mut()
+                .insert("retry-after", "5".parse().unwrap());
+            return Ok(resp);
+        }
+        let admit = admission.clone();
+        let _guard = AdmitGuard::new(admit, inflight);
+        // 泵:hyper body → 同步 channel reader(有界 16 块,背压传导)
+        let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(16);
         let body = req.into_body();
         tokio::spawn(async move {
             let mut body = body;
@@ -138,8 +190,9 @@ async fn handle(
                 match body.frame().await {
                     Some(Ok(frame)) => {
                         if let Ok(data) = frame.into_data() {
-                            if tx.send(Ok(data.to_vec())).is_err() {
-                                break;
+                            // 有界通道:满则让出(不阻塞 runtime worker)
+                            while tx.try_send(Ok(data.to_vec())).is_err() {
+                                tokio::task::yield_now().await;
                             }
                         }
                     }
@@ -165,7 +218,13 @@ async fn handle(
                     Err(S3Error::new(fs3_s3::S3ErrorCode::InternalError)
                         .with_message(e.to_string()))
                 });
-        return Ok(render(service, result, host_id));
+        return Ok(render_with(
+            service,
+            result,
+            host_id,
+            Some(admission.clone()),
+            Some((zc_ctx, false)),
+        ));
     }
 
     // 缓冲路径
@@ -180,13 +239,22 @@ async fn handle(
     let mut s3req = s3req;
     s3req.body = body_bytes;
     let result = service.handle(&s3req);
-    Ok(render(service, result, host_id))
+    Ok(render_with(
+        service,
+        result,
+        host_id,
+        Some(admission),
+        Some((zc_ctx, false)),
+    ))
 }
 
-fn render(
+#[allow(clippy::too_many_arguments)]
+fn render_with(
     service: Arc<S3Service>,
     result: Result<ServiceResponse, S3Error>,
     host_id: &str,
+    admission: Option<Arc<crate::Admission>>,
+    zc: Option<(crate::zero_copy::ZeroCtx, bool)>,
 ) -> Response<RespBody> {
     let resp = match result {
         Ok(r) => r,
@@ -204,7 +272,63 @@ fn render(
             key,
             offset,
             length,
+            zc_segments,
+            zc_fd,
+            zc_verify,
         } => {
+            // 零拷贝候选(h1 + 设备支持 + 对象 extent 段 + 未开 verify_reads)
+            let zc_body = zc.and_then(|(ctx, is_h2)| {
+                if is_h2 || zc_verify {
+                    return None;
+                }
+                let fd = zc_fd?;
+                if crate::zero_copy::probe_fd_capability(fd) == 0 {
+                    return None;
+                }
+                let segs = zc_segments?;
+                if segs.is_empty() {
+                    return None;
+                }
+                crate::zero_copy::register_trusted_fd(fd);
+                // 至少 2 个标记帧(数据段 + 填充帧)才走零拷贝
+                if length < 2 * crate::zero_copy::MARKER_LEN as u64 {
+                    return None;
+                }
+                Some(ZcBody {
+                    ctx,
+                    fd,
+                    segs,
+                    idx: 0,
+                    length,
+                })
+            });
+            // 全局准入(仅当有准入上下文,即 HTTP 路径)
+            let admit = match &admission {
+                Some(a) if !a.try_acquire(length) => {
+                    let err = S3Error::new(fs3_s3::S3ErrorCode::SlowDown)
+                        .with_message("Reduce your request rate.");
+                    let mut resp = error_response(&err, host_id);
+                    resp.headers_mut()
+                        .insert("retry-after", "5".parse().unwrap());
+                    return resp;
+                }
+                Some(a) => Some((a.clone(), length)),
+                None => None,
+            };
+            if let Some(body) = zc_body {
+                let guard = admit;
+                let zbody = StreamBody::new(ZcBodyStream {
+                    inner: Some(body),
+                    guard,
+                })
+                .boxed();
+                return builder.body(zbody).unwrap_or_else(|_| {
+                    Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(empty_body())
+                        .unwrap()
+                });
+            }
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
             let svc = service.clone();
             tokio::spawn(async move {
@@ -233,6 +357,10 @@ fn render(
                         break;
                     }
                 }
+                // 流结束:释放准入
+                if let Some((a, n)) = &admit {
+                    a.release(*n);
+                }
             });
             // Frame 包装:StreamBody 需要 Stream<Item = Result<Frame<D>, E>>
             let stream = ReceiverStream::new(rx).map(|r| r.map(hyper::body::Frame::data));
@@ -246,6 +374,73 @@ fn render(
             .body(empty_body())
             .unwrap()
     })
+}
+
+/// 零拷贝响应体:逐段产出 28 字节标记帧(ZeroCopyIo 识别后 sendfile/splice)。
+struct ZcBody {
+    ctx: crate::zero_copy::ZeroCtx,
+    fd: i32,
+    segs: Vec<fs3_engine::Segment>,
+    idx: usize,
+    /// 响应总长度(填充帧对齐 content-length 记账)。
+    length: u64,
+}
+
+struct ZcBodyStream {
+    inner: Option<ZcBody>,
+    /// (准入, 字节数):流结束/丢弃时释放。
+    guard: Option<(Arc<crate::Admission>, u64)>,
+}
+
+impl Drop for ZcBodyStream {
+    fn drop(&mut self) {
+        if let Some((a, n)) = &self.guard {
+            a.release(*n);
+        }
+        self.inner = None;
+    }
+}
+
+impl tokio_stream::Stream for ZcBodyStream {
+    type Item = Result<hyper::body::Frame<Bytes>, std::io::Error>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match &mut self.inner {
+            Some(body) => {
+                if body.idx < body.segs.len() {
+                    let seg = body.segs[body.idx];
+                    body.idx += 1;
+                    let frame = hyper::body::Frame::data(Bytes::copy_from_slice(&body.ctx.marker(
+                        body.fd,
+                        seg.dev_offset,
+                        seg.len,
+                    )));
+                    return std::task::Poll::Ready(Some(Ok(frame)));
+                }
+                // 收尾:填充帧 [pad 标记(28) + pad_count 个零],由包装层丢弃;
+                // 使 hyper 记账字节数 == content-length。
+                let frames_total =
+                    (body.segs.len() + 1) as u64 * crate::zero_copy::MARKER_LEN as u64;
+                let pad = body.length.saturating_sub(frames_total) as usize;
+                let marker = body.ctx.marker(crate::zero_copy::PAD_FD, pad as u64, 0);
+                let segs = body.segs.len();
+                let length = body.length;
+                let _ = (segs, length);
+                self.inner = None;
+                if pad == 0 {
+                    // 无填充:直接结束(长度恰好 = 帧总数)
+                    return std::task::Poll::Ready(None);
+                }
+                let mut bytes = Vec::with_capacity(crate::zero_copy::MARKER_LEN + pad);
+                bytes.extend_from_slice(&marker);
+                bytes.resize(crate::zero_copy::MARKER_LEN + pad, 0);
+                std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::from(bytes)))))
+            }
+            None => std::task::Poll::Ready(None),
+        }
+    }
 }
 
 /// std::sync::mpsc Receiver → std::io::Read(阻塞读,供引擎流式 PUT)。

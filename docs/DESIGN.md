@@ -222,6 +222,14 @@ M1 实现将以下协议语义具体化,经 CEPH s3-tests 核心子集 68/68 验
 3. **Owner/ACL 最小实现**:单机单账号模型下,CanonicalUser ID = DisplayName = 首个配置凭据的 access key;GetObjectAcl 返回 owner FULL_CONTROL 的私有默认 ACL;ListObjectsV1/V2 的 Contents 含 Owner(与 AWS V1 一致)。完整 ACL/策略为 M2+ 范围。
 4. **对象级 `?acl` 子资源**:GET 实现(见 3);PUT(PutObjectAcl)→ NotImplemented。
 
+#### ADR-7(M2 实现确认):multipart 组合语义、h1 零拷贝标记协议与引擎读写锁
+
+1. **multipart 数据模型与组合**:会话 `u:{uploadId}`(含 Content-Type/元数据/完成快照)+ 分片 `p:{uploadId}\0{part_no}` + 桶索引 `m:{bucket}\0{uploadId}`(ListMultipartUploads)。Complete 的客户端分片列表按 part_no 建图(**同名多次取最后**,RGW 语义,兼容 `test_multipart_resend_first_finishes_last` 的竞态),校验存在 + ETag;非最后分片 < 5MiB → EntityTooSmall;全 extent 分片零数据搬运拼接,全内联拼数据,混合走数据路径。会话完成后保留(二次 Complete 幂等返回;分片重传 reactivate),超时 7 天惰性清扫。
+2. **h1 零拷贝读路径 = 标记帧协议**:hyper 写路径无法注入 sendfile,故响应体以 `[连接nonce(8)|fd(4)|off(8)|len(8)]` 28 字节标记帧替代数据帧;包裹 socket 的 `ZeroCopyIo` 在 `poll_write` 扫描 nonce,命中且 fd 在白名单 → 专用线程**阻塞 sendfile**(镜像)/ splice(裸设备)直接写 socket(零用户态拷贝),其余字节透传。nonce 每连接随机(2^-64/帧防对象数据伪造)+ fd 白名单(防任意 fd 读)。hyper 按帧长记账 content-length → 收尾"填充帧"(PAD 标记 + 零字节)由包装层丢弃对齐。h2(帧内嵌标记会损坏数据流)与 verify_reads 走缓冲路径。能力探测:fstat(REG→sendfile,BLK→splice);WSL 非阻塞 sendfile 的 EAGAIN 与可写事件不同步 → EAGAIN 时 poll(POLLOUT) 等待(免 fcntl,fcntl F_SETFL 在 WSL 上昂贵)。
+3. **引擎锁升级为 `parking_lot::RwLock`**:只读路径(meta/segments)取读锁并发,写路径(put/delete/multipart/copy)取写锁串行;`io` 与 `checkpoint_tick` 字段以内部 Mutex 包装满足 Sync。实测将 16 并发 128KiB GET 从 ~0.7k 提升至 ~8.5k ops/s(上限受 sled 元数据与每请求协议开销约束,thread-per-core 在 M5)。
+4. **G3 背压落地**:`Admission`(AtomicU64 全局在途字节,默认 16GiB)在流式 PUT/GET 入口准入,超限 503 SlowDown + Retry-After;每流窗口 = 有界通道(泵 try_send+让出)。
+5. **注册缓冲池**:io_uring 打开时尽力 `IORING_REGISTER_BUFFERS`(16×256KiB 对齐池),READ_FIXED/WRITE_FIXED opcode + 往返测试;内核不支持则自动降级普通 Read/Write。
+
 ---
 
 ## 4. 存储引擎设计(Rust)

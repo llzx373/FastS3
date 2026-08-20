@@ -8,5 +8,7 @@ pub mod device;
 pub mod superblock;
 
 pub use aligned::AlignedBuffer;
-pub use device::{open_device, read_exact_at, write_all_at, BlockDevice, ImageFile, RawDevice};
+pub use device::{
+    open_device, open_zerocopy_fd, read_exact_at, write_all_at, BlockDevice, ImageFile, RawDevice,
+};
 pub use superblock::{init_device, read_superblock};

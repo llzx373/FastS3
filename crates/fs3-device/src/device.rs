@@ -382,6 +382,36 @@ impl BlockDevice for ImageFile {
     }
 }
 
+/// 打开零拷贝专用 fd(只读、无 O_DIRECT):sendfile/splice 需要页缓存
+/// 路径,O_DIRECT 源在多数内核上 EINVAL(DESIGN §6.4)。
+pub fn open_zerocopy_fd(path: &Path) -> Result<RawFd> {
+    let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|_| Error::InvalidArgument(format!("path contains NUL: {}", path.display())))?;
+    // SAFETY: cpath 为合法 CString。
+    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(Error::Io(io::Error::last_os_error()));
+    }
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: fd 有效。
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        let e = io::Error::last_os_error();
+        // SAFETY: fd 有效。
+        unsafe { libc::close(fd) };
+        return Err(Error::Io(e));
+    }
+    match st.st_mode & libc::S_IFMT {
+        libc::S_IFREG | libc::S_IFBLK => Ok(fd),
+        other => {
+            // SAFETY: fd 有效。
+            unsafe { libc::close(fd) };
+            Err(Error::InvalidArgument(format!(
+                "zerocopy fd: unsupported file type {other:o}"
+            )))
+        }
+    }
+}
+
 /// 按路径打开设备(自动区分裸设备/镜像文件)。
 pub fn open_device(path: &Path, readonly: bool) -> Result<Box<dyn BlockDevice>> {
     use std::os::unix::fs::FileTypeExt;

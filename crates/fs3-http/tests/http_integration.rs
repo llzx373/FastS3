@@ -21,7 +21,7 @@ fn setup() -> (tempfile::TempDir, Arc<S3Service>) {
         meta_dir: dir.path().join("meta"),
         ..Default::default()
     };
-    let engine = Arc::new(std::sync::Mutex::new(Engine::open(&cfg).unwrap()));
+    let engine = Arc::new(parking_lot::RwLock::new(Engine::open(&cfg).unwrap()));
     let service = Arc::new(S3Service::new(
         engine,
         vec![auth::Credentials {
@@ -168,7 +168,8 @@ async fn spawn_server(service: Arc<S3Service>) -> std::net::SocketAddr {
             let (stream, _) = listener.accept().await.unwrap();
             let svc = service.clone();
             tokio::spawn(async move {
-                let _ = fs3_http::serve_connection(svc, stream).await;
+                let _ = fs3_http::serve_connection(svc, fs3_http::Admission::new(1 << 30), stream)
+                    .await;
             });
         }
     });
@@ -295,6 +296,14 @@ async fn full_crud_over_http() {
         .send(render_request("GET", "/test-bucket/big.bin", &h, b""))
         .await;
     assert_eq!(status, 200);
+    if body.len() != big.len() {
+        let extra = &body[big.len().min(body.len())..];
+        eprintln!(
+            "EXTRA {} bytes: {:?}",
+            extra.len(),
+            &extra[..extra.len().min(64)]
+        );
+    }
     assert_eq!(body.len(), big.len());
     assert_eq!(&body[..1024], &big[..1024]);
     assert_eq!(&body[body.len() - 1024..], &big[big.len() - 1024..]);

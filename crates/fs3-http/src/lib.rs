@@ -10,7 +10,12 @@ use std::sync::Arc;
 use fs3_s3::S3Service;
 use tokio::net::TcpListener;
 
+mod admission;
 mod handler;
+mod zero_copy;
+
+pub use admission::Admission;
+pub use zero_copy::{probe_fd_capability, ZeroCopyIo, ZeroCtx};
 
 /// 单连接处理(测试与内嵌复用)。
 pub use handler::serve_connection;
@@ -21,6 +26,8 @@ pub struct HttpServerConfig {
     pub listen: SocketAddr,
     /// 每核 worker 数(0 = 自动 = 逻辑核数)。
     pub workers: usize,
+    /// 全局在途字节上限(G3;超限 503 SlowDown + Retry-After)。
+    pub max_inflight_bytes: u64,
 }
 
 impl Default for HttpServerConfig {
@@ -28,6 +35,7 @@ impl Default for HttpServerConfig {
         HttpServerConfig {
             listen: "0.0.0.0:9000".parse().unwrap(),
             workers: 0,
+            max_inflight_bytes: 16 * 1024 * 1024 * 1024, // DESIGN §6.5:16GiB
         }
     }
 }
@@ -47,12 +55,14 @@ pub fn serve(service: Arc<S3Service>, cfg: &HttpServerConfig) -> std::io::Result
         workers
     );
 
+    let admission = Admission::new(cfg.max_inflight_bytes);
     let mut handles = Vec::new();
     for w in 0..workers {
         let service = service.clone();
         let listen = cfg.listen;
+        let admission = admission.clone();
         handles.push(std::thread::spawn(move || {
-            worker_main(service, listen, w);
+            worker_main(service, listen, admission, w);
         }));
     }
     for h in handles {
@@ -61,7 +71,12 @@ pub fn serve(service: Arc<S3Service>, cfg: &HttpServerConfig) -> std::io::Result
     Ok(())
 }
 
-fn worker_main(service: Arc<S3Service>, listen: SocketAddr, worker_id: usize) {
+fn worker_main(
+    service: Arc<S3Service>,
+    listen: SocketAddr,
+    admission: Arc<Admission>,
+    worker_id: usize,
+) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_io()
@@ -75,8 +90,10 @@ fn worker_main(service: Arc<S3Service>, listen: SocketAddr, worker_id: usize) {
             match listener.accept().await {
                 Ok((stream, peer)) => {
                     let service = service.clone();
+                    let admission = admission.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handler::serve_connection(service, stream).await {
+                        if let Err(e) = handler::serve_connection(service, admission, stream).await
+                        {
                             tracing::debug!("connection {peer} ended: {e}");
                         }
                     });

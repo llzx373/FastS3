@@ -51,6 +51,15 @@ pub const DEFAULT_IO_RING_DEPTH: u32 = 1024;
 /// 对象大小上限(对齐 AWS:5TiB)。
 pub const MAX_OBJECT_SIZE: u64 = 5 * 1024 * 1024 * 1024 * 1024;
 
+/// multipart:除最后一片外的最小分片大小(对齐 AWS:5MiB)。
+pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
+/// multipart:单片大小上限(对齐 AWS:5GiB)。
+pub const MAX_PART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+/// multipart:分片数上限(对齐 AWS:10000)。
+pub const MAX_PARTS: u32 = 10_000;
+/// multipart 会话超时(默认 7 天;DESIGN §4.7)。
+pub const MULTIPART_TTL_SECS: i64 = 7 * 24 * 3600;
+
 /// 单设备 extent 数上限(64TiB / 4MiB = 16M,位图 2MiB)。
 pub const MAX_EXTENTS: u64 = 16 * 1024 * 1024;
 

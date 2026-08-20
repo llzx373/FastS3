@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dev-dependencies]
 fs3-core.workspace = true
+parking_lot.workspace = true
 fs3-device.workspace = true
 fs3-engine.workspace = true
 fs3-s3.workspace = true

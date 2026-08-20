@@ -37,6 +37,22 @@ pub enum Error {
 
     #[error("transaction aborted after retries: {0}")]
     TxnConflict(String),
+
+    /// multipart:分片缺失或 ETag 不匹配(AWS InvalidPart)。
+    #[error("invalid part: {0}")]
+    InvalidPart(String),
+
+    /// multipart:分片号乱序(AWS InvalidPartOrder)。
+    #[error("invalid part order: {0}")]
+    InvalidPartOrder(String),
+
+    /// multipart:非最后分片小于 5MiB(AWS EntityTooSmall)。
+    #[error("part too small: {0}")]
+    PartTooSmall(String),
+
+    /// multipart:会话不存在(AWS NoSuchUpload)。
+    #[error("no such upload: {0}")]
+    NoSuchUpload(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

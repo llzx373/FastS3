@@ -2,7 +2,8 @@
 
 use std::path::Path;
 
-use fs3_core::{AllocRecord, BucketMeta, Error, ObjectMeta, Result, MAX_OBJECT_SIZE};
+use fs3_core::{AllocRecord, BucketMeta, Error, ExtentRef, ObjectMeta, Result, MAX_OBJECT_SIZE};
+use serde::{Deserialize, Serialize};
 use sled::transaction::ConflictableTransactionError;
 
 use crate::keys::*;
@@ -60,6 +61,68 @@ pub struct StatsDelta {
     pub bytes: i64,
 }
 
+/// 分片上传会话(DESIGN §4.7;键 `u:{uploadId}`,桶索引 `m:{bucket}\0{uploadId}`)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MultipartSession {
+    pub bucket: String,
+    pub key: String,
+    /// CreateMultipartUpload 携带的 Content-Type(Complete 时落到对象上)。
+    pub content_type: String,
+    pub user_meta: Vec<(String, String)>,
+    pub created: i64,
+    /// 已完成标记:二次 Complete 幂等返回;分片重传后清位(reactivate)。
+    pub completed: bool,
+    /// 完成结果快照(幂等重放:返回相同 ETag/Size/LastModified)。
+    pub final_etag: [u8; 16],
+    pub final_size: u64,
+    pub final_mtime: i64,
+}
+
+/// 当前 Unix 秒(会话时间戳用)。
+fn now_ts() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+impl MultipartSession {
+    pub fn new(
+        bucket: &str,
+        key: &str,
+        content_type: &str,
+        user_meta: Vec<(String, String)>,
+    ) -> Self {
+        MultipartSession {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            content_type: content_type.to_string(),
+            user_meta,
+            created: now_ts(),
+            completed: false,
+            final_etag: [0u8; 16],
+            final_size: 0,
+            final_mtime: 0,
+        }
+    }
+}
+
+/// 分片元数据(键 `p:{uploadId}\0{part_no be32}`;数据在 extents 或 inline)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartMeta {
+    pub size: u64,
+    pub etag: [u8; 16],
+    pub mtime: i64,
+    pub extents: Vec<ExtentRef>,
+    pub inline: Option<Vec<u8>>,
+}
+
+impl PartMeta {
+    pub fn etag_hex(&self) -> String {
+        self.etag.iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
 /// 元数据操作(单事务应用,顺序执行)。
 #[derive(Debug, Clone)]
 pub enum Op {
@@ -87,6 +150,33 @@ pub enum Op {
     Stats {
         bucket: String,
         delta: StatsDelta,
+    },
+    /// 创建分片会话:写 `u:{uploadId}` + 桶索引 `m:{bucket}\0{uploadId}`。
+    MultipartCreate {
+        upload_id: String,
+        session: MultipartSession,
+    },
+    /// 更新会话标志(completed/final 快照;读改写保证冲突集)。
+    MultipartUpdate {
+        upload_id: String,
+        completed: bool,
+        final_etag: [u8; 16],
+        final_size: u64,
+        final_mtime: i64,
+    },
+    /// 删除会话 + 桶索引。
+    MultipartDelete {
+        upload_id: String,
+    },
+    /// 写分片(覆盖已存在分片)。
+    PartPut {
+        upload_id: String,
+        part_no: u32,
+        meta: PartMeta,
+    },
+    /// 按原始键删除分片(键在事务外枚举,事务内先读建立冲突集)。
+    PartDelete {
+        key: Vec<u8>,
     },
 }
 
@@ -403,6 +493,181 @@ impl MetaStore {
             },
         ])
     }
+
+    // ─────────────────────────── multipart ───────────────────────────
+
+    /// 创建分片上传会话(桶必须存在)。
+    pub fn create_multipart(&self, upload_id: &str, session: &MultipartSession) -> Result<u64> {
+        self.commit(&[Op::MultipartCreate {
+            upload_id: upload_id.to_string(),
+            session: session.clone(),
+        }])
+    }
+
+    pub fn get_multipart(&self, upload_id: &str) -> Result<Option<MultipartSession>> {
+        match self.db.get(session_key(upload_id)).map_err(sled_err)? {
+            Some(v) => Ok(Some(decode(&v)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 写分片(覆盖同号旧分片;会话不存在 → NotFound)。
+    pub fn put_part(
+        &self,
+        upload_id: &str,
+        part_no: u32,
+        meta: &PartMeta,
+        draft: AllocDraft,
+    ) -> Result<u64> {
+        self.commit(&[
+            Op::PartPut {
+                upload_id: upload_id.to_string(),
+                part_no,
+                meta: meta.clone(),
+            },
+            Op::Alloc { draft },
+        ])
+    }
+
+    /// 分片重传/reactivate:清 completed 标记(读改写)。
+    pub fn touch_multipart(&self, upload_id: &str) -> Result<u64> {
+        self.commit(&[Op::MultipartUpdate {
+            upload_id: upload_id.to_string(),
+            completed: false,
+            final_etag: [0u8; 16],
+            final_size: 0,
+            final_mtime: 0,
+        }])
+    }
+
+    pub fn get_part(&self, upload_id: &str, part_no: u32) -> Result<Option<PartMeta>> {
+        match self
+            .db
+            .get(part_key(upload_id, part_no))
+            .map_err(sled_err)?
+        {
+            Some(v) => Ok(Some(decode(&v)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 按分片号升序列出全部已上传分片。
+    pub fn list_parts(&self, upload_id: &str) -> Result<Vec<(u32, PartMeta)>> {
+        let mut out = Vec::new();
+        for item in self.db.scan_prefix(part_prefix(upload_id)) {
+            let (k, v) = item.map_err(sled_err)?;
+            let part_no = parse_part_key(&k)?;
+            out.push((part_no, decode(&v)?));
+        }
+        Ok(out)
+    }
+
+    /// 会话过期清理辅助:列出全部会话(u: 前缀扫描)。
+    pub fn list_all_sessions(&self) -> Result<Vec<(String, MultipartSession)>> {
+        let mut out = Vec::new();
+        for item in self.db.scan_prefix(PREFIX_UPLOAD) {
+            let (k, v) = item.map_err(sled_err)?;
+            let uid = String::from_utf8(
+                k.strip_prefix(PREFIX_UPLOAD)
+                    .ok_or_else(|| Error::Corrupt("upload key missing prefix".into()))?
+                    .to_vec(),
+            )
+            .map_err(|_| Error::Corrupt("upload id not utf8".into()))?;
+            out.push((uid, decode(&v)?));
+        }
+        Ok(out)
+    }
+
+    /// 桶内会话(按创建时间升序;ListMultipartUploads)。
+    pub fn list_bucket_sessions(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        after_key: Option<(&str, &str)>,
+        max: usize,
+    ) -> Result<Vec<(String, MultipartSession)>> {
+        let mut out = Vec::new();
+        let mut scanned = 0usize;
+        'outer: for item in self.db.scan_prefix(session_index_prefix(bucket)) {
+            let (k, _) = item.map_err(sled_err)?;
+            let uid = parse_session_index_key(&k)?;
+            let sess = match self.get_multipart(&uid)? {
+                Some(s) => s,
+                None => continue,
+            };
+            // 前缀 + 游标过滤(游标 = (key, upload_id),字典序)
+            if !prefix.is_empty() && !sess.key.starts_with(prefix) {
+                continue;
+            }
+            if let Some((mk, mu)) = after_key {
+                let (a, b) = (sess.key.as_str(), uid.as_str());
+                if a < mk || (a == mk && b <= mu) {
+                    continue;
+                }
+            }
+            if scanned >= max {
+                break 'outer;
+            }
+            scanned += 1;
+            out.push((uid, sess));
+        }
+        Ok(out)
+    }
+
+    /// Abort:删除会话 + 桶索引 + 全部已枚举分片键 + 分配释放记录。
+    /// 分片键在事务外枚举(引擎持全局锁,无并发竞态)。
+    pub fn abort_multipart(
+        &self,
+        upload_id: &str,
+        part_keys: &[Vec<u8>],
+        draft: AllocDraft,
+    ) -> Result<u64> {
+        let mut ops: Vec<Op> = Vec::with_capacity(part_keys.len() + 2);
+        ops.push(Op::MultipartDelete {
+            upload_id: upload_id.to_string(),
+        });
+        for k in part_keys {
+            ops.push(Op::PartDelete { key: k.clone() });
+        }
+        ops.push(Op::Alloc { draft });
+        self.commit(&ops)
+    }
+
+    /// Complete:对象写入 + 会话收尾 + 分片删除 + 分配/统计,单事务。
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_multipart(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        meta: &ObjectMeta,
+        part_keys: &[Vec<u8>],
+        draft: AllocDraft,
+        delta: StatsDelta,
+    ) -> Result<u64> {
+        let mut ops: Vec<Op> = Vec::with_capacity(part_keys.len() + 4);
+        ops.push(Op::ObjectPut {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            meta: meta.clone(),
+        });
+        ops.push(Op::MultipartUpdate {
+            upload_id: upload_id.to_string(),
+            completed: true,
+            final_etag: meta.etag,
+            final_size: meta.size,
+            final_mtime: meta.mtime,
+        });
+        for k in part_keys {
+            ops.push(Op::PartDelete { key: k.clone() });
+        }
+        ops.push(Op::Alloc { draft });
+        ops.push(Op::Stats {
+            bucket: bucket.to_string(),
+            delta,
+        });
+        self.commit(&ops)
+    }
 }
 
 fn apply_ops(tree: &sled::transaction::TransactionalTree, ops: &[Op]) -> TxnResult<u64> {
@@ -504,6 +769,75 @@ fn apply_ops(tree: &sled::transaction::TransactionalTree, ops: &[Op]) -> TxnResu
                 meta.stats.bytes = (meta.stats.bytes as i128 + delta.bytes as i128).max(0) as u64;
                 tinsert(tree, k, encode(&meta).unwrap())?;
             }
+            Op::MultipartCreate { upload_id, session } => {
+                // 桶必须存在
+                if tget(tree, &bucket_key(&session.bucket))?.is_none() {
+                    return Err(ConflictableTransactionError::Abort(Error::NotFound(
+                        format!("bucket {}", session.bucket),
+                    )));
+                }
+                let uk = session_key(upload_id);
+                tget(tree, &uk)?;
+                tinsert(tree, uk, encode(session).unwrap())?;
+                let mk = session_index_key(&session.bucket, upload_id);
+                tget(tree, &mk)?;
+                tinsert(tree, mk, Vec::<u8>::new())?;
+            }
+            Op::MultipartUpdate {
+                upload_id,
+                completed,
+                final_etag,
+                final_size,
+                final_mtime,
+            } => {
+                let uk = session_key(upload_id);
+                let cur = tget(tree, &uk)?.ok_or_else(|| {
+                    ConflictableTransactionError::Abort(Error::NotFound(format!(
+                        "upload {upload_id}"
+                    )))
+                })?;
+                let mut sess: MultipartSession =
+                    decode(&cur).map_err(ConflictableTransactionError::Abort)?;
+                sess.completed = *completed;
+                sess.final_etag = *final_etag;
+                sess.final_size = *final_size;
+                sess.final_mtime = *final_mtime;
+                tinsert(tree, uk, encode(&sess).unwrap())?;
+            }
+            Op::MultipartDelete { upload_id } => {
+                let uk = session_key(upload_id);
+                let cur = tget(tree, &uk)?.ok_or_else(|| {
+                    ConflictableTransactionError::Abort(Error::NotFound(format!(
+                        "upload {upload_id}"
+                    )))
+                })?;
+                let sess: MultipartSession =
+                    decode(&cur).map_err(ConflictableTransactionError::Abort)?;
+                tremove(tree, &uk)?;
+                let mk = session_index_key(&sess.bucket, upload_id);
+                tget(tree, &mk)?;
+                tremove(tree, &mk)?;
+            }
+            Op::PartPut {
+                upload_id,
+                part_no,
+                meta,
+            } => {
+                // 会话必须存在(NoSuchUpload 语义)
+                if tget(tree, &session_key(upload_id))?.is_none() {
+                    return Err(ConflictableTransactionError::Abort(Error::NotFound(
+                        format!("upload {upload_id}"),
+                    )));
+                }
+                let pk = part_key(upload_id, *part_no);
+                tget(tree, &pk)?;
+                tinsert(tree, pk, encode(meta).unwrap())?;
+            }
+            Op::PartDelete { key } => {
+                if tget(tree, key)?.is_some() {
+                    tremove(tree, key)?;
+                }
+            }
         }
     }
 
@@ -541,6 +875,7 @@ mod tests {
             content_type: "application/octet-stream".into(),
             user_meta: vec![],
             inline: None,
+            parts: vec![],
         }
     }
 

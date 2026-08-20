@@ -71,7 +71,9 @@ FastS3 的对策:**不做底层已经做过的事**。工程力量全部投入�
 
 ✅ **M0 引擎 PoC 完成(v0.1)。** 裸设备/镜像文件 PUT/GET 全链路、位图分配器、检查点双缓冲与崩溃恢复、sled 事务/组提交、引擎基准回路;kill -9 崩溃 harness 50 轮零失败。
 
-✅ **M1 S3 核心语义完成(v0.2)。** S3 协议面:路径/虚拟主机路由、SigV4 header + 预签名认证、桶/对象 CRUD、ListObjectsV1/V2(分页/StartAfter/delimiter)、Range 与条件头、DeleteObjects、小对象内联(E3)、hyper + SO_REUSEPORT 流式接入;门禁全过:aws cli / boto3 / mc / rclone 4 客户端冒烟 ✅、CEPH s3-tests 核心子集 68/68 ✅(两例排除见 TODO.md)、HTTP 崩溃 harness 100 轮 + CLI 50 轮零撕裂 ✅、覆盖率 ≥60%(实测 ~76%)✅、cargo audit 漏洞清零 ✅。下一步:M2 高级语义与零拷贝。
+✅ **M1 S3 核心语义完成(v0.2)。** S3 协议面:路径/虚拟主机路由、SigV4 header + 预签名认证、桶/对象 CRUD、ListObjectsV1/V2(分页/StartAfter/delimiter)、Range 与条件头、DeleteObjects、小对象内联(E3)、hyper + SO_REUSEPORT 流式接入;门禁全过:aws cli / boto3 / mc / rclone 4 客户端冒烟 ✅、CEPH s3-tests 核心子集 68/68 ✅、HTTP 崩溃 harness 100 轮 + CLI 50 轮零撕裂 ✅、覆盖率 ≥60% ✅、cargo audit 漏洞清零 ✅。
+
+✅ **M2 高级语义与零拷贝完成(v0.3)。** Multipart 上传(分片/列表/完成/中止、extent 零数据搬运组合、ETag=MD5+“-N”)、CopyObject COW(引用计数共享)、UploadPartCopy、零拷贝读路径(h1 标记帧协议 + sendfile/splice + 注册缓冲池)、HTTP/2(h2c)、背压(503 SlowDown + Retry-After)、自研 loadgen;门禁:CEPH s3-tests M1+M2 合并 107/107 ✅、崩溃 harness 100 轮 ✅、覆盖率 73.9% ✅、audit 清零 ✅、混载无 OOM ✅。性能基线见 docs/perf-M2.md。下一步:M3 管理面 v1。
 
 | 文档 | 内容 |
 | --- | --- |

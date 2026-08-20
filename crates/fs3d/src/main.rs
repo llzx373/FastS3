@@ -12,6 +12,7 @@ use fs3_meta::SyncMode;
 
 mod bench;
 mod config;
+mod loadgen;
 
 use config::load_config;
 
@@ -107,6 +108,8 @@ enum Cmd {
     Checkpoint {},
     /// 引擎级基准(设备层直测,不经协议)
     Bench(bench::BenchArgs),
+    /// 协议层负载生成器(A4)
+    Loadgen(loadgen::LoadgenArgs),
     /// 启动 S3 数据面 HTTP 服务
     Serve {
         /// 监听地址(如 0.0.0.0:9000)
@@ -121,6 +124,9 @@ enum Cmd {
         /// 允许匿名 GET/HEAD
         #[arg(long)]
         allow_anonymous: bool,
+        /// 全局在途字节上限(字节;默认 16GiB;超限 503 SlowDown)
+        #[arg(long)]
+        max_inflight_bytes: Option<u64>,
     },
 }
 
@@ -252,11 +258,13 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
             )?;
             bench::run(&engine_cfg, args)
         }
+        Cmd::Loadgen(args) => loadgen::run(&args),
         Cmd::Serve {
             listen,
             workers,
             key,
             allow_anonymous,
+            max_inflight_bytes,
         } => {
             let engine_cfg = engine_config(
                 device,
@@ -266,12 +274,21 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.checkpoint_interval.or(storage.checkpoint_interval),
                 cli.no_uring,
             )?;
-            cmd_serve(&engine_cfg, &cfg, listen, workers, key, allow_anonymous)
+            cmd_serve(
+                &engine_cfg,
+                &cfg,
+                listen,
+                workers,
+                key,
+                allow_anonymous,
+                max_inflight_bytes,
+            )
         }
     }
 }
 
 /// 启动 S3 服务:引擎 + S3Service + hyper 多 worker 监听。
+#[allow(clippy::too_many_arguments)]
 fn cmd_serve(
     engine_cfg: &EngineConfig,
     cfg: &config::RootConfig,
@@ -279,8 +296,9 @@ fn cmd_serve(
     workers: Option<usize>,
     cli_keys: Vec<String>,
     cli_allow_anonymous: bool,
+    cli_max_inflight: Option<u64>,
 ) -> fs3_core::Result<()> {
-    let engine = Arc::new(std::sync::Mutex::new(Engine::open(engine_cfg)?));
+    let engine = Arc::new(parking_lot::RwLock::new(Engine::open(engine_cfg)?));
 
     // 密钥:CLI --key access:secret 优先,否则配置文件
     let mut keys: Vec<fs3_s3::auth::Credentials> = Vec::new();
@@ -331,6 +349,9 @@ fn cmd_serve(
     let http_cfg = fs3_http::HttpServerConfig {
         listen: addr,
         workers: workers.or(cfg.server.workers).unwrap_or(0),
+        max_inflight_bytes: cli_max_inflight
+            .or(cfg.server.max_inflight_bytes)
+            .unwrap_or(16 * 1024 * 1024 * 1024),
     };
     fs3_http::serve(service, &http_cfg).map_err(fs3_core::Error::Io)
 }

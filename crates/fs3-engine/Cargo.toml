@@ -12,6 +12,7 @@ fs3-device.workspace = true
 fs3-alloc.workspace = true
 fs3-meta.workspace = true
 io-uring.workspace = true
+hex.workspace = true
 libc.workspace = true
 md-5.workspace = true
 tracing.workspace = true

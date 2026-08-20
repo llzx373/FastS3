@@ -15,7 +15,12 @@ use fs3_core::{Error, Result};
 
 pub const PREFIX_BUCKET: &[u8] = b"b:";
 pub const PREFIX_OBJECT: &[u8] = b"o:";
+/// 分片上传会话(主键:`u:{uploadId}`,值 = MultipartSession)。
 pub const PREFIX_UPLOAD: &[u8] = b"u:";
+/// 会话桶索引(`m:{bucket}\0{uploadId}` → 空;ListMultipartUploads 用)。
+pub const PREFIX_UPLOAD_INDEX: &[u8] = b"m:";
+/// 分片元数据(`p:{uploadId}\0{part_no be32}` → PartMeta)。
+pub const PREFIX_PART: &[u8] = b"p:";
 pub const PREFIX_ALLOC: &[u8] = b"a:";
 pub const PREFIX_TXN: &[u8] = b"t:";
 pub const PREFIX_SYS: &[u8] = b"s:";
@@ -122,6 +127,82 @@ pub fn txn_key(seq: u64) -> Vec<u8> {
     k.extend_from_slice(PREFIX_TXN);
     k.extend_from_slice(&seq.to_be_bytes());
     k
+}
+
+/// 会话主键:`u:{uploadId}`。
+pub fn session_key(upload_id: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(PREFIX_UPLOAD.len() + upload_id.len());
+    k.extend_from_slice(PREFIX_UPLOAD);
+    k.extend_from_slice(upload_id.as_bytes());
+    k
+}
+
+/// 会话桶索引键:`m:{bucket}\0{uploadId}`。
+pub fn session_index_key(bucket: &str, upload_id: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(PREFIX_UPLOAD_INDEX.len() + bucket.len() + 1 + upload_id.len());
+    k.extend_from_slice(PREFIX_UPLOAD_INDEX);
+    k.extend_from_slice(bucket.as_bytes());
+    k.push(0x00);
+    k.extend_from_slice(upload_id.as_bytes());
+    k
+}
+
+/// 会话桶索引前缀:`m:{bucket}\0`(ListMultipartUploads 扫描)。
+pub fn session_index_prefix(bucket: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(PREFIX_UPLOAD_INDEX.len() + bucket.len() + 1);
+    k.extend_from_slice(PREFIX_UPLOAD_INDEX);
+    k.extend_from_slice(bucket.as_bytes());
+    k.push(0x00);
+    k
+}
+
+/// 解析 `m:` 索引键 → uploadId。
+pub fn parse_session_index_key(raw: &[u8]) -> Result<String> {
+    let body = raw
+        .strip_prefix(PREFIX_UPLOAD_INDEX)
+        .ok_or_else(|| Error::Corrupt("session index key missing prefix".into()))?;
+    let sep = body
+        .iter()
+        .position(|&b| b == 0x00)
+        .ok_or_else(|| Error::Corrupt("session index key missing separator".into()))?;
+    let uid = String::from_utf8(body[sep + 1..].to_vec())
+        .map_err(|_| Error::Corrupt("upload id not utf8".into()))?;
+    Ok(uid)
+}
+
+/// 分片键:`p:{uploadId}\0{part_no be32}`。
+pub fn part_key(upload_id: &str, part_no: u32) -> Vec<u8> {
+    let mut k = Vec::with_capacity(PREFIX_PART.len() + upload_id.len() + 1 + 4);
+    k.extend_from_slice(PREFIX_PART);
+    k.extend_from_slice(upload_id.as_bytes());
+    k.push(0x00);
+    k.extend_from_slice(&part_no.to_be_bytes());
+    k
+}
+
+/// 分片前缀:`p:{uploadId}\0`(ListParts 扫描)。
+pub fn part_prefix(upload_id: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(PREFIX_PART.len() + upload_id.len() + 1);
+    k.extend_from_slice(PREFIX_PART);
+    k.extend_from_slice(upload_id.as_bytes());
+    k.push(0x00);
+    k
+}
+
+/// 解析 `p:` 键 → part_no。
+pub fn parse_part_key(raw: &[u8]) -> Result<u32> {
+    let body = raw
+        .strip_prefix(PREFIX_PART)
+        .ok_or_else(|| Error::Corrupt("part key missing prefix".into()))?;
+    let sep = body
+        .iter()
+        .position(|&b| b == 0x00)
+        .ok_or_else(|| Error::Corrupt("part key missing separator".into()))?;
+    let no = &body[sep + 1..];
+    if no.len() != 4 {
+        return Err(Error::Corrupt("part key malformed".into()));
+    }
+    Ok(u32::from_be_bytes(no.try_into().unwrap()))
 }
 
 /// 解析 `a:` 键中的 seq。

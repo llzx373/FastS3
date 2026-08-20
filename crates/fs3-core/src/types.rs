@@ -43,6 +43,8 @@ impl AllocRecord {
 ///
 /// > v0.1 演进说明(M1):新增 `inline` 字段承载 E3 小对象内联;旧格式
 /// > 记录无法解码,属预期(未发布版本无迁移义务)。
+/// > v0.2 演进说明(M2):新增 `parts` 字段承载 multipart 分片边界
+/// > (GetObject PartNumber 用);非 multipart 对象为空。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectMeta {
     pub size: u64,
@@ -55,11 +57,23 @@ pub struct ObjectMeta {
     pub user_meta: Vec<(String, String)>,
     /// 小对象内联数据(E3:size ≤ small_object_limit 时零设备 I/O)。
     pub inline: Option<Vec<u8>>,
+    /// multipart 分片大小列表(索引 = part_no-1;非 multipart 为空)。
+    pub parts: Vec<u64>,
 }
 
 impl ObjectMeta {
     pub fn etag_hex(&self) -> String {
         self.etag.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// 完整 ETag:multipart 对象为 `md5hex-N`(N = 分片数),与 AWS 一致。
+    pub fn etag_full(&self) -> String {
+        let hex = self.etag_hex();
+        if self.parts.is_empty() {
+            hex
+        } else {
+            format!("{hex}-{}", self.parts.len())
+        }
     }
 }
 

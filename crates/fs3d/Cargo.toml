@@ -11,7 +11,11 @@ name = "fasts3d"
 path = "src/main.rs"
 
 [dependencies]
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true
 fs3-core.workspace = true
+parking_lot.workspace = true
 fs3-device.workspace = true
 fs3-alloc.workspace = true
 fs3-meta.workspace = true
