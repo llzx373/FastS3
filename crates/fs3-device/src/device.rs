@@ -50,13 +50,13 @@ fn fsync_fd(fd: RawFd) -> io::Result<()> {
 }
 
 fn check_aligned(offset: u64, len: usize) -> io::Result<()> {
-    if offset % SECTOR_SIZE != 0 {
+    if !offset.is_multiple_of(SECTOR_SIZE) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("offset {offset} not {SECTOR_SIZE}-aligned"),
         ));
     }
-    if len as u64 % SECTOR_SIZE != 0 {
+    if !(len as u64).is_multiple_of(SECTOR_SIZE) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("len {len} not a multiple of {SECTOR_SIZE}"),

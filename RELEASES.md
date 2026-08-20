@@ -24,7 +24,7 @@
 
 ### 已知限制(递延)
 
-- 多设备池(D5)顺延 M4;thread-per-core 每核 sled 视图 + 进一步零拷贝为 M5 性能冲刺;TLS/h2 经 ALPN 为 M4。
+- 多设备池(D5)顺延 M4;thread-per-core 每核 rocksdb 视图 + 进一步零拷贝为 M5 性能冲刺;TLS/h2 经 ALPN 为 M4。
 
 ## v0.2 — M1 S3 核心语义(2026-08-20)
 
@@ -55,4 +55,4 @@ S3 协议面完成:单机高性能 S3 服务可经标准客户端接入。
 
 ## v0.1 — M0 引擎 PoC(2026-08-19)
 
-- 裸设备/镜像文件 O_DIRECT 设备层;双缓冲检查点 + `a:`/`t:` 记录重放崩溃恢复;位图分配器(每核 hint 游标);sled 事务/组提交;64KiB chunk 流式写 + extent 边界切分;io_uring + pread 兜底;`fasts3d` CLI(init/put/get/del/ls/check/checkpoint/bench/serve);fio 基线 + 引擎基准回路;kill -9 CLI 崩溃 harness 50 轮零失败。
+- 裸设备/镜像文件 O_DIRECT 设备层;双缓冲检查点 + `a:`/`t:` 记录重放崩溃恢复;位图分配器(每核 hint 游标);rocksdb 事务/组提交;64KiB chunk 流式写 + extent 边界切分;io_uring + pread 兜底;`fasts3d` CLI(init/put/get/del/ls/check/checkpoint/bench/serve);fio 基线 + 引擎基准回路;kill -9 CLI 崩溃 harness 50 轮零失败。

@@ -631,9 +631,8 @@ impl S3Service {
         let mut engine = self.engine.write();
         engine
             .read_at(bucket, key, offset + *pos, &mut buf[..want])
-            .map(|n| {
+            .inspect(|&n| {
                 *pos += n as u64;
-                n
             })
             .map_err(|e| map_engine_error(e, bucket, key))
     }
@@ -813,7 +812,7 @@ impl S3Service {
         {
             return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
         }
-        // sled 前缀扫描天然按 key 字典序。
+        // rocksdb 前缀扫描天然按 key 字典序。
         let all = engine
             .list_objects(bucket, prefix)
             .map_err(|e| map_engine_error(e, bucket, ""))?;

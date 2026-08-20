@@ -88,6 +88,13 @@ cargo test                       # 单元 + 属性测试
 cargo clippy -- -D warnings
 cargo fmt --check
 
+# 构建前提:rust-rocksdb 构建期需要 libclang(bindgen)与 C++17 编译器(g++/clang++)
+# - Ubuntu/Debian: sudo apt install libclang-21-dev clang-21(或等价版本)
+# - 无 root 环境:下载 libclang*.deb 解压到本地目录,并设置:
+#     export LIBCLANG_PATH=$HOME/llvm-clang/lib
+#   bindgen 找不到 clang 内建头文件时,追加:
+#     export BINDGEN_EXTRA_CLANG_ARGS="-resource-dir=$HOME/llvm-clang/lib/clang/21"
+
 # Node 管理面 + 控制台
 cd web && pnpm install && pnpm -r build
 pnpm -r test

@@ -60,7 +60,7 @@ impl Rng {
 
 pub fn run(cfg: &fs3_engine::EngineConfig, args: BenchArgs) -> Result<()> {
     let block = parse_size(&args.block)?;
-    if block < SECTOR_SIZE || block % SECTOR_SIZE != 0 {
+    if block < SECTOR_SIZE || !block.is_multiple_of(SECTOR_SIZE) {
         return Err(Error::InvalidArgument(format!(
             "block {block} must be a multiple of {SECTOR_SIZE}"
         )));

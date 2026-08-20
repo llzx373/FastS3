@@ -1,7 +1,7 @@
 //! FastS3 空间分配器。
 //!
 //! - 内存位图(每 extent 1 bit)+ 引用计数数组(u32)(DESIGN §4.3);
-//! - 每核私有 hint 游标,位操作走 CAS(无锁近似);真正的原子性靠 sled 事务
+//! - 每核私有 hint 游标,位操作走 CAS(无锁近似);真正的原子性靠 rocksdb 事务
 //!   (ADR-4):变更先落内存位图并暂存(staged),随对象元数据同一事务提交;
 //!   事务失败则回滚;
 //! - 检查点:双缓冲槽,槽自含代数/序号/CRC(ADR-5),写满一个槽后切换;
@@ -23,7 +23,7 @@ thread_local! {
     static HINT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// 暂存的分配变更(随 sled 事务一并提交或回滚)。
+/// 暂存的分配变更(随 rocksdb 事务一并提交或回滚)。
 #[derive(Debug, Default, Clone)]
 pub struct Staged {
     pub alloc: Vec<(u64, u64)>, // (start, count) 新分配

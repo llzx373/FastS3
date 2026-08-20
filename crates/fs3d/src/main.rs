@@ -31,7 +31,7 @@ struct Cli {
     #[arg(long, global = true)]
     device: Option<PathBuf>,
 
-    /// sled 元数据目录
+    /// 元数据目录(rocksdb)
     #[arg(long, global = true)]
     meta_dir: Option<PathBuf>,
 

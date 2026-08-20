@@ -1,6 +1,6 @@
 [package]
 name = "fs3-meta"
-description = "FastS3 元数据:sled 封装、键编码/转义、事务与组提交"
+description = "FastS3 元数据:rocksdb 封装、键编码/转义、事务与组提交"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,7 +8,10 @@ rust-version.workspace = true
 
 [dependencies]
 fs3-core.workspace = true
-sled.workspace = true
+# backstore:rust-rocksdb(ADR-8)。default-features=false 剔除压缩库
+# (值已 postcard 编码,压缩收益有限;依赖最小化);bindgen-runtime 使
+# librocksdb-sys 构建期经 LIBCLANG_PATH 动态加载 libclang。
+rocksdb = { workspace = true, default-features = false, features = ["bindgen-runtime"] }
 serde.workspace = true
 postcard.workspace = true
 

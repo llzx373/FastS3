@@ -1,10 +1,23 @@
-//! sled 封装:打开/配置、键值编解码、事务与组提交(E1/E2)。
+//! rocksdb 封装:打开/配置、键值编解码、事务与组提交(E1/E2)。
+//!
+//! backstore 为 [rust-rocksdb](https://crates.io/crates/rocksdb) 的乐观事务
+//! (OptimisticTransactionDB):事务语义与 sled 一致(冲突自动重试、Abort 即
+//! 回滚),组提交窗口由后台线程按 `flush_every_ms` 批量 `flush_wal` 实现
+//! (ADR-8,替代 sled 内建 `flush_every_ms`)。
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use fs3_core::{AllocRecord, BucketMeta, Error, ExtentRef, ObjectMeta, Result, MAX_OBJECT_SIZE};
+use rocksdb::{
+    BlockBasedOptions, Cache, DBCompressionType, Direction, Error as RocksError, ErrorKind,
+    IteratorMode, OptimisticTransactionDB, OptimisticTransactionOptions, Options, Transaction,
+    WriteOptions,
+};
 use serde::{Deserialize, Serialize};
-use sled::transaction::ConflictableTransactionError;
 
 use crate::keys::*;
 
@@ -26,7 +39,7 @@ pub enum SyncMode {
 pub struct MetaConfig {
     pub flush_every_ms: u64,
     pub sync_mode: SyncMode,
-    /// sled 缓存容量(字节);None = sled 默认。
+    /// rocksdb block cache 容量(字节);None = rocksdb 默认。
     pub cache_capacity: Option<u64>,
 }
 
@@ -180,17 +193,79 @@ pub enum Op {
     },
 }
 
-pub struct MetaStore {
-    db: sled::Db,
-    sync_mode: SyncMode,
+/// 组提交刷盘线程(sled `flush_every_ms` 语义的 rocksdb 等价物,ADR-8)。
+///
+/// rocksdb 无内建"每 N ms 刷 WAL"定时器;开启 `manual_wal_flush` 后 WAL 写入
+/// 停留在内存缓冲,由本线程每 `flush_every_ms` 调用一次 `flush_wal(true)`
+/// (write + fsync)批量落盘。窗口内 kill -9 的数据丢失语义与 sled 一致。
+struct Flusher {
+    stop: Arc<AtomicBool>,
+    wake: Arc<(Mutex<()>, Condvar)>,
+    join: Option<JoinHandle<()>>,
 }
 
-/// sled 事务闭包的返回类型。
-type TxnResult<T> = std::result::Result<T, ConflictableTransactionError<Error>>;
+impl Flusher {
+    fn spawn(db: Arc<OptimisticTransactionDB>, every_ms: u64) -> Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new((Mutex::new(()), Condvar::new()));
+        let (s, w) = (stop.clone(), wake.clone());
+        let join = std::thread::Builder::new()
+            .name("fs3-meta-flusher".to_string())
+            .spawn(move || {
+                let (m, cv) = &*w;
+                loop {
+                    let guard = m.lock().unwrap();
+                    let (guard, _) = cv
+                        .wait_timeout(guard, Duration::from_millis(every_ms))
+                        .unwrap();
+                    drop(guard);
+                    if s.load(Ordering::Acquire) {
+                        break;
+                    }
+                    // 组提交窗口到期:WAL 批量 write + fsync
+                    if let Err(e) = db.flush_wal(true) {
+                        // 刷盘失败不 panic:下一窗口重试,调用方仍可显式 flush
+                        eprintln!("fs3-meta: flush_wal failed: {e}");
+                    }
+                }
+            })
+            .map_err(|e| Error::Meta(format!("spawn flusher thread: {e}")))?;
+        Ok(Flusher {
+            stop,
+            wake,
+            join: Some(join),
+        })
+    }
+}
 
-/// sled 错误 → fs3 Error。
-fn sled_err(e: sled::Error) -> Error {
-    Error::Meta(format!("sled: {e}"))
+impl Drop for Flusher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let (m, cv) = &*self.wake;
+        let _g = m.lock().unwrap();
+        cv.notify_all();
+        drop(_g);
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
+}
+
+pub struct MetaStore {
+    db: Arc<OptimisticTransactionDB>,
+    sync_mode: SyncMode,
+    /// 事务提交写选项(None 模式 disable WAL)。
+    write_opts: WriteOptions,
+    /// 乐观事务选项:事务开始即取快照,读集参与提交冲突检测。
+    txn_opts: OptimisticTransactionOptions,
+    /// 组提交刷盘线程句柄:仅靠 Drop 停止/回收线程(字段本身不读取)。
+    #[allow(dead_code)]
+    flusher: Option<Flusher>,
+}
+
+/// rocksdb 错误 → fs3 Error。
+fn rocks_err(e: RocksError) -> Error {
+    Error::Meta(format!("rocksdb: {e}"))
 }
 
 /// postcard(serde 原生,积极维护)编码。
@@ -215,6 +290,19 @@ fn decode_alloc(v: &[u8]) -> Result<AllocRecord> {
     decode(v).map_err(|e| Error::Corrupt(format!("alloc record: {e}")))
 }
 
+/// 前缀扫描(惰性迭代;调用方 break 即停止)。
+fn scan_prefix<'a>(
+    db: &'a OptimisticTransactionDB,
+    prefix: &'a [u8],
+) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a {
+    db.iterator(IteratorMode::From(prefix, Direction::Forward))
+        .map_while(|item| match item {
+            Ok((k, v)) if k.starts_with(prefix) => Some(Ok((k.to_vec(), v.to_vec()))),
+            Ok(_) => None,
+            Err(e) => Some(Err(rocks_err(e))),
+        })
+}
+
 /// 分页列举结果(delimiter 分组后;`last_scanned` 为游标,供续扫)。
 #[derive(Debug, Clone, Default)]
 pub struct ListPage {
@@ -228,25 +316,50 @@ pub struct ListPage {
 impl MetaStore {
     pub fn open(dir: &Path, cfg: &MetaConfig) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
-        let mut c = sled::Config::new().path(dir).flush_every_ms(Some(
-            if cfg.sync_mode == SyncMode::None {
-                0
-            } else {
-                cfg.flush_every_ms
-            },
-        ));
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        // 元数据值已由 postcard 编码且含大量内联小对象,压缩收益有限;
+        // 保持确定性,不依赖可选压缩库(依赖最小化,ADR-8)。
+        opts.set_compression_type(DBCompressionType::None);
         if let Some(cap) = cfg.cache_capacity {
-            c = c.cache_capacity(cap);
+            let cache = Cache::new_lru_cache(cap as usize);
+            let mut block_opts = BlockBasedOptions::default();
+            block_opts.set_block_cache(&cache);
+            opts.set_block_based_table_factory(&block_opts);
         }
-        let db = c.open().map_err(sled_err)?;
+        let mut write_opts = WriteOptions::new();
+        let mut txn_opts = OptimisticTransactionOptions::new();
+        // 快照读:事务内读集参与提交冲突检测,等价 sled 事务冲突集。
+        txn_opts.set_snapshot(true);
+        match cfg.sync_mode {
+            SyncMode::Group => {
+                // WAL 写入缓冲在内存,由后台线程按窗口批量落盘(ADR-8)
+                opts.set_manual_wal_flush(true);
+            }
+            SyncMode::None => {
+                // 纯内存语义:跳过 WAL,数据仅存 memtable(崩溃即丢,HA 层兜底)
+                write_opts.disable_wal(true);
+            }
+            SyncMode::Full => {}
+        }
+        let db = Arc::new(OptimisticTransactionDB::open(&opts, dir).map_err(rocks_err)?);
+        let flusher = if cfg.sync_mode == SyncMode::Group && cfg.flush_every_ms > 0 {
+            Some(Flusher::spawn(db.clone(), cfg.flush_every_ms)?)
+        } else {
+            None
+        };
         Ok(MetaStore {
             db,
             sync_mode: cfg.sync_mode,
+            write_opts,
+            txn_opts,
+            flusher,
         })
     }
 
+    /// 显式落盘:WAL write + fsync(组提交窗口外的确定性刷盘)。
     pub fn flush(&self) -> Result<()> {
-        self.db.flush().map(|_| ()).map_err(sled_err)
+        self.db.flush_wal(true).map_err(rocks_err)
     }
 
     pub fn sync_mode(&self) -> SyncMode {
@@ -256,14 +369,14 @@ impl MetaStore {
     // —— 读路径 ——
 
     pub fn get_bucket(&self, name: &str) -> Result<Option<BucketMeta>> {
-        match self.db.get(bucket_key(name)).map_err(sled_err)? {
+        match self.db.get(bucket_key(name)).map_err(rocks_err)? {
             Some(v) => Ok(Some(decode_bucket(&v)?)),
             None => Ok(None),
         }
     }
 
     pub fn get_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>> {
-        match self.db.get(object_key(bucket, key)).map_err(sled_err)? {
+        match self.db.get(object_key(bucket, key)).map_err(rocks_err)? {
             Some(v) => Ok(Some(decode_object(&v)?)),
             None => Ok(None),
         }
@@ -271,8 +384,8 @@ impl MetaStore {
 
     pub fn list_buckets(&self) -> Result<Vec<(String, BucketMeta)>> {
         let mut out = Vec::new();
-        for item in self.db.scan_prefix(PREFIX_BUCKET) {
-            let (k, v) = item.map_err(sled_err)?;
+        for item in scan_prefix(&self.db, PREFIX_BUCKET) {
+            let (k, v) = item?;
             let name = String::from_utf8(k.strip_prefix(PREFIX_BUCKET).unwrap_or(&k).to_vec())
                 .map_err(|_| Error::Corrupt("bucket name not utf8".into()))?;
             out.push((name, decode_bucket(&v)?));
@@ -284,9 +397,12 @@ impl MetaStore {
     pub fn list_objects(&self, bucket: &str, prefix: &str) -> Result<Vec<(String, ObjectMeta)>> {
         let mut out = Vec::new();
         let start = object_prefix(bucket);
-        for item in self.db.range(start..) {
-            let (k, v) = item.map_err(sled_err)?;
-            if !k.starts_with(&object_prefix(bucket)) {
+        for item in self
+            .db
+            .iterator(IteratorMode::From(start.as_slice(), Direction::Forward))
+        {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(&start) {
                 break;
             }
             let (b, key) = parse_object_key(&k)?;
@@ -314,13 +430,13 @@ impl MetaStore {
         let mut page = ListPage::default();
         let base = object_prefix(bucket);
         let after_esc = after.map(|a| escape(a.as_bytes()));
-        let start: sled::IVec = match &after_esc {
+        let start: Vec<u8> = match &after_esc {
             Some(a) => {
                 let mut k = base.clone();
                 k.extend_from_slice(a);
-                k.into()
+                k
             }
-            None => base.clone().into(),
+            None => base,
         };
         // 注意:游标过滤在条目空间进行(见下),range 起点仅作扫描优化;
         // 裸键与完整键的字节比较不一致会导致游标失效,故不再直接比较 k。
@@ -330,9 +446,12 @@ impl MetaStore {
         // 续页会跳过一条(s3-tests: test_bucket_listv2_continuationtoken)。
         let mut last_emitted: Option<String> = None;
         let mut last_entry: Option<String> = None;
-        for item in self.db.range(start..) {
-            let (k, v) = item.map_err(sled_err)?;
-            if !k.starts_with(&base) {
+        for item in self
+            .db
+            .iterator(IteratorMode::From(start.as_slice(), Direction::Forward))
+        {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(&object_prefix(bucket)) {
                 break;
             }
             let (b, key) = parse_object_key(&k)?;
@@ -390,8 +509,8 @@ impl MetaStore {
     /// 列出 seq > after 的全部分配记录(恢复重放)。
     pub fn list_alloc_records(&self, after: u64) -> Result<Vec<AllocRecord>> {
         let mut out = Vec::new();
-        for item in self.db.scan_prefix(PREFIX_ALLOC) {
-            let (k, v) = item.map_err(sled_err)?;
+        for item in scan_prefix(&self.db, PREFIX_ALLOC) {
+            let (k, v) = item?;
             let seq = parse_alloc_seq(&k)?;
             if seq > after {
                 out.push(decode_alloc(&v)?);
@@ -405,28 +524,50 @@ impl MetaStore {
         Ok(self
             .db
             .get(SYS_SEQ)
-            .map_err(sled_err)?
-            .map(|v| u64::from_be_bytes(v.as_ref().try_into().unwrap()))
+            .map_err(rocks_err)?
+            .map(|v| u64::from_be_bytes(v.as_slice().try_into().unwrap()))
             .unwrap_or(0))
     }
 
-    // —— 写路径(全部走 sled 事务) ——
+    // —— 写路径(全部走 rocksdb 乐观事务) ——
 
-    /// 应用一组 Op(单个 sled 事务,原子;冲突自动重试)。
+    /// 应用一组 Op(单个乐观事务,原子;提交冲突自动重试)。
     ///
     /// 返回本次事务序号(新 s:seq 值)。
     pub fn commit(&self, ops: &[Op]) -> Result<u64> {
-        let seq = self
-            .db
-            .transaction(|tree| apply_ops(tree, ops))
-            .map_err(|e| match e {
-                sled::transaction::TransactionError::Abort(a) => a,
-                sled::transaction::TransactionError::Storage(e) => sled_err(e),
-            })?;
-        if self.sync_mode == SyncMode::Full {
-            self.flush()?;
+        // 冲突重试上限:引擎写路径已由全局锁串行,此处主要覆盖测试/多引擎
+        // 并发;上限仅为防御性,正常路径远达不到。
+        const MAX_TXN_RETRIES: u32 = 10_000;
+        let mut retries = 0u32;
+        loop {
+            let tx = self.db.transaction_opt(&self.write_opts, &self.txn_opts);
+            let seq = match apply_ops(&tx, ops) {
+                Ok(seq) => seq,
+                Err(e) => {
+                    tx.rollback().map_err(rocks_err)?;
+                    return Err(e);
+                }
+            };
+            match tx.commit() {
+                Ok(()) => {
+                    if self.sync_mode == SyncMode::Full {
+                        // Full:每事务显式 fsync
+                        self.db.flush_wal(true).map_err(rocks_err)?;
+                    }
+                    return Ok(seq);
+                }
+                Err(e) if e.kind() == ErrorKind::Busy || e.kind() == ErrorKind::TryAgain => {
+                    retries += 1;
+                    if retries > MAX_TXN_RETRIES {
+                        return Err(Error::Meta(format!(
+                            "rocksdb txn retries exhausted after {MAX_TXN_RETRIES}: {e}"
+                        )));
+                    }
+                    continue;
+                }
+                Err(e) => return Err(rocks_err(e)),
+            }
         }
-        Ok(seq)
     }
 
     /// 桶 PUT(创建/更新)。
@@ -505,7 +646,7 @@ impl MetaStore {
     }
 
     pub fn get_multipart(&self, upload_id: &str) -> Result<Option<MultipartSession>> {
-        match self.db.get(session_key(upload_id)).map_err(sled_err)? {
+        match self.db.get(session_key(upload_id)).map_err(rocks_err)? {
             Some(v) => Ok(Some(decode(&v)?)),
             None => Ok(None),
         }
@@ -544,7 +685,7 @@ impl MetaStore {
         match self
             .db
             .get(part_key(upload_id, part_no))
-            .map_err(sled_err)?
+            .map_err(rocks_err)?
         {
             Some(v) => Ok(Some(decode(&v)?)),
             None => Ok(None),
@@ -554,8 +695,9 @@ impl MetaStore {
     /// 按分片号升序列出全部已上传分片。
     pub fn list_parts(&self, upload_id: &str) -> Result<Vec<(u32, PartMeta)>> {
         let mut out = Vec::new();
-        for item in self.db.scan_prefix(part_prefix(upload_id)) {
-            let (k, v) = item.map_err(sled_err)?;
+        let prefix = part_prefix(upload_id);
+        for item in scan_prefix(&self.db, &prefix) {
+            let (k, v) = item?;
             let part_no = parse_part_key(&k)?;
             out.push((part_no, decode(&v)?));
         }
@@ -565,8 +707,8 @@ impl MetaStore {
     /// 会话过期清理辅助:列出全部会话(u: 前缀扫描)。
     pub fn list_all_sessions(&self) -> Result<Vec<(String, MultipartSession)>> {
         let mut out = Vec::new();
-        for item in self.db.scan_prefix(PREFIX_UPLOAD) {
-            let (k, v) = item.map_err(sled_err)?;
+        for item in scan_prefix(&self.db, PREFIX_UPLOAD) {
+            let (k, v) = item?;
             let uid = String::from_utf8(
                 k.strip_prefix(PREFIX_UPLOAD)
                     .ok_or_else(|| Error::Corrupt("upload key missing prefix".into()))?
@@ -588,8 +730,9 @@ impl MetaStore {
     ) -> Result<Vec<(String, MultipartSession)>> {
         let mut out = Vec::new();
         let mut scanned = 0usize;
-        'outer: for item in self.db.scan_prefix(session_index_prefix(bucket)) {
-            let (k, _) = item.map_err(sled_err)?;
+        let index_prefix = session_index_prefix(bucket);
+        'outer: for item in scan_prefix(&self.db, &index_prefix) {
+            let (k, _) = item?;
             let uid = parse_session_index_key(&k)?;
             let sess = match self.get_multipart(&uid)? {
                 Some(s) => s,
@@ -670,38 +813,25 @@ impl MetaStore {
     }
 }
 
-fn apply_ops(tree: &sled::transaction::TransactionalTree, ops: &[Op]) -> TxnResult<u64> {
-    // sled 事务闭包内,树操作错误需显式包装(无 From impl)。
-    use sled::transaction::UnabortableTransactionError;
-    fn map_unabort(e: UnabortableTransactionError) -> ConflictableTransactionError<Error> {
-        match e {
-            UnabortableTransactionError::Storage(s) => ConflictableTransactionError::Storage(s),
-            UnabortableTransactionError::Conflict => ConflictableTransactionError::Conflict,
-        }
-    }
-    fn tget(
-        tree: &sled::transaction::TransactionalTree,
-        key: &[u8],
-    ) -> TxnResult<Option<sled::IVec>> {
-        tree.get(key).map_err(map_unabort)
+fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u64> {
+    // rocksdb 事务闭包内操作失败 → 整体 Err → 回滚(调用方 commit 不执行)。
+    fn tget(tx: &Transaction<OptimisticTransactionDB>, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        tx.get(key).map_err(rocks_err)
     }
     fn tinsert(
-        tree: &sled::transaction::TransactionalTree,
-        key: impl AsRef<[u8]> + Into<sled::IVec>,
-        value: impl Into<sled::IVec>,
-    ) -> TxnResult<()> {
-        tree.insert(key, value).map(|_| ()).map_err(map_unabort)
+        tx: &Transaction<OptimisticTransactionDB>,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> Result<()> {
+        tx.put(key, value).map_err(rocks_err)
     }
-    fn tremove(
-        tree: &sled::transaction::TransactionalTree,
-        key: &[u8],
-    ) -> TxnResult<Option<sled::IVec>> {
-        tree.remove(key).map_err(map_unabort)
+    fn tremove(tx: &Transaction<OptimisticTransactionDB>, key: &[u8]) -> Result<()> {
+        tx.delete(key).map_err(rocks_err)
     }
 
-    // 单点序列化:读 s:seq → 写 s:seq+1;并发事务在此冲突并重试
-    let cur = tget(tree, SYS_SEQ)?
-        .map(|v| u64::from_be_bytes(v.as_ref().try_into().unwrap()))
+    // 单点序列化:读 s:seq → 写 s:seq+1;并发事务在提交时冲突并重试
+    let cur = tget(tx, SYS_SEQ)?
+        .map(|v| u64::from_be_bytes(v.as_slice().try_into().unwrap()))
         .unwrap_or(0);
     let seq = cur + 1;
 
@@ -710,36 +840,30 @@ fn apply_ops(tree: &sled::transaction::TransactionalTree, ops: &[Op]) -> TxnResu
             Op::BucketPut { name, meta } => {
                 let k = bucket_key(name);
                 // 读以建立冲突集(并发修改则重试)
-                tget(tree, &k)?;
-                tinsert(tree, k, encode(meta).unwrap())?;
+                tget(tx, &k)?;
+                tinsert(tx, k, encode(meta)?)?;
             }
             Op::BucketDelete { name } => {
                 let k = bucket_key(name);
-                if tget(tree, &k)?.is_none() {
-                    return Err(ConflictableTransactionError::Abort(Error::NotFound(
-                        format!("bucket {name}"),
-                    )));
+                if tget(tx, &k)?.is_none() {
+                    return Err(Error::NotFound(format!("bucket {name}")));
                 }
-                tremove(tree, &k)?;
+                tremove(tx, &k)?;
             }
             Op::ObjectPut { bucket, key, meta } => {
-                if tget(tree, &bucket_key(bucket))?.is_none() {
-                    return Err(ConflictableTransactionError::Abort(Error::NotFound(
-                        format!("bucket {bucket}"),
-                    )));
+                if tget(tx, &bucket_key(bucket))?.is_none() {
+                    return Err(Error::NotFound(format!("bucket {bucket}")));
                 }
                 let k = object_key(bucket, key);
-                tget(tree, &k)?;
-                tinsert(tree, k, encode(meta).unwrap())?;
+                tget(tx, &k)?;
+                tinsert(tx, k, encode(meta)?)?;
             }
             Op::ObjectDelete { bucket, key } => {
                 let k = object_key(bucket, key);
-                if tget(tree, &k)?.is_none() {
-                    return Err(ConflictableTransactionError::Abort(Error::NotFound(
-                        format!("object {bucket}/{key}"),
-                    )));
+                if tget(tx, &k)?.is_none() {
+                    return Err(Error::NotFound(format!("object {bucket}/{key}")));
                 }
-                tremove(tree, &k)?;
+                tremove(tx, &k)?;
             }
             Op::Alloc { draft } => {
                 if !draft.is_empty() {
@@ -750,38 +874,34 @@ fn apply_ops(tree: &sled::transaction::TransactionalTree, ops: &[Op]) -> TxnResu
                         ref_inc: draft.ref_inc.clone(),
                         ref_dec: draft.ref_dec.clone(),
                     };
-                    tinsert(tree, alloc_key(seq), encode(&rec).unwrap())?;
-                    tinsert(tree, txn_key(seq), &seq.to_be_bytes())?;
+                    tinsert(tx, alloc_key(seq), encode(&rec)?)?;
+                    tinsert(tx, txn_key(seq), seq.to_be_bytes().to_vec())?;
                 }
             }
             Op::Stats { bucket, delta } => {
                 let k = bucket_key(bucket);
-                let mut meta = match tget(tree, &k)? {
-                    Some(v) => decode_bucket(&v).map_err(ConflictableTransactionError::Abort)?,
+                let mut meta = match tget(tx, &k)? {
+                    Some(v) => decode_bucket(&v)?,
                     None => {
-                        return Err(ConflictableTransactionError::Abort(Error::NotFound(
-                            format!("bucket {bucket}"),
-                        )))
+                        return Err(Error::NotFound(format!("bucket {bucket}")));
                     }
                 };
                 meta.stats.objects =
                     (meta.stats.objects as i128 + delta.objects as i128).max(0) as u64;
                 meta.stats.bytes = (meta.stats.bytes as i128 + delta.bytes as i128).max(0) as u64;
-                tinsert(tree, k, encode(&meta).unwrap())?;
+                tinsert(tx, k, encode(&meta)?)?;
             }
             Op::MultipartCreate { upload_id, session } => {
                 // 桶必须存在
-                if tget(tree, &bucket_key(&session.bucket))?.is_none() {
-                    return Err(ConflictableTransactionError::Abort(Error::NotFound(
-                        format!("bucket {}", session.bucket),
-                    )));
+                if tget(tx, &bucket_key(&session.bucket))?.is_none() {
+                    return Err(Error::NotFound(format!("bucket {}", session.bucket)));
                 }
                 let uk = session_key(upload_id);
-                tget(tree, &uk)?;
-                tinsert(tree, uk, encode(session).unwrap())?;
+                tget(tx, &uk)?;
+                tinsert(tx, uk, encode(session)?)?;
                 let mk = session_index_key(&session.bucket, upload_id);
-                tget(tree, &mk)?;
-                tinsert(tree, mk, Vec::<u8>::new())?;
+                tget(tx, &mk)?;
+                tinsert(tx, mk, Vec::<u8>::new())?;
             }
             Op::MultipartUpdate {
                 upload_id,
@@ -791,32 +911,24 @@ fn apply_ops(tree: &sled::transaction::TransactionalTree, ops: &[Op]) -> TxnResu
                 final_mtime,
             } => {
                 let uk = session_key(upload_id);
-                let cur = tget(tree, &uk)?.ok_or_else(|| {
-                    ConflictableTransactionError::Abort(Error::NotFound(format!(
-                        "upload {upload_id}"
-                    )))
-                })?;
-                let mut sess: MultipartSession =
-                    decode(&cur).map_err(ConflictableTransactionError::Abort)?;
+                let cur =
+                    tget(tx, &uk)?.ok_or_else(|| Error::NotFound(format!("upload {upload_id}")))?;
+                let mut sess: MultipartSession = decode(&cur)?;
                 sess.completed = *completed;
                 sess.final_etag = *final_etag;
                 sess.final_size = *final_size;
                 sess.final_mtime = *final_mtime;
-                tinsert(tree, uk, encode(&sess).unwrap())?;
+                tinsert(tx, uk, encode(&sess)?)?;
             }
             Op::MultipartDelete { upload_id } => {
                 let uk = session_key(upload_id);
-                let cur = tget(tree, &uk)?.ok_or_else(|| {
-                    ConflictableTransactionError::Abort(Error::NotFound(format!(
-                        "upload {upload_id}"
-                    )))
-                })?;
-                let sess: MultipartSession =
-                    decode(&cur).map_err(ConflictableTransactionError::Abort)?;
-                tremove(tree, &uk)?;
+                let cur =
+                    tget(tx, &uk)?.ok_or_else(|| Error::NotFound(format!("upload {upload_id}")))?;
+                let sess: MultipartSession = decode(&cur)?;
+                tremove(tx, &uk)?;
                 let mk = session_index_key(&sess.bucket, upload_id);
-                tget(tree, &mk)?;
-                tremove(tree, &mk)?;
+                tget(tx, &mk)?;
+                tremove(tx, &mk)?;
             }
             Op::PartPut {
                 upload_id,
@@ -824,24 +936,22 @@ fn apply_ops(tree: &sled::transaction::TransactionalTree, ops: &[Op]) -> TxnResu
                 meta,
             } => {
                 // 会话必须存在(NoSuchUpload 语义)
-                if tget(tree, &session_key(upload_id))?.is_none() {
-                    return Err(ConflictableTransactionError::Abort(Error::NotFound(
-                        format!("upload {upload_id}"),
-                    )));
+                if tget(tx, &session_key(upload_id))?.is_none() {
+                    return Err(Error::NotFound(format!("upload {upload_id}")));
                 }
                 let pk = part_key(upload_id, *part_no);
-                tget(tree, &pk)?;
-                tinsert(tree, pk, encode(meta).unwrap())?;
+                tget(tx, &pk)?;
+                tinsert(tx, pk, encode(meta)?)?;
             }
             Op::PartDelete { key } => {
-                if tget(tree, key)?.is_some() {
-                    tremove(tree, key)?;
+                if tget(tx, key)?.is_some() {
+                    tremove(tx, key)?;
                 }
             }
         }
     }
 
-    tinsert(tree, SYS_SEQ, &seq.to_be_bytes())?;
+    tinsert(tx, SYS_SEQ.to_vec(), seq.to_be_bytes().to_vec())?;
     Ok(seq)
 }
 
@@ -1029,6 +1139,70 @@ mod tests {
         .unwrap();
         assert!(s.list_objects("b2", "").unwrap().is_empty());
         assert_eq!(s.list_objects("b", "").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sync_modes_full_and_none_work() {
+        // Full:每事务 fsync;None:禁用 WAL(纯 memtable)。两条路径的基本
+        // 读写、seq 推进、flush 幂等都必须正常。
+        for mode in [SyncMode::Full, SyncMode::None] {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = MetaConfig {
+                flush_every_ms: 1,
+                sync_mode: mode,
+                cache_capacity: None,
+            };
+            let s = MetaStore::open(dir.path(), &cfg).unwrap();
+            assert_eq!(s.sync_mode(), mode);
+            s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+            s.commit_object_put(
+                "b1",
+                "k",
+                &object_meta(5),
+                AllocDraft::default(),
+                StatsDelta {
+                    objects: 1,
+                    bytes: 5,
+                },
+            )
+            .unwrap();
+            assert_eq!(s.last_seq().unwrap(), 2);
+            assert!(s.get_object("b1", "k").unwrap().is_some());
+            // None 模式 WAL 已禁用:flush 为空操作,不得报错
+            s.flush().unwrap();
+            assert_eq!(s.list_alloc_records(0).unwrap().len(), 0);
+        }
+    }
+
+    #[test]
+    fn reopen_persists_data() {
+        // rocksdb WAL 恢复:重开目录后数据完整、seq 延续
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let s = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
+            s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+            s.commit_object_put(
+                "b1",
+                "k",
+                &object_meta(7),
+                AllocDraft {
+                    alloc: vec![(1, 1)],
+                    ..Default::default()
+                },
+                StatsDelta {
+                    objects: 1,
+                    bytes: 7,
+                },
+            )
+            .unwrap();
+        } // drop → rocksdb 关闭时刷 WAL
+        let s = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
+        assert!(s.get_bucket("b1").unwrap().is_some());
+        assert_eq!(s.get_object("b1", "k").unwrap().unwrap().size, 7);
+        assert_eq!(s.last_seq().unwrap(), 2);
+        let recs = s.list_alloc_records(0).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].alloc, vec![(1, 1)]);
     }
 
     #[test]

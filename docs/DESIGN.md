@@ -112,13 +112,13 @@
         │  │      │             │        │   │   │ 密钥/策略/状态/修复 │  │ │
         │  │  ┌───▼────┐  ┌─────▼──────┐ │   │   └─────────┬───────────┘  │ │
         │  │  │ 元数据 │  │ io_uring   │ │   │             │              │ │
-        │  │  │ sled   │  │ 每核 ring  │ │   │             │              │ │
-        │  │  │ B+树   │  │ O_DIRECT   │ │   └─────────────┼──────────────┘ │
+        │  │  │ rocksdb│  │ 每核 ring  │ │   │             │              │ │
+        │  │  │ LSM    │  │ O_DIRECT   │ │   └─────────────┼──────────────┘ │
         │  │  └───┬────┘  └─────┬──────┘ │                 │                │
         │  └──────┼─────────────┼────────┘                 │                │
         │         │ 文件        │ 裸块设备                  │                │
         │  ┌──────▼─────┐  ┌────▼───────────────────────────────┐           │
-        │  │ meta.sled  │  │ /dev/nvme0n1 或 磁盘镜像文件        │           │
+        │  │ rocksdb    │  │ /dev/nvme0n1 或 磁盘镜像文件        │           │
         │  │ (OS 文件系  │  │ [超块|检查点|数据区 extent...]     │           │
         │  │  统上)     │  │ 4KiB 对齐,O_DIRECT 访问            │           │
         │  └────────────┘  └────────────────────────────────────┘           │
@@ -132,7 +132,7 @@
 | --- | --- | --- |
 | `fasts3d` | Rust | 数据面唯一入口:S3 HTTP 服务 + 存储引擎 + 管理 API + 指标导出 |
 | `fs3-storage` | Rust | 设备抽象(裸设备/镜像文件)、extent 分配器、读写路径、CRC |
-| `fs3-meta` | Rust | 元数据存储(sled B+ 树)、键编码、事务与组提交 |
+| `fs3-meta` | Rust | 元数据存储(rocksdb LSM)、键编码、事务与组提交 |
 | `fs3-s3` | Rust | S3 协议:SigV4 鉴权、XML 编解码、错误码、虚拟主机路由 |
 | `fasts3-web` | Node.js | 管理面:Fastify REST/WS API + React 控制台静态资源 |
 | 管理 API(Rust 内) | Rust | 密钥 CRUD、桶管理、状态/容量/上传任务查询、修复工具入口 |
@@ -151,9 +151,9 @@
 
 | 选择 | 理由 |
 | --- | --- |
-| Rust(数据面) | 无 GC、零成本抽象、内存安全;`io_uring`/`sled`/`rustls` 生态成熟;单一静态二进制易分发 |
+| Rust(数据面) | 无 GC、零成本抽象、内存安全;`io_uring`/`rocksdb`/`rustls` 生态成熟;单一静态二进制易分发 |
 | io_uring | 提交/完成批量化、免系统调用风暴、支持 registered buffers/files;是榨干 NVMe 的唯一正道(见 §6) |
-| sled(元数据) | 纯 Rust 内嵌 B+ 树,自带组提交 `flush_every_ms`,前缀扫描支撑桶列举;避免外部进程(SQLite 亦可,见 ADR-3) |
+| rocksdb(元数据) | C++ 嵌入式 LSM,生产级成熟度(Meta 广泛部署),前缀扫描支撑桶列举;乐观事务保留 sled 式冲突重试,组提交窗口由后台线程复刻(ADR-8);避免外部进程(SQLite 亦可,见 ADR-3) |
 | Node.js(管理面) | 用户指定的技术栈;管理面不承担数据热路径,Node 的生态与开发效率是优势 |
 | React + Vite(控制台) | 成熟 SPA 方案,产出纯静态资源,可被 Rust 内嵌托管 |
 | Fastify(Node 侧) | 高吞吐、TS 友好、插件生态(相比 Express 更轻快) |
@@ -169,8 +169,8 @@
 ### 3.2 由此推出的四条核心决策
 
 1. **数据只写一份,直接落盘,零复制/零 EC。** 单副本即最终副本,写放大 = 1。
-2. **数据路径全程 O_DIRECT,永不进页缓存。** 页缓存是给通用文件系统用的;对 S3 对象写后即读、鲜有重读的场景,页缓存 = 二次拷贝 + 额外内存 + 失效风暴。元数据(热、小、随机)才需要缓存,由 sled 在用户态自己管理。
-3. **一致性由"元数据单点序列化"给出,而非分布式协议。** 所有对象可见性由 sled 事务的提交顺序定义:提交前不可见,提交后全局可见。给出 **强 read-after-write 一致性**(PUT 200 之后,任何连接立刻 GET 得到,列表立即可见)——比 S3 官方语义更强,客户端零惊讶。
+2. **数据路径全程 O_DIRECT,永不进页缓存。** 页缓存是给通用文件系统用的;对 S3 对象写后即读、鲜有重读的场景,页缓存 = 二次拷贝 + 额外内存 + 失效风暴。元数据(热、小、随机)才需要缓存,由 rocksdb 在用户态自己管理。
+3. **一致性由"元数据单点序列化"给出,而非分布式协议。** 所有对象可见性由 rocksdb 事务的提交顺序定义:提交前不可见,提交后全局可见。给出 **强 read-after-write 一致性**(PUT 200 之后,任何连接立刻 GET 得到,列表立即可见)——比 S3 官方语义更强,客户端零惊讶。
 4. **崩溃模型 = 进程崩溃,不负责介质损坏。** 底层介质可靠性由用户承诺的 HA 存储负责;我们负责的是:进程在任何时刻被 kill -9 后,**不产生撕裂对象、不丢已应答数据、空间账目不漂移**。
 
 ### 3.3 关键决策记录(ADR)
@@ -195,13 +195,13 @@ glommio / monoio / tokio-uring 各有拥趸,但本设计将存储 I/O **完全�
 
 因此运行时是可替换的实现细节。**开发期默认 tokio-uring(与 hyper 集成最省力,先求正确);M5 性能冲刺阶段对照 glommio/monoio 做 A/B 实测**,谁快且稳就用谁,引擎代码一行不改。
 
-#### ADR-3:元数据放 OS 文件系统上的 sled 文件,而非设备内区域
+#### ADR-3:元数据放 OS 文件系统上的 rocksdb 文件,而非设备内区域
 
-把 KV 存储直接放进裸设备需要自研"设备内微型文件系统"(参考 Ceph BlueFS 的复杂度),V1 不划算。sled 文件落在根分区/专用小分区上,底层同样受 HA 存储保护;其组提交 fsync 的延迟被批量化摊销。若 M5 实测发现元数据 fsync 成为瓶颈,再评估设备内元数据区(预留了升级路径,见 §4.2 布局中的保留区)。
+把 KV 存储直接放进裸设备需要自研"设备内微型文件系统"(参考 Ceph BlueFS 的复杂度),V1 不划算。rocksdb 文件落在根分区/专用小分区上,底层同样受 HA 存储保护;其组提交 fsync 的延迟被批量化摊销(ADR-8)。若 M5 实测发现元数据 fsync 成为瓶颈,再评估设备内元数据区(预留了升级路径,见 §4.2 布局中的保留区)。
 
 #### ADR-4:分配器状态与对象元数据同事务,单一事实源
 
-extent 分配/释放记录直接作为 sled 事务的一部分提交,位图仅定期检查点化到设备(双缓冲 + 代数)。好处:崩溃恢复逻辑极简(见 §4.10),不存在"设备日志与元数据两本账对不上"的问题。
+extent 分配/释放记录直接作为 rocksdb 事务的一部分提交,位图仅定期检查点化到设备(双缓冲 + 代数)。好处:崩溃恢复逻辑极简(见 §4.10),不存在"设备日志与元数据两本账对不上"的问题。
 
 #### ADR-5(M0 实现确认):检查点代数、分配记录扩展与恢复语义
 
@@ -211,7 +211,7 @@ M0 实现将以下设计点具体化,经 50 轮 kill -9 崩溃 harness 验证(AD
 2. **`a:` 记录扩展为 `alloc/ref_inc/ref_dec`**(设计 §16 仅有 alloc/free 区间):`alloc` 置位且引用计数 = 1;`ref_inc` 引用计数 +1(COW 复制,位图不变);`ref_dec` 引用计数 -1,归零者清位。这使引用计数也可由重放恢复。
 3. **恢复语义**(§4.10 步骤 3-5 的具体化):位图由"检查点 + seq 之后 `a:` 重放"恢复(权威);引用计数由**全量元数据可达性扫描重建**(mark 阶段,与泄漏扫描同一遍)。重放中的 `ref_dec` 对"检查点前已释放"的 extent 幂等跳过。
 4. **系统键 `s:seq`**(键表新增):每个事务读 `s:seq` 写 `s:seq+1`,作为单点序列化与 `a:`/`t:` 记录序号来源(事务冲突自动重试)。
-5. **值序列化用 postcard**:bincode 已无人维护(RUSTSEC-2025-0141),postcard(serde 原生、积极维护)替代;键布局不受影响。剩余 audit 告警均为 sled/postcard 传递依赖的"unmaintained"信息级告警,无实际漏洞。
+5. **值序列化用 postcard**:bincode 已无人维护(RUSTSEC-2025-0141),postcard(serde 原生、积极维护)替代;键布局不受影响。剩余 audit 告警均为 postcard 传递依赖的"unmaintained"信息级告警,无实际漏洞;sled 的同类告警随 ADR-8 替换 backstore 一并消除。
 
 #### ADR-6(M1 实现确认):列表游标语义、未启用版本的 ListObjectVersions 与最小 ACL
 
@@ -226,10 +226,37 @@ M1 实现将以下协议语义具体化,经 CEPH s3-tests 核心子集 68/68 验
 
 1. **multipart 数据模型与组合**:会话 `u:{uploadId}`(含 Content-Type/元数据/完成快照)+ 分片 `p:{uploadId}\0{part_no}` + 桶索引 `m:{bucket}\0{uploadId}`(ListMultipartUploads)。Complete 的客户端分片列表按 part_no 建图(**同名多次取最后**,RGW 语义,兼容 `test_multipart_resend_first_finishes_last` 的竞态),校验存在 + ETag;非最后分片 < 5MiB → EntityTooSmall;全 extent 分片零数据搬运拼接,全内联拼数据,混合走数据路径。会话完成后保留(二次 Complete 幂等返回;分片重传 reactivate),超时 7 天惰性清扫。
 2. **h1 零拷贝读路径 = 标记帧协议**:hyper 写路径无法注入 sendfile,故响应体以 `[连接nonce(8)|fd(4)|off(8)|len(8)]` 28 字节标记帧替代数据帧;包裹 socket 的 `ZeroCopyIo` 在 `poll_write` 扫描 nonce,命中且 fd 在白名单 → 专用线程**阻塞 sendfile**(镜像)/ splice(裸设备)直接写 socket(零用户态拷贝),其余字节透传。nonce 每连接随机(2^-64/帧防对象数据伪造)+ fd 白名单(防任意 fd 读)。hyper 按帧长记账 content-length → 收尾"填充帧"(PAD 标记 + 零字节)由包装层丢弃对齐。h2(帧内嵌标记会损坏数据流)与 verify_reads 走缓冲路径。能力探测:fstat(REG→sendfile,BLK→splice);WSL 非阻塞 sendfile 的 EAGAIN 与可写事件不同步 → EAGAIN 时 poll(POLLOUT) 等待(免 fcntl,fcntl F_SETFL 在 WSL 上昂贵)。
-3. **引擎锁升级为 `parking_lot::RwLock`**:只读路径(meta/segments)取读锁并发,写路径(put/delete/multipart/copy)取写锁串行;`io` 与 `checkpoint_tick` 字段以内部 Mutex 包装满足 Sync。实测将 16 并发 128KiB GET 从 ~0.7k 提升至 ~8.5k ops/s(上限受 sled 元数据与每请求协议开销约束,thread-per-core 在 M5)。
+3. **引擎锁升级为 `parking_lot::RwLock`**:只读路径(meta/segments)取读锁并发,写路径(put/delete/multipart/copy)取写锁串行;`io` 与 `checkpoint_tick` 字段以内部 Mutex 包装满足 Sync。实测将 16 并发 128KiB GET 从 ~0.7k 提升至 ~8.5k ops/s(上限受元数据与每请求协议开销约束,thread-per-core 在 M5)。
 4. **G3 背压落地**:`Admission`(AtomicU64 全局在途字节,默认 16GiB)在流式 PUT/GET 入口准入,超限 503 SlowDown + Retry-After;每流窗口 = 有界通道(泵 try_send+让出)。
 5. **注册缓冲池**:io_uring 打开时尽力 `IORING_REGISTER_BUFFERS`(16×256KiB 对齐池),READ_FIXED/WRITE_FIXED opcode + 往返测试;内核不支持则自动降级普通 Read/Write。
 
+
+#### ADR-8(M2 实现确认):元数据 backstore 由 sled 替换为 rust-rocksdb
+
+sled(0.34)自 2022 年发布后项目进入休眠,依赖链上的 `instant` 等 crate 被
+RustSec 标记 unmaintained,`cargo audit` 持续告警,且其
+B+ 树实现在超大对象数(风险 R5)下的扩展性未经验证。本 ADR 将 backstore
+替换为 rust-rocksdb(`rocksdb` crate,内嵌 C++ RocksDB),**接口隔离先行**:
+`fs3-meta` 公共 API(键编码、事务、组提交、分页列举)完全不变,替换只发生在
+封装层内部,引擎/S3 层零改动。
+
+1. **事务 = 乐观事务(OptimisticTransactionDB)**:`s:seq` 单点序列化读写
+   不变,事务开启即取快照,读集/写集参与提交冲突检测;提交冲突
+   (Busy/TryAgain)自动重试,业务错误(NotFound 等)在事务内 Abort → 回滚,
+   与 sled 事务语义一致(ADR-5 §4)。
+2. **组提交 = manual_wal_flush + 后台刷盘线程**:rocksdb 无内建
+   `flush_every_ms` 定时器;开启 `manual_wal_flush` 后 WAL 停留在内存缓冲,
+   `fs3-meta` 内按 `flush_every_ms` 窗口 `flush_wal(true)`(write + fsync)
+   批量落盘,窗口内 kill -9 的丢失语义与 sled 一致;`sync_mode=full` 每事务
+   提交后显式 fsync,`sync_mode=none` 直接禁用 WAL(纯 memtable,崩溃即丢,
+   HA 层兜底)。
+3. **值格式不变**:postcard 编码、键布局(`b:/o:/u:/m:/p:/a:/t:/s:` 前缀 +
+   0x00/0xFF 转义)不变,旧库无迁移负担;`cache_capacity` 映射为 block cache。
+4. **构建前提**:rust-rocksdb 构建期需 libclang(bindgen 生成 C 绑定)与
+   C++17 编译器;CI/本地需安装 clang,或设置 `LIBCLANG_PATH`(见 AGENT §9)。
+5. **取舍**:放弃 sled 的纯 Rust 依赖树(构建需要 C++ 工具链、产物更大),
+   换取生产级成熟度与 M4 一亿对象压测的可信度;压缩库默认关闭(值已
+   postcard 编码,收益有限,依赖最小化),后续可按需开启 snappy/zstd。
 ---
 
 ## 4. 存储引擎设计(Rust)
@@ -276,12 +303,12 @@ magic(4B) | 代数(8B) | 对象/上传归属 id(16B) | 对象内偏移(8B)
 
 ### 4.3 空间分配器
 
-- 内存中常驻**位图(每 extent 1 bit)+ 引用计数数组(u32)**;位图是权威状态,每次变更记录进 sled 事务;
-- 分配策略:按设备条带轮转 + 每核私有 hint 游标(无锁近似,**真正的原子性靠 sled 事务**),避免多核抢同一游标;
+- 内存中常驻**位图(每 extent 1 bit)+ 引用计数数组(u32)**;位图是权威状态,每次变更记录进 rocksdb 事务;
+- 分配策略:按设备条带轮转 + 每核私有 hint 游标(无锁近似,**真正的原子性靠 rocksdb 事务**),避免多核抢同一游标;
 - 检查点:每 `checkpoint_interval`(默认 30s)或每 64MB 分配增量,把位图 + 统计写入设备双缓冲区(先写副本 A 并 fsync,再写序号指针使 A 生效);
-- 启动恢复 = 加载最近检查点 + 从 sled 重放该检查点之后的 `alloc` 记录(见 §4.10)。
+- 启动恢复 = 加载最近检查点 + 从 rocksdb 重放该检查点之后的 `alloc` 记录(见 §4.10)。
 
-### 4.4 元数据存储(sled)
+### 4.4 元数据存储(rocksdb)
 
 #### 键设计(单树,统一前缀 + 转义)
 
@@ -289,15 +316,15 @@ magic(4B) | 代数(8B) | 对象/上传归属 id(16B) | 对象内偏移(8B)
 | --- | --- | --- |
 | `b:{bucket}` | 桶名 | 桶元数据:创建时间、owner、策略 JSON、配额、统计(对象数/字节) |
 | `o:{bucket}\0{key}` | 转义后的对象键 | 对象元数据:`size、etag、mtime、extent 引用列表、用户自定义元数据头、content-type、uploadId 关联` |
-| `u:{bucket}\0{key}\0{uploadId}` | 分片上传会话 | 状态、各 part 的 extent 列表、创建时间 |
+| `u:{uploadId}` | 分片上传会话 | 状态、各 part 的 extent 列表、创建时间 |
 | `a:{seq}` | 分配器变更记录 | 分配/释放的 extent 范围(供位图重放) |
 | `t:{txnId}` | 事务标记 | 事务提交标记(恢复时判定 a: 记录是否有效) |
 | `s:seq` | 系统计数器 | 事务单调序号(单点序列化;ADR-5) |
 
 - **键转义:** S3 对象键可含任意 UTF-8(理论上是任意字节),采用 `0x00 → 0xFF 0x00、0xFF → 0xFF 0xFF` 转义,保证前缀扫描 `o:{bucket}\0` 恰好是该桶全部对象;
-- **小对象内联:** `size ≤ small_object_limit`(默认 32KiB)的对象数据直接内联在元数据值里,**零设备 I/O**(一条 sled 事务搞定 PUT/GET);
+- **小对象内联:** `size ≤ small_object_limit`(默认 32KiB)的对象数据直接内联在元数据值里,**零设备 I/O**(一条 rocksdb 事务搞定 PUT/GET);
 - **列举:** `ListObjectsV2` 就是 `o:{bucket}\0` 前缀扫描,天然按 key 字典序,continuation-token = 上次扫描的最后键,零状态;
-- **组提交:** sled 开启 `flush_every_ms ≈ group_commit_ms`(默认 2ms,可配 0~10ms),事务批量落盘;`sync_mode=none` 时(用户声明"HA 层可容忍单机丢失",如纯缓存集群)彻底跳过 fsync,吞吐再上一档。
+- **组提交:** rocksdb 开启 `manual_wal_flush`,后台线程按 `flush_every_ms ≈ group_commit_ms`(默认 2ms)窗口批量 `flush_wal` 落盘(ADR-8);`sync_mode=none` 时(用户声明"HA 层可容忍单机丢失",如纯缓存集群)直接禁用 WAL,彻底跳过 fsync,吞吐再上一档。
 
 #### 对象元数据示例
 
@@ -320,7 +347,7 @@ user_meta: { "x-amz-meta-*": "..." }
    （多 extent 自动续接;extent 满则向分配器申请新 extent,申请记录进本事务）
    │
    ▼ 元数据提交:
-   sled 事务 { o:{b}\0{key} = 元数据, a:{seq} = 本对象占用的 extent 列表,
+   rocksdb 事务 { o:{b}\0{key} = 元数据, a:{seq} = 本对象占用的 extent 列表,
               b:{bucket} 统计 += 1/bytes }
    → 组提交 fsync → 返回 200 + ETag
 ```
@@ -335,7 +362,7 @@ user_meta: { "x-amz-meta-*": "..." }
 ### 4.6 读路径(GetObject 时序)
 
 ```
-GET → 鉴权 → 查 o:{bucket}\0{key}(sled 命中,微秒级)
+GET → 鉴权 → 查 o:{bucket}\0{key}(rocksdb 命中,微秒级)
    → 按 Range 计算目标 [offset, len)
    → 逐 extent 发起读,三条零拷贝策略由后端自动选择:
      ① 文件模式:sendfile(fd, socket, extent 对应偏移, len)    # 零用户态拷贝
@@ -353,7 +380,7 @@ GET → 鉴权 → 查 o:{bucket}\0{key}(sled 命中,微秒级)
 
 - `CreateMultipartUpload` → 创建 `u:` 记录,返回 uploadId(128 位随机);
 - `UploadPart` → 每个 part 就是一个"隐藏对象"(数据写 extent,元数据挂到 `u:` 会话下),完成即应;
-- `CompleteMultipartUpload` → 一条 sled 事务:把所有 part 的 extent 列表按 part 序拼接进最终对象元数据,**零数据搬运**;ETag = MD5(各 part ETag 十六进制串拼接)+"-N"(与 AWS 完全一致);
+- `CompleteMultipartUpload` → 一条 rocksdb 事务:把所有 part 的 extent 列表按 part 序拼接进最终对象元数据,**零数据搬运**;ETag = MD5(各 part ETag 十六进制串拼接)+"-N"(与 AWS 完全一致);
 - `AbortMultipartUpload` / 会话超时(默认 7 天)→ 释放全部 extent;
 - 好处:GET 完全不知道 multipart 的存在,extent 列表天然支持跨 part 连续读。
 
@@ -366,7 +393,7 @@ GET → 鉴权 → 查 o:{bucket}\0{key}(sled 命中,微秒级)
 
 ### 4.9 删除与空间回收
 
-- `DeleteObject/DeleteObjects` → sled 事务写删除记录(无版本控制时为物理删)、extent 引用计数递减,refcount 归零的 extent 立即回位图,计费/统计同步扣减;
+- `DeleteObject/DeleteObjects` → rocksdb 事务写删除记录(无版本控制时为物理删)、extent 引用计数递减,refcount 归零的 extent 立即回位图,计费/统计同步扣减;
 - 不需要后台 GC 进程——S3 语义下对象删除即空间回收,这是相对"日志型存储 + GC"方案的最大工程简化;
 - `fasts3 check`(离线/低峰期可在线跑):mark-sweep 扫描——位图说"已分配"但元数据不可达的 extent = 泄漏,回收入位图;输出修复报告。**这是崩溃恢复与运行异常的兜底净水器。**
 
@@ -375,16 +402,16 @@ GET → 鉴权 → 查 o:{bucket}\0{key}(sled 命中,微秒级)
 恢复目标(进程任意时刻崩溃,kill -9 / 断电):
 
 1. **已应答 200 的对象永不丢、永不撕裂** —— 由"数据先行 + 元数据组提交"保证;
-2. **未应答的对象要么完整可见要么完全不可见** —— 由 sled 事务原子性保证;
+2. **未应答的对象要么完整可见要么完全不可见** —— 由 rocksdb 事务原子性保证;
 3. **空间账目可收敛** —— 由 a: 记录重放 + 泄漏扫描保证。
 
 启动流程:
 
 ```
 1. 读超级块,校验 CRC 与布局版本
-2. 打开 sled,执行其自身 WAL 恢复(成熟的现成逻辑)
+2. 打开 rocksdb,执行其自身 WAL 恢复(成熟的现成逻辑)
 3. 加载检查点位图(取代数较新的有效副本)
-4. 从 sled 重放 seq > 检查点序号的 a: 记录(带 t: 提交标记的才生效)
+4. 从 rocksdb 重放 seq > 检查点序号的 a: 记录(带 t: 提交标记的才生效)
    → 恢复位图与引用计数
 5. (后台)启动泄漏扫描,核对位图 vs 全量元数据可达性
 6. 开放服务
@@ -399,7 +426,7 @@ GET → 鉴权 → 查 o:{bucket}\0{key}(sled 命中,微秒级)
 
 ### 4.12 缓存策略(可选,默认关闭)
 
-- **元数据缓存**:sled 自带 B+ 树缓存,默认即可;
+- **元数据缓存**:rocksdb 自带 memtable + block cache,默认即可;
 - **热对象数据缓存**:可选 `cache: {enabled: true, size: "8GiB"}` 的用户态 LRU,仅缓存小对象与高频 Range 头部;默认关闭——O_DIRECT 设计下系统页缓存不会搅局,内存预算全部留给元数据与缓冲池。
 
 ---
@@ -474,7 +501,7 @@ worker[i](绑定 CPU i):
    ├─ 独立 io_uring ring(提交/完成全在本地)
    ├─ 独立 HTTP listener(SO_REUSEPORT,内核按 4 元组哈希分流)
    ├─ 独立缓冲区池 + 小对象分配器(线程本地,无锁)
-   ├─ 独立 sled 实例视图(共享底层存储,无跨线程队列)
+   ├─ 独立 rocksdb 实例视图(共享底层存储,无跨线程队列)
    └─ 零跨核通信:连接从生到死都在这一个核上
 ```
 
@@ -507,7 +534,7 @@ worker[i](绑定 CPU i):
 | 兜底 | `READ_FIXED → send` | 1 |
 
 - sendfile 只接受普通文件 → 镜像文件模式天然享受;裸设备用 splice(block 设备 → pipe 合法);两端 `O_DIRECT` 均兼容,内核 5.x 实测稳定,工程上保留兜底开关;
-- 4KiB 小对象命中"元数据内联"路径:数据在 sled 值里,直接 `send` 一条写回,同样零设备 I/O;
+- 4KiB 小对象命中"元数据内联"路径:数据在 rocksdb 值里,直接 `send` 一条写回,同样零设备 I/O;
 - 顺序读带宽目标:Gen4 7GB/s 时,一次额外拷贝 ≈ 0.3 个核的 memcpy 成本——零拷贝省下的核心正好喂给 CRC/TLS。
 
 ### 6.5 缓冲与内存管理
@@ -662,7 +689,7 @@ extent_size = "4MiB"
 small_object_limit = "32KiB"
 sync_mode = "group"                   # group | full | none
 group_commit_ms = 2
-meta_dir = "/var/lib/fasts3/meta"     # sled 文件位置
+meta_dir = "/var/lib/fasts3/meta"     # rocksdb 文件位置
 checkpoint_interval = 30
 
 [server]
@@ -706,7 +733,7 @@ fasts3d meta-export /backup/meta.snapshot   # 元数据快照(备份)
 - `fasts3d`:静态 musl/glibc 二进制 → scratch 容器或直接分发;
 - `fasts3-web`:Node 20+ 生产依赖最小化,或 `fasts3d` 内嵌静态资源后完全去掉 Node;
 - systemd 单元(附 `LimitMEMLOCK=infinity`、`NoNewPrivileges`、`ProtectSystem=strict` 等加固项)与 docker-compose 样例随仓库分发;
-- 云上建议:根分区放 sled 元数据 + 独立 EBS 卷做数据盘,备份直接对元数据文件与底层卷做快照。
+- 云上建议:根分区放 rocksdb 元数据 + 独立 EBS 卷做数据盘,备份直接对元数据文件与底层卷做快照。
 
 ---
 
@@ -767,7 +794,7 @@ FastS3/
 │   ├── fs3-device/                # 设备抽象:裸设备/镜像文件、O_DIRECT、对齐
 │   ├── fs3-alloc/                 # 位图分配器、引用计数、检查点双缓冲
 │   ├── fs3-engine/                # 读写路径、extent、CRC、COW、恢复
-│   ├── fs3-meta/                  # sled 封装、键编码、事务/组提交
+│   ├── fs3-meta/                  # rocksdb 封装、键编码、事务/组提交
 │   ├── fs3-s3/                    # S3 协议:路由、XML、SigV4、预签名、错误
 │   ├── fs3-http/                  # hyper 接入、h1/h2、背压
 │   ├── fs3-admin/                 # admin API、审计、repair 工具
@@ -784,7 +811,7 @@ FastS3/
 └── tests/                         # s3-tests 配置、loadgen、crash harness
 ```
 
-依赖基线(尽可能少而精):Rust 侧 `tokio-uring(或 monoio/glommio)/hyper/rustls/quick-xml/sled/tracing/prometheus`;Node 侧 `fastify/ws/jose`;前端 `react/vite/uplot`。
+依赖基线(尽可能少而精):Rust 侧 `tokio-uring(或 monoio/glommio)/hyper/rustls/quick-xml/rocksdb/tracing/prometheus`;Node 侧 `fastify/ws/jose`;前端 `react/vite/uplot`。
 
 ---
 
@@ -800,7 +827,7 @@ FastS3/
 | M3 管理面 | 2 周 | admin API + Node 管理 API + 控制台 v1(仪表盘/桶/对象/密钥) |
 | M4 加固与打包 | 2 周 | 崩溃测试 1000 轮、泄漏修复、配额/限速、TLS、systemd/容器、文档 |
 | M5 性能冲刺 | 2 周 | 运行时 A/B、IRQ/轮询调优、对照 MinIO 基准、达到 §6.8 目标;发布 1.0 |
-| 路线图(V2+) | — | 版本控制、生命周期、SSE-C、对象锁、多设备在线扩容、HTTP/3、设备内元数据区(去 sled 文件依赖)、集中纳管平台 |
+| 路线图(V2+) | — | 版本控制、生命周期、SSE-C、对象锁、多设备在线扩容、HTTP/3、设备内元数据区(去 rocksdb 文件依赖)、集中纳管平台 |
 
 ---
 
@@ -809,7 +836,7 @@ FastS3/
 | 风险 | 影响 | 缓解 |
 | --- | --- | --- |
 | io_uring 内核 bug / 老内核缺失 | 数据面不可用 | 内核版本下限 + 引擎抽象层 pread/pwrite 兜底;CI 覆盖多内核矩阵 |
-| sled 在超大对象数下的表现 | 列举/元数据延迟 | 键布局保证局部性;压测 1 亿对象;必要时替换 backstore 为 rocksdb(接口隔离) |
+| rocksdb 在超大对象数下的表现 | 列举/元数据延迟 | 键布局保证局部性;压测 1 亿对象(M4);LSM 写放大随删除累积,定期 compaction 治理 |
 | MD5 计算的 CPU 成本 | 写带宽受限 | SIMD 多缓冲;`etag=fast` 降级开关;文档明示预算 |
 | XML 解析/生成开销 | 高并发小请求延迟 | quick-xml(零拷贝解析);响应模板化 |
 | 虚拟主机风格的通配符 TLS 运维 | 部署复杂度 | 支持路径风格兜底;文档给 LB 方案;证书热加载 |

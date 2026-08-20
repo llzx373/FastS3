@@ -1,8 +1,8 @@
 //! FastS3 存储引擎:PUT/GET/DELETE 全链路、崩溃恢复、检查点策略。
 //!
 //! 时序保证(DESIGN §4.5):数据先落盘(O_DIRECT 写返回)、元数据后提交
-//! (sled 事务 + 组提交);客户端中断 → 不提交事务,extent 回滚释放。
-//! 启动恢复(DESIGN §4.10):超级块 → sled → 检查点 → a: 重放 → 引用计数
+//! (rocksdb 事务 + 组提交,ADR-8);客户端中断 → 不提交事务,extent 回滚释放。
+//! 启动恢复(DESIGN §4.10):超级块 → rocksdb WAL → 检查点 → a: 重放 → 引用计数
 //! 可达性重建 → 泄漏报告。
 
 pub mod io;
@@ -29,7 +29,7 @@ use crate::io::{fsync, open_io_engine, read_exact, write_all, IoEngine};
 pub struct EngineConfig {
     /// 数据设备路径(裸设备或镜像文件)。
     pub device: std::path::PathBuf,
-    /// sled 元数据目录。
+    /// 元数据目录(rocksdb)。
     pub meta_dir: std::path::PathBuf,
     pub sync_mode: SyncMode,
     pub group_commit_ms: u64,
@@ -131,7 +131,7 @@ impl Engine {
         alloc.restore_bitmap(&cp.bitmap);
         alloc.restore_stats(cp.total_alloc, cp.total_free);
 
-        // 2. 打开 sled(其自身 WAL 恢复)
+        // 2. 打开 rocksdb(其自身 WAL 恢复)
         let meta_cfg = MetaConfig {
             flush_every_ms: cfg.group_commit_ms,
             sync_mode: cfg.sync_mode,
@@ -257,7 +257,7 @@ impl Engine {
     }
 
     /// 模拟崩溃(kill -9):跳过最终检查点直接释放资源。
-    /// sled 自身 WAL 仍会落盘;位图恢复依赖 a: 重放。
+    /// rocksdb WAL 按组提交窗口落盘;位图恢复依赖 a: 重放。
     pub fn abort(mut self) {
         self.closed = true;
     }
@@ -363,7 +363,7 @@ impl Engine {
         }
 
         if prefix.len() <= limit {
-            // —— 内联路径(E3):零设备 I/O,一条 sled 事务 ——
+            // —— 内联路径(E3):零设备 I/O,一条 rocksdb 事务 ——
             let size = prefix.len() as u64;
             let etag: [u8; 16] = md5::Md5::digest(&prefix).into();
             let meta = ObjectMeta {
@@ -1856,7 +1856,7 @@ mod tests {
         {
             let mut e = open_engine(&cfg);
             e.put("b1", "a", &mut Cursor::new(data.clone())).unwrap();
-            // 显式 flush 使 sled 落盘(模拟组提交窗口已过)
+            // 显式 flush 使 rocksdb 落盘(模拟组提交窗口已过)
             e.meta().flush().unwrap();
             e.abort(); // 模拟 kill -9:跳过最终检查点
         }
@@ -1895,7 +1895,7 @@ mod tests {
             e.get_to("b1", "k", 0..u64::MAX, &mut out).unwrap();
             assert_eq!(out.len(), 100_000);
             e.close().unwrap();
-        } // 释放 sled 锁
+        } // 释放 rocksdb 锁
 
         let mut cfg3 = cfg.clone();
         cfg3.verify_reads = true;

@@ -69,7 +69,7 @@ FastS3 的对策:**不做底层已经做过的事**。工程力量全部投入�
 
 ## 当前状态
 
-✅ **M0 引擎 PoC 完成(v0.1)。** 裸设备/镜像文件 PUT/GET 全链路、位图分配器、检查点双缓冲与崩溃恢复、sled 事务/组提交、引擎基准回路;kill -9 崩溃 harness 50 轮零失败。
+✅ **M0 引擎 PoC 完成(v0.1)。** 裸设备/镜像文件 PUT/GET 全链路、位图分配器、检查点双缓冲与崩溃恢复、rocksdb 事务/组提交(ADR-8)、引擎基准回路;kill -9 崩溃 harness 50 轮零失败。
 
 ✅ **M1 S3 核心语义完成(v0.2)。** S3 协议面:路径/虚拟主机路由、SigV4 header + 预签名认证、桶/对象 CRUD、ListObjectsV1/V2(分页/StartAfter/delimiter)、Range 与条件头、DeleteObjects、小对象内联(E3)、hyper + SO_REUSEPORT 流式接入;门禁全过:aws cli / boto3 / mc / rclone 4 客户端冒烟 ✅、CEPH s3-tests 核心子集 68/68 ✅、HTTP 崩溃 harness 100 轮 + CLI 50 轮零撕裂 ✅、覆盖率 ≥60% ✅、cargo audit 漏洞清零 ✅。
 
@@ -155,7 +155,7 @@ FastS3/
 │   ├── fs3-device/             # 设备抽象:裸设备/镜像文件、O_DIRECT、对齐
 │   ├── fs3-alloc/              # 位图分配器、引用计数、检查点双缓冲
 │   ├── fs3-engine/             # 读写路径、extent、CRC、COW、恢复
-│   ├── fs3-meta/               # sled 封装、键编码、事务/组提交
+│   ├── fs3-meta/               # rocksdb 封装、键编码、事务/组提交
 │   ├── fs3-s3/                 # S3 协议:路由、XML、SigV4、预签名、错误
 │   ├── fs3-http/               # hyper 接入、h1/h2、背压
 │   ├── fs3-admin/              # admin API、审计、repair 工具

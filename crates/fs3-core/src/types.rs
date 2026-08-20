@@ -18,7 +18,7 @@ pub struct ExtentRef {
 }
 
 /// 分配器变更记录(DESIGN §16;扩展:ref_inc/ref_dec 支撑引用计数恢复,
-/// 见 ADR-5)。与对象元数据同 sled 事务提交(ADR-4)。
+/// 见 ADR-5)。与对象元数据同 rocksdb 事务提交(ADR-4)。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AllocRecord {
     /// 单调递增序号(与 `s:seq` 同步,检查点重放边界)。
@@ -192,7 +192,7 @@ impl SuperBlock {
                 self.extent_size
             )));
         }
-        if self.extent_size % SECTOR_SIZE != 0 {
+        if !self.extent_size.is_multiple_of(SECTOR_SIZE) {
             return Err(Error::InvalidLayout(
                 "extent_size must be a multiple of 4KiB".into(),
             ));
@@ -236,7 +236,7 @@ pub fn compute_layout(capacity: u64, extent_size: u64) -> Result<SuperBlockLayou
             "extent_size {extent_size} out of range 1MiB..16MiB"
         )));
     }
-    if extent_size % SECTOR_SIZE != 0 {
+    if !extent_size.is_multiple_of(SECTOR_SIZE) {
         return Err(Error::InvalidArgument(
             "extent_size must be a multiple of 4KiB".into(),
         ));
