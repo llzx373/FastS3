@@ -127,7 +127,13 @@ fn zc_sender_loop(rx: std::sync::mpsc::Receiver<ZcJob>, sock: i32) {
             };
             let _ = unsafe { libc::fcntl(sock, libc::F_SETFL, flags) };
             if let Err(e) = &r {
-                tracing::warn!("zc job failed: {e} (fcntl={rc})");
+                // 客户端中途断开(EPIPE/ECONNRESET)属正常:降级为 debug
+                match e.kind() {
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset => {
+                        tracing::debug!("zc job aborted (client gone): {e}");
+                    }
+                    _ => tracing::warn!("zc job failed: {e} (fcntl={rc})"),
+                }
             }
             tracing::debug!(
                 "zc job done len={} -> {:?}",

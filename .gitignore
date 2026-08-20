@@ -7,3 +7,5 @@ web/**/dist/
 /tests/bench/archive/
 /tests/crash/run/
 __pycache__/
+var/
+tools/
