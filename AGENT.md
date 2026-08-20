@@ -1,0 +1,108 @@
+# AGENT.md — FastS3 仓库 AI 编码助手指南
+
+> 本文件面向在本仓库工作的 AI 编码助手(及人类开发者):项目背景、权威文档、工作纪律、构建命令与红线。开始任何任务前先读本文件与 §2 列出的权威文档。
+
+## 1. 项目是什么
+
+FastS3 是一个**单机 S3 服务**,面向裸块设备 / 磁盘镜像文件的高性能实现。前提假设:底层块设备已 HA 且一致,因此不做副本/EC/分布式协调,把全部开销转化为性能——目标是接近 fio 裸盘基线。
+
+- 数据面 + S3 协议:**Rust**(io_uring + thread-per-core + O_DIRECT)
+- 管理面 + Web 控制台:**Node.js**(Fastify + React/Vite),永不进入数据热路径
+- 当前状态:设计阶段,仓库仅有文档,**尚无代码**;按 [TODO.md](./TODO.md) 从 M0 开始实现
+
+## 2. 权威文档(改动任何设计前必读)
+
+| 文档 | 作用 |
+| --- | --- |
+| [docs/DESIGN.md](./docs/DESIGN.md) | 设计唯一事实源:架构、磁盘布局、引擎、协议、性能方案、ADR |
+| [docs/ROADMAP.md](./docs/ROADMAP.md) | 规划:WBS 工作分解、里程碑与门禁、开箱即用验收标准 |
+| [TODO.md](./TODO.md) | 执行清单:逐条任务 + 门禁,进度跟踪(见 §4) |
+
+**规则:实现行为与 DESIGN.md 冲突时,以 DESIGN.md 为准,并走 ADR 流程修正文档(见 §5),不得静默偏离。**
+
+## 3. 模块边界(Monorepo,按 DESIGN §13)
+
+```
+crates/   fs3-core / fs3-device / fs3-alloc / fs3-engine / fs3-meta
+          fs3-s3 / fs3-http / fs3-admin / fs3d
+web/      server(Node, Fastify + TS)/ console(React + Vite + uPlot)
+deploy/   systemd / container / 示例配置
+tests/    s3-tests 配置、loadgen、crash harness
+```
+
+- 依赖方向:`fs3d` 装配一切;`fs3-s3` 依赖 `fs3-engine`/`fs3-meta`,不得反向;`fs3-device` 不依赖协议层
+- **边界红线:Node.js 只做运维/管理,永不进入数据面热路径**;浏览器大对象传输走预签名 URL 直连 Rust 数据面
+- 依赖最小化原则(ROADMAP §2/风险 R9):新依赖须说明理由,`Cargo.lock` / `pnpm-lock.yaml` 必须提交
+
+## 4. 任务跟踪工作流(使用 TODO.md)
+
+1. **认领**:开始实现前,在 [TODO.md](./TODO.md) 找到对应条目,确认所属里程碑(WBS 编号 → 任务 → 门禁)。
+2. **实现**:一个勾选项 = 一个可验证的交付;按里程碑顺序推进,**禁止跨里程碑抢跑**(如 M0 未完成就做 S3 协议)。
+3. **勾选**:交付完成并验证后,将该条目改为 `- [x]`,并在提交/PR 描述中引用条目文字与编号。
+4. **门禁**:里程碑末尾的门禁(退出条件)全部勾选后才能进入下一里程碑;不达标须如实报告,不得自行勾选。
+5. **PR 引用**:提交信息形如 `feat(fs3-device): O_DIRECT 打开与 4KiB 对齐(TODO M0/B1)`。
+
+## 5. ADR 纪律
+
+- 涉及设计取舍的新决策(存储布局、运行时选择、协议语义、依赖引入)必须新增 ADR 到 [docs/DESIGN.md](./docs/DESIGN.md) §3.3,并同步 [docs/ROADMAP.md](./docs/ROADMAP.md) 受影响章节。
+- 现有 ADR 是裁决依据;推翻已有 ADR 需要明确记录原因与新证据。
+
+## 6. 质量门禁(随里程碑收紧,ROADMAP §3)
+
+| 门禁 | 要求 |
+| --- | --- |
+| 测试覆盖率 | M1 ≥60%,M4 起 ≥80% |
+| 属性测试 | 键编码往返、Range 代数、分配器随机序列(proptest) |
+| 协议一致性 | CEPH s3-tests 子集(M1 核心子集 100%,M4 全子集) |
+| 崩溃一致性 | crash harness 随机 kill -9:断言已应答对象完整、未应答对象不可见、账目零漂移 |
+| 性能门禁 | M5 起接入 CI:**回退 >5% 的 PR 禁止合并**(需 ADR 豁免) |
+| 依赖安全 | `cargo audit` / `pnpm audit` 漏洞清零 |
+
+## 7. 代码规范
+
+### Rust
+- 2021 edition;`cargo fmt --check` 与 `cargo clippy -- -D warnings` 必须干净
+- 热路径纪律(DESIGN §6):禁止跨核唤醒、禁止热路径堆分配(线程本地 arena)、I/O 必须走 io_uring 批量提交
+- 错误处理:公共错误类型放 `fs3-core`;对客户端返回的错误码逐字节对齐 AWS XML 语义(DESIGN §5.4)
+- 崩溃模型:进程崩溃是常态,任何"先记账后落盘"的代码都是 bug(数据先落盘、元数据后提交)
+
+### Node / 前端
+- TypeScript 严格模式;Fastify 插件化;控制台构建产物为纯静态资源,须可被 `fasts3d --web-root` 内嵌托管
+- Node 侧无状态、可多实例:状态一律放 Rust 侧
+
+## 8. 安全红线(违反即拒绝合入)
+
+- 代码零硬编码密钥/机密;配置模板用占位符(ROADMAP §3.4)
+- admin 通道默认 unix socket(0600)/回环 + token;secret 仅哈希存储、admin API 只下发一次
+- **裸设备保护(风险 R7):init 前强制校验块设备类型/文件系统签名,无二次确认绝不自动初始化**
+- 依赖漏洞清零;发布产物须带 SBOM 与签名(M6/A5)
+
+## 9. 构建与测试命令
+
+> 规划形态:M0(A1)落地 CI 后以 CI 配置为准,以下是目标命令。
+
+```bash
+# Rust 数据面
+cargo build --release
+cargo test                       # 单元 + 属性测试
+cargo clippy -- -D warnings
+cargo fmt --check
+
+# Node 管理面 + 控制台
+cd web && pnpm install && pnpm -r build
+pnpm -r test
+
+# 质量资产(tests/)
+fio 基线脚本、crash harness、loadgen、warp、s3-tests 配置
+```
+
+## 10. 提交规范
+
+- 前缀:`feat` / `fix` / `docs` / `test` / `perf` / `refactor` / `chore`
+- 关联 TODO 条目(见 §4.5);修复缺陷注明根因与验证方式
+- `main` 永远可发布:PR + 双人 review + CI 全绿方可合入(ROADMAP §3.1)
+
+## 11. 文档同步义务
+
+- 改了设计 → 更新 DESIGN.md(含 ADR);改了范围/计划 → 更新 ROADMAP.md;交付了任务 → 勾选 TODO.md
+- 三个文件任一出现与代码不一致,视为缺陷,与功能 bug 同等级修复
