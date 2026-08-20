@@ -9,7 +9,9 @@ rust-version.workspace = true
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true
+# 对象元数据值编码(ADR-9 §13:[版本字节] + postcard);本 crate 提供
+# ObjectMeta::encode_value/decode_value,供 fs3-meta 存储层使用。
+postcard.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-postcard.workspace = true

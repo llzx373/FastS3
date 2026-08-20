@@ -12,8 +12,9 @@ pub const SUPERBLOCK_MAGIC: [u8; 4] = *b"FS3S";
 /// 超级块格式版本。
 pub const SUPERBLOCK_FORMAT_VERSION: u8 = 1;
 
-/// 磁盘布局版本(升级迁移框架依据,见 ROADMAP §7.1)。
-pub const LAYOUT_VERSION: u32 = 1;
+/// 磁盘布局版本(ADR-9 v2:打包段布局;放弃旧布局前置兼容,
+/// 旧版本设备直接拒绝打开)。
+pub const LAYOUT_VERSION: u32 = 2;
 
 /// 保留区终点:超级块之后到 1MiB(未来:设备内元数据区 / WAL / 加密头)。
 pub const RESERVED_REGION_END: u64 = 1024 * 1024;
@@ -65,3 +66,12 @@ pub const MAX_EXTENTS: u64 = 16 * 1024 * 1024;
 
 /// 特征位:位 0 = 支持 io_uring 数据面(写入超级块 features)。
 pub const FEATURE_IO_URING: u64 = 1 << 0;
+/// 特征位:位 1 = 打包 extent 布局(ADR-9;布局版本 2 下恒置位)。
+pub const FEATURE_PACKED_EXTENTS: u64 = 1 << 1;
+
+/// extent 头 flags:位 0 = packed(打包 extent,无头 CRC 表;
+/// 各段 CRC 存对象元数据)。未置位 = 独占 extent(头带完整 CRC 表)。
+pub const EXTENT_FLAG_PACKED: u32 = 1 << 0;
+
+/// 段 CRC 网格单元大小(与 chunk 一致:64KiB;ADR-9 §4.3)。
+pub const SEGMENT_CRC_GRID: u64 = 64 * 1024;

@@ -380,7 +380,7 @@ fn render_with(
 struct ZcBody {
     ctx: crate::zero_copy::ZeroCtx,
     fd: i32,
-    segs: Vec<fs3_engine::Segment>,
+    segs: Vec<fs3_engine::DevSegment>,
     idx: usize,
     /// 响应总长度(填充帧对齐 content-length 记账)。
     length: u64,

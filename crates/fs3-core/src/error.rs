@@ -38,6 +38,10 @@ pub enum Error {
     #[error("transaction aborted after retries: {0}")]
     TxnConflict(String),
 
+    /// 压缩迁移:对象在发现后被并发覆盖/删除,放弃该对象(ADR-9 §6.2 阶段 3)。
+    #[error("object changed concurrently: {0}")]
+    ObjectChanged(String),
+
     /// multipart:分片缺失或 ETag 不匹配(AWS InvalidPart)。
     #[error("invalid part: {0}")]
     InvalidPart(String),

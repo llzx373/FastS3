@@ -3,8 +3,8 @@
 use std::path::Path;
 
 use fs3_core::{
-    compute_layout, random_bytes, CheckpointData, Error, Result, SuperBlock, LAYOUT_VERSION,
-    SUPERBLOCK_SIZE,
+    compute_layout, random_bytes, CheckpointData, Error, Result, SuperBlock, FEATURE_IO_URING,
+    FEATURE_PACKED_EXTENTS, LAYOUT_VERSION, SUPERBLOCK_SIZE,
 };
 
 use crate::aligned::AlignedBuffer;
@@ -62,7 +62,9 @@ pub fn init_device(
         checkpoint_len: layout.checkpoint_len,
         data_start: layout.data_start,
         data_end: layout.data_end,
-        features,
+        // ADR-9:布局版本 2 恒为打包布局;写入特性位供工具/日志识别。
+        // (放弃旧布局前置兼容:旧二进制经布局版本检查直接拒绝,无混合模式)
+        features: features | FEATURE_IO_URING | FEATURE_PACKED_EXTENTS,
     };
     sb.validate()?;
 

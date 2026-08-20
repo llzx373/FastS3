@@ -104,6 +104,12 @@ enum Cmd {
     },
     /// 一致性检查(只读):位图 vs 元数据核对 + 泄漏报告
     Check {},
+    /// 前台惰性压缩(ADR-9 Tier 2):在线迁移碎片 extent,打印报告
+    Compact {
+        /// 轮数(默认 1;0 = 直到无候选)
+        #[arg(long, default_value_t = 1)]
+        rounds: u32,
+    },
     /// 立即写检查点
     Checkpoint {},
     /// 引擎级基准(设备层直测,不经协议)
@@ -232,6 +238,17 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
             )?;
             cmd_check(&engine_cfg)
         }
+        Cmd::Compact { rounds } => {
+            let engine_cfg = engine_config(
+                device,
+                meta_dir,
+                sync_mode,
+                cli.group_commit_ms.or(storage.group_commit_ms),
+                cli.checkpoint_interval.or(storage.checkpoint_interval),
+                cli.no_uring,
+            )?;
+            cmd_compact(&engine_cfg, rounds)
+        }
         Cmd::Checkpoint {} => {
             let engine_cfg = engine_config(
                 device,
@@ -298,7 +315,9 @@ fn cmd_serve(
     cli_allow_anonymous: bool,
     cli_max_inflight: Option<u64>,
 ) -> fs3_core::Result<()> {
-    let engine = Arc::new(parking_lot::RwLock::new(Engine::open(engine_cfg)?));
+    let mut engine_cfg = engine_cfg.clone();
+    engine_cfg.compaction.enabled = true; // 服务常驻:后台惰性压缩(ADR-9 §6)
+    let engine = Arc::new(parking_lot::RwLock::new(Engine::open(&engine_cfg)?));
 
     // 密钥:CLI --key access:secret 优先,否则配置文件
     let mut keys: Vec<fs3_s3::auth::Credentials> = Vec::new();
@@ -386,6 +405,11 @@ fn engine_config(
         io_uring: !no_uring,
         read_only: false,
         small_object_limit: fs3_core::SMALL_OBJECT_LIMIT,
+        // 单次 CLI 命令不启后台压缩 worker(serve 自行开启;compact 命令前台跑)
+        compaction: fs3_engine::CompactionConfig {
+            enabled: false,
+            ..Default::default()
+        },
     })
 }
 
@@ -542,6 +566,44 @@ fn cmd_ls(cfg: &EngineConfig, bucket: Option<&str>, prefix: &str) -> fs3_core::R
     Ok(())
 }
 
+/// 前台惰性压缩(ADR-9 §6.7 离线档):高预算逐轮运行,输出迁移报告。
+fn cmd_compact(cfg: &EngineConfig, rounds: u32) -> fs3_core::Result<()> {
+    let mut e = Engine::open(cfg)?;
+    let mut total = fs3_engine::CompactionReport::default();
+    let mut round = 0u32;
+    loop {
+        let r = e.compact_once()?;
+        total.candidates += r.candidates;
+        total.migrated_objects += r.migrated_objects;
+        total.skipped_shared += r.skipped_shared;
+        total.conflicts += r.conflicts;
+        total.errors += r.errors;
+        total.copied_bytes += r.copied_bytes;
+        total.freed_extents += r.freed_extents;
+        round += 1;
+        if r.candidates == 0 || (rounds > 0 && round >= rounds) {
+            break;
+        }
+    }
+    e.close()?;
+    println!("compact: {round} round(s)");
+    println!("  candidates:     {}", total.candidates);
+    println!("  migrated:       {} objects", total.migrated_objects);
+    println!("  copied:         {} bytes", total.copied_bytes);
+    println!("  freed extents:  {}", total.freed_extents);
+    println!("  skipped shared: {}", total.skipped_shared);
+    println!("  conflicts:      {} (下轮重试)", total.conflicts);
+    println!("  errors:         {}", total.errors);
+    let leaks = e.allocator().leaks();
+    if !leaks.is_empty() {
+        return Err(fs3_core::Error::Corrupt(format!(
+            "{} leaked extents",
+            leaks.len()
+        )));
+    }
+    Ok(())
+}
+
 fn cmd_check(cfg: &EngineConfig) -> fs3_core::Result<()> {
     let mut cfg = cfg.clone();
     cfg.read_only = true;
@@ -557,6 +619,13 @@ fn cmd_check(cfg: &EngineConfig) -> fs3_core::Result<()> {
     println!("buckets:      {}", r.buckets);
     println!("objects:      {}", r.objects);
     println!("object bytes: {}", r.total_bytes);
+    println!("device bytes: {} (Σ 活段;ADR-9 设备占用)", r.live_bytes);
+    if r.total_bytes > 0 {
+        println!(
+            "utilization:  {:.2}% (device bytes / object bytes;ADR-9 门禁 ≥ 99%)",
+            r.live_bytes as f64 / r.total_bytes as f64 * 100.0
+        );
+    }
     println!("io engine:    {}", r.io_engine);
     println!(
         "checkpoint seq: {} (last txn seq {})",

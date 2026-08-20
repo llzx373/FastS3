@@ -341,10 +341,13 @@ fn build_request(
 }
 
 fn read_response(stream: &mut TcpStream) -> std::io::Result<(u16, u64)> {
-    // 块读头(避免逐字节 syscall 拖慢压测)
+    // 块读头(避免逐字节 syscall 拖慢压测)。
+    // 注意:必须检测"包含"而非"结尾"——小响应(如 404 的 XML body)
+    // 常与响应头在同一 TCP 段到达(粘包),若头以 body 结尾则 endswith
+    // 永不成立,read 会阻塞到超时(EAGAIN)。
     let mut head = Vec::new();
     let mut buf = [0u8; 4096];
-    while !head.ends_with(b"\r\n\r\n") && head.len() < 1 << 16 {
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") && head.len() < 1 << 16 {
         let n = stream.read(&mut buf)?;
         if n == 0 {
             return Err(std::io::Error::new(

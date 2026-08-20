@@ -57,7 +57,7 @@ pub enum ResponseBody {
         /// 数据长度。
         length: u64,
         /// 零拷贝数据段(设备偏移+长度;None = 不可用,走块读取)。
-        zc_segments: Option<Vec<fs3_engine::Segment>>,
+        zc_segments: Option<Vec<fs3_engine::DevSegment>>,
         /// 零拷贝 fd(无 O_DIRECT)。
         zc_fd: Option<i32>,
         /// 读校验开关(开启时禁零拷贝)。
@@ -122,7 +122,7 @@ impl S3Service {
         key: &str,
         offset: u64,
         length: u64,
-    ) -> Result<Option<Vec<fs3_engine::Segment>>, S3Error> {
+    ) -> Result<Option<Vec<fs3_engine::DevSegment>>, S3Error> {
         let engine = self.engine.read();
         engine
             .object_segments(bucket, key, offset, length)

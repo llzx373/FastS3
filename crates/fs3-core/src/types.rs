@@ -1,20 +1,35 @@
 //! 公共类型:超级块、extent 头、对象/桶元数据、分配记录。
 //!
-//! 磁盘上二进制布局与 docs/DESIGN.md §4.2 / §16 对齐;均为手工定长/可解码
-//! 编码(不依赖 serde),保证布局稳定与崩溃安全。
+//! 磁盘上二进制布局与 docs/DESIGN.md §4.2 / §16 及 ADR-9 对齐;均为手工
+//! 定长/可解码编码(不依赖 serde),保证布局稳定与崩溃安全。
 
 use crate::consts::*;
 use crate::crc32c::crc32c;
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
-/// 对象 → extent 引用(对象内按序拼接)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExtentRef {
-    pub extent_id: u64,
-    /// 数据在 extent 内的偏移(0 起,不含 4KiB 头)。
+/// 段(ADR-9 §4.1):对象 → 设备的引用单位(替代 v1 的 ExtentRef;offset 语义化)。
+///
+/// - 独占段(整 extent 属于一个对象且写满):`offset == 0`,`crcs` 为空,
+///   校验走 extent 头 CRC 表;
+/// - 打包段:4KiB 对齐的变长区间(≥ 4KiB,按 O_DIRECT 对齐),`crcs` 为
+///   段内 64KiB 网格 CRC(≤ 64 项 = 256B),校验走元数据。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Segment {
+    pub extent_id: u32,
+    /// extent 数据区内偏移(4KiB 对齐;独占段恒为 0)。
     pub offset: u32,
+    /// 段长度(4KiB 倍数)。
     pub len: u32,
+    /// 仅打包段:段内 64KiB 网格 CRC(尾部按实际数据 CRC);独占段为空。
+    pub crcs: Vec<u32>,
+}
+
+impl Segment {
+    /// 段内 CRC 网格单元数(64KiB 网格,尾单元可能不足)。
+    pub fn crc_units(&self) -> usize {
+        self.crcs.len()
+    }
 }
 
 /// 分配器变更记录(DESIGN §16;扩展:ref_inc/ref_dec 支撑引用计数恢复,
@@ -39,20 +54,19 @@ impl AllocRecord {
     }
 }
 
-/// 对象元数据(键 `o:{bucket}\0{key}`,值 postcard 序列化)。
+/// 对象元数据(键 `o:{bucket}\0{key}`,值 = [版本字节 u8] + postcard(ObjectMeta))。
 ///
-/// > v0.1 演进说明(M1):新增 `inline` 字段承载 E3 小对象内联;旧格式
-/// > 记录无法解码,属预期(未发布版本无迁移义务)。
-/// > v0.2 演进说明(M2):新增 `parts` 字段承载 multipart 分片边界
-/// > (GetObject PartNumber 用);非 multipart 对象为空。
+/// > v2 演进说明(ADR-9):`extents` 由 `ExtentRef`(整 extent 引用)改为
+/// > `Vec<Segment>`(4KiB 对齐变长段 + 段内 CRC 网格);值格式加版本字节。
+/// > 放弃旧布局前置兼容:旧值(无版本字节)直接拒绝解码。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectMeta {
     pub size: u64,
     /// ETag = MD5 摘要(与 AWS 对齐)。
     pub etag: [u8; 16],
     pub mtime: i64,
-    /// 大对象跨 extent 列表(小对象内联时为空)。
-    pub extents: Vec<ExtentRef>,
+    /// 大对象段列表(按序拼接;小对象内联时为空)。
+    pub extents: Vec<Segment>,
     pub content_type: String,
     pub user_meta: Vec<(String, String)>,
     /// 小对象内联数据(E3:size ≤ small_object_limit 时零设备 I/O)。
@@ -60,6 +74,10 @@ pub struct ObjectMeta {
     /// multipart 分片大小列表(索引 = part_no-1;非 multipart 为空)。
     pub parts: Vec<u64>,
 }
+
+/// 对象元数据值格式版本(ADR-9 §13:`[version: u8 = 2] + postcard(ObjectMeta)`;
+/// 旧值无版本字节,放弃前置兼容后直接拒绝)。
+pub const OBJECT_META_VERSION: u8 = 2;
 
 impl ObjectMeta {
     pub fn etag_hex(&self) -> String {
@@ -74,6 +92,32 @@ impl ObjectMeta {
         } else {
             format!("{hex}-{}", self.parts.len())
         }
+    }
+
+    /// 编码为值格式:`[version: u8] + postcard(Self)`。
+    pub fn encode_value(&self) -> Result<Vec<u8>> {
+        let mut v = Vec::with_capacity(64);
+        v.push(OBJECT_META_VERSION);
+        postcard::to_allocvec(self)
+            .map_err(|e| Error::Meta(format!("postcard encode object meta: {e}")))
+            .map(|mut p| {
+                v.append(&mut p);
+                v
+            })
+    }
+
+    /// 解码值格式;版本字节缺失/不符 → Corrupt(旧布局无前置兼容)。
+    pub fn decode_value(buf: &[u8]) -> Result<Self> {
+        let Some(&ver) = buf.first() else {
+            return Err(Error::Corrupt("object meta value too short".into()));
+        };
+        if ver != OBJECT_META_VERSION {
+            return Err(Error::Corrupt(format!(
+                "object meta version {ver} unsupported (expected {OBJECT_META_VERSION})"
+            )));
+        }
+        postcard::from_bytes(&buf[1..])
+            .map_err(|e| Error::Corrupt(format!("postcard decode object meta: {e}")))
     }
 }
 
@@ -295,41 +339,48 @@ pub fn align_up(v: u64, align: u64) -> u64 {
     (v + align - 1) & !(align - 1)
 }
 
-/// extent 头(DESIGN §4.2;4KiB,手工编码)。
+/// extent 头(ADR-9 §4.2;4KiB,手工编码)。
 ///
 /// 布局:
 /// ```text
 /// 0..4     magic "FS3E"
 /// 4..12    generation u64
-/// 12..28   owner_id [16]
-/// 28..36   object_offset u64
-/// 36..40   chunk_size u32
-/// 40..42   chunk_count u16
-/// 42..48   reserved [6]
-/// 48..48+4N crc32c[N] u32
+/// 12..16   flags u32(bit0 = packed)
+/// 16..36   reserved(owner_id/object_offset 弃用,恒零)
+/// 36..40   chunk_size u32(打包 = 0;独占 = 64KiB)
+/// 40..42   chunk_count u16(打包 = 0;独占 = CRC 表项数)
+/// 42..48   reserved(零)
+/// 48..48+4N crc32c[N] u32(仅独占 extent)
 /// 48+4N..52+4N header_crc u32(覆盖前面全部)
 /// 其余     reserved(零)
 /// ```
+///
+/// 打包 extent 头不存 CRC 表(各段 CRC 随对象元数据,ADR-9 §4.3);
+/// 独占 extent 头保持 v1 语义(完整 CRC 表,大对象读路径零改动)。
+/// 头延迟到封口时写(数据之后写,防撕裂)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtentHeader {
     pub generation: u64,
-    pub owner_id: [u8; 16],
-    /// 本 extent 数据在对象内的起始偏移。
-    pub object_offset: u64,
+    /// flags;`EXTENT_FLAG_PACKED` = 打包 extent。
+    pub flags: u32,
+    /// 独占:CRC 网格单元大小(64KiB);打包:0。
     pub chunk_size: u32,
-    /// 每个 chunk 的 CRC32C;最后一个 chunk 可能不足 chunk_size。
+    /// 独占:每个 chunk 的 CRC32C(最后一个可能不足);打包:空。
     pub chunk_crcs: Vec<u32>,
 }
 
 impl ExtentHeader {
+    pub fn is_packed(&self) -> bool {
+        self.flags & EXTENT_FLAG_PACKED != 0
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let n = self.chunk_crcs.len() as u16;
         let crc_end = 48 + 4 * self.chunk_crcs.len();
         let mut b = vec![0u8; EXTENT_HEADER_SIZE as usize];
         b[0..4].copy_from_slice(&EXTENT_MAGIC);
         b[4..12].copy_from_slice(&self.generation.to_le_bytes());
-        b[12..28].copy_from_slice(&self.owner_id);
-        b[28..36].copy_from_slice(&self.object_offset.to_le_bytes());
+        b[12..16].copy_from_slice(&self.flags.to_le_bytes());
         b[36..40].copy_from_slice(&self.chunk_size.to_le_bytes());
         b[40..42].copy_from_slice(&n.to_le_bytes());
         for (i, c) in self.chunk_crcs.iter().enumerate() {
@@ -347,7 +398,20 @@ impl ExtentHeader {
         if buf[0..4] != EXTENT_MAGIC {
             return Err(Error::Corrupt("extent header magic mismatch".into()));
         }
-        let n = u16::from_le_bytes(buf[40..42].try_into().unwrap()) as usize;
+        let flags = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+        let packed = flags & EXTENT_FLAG_PACKED != 0;
+        let n = if packed {
+            // 打包 extent:chunk 数必须为 0(CRC 表随元数据)
+            let n = u16::from_le_bytes(buf[40..42].try_into().unwrap());
+            if n != 0 {
+                return Err(Error::Corrupt(
+                    "packed extent header must not carry a crc table".into(),
+                ));
+            }
+            0
+        } else {
+            u16::from_le_bytes(buf[40..42].try_into().unwrap()) as usize
+        };
         let crc_end = 48 + 4 * n;
         if crc_end + 4 > buf.len() {
             return Err(Error::Corrupt(
@@ -367,14 +431,13 @@ impl ExtentHeader {
         }
         Ok(ExtentHeader {
             generation: u64::from_le_bytes(buf[4..12].try_into().unwrap()),
-            owner_id: buf[12..28].try_into().unwrap(),
-            object_offset: u64::from_le_bytes(buf[28..36].try_into().unwrap()),
+            flags,
             chunk_size: u32::from_le_bytes(buf[36..40].try_into().unwrap()),
             chunk_crcs,
         })
     }
 
-    /// 校验一个数据 chunk 的 CRC(verify_reads 时调用)。
+    /// 校验一个数据 chunk 的 CRC(verify_reads 时调用;仅独占 extent)。
     pub fn verify_chunk(&self, idx: usize, data: &[u8]) -> bool {
         match self.chunk_crcs.get(idx) {
             Some(expected) => crc32c(data, 0) == *expected,
@@ -519,10 +582,10 @@ mod tests {
 
     #[test]
     fn extent_header_roundtrip() {
+        // 独占 extent:完整 CRC 表
         let h = ExtentHeader {
             generation: 42,
-            owner_id: [9u8; 16],
-            object_offset: 65536,
+            flags: 0,
             chunk_size: 65536,
             chunk_crcs: vec![1, 2, 3, 4],
         };
@@ -530,9 +593,62 @@ mod tests {
         assert_eq!(enc.len() as u64, EXTENT_HEADER_SIZE);
         let dec = ExtentHeader::decode(&enc).unwrap();
         assert_eq!(h, dec);
+        assert!(!dec.is_packed());
         let mut bad = enc.clone();
         bad[10] ^= 1; // 代数区域(CRC 覆盖范围内)
         assert!(ExtentHeader::decode(&bad).is_err());
+    }
+
+    #[test]
+    fn extent_header_packed_roundtrip() {
+        // 打包 extent:flags 置位、chunk 数 = 0、无 CRC 表
+        let h = ExtentHeader {
+            generation: 7,
+            flags: EXTENT_FLAG_PACKED,
+            chunk_size: 0,
+            chunk_crcs: vec![],
+        };
+        let enc = h.encode();
+        let dec = ExtentHeader::decode(&enc).unwrap();
+        assert_eq!(h, dec);
+        assert!(dec.is_packed());
+        // 打包头携带 CRC 表 → 拒绝
+        let mut bad = h.encode();
+        bad[40..42].copy_from_slice(&1u16.to_le_bytes());
+        assert!(ExtentHeader::decode(&bad).is_err());
+        // 篡改 flags → CRC 不匹配
+        let mut bad2 = h.encode();
+        bad2[12] ^= 0x04;
+        assert!(ExtentHeader::decode(&bad2).is_err());
+    }
+
+    #[test]
+    fn object_meta_value_version_roundtrip() {
+        let m = ObjectMeta {
+            size: 5 * 1024 * 1024,
+            etag: [3u8; 16],
+            mtime: 9,
+            extents: vec![Segment {
+                extent_id: 1,
+                offset: 0,
+                len: 4190208,
+                crcs: vec![],
+            }],
+            content_type: "text/plain".into(),
+            user_meta: vec![("k".into(), "v".into())],
+            inline: None,
+            parts: vec![],
+        };
+        let v = m.encode_value().unwrap();
+        assert_eq!(v[0], OBJECT_META_VERSION);
+        assert_eq!(ObjectMeta::decode_value(&v).unwrap(), m);
+        // 无版本字节(旧布局值)→ 拒绝
+        let legacy = postcard::to_allocvec(&m).unwrap();
+        assert!(ObjectMeta::decode_value(&legacy).is_err());
+        // 版本字节不符 → 拒绝
+        let mut bad = v.clone();
+        bad[0] = 1;
+        assert!(ObjectMeta::decode_value(&bad).is_err());
     }
 
     #[test]
@@ -551,11 +667,11 @@ mod tests {
 
     proptest::proptest! {
         #[test]
-        fn extent_ref_serde_roundtrip(extent_id: u64, offset: u32, len: u32) {
-            let r = ExtentRef { extent_id, offset, len };
-            let enc = postcard::to_allocvec(&r).unwrap();
-            let dec: ExtentRef = postcard::from_bytes(&enc).unwrap();
-            assert_eq!(r, dec);
+        fn segment_serde_roundtrip(extent_id: u32, offset: u32, len: u32, crcs: Vec<u32>) {
+            let s = Segment { extent_id, offset, len, crcs };
+            let enc = postcard::to_allocvec(&s).unwrap();
+            let dec: Segment = postcard::from_bytes(&enc).unwrap();
+            assert_eq!(s, dec);
         }
     }
 }

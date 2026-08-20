@@ -11,7 +11,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use fs3_core::{AllocRecord, BucketMeta, Error, ExtentRef, ObjectMeta, Result, MAX_OBJECT_SIZE};
+use fs3_core::{AllocRecord, BucketMeta, Error, ObjectMeta, Result, Segment, MAX_OBJECT_SIZE};
 use rocksdb::{
     BlockBasedOptions, Cache, DBCompressionType, Direction, Error as RocksError, ErrorKind,
     IteratorMode, OptimisticTransactionDB, OptimisticTransactionOptions, Options, Transaction,
@@ -121,12 +121,13 @@ impl MultipartSession {
 }
 
 /// 分片元数据(键 `p:{uploadId}\0{part_no be32}`;数据在 extents 或 inline)。
+/// ADR-9:v2 起 `extents` 为段列表(Vec<Segment>)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartMeta {
     pub size: u64,
     pub etag: [u8; 16],
     pub mtime: i64,
-    pub extents: Vec<ExtentRef>,
+    pub extents: Vec<Segment>,
     pub inline: Option<Vec<u8>>,
 }
 
@@ -150,6 +151,15 @@ pub enum Op {
         bucket: String,
         key: String,
         meta: ObjectMeta,
+    },
+    /// 压缩迁移(ADR-9 §6.2 阶段 3):事务内读对象并校验旧段仍被引用,
+    /// 把 `old_segments` 按序替换为 `new_segments`;被并发覆盖/删除 →
+    /// 返回 Error::ObjectChanged(调用方放弃该对象,下轮再来)。
+    ObjectMigrate {
+        bucket: String,
+        key: String,
+        old_segments: Vec<Segment>,
+        new_segments: Vec<Segment>,
     },
     ObjectDelete {
         bucket: String,
@@ -283,7 +293,8 @@ fn decode_bucket(v: &[u8]) -> Result<BucketMeta> {
 }
 
 fn decode_object(v: &[u8]) -> Result<ObjectMeta> {
-    decode(v).map_err(|e| Error::Corrupt(format!("object meta: {e}")))
+    // ADR-9 §13:值 = [版本字节] + postcard(ObjectMeta);旧值(无版本字节)拒绝
+    ObjectMeta::decode_value(v)
 }
 
 fn decode_alloc(v: &[u8]) -> Result<AllocRecord> {
@@ -635,6 +646,74 @@ impl MetaStore {
         ])
     }
 
+    /// 压缩迁移事务(ADR-9 §6.2 阶段 3):单对象段列表更新(旧段→新段)+
+    /// 分配/释放记录,同事务;**不触碰桶统计**(数据量不变)。
+    ///
+    /// 事务内校验旧段仍按序被引用;对象被并发覆盖/删除 → `Error::ObjectChanged`
+    /// (调用方放弃该对象,下轮再来;乐观事务冲突自动重试)。
+    pub fn commit_object_migrate(
+        &self,
+        bucket: &str,
+        key: &str,
+        old_segments: &[Segment],
+        new_segments: &[Segment],
+        draft: AllocDraft,
+    ) -> Result<u64> {
+        self.commit(&[
+            Op::ObjectMigrate {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                old_segments: old_segments.to_vec(),
+                new_segments: new_segments.to_vec(),
+            },
+            Op::Alloc { draft },
+        ])
+    }
+
+    /// 全量对象快照扫描(o: 前缀;rocksdb MVCC 快照,与并发写完全隔离)。
+    /// 压缩发现阶段用(ADR-9 §6.2 阶段 1)。
+    pub fn snapshot_all_objects(&self) -> Result<Vec<(String, String, ObjectMeta)>> {
+        let snap = self.db.snapshot();
+        let mut out = Vec::new();
+        for item in snap.iterator(IteratorMode::From(PREFIX_OBJECT, Direction::Forward)) {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(PREFIX_OBJECT) {
+                break;
+            }
+            let (bucket, key) = parse_object_key(&k)?;
+            out.push((bucket, key, decode_object(&v)?));
+        }
+        Ok(out)
+    }
+
+    /// 全量分片快照扫描(p: 前缀;MVCC 快照)。压缩发现 + 恢复可达性扫描用。
+    pub fn snapshot_all_parts(&self) -> Result<Vec<(String, u32, PartMeta)>> {
+        let snap = self.db.snapshot();
+        let mut out = Vec::new();
+        for item in snap.iterator(IteratorMode::From(PREFIX_PART, Direction::Forward)) {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(PREFIX_PART) {
+                break;
+            }
+            let body = k
+                .strip_prefix(PREFIX_PART)
+                .ok_or_else(|| Error::Corrupt("part key missing prefix".into()))?;
+            let sep = body
+                .iter()
+                .position(|&b| b == 0x00)
+                .ok_or_else(|| Error::Corrupt("part key missing separator".into()))?;
+            let uid = String::from_utf8(body[..sep].to_vec())
+                .map_err(|_| Error::Corrupt("upload id not utf8".into()))?;
+            let no = &body[sep + 1..];
+            if no.len() != 4 {
+                return Err(Error::Corrupt("part key malformed".into()));
+            }
+            let part_no = u32::from_be_bytes(no.try_into().unwrap());
+            out.push((uid, part_no, decode(&v)?));
+        }
+        Ok(out)
+    }
+
     // ─────────────────────────── multipart ───────────────────────────
 
     /// 创建分片上传会话(桶必须存在)。
@@ -856,7 +935,43 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
                 }
                 let k = object_key(bucket, key);
                 tget(tx, &k)?;
-                tinsert(tx, k, encode(meta)?)?;
+                tinsert(tx, k, meta.encode_value()?)?;
+            }
+            Op::ObjectMigrate {
+                bucket,
+                key,
+                old_segments,
+                new_segments,
+            } => {
+                let k = object_key(bucket, key);
+                let cur = tget(tx, &k)?.ok_or_else(|| {
+                    Error::ObjectChanged(format!("{bucket}/{key} deleted during compaction"))
+                })?;
+                let mut meta = decode_object(&cur)?;
+                // 快照隔离 + 乐观重试:旧段必须仍按序被引用,否则放弃该对象
+                // (ADR-9 §6.2 阶段 3:对象被并发覆盖/删除 → 下轮再来)。
+                if old_segments.len() != new_segments.len() {
+                    return Err(Error::ObjectChanged(format!(
+                        "{bucket}/{key} segment mapping mismatch"
+                    )));
+                }
+                let mut ptr = 0usize;
+                let mut out: Vec<Segment> = Vec::with_capacity(meta.extents.len());
+                for s in &meta.extents {
+                    if ptr < old_segments.len() && *s == old_segments[ptr] {
+                        out.push(new_segments[ptr].clone());
+                        ptr += 1;
+                    } else {
+                        out.push(s.clone());
+                    }
+                }
+                if ptr != old_segments.len() {
+                    return Err(Error::ObjectChanged(format!(
+                        "{bucket}/{key} segments changed during compaction"
+                    )));
+                }
+                meta.extents = out;
+                tinsert(tx, k, meta.encode_value()?)?;
             }
             Op::ObjectDelete { bucket, key } => {
                 let k = object_key(bucket, key);
@@ -959,7 +1074,7 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
 mod tests {
     use super::*;
 
-    use fs3_core::BucketStats;
+    use fs3_core::{BucketStats, Segment};
 
     fn open_tmp() -> (tempfile::TempDir, MetaStore) {
         let dir = tempfile::tempdir().unwrap();
@@ -1203,6 +1318,135 @@ mod tests {
         let recs = s.list_alloc_records(0).unwrap();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].alloc, vec![(1, 1)]);
+    }
+
+    #[test]
+    fn object_value_version_byte_and_legacy_rejection() {
+        // ADR-9 §13:值 = [版本字节] + postcard;旧值(无版本字节)拒绝解码
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        let mut m = object_meta(100);
+        m.extents = vec![Segment {
+            extent_id: 3,
+            offset: 0,
+            len: 65536,
+            crcs: vec![1, 2],
+        }];
+        s.commit_object_put("b1", "k", &m, AllocDraft::default(), StatsDelta::default())
+            .unwrap();
+        let got = s.get_object("b1", "k").unwrap().unwrap();
+        assert_eq!(got, m, "段列表往返一致");
+        // 直接向 rocksdb 写入无版本字节的旧格式值 → 解码拒绝(Corrupt)
+        let legacy = postcard::to_allocvec(&m).unwrap();
+        let db = s.db.clone();
+        db.put(object_key("b1", "legacy"), legacy).unwrap();
+        assert!(matches!(
+            s.get_object("b1", "legacy"),
+            Err(Error::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn migrate_txn_replaces_segments_and_detects_stale() {
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        let mut m = object_meta(200_000);
+        let old = vec![
+            Segment {
+                extent_id: 1,
+                offset: 0,
+                len: 100_000,
+                crcs: vec![11],
+            },
+            Segment {
+                extent_id: 2,
+                offset: 0,
+                len: 100_000,
+                crcs: vec![22],
+            },
+        ];
+        m.extents = old.clone();
+        s.commit_object_put("b1", "k", &m, AllocDraft::default(), StatsDelta::default())
+            .unwrap();
+        // 迁移:旧段 → 新段(按序替换)
+        let new = vec![
+            Segment {
+                extent_id: 7,
+                offset: 0,
+                len: 100_000,
+                crcs: vec![77],
+            },
+            Segment {
+                extent_id: 8,
+                offset: 0,
+                len: 100_000,
+                crcs: vec![88],
+            },
+        ];
+        s.commit_object_migrate(
+            "b1",
+            "k",
+            &old,
+            &new,
+            AllocDraft {
+                alloc: vec![(7, 2)],
+                ref_dec: vec![1, 2],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let got = s.get_object("b1", "k").unwrap().unwrap();
+        assert_eq!(got.extents, new);
+        assert_eq!(got.size, 200_000, "元数据其余字段不变");
+        // 旧段已不存在 → ObjectChanged(对象被并发覆盖/删除的模拟)
+        let r = s.commit_object_migrate("b1", "k", &old, &new, AllocDraft::default());
+        assert!(matches!(r, Err(Error::ObjectChanged(_))));
+        // 对象已删除 → ObjectChanged(不得复活)
+        s.commit_object_delete("b1", "k", AllocDraft::default(), StatsDelta::default())
+            .unwrap();
+        let r = s.commit_object_migrate("b1", "k", &new, &old, AllocDraft::default());
+        assert!(matches!(r, Err(Error::ObjectChanged(_))));
+    }
+
+    #[test]
+    fn snapshot_scan_all_objects_and_parts() {
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        for i in 0..3 {
+            s.commit_object_put(
+                "b1",
+                &format!("k{i}"),
+                &object_meta(i),
+                AllocDraft::default(),
+                StatsDelta::default(),
+            )
+            .unwrap();
+        }
+        // multipart 分片也进入快照扫描(恢复可达性 + 压缩发现)
+        let uid = "upload-1";
+        s.create_multipart(uid, &MultipartSession::new("b1", "big", "text/x", vec![]))
+            .unwrap();
+        let part = PartMeta {
+            size: 100,
+            etag: [1u8; 16],
+            mtime: 1,
+            extents: vec![Segment {
+                extent_id: 9,
+                offset: 0,
+                len: 100,
+                crcs: vec![],
+            }],
+            inline: None,
+        };
+        s.put_part(uid, 1, &part, AllocDraft::default()).unwrap();
+        let objs = s.snapshot_all_objects().unwrap();
+        assert_eq!(objs.len(), 3);
+        assert!(objs.iter().all(|(b, _, _)| b == "b1"));
+        let parts = s.snapshot_all_parts().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].0, uid);
+        assert_eq!(parts[0].1, 1);
+        assert_eq!(parts[0].2.extents, part.extents);
     }
 
     #[test]

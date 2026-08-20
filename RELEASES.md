@@ -1,3 +1,24 @@
+## v0.6 — P1 打包存储(ADR-9,开发中)
+
+> 存储层按 ADR-9 重新实现:**放弃旧布局前置兼容**(布局版本 2,旧设备直接拒绝;无混合模式/无双兼容解码)。
+
+### 新能力
+
+- **段模型(Tier 1)**:对象 → 设备引用单位改为 4KiB 对齐变长段 `Segment{extent_id, offset, len, crcs}`;元数据值 = [版本字节] + postcard(ObjectMeta v2)。
+- **跨对象开放 extent**:每引擎一个开放 extent,watermark 追加;封口判定(写满 / 剩余 < 32KiB / seal-on-delete);对象尾部跨界 spill——1MiB 对象负载设备占用/逻辑字节 ≥ 99%(现状基线 25%)。
+- **封口类型**:独占 extent(单对象写满,头带完整 CRC 表,零拷贝大对象路径不变)/ 打包 extent(空 CRC 表,段 CRC 随元数据);verify_reads 双来源。
+- **段级派生账目**:live_bytes、Free/Open/Sealed 状态、COW 稀疏共享段表全部不持久化,启动可达性扫描重建;`a:` 记录触发时机 = 首段 alloc / 末段消亡 ref_dec(格式不变);staged 回滚扩展。
+- **恢复扩展**:开放 extent 按"无有效头"识别续写(watermark = 活段最大 end,跨会话孤儿区自然覆盖);写满未封口 extent 补写头(独占重算 CRC)。
+- **Tier 2 惰性压缩**:快照扫描发现(Top-K)+ 单对象迁移事务(乐观重试 + 放弃语义)+ 共享段跳过 + 速率节流与暂停;`fasts3d compact` 前台运行;崩溃任意窗口收敛。
+- COW 粒度从 extent 下沉到段(复制打包小对象不再浪费整个 4MiB extent)。
+
+### 验证(门禁)
+
+- cargo test 全绿(核心 20 / 分配器 20 / 引擎 39 含 3 组 proptest / 元数据 23 等);clippy 0 警告;fmt 干净。
+- 崩溃 harness:kill -9 随机中断 full/group 双模式通过,零撕裂、位图一致、零泄漏。
+- 利用率实测:1MiB + 5MiB 混载 `check` 报告 100.00%。
+- 压缩:候选发现/迁移/释放/共享跳过/崩溃收敛/防抖动均有专项测试。
+
 # FastS3 发布记录
 
 ## v0.3 — M2 高级语义与零拷贝(2026-08-20)

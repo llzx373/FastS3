@@ -1,29 +1,46 @@
-//! FastS3 存储引擎:PUT/GET/DELETE 全链路、崩溃恢复、检查点策略。
+//! FastS3 存储引擎(ADR-9 打包段布局):PUT/GET/DELETE 全链路、崩溃恢复、检查点策略。
 //!
 //! 时序保证(DESIGN §4.5):数据先落盘(O_DIRECT 写返回)、元数据后提交
-//! (rocksdb 事务 + 组提交,ADR-8);客户端中断 → 不提交事务,extent 回滚释放。
-//! 启动恢复(DESIGN §4.10):超级块 → rocksdb WAL → 检查点 → a: 重放 → 引用计数
-//! 可达性重建 → 泄漏报告。
+//! (rocksdb 事务 + 组提交,ADR-8);客户端中断 → 不提交事务,段/水位回滚。
+//! 启动恢复(DESIGN §4.10 + ADR-9 §5.7):超级块 → rocksdb WAL → 检查点 →
+//! a: 重放 → **段级可达性扫描**(live_bytes/引用计数/共享段表/watermark 重建)
+//! → 开放 extent 识别与续写 → 泄漏报告。
+//!
+//! 段模型(ADR-9):对象 → 设备引用单位为 4KiB 对齐变长段 `Segment`;引擎持一个
+//! 跨对象存活的开放 extent(watermark 追加,封口判定:写满 / 剩余 < 32KiB /
+//! seal-on-delete);大对象跨界 spill;独占 extent 头带 CRC 表,打包 extent 的
+//! 段 CRC 随对象元数据(verify_reads 双来源)。放弃旧布局前置兼容:布局版本 2,
+//! 旧设备直接拒绝。
 
+pub mod compaction;
 pub mod io;
 
-use md5::Digest;
+#[cfg(test)]
+mod tests;
+
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::mpsc::Receiver;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use fs3_alloc::{Allocator, Checkpointer};
+use fs3_alloc::{Allocator, Checkpointer, Staged};
+use fs3_core::crc32c::crc32c;
 use fs3_core::{
-    align_up, random_bytes, BucketMeta, BucketStats, Error, ExtentHeader, ExtentRef, ObjectMeta,
-    Result, CHECKPOINT_ALLOC_DELTA, SECTOR_SIZE,
+    align_up, random_bytes, BucketMeta, BucketStats, Error, ExtentHeader, ObjectMeta, Result,
+    Segment, CHECKPOINT_ALLOC_DELTA, EXTENT_FLAG_PACKED, EXTENT_HEADER_SIZE, SECTOR_SIZE,
+    SEGMENT_CRC_GRID,
 };
 use fs3_device::{open_device, BlockDevice};
 use fs3_meta::keys::part_key;
 use fs3_meta::{
     AllocDraft, MetaConfig, MetaStore, MultipartSession, PartMeta, StatsDelta, SyncMode,
 };
+use md5::Digest;
 
+use crate::compaction::{Compactor, CompactorHandle};
 use crate::io::{fsync, open_io_engine, read_exact, write_all, IoEngine};
+
+pub use crate::compaction::{CompactionConfig, CompactionReport};
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -43,6 +60,8 @@ pub struct EngineConfig {
     pub read_only: bool,
     /// 小对象内联阈值(E3;≤ 该值的数据存元数据,零设备 I/O)。
     pub small_object_limit: usize,
+    /// Tier 2 惰性压缩配置(ADR-9 §6)。
+    pub compaction: CompactionConfig,
 }
 
 impl Default for EngineConfig {
@@ -57,6 +76,7 @@ impl Default for EngineConfig {
             io_uring: true,
             read_only: false,
             small_object_limit: fs3_core::SMALL_OBJECT_LIMIT,
+            compaction: CompactionConfig::default(),
         }
     }
 }
@@ -83,10 +103,24 @@ pub struct CheckReport {
     pub buckets: usize,
     pub objects: usize,
     pub total_bytes: u64,
+    /// 全设备活字节数(ADR-9:设备占用 = Σ 活段;利用率 = live_bytes/逻辑字节)。
+    pub live_bytes: u64,
     pub leaks: Vec<u64>,
     pub io_engine: &'static str,
     pub checkpoint_seq: u64,
     pub last_seq: u64,
+}
+
+/// 开放 extent(ADR-9 §4.4/§5.1):当前正在被追加写入的 extent,每引擎一个。
+#[derive(Debug, Clone)]
+struct OpenExtent {
+    extent_id: u32,
+    /// 已写字节水位(追加位置;4KiB 对齐)。
+    watermark: u32,
+    /// 已提交事务覆盖到的水位(事务失败时回退,孤儿区被后续追加覆盖)。
+    committed_end: u32,
+    /// 参与对象数(封口时判定独占 vs 打包)。
+    participants: u32,
 }
 
 pub struct Engine {
@@ -95,17 +129,22 @@ pub struct Engine {
     zc_fd: Option<i32>,
     sb: fs3_core::SuperBlock,
     alloc: Arc<Allocator>,
-    meta: MetaStore,
+    meta: Arc<MetaStore>,
     /// Mutex 包装:使 Engine 满足 Sync(服务层 RwLock 共享;锁内无竞争,
-    /// 引擎写锁已互斥)。
-    io: std::sync::Mutex<Box<dyn IoEngine>>,
+    /// 引擎写锁已互斥;压缩 worker 短临界区借用,ADR-9 §6.3)。
+    io: Arc<Mutex<Box<dyn IoEngine>>>,
     chunk_size: usize,
     verify_reads: bool,
     read_only: bool,
     small_object_limit: usize,
+    /// 开放 extent(跨对象存活;写入路径唯一追加点)。
+    open_extent: Option<OpenExtent>,
     checkpoint: std::sync::Mutex<CheckpointState>,
     checkpoint_tick: std::sync::Mutex<Receiver<()>>,
     _checkpoint_thread: Option<std::thread::JoinHandle<()>>,
+    /// Tier 2 压缩核心(前台 compact_once 与后台 worker 共用)。
+    compactor: Option<Arc<Compactor>>,
+    _compactor_thread: Option<CompactorHandle>,
     closed: bool,
 }
 
@@ -137,7 +176,7 @@ impl Engine {
             sync_mode: cfg.sync_mode,
             cache_capacity: None,
         };
-        let meta = MetaStore::open(&cfg.meta_dir, &meta_cfg)?;
+        let meta = Arc::new(MetaStore::open(&cfg.meta_dir, &meta_cfg)?);
 
         // 3. 重放 seq > 检查点序号的 a: 记录 → 恢复位图
         let recs = meta.list_alloc_records(cp.seq)?;
@@ -152,8 +191,11 @@ impl Engine {
             alloc.apply_record(rec);
         }
 
-        // 4. 引用计数 = 元数据可达性重建(mark;位图 vs 元数据核对 = 泄漏扫描)
-        let leaks = rebuild_refcounts(&meta, alloc.as_ref());
+        let io = Arc::new(Mutex::new(open_io_engine(cfg.io_uring)?));
+
+        // 4. 段级可达性扫描(ADR-9 §5.7 第 4 步):重建 live_bytes/引用计数/
+        //    共享段表/watermark;位图 vs 元数据核对 = 泄漏报告
+        let (leaks, max_end) = rebuild_segment_state(meta.as_ref(), alloc.as_ref())?;
         if !leaks.is_empty() {
             tracing::warn!(
                 "recovery found {} leaked extents (allocated but unreachable)",
@@ -161,9 +203,16 @@ impl Engine {
             );
         }
 
-        let io = open_io_engine(cfg.io_uring)?;
+        // 5. 开放 extent 识别与续写(ADR-9 §5.7):有活段、无有效头(或代数
+        //    陈旧)的 extent = 崩溃时的开放 extent;watermark = 活段最大 end,
+        //    跨会话孤儿区由新追加自然覆盖
+        let open_extent = if cfg.read_only {
+            None
+        } else {
+            resume_open_extent(alloc.as_ref(), device.as_ref(), &sb, &max_end)?
+        };
 
-        // 5. 检查点定时线程(时间触发策略)
+        // 6. 检查点定时线程(时间触发策略)
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let interval = std::time::Duration::from_secs(cfg.checkpoint_interval_secs.max(1));
         let thread = std::thread::spawn(move || loop {
@@ -173,6 +222,27 @@ impl Engine {
             std::thread::sleep(interval);
         });
 
+        // 7. Tier 2 压缩核心 + 后台 worker(ADR-9 §6;`enabled` 只门控 worker,
+        // 前台 compact_once 始终可用)
+        let (compactor, compactor_thread) = if cfg.read_only {
+            (None, None)
+        } else {
+            let c = Arc::new(Compactor::new(
+                meta.clone(),
+                alloc.clone(),
+                io.clone(),
+                device.raw_fd(),
+                sb,
+                cfg.compaction.clone(),
+            ));
+            let h = if cfg.compaction.enabled {
+                Some(CompactorHandle::spawn(c.clone(), &cfg.compaction))
+            } else {
+                None
+            };
+            (Some(c), h)
+        };
+
         let last_seq = meta.last_seq()?;
         Ok(Engine {
             zc_fd,
@@ -180,11 +250,12 @@ impl Engine {
             sb,
             alloc,
             meta,
-            io: std::sync::Mutex::new(io),
+            io,
             chunk_size: fs3_core::DEFAULT_CHUNK_SIZE,
             verify_reads: cfg.verify_reads,
             read_only: cfg.read_only,
             small_object_limit: cfg.small_object_limit,
+            open_extent,
             checkpoint: std::sync::Mutex::new(CheckpointState {
                 seq: cp.seq.max(last_seq),
                 alloc_since: 0,
@@ -192,6 +263,8 @@ impl Engine {
             }),
             checkpoint_tick: std::sync::Mutex::new(rx),
             _checkpoint_thread: Some(thread),
+            compactor,
+            _compactor_thread: compactor_thread,
             closed: false,
         })
     }
@@ -210,6 +283,28 @@ impl Engine {
 
     pub fn io_engine_name(&self) -> &'static str {
         self.io.lock().unwrap().name()
+    }
+
+    // ─────────────────────────── 压缩(Tier 2) ───────────────────────────
+
+    /// 前台执行一轮压缩(测试 / check --compact);返回本轮报告。
+    pub fn compact_once(&self) -> Result<CompactionReport> {
+        if self.read_only {
+            return Err(Error::Unsupported(
+                "compaction requires a writable engine".into(),
+            ));
+        }
+        match &self.compactor {
+            Some(c) => c.compact_batch(),
+            None => Ok(CompactionReport::default()),
+        }
+    }
+
+    /// 压缩暂停原语(ADR-9 §6.4;管理面/admin API 可调用)。
+    pub fn set_compaction_paused(&self, paused: bool) {
+        if let Some(h) = &self._compactor_thread {
+            h.set_paused(paused);
+        }
     }
 
     /// 每个写操作后调用:处理检查点定时 tick 与分配增量触发。
@@ -256,22 +351,31 @@ impl Engine {
         Ok(())
     }
 
-    /// 模拟崩溃(kill -9):跳过最终检查点直接释放资源。
-    /// rocksdb WAL 按组提交窗口落盘;位图恢复依赖 a: 重放。
+    /// 模拟崩溃(kill -9):跳过最终检查点与封口直接释放资源。
+    /// rocksdb WAL 按组提交窗口落盘;位图恢复依赖 a: 重放;开放 extent 由
+    /// 下次启动按"无有效头"识别并续写。后台 worker 停止(测试中避免
+    /// 线程跨引擎残留;真实 kill -9 无需任何清理)。
     pub fn abort(mut self) {
         self.closed = true;
+        if let Some(mut h) = self._compactor_thread.take() {
+            h.stop();
+        }
     }
 
-    /// 优雅关闭:最终检查点 + 元数据 flush。
+    /// 优雅关闭:停压缩 → 封口开放 extent → 最终检查点 + 元数据 flush。
     pub fn close(&mut self) -> Result<()> {
         if self.closed {
             return Ok(());
         }
         self.closed = true;
+        if let Some(mut h) = self._compactor_thread.take() {
+            h.stop();
+        }
         if let Some(fd) = self.zc_fd.take() {
             // SAFETY: fd 由 open_zerocopy_fd 打开。
             unsafe { libc::close(fd) };
         }
+        self.seal_open_extent()?;
         self.checkpoint()?;
         self.meta.flush()?;
         Ok(())
@@ -325,7 +429,7 @@ impl Engine {
     /// PUT 全路径:先读前缀判定内联(E3);超过阈值走 extent 流水线。
     ///
     /// 时序保证(DESIGN §4.5):数据先落盘、元数据后提交;任何错误回滚
-    /// 已暂存分配;客户端中断 → 不提交事务、extent 释放。
+    /// 已暂存分配;客户端中断 → 不提交事务、段/水位回滚(ADR-9 §5.1)。
     pub fn put_with_meta(
         &mut self,
         bucket: &str,
@@ -338,10 +442,8 @@ impl Engine {
             return Err(Error::NotFound(format!("bucket {bucket}")));
         }
         let old = self.meta.get_object(bucket, key)?;
-        let old_ids: Vec<u64> = old
-            .as_ref()
-            .map(|o| o.extents.iter().map(|e| e.extent_id).collect())
-            .unwrap_or_default();
+        let old_segments: Vec<Segment> =
+            old.as_ref().map(|o| o.extents.clone()).unwrap_or_default();
         let old_size = old.as_ref().map(|o| o.size as i64).unwrap_or(0);
 
         // 1) 读前缀(≤ small_object_limit+1 字节)判定内联
@@ -378,12 +480,13 @@ impl Engine {
                 inline: Some(prefix),
                 parts: vec![],
             };
-            if !old_ids.is_empty() {
-                self.alloc.release(&old_ids);
+            let mut draft = Staged::default();
+            if !old_segments.is_empty() {
+                self.alloc.release_object(&mut draft, &old_segments);
+                self.after_release(&old_segments)?;
             }
-            let draft = self.alloc.take_draft();
             let delta = StatsDelta {
-                objects: if old_ids.is_empty() { 1 } else { 0 },
+                objects: if old_segments.is_empty() { 1 } else { 0 },
                 bytes: size as i64 - old_size,
             };
             return match self.meta.commit_object_put(
@@ -394,12 +497,11 @@ impl Engine {
                 delta,
             ) {
                 Ok(_) => {
-                    self.alloc.confirm_draft();
                     self.maybe_checkpoint()?;
                     Ok(meta)
                 }
                 Err(e) => {
-                    self.alloc.rollback_draft(&draft);
+                    self.abort_draft(&draft);
                     Err(e)
                 }
             };
@@ -416,47 +518,50 @@ impl Engine {
             key,
             reader: &mut prefixed,
             old_size,
-            old_ids,
+            old_segments,
             content_type,
             user_meta,
         });
         match result {
             Ok(meta) => {
-                self.alloc.confirm_draft();
                 self.maybe_checkpoint()?;
                 Ok(meta)
             }
-            Err(e) => {
-                let draft = self.alloc.take_draft();
-                self.alloc.rollback_draft(&draft);
-                Err(e)
-            }
+            Err(e) => Err(e),
         }
     }
 
     /// extent 写路径流水线:64KiB chunk 攒批 → O_DIRECT 写;数据先落盘。
     ///
-    /// 输入流按 extent/chunk 边界切分:chunk(64KiB)是 CRC 单元,与 extent
-    /// 载荷 64KiB 对齐;跨 extent 的输入在边界拆分,绝不超过 extent 容量
-    /// (防越界写坏下一个 extent 的头)。
+    /// 输入流按段边界切分:段 = 开放 extent 数据区内 4KiB 对齐连续区间,
+    /// CRC 网格 = 段内 64KiB(尾部按实际数据,补零落盘);跨 extent 的输入
+    /// 在边界拆分,绝不超过 extent 容量(防越界写坏下一个 extent 的头)。
     fn put_stream(&mut self, ctx: PutCtx) -> Result<ObjectMeta> {
         let PutCtx {
             bucket,
             key,
             reader,
             old_size,
-            old_ids,
+            old_segments,
             content_type,
             user_meta,
         } = ctx;
-        let (extents, size, etag) = self.stream_to_extents(reader)?;
+        let mut draft = Staged::default();
+        let (segments, size, etag) = match self.stream_to_extents(reader, &mut draft) {
+            Ok(v) => v,
+            Err(e) => {
+                // 流中断(客户端断连):回滚已暂存分配 + 开放 extent 水位
+                self.abort_draft(&draft);
+                return Err(e);
+            }
+        };
 
         let mtime = now_ts();
         let meta = ObjectMeta {
             size,
             etag,
             mtime,
-            extents,
+            extents: segments,
             content_type: content_type
                 .unwrap_or("application/octet-stream")
                 .to_string(),
@@ -465,29 +570,39 @@ impl Engine {
             parts: vec![],
         };
 
-        // 覆盖:旧 extent 释放记录进同一事务
-        if !old_ids.is_empty() {
-            self.alloc.release(&old_ids);
+        // 覆盖语义(ADR-9 §5.4):新段记账必须在旧段释放**之前**——开放 extent
+        // 内原地覆盖时,旧段释放若先执行会把 live_bytes 归零并清位图,
+        // 而新段随后才入账(同一 extent 的位图被错误清除)。
+        self.alloc.add_object(&mut draft, &meta.extents);
+        if !old_segments.is_empty() {
+            self.alloc.release_object(&mut draft, &old_segments);
         }
-        let draft = self.alloc.take_draft();
-        // 覆盖语义:对象数不变(用 old_ids 是否为空判断;空对象覆盖也算覆盖);
+        // 对象数不变(用 old_segments 是否为空判断;空对象覆盖也算覆盖);
         // 字节数 = 新大小 - 旧大小。
         let delta = StatsDelta {
-            objects: if old_ids.is_empty() { 1 } else { 0 },
+            objects: if old_segments.is_empty() { 1 } else { 0 },
             bytes: size as i64 - old_size,
         };
-        self.meta
-            .commit_object_put(bucket, key, &meta, to_alloc_draft(&draft), delta)?;
-        Ok(meta)
+        match self
+            .meta
+            .commit_object_put(bucket, key, &meta, to_alloc_draft(&draft), delta)
+        {
+            Ok(_) => Ok(meta),
+            Err(e) => {
+                self.abort_draft(&draft);
+                Err(e)
+            }
+        }
     }
 
-    /// 数据流 → extent 流水线(64KiB chunk 攒批 → O_DIRECT 写;CRC 入 extent
-    /// 头)。返回 (extents, size, md5)。分配/写错误自动回滚已暂存分配;
-    /// 不提交任何元数据(由调用方决定提交形式:对象 / 分片 / 组合)。
+    /// 数据流 → 段流水线(64KiB chunk 攒批 → O_DIRECT 写;CRC 入段表)。
+    /// 返回 (segments, size, md5)。分配/写错误自动回滚已暂存分配(调用方
+    /// 负责 rollback);不提交任何元数据(由调用方决定提交形式:对象/分片)。
     fn stream_to_extents(
         &mut self,
         reader: &mut dyn Read,
-    ) -> Result<(Vec<ExtentRef>, u64, [u8; 16])> {
+        draft: &mut Staged,
+    ) -> Result<(Vec<Segment>, u64, [u8; 16])> {
         let mut writer = ExtentWriter::new(self.chunk_size)?;
         let mut inbuf = fs3_device::AlignedBuffer::new(self.chunk_size)?;
         loop {
@@ -495,80 +610,181 @@ impl Engine {
             if n == 0 {
                 break;
             }
-            writer.feed(self, &inbuf.as_slice()[..n])?;
+            writer.feed(self, draft, &inbuf.as_slice()[..n])?;
         }
         writer.finish(self)
     }
 
-    /// 把 chunk 累积缓冲(acc[..fill])写入当前 extent,并记 CRC。
-    /// 写满 chunk 或 extent 将满时调用;写入补零到 4KiB 对齐。
-    fn flush_extent_chunk(
-        &mut self,
-        st: &mut WriteState,
-        acc: &mut fs3_device::AlignedBuffer,
-        fill: &mut usize,
-        hasher: &mut md5::Md5,
-    ) -> Result<()> {
-        if *fill == 0 {
-            return Ok(());
+    // ──────── 开放 extent 管理(ADR-9 §5.1/§5.2/§5.4) ────────
+
+    /// 对象起点封口判定(b):剩余空间 < 32KiB(装不下任何非内联对象)
+    /// → 封口,下个对象使用新 extent。
+    fn rotate_for_new_object(&mut self) -> Result<()> {
+        let should_seal = self
+            .open_extent
+            .as_ref()
+            .map(|oe| {
+                let remaining = self.sb.extent_capacity() - oe.watermark as u64;
+                remaining < self.small_object_limit as u64
+                    || oe.watermark as u64 >= self.sb.extent_capacity()
+            })
+            .unwrap_or(false);
+        if should_seal {
+            self.seal_open_extent()?;
+            self.open_extent = None;
         }
-        let crc = fs3_core::crc32c::crc32c(&acc.as_slice()[..*fill], 0);
-        let write_len = align_up(*fill as u64, SECTOR_SIZE) as usize;
-        if write_len > *fill {
-            acc.as_mut_slice()[*fill..write_len].fill(0);
-        }
-        let dev_off = self.extent_data_offset(st.extent_id) + st.written as u64;
-        write_all(
-            &mut **self.io.lock().unwrap(),
-            self.device.raw_fd(),
-            &acc.as_slice()[..write_len],
-            dev_off,
-        )?;
-        st.written += *fill as u32;
-        st.chunk_crcs.push(crc);
-        hasher.update(&acc.as_slice()[..*fill]);
-        *fill = 0;
         Ok(())
     }
 
-    /// 写 extent 头(含全部 chunk CRC;数据之后写,防撕裂),返回对象引用。
-    fn finalize_extent(
+    /// 分配新开放 extent(首段 alloc 记录随所属对象事务提交;ADR-9 §4.5)。
+    fn open_new_extent(&mut self, draft: &mut Staged) -> Result<()> {
+        let id = self.alloc.allocate(draft, 1)?.remove(0);
+        self.note_alloc(1);
+        self.alloc.mark_open(id);
+        self.open_extent = Some(OpenExtent {
+            extent_id: id as u32,
+            watermark: 0,
+            committed_end: 0,
+            participants: 1,
+        });
+        Ok(())
+    }
+
+    /// 封口当前开放 extent:写头(数据之后写,防撕裂)+ 状态 Sealed。
+    ///
+    /// 封口类型(ADR-9 §5.2):仅 1 个对象且写满 → 独占(头带完整 CRC 表);
+    /// 其余 → 打包(空 CRC 表)。正常流程中"写满"由 end_segment 即时封口,
+    /// 此处防御性重算 CRC(仅封口判定 b / seal-on-delete / 优雅关闭)。
+    fn seal_open_extent(&mut self) -> Result<()> {
+        let Some(oe) = self.open_extent.take() else {
+            return Ok(());
+        };
+        let capacity = self.sb.extent_capacity();
+        let full = oe.watermark as u64 >= capacity;
+        let exclusive = oe.participants == 1 && full;
+        if exclusive {
+            let crcs = self.compute_extent_crcs(oe.extent_id as u64, capacity)?;
+            self.write_extent_header(oe.extent_id, false, &crcs)?;
+        } else {
+            self.write_extent_header(oe.extent_id, true, &[])?;
+        }
+        self.alloc.mark_sealed(oe.extent_id as u64);
+        Ok(())
+    }
+
+    /// 写 extent 头(ADR-9 §4.2)。
+    fn write_extent_header(
         &mut self,
-        st: &WriteState,
-        owner_id: [u8; 16],
-        chunk_size: u32,
-    ) -> Result<ExtentRef> {
+        extent_id: u32,
+        packed: bool,
+        chunk_crcs: &[u32],
+    ) -> Result<()> {
         let header = ExtentHeader {
-            generation: self.alloc.generation(st.extent_id),
-            owner_id,
-            object_offset: 0, // 对象内偏移由元数据 extent 列表隐含
-            chunk_size,
-            chunk_crcs: st.chunk_crcs.clone(),
+            generation: self.alloc.generation(extent_id as u64),
+            flags: if packed { EXTENT_FLAG_PACKED } else { 0 },
+            chunk_size: if packed { 0 } else { self.chunk_size as u32 },
+            chunk_crcs: if packed {
+                Vec::new()
+            } else {
+                chunk_crcs.to_vec()
+            },
         };
         let mut hbuf = fs3_device::AlignedBuffer::new(SECTOR_SIZE as usize)?;
         hbuf.as_mut_slice().copy_from_slice(&header.encode());
-        let off = self.sb.data_start + st.extent_id * self.sb.extent_size;
+        let off = self.sb.data_start + extent_id as u64 * self.sb.extent_size;
         write_all(
             &mut **self.io.lock().unwrap(),
             self.device.raw_fd(),
             hbuf.as_slice(),
             off,
         )?;
-        Ok(ExtentRef {
-            extent_id: st.extent_id,
-            offset: 0,
-            len: st.written,
-        })
+        Ok(())
+    }
+
+    /// 读 extent 头;无头/撕裂头(CRC 不匹配)返回 None(恢复用;代数陈旧
+    /// 由调用方与分配器代数比较判定)。
+    fn read_extent_header(&self, extent_id: u64) -> Result<Option<ExtentHeader>> {
+        let mut hbuf = fs3_device::AlignedBuffer::new(SECTOR_SIZE as usize)?;
+        let off = self.sb.data_start + extent_id * self.sb.extent_size;
+        read_exact(
+            &mut **self.io.lock().unwrap(),
+            self.device.raw_fd(),
+            hbuf.as_mut_slice(),
+            off,
+        )?;
+        match ExtentHeader::decode(hbuf.as_slice()) {
+            Ok(h) => Ok(Some(h)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// 重算 extent 数据区全部 64KiB 网格 CRC(恢复期补写独占头用)。
+    fn compute_extent_crcs(&self, extent_id: u64, capacity: u64) -> Result<Vec<u32>> {
+        let base = self.extent_data_offset(extent_id);
+        let mut crcs = Vec::new();
+        let mut off = 0u64;
+        while off < capacity {
+            let chunk_len = ((off + SEGMENT_CRC_GRID).min(capacity) - off) as usize;
+            let read_len = align_up(chunk_len as u64, SECTOR_SIZE) as usize;
+            let mut buf = fs3_device::AlignedBuffer::new(read_len)?;
+            read_exact(
+                &mut **self.io.lock().unwrap(),
+                self.device.raw_fd(),
+                buf.as_mut_slice(),
+                base + off,
+            )?;
+            crcs.push(crc32c(&buf.as_slice()[..chunk_len], 0));
+            off += chunk_len as u64;
+        }
+        Ok(crcs)
+    }
+
+    /// 事务失败统一处理:回滚分配草稿;开放 extent 回退水位到已提交水位
+    /// (孤儿数据被后续追加覆盖)或丢弃被回滚释放的 extent。
+    fn abort_draft(&mut self, draft: &Staged) {
+        self.alloc.rollback(draft);
+        if let Some(oe) = &mut self.open_extent {
+            if !self.alloc.test_bit(oe.extent_id as u64) {
+                self.open_extent = None;
+            } else {
+                oe.watermark = oe.committed_end;
+            }
+        }
+    }
+
+    /// release_object 后调用(所有释放段路径):开放 extent 内部出现死段 →
+    /// 封口(seal-on-delete,ADR-9 §5.4);若活段全部消亡(位图已清)则丢弃,
+    /// 防止后续写入落到已释放 extent(内联覆盖等路径必须调用)。
+    fn after_release(&mut self, released: &[Segment]) -> Result<()> {
+        let hit_open = self
+            .open_extent
+            .as_ref()
+            .map(|oe| released.iter().any(|s| s.extent_id == oe.extent_id))
+            .unwrap_or(false);
+        if !hit_open {
+            return Ok(());
+        }
+        let still_allocated = self
+            .open_extent
+            .as_ref()
+            .map(|oe| self.alloc.test_bit(oe.extent_id as u64))
+            .unwrap_or(false);
+        if still_allocated {
+            self.seal_open_extent()?;
+        } else {
+            self.open_extent = None;
+        }
+        Ok(())
     }
 
     /// extent 数据区在设备上的偏移。
     fn extent_data_offset(&self, extent_id: u64) -> u64 {
-        self.sb.data_start + extent_id * self.sb.extent_size + fs3_core::EXTENT_HEADER_SIZE
+        self.sb.data_start + extent_id * self.sb.extent_size + EXTENT_HEADER_SIZE
     }
 
     // ─────────────────────────── GET ───────────────────────────
 
-    /// 读对象内容到 out(支持 Range;verify_reads 时逐 chunk 校验)。
+    /// 读对象内容到 out(支持 Range;verify_reads 时逐段校验)。
     pub fn get_to(
         &mut self,
         bucket: &str,
@@ -595,25 +811,26 @@ impl Engine {
         }
 
         let mut written = 0u64;
-        // 对象内累积偏移:extent 数据按序拼接
+        // 对象内累积偏移:段按序拼接
         let mut obj_pos = 0u64;
-        for ext in &meta.extents {
-            let ext_begin = obj_pos;
-            let ext_end = obj_pos + ext.len as u64;
-            obj_pos = ext_end;
-            let seg_start = ext_begin.max(start);
-            let seg_end = ext_end.min(end);
-            if seg_start >= seg_end {
+        for seg in &meta.extents {
+            let seg_begin = obj_pos;
+            let seg_end = obj_pos + seg.len as u64;
+            obj_pos = seg_end;
+            let s = seg_begin.max(start);
+            let e = seg_end.min(end);
+            if s >= e {
                 continue;
             }
-            // extent 数据区内的偏移
-            let payload_off = seg_start - ext_begin;
-            let dev_off = self.extent_data_offset(ext.extent_id) + payload_off;
-            let len = (seg_end - seg_start) as usize;
+            // 段内偏移
+            let payload_off = s - seg_begin;
+            let len = (e - s) as usize;
 
             if self.verify_reads {
-                self.read_verified_chunks(ext, payload_off, len, out, &mut written)?;
+                self.read_verified_segment(seg, payload_off, len, out, &mut written)?;
             } else {
+                let dev_off =
+                    self.extent_data_offset(seg.extent_id as u64) + seg.offset as u64 + payload_off;
                 let mut done = 0usize;
                 while done < len {
                     let cur_off = dev_off + done as u64;
@@ -639,54 +856,101 @@ impl Engine {
         Ok(written)
     }
 
-    /// verify_reads:按 chunk 读取并校验 CRC(开销约 3~5%,DESIGN §4.6)。
-    fn read_verified_chunks(
+    /// verify_reads:逐段校验(ADR-9 §4.3 CRC 双来源)——独占段读 extent 头
+    /// CRC 表(现状);打包段读段内 64KiB 网格 CRC(元数据)。开销约 3~5%。
+    fn read_verified_segment(
         &mut self,
-        ext: &ExtentRef,
+        seg: &Segment,
         payload_off: u64,
         len: usize,
         out: &mut dyn Write,
         written: &mut u64,
     ) -> Result<()> {
-        // 读 extent 头(含 chunk CRC 表)
-        let mut hbuf = fs3_device::AlignedBuffer::new(SECTOR_SIZE as usize)?;
-        let hdr_off = self.sb.data_start + ext.extent_id * self.sb.extent_size;
-        read_exact(
-            &mut **self.io.lock().unwrap(),
-            self.device.raw_fd(),
-            hbuf.as_mut_slice(),
-            hdr_off,
-        )?;
-        let header = ExtentHeader::decode(hbuf.as_slice())?;
-        let chunk_size = header.chunk_size as u64;
-
-        let mut pos = payload_off;
-        let end = payload_off + len as u64;
-        while pos < end {
-            let chunk_idx = (pos / chunk_size) as usize;
-            let chunk_start = chunk_idx as u64 * chunk_size;
-            let chunk_len = ((chunk_start + chunk_size).min(ext.len as u64) - chunk_start) as usize;
-            let read_len = align_up(chunk_len as u64, SECTOR_SIZE) as usize;
-            let mut cbuf = fs3_device::AlignedBuffer::new(read_len)?;
-            let dev_off = self.extent_data_offset(ext.extent_id) + chunk_start;
-            read_exact(
-                &mut **self.io.lock().unwrap(),
-                self.device.raw_fd(),
-                cbuf.as_mut_slice(),
-                dev_off,
-            )?;
-            let data = &cbuf.as_slice()[..chunk_len];
-            if !header.verify_chunk(chunk_idx, data) {
+        if seg.crcs.is_empty() {
+            // —— 独占段:校验走 extent 头 CRC 表 ——
+            debug_assert_eq!(seg.offset, 0, "exclusive segment must start at 0");
+            let header = self
+                .read_extent_header(seg.extent_id as u64)?
+                .ok_or_else(|| {
+                    Error::Corrupt(format!(
+                        "extent header missing for exclusive segment in extent {}",
+                        seg.extent_id
+                    ))
+                })?;
+            if header.is_packed() {
                 return Err(Error::Corrupt(format!(
-                    "chunk {chunk_idx} crc mismatch in extent {}",
-                    ext.extent_id
+                    "exclusive segment {} references packed extent {}",
+                    seg.extent_id, seg.extent_id
                 )));
             }
-            let skip = (pos - chunk_start) as usize;
-            let usable = &data[skip..(end - chunk_start).min(chunk_len as u64) as usize];
-            out.write_all(usable)?;
-            *written += usable.len() as u64;
-            pos += usable.len() as u64;
+            let chunk_size = header.chunk_size as u64;
+            let mut pos = payload_off;
+            let end = payload_off + len as u64;
+            while pos < end {
+                let chunk_idx = (pos / chunk_size) as usize;
+                let chunk_start = chunk_idx as u64 * chunk_size;
+                let chunk_len =
+                    ((chunk_start + chunk_size).min(seg.len as u64) - chunk_start) as usize;
+                let read_len = align_up(chunk_len as u64, SECTOR_SIZE) as usize;
+                let mut cbuf = fs3_device::AlignedBuffer::new(read_len)?;
+                let dev_off = self.extent_data_offset(seg.extent_id as u64) + chunk_start;
+                read_exact(
+                    &mut **self.io.lock().unwrap(),
+                    self.device.raw_fd(),
+                    cbuf.as_mut_slice(),
+                    dev_off,
+                )?;
+                let data = &cbuf.as_slice()[..chunk_len];
+                if !header.verify_chunk(chunk_idx, data) {
+                    return Err(Error::Corrupt(format!(
+                        "chunk {chunk_idx} crc mismatch in extent {}",
+                        seg.extent_id
+                    )));
+                }
+                let skip = (pos - chunk_start) as usize;
+                let usable = &data[skip..(end - chunk_start).min(chunk_len as u64) as usize];
+                out.write_all(usable)?;
+                *written += usable.len() as u64;
+                pos += usable.len() as u64;
+            }
+        } else {
+            // —— 打包段:校验走段内 64KiB 网格 CRC(元数据) ——
+            let grid = SEGMENT_CRC_GRID;
+            let mut pos = payload_off;
+            let end = payload_off + len as u64;
+            while pos < end {
+                let chunk_idx = (pos / grid) as usize;
+                let chunk_start = chunk_idx as u64 * grid;
+                let chunk_len = ((chunk_start + grid).min(seg.len as u64) - chunk_start) as usize;
+                let read_len = align_up(chunk_len as u64, SECTOR_SIZE) as usize;
+                let mut cbuf = fs3_device::AlignedBuffer::new(read_len)?;
+                let dev_off =
+                    self.extent_data_offset(seg.extent_id as u64) + seg.offset as u64 + chunk_start;
+                read_exact(
+                    &mut **self.io.lock().unwrap(),
+                    self.device.raw_fd(),
+                    cbuf.as_mut_slice(),
+                    dev_off,
+                )?;
+                let data = &cbuf.as_slice()[..chunk_len];
+                let expected = seg.crcs.get(chunk_idx).ok_or_else(|| {
+                    Error::Corrupt(format!(
+                        "segment crc table too short ({} entries, need {chunk_idx})",
+                        seg.crcs.len()
+                    ))
+                })?;
+                if crc32c(data, 0) != *expected {
+                    return Err(Error::Corrupt(format!(
+                        "segment crc mismatch in extent {} offset {}",
+                        seg.extent_id, seg.offset
+                    )));
+                }
+                let skip = (pos - chunk_start) as usize;
+                let usable = &data[skip..(end - chunk_start).min(chunk_len as u64) as usize];
+                out.write_all(usable)?;
+                *written += usable.len() as u64;
+                pos += usable.len() as u64;
+            }
         }
         Ok(())
     }
@@ -698,9 +962,9 @@ impl Engine {
 
     /// 对象顺序读原语:从 `offset` 读至多 `buf.len()` 字节,返回实际字节数。
     ///
-    /// 内联对象直接拷贝;extent 对象按 4KiB 对齐块读取后裁剪。供 HTTP
-    /// 层边读边发(每 chunk 上锁,见 fs3-s3/fs3-http)。verify_reads 校验
-    /// 走 get_to(整段路径)。
+    /// 内联对象直接拷贝;extent 对象按段定位后以 4KiB 对齐块读取裁剪。
+    /// 供 HTTP 层边读边发(每 chunk 上锁,见 fs3-s3/fs3-http)。
+    /// verify_reads 校验走 get_to(整段路径)。
     pub fn read_at(
         &mut self,
         bucket: &str,
@@ -723,20 +987,21 @@ impl Engine {
             return Ok(want);
         }
 
-        // extent 路径:定位 offset 所在 extent(对象内偏移连续)
+        // extent 路径:定位 offset 所在段(对象内偏移连续)
         let mut obj_pos = 0u64;
         let mut done = 0usize;
-        for ext in &meta.extents {
-            let ext_begin = obj_pos;
-            let ext_end = obj_pos + ext.len as u64;
-            obj_pos = ext_end;
-            if offset >= ext_end || offset < ext_begin {
+        for seg in &meta.extents {
+            let seg_begin = obj_pos;
+            let seg_end = obj_pos + seg.len as u64;
+            obj_pos = seg_end;
+            if offset >= seg_end || offset < seg_begin {
                 continue;
             }
-            let in_ext = offset - ext_begin;
-            let avail = (ext_end - offset) as usize;
+            let in_seg = offset - seg_begin;
+            let avail = (seg_end - offset) as usize;
             let take = want.min(avail);
-            let dev_base = self.extent_data_offset(ext.extent_id) + in_ext;
+            let dev_base =
+                self.extent_data_offset(seg.extent_id as u64) + seg.offset as u64 + in_seg;
             let mut got = 0usize;
             while got < take {
                 let cur = dev_base + got as u64;
@@ -763,15 +1028,17 @@ impl Engine {
 
     // ─────────────────────────── DELETE ───────────────────────────
 
-    /// 删除对象:元数据 + 释放记录同事务;refcount 归零的 extent 立即回位图。
+    /// 删除对象:元数据 + 释放记录同事务;live_bytes 归零的 extent 立即回位图。
+    /// 开放 extent 内部出现死段 → 封口(seal-on-delete,ADR-9 §5.4)。
     pub fn delete(&mut self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>> {
         let meta = match self.meta.get_object(bucket, key)? {
             Some(m) => m,
             None => return Ok(None),
         };
-        let ids: Vec<u64> = meta.extents.iter().map(|e| e.extent_id).collect();
-        self.alloc.release(&ids);
-        let draft = self.alloc.take_draft();
+        let mut draft = Staged::default();
+        self.alloc.release_object(&mut draft, &meta.extents);
+        // seal-on-delete:开放 extent 内出现死段 → 封口(保持"开放 extent 无洞")
+        self.after_release(&meta.extents)?;
         let delta = StatsDelta {
             objects: -1,
             bytes: -(meta.size as i64),
@@ -781,12 +1048,11 @@ impl Engine {
             .commit_object_delete(bucket, key, to_alloc_draft(&draft), delta)
         {
             Ok(_) => {
-                self.alloc.confirm_draft();
                 self.maybe_checkpoint()?;
                 Ok(Some(meta))
             }
             Err(e) => {
-                self.alloc.rollback_draft(&draft);
+                self.abort_draft(&draft);
                 Err(e)
             }
         }
@@ -802,9 +1068,9 @@ impl Engine {
             )));
         }
         for (key, meta) in objects {
-            let ids: Vec<u64> = meta.extents.iter().map(|e| e.extent_id).collect();
-            self.alloc.release(&ids);
-            let draft = self.alloc.take_draft();
+            let mut draft = Staged::default();
+            self.alloc.release_object(&mut draft, &meta.extents);
+            self.after_release(&meta.extents)?;
             let delta = StatsDelta {
                 objects: -1,
                 bytes: -(meta.size as i64),
@@ -813,9 +1079,9 @@ impl Engine {
                 .meta
                 .commit_object_delete(name, &key, to_alloc_draft(&draft), delta)
             {
-                Ok(_) => self.alloc.confirm_draft(),
+                Ok(_) => {}
                 Err(e) => {
-                    self.alloc.rollback_draft(&draft);
+                    self.abort_draft(&draft);
                     return Err(e);
                 }
             }
@@ -850,7 +1116,7 @@ impl Engine {
         Ok(upload_id)
     }
 
-    /// 上传分片:数据写 extent(小分片内联),元数据挂 `p:` 会话下。
+    /// 上传分片:数据写段(小分片内联),元数据挂 `p:` 会话下。
     /// 时序保证同 PUT:数据先落盘、分片记录后提交;失败回滚已暂存分配。
     pub fn upload_part(
         &mut self,
@@ -876,33 +1142,68 @@ impl Engine {
             }
         }
         let mtime = now_ts();
-        let (size, etag, extents, inline) = if prefix.len() <= limit {
+        let part = if prefix.len() <= limit {
             let etag: [u8; 16] = md5::Md5::digest(&prefix).into();
-            (prefix.len() as u64, etag, Vec::new(), Some(prefix))
+            PartMeta {
+                size: prefix.len() as u64,
+                etag,
+                mtime,
+                extents: Vec::new(),
+                inline: Some(prefix),
+            }
         } else {
             let mut prefixed = PrefixedReader {
                 prefix,
                 pos: 0,
                 inner: reader,
             };
-            let (extents, size, etag) = self.stream_to_extents(&mut prefixed)?;
-            (size, etag, extents, None)
+            let mut draft = Staged::default();
+            let (extents, size, etag) = match self.stream_to_extents(&mut prefixed, &mut draft) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.abort_draft(&draft);
+                    return Err(e);
+                }
+            };
+            self.alloc.add_object(&mut draft, &extents);
+            let part = PartMeta {
+                size,
+                etag,
+                mtime,
+                extents,
+                inline: None,
+            };
+            // 分片重传会清 completed 标记(reactivate;resend_first_finishes_last)
+            let seq = self
+                .meta
+                .put_part(upload_id, part_no, &part, to_alloc_draft(&draft));
+            return match seq {
+                Ok(_) => {
+                    if self
+                        .meta
+                        .get_multipart(upload_id)?
+                        .map(|s| s.completed)
+                        .unwrap_or(false)
+                    {
+                        self.meta.touch_multipart(upload_id)?;
+                    }
+                    self.maybe_checkpoint()?;
+                    Ok(part)
+                }
+                Err(e) => {
+                    self.abort_draft(&draft);
+                    Err(e)
+                }
+            };
         };
-        let part = PartMeta {
-            size,
-            etag,
-            mtime,
-            extents,
-            inline,
-        };
-        // 分片重传会清 completed 标记(reactivate;resend_first_finishes_last)
-        let draft = self.alloc.take_draft();
-        let seq = self
-            .meta
-            .put_part(upload_id, part_no, &part, to_alloc_draft(&draft));
+        let seq = self.meta.put_part(
+            upload_id,
+            part_no,
+            &part,
+            to_alloc_draft(&Staged::default()),
+        );
         match seq {
             Ok(_) => {
-                self.alloc.confirm_draft();
                 if self
                     .meta
                     .get_multipart(upload_id)?
@@ -914,10 +1215,7 @@ impl Engine {
                 self.maybe_checkpoint()?;
                 Ok(part)
             }
-            Err(e) => {
-                self.alloc.rollback_draft(&draft);
-                Err(e)
-            }
+            Err(e) => Err(e),
         }
     }
 
@@ -944,88 +1242,91 @@ impl Engine {
             return Err(Error::InvalidArgument("copy source range is empty".into()));
         }
         let len = end - start;
-        let mut writer = ExtentWriter::new(self.chunk_size)?;
-        // 内联源:直接灌入
-        if let Some(inline) = &src.inline {
-            let data = &inline[start as usize..end as usize];
-            writer.feed(self, data)?;
-        } else {
-            // extent 源:逐段读取(4KiB 对齐裁剪)直灌
-            let mut obj_pos = 0u64;
-            let mut remain = len;
-            for ext in &src.extents {
-                if remain == 0 {
-                    break;
+        let mut draft = Staged::default();
+        let result = (|| -> Result<PartMeta> {
+            let mut writer = ExtentWriter::new(self.chunk_size)?;
+            // 内联源:直接灌入
+            if let Some(inline) = &src.inline {
+                let data = &inline[start as usize..end as usize];
+                writer.feed(self, &mut draft, data)?;
+            } else {
+                // extent 源:逐段读取(4KiB 对齐裁剪)直灌
+                let mut obj_pos = 0u64;
+                let mut remain = len;
+                for seg in &src.extents {
+                    if remain == 0 {
+                        break;
+                    }
+                    let seg_begin = obj_pos;
+                    let seg_end = obj_pos + seg.len as u64;
+                    obj_pos = seg_end;
+                    let s = seg_begin.max(start);
+                    let e = seg_end.min(end);
+                    if s >= e {
+                        continue;
+                    }
+                    let payload_off = s - seg_begin;
+                    let dev_off = self.extent_data_offset(seg.extent_id as u64)
+                        + seg.offset as u64
+                        + payload_off;
+                    let mut done = 0usize;
+                    let seg_len = (e - s) as usize;
+                    while done < seg_len {
+                        let cur_off = dev_off + done as u64;
+                        let block_off = cur_off - (cur_off % SECTOR_SIZE);
+                        let skip = (cur_off - block_off) as usize;
+                        let want = (seg_len - done + skip).min(self.chunk_size);
+                        let block_len = align_up(want as u64, SECTOR_SIZE) as usize;
+                        let mut rbuf = fs3_device::AlignedBuffer::new(block_len)?;
+                        read_exact(
+                            &mut **self.io.lock().unwrap(),
+                            self.device.raw_fd(),
+                            rbuf.as_mut_slice(),
+                            block_off,
+                        )?;
+                        let usable =
+                            &rbuf.as_slice()[skip..skip + (want - skip).min(seg_len - done)];
+                        writer.feed(self, &mut draft, usable)?;
+                        done += usable.len();
+                        remain -= usable.len() as u64;
+                    }
                 }
-                let ext_begin = obj_pos;
-                let ext_end = obj_pos + ext.len as u64;
-                obj_pos = ext_end;
-                let seg_start = ext_begin.max(start);
-                let seg_end = ext_end.min(end);
-                if seg_start >= seg_end {
-                    continue;
-                }
-                let payload_off = seg_start - ext_begin;
-                let dev_off = self.extent_data_offset(ext.extent_id) + payload_off;
-                let mut done = 0usize;
-                let seg_len = (seg_end - seg_start) as usize;
-                while done < seg_len {
-                    let cur_off = dev_off + done as u64;
-                    let block_off = cur_off - (cur_off % SECTOR_SIZE);
-                    let skip = (cur_off - block_off) as usize;
-                    let want = (seg_len - done + skip).min(self.chunk_size);
-                    let block_len = align_up(want as u64, SECTOR_SIZE) as usize;
-                    let mut rbuf = fs3_device::AlignedBuffer::new(block_len)?;
-                    read_exact(
-                        &mut **self.io.lock().unwrap(),
-                        self.device.raw_fd(),
-                        rbuf.as_mut_slice(),
-                        block_off,
-                    )?;
-                    let usable = &rbuf.as_slice()[skip..skip + (want - skip).min(seg_len - done)];
-                    writer.feed(self, usable)?;
-                    done += usable.len();
-                    remain -= usable.len() as u64;
-                }
+                debug_assert_eq!(remain, 0);
             }
-            debug_assert_eq!(remain, 0);
-        }
-        let (extents, size, etag) = writer.finish(self)?;
-        debug_assert_eq!(size, len);
-        let part = PartMeta {
-            size,
-            etag,
-            mtime: now_ts(),
-            extents,
-            inline: None,
-        };
-        let draft = self.alloc.take_draft();
-        match self
-            .meta
-            .put_part(upload_id, part_no, &part, to_alloc_draft(&draft))
-        {
-            Ok(_) => {
-                self.alloc.confirm_draft();
-                if self
-                    .meta
-                    .get_multipart(upload_id)?
-                    .map(|s| s.completed)
-                    .unwrap_or(false)
-                {
-                    self.meta.touch_multipart(upload_id)?;
-                }
-                self.maybe_checkpoint()?;
-                Ok(part)
+            let (extents, size, etag) = writer.finish(self)?;
+            debug_assert_eq!(size, len);
+            self.alloc.add_object(&mut draft, &extents);
+            let part = PartMeta {
+                size,
+                etag,
+                mtime: now_ts(),
+                extents,
+                inline: None,
+            };
+            self.meta
+                .put_part(upload_id, part_no, &part, to_alloc_draft(&draft))?;
+            if self
+                .meta
+                .get_multipart(upload_id)?
+                .map(|s| s.completed)
+                .unwrap_or(false)
+            {
+                self.meta.touch_multipart(upload_id)?;
             }
+            self.maybe_checkpoint()?;
+            Ok(part)
+        })();
+        match result {
+            Ok(part) => Ok(part),
             Err(e) => {
-                self.alloc.rollback_draft(&draft);
+                self.abort_draft(&draft);
                 Err(e)
             }
         }
     }
 
     /// 完成上传:校验分片(存在 + ETag + 顺序 + 大小)→ 零数据搬运组合
-    /// (extent 列表按序拼接;全内联则拼数据;混合走数据路径)。
+    /// (段列表按序拼接;全内联则拼数据;混合走数据路径)。
     /// 返回最终对象元数据;二次 Complete 幂等返回(completed 快照)。
     pub fn complete_multipart(
         &mut self,
@@ -1113,22 +1414,21 @@ impl Engine {
         let mtime = now_ts();
 
         let old = self.meta.get_object(bucket, key)?;
-        let old_ids: Vec<u64> = old
-            .as_ref()
-            .map(|o| o.extents.iter().map(|e| e.extent_id).collect())
-            .unwrap_or_default();
+        let old_segments: Vec<Segment> =
+            old.as_ref().map(|o| o.extents.clone()).unwrap_or_default();
 
-        let (meta, extra_ref_dec) = if all_inline && total_size <= self.small_object_limit as u64 {
-            // 全内联:拼接数据,零设备 I/O
-            let mut data = Vec::with_capacity(total_size as usize);
-            for (no, p) in &stored {
-                if *no <= max_no {
-                    if let Some(d) = &p.inline {
-                        data.extend_from_slice(d);
+        let mut draft = Staged::default();
+        let result = (|| -> Result<ObjectMeta> {
+            let meta = if all_inline && total_size <= self.small_object_limit as u64 {
+                // 全内联:拼接数据,零设备 I/O
+                let mut data = Vec::with_capacity(total_size as usize);
+                for (no, p) in &stored {
+                    if *no <= max_no {
+                        if let Some(d) = &p.inline {
+                            data.extend_from_slice(d);
+                        }
                     }
                 }
-            }
-            (
                 ObjectMeta {
                     size: total_size,
                     etag,
@@ -1138,18 +1438,16 @@ impl Engine {
                     user_meta: session.user_meta.clone(),
                     inline: Some(data),
                     parts: part_sizes,
-                },
-                Vec::new(),
-            )
-        } else if all_extent {
-            // 零数据搬运:extent 列表按序拼接(所有权从分片转移给对象)
-            let mut extents: Vec<ExtentRef> = Vec::new();
-            for (no, p) in &stored {
-                if *no <= max_no {
-                    extents.extend_from_slice(&p.extents);
                 }
-            }
-            (
+            } else if all_extent {
+                // 零数据搬运:段列表按序拼接(所有权从分片转移给对象;
+                // 无分配器变更——段仍是同一批活段)
+                let mut extents: Vec<Segment> = Vec::new();
+                for (no, p) in &stored {
+                    if *no <= max_no {
+                        extents.extend_from_slice(&p.extents);
+                    }
+                }
                 ObjectMeta {
                     size: total_size,
                     etag,
@@ -1159,26 +1457,27 @@ impl Engine {
                     user_meta: session.user_meta.clone(),
                     inline: None,
                     parts: part_sizes,
-                },
-                Vec::new(),
-            )
-        } else {
-            // 混合(小分片 + 大分片):数据路径组合
-            let mut sink = Vec::with_capacity(total_size.min(64 * 1024 * 1024) as usize);
-            for (no, p) in &stored {
-                if *no <= max_no {
-                    self.read_part_to(p, &mut sink)?;
                 }
-            }
-            let (extents, size, _) = self.stream_to_extents(&mut std::io::Cursor::new(sink))?;
-            debug_assert_eq!(size, total_size);
-            let mut part_ids: Vec<u64> = Vec::new();
-            for (no, p) in &stored {
-                if *no <= max_no {
-                    part_ids.extend(p.extents.iter().map(|e| e.extent_id));
+            } else {
+                // 混合(小分片 + 大分片):数据路径组合
+                let mut sink = Vec::with_capacity(total_size.min(64 * 1024 * 1024) as usize);
+                for (no, p) in &stored {
+                    if *no <= max_no {
+                        self.read_part_to(p, &mut sink)?;
+                    }
                 }
-            }
-            (
+                let (extents, size, _) =
+                    self.stream_to_extents(&mut std::io::Cursor::new(sink), &mut draft)?;
+                debug_assert_eq!(size, total_size);
+                // 分片旧段释放(同事务;ADR-9 §5.4 覆盖语义)
+                let mut part_segments: Vec<Segment> = Vec::new();
+                for (no, p) in &stored {
+                    if *no <= max_no {
+                        part_segments.extend(p.extents.iter().cloned());
+                    }
+                }
+                self.alloc.add_object(&mut draft, &extents);
+                self.alloc.release_object(&mut draft, &part_segments);
                 ObjectMeta {
                     size: total_size,
                     etag,
@@ -1188,62 +1487,58 @@ impl Engine {
                     user_meta: session.user_meta.clone(),
                     inline: None,
                     parts: part_sizes,
-                },
-                part_ids,
-            )
-        };
+                }
+            };
 
-        // 释放旧对象 + (混合路径)分片 extent
-        if !old_ids.is_empty() {
-            self.alloc.release(&old_ids);
-        }
-        if !extra_ref_dec.is_empty() {
-            self.alloc.release(&extra_ref_dec);
-        }
-        let draft = self.alloc.take_draft();
-        let part_keys: Vec<Vec<u8>> = stored
-            .iter()
-            .map(|(no, _)| part_key(upload_id, *no))
-            .collect();
-        let delta = StatsDelta {
-            objects: if old.is_some() { 0 } else { 1 },
-            bytes: total_size as i64 - old.as_ref().map(|o| o.size as i64).unwrap_or(0),
-        };
-        match self.meta.complete_multipart(
-            bucket,
-            key,
-            upload_id,
-            &meta,
-            &part_keys,
-            to_alloc_draft(&draft),
-            delta,
-        ) {
-            Ok(_) => {
-                self.alloc.confirm_draft();
-                self.maybe_checkpoint()?;
-                Ok(meta)
+            // 释放旧对象段(覆盖语义)
+            if !old_segments.is_empty() {
+                self.alloc.release_object(&mut draft, &old_segments);
+                self.after_release(&old_segments)?;
             }
+            let part_keys: Vec<Vec<u8>> = stored
+                .iter()
+                .map(|(no, _)| part_key(upload_id, *no))
+                .collect();
+            let delta = StatsDelta {
+                objects: if old.is_some() { 0 } else { 1 },
+                bytes: total_size as i64 - old.as_ref().map(|o| o.size as i64).unwrap_or(0),
+            };
+            self.meta.complete_multipart(
+                bucket,
+                key,
+                upload_id,
+                &meta,
+                &part_keys,
+                to_alloc_draft(&draft),
+                delta,
+            )?;
+            self.maybe_checkpoint()?;
+            Ok(meta)
+        })();
+        match result {
+            Ok(meta) => Ok(meta),
             Err(e) => {
-                self.alloc.rollback_draft(&draft);
+                self.abort_draft(&draft);
                 Err(e)
             }
         }
     }
 
-    /// 中止上传:删除会话与全部分片,释放 extent(204)。
+    /// 中止上传:删除会话与全部分片,释放段(204)。
     pub fn abort_multipart(&mut self, upload_id: &str) -> Result<()> {
         if self.meta.get_multipart(upload_id)?.is_none() {
             return Err(Error::NoSuchUpload(upload_id.to_string()));
         }
         let parts = self.meta.list_parts(upload_id)?;
-        let mut ids: Vec<u64> = Vec::new();
+        let mut segments: Vec<Segment> = Vec::new();
         for (_, p) in &parts {
-            ids.extend(p.extents.iter().map(|e| e.extent_id));
+            segments.extend(p.extents.iter().cloned());
         }
-        if !ids.is_empty() {
-            self.alloc.release(&ids);
+        let mut draft = Staged::default();
+        if !segments.is_empty() {
+            self.alloc.release_object(&mut draft, &segments);
+            self.after_release(&segments)?;
         }
-        let draft = self.alloc.take_draft();
         let part_keys: Vec<Vec<u8>> = parts
             .iter()
             .map(|(no, _)| part_key(upload_id, *no))
@@ -1253,12 +1548,11 @@ impl Engine {
             .abort_multipart(upload_id, &part_keys, to_alloc_draft(&draft))
         {
             Ok(_) => {
-                self.alloc.confirm_draft();
                 self.maybe_checkpoint()?;
                 Ok(())
             }
             Err(e) => {
-                self.alloc.rollback_draft(&draft);
+                self.abort_draft(&draft);
                 Err(e)
             }
         }
@@ -1308,10 +1602,10 @@ impl Engine {
             return Ok(());
         }
         let mut written = 0u64;
-        for ext in &part.extents {
-            let dev_off = self.extent_data_offset(ext.extent_id);
+        for seg in &part.extents {
+            let dev_off = self.extent_data_offset(seg.extent_id as u64) + seg.offset as u64;
             let mut done = 0usize;
-            let len = ext.len as usize;
+            let len = seg.len as usize;
             while done < len {
                 let cur_off = dev_off + done as u64;
                 let block_off = cur_off - (cur_off % SECTOR_SIZE);
@@ -1337,7 +1631,7 @@ impl Engine {
 
     // ─────────────────────────── CopyObject(F6,COW) ───────────────────────────
 
-    /// 服务端复制:同设备 = 元数据操作(extent 引用计数 +1,零数据 I/O)。
+    /// 服务端复制:同设备 = 元数据操作(段级共享,零数据 I/O;ADR-9 §5.5)。
     /// `REPLACE` 指令传新 content_type/user_meta;`COPY` 传 None(沿用源)。
     pub fn copy_object(
         &mut self,
@@ -1353,10 +1647,6 @@ impl Engine {
             .get_object(src_bucket, src_key)?
             .ok_or_else(|| Error::NotFound(format!("object {src_bucket}/{src_key}")))?;
         let old = self.meta.get_object(dst_bucket, dst_key)?;
-        let old_ids: Vec<u64> = old
-            .as_ref()
-            .map(|o| o.extents.iter().map(|e| e.extent_id).collect())
-            .unwrap_or_default();
 
         let mut meta = src.clone();
         meta.mtime = now_ts();
@@ -1366,15 +1656,15 @@ impl Engine {
         if let Some(um) = replace_user_meta {
             meta.user_meta = um.to_vec();
         }
-        // 源为内联 → 数据拷贝进新内联;否则共享 extent 列表(ref_inc)
+        let mut draft = Staged::default();
+        // 源为内联 → 数据拷贝进新内联;否则共享段列表(稀疏共享表)
         if src.inline.is_none() {
-            self.alloc
-                .inc_ref(&meta.extents.iter().map(|e| e.extent_id).collect::<Vec<_>>());
+            self.alloc.share_object(&mut draft, &meta.extents);
         }
-        if !old_ids.is_empty() {
-            self.alloc.release(&old_ids);
+        if let Some(o) = &old {
+            self.alloc.release_object(&mut draft, &o.extents);
+            self.after_release(&o.extents)?;
         }
-        let draft = self.alloc.take_draft();
         let delta = StatsDelta {
             objects: if old.is_some() { 0 } else { 1 },
             bytes: meta.size as i64 - old.as_ref().map(|o| o.size as i64).unwrap_or(0),
@@ -1384,12 +1674,11 @@ impl Engine {
             .commit_object_put(dst_bucket, dst_key, &meta, to_alloc_draft(&draft), delta)
         {
             Ok(_) => {
-                self.alloc.confirm_draft();
                 self.maybe_checkpoint()?;
                 Ok(meta)
             }
             Err(e) => {
-                self.alloc.rollback_draft(&draft);
+                self.abort_draft(&draft);
                 Err(e)
             }
         }
@@ -1398,14 +1687,14 @@ impl Engine {
     // ─────────────────────────── 零拷贝读路径(B3/D2) ───────────────────────────
 
     /// 对象数据段(设备偏移 + 长度),裁剪到 [offset, offset+length) 响应区间;
-    /// 内联/空对象返回 Some(vec![])。零拷贝读路径用(B3/D2)。
+    /// 内联/空对象返回 Some(vec![])。零拷贝读路径用(B3/D2;ADR-9 段级拼接)。
     pub fn object_segments(
         &self,
         bucket: &str,
         key: &str,
         offset: u64,
         length: u64,
-    ) -> Result<Option<Vec<Segment>>> {
+    ) -> Result<Option<Vec<DevSegment>>> {
         let meta = match self.meta.get_object(bucket, key)? {
             Some(m) => m,
             None => return Ok(None),
@@ -1417,17 +1706,19 @@ impl Engine {
         let end = (offset + length).min(meta.size);
         let mut segs = Vec::new();
         let mut obj_pos = 0u64;
-        for ext in &meta.extents {
-            let ext_begin = obj_pos;
-            let ext_end = obj_pos + ext.len as u64;
-            obj_pos = ext_end;
-            let s = ext_begin.max(start);
-            let e = ext_end.min(end);
+        for seg in &meta.extents {
+            let seg_begin = obj_pos;
+            let seg_end = obj_pos + seg.len as u64;
+            obj_pos = seg_end;
+            let s = seg_begin.max(start);
+            let e = seg_end.min(end);
             if s >= e {
                 continue;
             }
-            segs.push(Segment {
-                dev_offset: self.extent_data_offset(ext.extent_id) + (s - ext_begin),
+            segs.push(DevSegment {
+                dev_offset: self.extent_data_offset(seg.extent_id as u64)
+                    + seg.offset as u64
+                    + (s - seg_begin),
                 len: e - s,
             });
         }
@@ -1479,6 +1770,7 @@ impl Engine {
             buckets: buckets.len(),
             objects,
             total_bytes,
+            live_bytes: self.alloc.live_bytes_total(),
             leaks,
             io_engine: self.io.lock().unwrap().name(),
             checkpoint_seq: cp_seq,
@@ -1501,7 +1793,7 @@ struct PutCtx<'a> {
     key: &'a str,
     reader: &'a mut dyn Read,
     old_size: i64,
-    old_ids: Vec<u64>,
+    old_segments: Vec<Segment>,
     content_type: Option<&'a str>,
     user_meta: Vec<(String, String)>,
 }
@@ -1527,51 +1819,65 @@ impl Read for PrefixedReader<'_> {
 
 /// 零拷贝读段(设备偏移 + 长度;B3/D2)。
 #[derive(Debug, Clone, Copy)]
-pub struct Segment {
+pub struct DevSegment {
     pub dev_offset: u64,
     pub len: u64,
 }
 
-/// 进行中的 extent 写状态。
-struct WriteState {
-    extent_id: u64,
-    /// 数据区已写字节(不含 4KiB 头)。
-    written: u32,
-    chunk_crcs: Vec<u32>,
-}
-
-/// extent 流水线状态机:feed(数据块,引擎借用) → finish(extents, size, md5)。
-/// 供普通 PUT(reader 循环)与 UploadPartCopy(源段直灌)复用。
+/// 进行中的对象写状态(ADR-9 §5.1):每对象一个 writer,共享引擎的开放
+/// extent;段 = 开放 extent 数据区内 4KiB 对齐区间,CRC 网格 = 段内 64KiB
+/// (尾部按实际数据 CRC、补零落盘,与 v1 逐字节一致;独占段 CRC 进头)。
 struct ExtentWriter {
     chunk_size: usize,
     capacity: u64,
     acc: fs3_device::AlignedBuffer,
     hasher: md5::Md5,
     fill: usize,
-    st: Option<WriteState>,
-    extents: Vec<ExtentRef>,
+    /// 对象首字节已写(封口判定 b 只查一次)。
+    started: bool,
+    /// 当前段的 CRC 网格累积(段内 64KiB 单元,尾单元按实际数据)。
+    seg_partial: u32,
+    seg_fill: usize,
+    /// 当前段已完成的网格 CRC(封口时按类型决定去留)。
+    seg_crcs: Vec<u32>,
+    /// 当前段起点(extent 数据区内偏移)。
+    seg_offset: u32,
+    /// 当前段实际数据字节数(watermark 按 4KiB 对齐推进,段长按实际字节)。
+    seg_written: u32,
+    segments: Vec<Segment>,
     size: u64,
-    owner_id: [u8; 16],
 }
 
 impl ExtentWriter {
     fn new(chunk_size: usize) -> Result<Self> {
-        let mut owner_id = [0u8; 16];
-        random_bytes(&mut owner_id)?;
         Ok(ExtentWriter {
             chunk_size,
             capacity: 0, // feed 首轮经 ensure_extent 设置
             acc: fs3_device::AlignedBuffer::new(chunk_size)?,
             hasher: md5::Md5::new(),
             fill: 0,
-            st: None,
-            extents: Vec::new(),
+            started: false,
+            seg_partial: 0,
+            seg_fill: 0,
+            seg_crcs: Vec::new(),
+            seg_offset: 0,
+            seg_written: 0,
+            segments: Vec::new(),
             size: 0,
-            owner_id,
         })
     }
 
-    fn feed(&mut self, engine: &mut Engine, data: &[u8]) -> Result<()> {
+    /// 开始新段:记录段起点(当前 watermark),重置段 CRC 网格。
+    fn begin_segment(&mut self, engine: &Engine) {
+        let oe = engine.open_extent.as_ref().expect("open extent");
+        self.seg_offset = oe.watermark;
+        self.seg_partial = 0;
+        self.seg_fill = 0;
+        self.seg_crcs.clear();
+        self.seg_written = 0;
+    }
+
+    fn feed(&mut self, engine: &mut Engine, draft: &mut Staged, data: &[u8]) -> Result<()> {
         if self.capacity == 0 {
             self.capacity = engine.sb.extent_capacity();
         }
@@ -1580,42 +1886,37 @@ impl ExtentWriter {
         let mut off = 0usize;
         let n = data.len();
         while off < n {
-            // extent 满(或尚无)→ 封口 + 申请新 extent
-            if self.st.is_none() || self.st.as_ref().unwrap().written as u64 >= capacity {
-                if let Some(mut s) = self.st.take() {
-                    engine.flush_extent_chunk(
-                        &mut s,
-                        &mut self.acc,
-                        &mut self.fill,
-                        &mut self.hasher,
-                    )?;
-                    self.extents.push(engine.finalize_extent(
-                        &s,
-                        self.owner_id,
-                        chunk_size as u32,
-                    )?);
+            if !self.started {
+                self.started = true;
+                // 封口判定 b:剩余空间 < 32KiB → 封口,下个对象用新 extent
+                engine.rotate_for_new_object()?;
+                if let Some(oe) = engine.open_extent.as_mut() {
+                    // 对象首字节写入既有开放 extent:参与者 +1
+                    oe.participants += 1;
+                    self.begin_segment(engine);
                 }
-                let id = engine.alloc.allocate(1)?.remove(0);
-                engine.note_alloc(1);
-                self.st = Some(WriteState {
-                    extent_id: id,
-                    written: 0,
-                    chunk_crcs: Vec::new(),
-                });
             }
+            if engine.open_extent.is_none() {
+                engine.open_new_extent(draft)?;
+                self.begin_segment(engine);
+            }
+            // 攒批 flush:acc 满 64KiB,或 extent 将满
             let need_flush = {
-                let s = self.st.as_ref().unwrap();
-                self.fill == chunk_size || s.written as u64 + self.fill as u64 >= capacity
+                let oe = engine.open_extent.as_ref().unwrap();
+                self.fill == chunk_size || oe.watermark as u64 + self.fill as u64 >= capacity
             };
             if need_flush {
-                let s = self.st.as_mut().unwrap();
-                engine.flush_extent_chunk(s, &mut self.acc, &mut self.fill, &mut self.hasher)?;
-                continue; // 重新评估(extent 可能恰好写满)
+                engine.flush_acc(self)?;
+                // extent 写满 → 段结束 + 封口(对象尾部跨界续写,ADR-9 D2)
+                if engine.open_extent.as_ref().unwrap().watermark as u64 >= capacity {
+                    engine.end_segment(self)?;
+                }
+                continue;
             }
-            let s = self.st.as_mut().unwrap();
-            // 剩余空间必须扣除 acc 中已积累但未落盘的 fill 字节,
-            // 否则跨输入 chunk 的累积会越过 extent 容量写坏下一个 extent 头
-            let space = (capacity - s.written as u64 - self.fill as u64) as usize;
+            let space = {
+                let oe = engine.open_extent.as_ref().unwrap();
+                (capacity - oe.watermark as u64 - self.fill as u64) as usize
+            };
             let take = (n - off).min(space).min(chunk_size - self.fill);
             self.acc.as_mut_slice()[self.fill..self.fill + take]
                 .copy_from_slice(&data[off..off + take]);
@@ -1629,19 +1930,45 @@ impl ExtentWriter {
         Ok(())
     }
 
-    /// 流结束:flush 剩余 chunk,封口最后 extent;返回 (extents, size, md5)。
-    fn finish(mut self, engine: &mut Engine) -> Result<(Vec<ExtentRef>, u64, [u8; 16])> {
-        if let Some(mut s) = self.st.take() {
-            engine.flush_extent_chunk(&mut s, &mut self.acc, &mut self.fill, &mut self.hasher)?;
-            self.extents
-                .push(engine.finalize_extent(&s, self.owner_id, self.chunk_size as u32)?);
+    /// 流结束:flush 剩余 chunk,结束当前段(extent 保持开放跨对象存活;
+    /// 恰好写满则走 end_segment 封口判定);返回 (segments, size, md5)。
+    fn finish(mut self, engine: &mut Engine) -> Result<(Vec<Segment>, u64, [u8; 16])> {
+        if self.fill > 0 {
+            engine.flush_acc(&mut self)?;
+        }
+        // 输入恰好把 extent 写满:走正常封口判定(独占 vs 打包)
+        let full = engine
+            .open_extent
+            .as_ref()
+            .map(|oe| oe.watermark as u64 >= engine.sb.extent_capacity())
+            .unwrap_or(false);
+        if full {
+            engine.end_segment(&mut self)?;
+        }
+        if let Some(oe) = engine.open_extent.as_ref() {
+            // 当前段收尾(未写满 → 打包:段 CRC 随元数据)
+            if self.seg_fill > 0 {
+                self.seg_crcs.push(self.seg_partial);
+                self.seg_partial = 0;
+                self.seg_fill = 0;
+            }
+            debug_assert!(
+                oe.watermark >= self.seg_offset + self.seg_written,
+                "watermark(对齐)≥ 段实际终点"
+            );
+            self.segments.push(Segment {
+                extent_id: oe.extent_id,
+                offset: self.seg_offset,
+                len: self.seg_written,
+                crcs: std::mem::take(&mut self.seg_crcs),
+            });
         }
         // sync_mode=full:数据 fsync 后再提交元数据
         if engine.meta.sync_mode() == SyncMode::Full {
             fsync(&mut **engine.io.lock().unwrap(), engine.device.raw_fd())?;
         }
         let etag: [u8; 16] = self.hasher.finalize().into();
-        Ok((self.extents, self.size, etag))
+        Ok((self.segments, self.size, etag))
     }
 }
 
@@ -1665,7 +1992,7 @@ fn now_ts() -> i64 {
         .unwrap_or(0)
 }
 
-fn to_alloc_draft(staged: &fs3_alloc::Staged) -> AllocDraft {
+fn to_alloc_draft(staged: &Staged) -> AllocDraft {
     AllocDraft {
         alloc: staged.alloc.clone(),
         ref_inc: staged.ref_inc.clone(),
@@ -1673,628 +2000,266 @@ fn to_alloc_draft(staged: &fs3_alloc::Staged) -> AllocDraft {
     }
 }
 
-/// 引用计数重建:扫描全部对象元数据,统计每个 extent 的被引用次数;
-/// 返回"位图已分配但元数据不可达"的泄漏列表(只报告,不回收)。
-fn rebuild_refcounts(meta: &MetaStore, alloc: &Allocator) -> Vec<u64> {
-    let mut counts: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
-    let mut seen_extents = 0usize;
-    if let Ok(buckets) = meta.list_buckets() {
-        for (name, _) in buckets {
-            if let Ok(objects) = meta.list_objects(&name, "") {
-                for (_, m) in objects {
-                    for e in &m.extents {
-                        *counts.entry(e.extent_id).or_insert(0) += 1;
-                        seen_extents += 1;
-                    }
-                }
-            }
+// ─────────────────────────── 恢复(ADR-9 §5.7) ───────────────────────────
+
+/// 段级可达性扫描:重建 live_bytes/引用计数/共享段表;返回
+/// (泄漏列表, 每 extent 活段最大 end)。泄漏 = 位图已分配但无活段。
+fn rebuild_segment_state(
+    meta: &MetaStore,
+    alloc: &Allocator,
+) -> Result<(Vec<u64>, HashMap<u64, u32>)> {
+    let mut lists: Vec<Vec<Segment>> = Vec::new();
+    let mut max_end: HashMap<u64, u32> = HashMap::new();
+    for (_, _, m) in meta.snapshot_all_objects()? {
+        for s in &m.extents {
+            let e = s.extent_id as u64;
+            let end = s.offset + s.len;
+            max_end
+                .entry(e)
+                .and_modify(|v| *v = (*v).max(end))
+                .or_insert(end);
         }
+        lists.push(m.extents);
     }
-    for (id, n) in &counts {
-        alloc.set_refcount(*id, *n);
+    for (_, _, p) in meta.snapshot_all_parts()? {
+        for s in &p.extents {
+            let e = s.extent_id as u64;
+            let end = s.offset + s.len;
+            max_end
+                .entry(e)
+                .and_modify(|v| *v = (*v).max(end))
+                .or_insert(end);
+        }
+        lists.push(p.extents);
     }
-    tracing::debug!(
-        "refcount rebuild: {} extents referenced by metadata",
-        seen_extents
-    );
-    alloc.leaks()
+    alloc.rebuild_derived(lists);
+    let leaks = alloc.leaks();
+    Ok((leaks, max_end))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Cursor;
-    use std::path::Path;
+/// 读 extent 头(恢复期;经 BlockDevice 直读)。无头/撕裂头(解码失败)→ None。
+fn read_extent_header_raw(
+    dev: &dyn BlockDevice,
+    sb: &fs3_core::SuperBlock,
+    extent_id: u64,
+) -> Result<Option<ExtentHeader>> {
+    let mut hbuf = fs3_device::AlignedBuffer::new(SECTOR_SIZE as usize)?;
+    let off = sb.data_start + extent_id * sb.extent_size;
+    dev.pread_aligned(hbuf.as_mut_slice(), off)?;
+    match ExtentHeader::decode(hbuf.as_slice()) {
+        Ok(h) => Ok(Some(h)),
+        Err(_) => Ok(None),
+    }
+}
 
-    fn test_cfg(dev: &Path, meta_dir: &Path) -> EngineConfig {
-        EngineConfig {
-            device: dev.to_path_buf(),
-            meta_dir: meta_dir.to_path_buf(),
-            ..Default::default()
+/// 重算 extent 数据区全部 64KiB 网格 CRC(恢复期补写独占头用)。
+fn compute_extent_crcs_raw(
+    dev: &dyn BlockDevice,
+    sb: &fs3_core::SuperBlock,
+    extent_id: u64,
+    capacity: u64,
+) -> Result<Vec<u32>> {
+    let base = sb.data_start + extent_id * sb.extent_size + EXTENT_HEADER_SIZE;
+    let mut crcs = Vec::new();
+    let mut off = 0u64;
+    while off < capacity {
+        let chunk_len = ((off + SEGMENT_CRC_GRID).min(capacity) - off) as usize;
+        let read_len = align_up(chunk_len as u64, SECTOR_SIZE) as usize;
+        let mut buf = fs3_device::AlignedBuffer::new(read_len)?;
+        dev.pread_aligned(buf.as_mut_slice(), base + off)?;
+        crcs.push(crc32c(&buf.as_slice()[..chunk_len], 0));
+        off += chunk_len as u64;
+    }
+    Ok(crcs)
+}
+
+/// 恢复期补写 extent 头(封口崩溃残留)。
+fn write_extent_header_raw(
+    dev: &dyn BlockDevice,
+    sb: &fs3_core::SuperBlock,
+    alloc: &Allocator,
+    extent_id: u32,
+    packed: bool,
+    chunk_crcs: &[u32],
+) -> Result<()> {
+    let header = ExtentHeader {
+        generation: alloc.generation(extent_id as u64),
+        flags: if packed { EXTENT_FLAG_PACKED } else { 0 },
+        chunk_size: if packed {
+            0
+        } else {
+            fs3_core::DEFAULT_CHUNK_SIZE as u32
+        },
+        chunk_crcs: if packed {
+            Vec::new()
+        } else {
+            chunk_crcs.to_vec()
+        },
+    };
+    let mut hbuf = fs3_device::AlignedBuffer::new(SECTOR_SIZE as usize)?;
+    hbuf.as_mut_slice().copy_from_slice(&header.encode());
+    let off = sb.data_start + extent_id as u64 * sb.extent_size;
+    dev.pwrite_aligned(hbuf.as_slice(), off)?;
+    Ok(())
+}
+
+/// 开放 extent 识别与续写(ADR-9 §5.7 第 5 步):
+/// - 候选 = 已分配、有活段、头缺失或代数陈旧(崩溃时未封口);
+/// - 写满候选(watermark == 容量)→ 立即补写头(独占重算 CRC / 打包);
+/// - 其余候选:取 watermark(活段最大 end)最大者续写为开放 extent,
+///   多余的补打包头(压缩 worker 崩溃残留等);
+/// - 跨崩溃会话孤儿区 [旧 watermark, 旧 written_end) 无活段,新追加自然覆盖。
+fn resume_open_extent(
+    alloc: &Allocator,
+    dev: &dyn BlockDevice,
+    sb: &fs3_core::SuperBlock,
+    max_end: &HashMap<u64, u32>,
+) -> Result<Option<OpenExtent>> {
+    let capacity = sb.extent_capacity();
+    let mut candidates: Vec<u64> = Vec::new();
+    for id in 0..alloc.len() {
+        if !alloc.test_bit(id) || alloc.live_bytes_of(id) == 0 {
+            continue;
+        }
+        let header = read_extent_header_raw(dev, sb, id)?;
+        let valid = header
+            .as_ref()
+            .map(|h| h.generation == alloc.generation(id))
+            .unwrap_or(false);
+        if !valid {
+            candidates.push(id);
         }
     }
-
-    fn setup() -> (tempfile::TempDir, EngineConfig) {
-        let dir = tempfile::tempdir().unwrap();
-        let img = dir.path().join("disk.img");
-        std::fs::File::create(&img)
-            .unwrap()
-            .set_len(64 * 1024 * 1024)
-            .unwrap();
-        fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
-        let cfg = test_cfg(&img, &dir.path().join("meta"));
-        (dir, cfg)
-    }
-
-    fn open_engine(cfg: &EngineConfig) -> Engine {
-        let mut e = Engine::open(cfg).unwrap();
-        e.ensure_bucket("b1").unwrap();
-        e
-    }
-
-    #[test]
-    fn put_get_delete_roundtrip() {
-        let (_d, cfg) = setup();
-        let mut e = open_engine(&cfg);
-
-        // 空对象
-        let m = e.put("b1", "empty", &mut Cursor::new(Vec::new())).unwrap();
-        assert_eq!(m.size, 0);
-        assert_eq!(m.extents.len(), 0);
-
-        // 小对象(单 chunk 内)
-        let data: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
-        let m = e
-            .put("b1", "small", &mut Cursor::new(data.clone()))
-            .unwrap();
-        assert_eq!(m.size, data.len() as u64);
-        assert_eq!(m.extents.len(), 1);
-        let mut out = Vec::new();
-        e.get_to("b1", "small", 0..u64::MAX, &mut out).unwrap();
-        assert_eq!(out, data);
-
-        // 大对象(跨 extent:4MiB extent,数据容量 4MiB-4KiB)
-        let big: Vec<u8> = (0..(5 * 1024 * 1024u32)).map(|i| (i % 253) as u8).collect();
-        let m = e.put("b1", "big", &mut Cursor::new(big.clone())).unwrap();
-        assert_eq!(m.size, big.len() as u64);
-        assert!(m.extents.len() >= 2, "expected >=2 extents");
-        let mut out = Vec::new();
-        e.get_to("b1", "big", 0..u64::MAX, &mut out).unwrap();
-        assert_eq!(out, big);
-
-        // Range
-        let mut out = Vec::new();
-        e.get_to("b1", "big", 100..200, &mut out).unwrap();
-        assert_eq!(out, &big[100..200]);
-        let mut out = Vec::new();
-        e.get_to("b1", "big", big.len() as u64 - 10..u64::MAX, &mut out)
-            .unwrap();
-        assert_eq!(out, &big[big.len() - 10..]);
-
-        // 删除
-        assert!(e.delete("b1", "small").unwrap().is_some());
-        assert!(e.delete("b1", "small").unwrap().is_none());
-        assert!(e.delete("b1", "big").unwrap().is_some());
-        assert_eq!(e.allocator().allocated_count(), 0, "all extents freed");
-        e.close().unwrap();
-    }
-
-    #[test]
-    fn overwrite_releases_old_extents() {
-        let (_d, cfg) = setup();
-        let mut e = open_engine(&cfg);
-        let d1 = vec![1u8; 100_000];
-        let d2 = vec![2u8; 200_000];
-        e.put("b1", "k", &mut Cursor::new(d1)).unwrap();
-        e.put("b1", "k", &mut Cursor::new(d2.clone())).unwrap();
-        let m = e.head("b1", "k").unwrap().unwrap();
-        assert_eq!(m.size, 200_000);
-        assert_eq!(e.allocator().allocated_count(), 1);
-        let mut out = Vec::new();
-        e.get_to("b1", "k", 0..u64::MAX, &mut out).unwrap();
-        assert_eq!(out, d2);
-        e.close().unwrap();
-    }
-
-    #[test]
-    fn put_interrupted_rolls_back() {
-        let (_d, cfg) = setup();
-        let mut e = open_engine(&cfg);
-        struct FailingReader {
-            remaining: usize,
+    let mut resumed: Option<(u64, u32)> = None;
+    for &id in &candidates {
+        let me = max_end.get(&id).copied().unwrap_or(0);
+        if me as u64 >= capacity {
+            // 写满未封口:补写头(独占:重算 CRC;打包:空表)
+            seal_at_recovery(alloc, dev, sb, id)?;
+        } else if resumed.is_none_or(|(_, wm)| me > wm) {
+            resumed = Some((id, me));
         }
-        impl Read for FailingReader {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                if self.remaining == 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "client gone",
-                    ));
-                }
-                let n = buf.len().min(1024).min(self.remaining);
-                buf[..n].fill(0xEE);
-                self.remaining -= n;
-                Ok(n)
-            }
+    }
+    for &id in &candidates {
+        let me = max_end.get(&id).copied().unwrap_or(0);
+        if (me as u64) < capacity && resumed != Some((id, me)) {
+            seal_at_recovery(alloc, dev, sb, id)?;
         }
-        let r = e.put(
-            "b1",
-            "partial",
-            &mut FailingReader {
-                remaining: 3 * 1024 * 1024,
-            },
+    }
+    Ok(resumed.map(|(id, wm)| OpenExtent {
+        extent_id: id as u32,
+        watermark: wm,
+        committed_end: wm,
+        participants: alloc.refcount(id).max(1),
+    }))
+}
+
+fn seal_at_recovery(
+    alloc: &Allocator,
+    dev: &dyn BlockDevice,
+    sb: &fs3_core::SuperBlock,
+    id: u64,
+) -> Result<()> {
+    let capacity = sb.extent_capacity();
+    let full = alloc.live_bytes_of(id) as u64 >= capacity;
+    if full && alloc.refcount(id) == 1 {
+        let crcs = compute_extent_crcs_raw(dev, sb, id, capacity)?;
+        write_extent_header_raw(dev, sb, alloc, id as u32, false, &crcs)?;
+    } else {
+        write_extent_header_raw(dev, sb, alloc, id as u32, true, &[])?;
+    }
+    alloc.mark_sealed(id);
+    Ok(())
+}
+
+impl Engine {
+    /// 把 chunk 累积缓冲(acc[..fill])写入当前开放 extent 的 watermark,
+    /// 并累积段内 64KiB 网格 CRC 与 md5。写入补零到 4KiB 对齐。
+    fn flush_acc(&mut self, w: &mut ExtentWriter) -> Result<()> {
+        let fill = w.fill;
+        if fill == 0 {
+            return Ok(());
+        }
+        let write_len = align_up(fill as u64, SECTOR_SIZE) as usize;
+        if write_len > fill {
+            w.acc.as_mut_slice()[fill..write_len].fill(0);
+        }
+        let data = &w.acc.as_slice()[..fill];
+        // 段内 64KiB 网格 CRC 累积(尾部按实际数据 CRC、补零落盘;ADR-9 §4.3)
+        w.seg_partial = crc32c(data, w.seg_partial);
+        w.seg_fill += fill;
+        if w.seg_fill >= SEGMENT_CRC_GRID as usize {
+            w.seg_crcs.push(w.seg_partial);
+            w.seg_partial = 0;
+            w.seg_fill -= SEGMENT_CRC_GRID as usize;
+        }
+        let (extent_id, watermark) = {
+            let oe = self.open_extent.as_mut().expect("open extent");
+            (oe.extent_id, oe.watermark)
+        };
+        let dev_off = self.extent_data_offset(extent_id as u64) + watermark as u64;
+        write_all(
+            &mut **self.io.lock().unwrap(),
+            self.device.raw_fd(),
+            &w.acc.as_slice()[..write_len],
+            dev_off,
+        )?;
+        // watermark 按 4KiB 对齐推进(段起点恒对齐,O_DIRECT 写安全);
+        // 段长按实际数据字节(与 v1 CRC 语义逐字节一致)。对齐间隙 = 死区,
+        // 浪费 ≤ 4KiB/对象(ADR-9 D1)。
+        self.open_extent.as_mut().unwrap().watermark += write_len as u32;
+        w.seg_written += fill as u32;
+        w.hasher.update(data);
+        w.fill = 0;
+        Ok(())
+    }
+
+    /// 段结束(extent 写满,对象尾部跨界续写):按参与数判定封口类型
+    /// (ADR-9 §5.2)——仅 1 个对象且写满 → 独占(头 CRC 表,段元数据 crcs
+    /// 为空);其余 → 打包(段 CRC 随元数据)。
+    fn end_segment(&mut self, w: &mut ExtentWriter) -> Result<()> {
+        if w.seg_fill > 0 {
+            w.seg_crcs.push(w.seg_partial);
+            w.seg_partial = 0;
+            w.seg_fill = 0;
+        }
+        let oe = self.open_extent.take().expect("open extent");
+        let capacity = self.sb.extent_capacity();
+        debug_assert_eq!(
+            oe.watermark as u64, capacity,
+            "end_segment requires full extent"
         );
-        assert!(r.is_err());
-        // 未提交事务:对象不可见,extent 全部回滚
-        assert!(e.head("b1", "partial").unwrap().is_none());
-        assert_eq!(e.allocator().allocated_count(), 0);
-        e.close().unwrap();
-    }
-
-    #[test]
-    fn recovery_after_clean_close() {
-        let (_d, cfg) = setup();
-        let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
-        {
-            let mut e = open_engine(&cfg);
-            e.put("b1", "a", &mut Cursor::new(data.clone())).unwrap();
-            e.close().unwrap();
+        debug_assert_eq!(
+            w.seg_written as u64,
+            capacity - w.seg_offset as u64,
+            "写满段的实际字节 == 段区间长"
+        );
+        let len = w.seg_written;
+        let exclusive = oe.participants == 1;
+        debug_assert!(
+            !exclusive || w.seg_offset == 0,
+            "exclusive segment starts at 0"
+        );
+        if exclusive {
+            let header_crcs = std::mem::take(&mut w.seg_crcs);
+            w.segments.push(Segment {
+                extent_id: oe.extent_id,
+                offset: w.seg_offset,
+                len,
+                crcs: vec![],
+            });
+            self.write_extent_header(oe.extent_id, false, &header_crcs)?;
+        } else {
+            let crcs = std::mem::take(&mut w.seg_crcs);
+            w.segments.push(Segment {
+                extent_id: oe.extent_id,
+                offset: w.seg_offset,
+                len,
+                crcs,
+            });
+            self.write_extent_header(oe.extent_id, true, &[])?;
         }
-        let mut e = Engine::open(&cfg).unwrap();
-        let mut out = Vec::new();
-        e.get_to("b1", "a", 0..u64::MAX, &mut out).unwrap();
-        assert_eq!(out, data);
-        assert_eq!(e.allocator().allocated_count(), 1);
-        assert!(e.allocator().leaks().is_empty());
-        e.close().unwrap();
-    }
-
-    #[test]
-    fn recovery_without_close_rolls_forward() {
-        let (_d, cfg) = setup();
-        let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
-        {
-            let mut e = open_engine(&cfg);
-            e.put("b1", "a", &mut Cursor::new(data.clone())).unwrap();
-            // 显式 flush 使 rocksdb 落盘(模拟组提交窗口已过)
-            e.meta().flush().unwrap();
-            e.abort(); // 模拟 kill -9:跳过最终检查点
-        }
-        let mut e = Engine::open(&cfg).unwrap();
-        let mut out = Vec::new();
-        e.get_to("b1", "a", 0..u64::MAX, &mut out).unwrap();
-        assert_eq!(out, data);
-        assert_eq!(e.allocator().allocated_count(), 1);
-        assert!(e.allocator().leaks().is_empty());
-        e.close().unwrap();
-    }
-
-    #[test]
-    fn verify_reads_detects_corruption() {
-        let (_d, cfg) = setup();
-        let data: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
-        let img_path = cfg.device.clone();
-        {
-            let mut e = open_engine(&cfg);
-            e.put("b1", "k", &mut Cursor::new(data)).unwrap();
-            e.close().unwrap();
-        }
-        // 篡改数据区第一字节(64MiB 设备:数据区起点 = 1MiB + 2×4KiB)
-        let dev = fs3_device::open_device(&img_path, false).unwrap();
-        let mut buf = fs3_device::AlignedBuffer::new(4096).unwrap();
-        let off = 1024 * 1024 + 2 * 4096 + 4096;
-        dev.pread_aligned(buf.as_mut_slice(), off).unwrap();
-        buf.as_mut_slice()[0] ^= 0xFF;
-        dev.pwrite_aligned(buf.as_slice(), off).unwrap();
-
-        let mut cfg2 = cfg.clone();
-        cfg2.verify_reads = false;
-        {
-            let mut e = Engine::open(&cfg2).unwrap();
-            let mut out = Vec::new();
-            e.get_to("b1", "k", 0..u64::MAX, &mut out).unwrap();
-            assert_eq!(out.len(), 100_000);
-            e.close().unwrap();
-        } // 释放 rocksdb 锁
-
-        let mut cfg3 = cfg.clone();
-        cfg3.verify_reads = true;
-        let mut e = Engine::open(&cfg3).unwrap();
-        let mut out = Vec::new();
-        let r = e.get_to("b1", "k", 0..u64::MAX, &mut out);
-        assert!(r.is_err(), "verify_reads must detect corruption");
-        e.close().unwrap();
-    }
-
-    #[test]
-    fn checkpoint_rolls_bitmap() {
-        let (_d, cfg) = setup();
-        let data = vec![7u8; 100_000];
-        {
-            let mut e = open_engine(&cfg);
-            e.put("b1", "k", &mut Cursor::new(data)).unwrap();
-            e.checkpoint().unwrap();
-            assert_eq!(e.checkpoint.lock().unwrap().seq, 2); // bucket create + put
-            e.close().unwrap();
-        }
-        let mut e = Engine::open(&cfg).unwrap();
-        assert_eq!(e.allocator().allocated_count(), 1);
-        assert!(e.allocator().leaks().is_empty());
-        e.close().unwrap();
-    }
-
-    #[test]
-    fn list_objects_prefix() {
-        let (_d, cfg) = setup();
-        let mut e = open_engine(&cfg);
-        for k in ["a/1", "a/2", "b/1"] {
-            e.put("b1", k, &mut Cursor::new(vec![1u8; 10])).unwrap();
-        }
-        let all = e.list_objects("b1", "").unwrap();
-        assert_eq!(all.len(), 3);
-        let a = e.list_objects("b1", "a/").unwrap();
-        assert_eq!(a.len(), 2);
-        e.close().unwrap();
-    }
-
-    #[test]
-    fn delete_bucket_force() {
-        let (_d, cfg) = setup();
-        let mut e = open_engine(&cfg);
-        e.put("b1", "k", &mut Cursor::new(vec![1u8; 100])).unwrap();
-        assert!(e.delete_bucket("b1", false).is_err());
-        e.delete_bucket("b1", true).unwrap();
-        assert!(e.list_buckets().unwrap().is_empty());
-        assert_eq!(e.allocator().allocated_count(), 0);
-        e.close().unwrap();
-    }
-
-    #[test]
-    fn multi_extent_boundary_split() {
-        // 回归:输入 chunk 跨 extent 边界拆分时,不得越界写坏下一 extent 头
-        let (_d, cfg) = setup();
-        let mut e = open_engine(&cfg);
-        let cap = e.superblock().extent_capacity();
-        // 2 个整 extent + 余量(触发第 3 个 extent,且第 64 个输入 chunk 拆分)
-        let total = 2 * cap + 300_000;
-        let data: Vec<u8> = (0..total as u32).map(|i| (i % 253) as u8).collect();
-        let m = e.put("b1", "big3", &mut Cursor::new(data.clone())).unwrap();
-        assert_eq!(m.size, total);
-        assert_eq!(m.extents.len(), 3);
-        let mut out = Vec::new();
-        e.get_to("b1", "big3", 0..u64::MAX, &mut out).unwrap();
-        assert_eq!(out, data, "3-extent object must roundtrip exactly");
-        e.close().unwrap();
-    }
-
-    #[test]
-    fn inline_small_objects_zero_device_io() {
-        // E3:≤ small_object_limit 的对象内联进元数据,零设备 I/O
-        let (_d, cfg) = setup();
-        let mut e = open_engine(&cfg);
-        let data: Vec<u8> = (0..30_000u32).map(|i| (i % 251) as u8).collect();
-        let m = e
-            .put("b1", "small", &mut Cursor::new(data.clone()))
-            .unwrap();
-        assert_eq!(m.size, data.len() as u64);
-        assert!(m.extents.is_empty(), "inline object must not use extents");
-        assert_eq!(m.inline.as_ref().unwrap(), &data);
-        assert_eq!(e.allocator().allocated_count(), 0, "zero device allocation");
-
-        // 读回
-        let mut out = Vec::new();
-        e.get_to("b1", "small", 0..u64::MAX, &mut out).unwrap();
-        assert_eq!(out, data);
-        // read_at 原语同样支持内联
-        let mut buf = vec![0u8; 1024];
-        let n = e.read_at("b1", "small", 100, &mut buf).unwrap();
-        assert_eq!(n, 1024);
-        assert_eq!(&buf[..1024], &data[100..1124]);
-        e.close().unwrap();
-    }
-
-    #[test]
-    fn inline_threshold_boundary() {
-        // 阈值边界:limit 内内联,limit+1 落盘
-        let (_d, mut cfg) = setup();
-        cfg.small_object_limit = 4096;
-        let mut e = Engine::open(&cfg).unwrap();
-        e.ensure_bucket("b1").unwrap();
-
-        let exact = vec![0xAAu8; 4096];
-        let m = e.put("b1", "exact", &mut Cursor::new(exact)).unwrap();
-        assert!(m.inline.is_some());
-        assert!(m.extents.is_empty());
-
-        let over = vec![0xBBu8; 4097];
-        let m = e.put("b1", "over", &mut Cursor::new(over.clone())).unwrap();
-        assert!(m.inline.is_none());
-        assert_eq!(m.extents.len(), 1);
-        assert_eq!(e.allocator().allocated_count(), 1);
-
-        // 读回一致
-        let mut out = Vec::new();
-        e.get_to("b1", "over", 0..u64::MAX, &mut out).unwrap();
-        assert_eq!(out, over);
-        e.close().unwrap();
-    }
-
-    #[test]
-    fn inline_with_meta_headers() {
-        let (_d, cfg) = setup();
-        let mut e = open_engine(&cfg);
-        let data = vec![9u8; 100];
-        let m = e
-            .put_with_meta(
-                "b1",
-                "k",
-                &mut Cursor::new(data),
-                Some("text/plain"),
-                vec![("x-amz-meta-foo".into(), "bar".into())],
-            )
-            .unwrap();
-        assert_eq!(m.content_type, "text/plain");
-        assert_eq!(m.user_meta, vec![("x-amz-meta-foo".into(), "bar".into())]);
-        e.close().unwrap();
-    }
-
-    #[test]
-    fn put_requires_bucket() {
-        let (_d, cfg) = setup();
-        let mut e = Engine::open(&cfg).unwrap();
-        let r = e.put("nobucket", "k", &mut Cursor::new(vec![1u8; 10]));
-        assert!(matches!(r, Err(Error::NotFound(_))));
-        e.close().unwrap();
-    }
-
-    /// 小分片(内联)+ 大分片(extent)混合 multipart 全流程。
-    #[test]
-    fn multipart_upload_complete_roundtrip() {
-        let (_d, cfg) = setup();
-        let mut e = open_engine(&cfg);
-
-        let uid = e
-            .create_multipart(
-                "b1",
-                "big",
-                Some("text/bla"),
-                vec![("k".into(), "v".into())],
-            )
-            .unwrap();
-        assert_eq!(uid.len(), 32);
-
-        // 分片 1:3MiB(内联阈值 32KiB 之上 → extent);分片 2:小内联
-        let part1 = vec![0x11u8; 5 * 1024 * 1024];
-        let p1 = e
-            .upload_part(&uid, 1, &mut Cursor::new(part1.clone()))
-            .unwrap();
-        assert_eq!(p1.size, part1.len() as u64);
-        assert!(p1.inline.is_none() && !p1.extents.is_empty());
-        let part2 = vec![0x22u8; 1000];
-        let p2 = e
-            .upload_part(&uid, 2, &mut Cursor::new(part2.clone()))
-            .unwrap();
-        assert!(p2.inline.is_some());
-
-        // ListParts 升序
-        let parts = e.list_parts(&uid).unwrap();
-        assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0].0, 1);
-        assert_eq!(parts[1].0, 2);
-
-        // 完成:混合路径(数据组合)
-        let m = e
-            .complete_multipart("b1", "big", &uid, &[(1, p1.etag_hex()), (2, p2.etag_hex())])
-            .unwrap();
-        assert_eq!(m.size, (part1.len() + part2.len()) as u64);
-        assert_eq!(m.parts, vec![part1.len() as u64, 1000]);
-        assert_eq!(m.content_type, "text/bla");
-        assert_eq!(m.user_meta, vec![("k".into(), "v".into())]);
-        // 内容完整
-        let mut out = Vec::new();
-        e.get_to("b1", "big", 0..m.size, &mut out).unwrap();
-        assert_eq!(out.len(), m.size as usize);
-        assert_eq!(&out[..part1.len()], &part1[..]);
-        assert_eq!(&out[part1.len()..], &part2[..]);
-        // 二次 Complete 幂等(同 ETag/Size)
-        let m2 = e
-            .complete_multipart("b1", "big", &uid, &[(1, p1.etag_hex()), (2, p2.etag_hex())])
-            .unwrap();
-        assert_eq!(m2.etag, m.etag);
-        assert_eq!(m2.size, m.size);
-
-        // 会话仍在(重传分片可 reactivate)
-        let p_new = e
-            .upload_part(&uid, 1, &mut Cursor::new(vec![0x33u8; 100]))
-            .unwrap();
-        let m3 = e
-            .complete_multipart("b1", "big", &uid, &[(1, p_new.etag_hex())])
-            .unwrap();
-        assert_eq!(m3.size, 100);
-        let mut out3 = Vec::new();
-        e.get_to("b1", "big", 0..100, &mut out3).unwrap();
-        assert_eq!(out3, vec![0x33u8; 100]);
-        e.close().unwrap();
-    }
-
-    /// 零数据搬运:全部大分片 extent 直接拼接(对象 extent 引用 == 分片之和)。
-    #[test]
-    fn multipart_extent_concat_no_copy() {
-        let (_d, cfg) = setup();
-        let mut e = open_engine(&cfg);
-        let uid = e.create_multipart("b1", "big", None, vec![]).unwrap();
-        let mut total_refs = 0usize;
-        let mut parts_meta = Vec::new();
-        for i in 0..3 {
-            let data = vec![i as u8; 5 * 1024 * 1024];
-            let p = e.upload_part(&uid, i + 1, &mut Cursor::new(data)).unwrap();
-            total_refs += p.extents.len();
-            parts_meta.push((i + 1, p.etag_hex()));
-        }
-        let m = e
-            .complete_multipart("b1", "big", &uid, &parts_meta)
-            .unwrap();
-        assert_eq!(m.extents.len(), total_refs);
-        assert_eq!(m.size, 15 * 1024 * 1024);
-        // 内容校验(抽样)
-        let mut out = Vec::new();
-        e.get_to("b1", "big", 0..m.size, &mut out).unwrap();
-        for i in 0..3 {
-            assert!(out[i * 5 * 1024 * 1024..(i + 1) * 5 * 1024 * 1024]
-                .iter()
-                .all(|&b| b == i as u8));
-        }
-        e.close().unwrap();
-    }
-
-    #[test]
-    fn multipart_validation_errors() {
-        let (_d, cfg) = setup();
-        let mut e = open_engine(&cfg);
-        let uid = e.create_multipart("b1", "k", None, vec![]).unwrap();
-
-        // 未知会话
-        assert!(matches!(
-            e.upload_part("nope", 1, &mut Cursor::new(vec![1u8; 10])),
-            Err(Error::NoSuchUpload(_))
-        ));
-        assert!(matches!(
-            e.complete_multipart("b1", "k", "nope", &[(1, "x".into())]),
-            Err(Error::NoSuchUpload(_))
-        ));
-        // 分片 ETag 不匹配 → InvalidPart
-        let p = e
-            .upload_part(&uid, 1, &mut Cursor::new(vec![0u8; 1]))
-            .unwrap();
-        assert!(matches!(
-            e.complete_multipart(
-                "b1",
-                "k",
-                &uid,
-                &[(1, "ffffffffffffffffffffffffffffffff".into())]
-            ),
-            Err(Error::InvalidPart(_))
-        ));
-        // 列出不存在的分片号 → InvalidPart(s3-tests missing_part)
-        let p2 = e
-            .upload_part(&uid, 3, &mut Cursor::new(vec![0u8; 1]))
-            .unwrap();
-        assert!(matches!(
-            e.complete_multipart("b1", "k", &uid, &[(9999, p.etag_hex())]),
-            Err(Error::InvalidPart(_))
-        ));
-        // 非最后分片 < 5MiB → PartTooSmall(part 1 非最后且 < 5MiB)
-        assert!(matches!(
-            e.complete_multipart("b1", "k", &uid, &[(1, p.etag_hex()), (3, p2.etag_hex())]),
-            Err(Error::PartTooSmall(_))
-        ));
-        // 乱序 part_no:map 语义(仅校验存在 + ETag);part 1 非最后且 < 5MiB → PartTooSmall
-        assert!(matches!(
-            e.complete_multipart("b1", "k", &uid, &[(3, p2.etag_hex()), (1, p.etag_hex())]),
-            Err(Error::PartTooSmall(_))
-        ));
-        // 重复 part_no:最后一次生效(resend_first_finishes_last 语义)
-        let big = e
-            .upload_part(&uid, 1, &mut Cursor::new(vec![0x55u8; 5 * 1024 * 1024]))
-            .unwrap();
-        let m = e
-            .complete_multipart("b1", "k", &uid, &[(1, p.etag_hex()), (1, big.etag_hex())])
-            .unwrap();
-        assert_eq!(m.size, 5 * 1024 * 1024);
-        let mut out = Vec::new();
-        e.get_to("b1", "k", 0..m.size, &mut out).unwrap();
-        assert!(out.iter().all(|&b| b == 0x55));
-        // 空列表 → InvalidArgument(服务层映射 MalformedXML)
-        assert!(matches!(
-            e.complete_multipart("b1", "k", &uid, &[]),
-            Err(Error::InvalidArgument(_))
-        ));
-        e.close().unwrap();
-    }
-
-    #[test]
-    fn multipart_abort_frees_extents() {
-        let (_d, cfg) = setup();
-        let mut e = open_engine(&cfg);
-        let uid = e.create_multipart("b1", "k", None, vec![]).unwrap();
-        e.upload_part(&uid, 1, &mut Cursor::new(vec![1u8; 5 * 1024 * 1024]))
-            .unwrap();
-        assert!(e.alloc.allocated_count() >= 1);
-        e.abort_multipart(&uid).unwrap();
-        assert_eq!(e.alloc.allocated_count(), 0);
-        assert!(matches!(
-            e.abort_multipart(&uid),
-            Err(Error::NoSuchUpload(_))
-        ));
-        // 对象不可见
-        assert!(e.head("b1", "k").unwrap().is_none());
-        e.close().unwrap();
-    }
-
-    #[test]
-    fn copy_object_cow_share_and_release() {
-        let (_d, cfg) = setup();
-        let mut e = open_engine(&cfg);
-        let data = vec![7u8; 5 * 1024 * 1024];
-        e.put("b1", "src", &mut Cursor::new(data.clone())).unwrap();
-        let src = e.head("b1", "src").unwrap().unwrap();
-        let ext_id = src.extents[0].extent_id;
-
-        // COW 复制:共享 extent,无新分配
-        let before = e.alloc.allocated_count();
-        let c = e.copy_object("b1", "src", "b1", "dst", None, None).unwrap();
-        assert_eq!(e.alloc.allocated_count(), before);
-        assert_eq!(c.extents, src.extents);
-        // 内容一致
-        let mut out = Vec::new();
-        e.get_to("b1", "dst", 0..c.size, &mut out).unwrap();
-        assert_eq!(out, data);
-        // 引用计数 = 2
-        let cnt = e.alloc.refcount(ext_id);
-        assert_eq!(cnt, 2);
-        // 删除一个引用:extent 仍在(计数 1)
-        e.delete("b1", "dst").unwrap();
-        assert_eq!(e.alloc.refcount(ext_id), 1);
-        // 再删:extent 归还位图
-        e.delete("b1", "src").unwrap();
-        assert_eq!(e.alloc.refcount(ext_id), 0);
-        assert!(!e.alloc.test_bit(ext_id));
-        // REPLACE 指令
-        e.put("b1", "src", &mut Cursor::new(vec![1u8; 10])).unwrap();
-        let c2 = e
-            .copy_object(
-                "b1",
-                "src",
-                "b1",
-                "dst",
-                Some("text/x"),
-                Some(&[("m".into(), "n".into())]),
-            )
-            .unwrap();
-        assert_eq!(c2.content_type, "text/x");
-        assert_eq!(c2.user_meta, vec![("m".into(), "n".into())]);
-        // 源不存在 → NotFound
-        assert!(matches!(
-            e.copy_object("b1", "nope", "b1", "x", None, None),
-            Err(Error::NotFound(_))
-        ));
-        e.close().unwrap();
-    }
-
-    /// 会话过期回收(TTL=0 → 立即过期)。
-    #[test]
-    fn multipart_sweep_expired() {
-        let (_d, cfg) = setup();
-        let mut e = open_engine(&cfg);
-        let uid = e.create_multipart("b1", "k", None, vec![]).unwrap();
-        e.upload_part(&uid, 1, &mut Cursor::new(vec![1u8; 5 * 1024 * 1024]))
-            .unwrap();
-        let n = e.sweep_expired_sessions(0).unwrap();
-        assert_eq!(n, 1);
-        assert!(matches!(
-            e.complete_multipart("b1", "k", &uid, &[]),
-            Err(Error::NoSuchUpload(_))
-        ));
-        e.close().unwrap();
+        self.alloc.mark_sealed(oe.extent_id as u64);
+        Ok(())
     }
 }
