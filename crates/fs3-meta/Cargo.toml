@@ -1,0 +1,17 @@
+[package]
+name = "fs3-meta"
+description = "FastS3 元数据:sled 封装、键编码/转义、事务与组提交"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fs3-core.workspace = true
+sled.workspace = true
+serde.workspace = true
+postcard.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true

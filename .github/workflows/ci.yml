@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # 每夜构建轨道(ROADMAP §3.1:nightly 不承诺)
+    - cron: "0 2 * * *"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  rust-stable:
+    name: Rust (stable) fmt/clippy/test/audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --workspace
+
+      - name: release build
+        run: cargo build --release -p fs3d
+
+      - name: cargo audit (依赖漏洞清零门禁)
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  rust-nightly:
+    name: Rust (nightly) build+test
+    runs-on: ubuntu-latest
+    continue-on-error: true # nightly 轨道不承诺
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: test
+        run: cargo test --workspace
+      - name: build
+        run: cargo build --release
+
+  pnpm-workspace:
+    name: pnpm workspace (lockfile frozen)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: install
+        run: pnpm install --frozen-lockfile
+      - name: workspace list
+        run: pnpm -r list --depth -1
+
+  # 性能门禁(M5 起接入 CI):需要专用 NVMe runner,当前为占位
+  # bench:
+  #   runs-on: [self-hosted, nvme]
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - run: tests/fio/baseline.sh /dev/nvme0n1
+  #     - run: target/release/fasts3d bench ...

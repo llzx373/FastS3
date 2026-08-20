@@ -1,0 +1,10 @@
+{
+  "name": "fasts3-web-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "description": "FastS3 管理面:fasts3-web(Node Fastify)+ console(React/Vite)(M3 起实现)",
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@9.15.0"
+}

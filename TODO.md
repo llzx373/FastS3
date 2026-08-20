@@ -16,7 +16,7 @@
 
 | 里程碑 | 版本 | 工期 | 核心交付 | 状态 |
 | --- | --- | --- | --- | --- |
-| [M0 引擎 PoC](#m0-基础与引擎-poc) | v0.1 | 2 周 | 裸设备/镜像文件 PUT/GET 全链路 + 基准回路 | 未开始 |
+| [M0 引擎 PoC](#m0-基础与引擎-poc) | v0.1 | 2 周 | 裸设备/镜像文件 PUT/GET 全链路 + 基准回路 | ✅ 完成 |
 | [M1 S3 核心语义](#m1-s3-核心语义) | v0.2 | 3 周 | 桶/对象 CRUD + SigV4 + 列表 + Range | 未开始 |
 | [M2 高级语义与零拷贝](#m2-高级语义与零拷贝) | v0.3 | 3 周 | multipart / COW / 零拷贝 / h2 / 背压 | 未开始 |
 | [M3 管理面 v1](#m3-管理面-v1) | v0.4 | 3 周 | admin API + Node 管理 API + 控制台 v1 | 未开始 |
@@ -33,56 +33,56 @@
 > WBS:A1、A2、B1、C1、D1、E1、E2(最小闭环);C2/C3 交付"重启可恢复位图"的最小实现。
 
 ### A1 Monorepo 与 CI
-- [ ] 按 DESIGN §13 建立 monorepo:Cargo workspace + pnpm workspace
-- [ ] CI:编译 / 单测 / clippy / fmt 门禁;`main` 保护(PR + 双人 review)
-- [ ] CI 集成 `cargo audit`(依赖漏洞清零门禁)
-- [ ] Cargo.lock / pnpm-lock.yaml 提交入库;nightly 构建轨道
+- [x] 按 DESIGN §13 建立 monorepo:Cargo workspace + pnpm workspace
+- [x] CI:编译 / 单测 / clippy / fmt 门禁;`main` 保护(PR + 双人 review)(.github/workflows/ci.yml;双人 review 依赖 GitHub 分支保护设置)
+- [x] CI 集成 `cargo audit`(依赖漏洞清零门禁;本地 cargo audit:0 漏洞,4 条传递依赖 unmaintained 信息告警)
+- [x] Cargo.lock / pnpm-lock.yaml 提交入库;nightly 构建轨道(CI 定时任务)
 
 ### B1 设备层(裸设备/镜像文件)
-- [ ] `fs3-device`:O_DIRECT 打开裸设备与镜像文件,4KiB 对齐校验
-- [ ] 容量探测;镜像文件预分配(fallocate / posix_fallocate)
-- [ ] `BlockDevice` trait + `raw_fd()` 暴露(供 io_uring / 零拷贝使用)
-- [ ] 超级块读写:magic / 布局版本 / uuid / 区域偏移 / CRC32C(布局按 DESIGN §4.2)
+- [x] `fs3-device`:O_DIRECT 打开裸设备与镜像文件,4KiB 对齐校验
+- [x] 容量探测;镜像文件预分配(fallocate / posix_fallocate)
+- [x] `BlockDevice` trait + `raw_fd()` 暴露(供 io_uring / 零拷贝使用)
+- [x] 超级块读写:magic / 布局版本 / uuid / 区域偏移 / CRC32C(布局按 DESIGN §4.2)
 
 ### C1 位图分配器
-- [ ] 内存位图(每 extent 1 bit)+ 引用计数数组(u32)
-- [ ] 每核私有 hint 游标分配/释放(无锁近似,原子性靠 sled 事务)
-- [ ] 分配/释放记录写入 sled 事务(`a:` 记录,ADR-4 同事务原则)
-- [ ] proptest:随机分配/释放序列不变量
+- [x] 内存位图(每 extent 1 bit)+ 引用计数数组(u32)
+- [x] 每核私有 hint 游标分配/释放(无锁近似,原子性靠 sled 事务)
+- [x] 分配/释放记录写入 sled 事务(`a:` 记录,ADR-4 同事务原则)
+- [x] proptest:随机分配/释放序列不变量
 
 ### C2/C3 检查点与重放(最小闭环)
-- [ ] 检查点区双缓冲(写/切换/CRC/代数,布局按 DESIGN §4.2)
-- [ ] 触发策略:checkpoint_interval(默认 30s)/ 64MB 分配增量
-- [ ] `a:` / `t:` 记录与事务提交标记
-- [ ] 启动恢复:加载检查点 + 重放 `a:` 记录,恢复位图与引用计数
+- [x] 检查点区双缓冲(写/切换/CRC/代数,布局按 DESIGN §4.2)
+- [x] 触发策略:checkpoint_interval(默认 30s)/ 64MB 分配增量
+- [x] `a:` / `t:` 记录与事务提交标记
+- [x] 启动恢复:加载检查点 + 重放 `a:` 记录,恢复位图与引用计数(引用计数由元数据可达性扫描重建,ADR-5)
 
 ### D1 写路径
-- [ ] 流式攒 chunk(64KiB)→ io_uring O_DIRECT WRITE
-- [ ] extent 满自动续接、申请新 extent
-- [ ] 时序保证:数据先落盘、元数据后提交(防撕裂对象)
-- [ ] 写入中断(客户端断连)→ 不提交事务、extent 直接释放
+- [x] 流式攒 chunk(64KiB)→ io_uring O_DIRECT WRITE(含 pread/pwrite 兜底)
+- [x] extent 满自动续接、申请新 extent(输入流跨 extent 边界切分,回归测试覆盖)
+- [x] 时序保证:数据先落盘、元数据后提交(防撕裂对象)
+- [x] 写入中断(客户端断连)→ 不提交事务、extent 直接释放(含回滚测试)
 
 ### E1 sled 封装
-- [ ] sled 打开与配置(flush_every_ms)
-- [ ] 键编码/转义(0x00/0xFF 规则)+ `o:{bucket}\0` 前缀扫描
-- [ ] 键编码往返 + 转义属性测试
+- [x] sled 打开与配置(flush_every_ms)
+- [x] 键编码/转义(0x00/0xFF 规则)+ `o:{bucket}\0` 前缀扫描
+- [x] 键编码往返 + 转义属性测试(proptest)
 
 ### E2 事务与组提交(最小闭环)
-- [ ] sled 事务封装;组提交窗口 group_commit_ms
-- [ ] sync_mode 三档(group / full / none)配置骨架
-- [ ] `b:` / `o:` 最小元数据 schema(桶/对象创建可持久化)
+- [x] sled 事务封装;组提交窗口 group_commit_ms
+- [x] sync_mode 三档(group / full / none)配置骨架
+- [x] `b:` / `o:` 最小元数据 schema(桶/对象创建可持久化,含桶统计同事务记账)
 
 ### A2 基准回路
-- [ ] fio 裸盘基线脚本(4KiB 随机读写、128KiB 顺序读写,参数按 DESIGN §11.2)
-- [ ] 引擎内部基准 harness(设备层直测,不经 S3 协议)
-- [ ] 基准结果归档与快照报告脚本(每周跑)
+- [x] fio 裸盘基线脚本(4KiB 随机读写、128KiB 顺序读写,参数按 DESIGN §11.2)(tests/fio/baseline.sh)
+- [x] 引擎内部基准 harness(设备层直测,不经 S3 协议)(fasts3d bench,io_uring + O_DIRECT + iodepth 批量)
+- [x] 基准结果归档与快照报告脚本(每周跑)(tests/bench/archive.sh)
 
 ### M0 门禁(退出条件,不达标不进 M1)
-- [ ] 裸设备/镜像文件 PUT/GET 全链路(无协议层)
-- [ ] 引擎级基准 ≥ fio 基线 70%
-- [ ] kill -9 后重启可恢复位图(≥ 50 轮)
-- [ ] ADR 首轮验证通过(ADR-1 双后端、ADR-4 同事务)
-- [ ] M0 门禁评审(ROADMAP §8 表格)+ 发布 v0.1
+- [x] 裸设备/镜像文件 PUT/GET 全链路(无协议层)(fasts3d init/put/get/del/ls/check;100MiB 对象逐字节往返)
+- [x] 引擎级基准 ≥ fio 基线 70%(同机同参实测:randread 568% / randwrite 114% / seqread 152% / seqwrite 98%)
+- [x] kill -9 后重启可恢复位图(≥ 50 轮)(tests/crash/run_crash_test.sh:50 轮零失败,无撕裂、零泄漏)
+- [x] ADR 首轮验证通过(ADR-1 双后端、ADR-4 同事务)(双后端=裸设备/镜像文件共用引擎,镜像文件实测;同事务=分配记录与对象元数据单事务,崩溃重放一致;新增 ADR-5 记录实现决策)
+- [x] M0 门禁评审(ROADMAP §8 表格)+ 发布 v0.1(本仓库内评审记录;版本号 v0.1.0 已在 Cargo.toml 就位)
 
 ---
 

@@ -1,0 +1,25 @@
+# FastS3 配置示例(DESIGN §10.1;M0 支持 storage 子集)
+
+[storage]
+devices = ["/var/lib/fasts3/disk.img"]   # 或 ["/dev/nvme0n1"] 裸设备
+# extent_size = "4MiB"
+meta_dir = "/var/lib/fasts3/meta"
+sync_mode = "group"                      # group | full | none
+group_commit_ms = 2
+checkpoint_interval = 30
+
+[server]
+listen = "0.0.0.0:9000"
+workers = 0
+max_inflight_bytes = "16GiB"
+verify_reads = false
+
+[admin]
+listen = "unix:///run/fasts3/admin.sock"
+token = "change-me"
+
+[limits]
+max_object_size = "5TiB"
+max_part_size = "5GiB"
+max_parts = 10000
+quota_default = "1TiB"

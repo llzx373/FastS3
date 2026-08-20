@@ -1,0 +1,21 @@
+[package]
+name = "fs3-engine"
+description = "FastS3 存储引擎:读写路径、extent、CRC、恢复"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fs3-core.workspace = true
+fs3-device.workspace = true
+fs3-alloc.workspace = true
+fs3-meta.workspace = true
+io-uring.workspace = true
+libc.workspace = true
+md-5.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true

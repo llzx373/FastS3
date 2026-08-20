@@ -1,0 +1,6 @@
+{
+  "name": "@fasts3/web-server",
+  "private": true,
+  "version": "0.1.0",
+  "description": "FastS3 管理 API(Fastify + TS);M3 起实现,当前为 workspace 占位"
+}

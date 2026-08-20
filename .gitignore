@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+web/**/node_modules/
+web/**/dist/
+*.log
+/tests/bench/results/
+/tests/bench/archive/
+/tests/crash/run/

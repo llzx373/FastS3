@@ -1,0 +1,15 @@
+[package]
+name = "fs3-alloc"
+description = "FastS3 空间分配器:位图、引用计数、每核 hint、检查点双缓冲"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fs3-core.workspace = true
+fs3-device.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true

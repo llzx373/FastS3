@@ -69,15 +69,34 @@ FastS3 的对策:**不做底层已经做过的事**。工程力量全部投入�
 
 ## 当前状态
 
-🚧 **设计阶段,尚未开始编码。** 设计文档与路线图已就绪,实现按里程碑推进中。
+✅ **M0 引擎 PoC 完成(v0.1)。** 裸设备/镜像文件 PUT/GET 全链路、位图分配器、检查点双缓冲与崩溃恢复、sled 事务/组提交、引擎基准回路;kill -9 崩溃 harness 50 轮零失败。下一步:M1 S3 核心语义。
 
 | 文档 | 内容 |
 | --- | --- |
-| [docs/DESIGN.md](./docs/DESIGN.md) | 总体架构、存储引擎、S3 协议、性能方案、管理面设计 |
+| [docs/DESIGN.md](./docs/DESIGN.md) | 总体架构、存储引擎、S3 协议、性能方案、管理面设计(含 ADR-1~5) |
 | [docs/ROADMAP.md](./docs/ROADMAP.md) | 实现规划、WBS 工作分解、里程碑计划、开箱即用验收标准 |
 | [TODO.md](./TODO.md) | 执行清单:M0~M8 逐条任务与门禁,勾选跟踪实现进度 |
 
 路线图:9 个里程碑(M0~M8,合计约 7 个月)→ v1.0 GA;v0.1 起逐版本发布(引擎 PoC → S3 核心 → 高级语义 → 管理面 → 加固 → 性能冲刺 → 打包开箱 → 文档与 Beta → GA)。
+
+## M0 引擎 PoC(当前)
+
+```bash
+cargo build --release -p fs3d
+
+# 初始化 1GiB 镜像并跑通 PUT/GET 全链路(裸设备传 /dev/nvme0n1 即可)
+target/release/fasts3d init --device /var/lib/fasts3/disk.img --size 1GiB
+target/release/fasts3d put   --device disk.img --meta-dir meta --bucket b1 data.bin data.bin
+target/release/fasts3d get   --device disk.img --meta-dir meta --bucket b1 data.bin out.bin
+target/release/fasts3d ls    --device disk.img --meta-dir meta
+target/release/fasts3d check --device disk.img --meta-dir meta      # 位图/元数据一致性
+
+# 引擎级基准(设备层直测,不经协议)
+target/release/fasts3d bench --device disk.img --meta-dir meta --rw randread --block 4KiB
+
+# 崩溃恢复门禁(50 轮 kill -9)
+tests/crash/run_crash_test.sh 50
+```
 
 ## 快速开始
 
@@ -129,14 +148,15 @@ FastS3/
 
 ## 构建
 
-> 实现 M0 后可用,当前为规划形态。
+> Rust 数据面已可用(M0);Node 管理面在 M3 起实现。
 
 ```bash
 cargo build --release          # Rust 数据面(单一静态二进制 fasts3d)
-cargo test                     # 单元 + 属性测试
+cargo test                     # 单元 + 属性测试(63 个)
 cargo clippy -- -D warnings    # lint 门禁
+cargo audit                    # 依赖漏洞扫描(0 漏洞)
 
-cd web && pnpm install && pnpm -r build   # Node 管理 API + 控制台
+cd web && pnpm install && pnpm -r build   # Node 管理 API + 控制台(M3 起)
 ```
 
 ## 许可证

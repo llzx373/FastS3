@@ -1,0 +1,15 @@
+[package]
+name = "fs3-core"
+description = "FastS3 核心:常量、错误、公共类型、CRC32C"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+postcard.workspace = true

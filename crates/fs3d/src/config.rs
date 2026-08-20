@@ -1,0 +1,80 @@
+//! 配置文件加载(M0 子集,见 DESIGN §10.1)。
+
+use std::path::Path;
+
+use fs3_core::{Error, Result};
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct RootConfig {
+    pub storage: StorageConfig,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct StorageConfig {
+    pub devices: Vec<std::path::PathBuf>,
+    #[allow(dead_code)] // init 命令使用(extent 大小)
+    pub extent_size: Option<String>,
+    pub meta_dir: Option<std::path::PathBuf>,
+    pub sync_mode: Option<String>,
+    pub group_commit_ms: Option<u64>,
+    pub checkpoint_interval: Option<u64>,
+}
+
+pub fn load_config(path: Option<&Path>) -> Result<RootConfig> {
+    match path {
+        None => Ok(RootConfig::default()),
+        Some(p) => {
+            let text = std::fs::read_to_string(p)?;
+            let cfg: RootConfig = toml::from_str(&text)
+                .map_err(|e| Error::InvalidArgument(format!("config {}: {e}", p.display())))?;
+            Ok(cfg)
+        }
+    }
+}
+
+/// 解析大小字符串:"4KiB" / "64MiB" / "1GiB" / 纯数字(字节)。
+pub fn parse_size(s: &str) -> Result<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err(Error::InvalidArgument("empty size".into()));
+    }
+    let lower = s.to_ascii_lowercase();
+    let (num, mult) = match lower.find(|c: char| !c.is_ascii_digit()) {
+        Some(i) => {
+            let (n, unit) = lower.split_at(i);
+            let m = match unit {
+                "" | "b" => 1u64,
+                "k" | "kb" | "kib" => 1024,
+                "m" | "mb" | "mib" => 1024 * 1024,
+                "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+                "t" | "tb" | "tib" => 1024 * 1024 * 1024 * 1024,
+                u => {
+                    return Err(Error::InvalidArgument(format!("bad size unit {u}")));
+                }
+            };
+            (n, m)
+        }
+        None => (s, 1),
+    };
+    let v: u64 = num
+        .parse()
+        .map_err(|_| Error::InvalidArgument(format!("bad size {s}")))?;
+    v.checked_mul(mult)
+        .ok_or_else(|| Error::InvalidArgument(format!("size overflow {s}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_sizes() {
+        assert_eq!(parse_size("4096").unwrap(), 4096);
+        assert_eq!(parse_size("4KiB").unwrap(), 4096);
+        assert_eq!(parse_size("4kib").unwrap(), 4096);
+        assert_eq!(parse_size("64MiB").unwrap(), 64 * 1024 * 1024);
+        assert_eq!(parse_size("1GiB").unwrap(), 1024 * 1024 * 1024);
+        assert!(parse_size("").is_err());
+        assert!(parse_size("xx").is_err());
+    }
+}
