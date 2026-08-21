@@ -1,7 +1,8 @@
-//! A4 loadgen(初版):协议层负载生成器(HTTP/1.1 + SigV4)。
+//! A4 loadgen(M5 完整化):协议层负载生成器(HTTP/1.1 + SigV4)。
 //!
-//! 每线程一条 keep-alive 连接,循环执行签名请求(PUT/GET/Range/Delete),
-//! 统计吞吐与延迟分位。对象大小/并发/Range 分布可控。
+//! 分布控制:对象大小 uniform/zipf/fixed;ops 混合比例 get:put:range;每线程
+//! keep-alive 连接循环执行签名请求。结果:控制台摘要 + 可选 JSON 归档
+//! (tests/bench/results),供 ci-perf-gate / 基准报告消费。
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -11,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use clap::Args;
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 pub struct LoadgenArgs {
     /// 端点(如 http://127.0.0.1:9000)
     #[arg(long, default_value = "http://127.0.0.1:9000")]
@@ -25,9 +26,18 @@ pub struct LoadgenArgs {
     /// 操作:put | get | range | delete | mix
     #[arg(long, default_value = "get")]
     ops: String,
-    /// 对象大小(put / range 目标)
+    /// 对象大小基准(put / range 目标;size_dist=fixed 时即固定值)
     #[arg(long, default_value = "131072")]
     size: u64,
+    /// 大小分布:fixed | uniform | zipf
+    #[arg(long, default_value = "fixed")]
+    size_dist: String,
+    /// 大小下限(uniform/zipf 时)
+    #[arg(long, default_value = "4096")]
+    size_min: u64,
+    /// 大小上限(uniform/zipf 时)
+    #[arg(long, default_value = "1048576")]
+    size_max: u64,
     /// 并发连接数
     #[arg(long, default_value = "16")]
     concurrency: usize,
@@ -40,6 +50,12 @@ pub struct LoadgenArgs {
     /// 对象键池大小
     #[arg(long, default_value = "64")]
     keys: u64,
+    /// mix 比例 get:put:range(:delete 可省,默认 40:30:30:0)
+    #[arg(long, default_value = "40:30:30:0")]
+    mix: String,
+    /// 结果 JSON 输出路径(省略 = 不归档)
+    #[arg(long)]
+    json: Option<String>,
 }
 
 struct Stats {
@@ -97,6 +113,50 @@ impl Stats {
     }
 }
 
+/// 大小分布控制(M5 A4)。
+#[derive(Clone, Copy)]
+enum SizeDist {
+    Fixed(u64),
+    Uniform(u64, u64),
+    Zipf(u64, u64),
+}
+
+impl SizeDist {
+    fn new(kind: &str, base: u64, min: u64, max: u64) -> fs3_core::Result<SizeDist> {
+        let (lo, hi) = (min.max(1), max.max(min));
+        match kind {
+            "fixed" => Ok(SizeDist::Fixed(base.max(1))),
+            "uniform" => Ok(SizeDist::Uniform(lo, hi)),
+            "zipf" => Ok(SizeDist::Zipf(lo, hi)),
+            other => Err(fs3_core::Error::InvalidArgument(format!(
+                "unknown --size-dist {other} (fixed|uniform|zipf)"
+            ))),
+        }
+    }
+
+    /// 取下一个大小(线程本地 RNG 种子)。
+    fn next(&self, rng: &mut u64) -> u64 {
+        let u = rng_f64(rng);
+        match *self {
+            SizeDist::Fixed(s) => s,
+            SizeDist::Uniform(lo, hi) => lo + (u * (hi - lo) as f64) as u64,
+            SizeDist::Zipf(lo, hi) => {
+                let span = (hi - lo) as f64 + 1.0;
+                // 重尾近似:CDF^-1 抽样(指数参数 s=1)
+                let rank = span.powf(1.0 - u);
+                lo + (rank.clamp(1.0, span) as u64).saturating_sub(1)
+            }
+        }
+    }
+}
+
+fn rng_f64(rng: &mut u64) -> f64 {
+    *rng ^= *rng >> 12;
+    *rng ^= *rng << 25;
+    *rng ^= *rng >> 27;
+    (*rng as f64) / (u64::MAX as f64)
+}
+
 pub fn run(args: &LoadgenArgs) -> fs3_core::Result<()> {
     let (access, secret) = args.key.split_once(':').ok_or_else(|| {
         fs3_core::Error::InvalidArgument(format!("bad --key {} (expect access:secret)", args.key))
@@ -116,6 +176,19 @@ pub fn run(args: &LoadgenArgs) -> fs3_core::Result<()> {
         None,
     );
 
+    // 解析 mix 比例 get:put:range:delete
+    let mut mix = [0u8; 4];
+    {
+        let parts: Vec<&str> = args.mix.split(':').collect();
+        for (i, p) in parts.iter().take(4).enumerate() {
+            mix[i] = p
+                .trim()
+                .parse()
+                .map_err(|_| fs3_core::Error::InvalidArgument(format!("bad --mix {}", args.mix)))?;
+        }
+    }
+    let size_dist = SizeDist::new(&args.size_dist, args.size, args.size_min, args.size_max)?;
+
     let stop = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(Stats::default());
     let start = Instant::now();
@@ -128,12 +201,13 @@ pub fn run(args: &LoadgenArgs) -> fs3_core::Result<()> {
         let secret = secret.to_string();
         let bucket = args.bucket.clone();
         let ops = args.ops.clone();
-        let size = args.size;
         let range_len = args.range_len;
         let keys = args.keys.max(1);
+        let mix = mix;
         handles.push(std::thread::spawn(move || {
             worker(
-                t, host, port, access, secret, bucket, ops, size, range_len, keys, stop, stats,
+                t, host, port, access, secret, bucket, ops, size_dist, range_len, keys, mix, stop,
+                stats,
             );
         }));
     }
@@ -147,18 +221,59 @@ pub fn run(args: &LoadgenArgs) -> fs3_core::Result<()> {
     let ok = stats.ok.load(Ordering::Relaxed);
     let err = stats.err.load(Ordering::Relaxed);
     let bytes = stats.bytes.load(Ordering::Relaxed);
+    let ops_s = ok as f64 / elapsed;
+    let mbps = bytes as f64 / elapsed / (1024.0 * 1024.0);
+    let p50 = stats.percentile(0.50).as_secs_f64() * 1e3;
+    let p99 = stats.percentile(0.99).as_secs_f64() * 1e3;
+
     println!("loadgen: ops={ok} err={err} elapsed={elapsed:.1}s");
-    println!("  ops/s: {:.0}", ok as f64 / elapsed);
-    println!(
-        "  throughput: {:.1} MiB/s",
-        bytes as f64 / elapsed / 1024.0 / 1024.0
-    );
-    println!(
-        "  latency p50: {:?} p99: {:?}",
-        stats.percentile(0.50),
-        stats.percentile(0.99)
-    );
+    println!("  ops/s: {:.0}", ops_s);
+    println!("  throughput: {:.1} MiB/s", mbps);
+    println!("  latency p50: {p50:.3} ms  p99: {p99:.3} ms");
+
+    // 结果归档(M5 A4):JSON 输出到指定路径(默认 tests/bench/results)
+    if let Some(path) = &args.json {
+        let dir = std::path::Path::new(path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+        std::fs::create_dir_all(dir).map_err(fs3_core::Error::Io)?;
+        let rec = format!(
+            "{{\"timestamp\":\"{}\",\"endpoint\":\"{}\",\"ops\":\"{}\",\"concurrency\":{},\"duration\":{},\"size_dist\":\"{}\",\"size\":{},\"ops_s\":{:.1},\"mbps\":{:.1},\"p50_ms\":{:.3},\"p99_ms\":{:.3},\"ok\":{},\"err\":{}}}",
+            now_rfc3339(),
+            endpoint,
+            args.ops,
+            args.concurrency,
+            args.duration,
+            args.size_dist,
+            args.size,
+            ops_s,
+            mbps,
+            p50,
+            p99,
+            ok,
+            err,
+        );
+        std::fs::write(path, &rec).map_err(fs3_core::Error::Io)?;
+        println!("  result json: {}", path);
+    }
     Ok(())
+}
+
+fn now_rfc3339() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = secs / 86400;
+    let sod = secs % 86400;
+    let (y, m, d) = civil_from_days(days as i64);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        sod / 3600,
+        (sod % 3600) / 60,
+        sod % 60
+    )
 }
 
 /// 单请求(建桶/探测用)。
@@ -402,21 +517,14 @@ fn worker(
     secret: String,
     bucket: String,
     ops: String,
-    size: u64,
+    size_dist: SizeDist,
     range_len: u64,
     keys: u64,
+    mix: [u8; 4],
     stop: Arc<AtomicBool>,
     stats: Arc<Stats>,
 ) {
-    let body: Vec<u8> = if size <= 16 * 1024 * 1024 && (ops == "put" || ops == "mix") {
-        let mut b = vec![0u8; size as usize];
-        for (i, x) in b.iter_mut().enumerate() {
-            *x = (i % 251) as u8;
-        }
-        b
-    } else {
-        Vec::new()
-    };
+    let mut rng = (t as u64).wrapping_mul(0x9E3779B97F4A7C15) + 1;
     let mut stream = match TcpStream::connect((host.as_str(), port)) {
         Ok(s) => s,
         Err(_) => return,
@@ -427,15 +535,42 @@ fn worker(
     let mut seq = 0u64;
     while !stop.load(Ordering::Relaxed) {
         seq += 1;
-        let key_no = (t as u64 * 7919 + seq) % keys;
+        let key_no = ((t as u64).wrapping_mul(7919).wrapping_add(seq)) % keys;
         let key = format!("load-{key_no}");
-        // mix:按序轮转 put/get/range
+        let size = size_dist.next(&mut rng);
+        // 选操作:put/get/range/delete(mix 按比例加权;单 ops 模式直取)
         let op = match ops.as_str() {
             "put" => "put",
+            "get" => "get",
             "delete" => "delete",
             "range" => "range",
-            "mix" => ["put", "get", "range"][(seq % 3) as usize],
-            _ => "get",
+            _ => {
+                let r = rng_f64(&mut rng) * (mix.iter().map(|&x| x as f64).sum::<f64>().max(1.0));
+                let mut acc = 0.0;
+                let mut pick = "get";
+                for (i, &w) in mix.iter().enumerate() {
+                    acc += w as f64;
+                    if r < acc {
+                        pick = match i {
+                            0 => "get",
+                            1 => "put",
+                            2 => "range",
+                            _ => "delete",
+                        };
+                        break;
+                    }
+                }
+                pick
+            }
+        };
+        let body: Vec<u8> = if op == "put" && size <= 16 * 1024 * 1024 {
+            let mut b = vec![0u8; size as usize];
+            for (i, x) in b.iter_mut().enumerate() {
+                *x = (i % 251) as u8;
+            }
+            b
+        } else {
+            Vec::new()
         };
         let (method, path, body_bytes, extra): (&str, String, &[u8], Vec<(String, String)>) =
             match op {

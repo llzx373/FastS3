@@ -81,6 +81,29 @@ pub struct ObjectMeta {
 /// 旧值无版本字节,放弃前置兼容后直接拒绝)。
 pub const OBJECT_META_VERSION: u8 = 2;
 
+/// ETag 计算模式(M5「CPU 优化」etag=fast 降级开关;DESIGN §6.7)。
+///
+/// - `Md5`(默认):严格 S3 兼容,返回 MD5 摘要;
+/// - `Crc32c`:返回对象全长 CRC32C(置于 ETag 低 4 字节),省去单流 MD5
+///   —— MD5 是 Merkle–Damgård 串行结构,无法多缓冲加速单对象,是热路径
+///   主要 CPU 成本;降级为 CRC32C(已有 chunk 级计算复用,~20GB/s/核)换取
+///   高吞吐,代价是 ETag 不再是严格 MD5(外部按弱 ETag 使用无碍)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EtagMode {
+    #[default]
+    Md5,
+    Crc32c,
+}
+
+impl EtagMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EtagMode::Md5 => "md5",
+            EtagMode::Crc32c => "crc32c",
+        }
+    }
+}
+
 impl ObjectMeta {
     pub fn etag_hex(&self) -> String {
         self.etag.iter().map(|b| format!("{b:02x}")).collect()

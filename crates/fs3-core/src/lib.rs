@@ -6,6 +6,7 @@ pub mod audit;
 pub mod consts;
 pub mod crc32c;
 pub mod error;
+pub mod md5x4;
 pub mod metrics;
 pub mod types;
 pub mod util;

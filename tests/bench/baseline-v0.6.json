@@ -1,0 +1,16 @@
+# FastS3 CI 性能门禁基线(M5)
+#
+# 语义:设备层引擎内部基准(BENCH §11.2),randread_4k_iops / seqread_128k_mbps
+# 与「同宿主类型」的后续运行对比,回退 >5% 即门禁失败(性能回退禁止合并)。
+#
+# 本文件是 CI 首跑 seeds(actions/cache 按 runner 类型缓存);生产/NVMe
+# runner 用 `FS3_BASELINE=... FS3_SEED=1 ./ci-perf-gate.sh` 重新录制,
+# 并把数值替换到本文件。当前数值录自 WSL2 虚拟盘(内存背衬,非真实 NVMe),
+# 仅用于本环境门禁自洽;真 NVMe 门禁以专用 runner 重录为准。
+{
+  "randread_4k_iops": 1270443,
+  "seqread_128k_mbps": 4900,
+  "host": "wsl-virtual-perf-runner",
+  "date": "2026-08-21T00:00:00Z",
+  "note": "WSL 虚拟盘种子基线;真 NVMe runner 需重录"
+}

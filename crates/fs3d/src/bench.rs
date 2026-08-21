@@ -2,6 +2,8 @@
 //!
 //! 与 fio 基线同一方法论(DESIGN §11.2):O_DIRECT、io_uring、对齐 I/O。
 //! 数据区直写/直读,报告 IOPS / MB/s / p99 延迟。
+//!
+//! M5 追加 `md5` 目标:SIMD 4 路多缓冲 MD5 vs 单缓冲(md-5)吞吐对比。
 
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,6 +34,18 @@ pub struct BenchArgs {
     /// 并发线程数
     #[arg(long, default_value = "1")]
     threads: u32,
+    /// io_uring IOPOLL(轮询完成;需设备支持;不兼容则自动降级)
+    #[arg(long)]
+    iopoll: bool,
+    /// io_uring COOP_TASKRUN
+    #[arg(long)]
+    coop_taskrun: bool,
+    /// io_uring SINGLE_ISSUER(6.0+)
+    #[arg(long)]
+    single_issuer: bool,
+    /// I/O 后端:uring(默认) | pread(强制 pread/pwrite 兜底,引擎零改动对照)
+    #[arg(long, default_value = "uring")]
+    io_backend: String,
 }
 
 struct ThreadResult {
@@ -91,6 +105,12 @@ pub fn run(cfg: &fs3_engine::EngineConfig, args: BenchArgs) -> Result<()> {
     });
 
     let device_path = cfg.device.clone();
+    let io_opts = fs3_engine::io::IoUringOptions {
+        iopoll: args.iopoll,
+        coop_taskrun: args.coop_taskrun,
+        single_issuer: args.single_issuer,
+    };
+    let prefer_uring = args.io_backend != "pread";
     let mut handles = vec![];
     for t in 0..args.threads {
         let stop = stop.clone();
@@ -105,6 +125,8 @@ pub fn run(cfg: &fs3_engine::EngineConfig, args: BenchArgs) -> Result<()> {
                 data_len,
                 seed: t as u64,
                 stop,
+                prefer_uring,
+                io_opts,
             })
         }));
     }
@@ -127,8 +149,16 @@ pub fn run(cfg: &fs3_engine::EngineConfig, args: BenchArgs) -> Result<()> {
 
     println!("== FastS3 engine bench (device layer, O_DIRECT) ==");
     println!(
-        "mode={} block={}B iodepth={} threads={} duration={}s",
-        args.rw, block, args.iodepth, args.threads, args.duration
+        "mode={} block={}B iodepth={} threads={} duration={}s io={} iopoll={} coop={} single={}",
+        args.rw,
+        block,
+        args.iodepth,
+        args.threads,
+        args.duration,
+        args.io_backend,
+        args.iopoll,
+        args.coop_taskrun,
+        args.single_issuer
     );
     println!(
         "data region: [{data_start}, {}) {} bytes",
@@ -150,6 +180,83 @@ enum Mode {
     RandWrite,
 }
 
+// ──────────────── M5:MD5 多缓冲基准 ────────────────
+
+/// `fasts3d bench-md5` 参数:对比 SIMD 4 路多缓冲 MD5 与单缓冲聚合吞吐。
+#[derive(Args, Debug, Clone)]
+pub struct Md5BenchArgs {
+    /// 每条消息(缓冲区)大小
+    #[arg(long, default_value = "1MiB")]
+    size: String,
+    /// 轮数(每轮 4 条 lane × size 字节)
+    #[arg(long, default_value = "128")]
+    rounds: u32,
+}
+
+pub fn run_md5(args: &Md5BenchArgs) -> Result<()> {
+    use fs3_core::md5x4::Md5Multi4;
+    use md5::Digest;
+
+    let size = parse_size(&args.size)? as usize;
+    if size == 0 || size > 256 * 1024 * 1024 {
+        return Err(Error::InvalidArgument(format!("bad --size {}", args.size)));
+    }
+    let rounds = args.rounds.max(1) as usize;
+    let total = 4u64 * rounds as u64 * size as u64;
+
+    // 4 条确定性数据 lane(size 对齐 64 的倍数由内部处理)。
+    let lanes: [Vec<u8>; 4] = std::array::from_fn(|l| {
+        (0..size)
+            .map(|i| ((i as u64 + l as u64 * 31) % 251) as u8)
+            .collect()
+    });
+    let lane_refs: [&[u8]; 4] = lanes
+        .iter()
+        .map(|v| v.as_slice())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+
+    // A) 单缓冲基线:4×rounds 次独立 md5。
+    let t0 = Instant::now();
+    let mut sink = [0u8; 16];
+    for _ in 0..rounds {
+        for v in lanes.iter() {
+            sink = md5::Md5::digest(v).into();
+        }
+    }
+    let single_secs = t0.elapsed().as_secs_f64();
+
+    // B) 4 路多缓冲:rounds 轮 × 4 lane。
+    let t1 = Instant::now();
+    let mut sink4 = [[0u8; 16]; 4];
+    for _ in 0..rounds {
+        sink4 = Md5Multi4::digest(&lane_refs);
+    }
+    let multi_secs = t1.elapsed().as_secs_f64();
+    // 防止被优化掉
+    std::hint::black_box(&sink);
+    std::hint::black_box(&sink4);
+
+    let single_mbps = total as f64 / single_secs / (1024.0 * 1024.0);
+    let multi_mbps = total as f64 / multi_secs / (1024.0 * 1024.0);
+    println!("== MD5 基准(M5 SIMD 多缓冲)==");
+    println!(
+        "size={size} rounds={rounds} total={} MiB",
+        total / (1024 * 1024)
+    );
+    println!(
+        "single(md5 crate): {single_mbps:8.0} MiB/s ({:.2}s)",
+        single_secs
+    );
+    println!(
+        "multi  (md5x4)   : {multi_mbps:8.0} MiB/s ({:.2}s)",
+        multi_secs
+    );
+    println!("speedup          : {:.2}x", multi_mbps / single_mbps);
+    Ok(())
+}
+
 struct BenchCtx {
     device_path: std::path::PathBuf,
     block: u64,
@@ -159,12 +266,15 @@ struct BenchCtx {
     data_len: u64,
     seed: u64,
     stop: Arc<AtomicBool>,
+    prefer_uring: bool,
+    io_opts: fs3_engine::io::IoUringOptions,
 }
 
 fn bench_thread(ctx: &BenchCtx) -> ThreadResult {
     let dev = ImageFile::open(&ctx.device_path, false).expect("open device");
     let fd: RawFd = dev.raw_fd();
-    let mut io: Box<dyn IoEngine> = fs3_engine::io::open_io_engine(true).expect("io engine");
+    let mut io: Box<dyn IoEngine> =
+        fs3_engine::io::open_io_engine_opts(ctx.prefer_uring, ctx.io_opts).expect("io engine");
     let depth = ctx.iodepth.max(1) as usize;
     let block = ctx.block;
 

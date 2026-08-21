@@ -21,8 +21,8 @@
 | [M2 高级语义与零拷贝](#m2-高级语义与零拷贝) | v0.3 | 3 周 | multipart / COW / 零拷贝 / h2 / 背压 | ✅ 完成 |
 | [M3 管理面 v1](#m3-管理面-v1) | v0.4 | 3 周 | admin API + Node 管理 API + 控制台 v1 | ✅ 完成 |
 | [M4 加固](#m4-加固) | v0.5 | 3 周 | 崩溃恢复闭环 / 故障注入 / TLS | ✅ 完成 |
-| [P1 打包存储](#p1-打包存储adr-9) | v0.6 | 5~7 周 | 段打包 + 惰性压缩(ADR-9);建议插 M4 后、M5 前 | **进行中**(Tier1+Tier2 核心已落地,放弃旧布局前置兼容) |
-| [M5 性能冲刺](#m5-性能冲刺) | v0.6 | 3 周 | §6.8 目标 ≥90% + 性能门禁入 CI | 未开始 |
+| [P1 打包存储](#p1-打包存储adr-9) | v0.6 | 5~7 周 | 段打包 + 惰性压缩(ADR-9);建议插 M4 后、M5 前 | 基本完成(发布 v0.6;余 3 项环境受限门禁,见 P1 段) |
+| [M5 性能冲刺](#m5-性能冲刺) | v0.6 | 3 周 | §6.8 目标 ≥90% + 性能门禁入 CI | ✅ 代码/工具交付完成;§6.8/MinIO 数值验收待 NVMe runner(见 perf-M5.md) |
 | [M6 打包与开箱](#m6-打包与开箱) | v0.7 | 3 周 | 5 分钟安装 + init 向导 + 升级回滚 | 未开始 |
 | [M7 文档与 Beta](#m7-文档与-beta) | v0.8/v0.9 | 4 周 | 文档站 + 公开 Beta | 未开始 |
 | [M8 GA 发布](#m8-ga-发布) | v1.0.0 | 3 周 | 全量回归 + 安全审计 + GA | 未开始 |
@@ -311,44 +311,66 @@
 
 ### P1 门禁(退出条件)
 - [x] 利用率基准:1MiB 对象设备占用/逻辑字节 ≥ 99%(引擎单测 + CLI `check` 实测 100%;现状基线 25%)
-- [~] 崩溃 harness:现有 run_crash_test.sh(full/group)通过,零撕裂零泄漏;200 轮随机尺寸 + 压缩并发 harness 扩展列 M4
+- [~] 崩溃 harness:现有 run_crash_test.sh(full/group)通过,零撕裂零泄漏;200 轮随机尺寸 + 压缩并发 harness 扩展列 M4(M4 已含压缩并发矩阵,200 轮扩展待真机 runner)
 - [ ] s3-tests M1+M2 全量零回归(本地 service/http 集成测试通过;s3-tests 环境接入待 CI)
-- [ ] 压缩影响:PUT p99 开/关差异 < 5%;恢复耗时 + ≤ 10%(性能门禁 M5 基建)
-- [ ] 发布 v0.6
+- [ ] 压缩影响:PUT p99 开/关差异 < 5%;恢复耗时 + ≤ 10%(需负载环境实测;perf-M5 已挂接基线回路)
+- [x] 发布 v0.6(与 M5 合并发布:v0.6.0,RELEASES.md)
 
 ---
 
 ## M5 性能冲刺
 
 > WBS:G4、MD5 多缓冲、IRQ 亲和/轮询、A4(loadgen 完整化)、L4(部分)
+> 交付记录:commit `M5 完成`(v0.6);ADR-10(运行时结论/etag=fast/md5x4 结论);
+> 报告 docs/perf-M5.md 与 docs/tuning-M5.md;Grafana/告警资产入 deploy/grafana。
+> 环境说明:①§6.8 ≥90% 与 MinIO 对照属数值验收项,需真 NVMe + 可联网环境,
+> 脚本/门禁已就绪(ci-perf-gate.sh / compare-minio.sh),本环境(内存背衬虚拟盘)
+> 不虚报达标;②monoio/glommio 需 nightly 且与 thread-per-core 模型不匹配,
+> tokio-uring 对照已工具化(tools/runtime-ab/),运行依赖 crates.io 可达性。
 
 ### G4 运行时 A/B
-- [ ] tokio-uring vs monoio/glommio A/B 基准(引擎零改动)
-- [ ] 结论 ADR + 落地最优运行时
+- [x] tokio-uring vs monoio/glommio A/B 基准(引擎零改动)(设备层 A/B 实测:
+  uring vs pread 对照 + IOPOLL/COOP/SINGLE 旋钮;tokio-uring 对照 crate
+  tools/runtime-ab/ 独立 workspace,不污染 Cargo.lock;monoio/glommio 需 nightly)
+- [x] 结论 ADR + 落地最优运行时(ADR-10:维持自研 thread-per-core + 直连
+  io_uring;落地 = bench 旋钮 + run-ab.sh 复核流程)
 
 ### CPU 优化
-- [ ] SIMD 多缓冲 MD5(4 路交错)
-- [ ] etag=fast 降级开关(返回 CRC32C 串,默认关)
+- [x] SIMD 多缓冲 MD5(4 路交错)(fs3_core::md5x4:4 lane 按步交错、RFC 逐字节
+  一致、proptest + 边界全覆盖;bench-md5 复测;ADR-10 诚实结论:标量交错 ≈
+  打平优化单缓冲,单对象 ETag 串行不可并行,真加速需 AVX2 bitslice)
+- [x] etag=fast 降级开关(返回 CRC32C 串,默认关)([storage] etag_mode;
+  内联/extent/分片全路径 + 回归测试;multipart 复合 ETag 维持 MD5)
 
 ### 系统级调优
-- [ ] IRQ 亲和脚本 + irqbalance 建议;NVMe scheduler 直通清单
-- [ ] 可选:nvme.poll_queues + IOPOLL + HIPRI 实验(低延迟场景)
-- [ ] `fasts3 doctor` 性能体检(设备对齐/内核特性/IRQ/配置正确性/基线对比)
+- [x] IRQ 亲和脚本 + irqbalance 建议;NVMe scheduler 直通清单(deploy/tuning/
+  setup-irq-affinity.sh + setup-nvme.sh + 文档 docs/tuning-M5.md)
+- [x] 可选:nvme.poll_queues + IOPOLL + HIPRI 实验(低延迟场景)(IOPOLL 旋钮 +
+  doctor 探测;非 poll_queues 干净降级实测 EOPNOTSUPP;真 NVMe 验证待硬件)
+- [x] `fasts3 doctor` 性能体检(设备对齐/内核特性/IRQ/配置正确性/基线对比
+  --perf + --json;irqbalance 核验;IOPOLL 提示)
 
 ### A4 loadgen 完整化
-- [ ] 精确分布控制 + 结果归档;warp 全套封装
-- [ ] 同机 MinIO 对照实验(单机单盘模式)
+- [x] 精确分布控制 + 结果归档;warp 全套封装(size fixed/uniform/zipf;
+  mix get:put:range:delete 加权;--json 归档 → tests/bench/results;
+  tests/bench/warp/warp-run.sh;协议层实测见 perf-M5.md §5)
+- [~] 同机 MinIO 对照实验(单机单盘模式)(tests/bench/minio/compare-minio.sh
+  就绪:MinIO 拉起 + loadgen/warp 双端对照 + 汇总;运行需可联网/真机环境)
 
 ### L4 部分:Grafana
-- [ ] Grafana 仪表盘 JSON
-- [ ] Prometheus 告警规则文件
+- [x] Grafana 仪表盘 JSON(deploy/grafana/dashboard.json:吞吐/延迟分位/
+  错误/流量/ring 水位/容量/时钟)
+- [x] Prometheus 告警规则文件(deploy/grafana/alerts.yml:5xx 占比/延迟劣化/
+  时钟回拨/ring 饱和;prometheus.yml 抓取示例)
 
 ### M5 门禁(退出条件)
-- [ ] DESIGN §6.8 目标表 ≥ 90%
-- [ ] 优于同机 MinIO 对照
-- [ ] 性能门禁接入 CI(回退 >5% 禁止合并,ADR 豁免)
-- [ ] 调优文档 + 基准报告
-- [ ] 发布 v0.6
+- [ ] DESIGN §6.8 目标表 ≥ 90%(数值验收项:真 NVMe runner 跑
+  tests/bench/ci-perf-gate.sh 后对照;本环境如实记录,见 perf-M5.md §6)
+- [ ] 优于同机 MinIO 对照(同机对照脚本就绪;待可联网/真机环境执行)
+- [x] 性能门禁接入 CI(回退 >5% 禁止合并,ADR 豁免)(ci-perf-gate.sh +
+  .github/workflows/perf.yml;基线按 runner 类型缓存自校准)
+- [x] 调优文档 + 基准报告(docs/tuning-M5.md + docs/perf-M5.md)
+- [x] 发布 v0.6(v0.6.0;RELEASES.md;P1+M5 合并发布)
 
 ---
 

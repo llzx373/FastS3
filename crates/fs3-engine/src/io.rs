@@ -67,13 +67,42 @@ pub struct IoStats {
     pub pending: u64,
 }
 
+/// io_uring ring 创建参数(M5「系统级调优」:IOPOLL/COOP/SINGLE_ISSUER 实验)。
+///
+/// 对应 DESIGN §6.3/§6.6:低延迟场景可开 IOPOLL(配合内核 nvme.poll_queues,
+/// 轮询完成降延迟 ~20µs 档,代价烧核);COOP_TASKRUN 降低唤醒开销;
+/// SINGLE_ISSUER(6.0+)声明单线程提交,免同步开销。三者默认全关 = 现状。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IoUringOptions {
+    /// IORING_SETUP_IOPOLL:轮询完成队列(需设备支持 + O_DIRECT)。
+    pub iopoll: bool,
+    /// IORING_SETUP_COOP_TASKRUN:协作式 task_work 收割。
+    pub coop_taskrun: bool,
+    /// IORING_SETUP_SINGLE_ISSUER:单线程提交语义(6.0+)。
+    pub single_issuer: bool,
+}
+
 /// 打开 I/O 引擎:优先 io_uring,失败降级 pread/pwrite。
 pub fn open_io_engine(prefer_uring: bool) -> io::Result<Box<dyn IoEngine>> {
+    open_io_engine_opts(prefer_uring, IoUringOptions::default())
+}
+
+/// 带 ring 参数的版本(IOPOLL 等;不支持的组合会自动降级 pread/pwrite)。
+pub fn open_io_engine_opts(
+    prefer_uring: bool,
+    opts: IoUringOptions,
+) -> io::Result<Box<dyn IoEngine>> {
     if prefer_uring {
-        if let Ok(e) = IoUringEngine::new() {
-            return Ok(Box::new(e));
+        match IoUringEngine::new_with(opts) {
+            Ok(e) => return Ok(Box::new(e)),
+            Err(e) => {
+                if opts != IoUringOptions::default() {
+                    tracing::warn!("io_uring with {opts:?} unavailable ({e}); falling back");
+                } else {
+                    tracing::warn!("io_uring unavailable, falling back to pread/pwrite engine");
+                }
+            }
         }
-        tracing::warn!("io_uring unavailable, falling back to pread/pwrite engine");
     }
     Ok(Box::new(PreadEngine))
 }
@@ -221,8 +250,22 @@ pub struct IoUringEngine {
 
 impl IoUringEngine {
     pub fn new() -> io::Result<Self> {
+        Self::new_with(IoUringOptions::default())
+    }
+
+    pub fn new_with(opts: IoUringOptions) -> io::Result<Self> {
         let depth = fs3_core::DEFAULT_IO_RING_DEPTH;
-        let ring = io_uring::IoUring::new(depth)?;
+        let mut builder = io_uring::IoUring::builder();
+        if opts.iopoll {
+            builder.setup_iopoll();
+        }
+        if opts.coop_taskrun {
+            builder.setup_coop_taskrun();
+        }
+        if opts.single_issuer {
+            builder.setup_single_issuer();
+        }
+        let ring = builder.build(depth)?;
         let mut engine = IoUringEngine {
             ring,
             depth: depth as usize,

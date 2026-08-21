@@ -1,0 +1,71 @@
+name: Perf Gate (M5)
+
+# 性能门禁(ROADMAP §3.3 / TODO M5 门禁):引擎内部基准与同宿主基线对比,
+# 回退 >5% 即失败(禁止合并,需 ADR 豁免)。基线按 runner 类型缓存自校准。
+#
+# 说明:标准 ubuntu-latest 是共享 CPU 的临时含虚拟盘环境,数值仅供门禁自洽;
+# 真 NVMe runner(专用机器,见 docs/perf-M5.md)接入后可把基线替换为真实值。
+# 打开方式:每周日 + 手动触发;PR 带 `perf` label 亦触发(与 dev CI 解耦,
+# 避免共享 runner 抖动让常规 PR 红)。
+
+on:
+  schedule:
+    - cron: "0 3 * * 0"   # 每周日 03:00 UTC
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    types: [labeled]
+
+permissions:
+  contents: read
+
+jobs:
+  perf-gate:
+    name: perf gate (urand/seq cmp)
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'perf')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build -p fs3d --release
+
+      # 按 runner 类型自校准基线(cache miss → 首跑 seed 保存)
+      - name: Restore perf baseline
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: tests/bench/baseline-v0.6.json
+          key: perf-baseline-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Seed baseline (first run on this runner type)
+        if: steps.cache-restore.outputs.cache-hit != 'true'
+        env:
+          FS3_BASELINE: tests/bench/baseline-v0.6.json
+          FS3_SEED: "1"
+        run: tests/bench/ci-perf-gate.sh
+
+      - name: Run perf gate (compare vs baseline)
+        if: steps.cache-restore.outputs.cache-hit == 'true'
+        env:
+          FS3_BASELINE: tests/bench/baseline-v0.6.json
+        run: tests/bench/ci-perf-gate.sh
+
+      - name: Save perf baseline
+        uses: actions/cache/save@v4
+        with:
+          path: tests/bench/baseline-v0.6.json
+          key: perf-baseline-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Upload perf result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-gate-results
+          path: tests/bench/baseline-v0.6.json
+          if-no-files-found: ignore

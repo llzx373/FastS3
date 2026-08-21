@@ -1,0 +1,166 @@
+{
+  "id": null,
+  "title": "FastS3 数据面",
+  "uid": "fasts3-dashboard",
+  "tags": ["fasts3", "storage"],
+  "timezone": "browser",
+  "editable": true,
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus scraping FastS3 admin `/v1/admin/metrics`",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "ds",
+        "type": "datasource",
+        "query": "Prometheus",
+        "label": "数据源",
+        "current": { "text": "Prometheus", "value": "${DS_PROMETHEUS}" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "S3 请求吞吐 (ops/s, 按 op)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "expr": "sum(rate(fasts3_requests_total{op!=\"other\"}[1m])) by (op)",
+          "legendFormat": "{{op}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 15 } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 2,
+      "title": "错误率 (5xx/s)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "expr": "sum(rate(fasts3_requests_total{class=\"5xx\"}[1m]))",
+          "legendFormat": "5xx/s",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(fasts3_errors_total[1m]))",
+          "legendFormat": "错误码总数/s",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "title": "延迟分位 (p50/p90/p99, 按 op=get)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(fasts3_latency_seconds_bucket{op=\"get\"}[1m])) by (le))", "legendFormat": "p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.90, sum(rate(fasts3_latency_seconds_bucket{op=\"get\"}[1m])) by (le))", "legendFormat": "p90", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, sum(rate(fasts3_latency_seconds_bucket{op=\"get\"}[1m])) by (le))", "legendFormat": "p99", "refId": "C" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 8 } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "title": "延迟分位 (所有操作)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "expr": "histogram_quantile(0.99, sum(rate(fasts3_latency_seconds_bucket[1m])) by (le))", "legendFormat": "p99(ALL)", "refId": "A" },
+        { "expr": "histogram_quantile(0.50, sum(rate(fasts3_latency_seconds_bucket[1m])) by (le))", "legendFormat": "p50(ALL)", "refId": "B" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 8 } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "title": "流量 (MiB/s, 读/写)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "expr": "rate(fasts3_bytes_transferred{dir=\"read\"}[1m]) / 1048576", "legendFormat": "读", "refId": "A" },
+        { "expr": "rate(fasts3_bytes_transferred{dir=\"write\"}[1m]) / 1048576", "legendFormat": "写", "refId": "B" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "decmbytes", "custom": { "drawStyle": "line", "fillOpacity": 15 } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 6,
+      "title": "io_uring 水位 & WAL",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "expr": "fasts3_io_uring_inflight", "legendFormat": "ring inflight", "refId": "A" },
+        { "expr": "rate(fasts3_meta_wal_flush_count[1m])", "legendFormat": "WAL 组提交/s", "refId": "B" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 12 } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 7,
+      "title": "容量 / 分配器水位",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "expr": "fasts3_alloc_allocated_extents", "legendFormat": "已分配 extent", "refId": "A" },
+        { "expr": "fasts3_alloc_live_bytes", "legendFormat": "活字节", "refId": "B" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "bytes", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 8,
+      "title": "运行时长 & 时钟回拨",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "expr": "fasts3_uptime_seconds", "legendFormat": "uptime(s)", "refId": "A" },
+        { "expr": "fasts3_clock_jumps_total", "legendFormat": "时钟回拨(总)", "refId": "B" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] } },
+        "overrides": []
+      }
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "version": 1
+}

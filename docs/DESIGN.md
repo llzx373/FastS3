@@ -264,6 +264,46 @@ B+ 树实现在超大对象数(风险 R5)下的扩展性未经验证。本 ADR �
 25%、64KiB 对象仅 1.56%。方案:变长 4KiB 段打包 + 段跨 extent 续写(spill)+
 段状态全派生(零新增持久化账本)+ extent 级惰性压缩(永远让位前台)。
 完整设计见 [ADR-9.md](./ADR-9.md);实施门禁挂 TODO 里程碑 P1。
+
+#### ADR-10(M5 实现确认):运行时结局、etag=fast 与 MD5 多缓冲
+
+**背景**:M5「性能冲刺」要求对运行时做 A/B 并落地最优方案,并对 ETag(MD5)
+做 CPU 优化。本 ADR 记录三项结论(全部为 M5 实测/工程分析,证据见
+[perf-M5.md](./perf-M5.md) 与仓库 `tools/runtime-ab/`)。
+
+**结论 1 —— 运行时保持自研 thread-per-core + 直连 io_uring(A/B 落地)**:
+
+- A/B 方式(引擎零改动):设备层 O_DIRECT 批量读,`fasts3d bench --io-backend uring|pread`
+  对照自研 io_uring 与 pread 兜底;`--iopoll/--coop-taskrun/--single-issuer` 承载
+  IOPOLL 低延迟实验;`tools/runtime-ab/` 提供 tokio-uring 对照微基准(独立 crate,
+  不污染主 Cargo.lock)。
+- monoio / glommio 依赖 **nightly**(本工具链 stable 1.97 不可编译),且其调度层
+  与「thread-per-core + SO_REUSEPORT + 每核单 ring + 零跨核唤醒」(ADR-2、§6.2)
+  模型重复且无增益;tokio-uring 增加了 executor 层,同样不匹配该模型。
+- 实测 IOPOLL 在非 NVMe/镜像文件上返回 EOPNOTSUPP(干净降级,bench 不 panic),
+  印证「仅 NVMe poll_queues 低延迟场景可用」的设计预期。
+- **决策:运行时维持自研 thread-per-core + 直连 io_uring**;新增 ring setup 旋钮
+  (IO_POLL/COOP_TASKRUN/SINGLE_ISSUER 可选)与 A/B 工具,留给 NVMe runner 复查。
+  数据面不引入 tokio/glommio/monoio(依赖最小化,§2/R9)。
+
+**结论 2 —— etag=fast(返回 CRC32C,默认关)**:
+
+- MD5 是 Merkle–Damgård 串行结构,单条对象的 ETag **无法**用多缓冲并行加速;
+  CRC32C(SIMD ~20GB/s/核)远低于 MD5(~0.6GB/s/核)。写入 7GB/s 时 MD5 需约
+  12 核仅算 ETag → §6.7 目标必须依赖 etag=fast 或接受该预算。
+- 落地:`storage.etag_mode = "md5" | "crc32c"`(默认 md5)。crc32c 模式下内联/
+  extent/分片路径均跳过 MD5,ETag 为全对象 CRC32C(置于低 4 字节,高位补零);
+  multipart 复合 ETag 仍是 MD5(拼接串 ≤43KB,可忽略)。**兼容以默认 md5 为准。**
+
+**结论 3 —— SIMD 多缓冲 MD5(md5x4)为正确原语,但标量交错不拉开差距**:
+
+- 实现 `fs3_core::md5x4::Md5Multi4`(4 lane 交错压缩,offline 字节逐位与 md-5
+  一致,proptest 任意长度/字节通过;`fasts3d bench-md5` 可复测)。
+- 本机(标量)实测:multi vs md-5 crate **≈0.78~1.03×**(按缓冲大小浮动),未达
+  「≈2~4×」。真正的多缓冲加速需要 AVX2/AVX-512 bitslice(如 Cloudflare md5multi),
+  工程量大且引入 unsafe SIMD;当前标量交错仅在有大量独立小缓冲时与单缓冲打平。
+- **决策:保留 md5x4 原语(供未来批处理/校验路径),热路径按结论 2 用 etag=fast;
+  防止把「多缓冲」误用为单对象 ETag 加速(物理不可行)写进文档**。
 ---
 
 ## 4. 存储引擎设计(Rust)

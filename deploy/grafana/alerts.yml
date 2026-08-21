@@ -1,0 +1,82 @@
+# FastS3 Prometheus 告警规则(M5 L4 部分)。
+#
+# 部署:
+#   - Prometheus 抓取 FastS3 admin `/v1/admin/metrics`(见 prometheus.yml 示例);
+#   - 把本文件挂到 Prometheus rule_files,`promtool check rules` 校验:
+#       promtool check rules deploy/grafana/alerts.yml
+#   - 阈值按部署规模调整;email/webhook/alertmanager 集成由 operator 配置。
+
+groups:
+  - name: fasts3
+    rules:
+      # 数据面可用性:5xx 速率激增
+      - alert: FastS3High5xxRate
+        expr: |
+          sum(rate(fasts3_requests_total{class="5xx"}[5m]))
+          /
+          clamp_min(sum(rate(fasts3_requests_total[5m])), 1)
+          > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "FastS3 5xx 占比 > 5%@5m"
+          description: "最近 5 分钟 5xx 请求占比 >> 5%;检查设备降级、超载或配置错误"
+
+      # 错误码激增(NoSuchKey 之外的 server 错误)
+      - alert: FastS3ServerErrorsSpike
+        expr: |
+          sum(rate(fasts3_errors_total[5m])) > 50
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "FastS3 错误码速率 > 50/s@5m"
+          description: "错误码(含客户端 4xx)速率异常,查看 fasts3_errors_total 明细"
+
+      # 延迟劣化:p99 > 200ms(小对象命中路径的目标 <1ms;阈值给足余量)
+      - alert: FastS3HighP99Latency
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum(rate(fasts3_latency_seconds_bucket[5m])) by (le)
+          ) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "FastS3 p99 延迟 > 200ms"
+          description: "全 op p99 延迟超过 200ms 持续 5 分钟;检查设备降级/过载"
+
+      # 时钟回拨(预签名对时钟敏感;回拨会破坏 SigV4/预签名)
+      - alert: FastS3ClockJump
+        expr: |
+          increase(fasts3_clock_jumps_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "检测到 wall-clock 回拨"
+          description: "NTP 校时引发时钟回拨将导致预签名/签名窗口失效;立即核查 ntpd/chronyd"
+
+      # 设备已降级(掉盘 → 只读)
+      - alert: FastS3DeviceDegraded
+        expr: |
+          fasts3_io_uring_inflight < 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "占位:设备降级(接入 /v1/admin/status.degraded 后启用)"
+          description: "设备降级目前通过 admin /v1/admin/status 的 degraded 字段暴露;Prometheus 侧接入后可替换此规则"
+
+      # io_uring 队列频繁打满(在途=深度,说明配额/背压触顶)
+      - alert: FastS3IoRingSaturated
+        expr: |
+          fasts3_io_uring_inflight > 1000
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "io_uring 在途接近 ring 深度上限"
+          description: "ring depth 默认 1024;持续打满说明背压/限速在工作(见 503 SlowDown 与 admission 指标)"

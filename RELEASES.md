@@ -1,8 +1,9 @@
-## v0.6 — P1 打包存储(ADR-9,开发中)
+## v0.6 — P1 打包存储 + M5 性能冲刺(2026-08-21)
 
-> 存储层按 ADR-9 重新实现:**放弃旧布局前置兼容**(布局版本 2,旧设备直接拒绝;无混合模式/无双兼容解码)。
+> 两个里程碑合入 v0.6:存储层按 ADR-9 重新实现(布局版本 2,放弃旧布局前置兼容);
+> M5 完成 CPU 优化/运行时结论/系统级调优工具/性能门禁入 CI(数值验收项待真 NVMe runner)。
 
-### 新能力
+### 新能力 — P1 打包存储(ADR-9)
 
 - **段模型(Tier 1)**:对象 → 设备引用单位改为 4KiB 对齐变长段 `Segment{extent_id, offset, len, crcs}`;元数据值 = [版本字节] + postcard(ObjectMeta v2)。
 - **跨对象开放 extent**:每引擎一个开放 extent,watermark 追加;封口判定(写满 / 剩余 < 32KiB / seal-on-delete);对象尾部跨界 spill——1MiB 对象负载设备占用/逻辑字节 ≥ 99%(现状基线 25%)。
@@ -12,12 +13,24 @@
 - **Tier 2 惰性压缩**:快照扫描发现(Top-K)+ 单对象迁移事务(乐观重试 + 放弃语义)+ 共享段跳过 + 速率节流与暂停;`fasts3d compact` 前台运行;崩溃任意窗口收敛。
 - COW 粒度从 extent 下沉到段(复制打包小对象不再浪费整个 4MiB extent)。
 
+### 新能力 — M5 性能冲刺
+
+- **SIMD 多缓冲 MD5(`fs3_core::md5x4`)**:4 lane 按步交错压缩,RFC-1321 逐字节一致(proptest 任意长度/字节 + 边界全覆盖);`fasts3d bench-md5` 复测;ADR-10 诚实结论:标量交错 ≈打平已优化单缓冲,单对象 ETag 串行不可并行,真加速需 AVX2 bitslice。
+- **etag=fast 降级开关(默认关)**:`[storage] etag_mode = "crc32c"`;内联/extent/分片路径跳过 MD5,ETag = 全对象 CRC32C(高吞吐档);严格兼容档保持 md5;含专项回归测试。
+- **运行时 A/B 结论(ADR-10)**:设备层 A/B 工具(`fasts3d bench --io-backend uring|pread` + `--iopoll/--coop-taskrun/--single-issuer`)+ `tools/runtime-ab/`(tokio-uring 独立对照 crate);结论维持自研 thread-per-core + 直连 io_uring(monoio/glommio 需 nightly,tokio-uring 与模型不匹配)。
+- **系统级调优**:`deploy/tuning/setup-irq-affinity.sh`(NVMe IRQ 按核绑定 + irqbalance 建议)、`setup-nvme.sh`(scheduler=none + nomerges + nr_requests);IOPOLL 实验(非 poll_queues 干净降级);`docs/tuning-M5.md`。
+- **`fasts3d doctor` 性能体检**:io_uring/IOPOLL 探测、IRQ/irqbalance 核验、配置建议、`--perf` 3s 设备层探测 + 基线回退 >5% 告警、`--json` 输出。
+- **loadgen 完整化**:size 分布(fixed/uniform/zipf)、mix 比例(get:put:range:delete)、`--json` 结果归档;`tests/bench/warp/warp-run.sh` 全套封装;`tests/bench/minio/compare-minio.sh` 同机对照实验脚本(运行需可联网/真机环境)。
+- **性能门禁入 CI**:`tests/bench/ci-perf-gate.sh`(引擎基准 vs 同宿主基线,回退 >5% 失败)+ `.github/workflows/perf.yml`(每周/手动/perf label;基线按 runner 类型缓存自校准)。
+- **Grafana 资产**:`deploy/grafana/dashboard.json`(吞吐/延迟分位/错误/流量/ring 水位/容量)+ `alerts.yml`(5xx 占比、延迟劣化、时钟回拨、ring 饱和)+ `prometheus.yml` 抓取示例。
+
 ### 验证(门禁)
 
-- cargo test 全绿(核心 20 / 分配器 20 / 引擎 39 含 3 组 proptest / 元数据 23 等);clippy 0 警告;fmt 干净。
+- cargo test 全绿(核心 20 / 分配器 20 / 引擎 39 含 3 组 proptest / 元数据 23 等;M5 新增 md5x4 7 项 + etag=fast 2 项);clippy 0 警告;fmt 干净。
 - 崩溃 harness:kill -9 随机中断 full/group 双模式通过,零撕裂、位图一致、零泄漏。
 - 利用率实测:1MiB + 5MiB 混载 `check` 报告 100.00%。
 - 压缩:候选发现/迁移/释放/共享跳过/崩溃收敛/防抖动均有专项测试。
+- M5 数值项(§6.8 ≥90%、MinIO 对照、IOPOLL 延迟)已在 docs/perf-M5.md 如实记录:**待真 NVMe runner 执行门禁脚本验收**,本环境(内存背衬虚拟盘)不虚报达标。
 
 # FastS3 发布记录
 

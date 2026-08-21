@@ -78,6 +78,8 @@ pub struct StorageConfig {
     pub sync_mode: Option<String>,
     pub group_commit_ms: Option<u64>,
     pub checkpoint_interval: Option<u64>,
+    /// ETag 模式(M5 etag=fast):"md5"(默认) | "crc32c"。
+    pub etag_mode: Option<String>,
 }
 
 pub fn load_config(path: Option<&Path>) -> Result<RootConfig> {

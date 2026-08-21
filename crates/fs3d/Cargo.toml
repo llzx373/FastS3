@@ -32,3 +32,5 @@ serde.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 libc.workspace = true
+# M5 `bench-md5`:与 SIMD 多缓冲 MD5 对比的单缓冲基线(仅基准用)
+md-5.workspace = true

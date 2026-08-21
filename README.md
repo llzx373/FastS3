@@ -77,6 +77,10 @@ FastS3 的对策:**不做底层已经做过的事**。工程力量全部投入�
 
 ✅ **M3 管理面 v1 完成(v0.4)。** admin API(新 crate `fs3-admin`:unix socket 0600/TCP 回环 + Bearer token;status/buckets/keys/uploads/metrics/audit/repair)、Prometheus 指标与审计环形缓冲(H2)、Node 管理 API(Fastify + TS:JWT 登录 + admin/readonly 角色、admin 通道代理、dashboard 聚合、SigV4 预签名、multipart 分片编排、WS 推送)、Web 控制台(Vite + React + uPlot:登录/仪表盘/桶管理/对象浏览/密钥/审计/在途上传)、桶配额执行(403 QuotaExceeded)、`fasts3d check --fix` 泄漏修复;门禁:控制台"建桶 → 拖拽上传 → 下载 → 删桶"全流程演示 ✅、check 可用 ✅、v0.4 发布 + 性能报告 ✅。管理面开销数据见 docs/perf-M3.md。下一步:M4 加固。
 
+✅ **M4 加固完成(v0.5)。** 崩溃 1000 轮 + 断电模拟零撕裂/零泄漏/账目零漂移;故障注入(掉盘只读降级 + 告警 / 磁盘满 507 / 时钟回拨监控);H3/H4 运维命令(热重载、WS 推送、每密钥限速、超时控制);TLS(rustls 1.2/1.3 + SNI + 热加载);`fasts3d doctor` 能力自检、s3-tests 支持子集 gate 全绿、覆盖率 80.05%、扩展性 6000 万+对象恒定。
+
+✅ **P1 打包存储 + M5 性能冲刺完成(v0.6)。** ADR-9 段模型(4KiB 变长段打包、跨对象开放 extent、段级派生账目、Tier2 惰性压缩、COW 段级化;利用率 ≥99%)+ M5 性能冲刺:`fs3_core::md5x4` SIMD 4 路多缓冲 MD5、etag=fast 降级开关(默认关)、运行时 A/B 结论(ADR-10:维持 thread-per-core + io_uring)、`deploy/tuning/` IRQ 亲和/NVMe scheduler 脚本、`fasts3d doctor --perf` 性能体检、loadgen 分布控制 + JSON 归档 + warp 封装、MinIO 同机对照脚本、Grafana 仪表盘 + Prometheus 告警、性能门禁入 CI(回退 >5% 禁止合并)。数值验收(§6.8 ≥90%、MinIO 对照)待真 NVMe runner,报告见 [docs/perf-M5.md](./docs/perf-M5.md)、调优见 [docs/tuning-M5.md](./docs/tuning-M5.md)。
+
 | 文档 | 内容 |
 | --- | --- |
 | [docs/DESIGN.md](./docs/DESIGN.md) | 总体架构、存储引擎、S3 协议、性能方案、管理面设计(含 ADR-1~5) |

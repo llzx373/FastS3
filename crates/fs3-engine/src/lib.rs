@@ -60,6 +60,8 @@ pub struct EngineConfig {
     pub read_only: bool,
     /// 小对象内联阈值(E3;≤ 该值的数据存元数据,零设备 I/O)。
     pub small_object_limit: usize,
+    /// ETag 计算模式(默认 Md5;crc32c = etag=fast 降级开关,M5)。
+    pub etag_mode: fs3_core::EtagMode,
     /// Tier 2 惰性压缩配置(ADR-9 §6)。
     pub compaction: CompactionConfig,
     /// 测试/故障注入覆盖:I/O 引擎替换(默认 None = 正常打开)。
@@ -80,6 +82,7 @@ impl Default for EngineConfig {
             io_uring: true,
             read_only: false,
             small_object_limit: fs3_core::SMALL_OBJECT_LIMIT,
+            etag_mode: fs3_core::EtagMode::Md5,
             compaction: CompactionConfig::default(),
             debug_io: None,
         }
@@ -142,6 +145,7 @@ pub struct Engine {
     verify_reads: bool,
     read_only: bool,
     small_object_limit: usize,
+    etag_mode: fs3_core::EtagMode,
     /// 开放 extent(跨对象存活;写入路径唯一追加点)。
     open_extent: Option<OpenExtent>,
     checkpoint: std::sync::Mutex<CheckpointState>,
@@ -273,6 +277,7 @@ impl Engine {
             verify_reads: cfg.verify_reads,
             read_only: cfg.read_only,
             small_object_limit: cfg.small_object_limit,
+            etag_mode: cfg.etag_mode,
             open_extent,
             checkpoint: std::sync::Mutex::new(CheckpointState {
                 seq: cp.seq.max(last_seq),
@@ -461,6 +466,18 @@ impl Engine {
 
     // ─────────────────────────── PUT ───────────────────────────
 
+    /// 按 etag_mode 计算单缓冲数据的 ETag(内联小对象路径用)。
+    fn compute_etag(&self, data: &[u8]) -> [u8; 16] {
+        match self.etag_mode {
+            fs3_core::EtagMode::Md5 => md5::Md5::digest(data).into(),
+            fs3_core::EtagMode::Crc32c => {
+                let mut e = [0u8; 16];
+                e[12..16].copy_from_slice(&crc32c(data, 0).to_be_bytes());
+                e
+            }
+        }
+    }
+
     /// 流式 PUT(便捷入口:默认无自定义头)。
     pub fn put(&mut self, bucket: &str, key: &str, reader: &mut dyn Read) -> Result<ObjectMeta> {
         self.put_with_meta(bucket, key, reader, None, Vec::new())
@@ -507,7 +524,7 @@ impl Engine {
         if prefix.len() <= limit {
             // —— 内联路径(E3):零设备 I/O,一条 rocksdb 事务 ——
             let size = prefix.len() as u64;
-            let etag: [u8; 16] = md5::Md5::digest(&prefix).into();
+            let etag = self.compute_etag(&prefix);
             let meta = ObjectMeta {
                 size,
                 etag,
@@ -651,7 +668,7 @@ impl Engine {
         reader: &mut dyn Read,
         draft: &mut Staged,
     ) -> Result<(Vec<Segment>, u64, [u8; 16])> {
-        let mut writer = ExtentWriter::new(self.chunk_size)?;
+        let mut writer = ExtentWriter::new(self.chunk_size, self.etag_mode)?;
         let mut inbuf = fs3_device::AlignedBuffer::new(self.chunk_size)?;
         loop {
             let n = read_up_to(reader, inbuf.as_mut_slice())?;
@@ -1213,7 +1230,7 @@ impl Engine {
         }
         let mtime = now_ts();
         let part = if prefix.len() <= limit {
-            let etag: [u8; 16] = md5::Md5::digest(&prefix).into();
+            let etag = self.compute_etag(&prefix);
             PartMeta {
                 size: prefix.len() as u64,
                 etag,
@@ -1314,7 +1331,7 @@ impl Engine {
         let len = end - start;
         let mut draft = Staged::default();
         let result = (|| -> Result<PartMeta> {
-            let mut writer = ExtentWriter::new(self.chunk_size)?;
+            let mut writer = ExtentWriter::new(self.chunk_size, self.etag_mode)?;
             // 内联源:直接灌入
             if let Some(inline) = &src.inline {
                 let data = &inline[start as usize..end as usize];
@@ -2014,7 +2031,10 @@ struct ExtentWriter {
     chunk_size: usize,
     capacity: u64,
     acc: fs3_device::AlignedBuffer,
-    hasher: md5::Md5,
+    /// 全对象 MD5(etag=fast:None = 不计算,改由 crc_acc 出 ETag,M5)。
+    hasher: Option<md5::Md5>,
+    /// 全对象 CRC32C 累积(始终计算:chunk 级 CRC 已有,零额外成本)。
+    crc_acc: u32,
     fill: usize,
     /// 对象首字节已写(封口判定 b 只查一次)。
     started: bool,
@@ -2032,12 +2052,16 @@ struct ExtentWriter {
 }
 
 impl ExtentWriter {
-    fn new(chunk_size: usize) -> Result<Self> {
+    fn new(chunk_size: usize, etag_mode: fs3_core::EtagMode) -> Result<Self> {
         Ok(ExtentWriter {
             chunk_size,
             capacity: 0, // feed 首轮经 ensure_extent 设置
             acc: fs3_device::AlignedBuffer::new(chunk_size)?,
-            hasher: md5::Md5::new(),
+            hasher: match etag_mode {
+                fs3_core::EtagMode::Md5 => Some(md5::Md5::new()),
+                fs3_core::EtagMode::Crc32c => None,
+            },
+            crc_acc: 0,
             fill: 0,
             started: false,
             seg_partial: 0,
@@ -2150,7 +2174,15 @@ impl ExtentWriter {
         if engine.meta.sync_mode() == SyncMode::Full {
             fsync(&mut **engine.io.lock().unwrap(), engine.device.raw_fd())?;
         }
-        let etag: [u8; 16] = self.hasher.finalize().into();
+        let etag: [u8; 16] = match self.hasher.take() {
+            Some(h) => h.finalize().into(),
+            // etag=fast:ETag = 全对象 CRC32C(大写 4 字节置于低 4 字节,高位补零)
+            None => {
+                let mut e = [0u8; 16];
+                e[12..16].copy_from_slice(&self.crc_acc.to_be_bytes());
+                e
+            }
+        };
         Ok((self.segments, self.size, etag))
     }
 }
@@ -2383,6 +2415,8 @@ impl Engine {
             w.seg_partial = 0;
             w.seg_fill -= SEGMENT_CRC_GRID as usize;
         }
+        // 全对象 CRC32C(etag=fast 出 ETag;始终累积,零额外成本)
+        w.crc_acc = crc32c(data, w.crc_acc);
         let (extent_id, watermark) = {
             let oe = self.open_extent.as_mut().expect("open extent");
             (oe.extent_id, oe.watermark)
@@ -2399,7 +2433,9 @@ impl Engine {
         // 浪费 ≤ 4KiB/对象(ADR-9 D1)。
         self.open_extent.as_mut().unwrap().watermark += write_len as u32;
         w.seg_written += fill as u32;
-        w.hasher.update(data);
+        if let Some(h) = w.hasher.as_mut() {
+            h.update(data);
+        }
         w.fill = 0;
         Ok(())
     }

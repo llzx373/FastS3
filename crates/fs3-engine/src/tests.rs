@@ -1486,3 +1486,73 @@ fn debug_flaky_eio() {
     println!("put2 result: {:?}", r2.as_ref().err());
     println!("degraded after put2: {}", e.degraded());
 }
+
+// ───────────────────────── M5 etag=fast(CRC32C 降级)─────────────────────────
+
+/// etag=fast:小对象内联 + 大对象 extent + multipart 分片,ETag 均为 CRC32C。
+/// crc32c 的 ETag 布局:[0u8;12] + crc32c(data).to_be_bytes()。
+#[test]
+fn etag_fast_crc32c_mode() {
+    use fs3_core::EtagMode;
+
+    let (_d, mut cfg) = setup();
+    cfg.etag_mode = EtagMode::Crc32c;
+    let mut e = open_engine(&cfg);
+
+    // 1) 内联小对象(< small_object_limit)
+    let small = rnd(8 * 1024, 9);
+    let m = e
+        .put("b1", "small", &mut Cursor::new(small.clone()))
+        .unwrap();
+    assert!(m.inline.is_some(), "small object should be inline");
+    let mut want = [0u8; 16];
+    want[12..16].copy_from_slice(&crc32c(&small, 0).to_be_bytes());
+    assert_eq!(m.etag, want, "inline etag = crc32c");
+    let sm: [u8; 16] = md5::Md5::digest(&small).into();
+    assert_ne!(m.etag, sm, "should NOT be md5");
+
+    // 2) 大对象(extent 路径)
+    let big = rnd(512 * 1024, 11);
+    let m2 = e.put("b1", "big", &mut Cursor::new(big.clone())).unwrap();
+    assert!(m2.inline.is_none(), "big object should go to extent");
+    let mut want2 = [0u8; 16];
+    want2[12..16].copy_from_slice(&crc32c(&big, 0).to_be_bytes());
+    assert_eq!(m2.etag, want2, "extent etag = crc32c");
+
+    // 3) multipart 分片(内联分片)
+    let upload = e
+        .create_multipart("b1", "mp", Some("application/octet-stream"), Vec::new())
+        .unwrap();
+    let part_data = rnd(16 * 1024, 13);
+    e.upload_part(&upload, 1, &mut Cursor::new(part_data.clone()))
+        .unwrap();
+    let stored = e.list_parts(&upload).unwrap();
+    let (_, pm) = &stored[0];
+    let mut wantp = [0u8; 16];
+    wantp[12..16].copy_from_slice(&crc32c(&part_data, 0).to_be_bytes());
+    assert_eq!(pm.etag, wantp, "part etag = crc32c");
+
+    // 4) 读回内容一致
+    let mut out = Vec::new();
+    let n = e.get_to("b1", "big", 0..u64::MAX, &mut out).unwrap();
+    assert_eq!(n as usize, big.len());
+    assert_eq!(&out, &big, "big readback intact");
+    let mut out2 = Vec::new();
+    e.get_to("b1", "small", 0..u64::MAX, &mut out2).unwrap();
+    assert_eq!(&out2, &small, "small readback intact");
+    e.close().unwrap();
+}
+
+/// md5 模式(默认)回归:ETag 仍为 MD5(与 etag=fast 互斥)。
+#[test]
+fn etag_md5_mode_default() {
+    use fs3_core::EtagMode;
+    let (_d, cfg) = setup();
+    assert_eq!(cfg.etag_mode, EtagMode::Md5, "default is md5");
+    let mut e = open_engine(&cfg);
+    let data = rnd(200 * 1024, 5);
+    let m = e.put("b1", "k", &mut Cursor::new(data.clone())).unwrap();
+    let want: [u8; 16] = md5::Md5::digest(&data).into();
+    assert_eq!(m.etag, want, "default etag = md5");
+    e.close().unwrap();
+}

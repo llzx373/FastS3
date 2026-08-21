@@ -23,3 +23,5 @@ postcard.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# Md5Multi4 正确性比对(md5x4 模块 test-only)
+md-5.workspace = true

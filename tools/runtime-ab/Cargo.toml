@@ -1,0 +1,20 @@
+[package]
+name = "runtime-ab"
+version = "0.1.0"
+edition = "2021"
+description = "FastS3 G4 运行时 A/B:tokio-uring vs 自研 thread-per-core io_uring(引擎零改动,设备层微基准)"
+publish = false
+
+# 注意:本 crate 独立于主 workspace(不参与 Cargo.lock / CI 编译),
+# 仅用于 G4 运行时 A/B 实验。monoio/glommio 需 nightly,tokio-uring 需
+# 独立运行(RUSTFLAGS 视工具链决定)。
+[dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+tokio-uring = "0.5"
+futures = "0.3"
+libc = "0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

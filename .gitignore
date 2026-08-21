@@ -8,5 +8,7 @@ web/**/dist/
 /tests/crash/run/
 __pycache__/
 var/
-tools/
+tools/*
+# M5 G4 运行时 A/B 工具是仓库交付物(独立 workspace,不参与主构建):
+!tools/runtime-ab/
 *.tsbuildinfo

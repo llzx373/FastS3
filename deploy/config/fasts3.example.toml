@@ -7,6 +7,9 @@ meta_dir = "/var/lib/fasts3/meta"
 sync_mode = "group"                      # group | full | none
 group_commit_ms = 2
 checkpoint_interval = 30
+# ETag 模式(M5 etag=fast 降级开关):md5(默认,严格 S3 兼容) | crc32c(返回
+# CRC32C 串,省去单流 MD5,高吞吐场景;代价 = ETag 非严格 MD5)
+# etag_mode = "md5"
 
 [server]
 listen = "0.0.0.0:9000"

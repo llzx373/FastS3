@@ -49,6 +49,10 @@ struct Cli {
     #[arg(long, global = true)]
     checkpoint_interval: Option<u64>,
 
+    /// ETag 模式:md5(默认) | crc32c(etag=fast 降级开关,M5)
+    #[arg(long, global = true)]
+    etag_mode: Option<String>,
+
     /// 强制使用 pread/pwrite(禁用 io_uring)
     #[arg(long, global = true)]
     no_uring: bool,
@@ -118,10 +122,12 @@ enum Cmd {
     },
     /// 立即写检查点
     Checkpoint {},
-    /// 能力自检与配置体检(B2 / M4):io_uring/设备/布局/元数据可写
-    Doctor {},
+    /// 能力自检与配置体检(B2 / M4;+ M5 性能体检 --perf)
+    Doctor(doctor::DoctorArgs),
     /// 引擎级基准(设备层直测,不经协议)
     Bench(bench::BenchArgs),
+    /// M5:MD5 多缓冲吞吐对比(单缓冲 vs SIMD 4 路)
+    BenchMd5(bench::Md5BenchArgs),
     /// 协议层负载生成器(A4)
     Loadgen(loadgen::LoadgenArgs),
     /// 批量对象压测(M4 门禁:1 亿对象,rockdb 扩展性 R5)
@@ -187,6 +193,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
             )))
         }
     };
+    let etag_mode = parse_etag_mode(cli.etag_mode.as_deref().or(storage.etag_mode.as_deref()))?;
 
     match cli.cmd {
         Cmd::Init {
@@ -202,6 +209,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.group_commit_ms.or(storage.group_commit_ms),
                 cli.checkpoint_interval.or(storage.checkpoint_interval),
                 cli.no_uring,
+                etag_mode,
             )?;
             cmd_put(&engine_cfg, &bucket, &key, &file)
         }
@@ -218,6 +226,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.group_commit_ms.or(storage.group_commit_ms),
                 cli.checkpoint_interval.or(storage.checkpoint_interval),
                 cli.no_uring,
+                etag_mode,
             )?;
             cmd_get(&engine_cfg, &bucket, &key, &out, range.as_deref())
         }
@@ -229,6 +238,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.group_commit_ms.or(storage.group_commit_ms),
                 cli.checkpoint_interval.or(storage.checkpoint_interval),
                 cli.no_uring,
+                etag_mode,
             )?;
             cmd_del(&engine_cfg, &bucket, &key)
         }
@@ -240,6 +250,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.group_commit_ms.or(storage.group_commit_ms),
                 cli.checkpoint_interval.or(storage.checkpoint_interval),
                 cli.no_uring,
+                etag_mode,
             )?;
             cmd_ls(&engine_cfg, bucket.as_deref(), &prefix)
         }
@@ -251,6 +262,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.group_commit_ms.or(storage.group_commit_ms),
                 cli.checkpoint_interval.or(storage.checkpoint_interval),
                 cli.no_uring,
+                etag_mode,
             )?;
             if fix {
                 cmd_check_fix(&engine_cfg)
@@ -266,6 +278,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.group_commit_ms.or(storage.group_commit_ms),
                 cli.checkpoint_interval.or(storage.checkpoint_interval),
                 cli.no_uring,
+                etag_mode,
             )?;
             cmd_compact(&engine_cfg, rounds)
         }
@@ -277,6 +290,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.group_commit_ms.or(storage.group_commit_ms),
                 cli.checkpoint_interval.or(storage.checkpoint_interval),
                 cli.no_uring,
+                etag_mode,
             )?;
             let mut e = Engine::open(&engine_cfg)?;
             e.checkpoint()?;
@@ -284,8 +298,8 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
             println!("checkpoint written");
             Ok(())
         }
-        Cmd::Doctor {} => {
-            let code = doctor::run(Some(&cfg))?;
+        Cmd::Doctor(args) => {
+            let code = doctor::run(Some(&cfg), &args)?;
             if code != 0 {
                 std::process::exit(code as i32);
             }
@@ -299,9 +313,11 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.group_commit_ms.or(storage.group_commit_ms),
                 cli.checkpoint_interval.or(storage.checkpoint_interval),
                 cli.no_uring,
+                etag_mode,
             )?;
             bench::run(&engine_cfg, args)
         }
+        Cmd::BenchMd5(args) => bench::run_md5(&args),
         Cmd::Loadgen(args) => loadgen::run(&args),
         Cmd::StressInsert(args) => {
             let engine_cfg = engine_config(
@@ -311,6 +327,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.group_commit_ms.or(storage.group_commit_ms),
                 cli.checkpoint_interval.or(storage.checkpoint_interval),
                 cli.no_uring,
+                etag_mode,
             )?;
             stress::run(&args, &engine_cfg)
         }
@@ -330,6 +347,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.group_commit_ms.or(storage.group_commit_ms),
                 cli.checkpoint_interval.or(storage.checkpoint_interval),
                 cli.no_uring,
+                etag_mode,
             )?;
             cmd_serve(
                 cli.config.clone(),
@@ -516,6 +534,7 @@ fn engine_config(
     group_commit_ms: Option<u64>,
     checkpoint_interval: Option<u64>,
     no_uring: bool,
+    etag_mode: fs3_core::EtagMode,
 ) -> fs3_core::Result<EngineConfig> {
     let device = device.ok_or_else(|| {
         fs3_core::Error::InvalidArgument(
@@ -540,12 +559,24 @@ fn engine_config(
         io_uring: !no_uring,
         read_only: false,
         small_object_limit: fs3_core::SMALL_OBJECT_LIMIT,
+        etag_mode,
         // 单次 CLI 命令不启后台压缩 worker(serve 自行开启;compact 命令前台跑)
         compaction: fs3_engine::CompactionConfig {
             enabled: false,
             ..Default::default()
         },
     })
+}
+
+/// 解析 etag 模式(M5 etag=fast):"md5" | "crc32c"。
+fn parse_etag_mode(s: Option<&str>) -> fs3_core::Result<fs3_core::EtagMode> {
+    match s {
+        None | Some("md5") => Ok(fs3_core::EtagMode::Md5),
+        Some("crc32c") => Ok(fs3_core::EtagMode::Crc32c),
+        Some(other) => Err(fs3_core::Error::InvalidArgument(format!(
+            "unknown etag_mode {other} (md5 | crc32c)"
+        ))),
+    }
 }
 
 fn cmd_init(

@@ -446,7 +446,7 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "fs3-admin"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "fs3-core",
  "fs3-device",
@@ -468,7 +468,7 @@ dependencies = [
 
 [[package]]
 name = "fs3-alloc"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "fs3-core",
  "fs3-device",
@@ -478,12 +478,13 @@ dependencies = [
 
 [[package]]
 name = "fs3-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "aes-gcm",
  "base64",
  "hex",
  "hmac",
+ "md-5",
  "postcard",
  "proptest",
  "serde",
@@ -493,7 +494,7 @@ dependencies = [
 
 [[package]]
 name = "fs3-device"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "fs3-core",
  "libc",
@@ -502,7 +503,7 @@ dependencies = [
 
 [[package]]
 name = "fs3-engine"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "fs3-alloc",
  "fs3-core",
@@ -519,7 +520,7 @@ dependencies = [
 
 [[package]]
 name = "fs3-http"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bytes",
  "fs3-core",
@@ -546,7 +547,7 @@ dependencies = [
 
 [[package]]
 name = "fs3-meta"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "fs3-core",
  "postcard",
@@ -558,7 +559,7 @@ dependencies = [
 
 [[package]]
 name = "fs3-s3"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "base64",
  "fs3-core",
@@ -581,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "fs3d"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "clap",
  "fs3-admin",
@@ -595,6 +596,7 @@ dependencies = [
  "hex",
  "hmac",
  "libc",
+ "md-5",
  "parking_lot",
  "serde",
  "sha2",
