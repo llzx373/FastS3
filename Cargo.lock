@@ -519,6 +519,7 @@ dependencies = [
  "fs3-meta",
  "hex",
  "hmac",
+ "libc",
  "md-5",
  "parking_lot",
  "proptest",

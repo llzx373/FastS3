@@ -86,6 +86,8 @@ pub struct S3Service {
     last_peer: std::sync::Mutex<String>,
     /// 每密钥限速(H4;rps=0 关闭)。热重载可动态调整。
     limiter: Arc<crate::ratelimit::KeyLimiter>,
+    /// 上次请求时的墙钟秒(M4 D4 时钟回拨检测;0 = 未初始化)。
+    last_clock_secs: std::sync::atomic::AtomicI64,
     /// 密钥策略缓存(J4:access → Policy;None = 无策略 = 放行)。
     /// 与 meta 中 KeyRecord.policy 保持同步(启动恢复/写入时更新)。
     policies: std::sync::Mutex<std::collections::HashMap<String, Option<crate::policy::Policy>>>,
@@ -142,7 +144,26 @@ impl S3Service {
             last_peer: std::sync::Mutex::new(String::new()),
             limiter: Arc::new(crate::ratelimit::KeyLimiter::new()),
             policies: std::sync::Mutex::new(std::collections::HashMap::new()),
+            last_clock_secs: std::sync::atomic::AtomicI64::new(unix_now() as i64),
         }
+    }
+
+    /// M4 D4 时钟回拨检测:每次请求采样墙钟,若比上次回拨 > 阈值(5s)
+    /// 则计数 + 告警(预签名对时钟敏感,DESIGN §5.2)。回拨后重置基准,
+    /// 避免永久告警风暴。`last`/`now` 秒。
+    fn check_clock(&self, now: i64) {
+        let last = self
+            .last_clock_secs
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if last != 0 && now < last - 5 {
+            self.metrics.record_clock_jump();
+            tracing::warn!(
+                clock_backward_secs = last - now,
+                "WALL CLOCK ROLLBACK detected; presigned URL validity may be affected"
+            );
+        }
+        self.last_clock_secs
+            .store(now, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// 每密钥限速(H4):设置 rps(0 = 关闭;热重载即时生效)。
@@ -429,6 +450,8 @@ impl S3Service {
     /// 主入口包装:计时 + 指标 + 审计(H2)。
     pub fn handle(&self, req: &S3Request) -> Result<ServiceResponse, S3Error> {
         let start = std::time::Instant::now();
+        // M4 D4 时钟回拨监控(每请求采样;廉价原子比较)
+        self.check_clock(unix_now() as i64);
         // 审计需要 who(access key):提前认证一次(仅查表/HMAC,无副作用;
         // 内部 handle_inner 仍会认证——M5 性能冲刺时合并)
         let access = self.authenticate(req).ok().flatten();
@@ -2423,6 +2446,14 @@ fn map_engine_error(e: CoreError, bucket: &str, key: &str) -> S3Error {
         }
         CoreError::NoSpace => S3Error::new(S3ErrorCode::InsufficientStorage)
             .with_message("The storage device is out of space."),
+        // M4 D4 故障注入:设备层 ENOSPC(设备所在卷写满)同样映射 507
+        CoreError::Io(e)
+            if e.kind() == std::io::ErrorKind::StorageFull
+                || e.raw_os_error() == Some(libc::ENOSPC) =>
+        {
+            S3Error::new(S3ErrorCode::InsufficientStorage)
+                .with_message("The storage device is out of space (device ENOSPC).")
+        }
         CoreError::InvalidArgument(m) => S3Error::new(S3ErrorCode::InvalidArgument).with_message(m),
         CoreError::InvalidPart(m) => S3Error::new(S3ErrorCode::InvalidPart).with_message(m),
         CoreError::InvalidPartOrder(m) => {
@@ -2465,9 +2496,105 @@ impl Read for HashingReader<'_> {
     }
 }
 
+/// unix 秒(墙钟;回拨检测/快照用)。
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
+
+    // ── M4 D4 时钟回拨检测 ──
+
+    #[test]
+    fn clock_rollback_detected_and_counted() {
+        let (_d, _engine, service) = service_fixture();
+        let now = unix_now() as i64;
+        service.last_clock_secs.store(now, Ordering::Relaxed);
+        let before = service.metrics().clock_jumps();
+        // 模拟回拨 60s:说明墙钟被 ntp/manual 向后调
+        service.check_clock(now - 60);
+        assert_eq!(service.metrics().clock_jumps(), before + 1);
+        // 正常前进不计数
+        service.check_clock(now - 55);
+        assert_eq!(service.metrics().clock_jumps(), before + 1);
+        // 微小抖动(≤5s)不计数
+        service.check_clock(now - 58);
+        assert_eq!(service.metrics().clock_jumps(), before + 1);
+    }
+
+    /// 测试夹具:临时镜像引擎 + S3Service(密钥 test/secret123)。
+    fn service_fixture() -> (
+        tempfile::TempDir,
+        Arc<parking_lot::RwLock<Engine>>,
+        S3Service,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("disk.img");
+        std::fs::File::create(&img)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
+        let cfg = fs3_engine::EngineConfig {
+            device: img,
+            meta_dir: dir.path().join("meta"),
+            compaction: fs3_engine::CompactionConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let engine = Arc::new(parking_lot::RwLock::new(Engine::open(&cfg).unwrap()));
+        let service = S3Service::new(
+            engine.clone(),
+            vec![Credentials {
+                access_key: "test".into(),
+                secret_key: "secret123".into(),
+            }],
+            "us-east-1".into(),
+            false,
+        );
+        (dir, engine, service)
+    }
+
+    // ── M4 D4 掉盘只读降级(S3 层拒绝写) ──
+
+    #[test]
+    fn degraded_engine_rejects_writes() {
+        let (_d, engine, service) = service_fixture();
+        engine.write().mark_degraded();
+        let req = S3Request {
+            method: "PUT".into(),
+            raw_path: "/b/k".into(),
+            decoded_path: "/b/k".into(),
+            host: "localhost".into(),
+            query: vec![],
+            headers: vec![("authorization".into(), "x".into())],
+            body: vec![],
+        };
+        // 认证失败先于降级检查 → 直接看降级检查本身
+        let result = service.check_writable(&req);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status(), 503);
+        // 读类方法不受影响
+        let get_req = S3Request {
+            method: "GET".into(),
+            raw_path: "/b/k".into(),
+            decoded_path: "/b/k".into(),
+            host: "localhost".into(),
+            query: vec![],
+            headers: vec![],
+            body: vec![],
+        };
+        assert!(service.check_writable(&get_req).is_ok());
+    }
 
     #[test]
     fn bucket_name_validation() {

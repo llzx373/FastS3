@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 serde_json = "1.0"
+libc.workspace = true
 fs3-core.workspace = true
 fs3-engine.workspace = true
 parking_lot.workspace = true

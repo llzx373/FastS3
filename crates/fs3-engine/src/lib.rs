@@ -42,7 +42,7 @@ use crate::io::{fsync, open_io_engine, read_exact, read_exact_batch, write_all, 
 
 pub use crate::compaction::{CompactionConfig, CompactionReport};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EngineConfig {
     /// 数据设备路径(裸设备或镜像文件)。
     pub device: std::path::PathBuf,
@@ -62,6 +62,10 @@ pub struct EngineConfig {
     pub small_object_limit: usize,
     /// Tier 2 惰性压缩配置(ADR-9 §6)。
     pub compaction: CompactionConfig,
+    /// 测试/故障注入覆盖:I/O 引擎替换(默认 None = 正常打开)。
+    /// 掉盘模拟用:注入一个会在 N 次写后失败的 IoEngine。
+    #[doc(hidden)]
+    pub debug_io: Option<Arc<Mutex<Box<dyn IoEngine>>>>,
 }
 
 impl Default for EngineConfig {
@@ -77,6 +81,7 @@ impl Default for EngineConfig {
             read_only: false,
             small_object_limit: fs3_core::SMALL_OBJECT_LIMIT,
             compaction: CompactionConfig::default(),
+            debug_io: None,
         }
     }
 }
@@ -147,7 +152,7 @@ pub struct Engine {
     _compactor_thread: Option<CompactorHandle>,
     closed: bool,
     /// 设备降级标记(M4 D4:掉盘/IO 故障 → 只读降级 + 告警;粘性,重启清除)。
-    degraded: bool,
+    degraded: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Engine {
@@ -193,7 +198,18 @@ impl Engine {
             alloc.apply_record(rec);
         }
 
-        let io = Arc::new(Mutex::new(open_io_engine(cfg.io_uring)?));
+        // M4 D4:降级标志(掉盘检测)在 open 期确定并贯穿整个引擎生命周期
+        let degraded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let io_raw: Box<dyn IoEngine> = match cfg.debug_io.clone() {
+            Some(io) => {
+                let mut lock = io.lock().unwrap();
+                std::mem::replace(&mut *lock, Box::new(io::PreadEngine))
+            }
+            None => open_io_engine(cfg.io_uring)?,
+        };
+        let io: Arc<Mutex<Box<dyn IoEngine>>> = Arc::new(Mutex::new(Box::new(
+            io::DegradeAware::new(io_raw, degraded.clone()),
+        )));
 
         // 4. 段级可达性扫描(ADR-9 §5.7 第 4 步):重建 live_bytes/引用计数/
         //    共享段表/watermark;位图 vs 元数据核对 = 泄漏报告
@@ -268,7 +284,7 @@ impl Engine {
             compactor,
             _compactor_thread: compactor_thread,
             closed: false,
-            degraded: false,
+            degraded: degraded.clone(),
         })
     }
 
@@ -1803,13 +1819,15 @@ impl Engine {
 
     /// 设备降级标志(M4 D4):掉盘/连续 IO 故障 → true;粘性,重启清除。
     pub fn degraded(&self) -> bool {
-        self.degraded
+        self.degraded.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 标记设备降级(只读降级 + 告警;由写路径 IO 错误触发)。
     pub fn mark_degraded(&mut self) {
-        if !self.degraded {
-            self.degraded = true;
+        if !self
+            .degraded
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
             tracing::error!(
                 "DEVICE DEGRADED: storage I/O failing; service switched to read-only mode"
             );

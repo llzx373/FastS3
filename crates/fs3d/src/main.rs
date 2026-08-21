@@ -483,6 +483,7 @@ fn engine_config(
     Ok(EngineConfig {
         device,
         meta_dir,
+        debug_io: None,
         sync_mode,
         group_commit_ms: group_commit_ms.unwrap_or(fs3_core::DEFAULT_GROUP_COMMIT_MS),
         checkpoint_interval_secs: checkpoint_interval

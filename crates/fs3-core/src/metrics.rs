@@ -99,6 +99,8 @@ pub struct Metrics {
     bytes_read: AtomicU64,
     /// 传输字节(写方向)。
     bytes_written: AtomicU64,
+    /// 时钟回拨跳跃计数(M4 D4:预签名对时钟敏感,回拨 → 告警指标)。
+    clock_jumps: AtomicU64,
     /// 启动时间(uptime 计算)。
     started: Instant,
 }
@@ -121,6 +123,7 @@ impl Metrics {
             total_errors: AtomicU64::new(0),
             bytes_read: AtomicU64::new(0),
             bytes_written: AtomicU64::new(0),
+            clock_jumps: AtomicU64::new(0),
             started: Instant::now(),
         }
     }
@@ -150,6 +153,16 @@ impl Metrics {
     }
 
     /// 记录错误码(错误路径调用;4xx/5xx)。
+    /// 时钟回拨事件计数(服务层检测到 SystemTime 向后跳跃时调用)。
+    pub fn record_clock_jump(&self) {
+        self.clock_jumps.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 时钟回拨次数(指标/告警)。
+    pub fn clock_jumps(&self) -> u64 {
+        self.clock_jumps.load(Ordering::Relaxed)
+    }
+
     pub fn record_error(&self, code: &str) {
         let mut m = self.errors.lock().unwrap();
         *m.entry(code.to_string()).or_insert(0) += 1;
@@ -225,6 +238,14 @@ impl Metrics {
     /// Prometheus 文本格式(admin `GET /v1/admin/metrics`)。
     pub fn render_prometheus(&self) -> String {
         let mut out = String::with_capacity(4096);
+        out.push_str(
+            "# HELP fasts3_clock_jumps_total wall-clock backward jumps detected (M4 D4)\n",
+        );
+        out.push_str("# TYPE fasts3_clock_jumps_total counter\n");
+        out.push_str(&format!(
+            "fasts3_clock_jumps_total {}\n",
+            self.clock_jumps()
+        ));
         out.push_str("# HELP fasts3_requests_total S3 requests by operation and status class\n");
         out.push_str("# TYPE fasts3_requests_total counter\n");
         for &op in &Op::ALL {

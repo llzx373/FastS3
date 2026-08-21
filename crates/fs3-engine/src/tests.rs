@@ -1360,3 +1360,129 @@ fn repair_no_leaks_is_noop() {
     // 对象完好
     assert!(e.meta().get_object("b1", "x").unwrap().is_some());
 }
+
+// ─────────────────────────── M4 D4 故障注入 ───────────────────────────
+
+/// 故障注入 I/O 引擎:前 `budget` 次写 submit 成功,其后写操作失败(errno)。
+/// 读始终透传。用于模拟掉盘(EIO/ENXIO)与磁盘满(ENOSPC)。
+struct FlakyIo {
+    inner: crate::io::PreadEngine,
+    writes_budget: std::sync::atomic::AtomicUsize,
+    fail_errno: i32,
+}
+
+impl FlakyIo {
+    fn new(writes_budget: usize, fail_errno: i32) -> Self {
+        FlakyIo {
+            inner: crate::io::PreadEngine,
+            writes_budget: std::sync::atomic::AtomicUsize::new(writes_budget),
+            fail_errno,
+        }
+    }
+}
+
+impl crate::io::IoEngine for FlakyIo {
+    fn submit(&mut self, ops: &[crate::io::IoOp]) -> std::io::Result<()> {
+        let is_write = ops.iter().any(|op| {
+            matches!(
+                op,
+                crate::io::IoOp::Write { .. }
+                    | crate::io::IoOp::WriteFixed { .. }
+                    | crate::io::IoOp::Fsync { .. }
+            )
+        });
+        if is_write {
+            // checked_sub 防下溢(预算 0 时保持 0 → 立即失败)
+            let remaining = self
+                .writes_budget
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |r| r.checked_sub(1),
+                )
+                .unwrap_or(0);
+            if remaining == 0 {
+                return Err(std::io::Error::from_raw_os_error(self.fail_errno));
+            }
+        }
+        self.inner.submit(ops)
+    }
+
+    fn name(&self) -> &'static str {
+        "flaky"
+    }
+}
+
+/// 掉盘模拟(EIO):设备写失败 → put 报错 + degraded 标志置位(只读降级)。
+#[test]
+fn io_failure_marks_degraded() {
+    let (_d, mut cfg) = setup();
+    // 预算 4 次写:数据段写入会消耗多次 submit(64KiB chunk 粒度,1MiB = 16 次)
+    let flaky = Arc::new(Mutex::new(
+        Box::new(FlakyIo::new(4, libc::EIO)) as Box<dyn IoEngine>
+    ));
+    cfg.debug_io = Some(flaky);
+    let mut e = Engine::open(&cfg).unwrap();
+    e.ensure_bucket("b1").unwrap();
+    assert!(!e.degraded());
+
+    let r = e.put("b1", "k", &mut Cursor::new(rnd(1024 * 1024, 3)));
+    // 预算耗尽后某次写失败 → 错误(不 panic、不撕裂)
+    assert!(r.is_err());
+    assert!(e.degraded(), "device I/O failure must mark degraded");
+
+    // 其他操作不可用:写失败持续(降级期行为由 S3 层拒绝写)
+}
+
+/// ENOSPC(磁盘满)不触发降级,映射 507 语义(服务层校验)。
+#[test]
+fn enospc_does_not_mark_degraded() {
+    let (_d, mut cfg) = setup();
+    let flaky = Arc::new(Mutex::new(
+        Box::new(FlakyIo::new(1, libc::ENOSPC)) as Box<dyn IoEngine>
+    ));
+    cfg.debug_io = Some(flaky);
+    let mut e = Engine::open(&cfg).unwrap();
+    e.ensure_bucket("b1").unwrap();
+
+    let r = e.put("b1", "k", &mut Cursor::new(rnd(256 * 1024, 4)));
+    assert!(r.is_err());
+    // 磁盘满是健康状态:不降级,服务层返回 InsufficientStorage(507)
+    assert!(!e.degraded(), "ENOSPC must NOT mark degraded");
+}
+
+/// Drop 注入:掉盘后读仍可(只读模式保留),写持续失败且 flag 保持粘性。
+#[test]
+fn degraded_is_sticky_across_failures() {
+    let (_d, mut cfg) = setup();
+    // 预算 0:所有写立即失败(ENXIO 掉盘)
+    let flaky = Arc::new(Mutex::new(
+        Box::new(FlakyIo::new(0, libc::ENXIO)) as Box<dyn IoEngine>
+    ));
+    cfg.debug_io = Some(flaky);
+    let mut e = Engine::open(&cfg).unwrap();
+    e.ensure_bucket("b1").unwrap();
+    let _ = e.put("b1", "k", &mut Cursor::new(rnd(512 * 1024, 5)));
+    assert!(e.degraded());
+    // 后续写依旧失败(预算已耗尽)
+    let r = e.put("b1", "k2", &mut Cursor::new(rnd(64 * 1024, 6)));
+    assert!(r.is_err());
+    assert!(e.degraded());
+}
+
+#[test]
+fn debug_flaky_eio() {
+    let (_d, mut cfg) = setup();
+    let flaky = Arc::new(Mutex::new(
+        Box::new(FlakyIo::new(4, libc::EIO)) as Box<dyn IoEngine>
+    ));
+    cfg.debug_io = Some(flaky);
+    let mut e = Engine::open(&cfg).unwrap();
+    println!("degraded after open: {}", e.degraded());
+    let r = e.put("b1", "k", &mut Cursor::new(rnd(1024 * 1024, 3)));
+    println!("put result: {:?}", r.as_ref().err());
+    println!("degraded after put: {}", e.degraded());
+    let r2 = e.put("b1", "k2", &mut Cursor::new(rnd(1024 * 1024, 7)));
+    println!("put2 result: {:?}", r2.as_ref().err());
+    println!("degraded after put2: {}", e.degraded());
+}

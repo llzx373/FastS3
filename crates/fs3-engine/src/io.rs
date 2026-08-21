@@ -2,9 +2,12 @@
 //!
 //! ADR-2:存储 I/O 完全旁路运行时,引擎自持 io_uring ring;
 //! 内核不支持时自动降级 pread/pwrite(功能完整、性能降级,老内核兜底雏形)。
+//! M4 D4:任何非「磁盘满」的设备 I/O 错误 → 降级标志(掉盘只读降级 + 告警)。
 
 use std::io;
 use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// 批量 I/O 操作;返回时全部完成(io_uring 同步收割 / pread 顺序执行)。
 ///
@@ -73,6 +76,46 @@ pub fn open_io_engine(prefer_uring: bool) -> io::Result<Box<dyn IoEngine>> {
         tracing::warn!("io_uring unavailable, falling back to pread/pwrite engine");
     }
     Ok(Box::new(PreadEngine))
+}
+
+/// 设备故障检测包装(M4 D4):submit 失败且非「磁盘满」→ 置降级标志。
+/// 掉盘(ENXIO/EBADF/EIO 等)多次 IO 失败后,S3 层写方法拒绝(只读降级 + 告警)。
+pub struct DegradeAware {
+    inner: Box<dyn IoEngine>,
+    degraded: Arc<AtomicBool>,
+}
+
+impl DegradeAware {
+    pub fn new(inner: Box<dyn IoEngine>, degraded: Arc<AtomicBool>) -> Self {
+        DegradeAware { inner, degraded }
+    }
+}
+
+impl IoEngine for DegradeAware {
+    fn submit(&mut self, ops: &[IoOp]) -> io::Result<()> {
+        match self.inner.submit(ops) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // 磁盘满(ENOSPC)≠ 设备故障:507 语义,不降级
+                let disk_full = e.kind() == io::ErrorKind::StorageFull
+                    || e.raw_os_error() == Some(libc::ENOSPC);
+                if !disk_full && !self.degraded.swap(true, Ordering::Relaxed) {
+                    tracing::error!(
+                        "DEVICE DEGRADED: device I/O failed ({e}); switching to read-only mode"
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn stats(&self) -> IoStats {
+        self.inner.stats()
+    }
 }
 
 // ─────────────────────────── pread/pwrite ───────────────────────────
