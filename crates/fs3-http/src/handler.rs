@@ -41,13 +41,50 @@ pub async fn serve_connection(
         .map(|a| a.to_string())
         .unwrap_or_default();
     service.set_peer(&peer);
-    let zc_ctx = crate::zero_copy::ZeroCtx::new();
+    let zc_ctx = Some(crate::zero_copy::ZeroCtx::new());
     // H4:DeadlinedIo 提供 30s 首读(header)/ 60s 每读(idle)截止
     let io = TokioIo::new(crate::DeadlinedIo::new(
-        crate::zero_copy::ZeroCopyIo::new(stream, &zc_ctx),
+        crate::zero_copy::ZeroCopyIo::new(stream, zc_ctx.as_ref().unwrap()),
         header_timeout,
         idle_timeout,
     ));
+    serve_common(service, admission, io, zc_ctx, idle_timeout).await
+}
+
+/// TLS 连接服务(M4):rustls 流,零拷贝禁用(标记帧无法穿透加密层,走缓冲读)。
+pub async fn serve_connection_tls(
+    service: Arc<S3Service>,
+    admission: Arc<crate::Admission>,
+    stream: tokio_rustls::server::TlsStream<TcpStream>,
+    header_timeout: std::time::Duration,
+    idle_timeout: std::time::Duration,
+) -> std::io::Result<()> {
+    let peer = stream
+        .get_ref()
+        .0
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+    service.set_peer(&peer);
+    let io = TokioIo::new(crate::DeadlinedIo::new(
+        stream,
+        header_timeout,
+        idle_timeout,
+    ));
+    serve_common(service, admission, io, None, idle_timeout).await
+}
+
+/// 公共连接驱动(h1/h2 自动协商;超时交给 hyper Timer + DeadlinedIo)。
+async fn serve_common<S>(
+    service: Arc<S3Service>,
+    admission: Arc<crate::Admission>,
+    io: TokioIo<S>,
+    zc_ctx: Option<crate::zero_copy::ZeroCtx>,
+    idle_timeout: std::time::Duration,
+) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let service_fn = hyper::service::service_fn(move |req| {
         let service = service.clone();
         let admission = admission.clone();
@@ -131,7 +168,7 @@ fn rand_u64() -> u64 {
 async fn handle(
     service: Arc<S3Service>,
     admission: Arc<crate::Admission>,
-    zc_ctx: crate::zero_copy::ZeroCtx,
+    zc_ctx: Option<crate::zero_copy::ZeroCtx>,
     req: Request<Incoming>,
 ) -> Result<Response<RespBody>, std::convert::Infallible> {
     let host_id = "fasts3";
@@ -196,10 +233,14 @@ async fn handle(
         .find(|(k, _)| k == "x-amz-content-sha256")
         .map(|(_, v)| v.as_str());
     let streaming_put = method == "PUT"
-        && (sha256 == Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
-            || content_length
-                .map(|l| l > fs3_s3::BUFFERED_PUT_LIMIT as u64)
-                .unwrap_or(true));
+        && (matches!(
+            sha256,
+            Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+                | Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER")
+                | Some("STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+        ) || content_length
+            .map(|l| l > fs3_s3::BUFFERED_PUT_LIMIT as u64)
+            .unwrap_or(true));
 
     if streaming_put {
         // 全局准入:按 Content-Length(未知则按每流窗口上限 64MiB)
@@ -256,7 +297,7 @@ async fn handle(
             result,
             host_id,
             Some(admission.clone()),
-            Some((zc_ctx, false)),
+            zc_ctx.map(|c| (c, false)),
         ));
     }
 
@@ -277,7 +318,7 @@ async fn handle(
         result,
         host_id,
         Some(admission),
-        Some((zc_ctx, false)),
+        zc_ctx.map(|c| (c, false)),
     ))
 }
 

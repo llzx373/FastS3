@@ -46,6 +46,9 @@ pub struct ChunkedSigV4Reader<'a> {
     header_buf: Vec<u8>,
     total_decoded: u64,
     error: Option<S3Error>,
+    /// unsigned 模式(HTTPS 下 aws cli 的 STREAMING-UNSIGNED-PAYLOAD-TRAILER):
+    /// chunk 行无 signature,逐 chunk 校验跳过。
+    unsigned: bool,
 }
 
 impl<'a> ChunkedSigV4Reader<'a> {
@@ -57,7 +60,28 @@ impl<'a> ChunkedSigV4Reader<'a> {
         seed_signature: &str,
         amz_date: &str,
     ) -> Self {
-        let signing_key = crate::auth::signing_key(secret, date, region);
+        Self::new_inner(inner, secret, date, region, seed_signature, amz_date, false)
+    }
+
+    /// unsigned aws-chunked 解码(无 chunk 签名;trailer 段消费)。
+    pub fn new_unsigned(inner: &'a mut dyn Read, amz_date: &str) -> Self {
+        Self::new_inner(inner, "", &amz_date[0..8], "", "", amz_date, true)
+    }
+
+    fn new_inner(
+        inner: &'a mut dyn Read,
+        secret: &str,
+        date: &str,
+        region: &str,
+        seed_signature: &str,
+        amz_date: &str,
+        unsigned: bool,
+    ) -> Self {
+        let signing_key = if unsigned {
+            [0u8; 32]
+        } else {
+            crate::auth::signing_key(secret, date, region)
+        };
         ChunkedSigV4Reader {
             inner,
             signing_key,
@@ -71,6 +95,7 @@ impl<'a> ChunkedSigV4Reader<'a> {
             header_buf: Vec::new(),
             total_decoded: 0,
             error: None,
+            unsigned,
         }
     }
 
@@ -123,12 +148,20 @@ impl<'a> ChunkedSigV4Reader<'a> {
             Some(l) => l,
             None => return Ok(false),
         };
-        // 格式:<hex-size>;chunk-signature=<64hex>
+        // 格式:<hex-size> 或 <hex-size>;chunk-signature=<64hex>(signed)
         let line_str = String::from_utf8_lossy(&line).into_owned();
-        let (size_part, sig_part) = line_str.split_once(";chunk-signature=").ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed chunk header")
-        })?;
-        let size = usize::from_str_radix(size_part, 16)
+        let (size_part, sig_opt) = match line_str.split_once(";chunk-signature=") {
+            Some((sz, sg)) => (sz, Some(sg.to_string())),
+            // unsigned 模式:无签名头(HTTPS aws cli)
+            None if self.unsigned => (line_str.as_str(), None),
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "malformed chunk header",
+                ))
+            }
+        };
+        let size = usize::from_str_radix(size_part.trim_end(), 16)
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk size"))?;
         if size > MAX_CHUNK_SIZE {
             return Err(std::io::Error::new(
@@ -136,39 +169,29 @@ impl<'a> ChunkedSigV4Reader<'a> {
                 "chunk too large",
             ));
         }
-        if sig_part.len() != 64 || !sig_part.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "bad chunk signature",
-            ));
+        if let Some(sig) = &sig_opt {
+            if sig.len() != 64 || !sig.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "bad chunk signature",
+                ));
+            }
         }
-        // 校验签名
-        let declared = sig_part.to_string();
         if size == 0 {
-            // 最终 chunk:校验签名后还需消费收尾 CRLF
-            self.verify_chunk_sig(&declared, &[])?;
-            // 收尾 CRLF
-            let mut cr = [0u8; 1];
-            if self.inner.read(&mut cr)? == 0 || cr[0] != b'\r' {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "missing final CRLF",
-                ));
+            // 最终 chunk:校验签名(若有)→ 消费 trailer 段直到空行
+            if let Some(sig) = &sig_opt {
+                self.verify_chunk_sig(sig, &[])?;
             }
-            let mut lf = [0u8; 1];
-            if self.inner.read(&mut lf)? == 0 || lf[0] != b'\n' {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "missing final LF",
-                ));
-            }
+            self.consume_trailers_until_blank()?;
             self.state = State::Done;
             return Ok(true);
         }
         // 数据 chunk:先读入缓冲再校验(需 sha256(data))
         let mut data = vec![0u8; size];
         self.inner.read_exact(&mut data)?;
-        self.verify_chunk_sig(&declared, &data)?;
+        if let Some(sig) = &sig_opt {
+            self.verify_chunk_sig(sig, &data)?;
+        }
         self.data_buf = data;
         self.remaining = size;
         self.data_pos = 0;
@@ -221,6 +244,25 @@ impl<'a> ChunkedSigV4Reader<'a> {
         }
         self.prev_sig = declared.as_bytes().to_vec();
         Ok(())
+    }
+
+    /// 消费最终 0-chunk 之后的 trailer 段直到空行("\r\n\r\n" 第二段)。
+    /// 无 trailer 时(普通 aws-chunked)0-chunk 行后直接是空行,此处等价消费
+    /// 原「收尾 CRLF」。
+    fn consume_trailers_until_blank(&mut self) -> std::io::Result<()> {
+        loop {
+            let line = self.read_line()?;
+            match line {
+                Some(l) if l.is_empty() => return Ok(()),
+                Some(_) => continue, // trailer 行(x-amz-checksum-*),忽略
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "EOF in chunk trailers",
+                    ))
+                }
+            }
+        }
     }
 }
 

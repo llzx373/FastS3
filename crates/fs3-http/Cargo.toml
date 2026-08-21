@@ -16,6 +16,7 @@ md-5.workspace = true
 sha2.workspace = true
 hex.workspace = true
 tempfile.workspace = true
+rcgen = { version = "0.13", features = ["pem", "crypto"] }
 
 [dependencies]
 fs3-core.workspace = true
@@ -29,3 +30,6 @@ tokio-stream = "0.1"
 bytes = "1"
 libc.workspace = true
 tracing.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+tokio-rustls = "0.26"

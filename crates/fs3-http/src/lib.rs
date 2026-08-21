@@ -13,14 +13,16 @@ use tokio::net::TcpListener;
 mod admission;
 mod handler;
 mod timeout_io;
+pub mod tls;
 mod zero_copy;
 
 pub use admission::Admission;
 pub use timeout_io::DeadlinedIo;
+pub use tls::{TlsConfig, TlsState};
 pub use zero_copy::{probe_fd_capability, ZeroCopyIo, ZeroCtx};
 
 /// 单连接处理(测试与内嵌复用)。
-pub use handler::serve_connection;
+pub use handler::{serve_connection, serve_connection_tls};
 
 /// 服务配置。
 #[derive(Debug, Clone)]
@@ -34,6 +36,8 @@ pub struct HttpServerConfig {
     pub header_timeout: std::time::Duration,
     /// keep-alive 空闲超时(H4;默认 60s;超时关闭连接)。
     pub idle_timeout: std::time::Duration,
+    /// TLS(M4):None = 明文;Some = rustls(ALPN h2/h1;证书热加载)。
+    pub tls: Option<Arc<TlsState>>,
 }
 
 impl Default for HttpServerConfig {
@@ -44,11 +48,13 @@ impl Default for HttpServerConfig {
             max_inflight_bytes: 16 * 1024 * 1024 * 1024, // DESIGN §6.5:16GiB
             header_timeout: std::time::Duration::from_secs(30), // DESIGN §9:header 30s
             idle_timeout: std::time::Duration::from_secs(60), // DESIGN §9:idle 60s
+            tls: None,
         }
     }
 }
 
 /// 启动 HTTP 服务器(阻塞;每 worker 一个 runtime + SO_REUSEPORT listener)。
+/// TLS 启用时:并发起证书热加载轮询线程(5s;文件 mtime 变更即替换)。
 pub fn serve(service: Arc<S3Service>, cfg: &HttpServerConfig) -> std::io::Result<()> {
     let workers = if cfg.workers == 0 {
         std::thread::available_parallelism()
@@ -57,11 +63,31 @@ pub fn serve(service: Arc<S3Service>, cfg: &HttpServerConfig) -> std::io::Result
     } else {
         cfg.workers
     };
+    let tls = cfg.tls.clone();
+    if tls.is_some() {
+        tracing::info!(
+            "TLS enabled (rustls, {})",
+            crate::tls::tls_versions().join(" / ")
+        );
+    }
     tracing::info!(
-        "fasts3d S3 http listening on {} ({} workers, SO_REUSEPORT)",
+        "fasts3d S3 http listening on {} ({} workers, SO_REUSEPORT, tls={})",
         cfg.listen,
-        workers
+        workers,
+        tls.is_some()
     );
+
+    // 证书热加载轮询(每 5s 查 mtime;换证书不断连,新连接用新配置)
+    if let Some(state) = &tls {
+        let state = state.clone();
+        std::thread::Builder::new()
+            .name("fs3-tls-reload".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                state.reload_if_changed();
+            })
+            .map_err(std::io::Error::other)?;
+    }
 
     let admission = Admission::new(cfg.max_inflight_bytes);
     let header_timeout = cfg.header_timeout;
@@ -71,8 +97,17 @@ pub fn serve(service: Arc<S3Service>, cfg: &HttpServerConfig) -> std::io::Result
         let service = service.clone();
         let listen = cfg.listen;
         let admission = admission.clone();
+        let tls = tls.clone();
         handles.push(std::thread::spawn(move || {
-            worker_main(service, listen, admission, header_timeout, idle_timeout, w);
+            worker_main(
+                service,
+                listen,
+                admission,
+                header_timeout,
+                idle_timeout,
+                tls,
+                w,
+            );
         }));
     }
     for h in handles {
@@ -87,6 +122,7 @@ fn worker_main(
     admission: Arc<Admission>,
     header_timeout: std::time::Duration,
     idle_timeout: std::time::Duration,
+    tls: Option<Arc<TlsState>>,
     worker_id: usize,
 ) {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -103,17 +139,42 @@ fn worker_main(
                 Ok((stream, peer)) => {
                     let service = service.clone();
                     let admission = admission.clone();
+                    let tls = tls.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handler::serve_connection(
-                            service,
-                            admission,
-                            stream,
-                            header_timeout,
-                            idle_timeout,
-                        )
-                        .await
-                        {
-                            tracing::debug!("connection {peer} ended: {e}");
+                        match &tls {
+                            // TLS:先握手(慢路径;失败即断开);零拷贝禁用
+                            Some(state) => match state.acceptor().accept(stream).await {
+                                Ok(s) => {
+                                    if let Err(e) = handler::serve_connection_tls(
+                                        service,
+                                        admission,
+                                        s,
+                                        header_timeout,
+                                        idle_timeout,
+                                    )
+                                    .await
+                                    {
+                                        tracing::debug!("connection {peer} ended: {e}");
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::debug!("tls handshake {peer} failed: {e}");
+                                }
+                            },
+                            // 明文:零拷贝路径(B3/D2)
+                            None => {
+                                if let Err(e) = handler::serve_connection(
+                                    service,
+                                    admission,
+                                    stream,
+                                    header_timeout,
+                                    idle_timeout,
+                                )
+                                .await
+                                {
+                                    tracing::debug!("connection {peer} ended: {e}");
+                                }
+                            }
                         }
                     });
                 }

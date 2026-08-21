@@ -34,6 +34,12 @@ pub enum PayloadHash {
     Unsigned,
     /// STREAMING-AWS4-HMAC-SHA256-PAYLOAD(aws-chunked,M1 支持解码)。
     Streaming,
+    /// STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER(AWS SDK 在尾部带
+    /// checksum trailer;解码同 Streaming,收尾消费 trailer)。
+    StreamingSignedTrailer,
+    /// STREAMING-UNSIGNED-PAYLOAD-TRAILER(HTTPS 下 aws cli 默认;
+    /// chunk 无签名,纯长度分块 + trailer)。
+    StreamingUnsignedTrailer,
 }
 
 /// 认证结果。
@@ -585,6 +591,10 @@ impl Authenticator {
             PayloadHash::HexSha256(h) => h.clone(),
             PayloadHash::Unsigned => "UNSIGNED-PAYLOAD".into(),
             PayloadHash::Streaming => "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".into(),
+            PayloadHash::StreamingSignedTrailer => {
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER".into()
+            }
+            PayloadHash::StreamingUnsignedTrailer => "STREAMING-UNSIGNED-PAYLOAD-TRAILER".into(),
         };
         let creq =
             format!("{method}\n{path}\n{query_str}\n{c_headers}\n{signed_list}\n{payload_str}");
@@ -638,6 +648,8 @@ fn payload_hash_value(v: &str) -> Result<PayloadHash, S3Error> {
     match v {
         "UNSIGNED-PAYLOAD" => Ok(PayloadHash::Unsigned),
         "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" => Ok(PayloadHash::Streaming),
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER" => Ok(PayloadHash::StreamingSignedTrailer),
+        "STREAMING-UNSIGNED-PAYLOAD-TRAILER" => Ok(PayloadHash::StreamingUnsignedTrailer),
         s if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) => {
             Ok(PayloadHash::HexSha256(s.to_lowercase()))
         }
@@ -668,6 +680,8 @@ pub fn sign_request(
         PayloadHash::HexSha256(h) => h.clone(),
         PayloadHash::Unsigned => "UNSIGNED-PAYLOAD".into(),
         PayloadHash::Streaming => "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".into(),
+        PayloadHash::StreamingSignedTrailer => "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER".into(),
+        PayloadHash::StreamingUnsignedTrailer => "STREAMING-UNSIGNED-PAYLOAD-TRAILER".into(),
     };
     let mut headers = headers.to_vec();
     if !headers

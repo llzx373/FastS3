@@ -465,9 +465,33 @@ fn cmd_serve(
             cfg.server.header_timeout_secs.unwrap_or(30),
         ),
         idle_timeout: std::time::Duration::from_secs(cfg.server.idle_timeout_secs.unwrap_or(60)),
+        tls: None,
     };
     // H4 每密钥限速(0 = 关闭)
     service.set_rate_limit(cfg.limits.key_rps.unwrap_or(0));
+    // M4 TLS:证书 + 私钥同时配置即启用(未配对 → 忽略并告警)
+    let tls = match (&cfg.server.tls_cert, &cfg.server.tls_key) {
+        (Some(cert), Some(key)) => Some(
+            fs3_http::TlsState::load(&fs3_http::TlsConfig {
+                cert_path: cert.clone(),
+                key_path: key.clone(),
+            })
+            .map_err(|e| {
+                fs3_core::Error::InvalidArgument(format!(
+                    "TLS load failed (cert={}, key={}): {e}",
+                    cert.display(),
+                    key.display()
+                ))
+            })?,
+        ),
+        (None, None) => None,
+        _ => {
+            tracing::warn!("tls_cert/tls_key 需成对配置;本次以明文启动");
+            None
+        }
+    };
+    let mut http_cfg = http_cfg;
+    http_cfg.tls = tls;
     fs3_http::serve(service, &http_cfg).map_err(fs3_core::Error::Io)
 }
 

@@ -46,6 +46,10 @@ pub struct ServerConfig {
     pub header_timeout_secs: Option<u64>,
     /// keep-alive 空闲超时秒数(H4;默认 60;超时断开连接)。
     pub idle_timeout_secs: Option<u64>,
+    /// TLS 证书 PEM(M4;与 tls_key 同时配置即启用 rustls;热加载)。
+    pub tls_cert: Option<std::path::PathBuf>,
+    /// TLS 私钥 PEM。
+    pub tls_key: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]

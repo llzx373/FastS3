@@ -979,8 +979,8 @@ impl S3Service {
                 header(req, "content-type"),
                 user_meta(req),
             )?,
-            PayloadHash::Streaming => {
-                // aws-chunked:逐 chunk 校验签名后解码为原始流
+            PayloadHash::Streaming | PayloadHash::StreamingSignedTrailer => {
+                // aws-chunked(signed):逐 chunk 校验签名后解码为原始流;尾部 trailer 消费
                 let date = &amz_date[0..8];
                 let cred = self.auth.find_key_by_amz(req)?;
                 let mut chunked = ChunkedSigV4Reader::new(
@@ -991,6 +991,16 @@ impl S3Service {
                     seed_sig.as_deref().unwrap_or_default(),
                     &amz_date,
                 );
+                write_once(
+                    &mut engine,
+                    &mut chunked,
+                    header(req, "content-type"),
+                    user_meta(req),
+                )?
+            }
+            PayloadHash::StreamingUnsignedTrailer => {
+                // HTTPS 下 aws cli 默认:无签名 chunk + trailer
+                let mut chunked = ChunkedSigV4Reader::new_unsigned(reader, &amz_date);
                 write_once(
                     &mut engine,
                     &mut chunked,
@@ -1419,7 +1429,12 @@ impl S3Service {
             AuthOutcome::Authenticated { payload_hash, .. } => payload_hash,
             AuthOutcome::Anonymous => PayloadHash::Unsigned,
         };
-        if matches!(payload_hash, PayloadHash::Streaming) {
+        if matches!(
+            payload_hash,
+            PayloadHash::Streaming
+                | PayloadHash::StreamingSignedTrailer
+                | PayloadHash::StreamingUnsignedTrailer
+        ) {
             return Err(S3Error::new(S3ErrorCode::InvalidRequest)
                 .with_message("STREAMING payload must use the streaming PUT path"));
         }
