@@ -1,4 +1,5 @@
-# FastS3 配置示例(DESIGN §10.1;M0 支持 storage 子集)
+# FastS3 配置示例(DESIGN §10.1;字段与 crates/fs3d/src/config.rs 一一对应,
+# 未知字段 serde 静默忽略——不要依赖死字段,REVIEW §4.3 清理)。
 
 [storage]
 devices = ["/var/lib/fasts3/disk.img"]   # 或 ["/dev/nvme0n1"] 裸设备
@@ -10,20 +11,41 @@ checkpoint_interval = 30
 # ETag 模式(M5 etag=fast 降级开关):md5(默认,严格 S3 兼容) | crc32c(返回
 # CRC32C 串,省去单流 MD5,高吞吐场景;代价 = ETag 非严格 MD5)
 # etag_mode = "md5"
+# 内联小对象阈值(默认 32KiB;对象 ≤ 此值数据直接内联元数据,零设备 I/O)
+# small_object_limit = 32768
 
 [server]
 listen = "0.0.0.0:9000"
 workers = 0
 # 全局在途字节上限(整数;16GiB,超限 503 SlowDown)
 max_inflight_bytes = 17179869184
+# 请求头读取超时秒数(默认 30;超时断开连接)
+# header_timeout_secs = 30
+# keep-alive 空闲超时秒数(默认 60)
+# idle_timeout_secs = 60
 verify_reads = false
+# TLS:证书 + 私钥同时配置即启用 rustls(热加载;未配对则告警并明文启动)
+# tls_cert = "/etc/fasts3/tls/cert.pem"
+# tls_key = "/etc/fasts3/tls/key.pem"
+# 内嵌控制台静态目录(等价 serve --web-root;build 后的 web/console/dist)
+# web_root = "/opt/fasts3/console/dist"
+# REVIEW §2.4:受控 CORS 允许源(浏览器跨源直传数据面;空/缺省 = 关闭)。
+# 实际写操作仍需合法 SigV4 签名;["*"] 仅建议内网。
+# cors_allow_origins = ["https://console.example.com"]
+
+[auth]
+region = "us-east-1"
+# 匿名公共读(仅 GET/HEAD;匿名写恒拒绝,REVIEW §3.5)
+allow_anonymous = false
+# 访问密钥表(生产建议用 fasts3d init 向导生成并落盘)
+# [[auth.keys]]
+# access_key = "AKIA...EXAMPLE"
+# secret_key = "change-me"
 
 [admin]
 listen = "unix:///run/fasts3/admin.sock"
 token = "change-me"
 
 [limits]
-max_object_size = "5TiB"
-max_part_size = "5GiB"
-max_parts = 10000
-quota_default = "1TiB"
+# 每密钥每秒请求上限(0 = 关闭;超限 503 SlowDown + Retry-After)
+key_rps = 0

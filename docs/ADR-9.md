@@ -15,7 +15,7 @@
 
 当前实现中,一个 extent(默认 4MiB)在写入时被**独占分配给单个对象**:
 
-- `ExtentWriter::feed` 每次经 `alloc.allocate(1)` 申请全新 extent,`finalize_extent` 返回的 `ExtentRef` 恒为 `{extent_id, offset: 0, len: st.written}`(crates/fs3-engine/src/lib.rs:1598、557)——对象从 extent 数据区开头写起,写多少算多少,剩余空间**没有任何对象可以复用**;
+- `ExtentWriter::feed` 每次经 `alloc.allocate(1)` 申请全新 extent,`finalize_extent` 返回的 `ExtentRef` 恒为 `{extent_id, offset: 0, len: st.written}`(crates/fs3-engine/src/lib.rs `ExtentWriter` 实现,§2.2)——对象从 extent 数据区开头写起,写多少算多少,剩余空间**没有任何对象可以复用**;
 - 位图 1 bit / extent、引用计数按 extent 记、COW/删除/重放全部按 extent 粒度(ADR-5)——这是"恢复与引用计数极简"的刻意取舍,代价是最小分配单位 = 4MiB;
 - 内联阈值 32KiB(`SMALL_OBJECT_LIMIT`),只救 ≤ 32KiB 对象。
 
@@ -90,7 +90,7 @@ extent 总大小 4MiB = 4,194,304B,含 4KiB 头 → 数据区容量 = 4,190,208B
 | --- | --- | --- |
 | extent 位图 | 检查点 + `a:` 记录(不变) | 既有重放(不变) |
 | extent 分配记录 | `a:` 记录(不变):**首段分配时发 alloc,末段消亡时发 ref_dec** | 既有重放(不变) |
-| live_bytes / 段引用计数 / watermark | **否** | 既有元数据可达性扫描重建(ADR-5 mark 阶段;启动恢复第 4 步已在做全量扫描,见 crates/fs3-engine/src/lib.rs:156 `rebuild_refcounts`) |
+| live_bytes / 段引用计数 / watermark | **否** | 既有元数据可达性扫描重建(ADR-5 mark 阶段;启动恢复第 4 步已在做全量扫描,见 crates/fs3-engine/src/lib.rs `rebuild_segment_state`) |
 | 共享段稀疏表(COW) | 否 | 同上 |
 
 推论:
@@ -265,7 +265,7 @@ PUT 数据流(每对象一个 ExtentWriter,共享本引擎的开放 extent):
 5. (后台)泄漏扫描复核 / 开放服务
 ```
 
-- 现状第 4 步已是全量可达性扫描(ADR-5;crates/fs3-engine/src/lib.rs:156),段状态只是同一遍扫描的副产品——**不新增启动阶段**;
+- 现状第 4 步已是全量可达性扫描(ADR-5;`rebuild_segment_state`),段状态只是同一遍扫描的副产品——**不新增启动阶段**;
 - 分阶段启动(可选增强):扫描完成前只允许读 + 新 extent 分配,不允许开放 extent 追加,避免在未收敛 watermark 上写入;默认不启用(扫描与重放一致性由门禁保证)。
 
 ### 5.8 崩溃一致性窗口对照(与现状逐项等价)
@@ -316,7 +316,7 @@ PUT 数据流(每对象一个 ExtentWriter,共享本引擎的开放 extent):
 | 资源 | 现状 | 压缩 worker 交互 |
 | --- | --- | --- |
 | 引擎大锁 `Arc<RwLock<Engine>>`(service 层) | 写路径串行 | **不获取**(不调用 engine 的 put/delete 等高层方法) |
-| `meta`(rocksdb) | `commit(&self)`,内部并发安全(fs3-meta/src/lib.rs:537) | 直接发起迁移事务 |
+| `meta`(rocksdb) | `commit(&self)`,内部并发安全(fs3-meta `MetaStore::commit`) | 直接发起迁移事务 |
 | `alloc` | 内部 `Mutex<Staged>`(fs3-alloc/src/lib.rs:39) | 短暂临界区(allocate/release/rollback) |
 | 设备 IO | `Mutex<Box<dyn IoEngine>>`(fs3-engine/src/lib.rs:99) | 拷贝时短临界 |
 
@@ -326,13 +326,17 @@ PUT 数据流(每对象一个 ExtentWriter,共享本引擎的开放 extent):
 
 ### 6.4 节流与背压
 
-| 机制 | 默认 | 说明 |
-| --- | --- | --- |
-| 组提交窗口占用率闸门 | 批内 ≤ 25% 为压缩事务 | 空闲窗口才插队,前台满时自动退让 |
-| 全局速率上限 | 64 MiB/s(可配) | 拷贝 + 迁移字节计数 |
-| 前台延迟背压 | PUT/GET p99 超过基线 ×2 暂停 | 用既有指标(延迟直方图)驱动,恢复后继续 |
-| 容量水位提升 | > 85% 时预算 ×4 | 空间比延迟更稀缺时提高优先级(可选开关) |
-| 压缩暂停原语 | admin API | `POST /v1/admin/repair/pause`(管理面已有 repair 入口) |
+> **实现状态(REVIEW §3.8 同步)**:全局速率上限、容量水位提升、压缩暂停原语为
+> **已实现**;组提交窗口占用率闸门与前台延迟背压为**规划**(依赖 meta 组提交占用率
+> 与 p99 延迟信号的跨组件接线,当前未落地,如实标注)。
+
+| 机制 | 默认 | 状态 | 说明 |
+| --- | --- | --- | --- |
+| 组提交窗口占用率闸门 | 批内 ≤ 25% 为压缩事务 | 规划 | 空闲窗口才插队,前台满时自动退让 |
+| 全局速率上限 | 64 MiB/s(可配) | ✅ 已实现 | 拷贝 + 迁移字节计数,`compact_batch` 内预算节流 |
+| 前台延迟背压 | PUT/GET p99 超过基线 ×2 暂停 | 规划 | 用既有指标(延迟直方图)驱动,恢复后继续 |
+| 容量水位提升 | > 85% 时预算 ×4 | ✅ 已实现 | `live_bytes_total / (extent 数 × capacity) > 85%` 时预算 ×4 |
+| 压缩暂停原语 | admin API | ✅ 已实现 | `Engine::set_compaction_paused` + admin repair 入口 |
 
 节流信号全部来自现有指标体系(fsync p99、ring 深度、延迟分位),不新增采集。
 
@@ -424,12 +428,16 @@ PUT 数据流(每对象一个 ExtentWriter,共享本引擎的开放 extent):
 
 ## 9. 兼容与迁移
 
-| 场景 | 行为 |
+> **REVIEW §4.20 同步**:以下表格按**实施取舍**修正——布局版本 2 已落地,
+> 旧设备直接拒绝(引擎打开时布局版本检查),无双兼容解码、无特性位门控、
+> 无 legacy 在线迁移(与文件头部声明一致,不再与 §9 表矛盾)。
+
+| 场景 | 行为(当前实现) |
 | --- | --- |
 | 旧二进制读新设备 | 不支持(布局版本检查,现状即如此) |
-| 新二进制读旧设备 | **支持**:特性位未置 → 新写入走 legacy 独占模式;旧 extent 原样读 |
-| 混合模式 | 新二进制 + 特性位开启:新写入打包,旧 extent 独占读;`check --compact` 在线迁移旧数据 |
-| 回滚 | 关特性位(或换旧二进制):打包 extent 仍可读(读路径双兼容),新写入回 legacy——零数据搬迁 |
+| 新二进制读旧设备 | **不支持**:布局版本 1 直接拒绝(不给 silent 误读机会);升级路径 = 重新 init + 数据迁移(meta-export/import / mc mirror / rclone,见 tests/m7) |
+| 混合模式 | 不适用(无双布局共存) |
+| 回滚 | 不适用(无双兼容解码);数据迁移后可切回,但旧设备需重新初始化 |
 | 备份/快照 | 设备布局语义不变,底层快照/EBS 快照流程不受影响 |
 
 ---

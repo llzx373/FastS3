@@ -55,7 +55,7 @@ s3-tests 门禁需要克隆 CEPH s3-tests 到 `$S3TESTS_DIR`(默认 /tmp/s3-test
 且有 boto3+pytest(系统 python 即可)。两者缺失时 regression 退出码仍为 0
 但汇总中相应项记为 `SKIP(环境)`——**真机/CI 矩阵必须全绿,不得 skip**。
 N-1 升级演练:`N1_BIN=<旧版本二进制>` 传给 regression(默认回退 target/debug/
-fasts3d);例:`N1_BIN=/tmp/clients/fasts3d-v0.8.0 bash tests/m8/regression.sh`。
+fasts3d);例:`N1_BIN=/tmp/clients/fasts3d-v1.0.0 bash tests/m8/regression.sh`。
 
 ## GA 检查单证据映射(§8 GA 列)
 

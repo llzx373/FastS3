@@ -7,6 +7,28 @@
 
 ## [Unreleased] — v1.0.0 GA(候选)
 
+REVIEW.md 一致性修复批次(2026-08-22;逐项修复 + 针对验证,门禁保持全绿):
+
+- **高危(P0)**:控制台 multipart 直传(presign 全链路透传 uploadId/partNumber,
+  数据面命中 UploadPart)+ e2e;h2 标记帧污染(handler 协议感知关闭零拷贝)+
+  额外修复服务端 h2 keep-alive 缺 Timer 会 panic 的隐藏缺陷 + h2c 集成测试;
+  README 桶策略表述;数据面受控 CORS(server.cors_allow_origins);流式 PUT
+  接入每密钥限速(与缓冲路径同语义)。
+- **中危(P1)**:/api/ws JWT 鉴权;health 版本读 package.json;config.json
+  明文凭据移出版本控制;allow_anonymous 收敛为匿名公共读;指标历史双链修复
+  (Rust WS ops 5 键数字 + Node 归一化兼容 + prometheus 键别名);掉盘告警
+  (fasts3_device_degraded + alerts.yml);压缩发现扫 p: 分片(PartMigrate 事务)
+  + 阶段 2 崩溃测试 + ADR-9 §6.2/§6.4/§9 同步;发布口径统一(GA 候选);
+  5GiB/5TiB 上限执行 + InvalidPartOrder 落地。
+- **低危/卫生(P2/P3)**:AGENT.md/REVIEW 追踪表;README/DESIGN/ROADMAP 动态
+  链接表述;example.toml 死字段清理与补齐;systemd 端口 9090 对齐;版本残留
+  清除;loadgen_smoke 修复 + loadgen 不可达即报错;small_object_limit 配置暴露;
+  sha256sums 重建(含 deb/签名);warp-run 分布 profile;proptest 已核实非空;
+  文档页数 19;multipart ETag 空洞语义(请求子集);quick probe 命中 btrfs;
+  Expect/chunked 集成测试;控制台 Dashboard 接入 WS + metrics history + 对象
+  详情元数据 + vite 相对 base;PATCH keys 空 body 400;集成测试补 multipart/
+  presign/uploads/abort e2e;init 向导 staticDir 按部署形态;ADR-9 行号/兼容表。
+
 M8 GA 发布(任务与门禁合一,TODO.md M8):
 
 - **兼容矩阵全量回归** 资产与本地实测:`tests/m8/regression.sh`(客户端 × OS ×

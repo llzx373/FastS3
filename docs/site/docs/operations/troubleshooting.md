@@ -19,7 +19,7 @@ error: metadata error: rocksdb: IO error: While lock file: .../meta/LOCK: Resour
 ### 1.2 端口占用
 
 `error: ... Address already in use`(SO_REUSEPORT 绑定失败)。检查 9000/
-9001/8080 占用:`ss -ltnp | grep 9000`;systemd 场景确认旧单元已停。
+9001/9090 占用:`ss -ltnp | grep 9000`;systemd 场景确认旧单元已停。
 
 ### 1.3 prepare(init)报「设备未初始化/无有效检查点」
 

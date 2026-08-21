@@ -26,7 +26,7 @@
 | --- | --- | --- | --- |
 | S1 | 依赖漏洞清零(Rust) | `cargo audit` | ✅ 0 漏洞(2 条传递依赖 unmaintained 告警,白名单化跟踪,非漏洞) |
 | S2 | 依赖漏洞清零(Node) | `pnpm audit --prod` | ✅ 0 known vulnerabilities |
-| S3 | 硬编码密钥/令牌扫描 | 正则扫描仓库源码(rs/ts/py/sh/toml/yml) | ✅ 零命中 |
+| S3 | 硬编码密钥/令牌扫描 | 正则扫描仓库源码(rs/ts/py/sh/toml/yml);**REVIEW §3.4 补充**:web/server/config.json(含明文凭据)已移出版本控制(.gitignore,README 同款模板见 config.example.json),扫描面覆盖仓库全部 .json 配置模板 | ✅ 零命中 + 凭据文件不入库 |
 | S4 | 敏感文件权限 | meta-export 落盘 0600(单测覆盖)、TLS 私钥 0600(wizard) | ✅ 实现 + 测试 |
 | S5 | admin 通道最小暴露 | 默认 unix socket `/run/fasts3/admin.sock`;TCP 仅回环 + Bearer token | ✅ 设计(§7.2) |
 | S6 | 凭据存储 | S3 secret/管理员密码哈希入库,仅 init 下发一次 | ✅ M3/M6 实现 |

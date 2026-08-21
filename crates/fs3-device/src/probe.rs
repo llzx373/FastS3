@@ -125,8 +125,11 @@ pub fn probe_device(path: &Path) -> Result<DeviceProbe> {
     };
     use crate::device::BlockDevice as _;
 
-    // 只读读头部 4KiB 用于签名探测(块设备也安全:仅 pread)
-    let head = read_head(path)?;
+    // 只读头部做签名探测(块设备也安全:仅 pread)。
+    // REVIEW §4.13:quick 路径也读 64KiB 扩展头——btrfs 魔数在 0x10040(64KiB
+    // 偏移),仅 4KiB 头永远无法命中;对已格式化 btrfs 盘单用 quick 会误报
+    // 「无文件系统签名」(R7 红线相关)。扩展读失败(短盘/IO 错)退化 4KiB。
+    let head = read_extended_head(path).or_else(|_| read_head(path))?;
     let filesystem = detect_filesystem(&head, path);
     let has_fasts3_layout =
         head.len() >= SUPERBLOCK_MAGIC.len() && head[..SUPERBLOCK_MAGIC.len()] == SUPERBLOCK_MAGIC;
@@ -239,20 +242,9 @@ fn starts_with(buf: &[u8], off: usize, magic: &[u8]) -> bool {
 /// 探测 + 文件系统完整签名识别(含 64KiB 偏移的 btrfs 等):
 /// 向导用入口,失败时退化为 probe_device 结果。
 pub fn probe_device_deep(path: &Path) -> Result<DeviceProbe> {
-    let mut p = probe_device(path)?;
-    if p.kind == DeviceKind::Missing || p.kind == DeviceKind::Other {
-        return Ok(p);
-    }
-    // 读 64KiB+ 头部(覆盖 btrfs 签名偏移);失败不影响基本结果
-    if let Ok(full) = read_extended_head(path) {
-        if let Some(fs) = detect_filesystem(&full, path) {
-            p.filesystem = Some(fs);
-        }
-        if !p.has_content {
-            p.has_content = full.iter().any(|&b| b != 0);
-        }
-    }
-    Ok(p)
+    // REVIEW §4.13:quick 路径已读 64KiB 扩展头(btrfs 0x10040 可命中),
+    // deep 与 quick 语义等同;保留入口以兼容既有调用方。
+    probe_device(path)
 }
 
 fn read_extended_head(path: &Path) -> Result<Vec<u8>> {
@@ -364,5 +356,30 @@ mod tests {
         let r = probe_device(&p).unwrap();
         assert!(r.has_content);
         assert!(r.filesystem.is_none());
+    }
+
+    // ── REVIEW §4.13:quick probe 必须命中 64KiB 偏移的 btrfs 签名 ──
+    // 回归:此前 probe_device 只读 4KiB 头,已格式化 btrfs 盘被误报
+    // 「无文件系统签名」(R7 红线)。
+    #[test]
+    fn quick_probe_detects_btrfs_at_0x10040() {
+        // btrfs 魔数 "_BHRfS_M" @ 0x10040(64KiB+64)
+        let mut buf = vec![0u8; 0x10080];
+        buf[0x10040..0x10048].copy_from_slice(b"_BHRfS_M");
+        let (_d, p) = tmp_image(8 * 1024 * 1024, &buf);
+        let r = probe_device(&p).unwrap();
+        assert_eq!(r.filesystem, Some("btrfs"), "quick probe must see btrfs");
+        assert_eq!(probe_device_deep(&p).unwrap().filesystem, Some("btrfs"));
+    }
+
+    #[test]
+    fn quick_probe_still_detects_4k_signatures() {
+        // ext4 在 4KiB 头内;扩展读不影响原有识别
+        let mut buf = vec![0u8; 4096];
+        buf[0x438] = 0x53;
+        buf[0x439] = 0xEF;
+        let (_d, p) = tmp_image(8 * 1024 * 1024, &buf);
+        let r = probe_device(&p).unwrap();
+        assert_eq!(r.filesystem, Some("ext2/3/4"));
     }
 }

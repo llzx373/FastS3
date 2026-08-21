@@ -58,6 +58,18 @@ else
 fi
 [ -f "$DIST/sha256sums" ] && chk 0 "sha256sums 存在" || chk 1 "sha256sums 缺失"
 
+# ── 1.5 重建 sha256sums(全产物)──
+# REVIEW §4.8:build-tarball.sh 生成清单时 deb/签名尚未产生(生成顺序),
+# 导致清单漏 deb 与 .sig;此处产物齐备后统一重建(幂等)。
+say "1.5 重建 sha256sums(含 deb / rpm / 签名)"
+(cd "$DIST" && {
+    for f in fasts3-*.tar.gz ./*.deb ./*.rpm ./*.sig ./*.minisig SBOM.json; do
+        [ -f "$f" ] || continue
+        sha256sum "$f"
+    done
+} | sort -k2 > sha256sums)
+chk $? "sha256sums 重建"
+
 # ── 2 校验和 ──
 say "2 sha256sum -c"
 (cd "$DIST" && sha256sum -c sha256sums >/dev/null 2>&1)

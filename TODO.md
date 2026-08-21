@@ -499,7 +499,7 @@
 ### ② 使用体验
 - [x] aws cli / boto3 / mc / rclone 零配置对接(兼容矩阵全绿;regression 阶段 3 4 客户端实测)
 - [x] Web 控制台覆盖完整运维闭环:仪表盘、桶、对象(直传)、密钥、策略、审计、设置(web 集成测试 + 演练)
-- [x] 文档全覆盖:Quickstart / 管理员指南 / 性能调优 / 故障排查 / FAQ / admin API 参考(文档站 15 页,mkdocs 0 警告)
+- [x] 文档全覆盖:Quickstart / 管理员指南 / 性能调优 / 故障排查 / FAQ / admin API 参考(文档站 19 页,mkdocs 0 警告)
 - [x] 内置示例与一键脚本(新增 `deploy/examples/backup-dir.sh`:"备份这个目录到 FastS3",rclone/mc 双后端,**备份→对账→清单实测**)
 
 ### ③ 运维体验
@@ -535,4 +535,4 @@
 | v1.4 | 容量与底座 | 多设备在线扩容与再平衡;设备内元数据区(BlueFS 风格);zstd 压缩(可选) | Tier2 迁移框架、meta-export/import(v1.0 已具备) |
 | v2.0 | 集中纳管与生态 | 多节点纳管平台;HTTP/3;热对象缓存;Terraform / K8s Operator(评估) | 1.x 用户反馈 |
 
-> 增补建议(S3-GAP §7,评审决定后回写本表):v1.1.x 或 v1.2 同步纳入对象标签、CORS、桶级策略、POST 表单 4 个低成本协议补全项;v1.0.x 补丁轨道修协议正确性 12 项。
+> 增补建议(S3-GAP §7,评审决定后回写本表):v1.1.x 或 v1.2 同步纳入对象标签、桶级策略、POST 表单 3 个低成本协议补全项;**REVIEW §2.4 后 CORS 已实现**(数据面 `server.cors_allow_origins` 受控允许源,2026-08-22);v1.0.x 补丁轨道修协议正确性 12 项。

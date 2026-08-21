@@ -30,9 +30,9 @@ Type=simple
 #
 #   # 当前实际形态(与 config.ts 一致):
 Environment=FS3_WEB_CONFIG=/etc/fasts3/web.json
-# 仅回环监听 127.0.0.1:8080 —— 管理面不对公网暴露;需要对外访问请经反向
+# 仅回环监听 127.0.0.1:9090 —— 管理面不对公网暴露;需要对外访问请经反向
 # 代理(TLS 终止),不要直接改绑 0.0.0.0。
-Environment=FS3_WEB_LISTEN=127.0.0.1:8080
+Environment=FS3_WEB_LISTEN=127.0.0.1:9090
 # 静态资源(控制台 dist)由 Node 内嵌提供;路径按安装布局 /opt/fasts3
 Environment=FS3_WEB_STATIC=/opt/fasts3/web/console/dist
 ExecStart=/usr/bin/node /opt/fasts3/web/server/dist/index.js

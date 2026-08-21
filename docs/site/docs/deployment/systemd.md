@@ -7,7 +7,7 @@
 | 单元 | 进程 | 说明 |
 | --- | --- | --- |
 | `fasts3.service` | `fasts3d serve --config /etc/fasts3/fasts3.toml` | 数据面:S3(9000)+ admin API(unix socket)常驻进程 |
-| `fasts3-web.service` | `node dist/index.js`(FS3_WEB_CONFIG=/etc/fasts3/web.json) | 管理面:仅回环 127.0.0.1:8080;无状态(状态全在 Rust 侧) |
+| `fasts3-web.service` | `node dist/index.js`(FS3_WEB_CONFIG=/etc/fasts3/web.json) | 管理面:仅回环 127.0.0.1:9090;无状态(状态全在 Rust 侧) |
 
 ## 加固项(数据面,注释见单元文件)
 

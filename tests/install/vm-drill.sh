@@ -178,7 +178,7 @@ else
     tail -20 "$TARBALL_LOG" >&2
     exit 1
 fi
-# 取实际产物(tarball 版本号随 FASTS3_VERSION/默认 0.7.0)
+# 取实际产物(tarball 版本号随 FASTS3_VERSION/默认 1.0.0)
 PKG="$(ls -1t "$DIST"/fasts3-*.tar.gz | head -1)"
 PKG_NAME="$(basename "$PKG")"
 echo "  解压 -> 假根 $FRS: $PKG_NAME"

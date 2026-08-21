@@ -11,7 +11,7 @@
 
 ```bash
 # 从仓库根(需要 Docker >= 24、BuildKit 默认开启):
-docker build -f deploy/container/Dockerfile -t fasts3:0.8.0 .
+docker build -f deploy/container/Dockerfile -t fasts3:1.0.0 .
 # 或直接用 compose:
 docker compose -f deploy/container/docker-compose.yml build
 ```
@@ -37,7 +37,7 @@ docker run -d --name fasts3 \
   -v "$(pwd)/data:/var/lib/fasts3" \
   -v "$(pwd)/fasts3.toml:/etc/fasts3/fasts3.toml:ro" \
   --ulimit memlock=-1:-1 \
-  fasts3:0.8.0
+  fasts3:1.0.0
 
 # 3) 初始化(在容器内跑一次 init;镜像文件在数据卷里):
 docker exec -it fasts3 fasts3d init --config /etc/fasts3/fasts3.toml \
@@ -65,7 +65,7 @@ docker run -d --name fasts3-raw \
   --ulimit memlock=-1:-1 \
   -v "$(pwd)/data/meta:/var/lib/fasts3/meta" \
   -v "$(pwd)/fasts3.toml:/etc/fasts3/fasts3.toml:ro" \
-  fasts3:0.8.0
+  fasts3:1.0.0
 ```
 
 ### 非 root 形态
@@ -96,9 +96,9 @@ tls_key  = "/etc/fasts3/tls/privkey.pem"
 
 ```bash
 # 数据卷不变,换镜像即可(N-1 原地升级保证,见 docs/site/operations/upgrade.md):
-docker build -f deploy/container/Dockerfile -t fasts3:0.8.0 .
+docker build -f deploy/container/Dockerfile -t fasts3:1.0.0 .
 docker stop fasts3 && docker rm fasts3
-docker run -d --name fasts3 ... fasts3:0.8.0        # 同一组 -v 数据卷
+docker run -d --name fasts3 ... fasts3:1.0.0        # 同一组 -v 数据卷
 # 布局迁移:镜像内 fasts3d upgrade --config /etc/fasts3/fasts3.toml
 # 回滚:退回旧镜像标签重跑即可;磁盘布局迁移失败会自动回滚(N-1 保证)
 ```

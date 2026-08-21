@@ -56,7 +56,7 @@
 | 功能 | 单机完整 S3 服务:桶、对象、分片上传、服务端复制、预签名 URL、SigV4 鉴权、桶策略 |
 | 性能 | 顺序读写接近 PCIe Gen4/Gen5 NVMe 线速;4KiB 随机读达到裸盘基线的 70%~90% |
 | 存储底座 | 支持裸块设备(`/dev/nvme0n1`)、自定义磁盘镜像文件两种模式,引擎层完全一致 |
-| 资源占用 | 极低内存基线(边缘设备 256MB 内存可运行);无 GC 停顿;单一静态二进制 |
+| 资源占用 | 极低内存基线(边缘设备 256MB 内存可运行);无 GC 停顿;单一 glibc 动态链接二进制(REVIEW §3.1:依赖 libstdc++/libgcc,见容器文档) |
 | 部署 | 单配置文件 + systemd / 容器;Web 控制台开箱即用 |
 | 兼容 | aws cli、boto3、mc、rclone、s3cmd、Hadoop S3A 等主流客户端可直接使用 |
 
@@ -151,7 +151,7 @@
 
 | 选择 | 理由 |
 | --- | --- |
-| Rust(数据面) | 无 GC、零成本抽象、内存安全;`io_uring`/`rocksdb`/`rustls` 生态成熟;单一静态二进制易分发 |
+| Rust(数据面) | 无 GC、零成本抽象、内存安全;`io_uring`/`rocksdb`/`rustls` 生态成熟;单一 glibc 动态链接二进制易分发(REVIEW §3.1) |
 | io_uring | 提交/完成批量化、免系统调用风暴、支持 registered buffers/files;是榨干 NVMe 的唯一正道(见 §6) |
 | rocksdb(元数据) | C++ 嵌入式 LSM,生产级成熟度(Meta 广泛部署),前缀扫描支撑桶列举;乐观事务保留 sled 式冲突重试,组提交窗口由后台线程复刻(ADR-8);避免外部进程(SQLite 亦可,见 ADR-3) |
 | Node.js(管理面) | 用户指定的技术栈;管理面不承担数据热路径,Node 的生态与开发效率是优势 |
@@ -720,7 +720,7 @@ echo none > /sys/block/nvme0n1/queue/scheduler    # 直通,免合并层
 | 管理面 | admin 通道 unix socket/回环 + token;控制台 JWT;角色分离 |
 | 限额与抗滥用 | 每桶配额、每密钥限速、全局在途字节上限、超时(header 30s / idle 60s) |
 | 数据静态保护 | V1 信任底层卷(加密盘/云盘加密);应用层加密(SSE-C 路线图) |
-| 依赖面 | Rust 单一静态二进制 + 最小容器(scratch/distroless),攻击面最小化 |
+| 依赖面 | Rust 单一二进制(glibc 动态链接;容器采用 Ubuntu slim 携带运行时依赖,REVIEW §3.1 与 §3.1 容器文档一致)+ 最小化容器,攻击面最小化 |
 
 ### 9.1 密钥存储实现细化(M3 ADR)
 
@@ -787,7 +787,7 @@ fasts3d meta-export /backup/meta.snapshot   # 元数据快照(备份)
 
 ### 10.3 打包
 
-- `fasts3d`:静态 musl/glibc 二进制 → scratch 容器或直接分发;
+- `fasts3d`:单一 glibc 动态链接二进制(REVIEW §3.1:非全静态,容器需带 libstdc++/libgcc/ld-linux)→ Ubuntu slim 容器或直接分发;
 - `fasts3-web`:Node 20+ 生产依赖最小化,或 `fasts3d` 内嵌静态资源后完全去掉 Node;
 - systemd 单元(附 `LimitMEMLOCK=infinity`、`NoNewPrivileges`、`ProtectSystem=strict` 等加固项)与 docker-compose 样例随仓库分发;
 - 云上建议:根分区放 rocksdb 元数据 + 独立 EBS 卷做数据盘,备份直接对元数据文件与底层卷做快照。

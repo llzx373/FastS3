@@ -8,7 +8,10 @@ FastS3 是一个**单机 S3 服务**,面向裸块设备 / 磁盘镜像文件的�
 
 - 数据面 + S3 协议:**Rust**(io_uring + thread-per-core + O_DIRECT)
 - 管理面 + Web 控制台:**Node.js**(Fastify + React/Vite),永不进入数据热路径
-- 当前状态:设计阶段,仓库仅有文档,**尚无代码**;按 [TODO.md](./TODO.md) 从 M0 开始实现
+- 当前状态:**v1.0.0 GA 候选已交付**(M0~M8 全部完成):存储引擎/S3 协议/admin
+  API/Web 控制台/打包签名 SBOM/文档站齐备,构建·clippy·测试三绿
+  (REVIEW.md 为交付同步的只读一致性审查报告);执行期门禁(外部审计、真 NVMe、
+  rpm/ARM64 真机、Beta 窗口)按 checklist 如实标注,尚未正式打 tag 发布
 
 ## 2. 权威文档(改动任何设计前必读)
 
@@ -79,7 +82,8 @@ tests/    s3-tests 配置、loadgen、crash harness
 
 ## 9. 构建与测试命令
 
-> 规划形态:M0(A1)落地 CI 后以 CI 配置为准,以下是目标命令。
+> **现状(REVIEW §4.1 同步)**:以下命令即仓库实际门禁,CI(.github/workflows)
+> 与此保持一致;`cargo fmt --check` 为可选纪律项。
 
 ```bash
 # Rust 数据面

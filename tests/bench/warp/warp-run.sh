@@ -47,6 +47,11 @@ run get      get        --obj-size 128MiB --concurrent 32
 run put      put        --obj-size 128MiB --concurrent 32
 run mixed    mixed      --obj-size 16MiB  --concurrent 16 --get-dist 50 --put-dist 50
 run range    get        --obj-size 128MiB --concurrent 32 --noclear  --ranges 64KiB
+# REVIEW §4.9:补尺寸分布 profile(warp --obj-size 支持 min-max 区间)与
+# 三路加权 mix;细粒度 fixed/uniform/zipf 分布由 fasts3d loadgen
+# (--size-dist / --mix)提供,见 docs/perf-M5.md。
+run putdist   put        --obj-size 4K-32M --concurrent 32 --dist 20
+run mixdist   mixed      --obj-size 4K-32M --concurrent 16 --get-dist 40 --put-dist 40 --range-dist 20
 
 echo "== warp done。JSON 归档于 $OUTDIR;解读:
      ops/s / MiB/s / p99 见各 JSON;汇总表见 docs/perf-M5.md =="

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import uPlot from "uplot";
 import "uplot/dist/uPlot.min.css";
-import { api, fmtBytes, type Dashboard as Dash } from "../api";
+import { api, getToken, fmtBytes, type Dashboard as Dash, type MetricsSnapshot } from "../api";
 
 /** 轻量滚动时间序列缓存(5s 采样 × 120 点 = 10 分钟)。 */
 const MAX_POINTS = 120;
@@ -12,41 +12,145 @@ const series: { t: number[]; iops: number[]; mbps: number[]; p99: number[] } = {
   p99: [],
 };
 
+/** 快照 ops 总量(5 类求和;累计值,增量由调用方换算)。 */
+function snapTotal(d: MetricsSnapshot["data"]): number {
+  return d.ops.put + d.ops.get + d.ops.del + d.ops.list + d.ops.multipart;
+}
+function snapBytes(d: MetricsSnapshot["data"]): number {
+  return d.bytes.in + d.bytes.out;
+}
+
 export default function Dashboard() {
   const [dash, setDash] = useState<Dash | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [wsMode, setWsMode] = useState<boolean | null>(null);
   const chartRef = useRef<HTMLDivElement>(null);
   const plotRef = useRef<uPlot | null>(null);
 
   useEffect(() => {
     let alive = true;
+    let ws: WebSocket | null = null;
     let prev = { total: 0, bytes: 0 };
+
+    const append = (t: number, d: Dash | MetricsSnapshot["data"], isDelta: boolean) => {
+      // isDelta=false(历史快照):直接取累计差;实时帧按增量换算
+      const total = "requests" in d ? d.requests.total : snapTotal(d);
+      const bytes = "requests" in d ? d.requests.bytesRead + d.requests.bytesWritten : snapBytes(d);
+      const p99 = "latency" in d && "get" in d.latency ? d.latency.get.p99 : d.latency.p99;
+      series.t.push(t);
+      series.iops.push(isDelta ? Math.max(0, total - prev.total) / 5 : total - prev.total);
+      series.mbps.push(
+        isDelta
+          ? (bytes - prev.bytes) / 5 / 1024 / 1024
+          : (bytes - prev.bytes) / 5 / 1024 / 1024
+      );
+      series.p99.push(p99 * 1000); // ms
+      prev = { total, bytes };
+      for (const k of ["t", "iops", "mbps", "p99"] as const) {
+        if (series[k].length > MAX_POINTS) series[k].shift();
+      }
+      if (alive) drawChart();
+    };
+
+    // REVIEW §4.15:初次加载消费 /api/metrics/history(24h×5s 环形缓冲),
+    // 用最近快照预填充曲线(此前没有任何页面消费该端点)。
+    api
+      .metricsHistory(MAX_POINTS)
+      .then((h) => {
+        if (!alive || !Array.isArray(h.snapshots) || h.snapshots.length === 0) return;
+        const snaps = h.snapshots as MetricsSnapshot[];
+        let pt = 0;
+        let pb = 0;
+        for (const s of snaps) {
+          const d = s.data;
+          const total = snapTotal(d);
+          const bytes = snapBytes(d);
+          if (pt === 0) {
+            pt = total;
+            pb = bytes;
+            continue; // 首点仅作基准
+          }
+          series.t.push(s.t);
+          series.iops.push(total - pt);
+          series.mbps.push((bytes - pb) / 5 / 1024 / 1024);
+          series.p99.push(d.latency.p99 * 1000);
+          pt = total;
+          pb = bytes;
+        }
+        for (const k of ["t", "iops", "mbps", "p99"] as const) {
+          if (series[k].length > MAX_POINTS) series[k].shift();
+        }
+        if (alive) drawChart();
+      })
+      .catch(() => {
+        /* 历史不可用:曲线从实时数据累积 */
+      });
+
     const load = async () => {
       try {
         const d = await api.dashboard();
         if (!alive) return;
         setDash(d);
         setError(null);
-        // 追加时间序列(吞吐 = 请求增量 / 5s;IOPS = 请求量)
-        const now = Date.now() / 1000;
-        series.t.push(now);
-        series.iops.push(Math.max(0, d.requests.total - prev.total) / 5);
-        series.mbps.push((d.requests.bytesRead + d.requests.bytesWritten - prev.bytes) / 5 / 1024 / 1024);
-        series.p99.push(d.latency.get.p99 * 1000); // ms
-        prev = { total: d.requests.total, bytes: d.requests.bytesRead + d.requests.bytesWritten };
-        for (const k of ["t", "iops", "mbps", "p99"] as const) {
-          if (series[k].length > MAX_POINTS) series[k].shift();
-        }
-        drawChart();
+        append(Date.now() / 1000, d, true);
       } catch (e) {
         if (alive) setError((e as Error).message);
       }
     };
-    load();
-    const iv = setInterval(load, 5000);
+
+    // REVIEW §4.15:优先 WebSocket /api/ws(推帧形状 {"type":"dashboard",
+    // "data":Dashboard});未连接/断开时回退 5s 轮询(与 Node 侧回退一致)。
+    try {
+      const token = getToken();
+      const proto = window.location.protocol === "https:" ? "wss" : "ws";
+      ws = new WebSocket(`${proto}://${window.location.host}/api/ws?token=${encodeURIComponent(token ?? "")}`);
+      ws.onopen = () => {
+        if (alive) setWsMode(true);
+      };
+      ws.onmessage = (ev) => {
+        if (!alive) return;
+        try {
+          const frame = JSON.parse(ev.data as string) as { type?: string; data?: Dash };
+          if (frame.type === "dashboard" && frame.data) {
+            setDash(frame.data);
+            setError(null);
+            append(Date.now() / 1000, frame.data, true);
+          }
+        } catch {
+          /* 忽略坏帧 */
+        }
+      };
+      ws.onerror = () => {
+        /* 交给 onclose 回退轮询 */
+      };
+      ws.onclose = () => {
+        if (alive) setWsMode(false);
+      };
+    } catch {
+      setWsMode(false);
+    }
+
+    if (!ws) {
+      load();
+      const iv = setInterval(load, 5000);
+      return () => {
+        alive = false;
+        clearInterval(iv);
+      };
+    }
+    // WS 可用:仍保留轮询作为 WS 静默断线时的兜底(Node 侧同策略)
+    const iv = setInterval(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) return;
+      void load();
+    }, 5000);
     return () => {
       alive = false;
       clearInterval(iv);
+      try {
+        ws?.close();
+      } catch {
+        /* ignore */
+      }
     };
   }, []);
 
@@ -105,7 +209,11 @@ export default function Dashboard() {
 
   return (
     <div>
-      <h1>仪表盘</h1>
+      <h1>
+        仪表盘
+        {wsMode === true && <span className="badge">实时 WS</span>}
+        {wsMode === false && <span className="badge muted">轮询 5s</span>}
+      </h1>
       {dash.alerts.map((a, i) => (
         <div key={i} className="alert warn">
           ⚠ {a}

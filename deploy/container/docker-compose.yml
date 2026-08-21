@@ -13,7 +13,7 @@ services:
     build:
       context: ..
       dockerfile: container/Dockerfile
-    image: fasts3:0.8.0
+    image: fasts3:1.0.0
     # 数据面 S3 端口;如需裸设备,追加 devices: [/dev/nvme0n1]
     ports:
       - "9000:9000"
@@ -44,7 +44,7 @@ services:
     restart: unless-stopped
 
   fasts3-web:
-    image: fasts3:0.8.0
+    image: fasts3:1.0.0
     build:
       context: ..
       dockerfile: container/Dockerfile
@@ -73,7 +73,7 @@ services:
   # M7/I5 多实例演示:第二个管理面实例(无状态,任意增减;与 fasts3-web
   # 共享 JWT 密钥与数据面,会话令牌跨实例可用)
   fasts3-web2:
-    image: fasts3:0.8.0
+    image: fasts3:1.0.0
     entrypoint: ["/usr/bin/node", "/opt/fasts3/web/server/dist/index.js"]
     ports:
       - "8081:8080"

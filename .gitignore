@@ -19,3 +19,6 @@ tools/package/dist/
 tools/sbom/target/
 tools/runtime-ab/target/
 docs/site/site/
+
+# 明文凭据不入库(模板见 config.example.json;运行时由部署方生成)
+web/server/config.json

@@ -60,15 +60,17 @@ groups:
           description: "NTP 校时引发时钟回拨将导致预签名/签名窗口失效;立即核查 ntpd/chronyd"
 
       # 设备已降级(掉盘 → 只读)
+      # REVIEW §3.7:指标源已接入(/v1/admin/metrics 输出 fasts3_device_degraded,
+      # 由引擎 degraded 状态驱动);持续 5 分钟降级即告警,避免瞬时抖动误报。
       - alert: FastS3DeviceDegraded
         expr: |
-          fasts3_io_uring_inflight < 0
-        for: 0m
+          fasts3_device_degraded == 1
+        for: 5m
         labels:
           severity: critical
         annotations:
-          summary: "占位:设备降级(接入 /v1/admin/status.degraded 后启用)"
-          description: "设备降级目前通过 admin /v1/admin/status 的 degraded 字段暴露;Prometheus 侧接入后可替换此规则"
+          summary: "设备已降级(掉盘 → 只读)"
+          description: "fasts3_device_degraded=1:存储设备 I/O 失败,引擎进入只读降级;立即核查磁盘/线缆/NVMe 健康,恢复后自动解除"
 
       # io_uring 队列频繁打满(在途=深度,说明配额/背压触顶)
       - alert: FastS3IoRingSaturated

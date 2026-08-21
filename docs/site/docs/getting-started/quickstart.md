@@ -58,7 +58,7 @@ sudo fasts3d doctor --config /etc/fasts3/fasts3.toml
 
 ```bash
 sudo systemctl enable --now fasts3        # 数据面:S3 9000 + admin unix socket
-sudo systemctl enable --now fasts3-web    # 管理面:仅回环 127.0.0.1:8080
+sudo systemctl enable --now fasts3-web    # 管理面:仅回环 127.0.0.1:9090
 
 # 验证探针:/health 存活;/ready 就绪(含设备可写探测,K2)
 curl -sf http://127.0.0.1:9000/health && echo
@@ -85,7 +85,7 @@ md5sum /tmp/hello.txt /tmp/hello.out        # 两个值应一致
 #   fasts3d get --config /etc/fasts3/fasts3.toml --bucket drill-demo hello.txt /tmp/hello.out
 ```
 
-管理面:`http://127.0.0.1:8080`(登录口令见 /etc/fasts3/web.json —— init 向导生成,
+管理面:`http://127.0.0.1:9090`(登录口令见 /etc/fasts3/web.json —— init 向导生成,
 只显示一次)。
 
 ## 5) 升级演练(N-1 保证)

@@ -8,6 +8,52 @@
 
 ---
 
+## 0.5 修复状态追踪(2026-08-22 · 逐项修复与验证)
+
+> 依据本报告 §7 优先级逐项修复;每项修复均配套针对性测试(单元/集成/门禁),
+> 全程保持列门禁全绿无回退。以下为当前状态(§2~§4 对应条目):
+
+| 条目 | 状态 | 修复摘要(详见对应章节) |
+| --- | --- | --- |
+| §2.1 multipart 直传断裂 | ✅ 已修复 | presign 链路全层透传 uploadId/partNumber(console → Node → SigV4 extraQuery 参与签名),数据面按 `?partNumber=&uploadId=` 路由 UploadPart;新增 presign 端点单测 + integration multipart e2e |
+| §2.2 h2 标记帧污染 | ✅ 已修复 | handler 按 `req.version()==HTTP_2` 关闭零拷贝渲染;另发现并修复服务端 h2 keep-alive 缺 Timer 会在 30s 后 panic 的隐藏缺陷;新增 h2c prior-knowledge GET/PUT 逐字节集成测试 |
+| §2.3 桶策略表述 | ✅ 已修复 | README 特性表改为「密钥级 IAM 策略(Deny 优先;桶策略为远期)」,与 compat.md 口径一致 |
+| §2.4 CORS 阻断 | ✅ 已修复 | 数据面受控 CORS:`HttpServerConfig.cors_allow_origins`(配置 `server.cors_allow_origins`),仅对命中允许源且带 Origin 的请求附加 CORS 头并按需应答预检 OPTIONS;默认关闭零干预;新增预检/实际请求/未启用三态集成测试 |
+| §2.5 流式 PUT 限速绕过 | ✅ 已修复 | `put_object_stream` 入口与缓冲 `handle()` 同语义执行每密钥令牌桶;新增流式限速集成测试(503 且不落对象) |
+| §3.1 静态链接表述 | ✅ 已修复 | README/DESIGN/ROADMAP 静态链接表述改为动态链接(容器文档口径) |
+| §3.2 /api/ws 无鉴权 | ✅ 已修复 | WS upgrade 前强制 JWT(`?token=`;无效即 401 断开) |
+| §3.3 health 版本硬编码 | ✅ 已修复 | 读 package.json 版本(与 Rust 侧 1.0.0 对齐) |
+| §3.4 config.json 明文凭据 | ✅ 已修复 | 移出版本控制(.gitignore),config.example.json 为唯一模板 |
+| §3.5 allow_anonymous 匿名写 | ✅ 已修复 | 匿名放行收敛为仅 GET/HEAD(写操作无论开关恒需签名) |
+| §3.6 指标历史双链 bug | ✅ 已修复 | Rust WS snapshot ops 改 5 键数字形状;Node 归一化兼容 {ok,client,server} 与 delete/list_objects 别名;dashboard parseOpCounts 键映射;补两边回归测试 |
+| §3.7 掉盘告警占位 | ✅ 已修复 | `fasts3_device_degraded` gauge 入 admin metrics;alerts.yml 表达式替换为 `== 1`(for 5m) |
+| §3.8 压缩发现不扫 p: | ✅ 已修复 | 发现阶段扫 o:+p: 双前缀;新增 PartMigrate 事务(乐观校验同对象语义);阶段 2 崩溃注入测试补齐;ADR-9 §6.4 标注实现状态(速率上限/水位提速/暂停 ✅,组提交闸门/延迟背压 规划);§9 兼容表按布局 v2 修正 |
+| §3.9 发布口径 | ✅ 已修复 | RELEASES 改「GA 候选」,rc-log 注明 rc1/rc2 合并为候选复核;git tag/release.yml/外部审计未完成如实标注 |
+| §3.10 5GiB/5TiB/乱序 | ✅ 已修复 | UploadPart >5GiB → InvalidPart;PutObject >5TiB → EntityTooLarge(缓冲+流式按 Content-Length 提前 400);complete 列表必须严格递增否则 InvalidPartOrder(引擎+服务层测试) |
+| §4.1 AGENT.md | ✅ 已修复 | 当前状态/命令表更新 |
+| §4.2 客户端兼容声称 | ✅ 已修复 | README 按 compat.md 分级表述(s3cmd/Hadoop 为规划) |
+| §4.3 example.toml 死字段 | ✅ 已修复 | 清死字段,补齐 auth/tls/timeout/web_root/cors/small_object_limit 注释示例 |
+| §4.4 systemd 端口 | ✅ 已修复 | fasts3-web.service 8080 → 9090,文档站同步(容器形态保留 8080,端口可覆盖) |
+| §4.5 版本残留 | ✅ 已修复 | compose/container README/package README/sign 注释/m8 README/vm-drill/release.yml 全清(0.8.0/0.7.0) |
+| §4.6 loadgen_smoke 空转 | ✅ 已修复 | 真实参数 + 断言非零退出;loadgen 对不可达端点立即报错(此前静默跑满 duration) |
+| §4.7 small_object_limit | ✅ 已修复 | 配置 `storage.small_object_limit` 暴露 |
+| §4.8 sha256sums 漏项 | ✅ 已修复 | verify-release.sh 产物齐备后统一重建清单(含 deb/rpm/签名) |
+| §4.9 warp-run.sh | ✅ 已修复 | 补尺寸分布与三路加权 mix profile,分布能力归属说明 |
+| §4.10 proptest 空模板 | ✅ 已核实 | 复核 5 个文件均含真实 seed 记录(非空);详见 §4.10 标注 |
+| §4.11 页数口径 | ✅ 已修复 | checklist/TODO 统一为 19 页 |
+| §4.12 multipart ETag 语义 | ✅ 已修复 | 只取请求子集组合;parts 紧凑数组(ETag-N = 请求分片数);EntityTooSmall 仅查请求内非末片;补空洞场景测试 |
+| §4.13 quick probe 漏 btrfs | ✅ 已修复 | quick 路径读 64KiB 扩展头,0x10040 btrfs 魔数可命中;补快速探测测试 |
+| §4.14 Expect/chunked | ✅ 已修复 | 补 100-continue 握手与 TE: chunked PUT 字节级集成测试 |
+| §4.15 控制台消费缺口 | ✅ 已修复 | Dashboard 接 /api/ws(JWT)+ /api/metrics/history 预填充曲线;对象详情弹窗展示 size/etag/修改时间;vite base 相对化 |
+| §4.16 PATCH keys 空 body | ✅ 已修复 | enabled 缺失 → 400,不再默认禁用 |
+| §4.17 集成测试覆盖 | ✅ 已修复 | integration 补 multipart 全流程(init/分片/complete/abort/uploads);presign 端点单测新增 |
+| §4.18 init 向导 staticDir | ✅ 已修复 | root 形态写 /opt/fasts3/web/console/dist(systemd 口径)并提示;dev 形态保留相对路径 |
+| §4.19 占位 URL | ⏳ 保留 | 已知待办,全部带「占位」注释,如实标注(官网部署后替换) |
+| §4.20 ADR-9 行号/兼容表 | ✅ 已修复 | 行号引用改函数名;§9 表按布局 v2 实现修正 |
+| §4.21 | ✅ 已解决 | 审查期间原已解决 |
+
+---
+
 ## 0. 可复现的门禁实测(本次审查实际运行)
 
 | 门禁 | 命令 | 结果 |
@@ -122,7 +168,7 @@
 | 4.7 | **small_object_limit 未暴露配置**:README/TODO 称「阈值可配置」,实际 CLI 硬编码,仅引擎层 `EngineConfig` 可配 | `crates/fs3d/src/main.rs:650` |
 | 4.8 | **sha256sums 清单漏 deb 与两个 .sig**(生成顺序导致);install.sh 的「apt/dnf 走 deb/rpm」实为 tarball 直装 + 打印提示 | `tools/package/dist/sha256sums`、`install.sh:191-203` |
 | 4.9 | **warp-run.sh 无 size 分布与 mix 加权**:声明 fixed/uniform/zipf + get:put:range:delete 加权,实际只有 4 个固定尺寸 profile;分布能力仅在 `fasts3d loadgen` | `tests/bench/warp/warp-run.sh:46-49` |
-| 4.10 | **proptest-regressions 5 个文件全是空模板**(零 seed),未记录任何历史失败案例 | `crates/*/proptest-regressions/*.txt` |
+| 4.10 | ~~proptest-regressions 5 个文件全是空模板(零 seed)~~ **已核实**:复核 5 个文件均含真实 `cc <seed>` 历史失败记录(引擎 3 条/核心 md5x4 2 条/alloc 2 条/meta 1 条),审查时刻的快照疑似未含这些非空版本 | `crates/*/proptest-regressions/*.txt` |
 | 4.11 | **文档页数口径不一**:checklist.md 写「12 页」、TODO M8 写「15 页」、实际 19 篇 md | `docs/ga/checklist.md` |
 | 4.12 | **multipart ETag 空洞语义偏大**:`-N` 用 `parts.len()`(按最大分片号补齐),只传分片 1、3 时返回 "-3" 而非 AWS 的 "-2";EntityTooSmall 检查所有已存非末分片而非请求子集 | `crates/fs3-core/src/types.rs:113-120` |
 | 4.13 | **quick probe 漏 btrfs**:4KiB 头探测无法命中 0x10040 处的 btrfs 魔数,依赖 deep 探测;对已格式化 btrfs 盘单用 quick 路径会误报「无文件系统签名」(R7 红线相关) | `crates/fs3-device/src/probe.rs:88-144,241-267` |
@@ -146,7 +192,7 @@
 - 分配器:位图 + u32 引用计数、每核 hint 游标、`a:` 记录同事务、检查点双缓冲(代数+CRC+损坏槽回退)、checkpoint_interval 30s / 64MiB 触发、启动重放 + 可达性重建、ADR-9 live_bytes/Free/Open/Sealed/稀疏共享段表/Staged 回滚。
 - 引擎:64KiB 流式攒 chunk、io_uring + pread 兜底、extent 续接与跨边界切分、数据先落盘元数据后提交、断连回滚、CRC32C(SIMD)+ verify_reads、COW 引用计数、ADR-9 段模型(元数据 v2/布局版本 2 拒绝旧设备/打包头/watermark 追加/spill/恢复补头/双来源校验)、Tier2 压缩主体、parking_lot::RwLock、小对象内联、桶统计同事务、掉盘降级 + ENOSPC 507。
 - 元数据:rocksdb 组提交(manual_wal_flush + 刷盘线程)、键编码 0x00/0xFF 转义 + proptest、乐观事务、sync_mode 三档、`b:/o:/u:/p:/m:/l:/a:/t:/s:/k:` 全 schema、种子盐持久化。
-- ⚠️:压缩崩溃注入仅覆盖阶段 3;发现不扫 `p:` 分片(§3.8);节流部分缺失;proptest-regressions 空壳。
+- ⚠️:压缩崩溃注入仅覆盖阶段 3(§3.8 修复后补阶段 2);发现不扫 `p:` 分片(§3.8 已修复);节流部分缺失(§6.4 标注);proptest-regressions 已核实含 seed(非空)。
 
 ### 5.2 S3 协议 + HTTP(fs3-s3 / fs3-http)
 

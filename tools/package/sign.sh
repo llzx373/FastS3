@@ -19,8 +19,8 @@
 #               公钥: openssl pkey -in fasts3.key -pubout -out fasts3.pub
 #
 # 示例:
-#   ./sign.sh ./fasts3.key dist/fasts3-0.7.0-linux-x86_64.tar.gz dist/SBOM.json
-#   -> dist/fasts3-0.7.0-linux-x86_64.tar.gz.minisig
+#   ./sign.sh ./fasts3.key dist/fasts3-1.0.0-linux-x86_64.tar.gz dist/SBOM.json
+#   -> dist/fasts3-1.0.0-linux-x86_64.tar.gz.minisig
 #      dist/SBOM.json.minisig
 
 set -euo pipefail

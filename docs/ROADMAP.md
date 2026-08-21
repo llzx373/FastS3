@@ -64,7 +64,7 @@ FastS3 的终点不是一个能跑通的代码库,而是一个**陌生用户在�
 
 | 类别 | 交付物 |
 | --- | --- |
-| 二进制 | `fasts3d`(静态链接,amd64/arm64)、`fasts3` CLI(init/check/doctor/upgrade/meta-export) |
+| 二进制 | `fasts3d`(glibc 动态链接,amd64/arm64,REVIEW §3.1)、`fasts3` CLI(init/check/doctor/upgrade/meta-export) |
 | 包 | deb、rpm、tarball、scratch 容器镜像、docker-compose 样例、systemd 单元 |
 | Web | `fasts3-web`(Node)+ 控制台 SPA(可内嵌进 `fasts3d` 单二进制形态) |
 | 文档站 | Quickstart / Admin Guide / Tuning / Troubleshooting / API Reference / FAQ / 兼容矩阵 / 基准报告 |

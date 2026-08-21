@@ -21,7 +21,7 @@
 | --- | --- | --- |
 | aws cli / boto3 / mc / rclone 零配置对接 | `tests/smoke/client_smoke.sh` 4 客户端全流程(建桶/上传/下载/列表/预签名/对账) | ✅ regression 阶段 3 实测 |
 | 控制台完整运维闭环(仪表盘/桶/对象直传/密钥/策略/审计/设置) | web 集成测试 + m6/m7 演练;仪表盘/桶/对象/密钥/策略/审计/设置页全部存在 | ✅ 本地实测 |
-| 文档全覆盖(Quickstart/管理员/调优/排查/FAQ/admin API 参考) | mkdocs build 0 警告;docs/site 12 页;新增:兼容矩阵页、安全基线页、v1.0.0 公告页 | ✅ 本地构建;⚠️ 站点托管 URL 占位待官网部署 |
+| 文档全覆盖(Quickstart/管理员/调优/排查/FAQ/admin API 参考) | mkdocs build 0 警告;docs/site 19 页;新增:兼容矩阵页、安全基线页、v1.0.0 公告页 | ✅ 本地构建;⚠️ 站点托管 URL 占位待官网部署 |
 | 内置示例与一键脚本 | `deploy/examples/backup-dir.sh`(新增:备份目录到 FastS3,选项含加密/校验/清理) | ✅ 新增 + 实测 |
 
 ## ③ 运维体验
