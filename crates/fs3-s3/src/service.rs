@@ -665,7 +665,7 @@ impl S3Service {
         self.require_auth(req)?;
         let mut headers = self.base_headers();
         let resp = match op {
-            Operation::ListBuckets => Ok(self.op_list_buckets()),
+            Operation::ListBuckets => Ok(self.op_list_buckets(req)),
             Operation::CreateBucket { bucket, location } => {
                 Ok(self.op_create_bucket(&bucket, location.as_deref())?)
             }
@@ -1089,11 +1089,44 @@ impl S3Service {
 
     // ─────────────────────────── 桶操作 ───────────────────────────
 
-    fn op_list_buckets(&self) -> ServiceResponse {
+fn op_list_buckets(&self, req: &S3Request) -> ServiceResponse {
+        let q = |k: &str| {
+            req.query
+                .iter()
+                .find(|(kk, _)| kk == k)
+                .map(|(_, v)| v.clone())
+                .filter(|v| !v.is_empty())
+        };
+        let prefix = q("prefix");
+        let marker = q("marker").or_else(|| q("continuation-token"));
+        // max-buckets / max-keys(after removal) 分页(M4 兼容 s3-tests 分页)
+        let max = q("max-buckets")
+            .and_then(|v| v.parse::<usize>().ok())
+            .or_else(|| q("max-keys").and_then(|v| v.parse::<usize>().ok()));
         let engine = self.engine.read();
-        let buckets = engine.list_buckets().unwrap_or_default();
+        let mut buckets: Vec<(String, fs3_core::BucketMeta)> =
+            engine.list_buckets().unwrap_or_default();
+        if let Some(p) = prefix {
+            buckets.retain(|(n, _)| n.starts_with(&p));
+        }
+        buckets.sort_by(|a, b| a.0.cmp(&b.0));
+        if let Some(m) = marker {
+            buckets.retain(|(n, _)| n.as_str() > m.as_str());
+        }
+        let truncated = match max {
+            Some(m) if buckets.len() > m => {
+                buckets.truncate(m);
+                true
+            }
+            _ => false,
+        };
+        let next = if truncated {
+            buckets.last().map(|(n, _)| n.clone())
+        } else {
+            None
+        };
         let owner = "fasts3";
-        let xml = xml::render_list_buckets(owner, &buckets);
+        let xml = xml::render_list_buckets(owner, &buckets, truncated, next.as_deref());
         let mut headers = vec![("Content-Type".into(), "application/xml".into())];
         headers.push(("Content-Length".into(), xml.len().to_string()));
         ServiceResponse {

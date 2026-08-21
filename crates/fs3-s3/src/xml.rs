@@ -508,7 +508,12 @@ pub fn http_date(ts: i64) -> String {
 }
 
 /// ListAllMyBucketsResult。
-pub fn render_list_buckets(owner: &str, buckets: &[(String, BucketMeta)]) -> String {
+pub fn render_list_buckets(
+    owner: &str,
+    buckets: &[(String, BucketMeta)],
+    truncated: bool,
+    next_marker: Option<&str>,
+) -> String {
     let mut xml = String::with_capacity(512);
     let _ = write!(
         xml,
@@ -525,7 +530,13 @@ pub fn render_list_buckets(owner: &str, buckets: &[(String, BucketMeta)]) -> Str
             ts_to_rfc3339(meta.created)
         );
     }
-    xml.push_str("</Buckets></ListAllMyBucketsResult>");
+    let _ = write!(xml, "</Buckets>");
+    if truncated {
+        if let Some(m) = next_marker {
+            let _ = write!(xml, "<NextMarker>{}</NextMarker>", escape_xml(m));
+        }
+    }
+    xml.push_str("</ListAllMyBucketsResult>");
     xml
 }
 
@@ -836,7 +847,7 @@ mod tests {
             stats: Default::default(),
             quota: None,
         };
-        let xml = render_list_buckets("owner1", &[("b1".into(), meta)]);
+        let xml = render_list_buckets("owner1", &[("b1".into(), meta)], false, None);
         assert!(xml.contains(
             "<ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
         ));
