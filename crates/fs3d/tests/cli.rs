@@ -379,26 +379,41 @@ fn bench_and_stress_smoke() {
 
 #[test]
 fn loadgen_smoke() {
-    // 无服务端:loadgen 应报错退出(覆盖 CLI 解析与运行主体路径)
+    // 无服务端:loadgen 应报错退出(覆盖 CLI 解析与运行主体路径)。
+    // REVIEW §4.6:此前用不存在的 --access/--secret/--objects 参数(clap 直接
+    // 报错)且 `let _ = out;` 不断言——无论成功失败都算"通过";现用真实参数
+    // (--key access:secret)并断言:连接被拒 → 非零退出。
     let dir = tempfile::tempdir().unwrap();
     let out = Command::new(BIN)
         .current_dir(dir.path())
         .args([
             "loadgen",
             "--endpoint",
-            "127.0.0.1:1",
-            "--access",
-            "a",
-            "--secret",
-            "s",
-            "--objects",
-            "1",
+            "http://127.0.0.1:1",
+            "--key",
+            "a:s",
             "--size",
             "1024",
+            "--duration",
+            "1",
         ])
         .output()
         .expect("run loadgen");
-    let _ = out;
+    assert!(
+        !out.status.success(),
+        "loadgen against unreachable endpoint must fail; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        text.contains("fail") || text.contains("error") || text.contains("拒绝"),
+        "loadgen failure must be reported: {text}"
+    );
 }
 
 /// 网络层 + 负载生成器覆盖:进程内起真实 HTTP server(SO_REUSEPORT worker)

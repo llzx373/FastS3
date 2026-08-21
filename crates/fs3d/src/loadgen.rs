@@ -164,8 +164,10 @@ pub fn run(args: &LoadgenArgs) -> fs3_core::Result<()> {
     let endpoint = args.endpoint.trim_end_matches('/').to_string();
     let (host, port) = parse_endpoint(&endpoint)?;
 
-    // 建桶(已存在则忽略)
-    let _ = request_once(
+    // 建桶(已存在则忽略)。REVIEW §4.6:端点不可达必须立即报错退出——
+    // 此前连接失败被静默吞掉(worker 直接 return),跑满 duration 后
+    // ops=0 err=0 且 exit 0,压测脚本无法发现服务端没起来。
+    request_once(
         &host,
         port,
         access,
@@ -174,7 +176,8 @@ pub fn run(args: &LoadgenArgs) -> fs3_core::Result<()> {
         &format!("/{}", args.bucket),
         b"",
         None,
-    );
+    )
+    .map_err(|e| fs3_core::Error::InvalidArgument(format!("endpoint unreachable: {e}")))?;
 
     // 解析 mix 比例 get:put:range:delete
     let mut mix = [0u8; 4];

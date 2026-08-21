@@ -26,6 +26,7 @@ use tokio_stream::StreamExt;
 ///
 /// `web_root`(M7/I5):非空时按静态资源托管内嵌控制台(SPA 回退;
 /// 带认证/桶路径的请求仍走 S3)。
+/// `cors_allow_origins`(REVIEW §2.4):受控 CORS 允许源;空 = 关闭。
 pub async fn serve_connection(
     service: Arc<S3Service>,
     admission: Arc<crate::Admission>,
@@ -33,6 +34,7 @@ pub async fn serve_connection(
     header_timeout: std::time::Duration,
     idle_timeout: std::time::Duration,
     web_root: Option<std::path::PathBuf>,
+    cors_allow_origins: Arc<Vec<String>>,
 ) -> std::io::Result<()> {
     // 零拷贝(B3/D2):注册设备 fd 白名单,包裹 socket 识别标记帧
     crate::zero_copy::register_trusted_fd(service.device_fd());
@@ -52,7 +54,16 @@ pub async fn serve_connection(
         header_timeout,
         idle_timeout,
     ));
-    serve_common(service, admission, io, zc_ctx, idle_timeout, web_root).await
+    serve_common(
+        service,
+        admission,
+        io,
+        zc_ctx,
+        idle_timeout,
+        web_root,
+        cors_allow_origins,
+    )
+    .await
 }
 
 /// TLS 连接服务(M4):rustls 流,零拷贝禁用(标记帧无法穿透加密层,走缓冲读)。
@@ -63,6 +74,7 @@ pub async fn serve_connection_tls(
     header_timeout: std::time::Duration,
     idle_timeout: std::time::Duration,
     web_root: Option<std::path::PathBuf>,
+    cors_allow_origins: Arc<Vec<String>>,
 ) -> std::io::Result<()> {
     let peer = stream
         .get_ref()
@@ -76,7 +88,16 @@ pub async fn serve_connection_tls(
         header_timeout,
         idle_timeout,
     ));
-    serve_common(service, admission, io, None, idle_timeout, web_root).await
+    serve_common(
+        service,
+        admission,
+        io,
+        None,
+        idle_timeout,
+        web_root,
+        cors_allow_origins,
+    )
+    .await
 }
 
 /// 公共连接驱动(h1/h2 自动协商;超时交给 hyper Timer + DeadlinedIo)。
@@ -87,6 +108,7 @@ async fn serve_common<S>(
     zc_ctx: Option<crate::zero_copy::ZeroCtx>,
     idle_timeout: std::time::Duration,
     web_root: Option<std::path::PathBuf>,
+    cors_allow_origins: Arc<Vec<String>>,
 ) -> std::io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -96,7 +118,32 @@ where
         let admission = admission.clone();
         let zc_ctx = zc_ctx;
         let web_root = web_root.clone();
-        async move { handle(service, admission, zc_ctx, web_root, req).await }
+        let cors = cors_allow_origins.clone();
+        async move {
+            // REVIEW §2.4 受控 CORS:
+            // 1) 浏览器预检 OPTIONS(带 Origin)→ 直接应答允许头(无副作用);
+            // 2) 实际跨源请求(带 Origin)→ 附加 CORS 响应头;
+            //    其余请求不受影响(未配置允许源时完全不干预)。
+            if !cors.is_empty() {
+                // 先取自有字符串,避免借用 req 后无法 move 进 handle
+                let origin = req
+                    .headers()
+                    .get("origin")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                if let Some(origin) = origin {
+                    if cors_origin_allowed(&cors, &origin) {
+                        if req.method() == hyper::Method::OPTIONS {
+                            return Ok(cors_preflight_response(&origin));
+                        }
+                        let mut resp = handle(service, admission, zc_ctx, web_root, req).await?;
+                        cors_attach_headers(resp.headers_mut(), &origin);
+                        return Ok(resp);
+                    }
+                }
+            }
+            handle(service, admission, zc_ctx, web_root, req).await
+        }
     });
     let mut builder =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
@@ -108,6 +155,9 @@ where
         .header_read_timeout(Some(idle_timeout));
     builder
         .http2()
+        // REVIEW §2.2:keep_alive_interval 需要 Timer,否则 30s 后台 PING 时
+        // hyper 直接 panic("You must supply a timer")——真实 h2c 连接必炸。
+        .timer(hyper_util::rt::TokioTimer::new())
         .keep_alive_interval(Some(std::time::Duration::from_secs(30)))
         .keep_alive_timeout(idle_timeout);
     builder
@@ -119,6 +169,45 @@ where
 type BoxBodyErr = std::io::Error;
 /// 响应体(静态文件模块复用)。
 pub type RespBody = BoxBody<Bytes, BoxBodyErr>;
+
+// ── REVIEW §2.4 受控 CORS 辅助 ──
+
+/// 源是否命中允许列表("*" 通配)。
+fn cors_origin_allowed(allow: &[String], origin: &str) -> bool {
+    allow.iter().any(|a| a == "*" || a == origin)
+}
+
+/// 预检 OPTIONS 应答(带允许头;无副作用,不落审计)。
+fn cors_preflight_response(origin: &str) -> Response<RespBody> {
+    let mut resp = Response::builder()
+        .status(StatusCode::OK)
+        .header("access-control-allow-origin", origin)
+        .header("vary", "Origin")
+        .header(
+            "access-control-allow-methods",
+            "GET,PUT,DELETE,HEAD,POST",
+        )
+        .header(
+            "access-control-allow-headers",
+            "content-type,content-md5,authorization,x-amz-date,x-amz-content-sha256,x-amz-security-token,range,x-amz-meta-*",
+        )
+        .header("access-control-max-age", "86400")
+        .header("access-control-expose-headers", "etag,content-length,x-amz-request-id,x-amz-id-2,retry-after")
+        .body(empty_body())
+        .unwrap();
+    resp.headers_mut()
+        .insert("content-length", "0".parse().unwrap());
+    resp
+}
+
+/// 给实际响应附加 CORS 头(源已命中允许列表)。
+fn cors_attach_headers(headers: &mut hyper::HeaderMap, origin: &str) {
+    headers.insert("access-control-allow-origin", origin.parse().unwrap());
+    headers.insert("vary", "Origin".parse().unwrap());
+    if let Some(etag) = headers.get("etag") {
+        headers.insert("access-control-expose-headers", etag.clone());
+    }
+}
 
 fn empty_body() -> RespBody {
     Full::new(Bytes::new())
@@ -247,6 +336,9 @@ async fn handle(
 ) -> Result<Response<RespBody>, std::convert::Infallible> {
     let host_id = "fasts3";
     let method = req.method().as_str().to_string();
+    // 协议感知(h2c prior-knowledge / ALPN h2):falsy 时关闭零拷贝渲染,
+    // 防止 28 字节标记帧被当普通数据嵌入响应(REVIEW §2.2)。
+    let is_h2 = req.version() == hyper::Version::HTTP_2;
     let uri = req.uri().clone();
     let raw_path = uri.path().to_string();
 
@@ -415,7 +507,7 @@ async fn handle(
             result,
             host_id,
             Some(admission.clone()),
-            zc_ctx.map(|c| (c, false)),
+            zc_ctx.map(|c| (c, is_h2)),
         ));
     }
 
@@ -436,7 +528,7 @@ async fn handle(
         result,
         host_id,
         Some(admission),
-        zc_ctx.map(|c| (c, false)),
+        zc_ctx.map(|c| (c, is_h2)),
     ))
 }
 

@@ -1230,3 +1230,151 @@ fn signed_with_headers(
 fn auth_sha_of(body: &[u8]) -> String {
     hex::encode(Sha256::digest(body))
 }
+
+// ── REVIEW §2.5:流式 PUT(大对象/aws-chunked 路径)同样受每密钥限速 ──
+// 回归:此前 limiter.check 只在缓冲 handle() 执行,>8MiB 流式 PUT 可绕过
+// 令牌桶;修复后 put_object_stream 入口与缓冲路径同语义。
+#[test]
+fn streaming_put_is_rate_limited() {
+    let (_d, svc) = setup();
+    // 建桶 + 开 1 rps 限速
+    assert_eq!(status(&svc.handle(&req("PUT", "/rl-bucket", vec![]))), 200);
+    svc.set_rate_limit(1);
+
+    let payload = vec![0xABu8; 4096];
+    // 第一个流式 PUT:桶容量刚满 → 通过(且载荷哈希一致 → 200)
+    let mut reader = std::io::Cursor::new(payload.clone());
+    let r = svc.put_object_stream(&req("PUT", "/rl-bucket/obj1", payload.clone()), &mut reader);
+    assert_eq!(status(&r), 200, "{:?}", r);
+
+    // 第二个立即执行(无经时补币)→ 503 SlowDown,且不写入对象
+    let mut reader2 = std::io::Cursor::new(payload.clone());
+    let r2 = svc.put_object_stream(&req("PUT", "/rl-bucket/obj2", payload), &mut reader2);
+    assert_eq!(err_code(&r2), "SlowDown", "{:?}", r2);
+    // 关闭限速后再列表(避免列表请求本身也被令牌桶拒绝)
+    svc.set_rate_limit(0);
+    let list = svc.handle(&req_q("GET", "/rl-bucket", &[("list-type", "2")], vec![]));
+    let text = match list {
+        Ok(x) => match x.body {
+            fs3_s3::ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+            _ => String::new(),
+        },
+        Err(_) => String::new(),
+    };
+    assert!(text.contains("obj1"), "obj1 must exist; list text: {text}",);
+    assert!(
+        !text.contains("obj2"),
+        "rate-limited obj2 must not be written"
+    );
+}
+
+// ── REVIEW §3.10:单片 5GiB 上限 / 单对象 5TiB 上限 / InvalidPartOrder ──
+
+#[test]
+fn part_size_limit_and_object_size_limit() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/lim-bucket", vec![]))), 200);
+
+    // 流式 UploadPart:Content-Length 超 5GiB → InvalidPart(不读 reader)
+    let mut big_part = req_q(
+        "PUT",
+        "/lim-bucket/obj",
+        &[("partNumber", "1"), ("uploadId", "u-big")],
+        vec![],
+    );
+    big_part.headers.push((
+        "content-length".into(),
+        (fs3_core::MAX_PART_SIZE + 1).to_string(),
+    ));
+    let mut reader = std::io::Cursor::new(vec![0u8; 64]);
+    let r = svc.put_object_stream(&big_part, &mut reader);
+    assert_eq!(err_code(&r), "InvalidPart", "{:?}", r);
+
+    // 流式 PutObject:Content-Length 超 5TiB → EntityTooLarge(不读 reader)
+    let mut big_obj = req_q("PUT", "/lim-bucket/obj", &[], vec![]);
+    big_obj.headers.push((
+        "content-length".into(),
+        (fs3_core::MAX_OBJECT_SIZE + 1).to_string(),
+    ));
+    let mut reader = std::io::Cursor::new(vec![0u8; 64]);
+    let r = svc.put_object_stream(&big_obj, &mut reader);
+    assert_eq!(err_code(&r), "EntityTooLarge", "{:?}", r);
+}
+
+#[test]
+fn multipart_complete_rejects_out_of_order_parts() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/ord-bucket", vec![]))), 200);
+
+    // 正常:init → 分片 1、2 → complete(递增)
+    let init = svc.handle(&req_q(
+        "POST",
+        "/ord-bucket/obj",
+        &[("uploads", "")],
+        vec![],
+    ));
+    let body = match init.unwrap().body {
+        fs3_s3::ResponseBody::Bytes(b) => b,
+        _ => panic!("init must return bytes"),
+    };
+    let text = String::from_utf8_lossy(&body).into_owned();
+    let upload_id = text
+        .split("<UploadId>")
+        .nth(1)
+        .and_then(|s| s.split("</UploadId>").next())
+        .unwrap()
+        .to_string();
+    let p1 = vec![0x11u8; 6 * 1024 * 1024]; // ≥5MiB
+    let p2 = vec![0x22u8; 6 * 1024 * 1024];
+    let r1 = svc.handle(&req_q(
+        "PUT",
+        "/ord-bucket/obj",
+        &[("partNumber", "1"), ("uploadId", &upload_id)],
+        p1.clone(),
+    ));
+    let etag1 = r1
+        .unwrap()
+        .headers
+        .iter()
+        .find(|(k, _)| k == "ETag")
+        .map(|(_, v)| v.trim_matches('"').to_string())
+        .unwrap();
+    let r2 = svc.handle(&req_q(
+        "PUT",
+        "/ord-bucket/obj",
+        &[("partNumber", "2"), ("uploadId", &upload_id)],
+        p2.clone(),
+    ));
+    let etag2 = r2
+        .unwrap()
+        .headers
+        .iter()
+        .find(|(k, _)| k == "ETag")
+        .map(|(_, v)| v.trim_matches('"').to_string())
+        .unwrap();
+
+    // 乱序 [2, 1] → InvalidPartOrder(BTreeMap 自动排序时代码静默接受)
+    let complete = |parts: Vec<(u32, String)>| {
+        let mut xml = String::from("<CompleteMultipartUpload>");
+        for (no, etag) in &parts {
+            xml.push_str(&format!(
+                "<Part><PartNumber>{no}</PartNumber><ETag>{etag}</ETag></Part>"
+            ));
+        }
+        xml.push_str("</CompleteMultipartUpload>");
+        svc.handle(&req_q(
+            "POST",
+            "/ord-bucket/obj",
+            &[("uploadId", &upload_id)],
+            xml.into_bytes(),
+        ))
+    };
+    let r_bad = complete(vec![(2, etag2.clone()), (1, etag1.clone())]);
+    assert_eq!(err_code(&r_bad), "InvalidPartOrder", "{:?}", r_bad);
+    // 重复分片号 [1, 1] 同样乱序
+    let r_dup = complete(vec![(1, etag1.clone()), (1, etag1.clone())]);
+    assert_eq!(err_code(&r_dup), "InvalidPartOrder", "{:?}", r_dup);
+    // 递增 [1, 2] → 成功(对象可见)
+    let r_ok = complete(vec![(1, etag1), (2, etag2)]);
+    assert_eq!(status(&r_ok), 200, "{:?}", r_ok);
+}

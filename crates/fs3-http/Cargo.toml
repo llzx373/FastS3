@@ -17,6 +17,8 @@ md-5.workspace = true
 sha2.workspace = true
 hex.workspace = true
 tempfile.workspace = true
+# h2c prior-knowledge 客户端(REVIEW §2.2 集成测试):http2 + client conn
+hyper = { version = "1.5", features = ["http1", "http2", "client", "server"] }
 
 [dependencies]
 fs3-core.workspace = true

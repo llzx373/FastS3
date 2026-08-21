@@ -44,6 +44,12 @@ pub struct HttpServerConfig {
     /// M7/I5:内嵌控制台静态目录(`fasts3d serve --web-root <dist>`;
     /// Some = 无认证且非桶路径的 GET/HEAD 按静态资源托管,SPA 回退)。
     pub web_root: Option<std::path::PathBuf>,
+    /// REVIEW §2.4:受控 CORS 允许源列表(浏览器跨源直传数据面)。
+    /// 空 = 关闭(默认,不附加任何 CORS 头,OPTIONS 保持原行为);
+    /// 非空 = 仅对带 Origin 且命中列表的请求附加 CORS 头并应答预检 OPTIONS。
+    /// 支持 "*"(通配所有源;仅建议局域网/内网部署)。仅影响响应头,
+    /// 不改变 S3 鉴权语义——实际写操作仍需合法签名。
+    pub cors_allow_origins: Vec<String>,
 }
 
 impl Default for HttpServerConfig {
@@ -56,6 +62,7 @@ impl Default for HttpServerConfig {
             idle_timeout: std::time::Duration::from_secs(60), // DESIGN §9:idle 60s
             tls: None,
             web_root: None,
+            cors_allow_origins: Vec::new(),
         }
     }
 }
@@ -130,6 +137,7 @@ pub fn serve_with_shutdown(
         let admission = admission.clone();
         let tls = tls.clone();
         let web_root = cfg.web_root.clone();
+        let cors_allow_origins = Arc::new(cfg.cors_allow_origins.clone());
         let shutdown = shutdown.as_ref().map(Arc::clone);
         handles.push(std::thread::spawn(move || {
             worker_main(
@@ -140,6 +148,7 @@ pub fn serve_with_shutdown(
                 idle_timeout,
                 tls,
                 web_root,
+                cors_allow_origins,
                 shutdown,
                 drain,
                 w,
@@ -161,6 +170,7 @@ fn worker_main(
     idle_timeout: std::time::Duration,
     tls: Option<Arc<TlsState>>,
     web_root: Option<std::path::PathBuf>,
+    cors_allow_origins: Arc<Vec<String>>,
     shutdown: Option<Arc<AtomicBool>>,
     drain: Duration,
     worker_id: usize,
@@ -199,6 +209,7 @@ fn worker_main(
                     let admission = admission.clone();
                     let tls = tls.clone();
                     let web_root = web_root.clone();
+                    let cors = cors_allow_origins.clone();
                     tokio::spawn(async move {
                         match &tls {
                             // TLS:先握手(慢路径;失败即断开);零拷贝禁用
@@ -211,6 +222,7 @@ fn worker_main(
                                         header_timeout,
                                         idle_timeout,
                                         web_root,
+                                        cors,
                                     )
                                     .await
                                     {
@@ -230,6 +242,7 @@ fn worker_main(
                                     header_timeout,
                                     idle_timeout,
                                     web_root,
+                                    cors,
                                 )
                                 .await
                                 {

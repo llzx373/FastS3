@@ -52,6 +52,9 @@ pub struct ServerConfig {
     pub tls_key: Option<std::path::PathBuf>,
     /// 内嵌控制台静态目录(M7/I5;等价 serve --web-root)。
     pub web_root: Option<std::path::PathBuf>,
+    /// REVIEW §2.4:受控 CORS 允许源列表(浏览器跨源直传数据面)。
+    /// 空/缺省 = 关闭;`["*"]` = 允许任意源(仅建议内网)。实际写操作仍需合法签名。
+    pub cors_allow_origins: Option<Vec<String>>,
     /// 读校验开关(M1 D3;默认关;设置页展示用,引擎级参数)。
     pub verify_reads: Option<bool>,
 }
@@ -84,6 +87,8 @@ pub struct StorageConfig {
     pub checkpoint_interval: Option<u64>,
     /// ETag 模式(M5 etag=fast):"md5"(默认) | "crc32c"。
     pub etag_mode: Option<String>,
+    /// 内联小对象阈值(REVIEW §4.7:默认 32KiB;CLI 可经此暴露配置)。
+    pub small_object_limit: Option<usize>,
 }
 
 pub fn load_config(path: Option<&Path>) -> Result<RootConfig> {

@@ -21,7 +21,13 @@ export default function Objects() {
   const [busy, setBusy] = useState(false);
   const [drag, setDrag] = useState(false);
   const [tasks, setTasks] = useState<UploadTask[]>([]);
-  const [metaObj, setMetaObj] = useState<{ bucket: string; key: string } | null>(null);
+  const [metaObj, setMetaObj] = useState<{
+    bucket: string;
+    key: string;
+    size?: number;
+    etag?: string;
+    lastModified?: string;
+  } | null>(null);
   const [copyKey, setCopyKey] = useState<string | null>(null);
   const [copyDest, setCopyDest] = useState("");
   const fileInput = useRef<HTMLInputElement>(null);
@@ -64,7 +70,7 @@ export default function Objects() {
         await fetch(u.url, { method: "PUT", body: file, headers: u.headers });
         update(100, { status: "done" });
       } else {
-        // multipart:init → 每片预签名直传 → complete
+        // multipart:init → 每片预签名(带 uploadId/partNumber,命中 UploadPart)直传 → complete
         const { uploadId } = await api.multipartInit(bucket, key);
         const partCount = Math.ceil(file.size / PART_SIZE);
         const parts: { etag: string; partNumber: number }[] = [];
@@ -72,7 +78,7 @@ export default function Objects() {
           const start = (i - 1) * PART_SIZE;
           const end = Math.min(start + PART_SIZE, file.size);
           const blob = file.slice(start, end);
-          const u = await api.presign(bucket, key, "PUT", 3600, "application/octet-stream", );
+          const u = await api.presign(bucket, key, "PUT", 3600, "application/octet-stream", uploadId, i);
           const r = await fetch(u.url, { method: "PUT", body: blob, headers: u.headers });
           if (!r.ok) throw new Error(`part ${i} failed: HTTP ${r.status}`);
           const etag = (r.headers.get("ETag") ?? "").replace(/^"|"$/g, "");
@@ -249,7 +255,7 @@ export default function Objects() {
                       <button className="ghost small" onClick={() => setCopyKey(o.key)}>
                         复制
                       </button>{" "}
-                      <button className="ghost small" onClick={() => setMetaObj({ bucket, key: o.key })}>
+                      <button className="ghost small" onClick={() => setMetaObj({ bucket, key: o.key, size: o.size, etag: o.etag, lastModified: o.lastModified })}>
                         详情
                       </button>{" "}
                       <button className="danger small" onClick={() => remove(o.key)}>
@@ -307,7 +313,21 @@ export default function Objects() {
   );
 }
 
-function ObjectMeta({ bucket, key, onClose }: { bucket: string; key: string; onClose: () => void }) {
+function ObjectMeta({
+  bucket,
+  key,
+  size,
+  etag,
+  lastModified,
+  onClose,
+}: {
+  bucket: string;
+  key: string;
+  size?: number;
+  etag?: string;
+  lastModified?: string;
+  onClose: () => void;
+}) {
   const [presign, setPresign] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -331,6 +351,22 @@ function ObjectMeta({ bucket, key, onClose }: { bucket: string; key: string; onC
         <div className="form-row">
           <label>桶</label>
           <input value={bucket} readOnly />
+        </div>
+        {/* REVIEW §4.15:弹窗展示 size/etag/修改时间元数据(此前只有键与桶) */}
+        <div className="form-row">
+          <label>大小</label>
+          <input value={size !== undefined ? fmtBytes(size) : "—"} readOnly />
+        </div>
+        <div className="form-row">
+          <label>ETag</label>
+          <input value={etag ?? "—"} readOnly />
+        </div>
+        <div className="form-row">
+          <label>修改时间</label>
+          <input
+            value={lastModified ? new Date(lastModified).toLocaleString() : "—"}
+            readOnly
+          />
         </div>
         <button className="ghost" onClick={gen}>
           生成预签名下载链接(1 小时)

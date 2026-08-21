@@ -452,6 +452,11 @@ fn cmd_serve(
 ) -> fs3_core::Result<()> {
     let mut engine_cfg = engine_cfg.clone();
     engine_cfg.compaction.enabled = true; // 服务常驻:后台惰性压缩(ADR-9 §6)
+                                          // REVIEW §4.7:small_object_limit 经配置暴露(README/TODO 称「阈值可配置」;
+                                          // 此前 CLI 硬编码仅引擎层可配)
+    if let Some(sol) = cfg.storage.small_object_limit {
+        engine_cfg.small_object_limit = sol;
+    }
     let engine = Arc::new(parking_lot::RwLock::new(Engine::open(&engine_cfg)?));
 
     // 密钥:CLI --key access:secret 优先,否则配置文件
@@ -577,6 +582,7 @@ fn cmd_serve(
         idle_timeout: std::time::Duration::from_secs(cfg.server.idle_timeout_secs.unwrap_or(60)),
         tls: None,
         web_root: None,
+        cors_allow_origins: Vec::new(),
     };
     // H4 每密钥限速(0 = 关闭)
     service.set_rate_limit(cfg.limits.key_rps.unwrap_or(0));
@@ -603,6 +609,14 @@ fn cmd_serve(
     };
     let mut http_cfg = http_cfg;
     http_cfg.tls = tls;
+    // REVIEW §2.4:受控 CORS(缺省空 = 关闭;浏览器跨源直传数据面需显式配置)
+    http_cfg.cors_allow_origins = cfg.server.cors_allow_origins.clone().unwrap_or_default();
+    if !http_cfg.cors_allow_origins.is_empty() {
+        tracing::info!(
+            "CORS enabled for {} origin(s)",
+            http_cfg.cors_allow_origins.len()
+        );
+    }
     // M7/I5 内嵌控制台:CLI --web-root 优先,否则配置 server.web_root
     if let Some(root) = cli_web_root.or_else(|| cfg.server.web_root.clone()) {
         if !root.is_dir() {
@@ -829,6 +843,7 @@ fn cmd_compact(cfg: &EngineConfig, rounds: u32) -> fs3_core::Result<()> {
         let r = e.compact_once()?;
         total.candidates += r.candidates;
         total.migrated_objects += r.migrated_objects;
+        total.migrated_parts += r.migrated_parts;
         total.skipped_shared += r.skipped_shared;
         total.conflicts += r.conflicts;
         total.errors += r.errors;
@@ -842,7 +857,10 @@ fn cmd_compact(cfg: &EngineConfig, rounds: u32) -> fs3_core::Result<()> {
     e.close()?;
     println!("compact: {round} round(s)");
     println!("  candidates:     {}", total.candidates);
-    println!("  migrated:       {} objects", total.migrated_objects);
+    println!(
+        "  migrated:       {} objects, {} parts",
+        total.migrated_objects, total.migrated_parts
+    );
     println!("  copied:         {} bytes", total.copied_bytes);
     println!("  freed extents:  {}", total.freed_extents);
     println!("  skipped shared: {}", total.skipped_shared);

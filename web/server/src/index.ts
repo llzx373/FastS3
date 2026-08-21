@@ -25,9 +25,10 @@
  */
 import Fastify, { type FastifyInstance } from "fastify";
 import { createServer } from "node:http";
+import { readFileSync } from "node:fs";
 import { WebSocketServer } from "ws";
 import { loadConfig, listenHostPort, type WebConfig } from "./config.js";
-import { authPlugin, issueToken, requireRole, type JwtClaims } from "./auth.js";
+import { authPlugin, issueToken, requireRole, verifyJwt, type JwtClaims } from "./auth.js";
 import { AdminClient } from "./admin-client.js";
 import { AdminWsClient } from "./admin-ws.js";
 import { S3Client } from "./s3-client.js";
@@ -41,6 +42,21 @@ export interface ServerDeps {
   cfg: WebConfig;
   /** 指标历史环形缓冲(共享实例;缺省时 buildServer 自建) */
   metricsHistory?: MetricsHistory;
+}
+
+/** 读取 web/server/package.json 的 version(进程启动时缓存一次)。 */
+let cachedVersion: string | null = null;
+function readPackageVersion(): string {
+  if (cachedVersion) return cachedVersion;
+  try {
+    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
+      version?: string;
+    };
+    cachedVersion = pkg.version ?? "unknown";
+  } catch {
+    cachedVersion = "unknown";
+  }
+  return cachedVersion;
 }
 
 export function buildServer(deps: ServerDeps): FastifyInstance {
@@ -76,7 +92,9 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       status: "ok",
       admin: adminOk ? "ok" : "down",
       adminError,
-      version: "0.4.0",
+      // REVIEW §3.3:版本读 package.json(与 Rust 侧 CARGO_PKG_VERSION=1.0.0 对齐),
+      // 不再硬编码旧版号
+      version: readPackageVersion(),
       uptimeSecs: Math.floor(process.uptime()),
     };
   });
@@ -188,24 +206,44 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   );
 
   // ── 预签名(I3:浏览器直连数据面) ──
+  // multipart 分片(I3/J1):配合 uploadId + partNumber 签发 UploadPart 预签名 URL,
+  // 使浏览器直传的每片 PUT 命中数据面 UploadPart 语义(而非普通 PutObject 覆盖)。
   app.post<{
     Params: { name: string };
-    Body: { key: string; method?: "PUT" | "GET" | "DELETE"; expires?: number; contentType?: string };
+    Body: {
+      key: string;
+      method?: "PUT" | "GET" | "DELETE";
+      expires?: number;
+      contentType?: string;
+      uploadId?: string;
+      partNumber?: number;
+    };
   }>("/api/buckets/:name/presign", async (req, reply) => {
     const { name } = req.params;
-    const { key, method = "PUT", expires = 3600, contentType } = req.body ?? {};
+    const { key, method = "PUT", expires = 3600, contentType, uploadId, partNumber } = req.body ?? {};
     if (!key) {
       return reply.code(400).send({ error: { code: "bad_request", message: "missing key" } });
+    }
+    if (uploadId !== undefined && partNumber === undefined) {
+      return reply.code(400).send({
+        error: { code: "bad_request", message: "partNumber required when uploadId given" },
+      });
     }
     try {
       const headers: Record<string, string> = {};
       if (contentType) headers["content-type"] = contentType;
+      // 附加 query 参与 SigV4 签名(presign.ts extraQuery),数据面按
+      // ?partNumber=&uploadId= 路由到 UploadPart。
+      const extraQuery: Record<string, string> = {};
+      if (partNumber !== undefined) extraQuery["partNumber"] = String(partNumber);
+      if (uploadId !== undefined) extraQuery["uploadId"] = uploadId;
       const u = presignUrl(cfg.s3.endpoint, cfg.s3.region, cfg.s3.accessKey, cfg.s3.secretKey, {
         method,
         bucket: name,
         key,
         expires,
         headers,
+        extraQuery,
       });
       return { url: u.url, headers: u.headers, expiresAt: u.expiresAt };
     } catch (e) {
@@ -312,8 +350,15 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     "/api/keys/:id",
     { preHandler: requireRole("admin") },
     async (req, reply) => {
+      // REVIEW §4.16:空 body 不得默认「禁用」——enabled 必须显式给出,
+      // 避免前端漏传字段时误禁用密钥。
+      if (req.body == null || typeof req.body.enabled !== "boolean") {
+        return reply.code(400).send({
+          error: { code: "bad_request", message: "body.enabled (boolean) is required" },
+        });
+      }
       try {
-        return await admin.setKeyEnabled(req.params.id, req.body?.enabled ?? false);
+        return await admin.setKeyEnabled(req.params.id, req.body.enabled);
       } catch (e) {
         return reply.code(404).send({ error: { code: "no_such_key", message: (e as Error).message } });
       }
@@ -483,8 +528,27 @@ export function startServer(): void {
   // WS /api/ws:向浏览器推送实时指标。
   // I4:优先转发 Rust 侧 WS /v1/admin/ws(snapshot/audit/health 帧,帧形状不变,
   // 仍为 {"type":"dashboard","data":Dashboard});WS 不可用/静默时回退 5s 轮询。
+  // REVIEW §3.2:升级前强制 JWT 鉴权(浏览器以 ?token= 携带;拒绝即 401 关连接),
+  // 避免任何能连上 9090 的客户端订阅指标快照/审计尾随。
   const httpServer = app.server;
-  const wss = new WebSocketServer({ server: httpServer, path: "/api/ws" });
+  const wss = new WebSocketServer({ noServer: true });
+  httpServer.on("upgrade", (req, socket, head) => {
+    const url = new URL(req.url ?? "/", "http://localhost");
+    if (url.pathname !== "/api/ws") {
+      socket.destroy();
+      return;
+    }
+    const token = url.searchParams.get("token") ?? "";
+    const claims = verifyJwt(token, cfg.jwtSecret);
+    if (!claims) {
+      socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws, req, claims);
+    });
+  });
 
   const broadcast = (msg: string) => {
     for (const c of wss.clients) {

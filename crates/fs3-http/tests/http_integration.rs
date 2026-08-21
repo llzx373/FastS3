@@ -161,12 +161,19 @@ fn render_request(method: &str, path: &str, headers: &[(String, String)], body: 
 }
 
 async fn spawn_server(service: Arc<S3Service>) -> std::net::SocketAddr {
+    spawn_server_cors(service, Vec::new()).await
+}
+
+/// 带 CORS 允许源的服务器(REVIEW §2.4 测试用)。
+async fn spawn_server_cors(service: Arc<S3Service>, cors: Vec<String>) -> std::net::SocketAddr {
+    let cors = Arc::new(cors);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
             let svc = service.clone();
+            let cors = cors.clone();
             tokio::spawn(async move {
                 let _ = fs3_http::serve_connection(
                     svc,
@@ -175,6 +182,7 @@ async fn spawn_server(service: Arc<S3Service>) -> std::net::SocketAddr {
                     std::time::Duration::from_secs(30),
                     std::time::Duration::from_secs(60),
                     None,
+                    cors,
                 )
                 .await;
             });
@@ -402,6 +410,7 @@ async fn tls_put_get_roundtrip_h1() {
                         std::time::Duration::from_secs(30),
                         std::time::Duration::from_secs(60),
                         None,
+                        Arc::new(Vec::new()),
                     )
                     .await;
                 }
@@ -507,4 +516,291 @@ where
     }
     body.truncate(content_length);
     (status, headers, body)
+}
+
+// ── REVIEW §2.2:h2c(prior-knowledge)连接上的 GET/PUT 数据完整性 ──
+// 回归:handler 层未感知 h2 时,零拷贝标记帧(28B nonce + 填充)曾被当普通
+// 数据嵌入响应体,导致 h2c 客户端读到大对象响应被污染。
+#[tokio::test]
+async fn h2c_get_put_not_polluted_by_marker_frames() {
+    let (_d, service) = setup();
+    let addr = spawn_server(service.clone()).await;
+    let host = format!("{addr}");
+
+    // prior-knowledge h2 客户端:直接 http2 handshake(不升级,不发 h1 preface)
+    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (mut send, conn) =
+        hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+            .timer(hyper_util::rt::TokioTimer::new())
+            .handshake(hyper_util::rt::TokioIo::new(tcp))
+            .await
+            .expect("h2c handshake");
+    tokio::spawn(conn);
+
+    // 建桶(PUT 空体;h2)
+    let h = sigv4_headers(&host, "PUT", "/h2-bucket", &[], &[], b"");
+    let mut req_builder = hyper::Request::builder().method("PUT").uri("/h2-bucket");
+    for (k, v) in &h {
+        req_builder = req_builder.header(k.as_str(), v.as_str());
+    }
+    let resp = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        send.send_request(
+            req_builder
+                .body(http_body_util::Full::new(hyper::body::Bytes::new()))
+                .unwrap(),
+        ),
+    )
+    .await
+    {
+        Ok(r) => r.expect("h2c send_request"),
+        Err(_) => panic!("h2c TIMEOUT: create bucket request got no response"),
+    };
+    assert_eq!(resp.status(), 200, "create bucket over h2c");
+    drop(resp);
+
+    // 68KiB 对象(>2×MARKER_LEN;之前会走零拷贝渲染路径)
+    let payload: Vec<u8> = (0..68 * 1024).map(|i| (i % 251) as u8).collect();
+    let h = sigv4_headers(&host, "PUT", "/h2-bucket/obj", &[], &[], &payload);
+    let mut req_builder = hyper::Request::builder()
+        .method("PUT")
+        .uri("/h2-bucket/obj")
+        .header("content-length", payload.len().to_string());
+    for (k, v) in &h {
+        if k != "content-length" {
+            req_builder = req_builder.header(k.as_str(), v.as_str());
+        }
+    }
+    let resp = send
+        .send_request(
+            req_builder
+                .body(http_body_util::Full::new(hyper::body::Bytes::from(
+                    payload.clone(),
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "put 68KiB over h2c");
+
+    // GET 回来:响应体必须与 payload 逐字节一致(无标记帧/填充零)
+    let h = sigv4_headers(&host, "GET", "/h2-bucket/obj", &[], &[], b"");
+    let mut req_builder = hyper::Request::builder()
+        .method("GET")
+        .uri("/h2-bucket/obj");
+    for (k, v) in &h {
+        req_builder = req_builder.header(k.as_str(), v.as_str());
+    }
+    let resp = send
+        .send_request(
+            req_builder
+                .body(http_body_util::Full::new(hyper::body::Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "get over h2c");
+    let body = http_body_util::BodyExt::collect(resp.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(body.len(), payload.len(), "h2c GET length must match");
+    assert_eq!(
+        body.as_ref(),
+        payload.as_slice(),
+        "h2c GET body must be byte-exact (no marker frame pollution)"
+    );
+}
+
+// ── REVIEW §2.4:受控 CORS ──
+// 配置允许源后:预检 OPTIONS 应答允许头;实际请求附加 ACAO;未命中源/未开启
+// 时不附加任何 CORS 头(默认行为不变)。
+#[tokio::test]
+async fn cors_preflight_and_actual_requests() {
+    let (_d, service) = setup();
+    let addr = spawn_server_cors(service.clone(), vec!["https://console.example".into()]).await;
+    let host = format!("{addr}");
+
+    // 1) 预检 OPTIONS(浏览器在 PUT 前的探测;无签名,无副作用)
+    let mut client = RawClient::connect(addr).await;
+    let rel = format!(
+        "OPTIONS /cors-bucket/obj HTTP/1.1\r\nHost: {host}\r\nOrigin: https://console.example\r\nAccess-Control-Request-Method: PUT\r\n\r\n"
+    );
+    let (status, headers, _) = client.send(rel.into_bytes()).await;
+    assert_eq!(status, 200, "preflight must be accepted");
+    let allow_origin = headers
+        .iter()
+        .find(|(k, _)| k == "access-control-allow-origin")
+        .map(|(_, v)| v.clone());
+    assert_eq!(allow_origin.as_deref(), Some("https://console.example"));
+    let allow_methods = headers
+        .iter()
+        .find(|(k, _)| k == "access-control-allow-methods")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    assert!(allow_methods.contains("PUT") && allow_methods.contains("GET"));
+
+    // 2) 预检来自未允许源 → 无 CORS 头(且不落 S3 语义,返回非 200)
+    let rel = format!(
+        "OPTIONS /cors-bucket/obj HTTP/1.1\r\nHost: {host}\r\nOrigin: https://evil.example\r\nAccess-Control-Request-Method: PUT\r\n\r\n"
+    );
+    let (status, headers, _) = client.send(rel.into_bytes()).await;
+    assert_ne!(
+        status, 200,
+        "disallowed preflight must not be answered by CORS"
+    );
+    assert!(
+        !headers
+            .iter()
+            .any(|(k, _)| k == "access-control-allow-origin"),
+        "no ACAO for disallowed origin"
+    );
+
+    // 3) 实际签名 PUT(带允许源 Origin)→ 响应附加 ACAO;写入成功
+    let h = sigv4_headers(&host, "PUT", "/cors-bucket", &[], &[], b"");
+    let mut ext = h.clone();
+    ext.push(("origin".into(), "https://console.example".into()));
+    let (status, headers, _) = client
+        .send(render_request("PUT", "/cors-bucket", &ext, b""))
+        .await;
+    assert_eq!(status, 200, "create bucket with allowed origin");
+    let allow_origin = headers
+        .iter()
+        .find(|(k, _)| k == "access-control-allow-origin")
+        .map(|(_, v)| v.clone());
+    assert_eq!(allow_origin.as_deref(), Some("https://console.example"));
+
+    // 4) 未开启 CORS 的服务器(默认)→ 即使带 Origin 也无 CORS 头
+    let addr2 = spawn_server(service.clone()).await;
+    let host2 = format!("{addr2}");
+    let mut client2 = RawClient::connect(addr2).await;
+    let h = sigv4_headers(&host2, "PUT", "/cors-off-bucket", &[], &[], b"");
+    let mut ext = h.clone();
+    ext.push(("origin".into(), "https://console.example".into()));
+    let (status, headers, _) = client2
+        .send(render_request("PUT", "/cors-off-bucket", &ext, b""))
+        .await;
+    assert_eq!(status, 200, "origin ignored when CORS disabled");
+    assert!(
+        !headers
+            .iter()
+            .any(|(k, _)| k == "access-control-allow-origin"),
+        "no CORS headers when CORS disabled"
+    );
+}
+
+// ── REVIEW §4.14:Expect: 100-continue 与 TE: chunked 的仓库内验证 ──
+// (TODO M2/F7 声称「原始 socket 验证」此前全仓找不到对应测试,依赖 hyper
+// 自动行为;此处补字节级断言。)
+
+#[tokio::test]
+async fn expect_100_continue_handshake() {
+    let (_d, service) = setup();
+    let addr = spawn_server(service.clone()).await;
+    let host = format!("{addr}");
+    // 建桶(普通 h1 PUT)
+    let mut c = RawClient::connect(addr).await;
+    let h = sigv4_headers(&host, "PUT", "/exp-bucket", &[], &[], b"");
+    let (status, _, _) = c.send(render_request("PUT", "/exp-bucket", &h, b"")).await;
+    assert_eq!(status, 200, "create bucket");
+
+    // Expect: 100-continue:先发请求头(带签名;体暂不发),等待 100 后补发体
+    let h = sigv4_headers(&host, "PUT", "/exp-bucket/obj", &[], &[], b"hello");
+    let mut head = "PUT /exp-bucket/obj HTTP/1.1\r\n".to_string();
+    for (k, v) in &h {
+        if k == "host" {
+            head.push_str(&format!("Host: {v}\r\n"));
+        } else {
+            head.push_str(&format!("{k}: {v}\r\n"));
+        }
+    }
+    head.push_str("Expect: 100-continue\r\nContent-Length: 5\r\n\r\n");
+    let stream = &mut c.stream;
+    stream.write_all(head.as_bytes()).await.unwrap();
+    // 读中间响应(超时保护):应为 100 Continue
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        stream.read_exact(&mut byte).await.unwrap();
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        assert!(buf.len() < 1 << 16, "100-continue header not received");
+    }
+    let interim = String::from_utf8_lossy(&buf);
+    assert!(
+        interim.contains("100 Continue"),
+        "expected 100 Continue, got: {interim:?}"
+    );
+    // 补发 body → 最终 200 + ETag
+    stream.write_all(b"hello").await.unwrap();
+    let mut out = Vec::new();
+    let mut header_end = None;
+    while out.len() < 1 << 20 {
+        if stream.read(&mut byte).await.unwrap() == 0 {
+            break;
+        }
+        out.push(byte[0]);
+        if out.ends_with(b"\r\n\r\n") {
+            header_end = Some(out.len());
+            break;
+        }
+    }
+    let head = String::from_utf8_lossy(&out[..header_end.unwrap()]).into_owned();
+    let status: u16 = head
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    // 读剩余 content-length 字节
+    let cl: usize = head
+        .lines()
+        .find_map(|l| {
+            l.split_once(':')
+                .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                .map(|(_, v)| v.trim().parse().unwrap_or(0))
+        })
+        .unwrap_or(0);
+    while out.len() - header_end.unwrap() < cl {
+        let mut chunk = vec![0u8; 4096];
+        let n = stream.read(&mut chunk).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&chunk[..n]);
+    }
+    assert_eq!(status, 200, "final response after 100-continue");
+}
+
+#[tokio::test]
+async fn te_chunked_put_is_accepted() {
+    let (_d, service) = setup();
+    let addr = spawn_server(service.clone()).await;
+    let host = format!("{addr}");
+    let mut c = RawClient::connect(addr).await;
+    let h = sigv4_headers(&host, "PUT", "/te-bucket", &[], &[], b"");
+    let (status, _, _) = c.send(render_request("PUT", "/te-bucket", &h, b"")).await;
+    assert_eq!(status, 200, "create bucket");
+
+    // TE: chunked PUT(签名 header 认证;体以 chunked 帧发送)
+    let h = sigv4_headers(&host, "PUT", "/te-bucket/obj", &[], &[], b"hello-chunked");
+    let mut req = "PUT /te-bucket/obj HTTP/1.1\r\n".to_string();
+    for (k, v) in &h {
+        if k == "host" {
+            req.push_str(&format!("Host: {v}\r\n"));
+        } else if k != "content-length" {
+            req.push_str(&format!("{k}: {v}\r\n"));
+        }
+    }
+    req.push_str("Transfer-Encoding: chunked\r\n\r\n");
+    req.push_str("5\r\nhello\r\n");
+    req.push_str("8\r\n-chunked\r\n");
+    req.push_str("0\r\n\r\n");
+    let (status, _, body) = c.send(req.into_bytes()).await;
+    assert_eq!(status, 200, "chunked PUT must be accepted: {body:?}");
 }

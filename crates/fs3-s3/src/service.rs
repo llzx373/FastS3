@@ -668,12 +668,17 @@ impl S3Service {
 
     fn require_auth(&self, req: &S3Request) -> Result<Option<String>, S3Error> {
         let access = self.authenticate(req)?;
-        if access.is_none()
-            && !self
-                .allow_anonymous
-                .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            return Err(S3Error::new(S3ErrorCode::AccessDenied));
+        if access.is_none() {
+            // REVIEW §3.5:allow_anonymous 仅开放「匿名公共读」(GET/HEAD),
+            // 写操作(PUT/DELETE/POST 等)即使开启也必须携带有效签名。
+            let read_only = matches!(req.method.as_str(), "GET" | "HEAD");
+            if !read_only
+                || !self
+                    .allow_anonymous
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(S3Error::new(S3ErrorCode::AccessDenied));
+            }
         }
         Ok(access)
     }
@@ -908,6 +913,16 @@ impl S3Service {
         let start = std::time::Instant::now();
         let access = self.authenticate(req).ok().flatten();
         let (op, name, bucket, key) = route_op_bucket_key(req);
+        // H4 每密钥限速:流式路径(>8MiB PUT / aws-chunked / 大分片)与缓冲路径
+        // 同语义——大数据上传恰是流量最大的路径,不能绕过令牌桶(REVIEW §2.5)。
+        if let Some(ak) = &access {
+            if !self.limiter.check(ak) {
+                self.metrics.record_error("SlowDown");
+                self.audit_record(Some(ak), &name, &bucket, &key, 503);
+                return Err(S3Error::new(S3ErrorCode::SlowDown)
+                    .with_message("Rate limit exceeded for this access key."));
+            }
+        }
         // J4 密钥策略执行(流式 PUT / UploadPart 同语义;认证失败在此体现为
         // handle_inner 的 AccessDenied,策略判定对未认证请求直接放行)
         if let Err(e) = self.authorize(access.as_deref(), &name, &bucket, &key) {
@@ -979,6 +994,24 @@ impl S3Service {
             }
         };
         let _access = self.require_auth(req)?;
+
+        // REVIEW §3.10:流式路径按 Content-Length 提前拒绝超限请求
+        // (单片 >5GiB → InvalidPart;整对象 >5TiB → EntityTooLarge,免写半程回滚)。
+        let content_length = header(req, "content-length").and_then(|v| v.parse::<u64>().ok());
+        match &target {
+            StreamTarget::Object { .. } => {
+                if content_length.is_some_and(|l| l > fs3_core::MAX_OBJECT_SIZE) {
+                    return Err(S3Error::new(S3ErrorCode::EntityTooLarge)
+                        .with_message("Object exceeds the 5TiB maximum object size."));
+                }
+            }
+            StreamTarget::Part { .. } => {
+                if content_length.is_some_and(|l| l > fs3_core::MAX_PART_SIZE) {
+                    return Err(S3Error::new(S3ErrorCode::InvalidPart)
+                        .with_message("Part size exceeds the 5GiB per-part limit."));
+                }
+            }
+        }
 
         // 桶必须存在(AWS:NoSuchBucket)
         let bucket_name = match &target {
@@ -1544,6 +1577,11 @@ impl S3Service {
         bucket: &str,
         key: &str,
     ) -> Result<ServiceResponse, S3Error> {
+        // REVIEW §3.10:缓冲路径同样提前拒绝超 5TiB 的请求(免写半程回滚)
+        if req.body.len() as u64 > fs3_core::MAX_OBJECT_SIZE {
+            return Err(S3Error::new(S3ErrorCode::EntityTooLarge)
+                .with_message("Object exceeds the 5TiB maximum object size."));
+        }
         // 载荷哈希校验(缓冲体可先验后写)
         let outcome =
             self.auth
@@ -1822,6 +1860,11 @@ impl S3Service {
         part_number: u32,
         upload_id: &str,
     ) -> Result<ServiceResponse, S3Error> {
+        // REVIEW §3.10:单片上限 5GiB(AWS;此前 MAX_PART_SIZE 零引用,超大分片不拒绝)
+        if req.body.len() as u64 > fs3_core::MAX_PART_SIZE {
+            return Err(S3Error::new(S3ErrorCode::InvalidPart)
+                .with_message("Part size exceeds the 5GiB per-part limit."));
+        }
         let mut engine = self.engine.write();
         if engine
             .meta()

@@ -611,6 +611,15 @@ pub fn run_wizard(args: &WizardArgs, global_config: Option<&Path>) -> Result<Gen
         )
     };
     let jwt_secret = gen_hex(32)?;
+    // REVIEW §4.18:staticDir 不再无条件写相对路径 "../console/dist"
+    // (该相对路径假设 web/server 与 console 平级的仓库布局;root 部署形态
+    // 与 systemd 单元 FS3_WEB_STATIC=/opt/fasts3/web/console/dist 对齐)。
+    let static_dir = if is_root {
+        "/opt/fasts3/web/console/dist".to_string()
+    } else {
+        // dev/本地形态:web/server 在仓库内运行,console 构建产物在同级
+        "../console/dist".to_string()
+    };
     write_web_json(
         &web_config_path,
         &web_user,
@@ -621,9 +630,15 @@ pub fn run_wizard(args: &WizardArgs, global_config: Option<&Path>) -> Result<Gen
         &s3_endpoint,
         &access_key,
         &secret_key,
-        "../console/dist",
+        &static_dir,
     )?;
     println!("Web 配置已写入: {}", web_config_path.display());
+    if is_root && !std::path::Path::new("/opt/fasts3/web/console/dist").is_dir() {
+        println!(
+            "  提示:staticDir={static_dir} 尚不存在;请将控制台构建产物 \
+             (web/console/dist)安装到该路径,或改配 web.json 的 staticDir 指向真实目录"
+        );
+    }
 
     // 8. systemd 安装(可选)
     let wants_systemd: Option<PathBuf> = match args.systemd.as_deref() {

@@ -217,11 +217,19 @@ export const api = {
     if (flat) q.set("flat", "true");
     return request<ListResult>("GET", `/api/buckets/${encodeURIComponent(bucket)}/objects?${q}`);
   },
-  presign: (bucket: string, key: string, method: "PUT" | "GET" | "DELETE", expires = 3600, contentType?: string) =>
+  presign: (
+    bucket: string,
+    key: string,
+    method: "PUT" | "GET" | "DELETE",
+    expires = 3600,
+    contentType?: string,
+    uploadId?: string,
+    partNumber?: number
+  ) =>
     request<{ url: string; headers: Record<string, string>; expiresAt: number }>(
       "POST",
       `/api/buckets/${encodeURIComponent(bucket)}/presign`,
-      { key, method, expires, contentType }
+      { key, method, expires, contentType, uploadId, partNumber }
     ),
   multipartInit: (bucket: string, key: string) =>
     request<{ uploadId: string }>("POST", `/api/buckets/${encodeURIComponent(bucket)}/multipart/init`, { key }),
