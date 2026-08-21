@@ -425,31 +425,31 @@
 > WBS:L2、L3、L5、L6、I5、J 收尾;E5 建议归属本里程碑(备份/恢复指南依赖)。
 
 ### E5 元数据快照(建议归属)
-- [ ] meta-export / import 工具
-- [ ] 备份/恢复演练
+- [x] meta-export / import 工具(`fasts3d meta-export`/`meta-import`:全量元数据 JSON 导出(0600);导入布局强校验 + 种子盐/序号复位 + 分配重放 + 新检查点;crates/fs3d/src/meta.rs + 往返/负例集成测试)
+- [x] 备份/恢复演练(tests/backup/backup-restore-drill.sh,**实测通过**:对象 md5 一致、密钥完整、零泄漏;与卷快照组合指南见文档站)
 
 ### I5 多实例与内嵌
-- [ ] Node 管理 API 无状态化验证(多实例部署)
-- [ ] 静态资源托管(内嵌形态:fasts3d --web-root dist)
+- [x] Node 管理 API 无状态化验证(多实例部署)(tests/m7/multi-web-drill.sh **实测通过**:双实例 JWT 互认、状态互见、重启无损;compose 增 fasts3-web2)
+- [x] 静态资源托管(内嵌形态:fasts3d --web-root dist)(fs3-http static_files + `serve --web-root`,**实测通过**:SPA 回退/穿越拒绝/与 S3 路径互不干扰;配置 server.web_root)
 
 ### L2 运维文档
-- [ ] Admin Guide;Tuning(系统调优清单);Troubleshooting / FAQ
+- [x] Admin Guide;Tuning(系统调优清单);Troubleshooting / FAQ(docs/site/docs/operations/ 三页,MkDocs 构建 0 警告)
 
 ### L3 API 文档
-- [ ] admin API 参考;Node 管理 API 参考;错误码速查
+- [x] admin API 参考;Node 管理 API 参考;错误码速查(docs/site/docs/reference/ 三页,含错误三层的处置速查)
 
 ### L5 备份与迁移
-- [ ] 备份/恢复指南(元数据快照 + 底层卷快照)
-- [ ] 迁移指南与脚本:MinIO → FastS3(mc mirror)、公有云 S3 → FastS3(rclone)
+- [x] 备份/恢复指南(元数据快照 + 底层卷快照)(backup-restore.md:两层备份/恢复矩阵/演练;meta-export 敏感文件 0600 说明)
+- [x] 迁移指南与脚本:MinIO → FastS3(mc mirror)、公有云 S3 → FastS3(rclone)(deploy/migrate/ 两脚本 + migration.md;**mc/rclone 真实双端点演练通过**)
 
 ### L6 Beta 反馈闭环
-- [ ] Beta 计划与反馈机制;v0.9 公开 Beta(注册/下载页/支持通道)
-- [ ] Beta 评审:NPS ≥ 30、P0/P1 清零、文档覆盖率检查
+- [x] Beta 计划与反馈机制;v0.9 公开 Beta(注册/下载页/支持通道)(docs/site/docs/beta/index.md:计划/通道/SLO/闭环清单;.github/ISSUE_TEMPLATE/ 缺陷+反馈模板;评审入口就绪)
+- [~] Beta 评审:NPS ≥ 30、P0/P1 清零、文档覆盖率检查 —— **评审机制与清单已交付**(beta/review.md + 文档覆盖率检查表),数值门禁待公开 Beta 满 2 周后执行,如实未勾选
 
 ### M7 门禁(退出条件)
-- [ ] Beta 用户 ≥ 10 位真实使用 2 周
-- [ ] P0/P1 缺陷清零;反馈闭环清单全部处理
-- [ ] 发布 v0.8 / v0.9
+- [ ] Beta 用户 ≥ 10 位真实使用 2 周(过程门禁:注册/跟踪入口已就绪,待公开 Beta 实际运行)
+- [ ] P0/P1 缺陷清零;反馈闭环清单全部处理(过程门禁:模板/SLO/闭环流程已就绪,依赖真实反馈)
+- [~] 发布 v0.8 / v0.9 —— **v0.8 已发布(本提交)**,v0.9 公开 Beta 待注册用户与 2 周使用期
 
 ---
 

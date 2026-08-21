@@ -13,7 +13,7 @@
 # 校验 spec 语法(无需环境): rpmspec -P fasts3.spec
 
 Name:           fasts3
-Version:        0.7.0
+Version:        0.8.0
 Release:        1%{?dist}
 Summary:        FastS3 单机高性能 S3 服务(io_uring/O_DIRECT 数据面 + Node 管理面)
 License:        Apache-2.0
@@ -102,6 +102,6 @@ exit 0
 %attr(0750,root,root) %dir /var/lib/fasts3/meta
 
 %changelog
-* Mon Aug 25 2025 FastS3 Project <release@example.com> - 0.7.0-1
+* Mon Aug 25 2025 FastS3 Project <release@example.com> - 0.8.0-1
 - M6 打包与开箱:首个 deb/rpm/tarball 制品;systemd 加固单元;SBOM + 签名
 - 升级/回滚 N-1 保证;5 分钟开箱门禁(安装 → init → 建桶 → 上传下载 → 升级演练)

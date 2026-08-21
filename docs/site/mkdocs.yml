@@ -27,9 +27,20 @@ nav:
       - systemd: deployment/systemd.md
       - 容器: deployment/container.md
   - 运维:
+      - 管理员指南: operations/admin-guide.md
       - 升级与回滚: operations/upgrade.md
+      - 备份/恢复: operations/backup-restore.md
+      - 迁移(MinIO/公有云): operations/migration.md
+      - 性能调优: operations/tuning.md
+      - 故障排查与 FAQ: operations/troubleshooting.md
   - 参考:
       - fasts3d 命令速查: reference/cli.md
+      - admin API 参考: reference/admin-api.md
+      - Node 管理 API 参考: reference/web-api.md
+      - 错误码速查: reference/errors.md
+  - Beta:
+      - Beta 计划与反馈: beta/index.md
+      - Beta 评审清单: beta/review.md
 
 markdown_extensions:
   - admonition

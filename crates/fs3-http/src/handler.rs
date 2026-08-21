@@ -23,12 +23,16 @@ use tokio_stream::StreamExt;
 /// H4 超时控制:header_read_timeout(默认 30s,连接建立后/请求间隙内
 /// 未收全请求头即断开)+ keep_alive_timeout(默认 60s,空闲超时断开);
 /// h2 用 keep-alive PING 间隔 + 应答超时。超时由 hyper 内部 Timer 驱动。
+///
+/// `web_root`(M7/I5):非空时按静态资源托管内嵌控制台(SPA 回退;
+/// 带认证/桶路径的请求仍走 S3)。
 pub async fn serve_connection(
     service: Arc<S3Service>,
     admission: Arc<crate::Admission>,
     stream: TcpStream,
     header_timeout: std::time::Duration,
     idle_timeout: std::time::Duration,
+    web_root: Option<std::path::PathBuf>,
 ) -> std::io::Result<()> {
     // 零拷贝(B3/D2):注册设备 fd 白名单,包裹 socket 识别标记帧
     crate::zero_copy::register_trusted_fd(service.device_fd());
@@ -48,7 +52,7 @@ pub async fn serve_connection(
         header_timeout,
         idle_timeout,
     ));
-    serve_common(service, admission, io, zc_ctx, idle_timeout).await
+    serve_common(service, admission, io, zc_ctx, idle_timeout, web_root).await
 }
 
 /// TLS 连接服务(M4):rustls 流,零拷贝禁用(标记帧无法穿透加密层,走缓冲读)。
@@ -58,6 +62,7 @@ pub async fn serve_connection_tls(
     stream: tokio_rustls::server::TlsStream<TcpStream>,
     header_timeout: std::time::Duration,
     idle_timeout: std::time::Duration,
+    web_root: Option<std::path::PathBuf>,
 ) -> std::io::Result<()> {
     let peer = stream
         .get_ref()
@@ -71,7 +76,7 @@ pub async fn serve_connection_tls(
         header_timeout,
         idle_timeout,
     ));
-    serve_common(service, admission, io, None, idle_timeout).await
+    serve_common(service, admission, io, None, idle_timeout, web_root).await
 }
 
 /// 公共连接驱动(h1/h2 自动协商;超时交给 hyper Timer + DeadlinedIo)。
@@ -81,6 +86,7 @@ async fn serve_common<S>(
     io: TokioIo<S>,
     zc_ctx: Option<crate::zero_copy::ZeroCtx>,
     idle_timeout: std::time::Duration,
+    web_root: Option<std::path::PathBuf>,
 ) -> std::io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -89,7 +95,8 @@ where
         let service = service.clone();
         let admission = admission.clone();
         let zc_ctx = zc_ctx;
-        async move { handle(service, admission, zc_ctx, req).await }
+        let web_root = web_root.clone();
+        async move { handle(service, admission, zc_ctx, web_root, req).await }
     });
     let mut builder =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
@@ -110,7 +117,8 @@ where
 }
 
 type BoxBodyErr = std::io::Error;
-type RespBody = BoxBody<Bytes, BoxBodyErr>;
+/// 响应体(静态文件模块复用)。
+pub type RespBody = BoxBody<Bytes, BoxBodyErr>;
 
 fn empty_body() -> RespBody {
     Full::new(Bytes::new())
@@ -234,6 +242,7 @@ async fn handle(
     service: Arc<S3Service>,
     admission: Arc<crate::Admission>,
     zc_ctx: Option<crate::zero_copy::ZeroCtx>,
+    web_root: Option<std::path::PathBuf>,
     req: Request<Incoming>,
 ) -> Result<Response<RespBody>, std::convert::Infallible> {
     let host_id = "fasts3";
@@ -269,6 +278,43 @@ async fn handle(
         _ => vec![],
     };
     let decoded_path = percent_decode(&raw_path);
+
+    // M7 / I5 内嵌控制台(web_root):无认证头的 GET/HEAD,且首段不是既有桶
+    // (S3 路径风格)时按静态资源托管(SPA 回退 index.html;目录穿越拒绝)。
+    // 带 Authorization / x-amz-date 或预签名查询的请求一律仍走 S3。
+    if let Some(root) = &web_root {
+        let first_seg = raw_path
+            .trim_start_matches('/')
+            .split('/')
+            .next()
+            .unwrap_or("");
+        let bucket_path = !first_seg.is_empty()
+            && service
+                .engine()
+                .read()
+                .meta()
+                .get_bucket(first_seg)
+                .map(|m| m.is_some())
+                .unwrap_or(false);
+        let s3_style = bucket_path
+            || req.headers().contains_key("authorization")
+            || req.headers().contains_key("x-amz-date")
+            || uri
+                .query()
+                .map(|q| q.contains("X-Amz-Signature"))
+                .unwrap_or(false);
+        if !s3_style && matches!(method.as_str(), "GET" | "HEAD") {
+            let resp = crate::static_files::serve_static(root, &decoded_path, &method)
+                .unwrap_or_else(|| {
+                    Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(empty_body())
+                        .unwrap()
+                });
+            return Ok(resp);
+        }
+    }
+
     let mut headers: Vec<(String, String)> = req
         .headers()
         .iter()

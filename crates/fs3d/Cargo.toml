@@ -17,6 +17,7 @@ tempfile.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 hex.workspace = true
+base64.workspace = true
 fs3-core.workspace = true
 parking_lot.workspace = true
 fs3-device.workspace = true

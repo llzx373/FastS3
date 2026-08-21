@@ -18,6 +18,7 @@ mod bench;
 mod config;
 mod doctor;
 mod loadgen;
+mod meta;
 mod settings;
 mod signal;
 mod stress;
@@ -84,6 +85,10 @@ enum Cmd {
     Init(wizard::WizardArgs),
     /// 升级/回滚(M6 K4):布局版本迁移框架 + 备份 + 启动自检
     Upgrade(upgrade::UpgradeArgs),
+    /// M7/E5 元数据快照导出(配合底层卷快照构成完整备份;停机窗口执行)
+    MetaExport(meta::MetaExportArgs),
+    /// M7/E5 元数据快照导入(先恢复底层卷数据快照;布局必须与导出一致)
+    MetaImport(meta::MetaImportArgs),
     /// 流式 PUT:文件或 stdin(-)到对象
     Put {
         /// 桶名(自动创建)
@@ -164,6 +169,10 @@ enum Cmd {
         /// 管理 API Bearer token
         #[arg(long)]
         admin_token: Option<String>,
+        /// 内嵌控制台静态目录(M7/I5:`--web-root <console dist>`;
+        /// 无认证且非桶路径的 GET/HEAD 按静态资源托管,SPA 回退)
+        #[arg(long)]
+        web_root: Option<PathBuf>,
         /// 优雅停机排空上限秒数(K4;默认 5;SIGTERM/SIGINT 触发)
         #[arg(long, default_value_t = 5)]
         drain_secs: u64,
@@ -231,6 +240,30 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
             cli.device.clone(),
             cli.meta_dir.clone(),
         ),
+        Cmd::MetaExport(args) => {
+            let engine_cfg = engine_config(
+                device,
+                meta_dir,
+                sync_mode,
+                cli.group_commit_ms.or(storage.group_commit_ms),
+                cli.checkpoint_interval.or(storage.checkpoint_interval),
+                cli.no_uring,
+                etag_mode,
+            )?;
+            meta::run_meta_export(&engine_cfg.device, &engine_cfg.meta_dir, &args)
+        }
+        Cmd::MetaImport(args) => {
+            let engine_cfg = engine_config(
+                device,
+                meta_dir,
+                sync_mode,
+                cli.group_commit_ms.or(storage.group_commit_ms),
+                cli.checkpoint_interval.or(storage.checkpoint_interval),
+                cli.no_uring,
+                etag_mode,
+            )?;
+            meta::run_meta_import(&engine_cfg.device, &engine_cfg.meta_dir, &args)
+        }
         Cmd::Put { bucket, key, file } => {
             let engine_cfg = engine_config(
                 device,
@@ -369,6 +402,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
             max_inflight_bytes,
             admin_listen,
             admin_token,
+            web_root,
             drain_secs,
         } => {
             let engine_cfg = engine_config(
@@ -391,6 +425,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 max_inflight_bytes,
                 admin_listen,
                 admin_token,
+                web_root,
                 drain_secs.max(1),
             )
         }
@@ -412,6 +447,7 @@ fn cmd_serve(
     cli_max_inflight: Option<u64>,
     cli_admin_listen: Option<String>,
     cli_admin_token: Option<String>,
+    cli_web_root: Option<PathBuf>,
     drain_secs: u64,
 ) -> fs3_core::Result<()> {
     let mut engine_cfg = engine_cfg.clone();
@@ -540,6 +576,7 @@ fn cmd_serve(
         ),
         idle_timeout: std::time::Duration::from_secs(cfg.server.idle_timeout_secs.unwrap_or(60)),
         tls: None,
+        web_root: None,
     };
     // H4 每密钥限速(0 = 关闭)
     service.set_rate_limit(cfg.limits.key_rps.unwrap_or(0));
@@ -566,6 +603,17 @@ fn cmd_serve(
     };
     let mut http_cfg = http_cfg;
     http_cfg.tls = tls;
+    // M7/I5 内嵌控制台:CLI --web-root 优先,否则配置 server.web_root
+    if let Some(root) = cli_web_root.or_else(|| cfg.server.web_root.clone()) {
+        if !root.is_dir() {
+            return Err(fs3_core::Error::InvalidArgument(format!(
+                "web_root {} is not a directory (point at the console dist)",
+                root.display()
+            )));
+        }
+        http_cfg.web_root = Some(root.clone());
+        tracing::info!("embedded console enabled (web_root={})", root.display());
+    }
 
     // M6 / K4:优雅停机(SIGTERM/SIGINT → 排空 → 引擎收尾)
     let shutdown = Arc::new(AtomicBool::new(false));

@@ -14,6 +14,7 @@ use tokio::net::TcpListener;
 
 mod admission;
 mod handler;
+mod static_files;
 mod timeout_io;
 pub mod tls;
 mod zero_copy;
@@ -40,6 +41,9 @@ pub struct HttpServerConfig {
     pub idle_timeout: std::time::Duration,
     /// TLS(M4):None = 明文;Some = rustls(ALPN h2/h1;证书热加载)。
     pub tls: Option<Arc<TlsState>>,
+    /// M7/I5:内嵌控制台静态目录(`fasts3d serve --web-root <dist>`;
+    /// Some = 无认证且非桶路径的 GET/HEAD 按静态资源托管,SPA 回退)。
+    pub web_root: Option<std::path::PathBuf>,
 }
 
 impl Default for HttpServerConfig {
@@ -51,6 +55,7 @@ impl Default for HttpServerConfig {
             header_timeout: std::time::Duration::from_secs(30), // DESIGN §9:header 30s
             idle_timeout: std::time::Duration::from_secs(60), // DESIGN §9:idle 60s
             tls: None,
+            web_root: None,
         }
     }
 }
@@ -124,6 +129,7 @@ pub fn serve_with_shutdown(
         let listen = cfg.listen;
         let admission = admission.clone();
         let tls = tls.clone();
+        let web_root = cfg.web_root.clone();
         let shutdown = shutdown.as_ref().map(Arc::clone);
         handles.push(std::thread::spawn(move || {
             worker_main(
@@ -133,6 +139,7 @@ pub fn serve_with_shutdown(
                 header_timeout,
                 idle_timeout,
                 tls,
+                web_root,
                 shutdown,
                 drain,
                 w,
@@ -153,6 +160,7 @@ fn worker_main(
     header_timeout: std::time::Duration,
     idle_timeout: std::time::Duration,
     tls: Option<Arc<TlsState>>,
+    web_root: Option<std::path::PathBuf>,
     shutdown: Option<Arc<AtomicBool>>,
     drain: Duration,
     worker_id: usize,
@@ -190,6 +198,7 @@ fn worker_main(
                     let service = service.clone();
                     let admission = admission.clone();
                     let tls = tls.clone();
+                    let web_root = web_root.clone();
                     tokio::spawn(async move {
                         match &tls {
                             // TLS:先握手(慢路径;失败即断开);零拷贝禁用
@@ -201,6 +210,7 @@ fn worker_main(
                                         s,
                                         header_timeout,
                                         idle_timeout,
+                                        web_root,
                                     )
                                     .await
                                     {
@@ -219,6 +229,7 @@ fn worker_main(
                                     stream,
                                     header_timeout,
                                     idle_timeout,
+                                    web_root,
                                 )
                                 .await
                                 {

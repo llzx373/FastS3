@@ -666,6 +666,25 @@ impl MetaStore {
         }])
     }
 
+    // —— 恢复/导入(M7 E5 meta-import;仅离线工具使用) ——
+
+    /// 将事务序号计数器设为 `base`(meta-import 用:导入的元数据从事务序号
+    /// 继续,保证 `seq > 检查点序号` 的所有导入记录在引擎打开时全部重放,
+    /// 位图恢复与崩溃重放语义完全一致)。
+    pub fn reset_seq(&self, base: u64) -> Result<()> {
+        self.db
+            .put(SYS_SEQ, base.to_be_bytes())
+            .map_err(rocks_err)?;
+        self.db.flush_wal(true).map_err(rocks_err)
+    }
+
+    /// 覆写密钥种子盐(meta-import 用:密钥密文依赖种子盐派生,AES-GCM
+    /// 密钥 = SHA-256(seed_salt);恢复时必须与导出时一致)。
+    pub fn set_seed_salt(&self, salt: &[u8]) -> Result<()> {
+        self.db.put(SYS_KEY_SEED_SALT, salt).map_err(rocks_err)?;
+        self.db.flush_wal(true).map_err(rocks_err)
+    }
+
     // —— 访问密钥(M3 密钥 CRUD;secret 哈希存储) ——
 
     /// 写/更新访问密钥。
@@ -1386,6 +1405,36 @@ mod tests {
         .unwrap();
         assert!(s.list_objects("b2", "").unwrap().is_empty());
         assert_eq!(s.list_objects("b", "").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reset_seq_and_seed_salt_import_support() {
+        // M7 E5:meta-import 的基础原语——序号可复位续写、种子盐可覆写。
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        assert_eq!(s.last_seq().unwrap(), 1);
+        // 导出时的序号(如 42)复位后,后续事务从 base+1 继续
+        s.reset_seq(42).unwrap();
+        assert_eq!(s.last_seq().unwrap(), 42);
+        s.commit_bucket_put("b2", &bucket_meta("b2")).unwrap();
+        assert_eq!(s.last_seq().unwrap(), 43);
+        // 种子盐覆写(导入备份时恢复原种子盐,AES-GCM 密文可解)
+        let salt = s.seed_salt().unwrap();
+        s.set_seed_salt(b"restored-seed-salt-000000000000000000000000000000000000")
+            .unwrap();
+        // 重开 DB 后仍是覆写值(种子盐不随 seed_salt() 默认生成逻辑变更)
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let st = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
+            st.set_seed_salt(b"x-000000000000000000000000000000000000000000000000")
+                .unwrap();
+        }
+        let st = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
+        assert_eq!(
+            st.seed_salt().unwrap(),
+            b"x-000000000000000000000000000000000000000000000000"
+        );
+        assert_ne!(salt, st.seed_salt().unwrap());
     }
 
     #[test]

@@ -12,7 +12,7 @@
 # 用法:
 #   ./build-rpm.sh [outdir]
 # 环境变量:
-#   FASTS3_VERSION   版本号(默认与 spec 内 Version 对齐:0.7.0)
+#   FASTS3_VERSION   版本号(默认与 spec 内 Version 对齐:0.8.0)
 #   FASTS3D / WEB_*  透传 build-tarball.sh
 #   FASTS3_RPMBUILD  显式指定 rpmbuild 二进制
 #   WITH_SBOM=1      打包 SBOM(默认关:spec 用 %if 0%{?with_sbom:1} 控制;
@@ -26,7 +26,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 OUTDIR="${1:-$ROOT/tools/package/dist}"
-VERSION="${FASTS3_VERSION:-0.7.0}"
+VERSION="${FASTS3_VERSION:-0.8.0}"
 SPEC="$ROOT/tools/package/fasts3.spec"
 
 # ── 检测 rpmbuild ─────────────────────────────────────────────────────────

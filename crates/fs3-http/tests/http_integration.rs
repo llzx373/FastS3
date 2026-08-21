@@ -174,6 +174,7 @@ async fn spawn_server(service: Arc<S3Service>) -> std::net::SocketAddr {
                     stream,
                     std::time::Duration::from_secs(30),
                     std::time::Duration::from_secs(60),
+                    None,
                 )
                 .await;
             });
@@ -400,6 +401,7 @@ async fn tls_put_get_roundtrip_h1() {
                         tls_s,
                         std::time::Duration::from_secs(30),
                         std::time::Duration::from_secs(60),
+                        None,
                     )
                     .await;
                 }

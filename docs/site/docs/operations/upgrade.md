@@ -26,8 +26,8 @@
 ```bash
 # 1) 安装新版本(三种形态任选):
 #    tarball: 下载解压到 /opt/fasts3(install.sh 会保留旧配置/数据)
-#    deb:      sudo dpkg -i fasts3_0.7.0_amd64.deb   (升级:dpkg -i 新包即可)
-#    rpm:      sudo rpm -Uvh fasts3-0.7.0-1.el9.x86_64.rpm
+#    deb:      sudo dpkg -i fasts3_0.8.0_amd64.deb   (升级:dpkg -i 新包即可)
+#    rpm:      sudo rpm -Uvh fasts3-0.8.0-1.el9.x86_64.rpm
 #    数据与配置(/var/lib/fasts3、/etc/fasts3)一律保留(noreplace/conffiles)
 
 # 2) 优雅停止 → 布局核对/迁移/自检(失败自动回滚)

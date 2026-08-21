@@ -234,7 +234,10 @@ impl Router {
         // 服务级:无桶
         let bucket = match bucket {
             None => {
-                if method == "GET" && query.is_empty() {
+                // AWS SDK 系客户端(如 rclone 的 Go SDK)以 GET /?x-id=ListBuckets
+                // 调用服务级列表;x-id 为 SDK 内部标记,忽略其值。
+                let only_xid = query.iter().all(|(k, _)| k.eq_ignore_ascii_case("x-id"));
+                if method == "GET" && (query.is_empty() || only_xid) {
                     return Ok(Operation::ListBuckets);
                 }
                 return Err(
@@ -530,6 +533,26 @@ mod tests {
         );
         let op = r.route("GET", "localhost", "/", &[], b"").unwrap();
         assert_eq!(op, Operation::ListBuckets);
+        // M7/L5:AWS SDK Go 系(rclone)用 GET /?x-id=ListBuckets 列桶
+        let op = r
+            .route(
+                "GET",
+                "localhost",
+                "/",
+                &[("x-id".into(), "ListBuckets".into())],
+                b"",
+            )
+            .unwrap();
+        assert_eq!(op, Operation::ListBuckets);
+        // 服务级其他查询仍拒绝(不是桶操作)
+        let bad = r.route(
+            "GET",
+            "localhost",
+            "/",
+            &[("versioning".into(), "".into())],
+            b"",
+        );
+        assert!(bad.is_err());
     }
 
     #[test]

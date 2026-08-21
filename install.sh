@@ -22,7 +22,7 @@
 #   --no-start                 安装后不尝试启动(默认仅打印启动指引)
 #   --dry-run                  只打印将执行的动作,不落盘(无 root 亦可跑)
 #   FASTS3_BASE_URL            发布宿主(默认 https://download.example.com/fasts3)
-#   FASTS3_VERSION             版本(默认 0.7.0,M6 升版)
+#   FASTS3_VERSION             版本(默认 0.8.0,M6 升版)
 #   INSTALL_ROOT               测试用假根(所有路径前加前缀,勿在生产使用)
 #
 # 仅依赖标准工具:curl 或 wget、tar、sed、id(uname/grep 随系统)。
@@ -32,7 +32,7 @@ set -euo pipefail
 # ── 默认与解析 ────────────────────────────────────────────────────────────
 # 占位宿主:发布后替换为真实下载站(如 https://get.fasts3.dev/fasts3)
 BASE_URL="${FASTS3_BASE_URL:-https://download.example.com/fasts3}"
-VERSION="${FASTS3_VERSION:-0.7.0}"
+VERSION="${FASTS3_VERSION:-0.8.0}"
 PREFIX="/opt/fasts3"
 INSTALL_ROOT="${INSTALL_ROOT:-}"     # 测试/CI 假根;生产为空
 DO_SYSTEMD=1

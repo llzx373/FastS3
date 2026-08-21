@@ -50,6 +50,8 @@ pub struct ServerConfig {
     pub tls_cert: Option<std::path::PathBuf>,
     /// TLS 私钥 PEM。
     pub tls_key: Option<std::path::PathBuf>,
+    /// 内嵌控制台静态目录(M7/I5;等价 serve --web-root)。
+    pub web_root: Option<std::path::PathBuf>,
     /// 读校验开关(M1 D3;默认关;设置页展示用,引擎级参数)。
     pub verify_reads: Option<bool>,
 }

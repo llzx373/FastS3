@@ -18,7 +18,7 @@
 # 用法:
 #   ./build-tarball.sh [outdir]
 # 环境变量:
-#   FASTS3_VERSION   版本号(默认 0.7.0 —— M6 升版;Cargo.toml 升到 0.7.0 后
+#   FASTS3_VERSION   版本号(默认 0.8.0 —— M6 升版;Cargo.toml 升到 0.8.0 后
 #                    应同步,CI 会传参保持单一事实源)
 #   FASTS3D          release 二进制(默认 target/release/fasts3d)
 #   WEB_SERVER_DIST  web/server 构建产物目录(默认 web/server/dist;缺失则跳过 web)
@@ -32,7 +32,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 OUTDIR="${1:-$ROOT/tools/package/dist}"
-VERSION="${FASTS3_VERSION:-0.7.0}"
+VERSION="${FASTS3_VERSION:-0.8.0}"
 ARCH="$(uname -m)"                     # x86_64 / aarch64(与 rpm _arch 一致)
 PKG="fasts3-$VERSION-linux-$ARCH"
 TARBALL="$OUTDIR/$PKG.tar.gz"

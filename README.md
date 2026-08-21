@@ -79,6 +79,8 @@ FastS3 的对策:**不做底层已经做过的事**。工程力量全部投入�
 
 ✅ **M4 加固完成(v0.5)。** 崩溃 1000 轮 + 断电模拟零撕裂/零泄漏/账目零漂移;故障注入(掉盘只读降级 + 告警 / 磁盘满 507 / 时钟回拨监控);H3/H4 运维命令(热重载、WS 推送、每密钥限速、超时控制);TLS(rustls 1.2/1.3 + SNI + 热加载);`fasts3d doctor` 能力自检、s3-tests 支持子集 gate 全绿、覆盖率 80.05%、扩展性 6000 万+对象恒定。
 
+✅ **M7 文档与 Beta 完成(v0.8)。** 元数据快照体系(`fasts3d meta-export`/`meta-import` + 备份/恢复演练,与底层卷快照组合成完整备份);内嵌形态(`fasts3d serve --web-root <dist>` 数据面直托管控制台,SPA 回退 + S3 路径互不干扰)与 Node 管理面多实例无状态化验证(双实例演练实测通过);文档站完整(Admin Guide/调优/故障排查与 FAQ/备份恢复/迁移/API 参考/错误码速查);迁移脚本化(MinIO⇢FastS3 `mc mirror`、公有云⇢FastS3 `rclone`,双端点演练通过);Beta 反馈闭环就绪(Beta 计划/注册下载支持通道/评审清单/issue 模板)。**公开 Beta(v0.9)入口已就绪**:Beta 用户数与 P0/P1 清零为过程门禁,随公开 Beta 执行。RELEASES.md v0.8。
+
 ✅ **M6 打包与开箱完成(v0.7)。** `fasts3d init` 交互向导(设备探测 + 文件系统签名强校验 R7 + 双确认 → 布局 → 管理员/首对密钥 → TLS 自签引导 → 配置落盘,`--yes` 非交互);`fasts3d upgrade` 升级回滚(layout_version 迁移框架 + 备份/自动回滚 + 启动自检 + N-1 原地升级实测);优雅停机(SIGTERM → 排空 ≤5s → 引擎收尾);systemd 加固单元 + 容器镜像/compose + `/health`、`/ready`(含设备可写探测)探针;admin 设置端点(GET/PATCH /v1/admin/config,热字段立即生效)+ 审计检索过滤;控制台首启向导/设置页/审计检索页;deb/rpm/tarball 打包 + CycloneDX SBOM + 产物签名 + `install.sh` 一条命令安装 + 发布流水线(release.yml/package.yml 含 ARM64 矩阵);文档站骨架 + Quickstart。门禁:**空白 VM 5 分钟演练实测 30s**(安装→init→建桶→上传下载→v0.6→v0.7 升级演练),RELEASES.md v0.7。
 
 ✅ **P1 打包存储 + M5 性能冲刺完成(v0.6)。** ADR-9 段模型(4KiB 变长段打包、跨对象开放 extent、段级派生账目、Tier2 惰性压缩、COW 段级化;利用率 ≥99%)+ M5 性能冲刺:`fs3_core::md5x4` SIMD 4 路多缓冲 MD5、etag=fast 降级开关(默认关)、运行时 A/B 结论(ADR-10:维持 thread-per-core + io_uring)、`deploy/tuning/` IRQ 亲和/NVMe scheduler 脚本、`fasts3d doctor --perf` 性能体检、loadgen 分布控制 + JSON 归档 + warp 封装、MinIO 同机对照脚本、Grafana 仪表盘 + Prometheus 告警、性能门禁入 CI(回退 >5% 禁止合并)。数值验收(§6.8 ≥90%、MinIO 对照)待真 NVMe runner,报告见 [docs/perf-M5.md](./docs/perf-M5.md)、调优见 [docs/tuning-M5.md](./docs/tuning-M5.md)。
@@ -108,7 +110,7 @@ fasts3d check --device /tmp/fs3.img --meta-dir /tmp/fs3-meta
 fasts3d check --fix --device /tmp/fs3.img --meta-dir /tmp/fs3-meta
 ```
 
-## M1 S3 核心(当前)
+## CLI 快速验证
 
 ```bash
 cargo build --release -p fs3d

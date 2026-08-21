@@ -132,6 +132,164 @@ fn init_put_get_ls_check_del_cycle() {
 }
 
 #[test]
+fn meta_export_import_roundtrip() {
+    // M7/E5:meta-export → 元数据丢失 → meta-import 恢复到同一布局设备,
+    // 对象内容(内联 + 段)完整、位图零泄漏;负例(非空目录/布局不匹配)拒绝。
+    let dir = tempfile::tempdir().unwrap();
+    let meta = dir.path().join("meta");
+    let img = init_img(dir.path(), "bk.img", "64MiB", &meta);
+    let b = "bkt";
+
+    let small_path = dir.path().join("small.bin");
+    let small_data = vec![0xABu8; 512]; // 内联(≤ 32KiB)
+    std::fs::write(&small_path, &small_data).unwrap();
+    let big_path = dir.path().join("big.bin");
+    let big_data: Vec<u8> = (0..(1024 * 1024 / 64))
+        .flat_map(|i| (i as u32).to_le_bytes().repeat(16))
+        .collect::<Vec<u8>>(); // 1MiB → 段数据
+    std::fs::write(&big_path, &big_data).unwrap();
+    for (k, f) in [("small", &small_path), ("big", &big_path)] {
+        let out = run(&[
+            "put",
+            "--device",
+            img.to_str().unwrap(),
+            "--meta-dir",
+            meta.to_str().unwrap(),
+            "--bucket",
+            b,
+            k,
+            f.to_str().unwrap(),
+        ]);
+        assert!(out.status.success(), "put {k} failed");
+    }
+
+    // 导出(停机窗口:CLI put 已收尾;导出文件权限 0600)
+    let export = dir.path().join("meta-export.json");
+    let out = run(&[
+        "meta-export",
+        "--device",
+        img.to_str().unwrap(),
+        "--meta-dir",
+        meta.to_str().unwrap(),
+        "--output",
+        export.to_str().unwrap(),
+    ]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "meta-export: {text}");
+    assert!(text.contains("2 objects"), "export summary: {text}");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&export).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "export file must be 0600");
+    }
+
+    // 模拟元数据卷丢失:meta 目录被毁,设备(底层数据卷)完好
+    std::fs::remove_dir_all(&meta).unwrap();
+
+    // 负例 1:非空 meta 目录无 --force 拒绝
+    let meta_dirty = dir.path().join("meta-dirty");
+    std::fs::create_dir_all(&meta_dirty).unwrap();
+    std::fs::write(meta_dirty.join("stray"), b"x").unwrap();
+    let out = run(&[
+        "meta-import",
+        "--device",
+        img.to_str().unwrap(),
+        "--meta-dir",
+        meta_dirty.to_str().unwrap(),
+        "--input",
+        export.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success(), "import into non-empty dir must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not empty"),
+        "expected not-empty error: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // 恢复:导入到全新 meta 目录
+    let meta2 = dir.path().join("meta2");
+    let out = run(&[
+        "meta-import",
+        "--device",
+        img.to_str().unwrap(),
+        "--meta-dir",
+        meta2.to_str().unwrap(),
+        "--input",
+        export.to_str().unwrap(),
+    ]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "meta-import failed: {text}");
+    assert!(text.contains("2 objects"), "import summary: {text}");
+    assert!(text.contains("leaks=0"), "no leaks after restore: {text}");
+
+    // 校验:ls 可见、get 内容逐字节一致
+    let out = run(&[
+        "ls",
+        "--device",
+        img.to_str().unwrap(),
+        "--meta-dir",
+        meta2.to_str().unwrap(),
+        "--bucket",
+        b,
+    ]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success());
+    assert!(text.contains("small") && text.contains("big"), "ls: {text}");
+
+    for (k, expect) in [("small", &small_data), ("big", &big_data)] {
+        let got = dir.path().join(format!("restored-{k}.bin"));
+        let out = run(&[
+            "get",
+            "--device",
+            img.to_str().unwrap(),
+            "--meta-dir",
+            meta2.to_str().unwrap(),
+            "--bucket",
+            b,
+            k,
+            got.to_str().unwrap(),
+        ]);
+        assert!(out.status.success(), "get {k} failed");
+        assert_eq!(
+            std::fs::read(&got).unwrap(),
+            *expect,
+            "content mismatch {k}"
+        );
+    }
+
+    // check 一致性:位图 vs 元数据零泄漏
+    let out = run(&[
+        "check",
+        "--device",
+        img.to_str().unwrap(),
+        "--meta-dir",
+        meta2.to_str().unwrap(),
+    ]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success());
+    assert!(text.contains("leaks:        none"), "check leaks: {text}");
+
+    // 负例 2:布局不匹配(不同容量设备)拒绝
+    let meta3 = dir.path().join("meta3");
+    let img2 = init_img(dir.path(), "other.img", "32MiB", &meta3);
+    let out = run(&[
+        "meta-import",
+        "--device",
+        img2.to_str().unwrap(),
+        "--meta-dir",
+        meta3.to_str().unwrap(),
+        "--input",
+        export.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success(), "layout mismatch must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("layout mismatch"),
+        "expected layout mismatch: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn doctor_healthy_and_uninitialized() {
     let dir = tempfile::tempdir().unwrap();
     let meta_d = dir.path().join("d-meta");

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Beta 报名与讨论
+    url: https://github.com/example/fasts3/discussions
+    about: Beta 注册、用法答疑、路线图讨论(占位:替换为真实 Discussions 链接)
+  - name: 邮件列表
+    url: https://example.com/fasts3/mailman
+    about: 发布/安全通告(占位:替换为真实订阅链接)

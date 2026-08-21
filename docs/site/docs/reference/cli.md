@@ -65,11 +65,42 @@ fasts3d serve --config fasts3.toml \
        [--listen 0.0.0.0:9000] [--workers N] \
        [--key access:secret ...](可重复) [--allow-anonymous] \
        [--admin-listen unix:///run/fasts3/admin.sock | 127.0.0.1:9001] \
-       [--admin-token TOKEN] [--max-inflight-bytes 16GiB]
+       [--admin-token TOKEN] [--max-inflight-bytes 16GiB] \
+       [--web-root web/console/dist] [--drain-secs 5]
 ```
 
 worker 0 = 自动(线程数);密钥未配置时使用开发默认 `fasts3dev/fasts3dev` 并告警;
 TLS 由配置 `server.tls_cert/tls_key` 启用(热加载)。
+
+**`--web-root <dir>`(M7/I5 内嵌形态)**:托管 Web 控制台静态产物(SPA 回退
+index.html)。路由区分:带 `Authorization`/预签名查询的请求、或首段为既有桶
+的路径一律仍走 S3;其余无认证 GET/HEAD 按静态资源返回。等价配置
+`server.web_root = "web/console/dist"`。控制台数据流仍经预签名 URL 直连数据面。
+
+## meta-export —— 元数据快照导出(M7/E5)
+
+```bash
+fasts3d meta-export --config fasts3.toml [--output meta-export.json]
+```
+
+把全部元数据(桶/密钥/对象/multipart 会话/种子盐)导出为可移植 JSON
+(对象 `inline` 数据 base64;落盘 0600)。**停机窗口执行**(rocksdb 目录锁,
+运行中的 serve 会拒绝);与底层卷快照同时采集构成完整备份,见
+[备份/恢复指南](../operations/backup-restore.md)。输出含种子盐与密钥哈希,
+属敏感文件,应加密保管。
+
+## meta-import —— 元数据快照导入(灾难恢复,M7/E5)
+
+```bash
+fasts3d meta-import --config fasts3.toml --input meta-export.json [--force]
+```
+
+恢复到**同一布局**的设备(extent_size/extent_count/layout_version 必须与导出
+一致;先恢复底层卷数据快照)。meta 目录非空时需 `--force`(旧目录改名备份,
+不删除)。导入后引擎自动重放分配记录并写新检查点;对象内容位于设备数据区,
+元数据恢复后即重新可见。
+
+## bench —— 引擎级基准(设备层直测)
 
 ## bench —— 引擎级基准(设备层直测)
 

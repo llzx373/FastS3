@@ -1,3 +1,61 @@
+# FastS3 发布记录
+## v0.8 — M7 文档与 Beta(2026-08-21)
+
+> 完整文档站 + 元数据快照体系 + 内嵌形态与多实例管理面 + 迁移工具 + Beta 反馈闭环。
+> 公开 Beta(v0.9)入口就绪;文档覆盖率检查与缺陷收敛进入实施窗口。
+
+### 新能力
+
+- **元数据快照(E5)**:`fasts3d meta-export`(全量元数据导出为可移植 JSON:
+  桶/密钥/对象/multipart 会话/种子盐;inline base64、落盘 0600)与
+  `fasts3d meta-import`(布局强校验 extent_size/extent_count/layout_version
+  必须与导出一致;meta 目录非空须 `--force` 备份重建;种子盐与事务序号
+  复位保证分配记录全量重放;导入后自动写新检查点)。与底层卷快照构成完整
+  备份体系;`tests/backup/backup-restore-drill.sh` 全链路演练(**实测通过**:
+  内联+段对象、admin 密钥、元数据损毁恢复后对象 md5 逐字节一致、密钥完整、
+  check 零泄漏)。
+- **内嵌控制台(I5)**:`fasts3d serve --web-root <dist>` 数据面直托管控制台
+  静态产物(SPA 回退、目录穿越拒绝、MIME 完整);路由区分——带认证/预签名
+  查询/首段为既有桶的请求一律保持 S3 语义;等价配置 `server.web_root`。
+  `tests/m7/webroot-drill.sh` 实测通过。
+- **管理面无状态化(I5)**:JWT 会话跨实例有效、权威状态全在 Rust 侧;
+  `tests/m7/multi-web-drill.sh` 双实例演练(登录/令牌互用/写读互见/重启
+  无损)实测通过;docker-compose 增 `fasts3-web2` 多实例示范。
+- **文档站完整(L2/L3/L5)**:Admin Guide(健康/体检/密钥桶治理/监控/多实例/
+  安全检查单)、性能调优(IRQ 亲和/调度器/内存锁/etag/sync 模式清单)、
+  故障排查与 FAQ(锁冲突/认证/507/崩溃恢复/掉盘降级/性能)、备份恢复指南
+  (两层快照 + 恢复矩阵 + 演练)、迁移指南(MinIO⇢FastS3 与公有云⇢FastS3
+  脚本化 + 检查单)、admin API / Node 管理 API 参考、错误码速查(S3/admin/
+  Node 三层)。
+- **迁移工具(L5)**:`deploy/migrate/migrate-minio.sh`(mc mirror:建桶/多线程/
+  ETag 对账/幂等追增量)与 `deploy/migrate/migrate-s3.sh`(rclone copy:
+  校验迁移 + 逐文件 check 对账;rclone 环境变量注入不落明文)。
+- **Beta 反馈闭环(L6)**:Beta 计划与反馈机制(注册/下载/支持通道/SLO/
+  闭环清单)、Beta 评审清单(NPS≥30、P0/P1 清零、文档覆盖率、全演练复核、
+  Go/No-Go 结论)、GitHub issue 模板(缺陷定级 + 环境必填 + 反馈模板)。
+  v0.9 公开 Beta(注册/下载页/支持通道)入口与执行文档就绪。
+- CLI 速查同步:meta-export / meta-import / serve --web-root 入文档站参考页。
+
+### 验证(门禁)
+
+- 新演练全绿且本地实测:`backup-restore-drill.sh`(E5)、`webroot-drill.sh`(I5)、
+  `multi-web-drill.sh`(I5);meta-export/import 集成测试(往返 + 0600 权限 +
+  布局不匹配/非空目录负例)入 `fs3d/tests/cli.rs`;静态文件单测(SPA 回退/
+  HEAD/穿越/404)入 fs3-http。
+- cargo test --workspace 全绿;fmt/clippy 0 警告;mkdocs build 0 警告。
+- 迁移脚本经真实 rclone 对 FastS3↔FastS3 双端点演练:migrate-s3.sh
+  `lsd → copy(自动建桶)→ check` 全绿,目标端对象 md5 逐字节一致;mc 路径
+  经 shim 管道验证 + M1 客户端矩阵兼容性覆盖。
+- **兼容性修复**:`GET /?x-id=ListBuckets`(AWS SDK Go 系客户端如 rclone
+  的服务级列桶约定)此前被路由为 400,现正确路由到 ListBuckets(router 单测
+  覆盖;rclone lsd 实测通过)。
+
+### 已知限制(递延)
+
+- Beta 用户数门禁(≥10 人真实使用 2 周)与 P0/P1 清零为**过程门禁**,
+  v0.9 公开 Beta 期间执行;M5 数值性能验收项待真 NVMe runner(与 M6 相同)。
+
+# FastS3 发布记录
 ## v0.7 — M6 打包与开箱(2026-08-21)
 
 > 从「能跑的引擎」到「别人敢用的产品」:init 向导 / 一键安装 / systemd+容器双形态 /
@@ -20,7 +78,6 @@
 - 单元/集成:cargo test 全绿(新增:设备探测签名识别、迁移链/备份回滚、优雅停机信号、向导凭据/unit 模板、审计过滤、TLS 自签、admin config 端点);web 集成测试(真实 fasts3d)通过;fmt/clippy 0 警告。
 - 新端点契约与 Web 侧联调通过(admin GET/PATCH /v1/admin/config、audit 过滤、/api/bootstrap)。
 
-# FastS3 发布记录
 ## v0.6 — P1 打包存储 + M5 性能冲刺(2026-08-21)
 
 > 两个里程碑合入 v0.6:存储层按 ADR-9 重新实现(布局版本 2,放弃旧布局前置兼容);

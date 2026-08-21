@@ -22,13 +22,13 @@
 ## 构建与运行
 
 ```bash
-docker build -f deploy/container/Dockerfile -t fasts3:0.7.0 .
+docker build -f deploy/container/Dockerfile -t fasts3:0.8.0 .
 docker run -d --name fasts3 \
   -p 9000:9000 -p 8080:8080 \
   -v "$(pwd)/data:/var/lib/fasts3" \
   -v "$(pwd)/fasts3.toml:/etc/fasts3/fasts3.toml:ro" \
   --ulimit memlock=-1:-1 \
-  fasts3:0.7.0
+  fasts3:0.8.0
 # 初始化(镜像文件): docker exec -it fasts3 fasts3d init \
 #   --config /etc/fasts3/fasts3.toml --device /var/lib/fasts3/disk.img --size 20GiB
 ```
@@ -61,6 +61,24 @@ tls_key  = "/etc/fasts3/tls/privkey.pem"
 ```
 
 签发(ACME/自签)见 `deploy/tls/`。
+
+## 多实例管理面(M7/I5)
+
+`docker compose up` 默认起 `fasts3`(数据面)+ `fasts3-web`;compose 文件另含
+`fasts3-web2` 示范——管理面无状态(JWT 共享密钥 + 权威状态在 Rust 侧),
+任意实例可增删/重启,会话令牌跨实例有效。实测脚本:
+`tests/m7/multi-web-drill.sh`。
+
+## 内嵌控制台(M7/I5)
+
+无 Node 管理面时,数据面可直接托管控制台静态产物:
+
+```bash
+docker run -d --name fasts3 -p 9000:9000 \
+  -v $PWD/data:/var/lib/fasts3 fasts3:0.8.0 \
+  ... --web-root /opt/fasts3/web/console/dist
+# 浏览器访问 http://host:9000/(大对象仍走预签名直连数据面)
+```
 
 ## 升级
 

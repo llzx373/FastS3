@@ -24,19 +24,19 @@ cd web && pnpm install && pnpm -r build && cd ..
 tools/sbom/sbom.sh
 
 # 2) 制品
-tools/package/build-tarball.sh     # → dist/fasts3-0.7.0-linux-x86_64.tar.gz + sha256sums
-tools/package/build-deb.sh         # → dist/fasts3_0.7.0_amd64.deb       (需 dpkg-deb)
+tools/package/build-tarball.sh     # → dist/fasts3-0.8.0-linux-x86_64.tar.gz + sha256sums
+tools/package/build-deb.sh         # → dist/fasts3_0.8.0_amd64.deb       (需 dpkg-deb)
 tools/package/build-rpm.sh         # → dist/rpmbuild/RPMS/x86_64/*.rpm  (需 rpmbuild,见下)
                                    #   rpm 真机机构建建议 rockylinux:9 容器:
                                    #   docker run --rm -v "$PWD":/src -w /src rockylinux:9 \
                                    #     bash -c 'dnf install -y rpm-build cargo rust clang gcc-c++ && tools/package/build-rpm.sh'
 
 # 3) 签名(发布必做;私钥自备,见 sign.sh 头部)
-tools/package/sign.sh ./fasts3.key dist/fasts3-0.7.0-linux-x86_64.tar.gz dist/SBOM.json
+tools/package/sign.sh ./fasts3.key dist/fasts3-0.8.0-linux-x86_64.tar.gz dist/SBOM.json
 
 # 4) 校验发布物
 cat dist/sha256sums
-minisign -Vm dist/fasts3-0.7.0-linux-x86_64.tar.gz -p fasts3.pub
+minisign -Vm dist/fasts3-0.8.0-linux-x86_64.tar.gz -p fasts3.pub
 ```
 
 ## 「一条命令安装」三种形态(README 承诺,ROADMAP §1.1)
@@ -50,14 +50,14 @@ minisign -Vm dist/fasts3-0.7.0-linux-x86_64.tar.gz -p fasts3.pub
 2. **apt 本地/镜像仓库(Debian/Ubuntu)**
    ```bash
    # 一次性:把 dist 目录做成 flat repo 并发布到内网镜像,或直接:
-   sudo dpkg -i dist/fasts3_0.7.0_amd64.deb    # 依赖 libc6,apt 会补
+   sudo dpkg -i dist/fasts3_0.8.0_amd64.deb    # 依赖 libc6,apt 会补
    # 企业形态:发布到自有 apt 仓库(如 aptly/reprepro),客户端:
    #   echo 'deb https://repo.example.com/fasts3 bookworm main' > /etc/apt/sources.list.d/fasts3.list
    #   sudo apt update && sudo apt install fasts3
    ```
 3. **dnf/yum(Rocky/Alma/Fedora)**
    ```bash
-   # 一次性: sudo rpm -ivh dist/rpmbuild/RPMS/x86_64/fasts3-0.7.0-1.el9.x86_64.rpm
+   # 一次性: sudo rpm -ivh dist/rpmbuild/RPMS/x86_64/fasts3-0.8.0-1.el9.x86_64.rpm
    # 企业形态:发布到自有 yum 仓库(createrepo),客户端:
    #   sudo dnf config-manager --add-repo https://repo.example.com/fasts3/fasts3.repo
    #   sudo dnf install fasts3
@@ -78,8 +78,8 @@ minisign -Vm dist/fasts3-0.7.0-linux-x86_64.tar.gz -p fasts3.pub
 
 ## 版本号
 
-脚本默认 `FASTS3_VERSION=0.7.0`(M6 升版目标);`Cargo.toml` workspace 升到
-0.7.0 后,CI/发布流水线统一传 `FASTS3_VERSION` 保持单一事实源(见
+脚本默认 `FASTS3_VERSION=0.8.0`(M6 升版目标);`Cargo.toml` workspace 升到
+0.8.0 后,CI/发布流水线统一传 `FASTS3_VERSION` 保持单一事实源(见
 .github/workflows/package.yml 与 release.yml)。
 
 ## 环境受限说明

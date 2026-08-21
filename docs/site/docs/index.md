@@ -1,8 +1,8 @@
 # FastS3 文档
 
-> 本站点为 **M6 文档站骨架**(TODO.md L1):结构与 Quickstart 已可用,完整
-> 内容(Admin Guide / Tuning / Troubleshooting / API 参考)在 **M7** 补齐。
-> 版本:0.7.0(M6 打包与开箱)。
+> **M7 文档与 Beta**(v0.8):文档站完整——管理员指南 / 调优 / 故障排查 /
+> 备份恢复 / 迁移 / API 参考 / 错误码速查 / Beta 计划,全部就位。
+> 公开 Beta 报名与支持通道见 [Beta 计划](beta/index.md)。
 
 FastS3 是面向**裸块设备 / 磁盘镜像文件**的单机高性能 S3 服务:
 
@@ -15,7 +15,8 @@ FastS3 是面向**裸块设备 / 磁盘镜像文件**的单机高性能 S3 服�
 | 项 | 状态 |
 | --- | --- |
 | 构建 | [![CI](https://img.shields.io/badge/CI-passing-brightgreen)](https://example.com/fasts3/actions) <!-- 占位:替换为真实 workflow 徽章 --> |
-| 版本 | v0.7.0(M6) |
+| 版本 | v0.8.0(M7 文档与 Beta) |
+| Beta | 公开 Beta 计划(≥10 用户 2 周 → v0.9) |
 | 性能门禁 | [![Perf](https://img.shields.io/badge/perf-gate-passing-brightgreen)]() <!-- 占位 --> |
 | 依赖审计 | [![Audit](https://img.shields.io/badge/audit-0%20vuln-brightgreen)]() <!-- 占位 --> |
 
@@ -25,7 +26,13 @@ FastS3 是面向**裸块设备 / 磁盘镜像文件**的单机高性能 S3 服�
 - [systemd 部署](deployment/systemd.md):加固单元、目录与权限、安装脚本
 - [容器部署](deployment/container.md):多阶段镜像、compose、特权/TLS/升级
 - [升级与回滚](operations/upgrade.md):N-1 保证、迁移失败自动回滚
-- [fasts3d 命令速查](reference/cli.md):init / check / doctor / upgrade / serve / bench / loadgen / compact
+- [管理员指南](operations/admin-guide.md):健康/体检/密钥与桶治理/监控/多实例
+- [备份/恢复](operations/backup-restore.md):meta-export + 卷快照,演练脚本
+- [迁移](operations/migration.md):MinIO(mc mirror)/ 公有云(rclone)脚本化
+- [性能调优](operations/tuning.md):IRQ 亲和/调度器/内存锁清单
+- [故障排查与 FAQ](operations/troubleshooting.md):常见问题处置
+- [fasts3d 命令速查](reference/cli.md):init / check / doctor / upgrade / meta-export / meta-import / serve --web-root / bench / loadgen / compact
+- [admin API 参考](reference/admin-api.md) / [Node 管理 API](reference/web-api.md) / [错误码速查](reference/errors.md)
 
 ## 项目形态
 
