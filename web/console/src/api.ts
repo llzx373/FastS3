@@ -68,6 +68,64 @@ export interface UploadInfo {
   parts?: number;
 }
 
+/** GET /api/config 返回的运行时配置形状(J5;字段可能缺失,消费方需容错)。 */
+export interface AdminConfig {
+  source: string;
+  storage: {
+    devices: string[];
+    meta_dir: string;
+    sync_mode?: "group" | "full" | "none";
+    group_commit_ms?: number;
+    checkpoint_interval?: number;
+    etag_mode?: "md5" | "crc32c";
+    verify_reads?: boolean;
+  };
+  server: {
+    listen?: string;
+    workers?: number;
+    max_inflight_bytes?: number;
+    header_timeout_secs?: number;
+    idle_timeout_secs?: number;
+    tls_cert?: string | null;
+    tls_key?: string | null;
+  };
+  limits: {
+    key_rps?: number;
+  };
+  auth: {
+    region?: string;
+    allow_anonymous?: boolean;
+  };
+  log_level?: string;
+  /** 可热重载字段;其余字段改动需重启 */
+  hot?: string[];
+}
+
+/** PATCH /api/config 返回:applied 已热生效 / restart_required 需重启。 */
+export interface ConfigPatchResult {
+  applied: string[];
+  saved_to_file: boolean;
+  restart_required: string[];
+}
+
+export interface AuditFilters {
+  limit?: number;
+  since?: number;
+  until?: number;
+  op?: string;
+  bucket?: string;
+  key?: string;
+  who?: string;
+  status?: number;
+}
+
+export interface BootstrapInfo {
+  first_run: boolean;
+  keys: number;
+  buckets: number;
+  version: string;
+}
+
 export interface MetricsSnapshotData {
   uptime: number;
   degraded: boolean;
@@ -204,7 +262,29 @@ export const api = {
   abortUpload: (uploadId: string) =>
     request<{ aborted: boolean }>("POST", `/api/uploads/${encodeURIComponent(uploadId)}/abort`),
 
-  audit: (limit = 200) => request<{ audit: AuditEntry[] }>("GET", `/api/audit?limit=${limit}`),
+  audit: (opts: AuditFilters = {}) => {
+    const q = new URLSearchParams();
+    q.set("limit", String(opts.limit ?? 200));
+    if (opts.since !== undefined) q.set("since", String(Math.floor(opts.since)));
+    if (opts.until !== undefined) q.set("until", String(Math.floor(opts.until)));
+    if (opts.op) q.set("op", opts.op);
+    if (opts.bucket) q.set("bucket", opts.bucket);
+    if (opts.key) q.set("key", opts.key);
+    if (opts.who) q.set("who", opts.who);
+    if (opts.status !== undefined) q.set("status", String(Math.floor(opts.status)));
+    return request<{ audit: AuditEntry[] }>("GET", `/api/audit?${q}`);
+  },
+
+  /** J5:首启探测(无认证)。 */
+  bootstrap: () => request<BootstrapInfo>("GET", "/api/bootstrap"),
+
+  /** J5:读取运行时配置。 */
+  config: () => request<AdminConfig>("GET", "/api/config"),
+  /** J5:部分更新配置(PATCH;applied/restart_required 原样返回)。 */
+  updateConfig: (patch: Record<string, unknown>) => request<ConfigPatchResult>("PATCH", "/api/config", patch),
+  /** J5:热重载配置(admin 已有端点)。 */
+  reloadConfig: () => request<Record<string, unknown>>("POST", "/api/config/reload"),
+
   repair: () => request<{ freed_extents: number; leaks_found: number; bytes_reclaimed: number }>(
     "POST",
     "/api/repair",

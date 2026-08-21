@@ -1,7 +1,7 @@
 {
   "name": "fasts3-web-workspace",
   "private": true,
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "FastS3 管理面:fasts3-web(Node Fastify)+ console(React/Vite)(M3 起实现)",
   "engines": {
     "node": ">=20"

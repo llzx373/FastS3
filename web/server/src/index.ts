@@ -3,6 +3,7 @@
  *
  * 端点(设计 §7.3):
  *   POST /api/login                       登录(JWT HS256,admin/readonly 角色)
+ *   GET  /api/bootstrap                   首启探测(无认证;first_run=keys==0&&buckets==0)
  *   GET  /api/health                      自身健康检查
  *   GET  /api/dashboard                   聚合概览
  *   GET/POST/DELETE /api/buckets[/{name}] 桶管理(代理 Rust admin)
@@ -13,7 +14,9 @@
  *   GET/POST/DELETE /api/keys[/{id}]      密钥管理(代理)
  *   PUT  /api/keys/{access}/policy        密钥策略文档(代理 admin PATCH)
  *   GET  /api/uploads;POST /api/uploads/{id}/abort
- *   GET  /api/audit                       审计查询
+ *   GET  /api/audit                       审计查询(limit/since/until/op/bucket/key/who/status 透传)
+ *   GET/PATCH /api/config                 运行时配置读取/部分更新(代理 admin)
+ *   POST /api/config/reload               热重载配置(代理 admin)
  *   POST /api/repair                      泄漏修复
  *   GET  /api/metrics/history?limit=N     指标历史(24h×5s 环形缓冲,I4)
  *   WS   /api/ws                          实时指标推送(优先 Rust WS,回退轮询)
@@ -75,6 +78,26 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       adminError,
       version: "0.4.0",
       uptimeSecs: Math.floor(process.uptime()),
+    };
+  });
+
+  // ── 首启探测(J5,无认证):first_run = keys==0 && buckets==0 ──
+  app.get("/api/bootstrap", async (_req, reply) => {
+    let status: Record<string, unknown>;
+    try {
+      status = await admin.status();
+    } catch (e) {
+      return reply.code(503).send({
+        error: { code: "admin_unreachable", message: (e as Error).message },
+      });
+    }
+    const keys = Number(status.keys ?? 0);
+    const buckets = Number(status.buckets ?? 0);
+    return {
+      first_run: keys === 0 && buckets === 0,
+      keys,
+      buckets,
+      version: String(status.version ?? "?"),
     };
   });
 
@@ -346,13 +369,75 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     }
   );
 
-  // ── 审计 ──
-  app.get<{ Querystring: { limit?: string } }>("/api/audit", async (req, reply) => {
+  // ── 审计(J5:limit/since/until/op/bucket/key/who/status 全部透传) ──
+  app.get<{
+    Querystring: {
+      limit?: string;
+      since?: string;
+      until?: string;
+      op?: string;
+      bucket?: string;
+      key?: string;
+      who?: string;
+      status?: string;
+    };
+  }>("/api/audit", async (req, reply) => {
     try {
-      const limit = Number(req.query.limit ?? 200);
-      return await admin.audit(Number.isFinite(limit) ? limit : 200);
+      const q = req.query;
+      const num = (v: string | undefined): number | undefined => {
+        if (v === undefined || v === "") return undefined;
+        const n = Number(v);
+        return Number.isFinite(n) ? n : undefined;
+      };
+      const filt: Parameters<typeof admin.audit>[0] = { limit: num(q.limit) ?? 200 };
+      const since = num(q.since);
+      const until = num(q.until);
+      const status = num(q.status);
+      if (since !== undefined) filt.since = since;
+      if (until !== undefined) filt.until = until;
+      if (status !== undefined) filt.status = status;
+      if (q.op) filt.op = q.op;
+      if (q.bucket) filt.bucket = q.bucket;
+      if (q.key) filt.key = q.key;
+      if (q.who) filt.who = q.who;
+      return await admin.audit(filt);
     } catch (e) {
       return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+    }
+  });
+
+  // ── 运行时配置(J5,代理 admin GET/PATCH /v1/admin/config) ──
+  app.get("/api/config", async (_req, reply) => {
+    try {
+      return await admin.getConfig();
+    } catch (e) {
+      return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+    }
+  });
+
+  app.patch<{ Body: Record<string, unknown> }>(
+    "/api/config",
+    { preHandler: requireRole("admin") },
+    async (req, reply) => {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      if (typeof body !== "object" || Array.isArray(body)) {
+        return reply.code(400).send({ error: { code: "bad_request", message: "body must be a JSON object" } });
+      }
+      try {
+        // 原样透传:applied / saved_to_file / restart_required
+        return await admin.patchConfig(body);
+      } catch (e) {
+        return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+      }
+    }
+  );
+
+  // ── 配置热重载(M4/H3:POST /v1/admin/config/reload) ──
+  app.post("/api/config/reload", { preHandler: requireRole("admin") }, async (_req, reply) => {
+    try {
+      return await admin.reloadConfig();
+    } catch (e) {
+      return reply.code(502).send({ error: { code: "reload_failed", message: (e as Error).message } });
     }
   });
 

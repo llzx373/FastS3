@@ -9,6 +9,12 @@ web/**/dist/
 __pycache__/
 var/
 tools/*
-# M5 G4 运行时 A/B 工具是仓库交付物(独立 workspace,不参与主构建):
+# 独立 workspace 工具是仓库交付物(不参与主构建/主锁文件),按需例外:
 !tools/runtime-ab/
+!tools/sbom/
+!tools/package/
 *.tsbuildinfo
+# 打包产出与独立 crate 的构建产物不入库:
+tools/package/dist/
+tools/sbom/target/
+tools/runtime-ab/target/

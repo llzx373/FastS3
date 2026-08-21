@@ -87,7 +87,14 @@ test("integration: fasts3d + admin + dashboard", { skip: !runInteg }, async () =
   dir = fs.mkdtempSync(path.join(os.tmpdir(), "fs3-int-"));
   const img = path.join(dir, "disk.img");
   fs.writeFileSync(img, Buffer.alloc(64 * 1024 * 1024));
-  execFileSync(bin, ["init", "--device", img, "--size", "64MiB"]);
+  // M6:init 向导非交互(--yes,跳过 TLS;凭据/配置落在临时目录)
+  execFileSync(bin, [
+    "init", "--yes", "--no-tls",
+    "--device", img, "--size", "64MiB",
+    "--meta-dir", path.join(dir, "meta"),
+    "--data-dir", dir,
+    "--config", path.join(dir, "fasts3.toml"),
+  ]);
   const port = 19100 + Math.floor(Math.random() * 500);
   const adminPort = port + 1;
   proc = spawn(
@@ -143,7 +150,7 @@ test("integration: fasts3d + admin + dashboard", { skip: !runInteg }, async () =
 
   // 审计:先经数据面产生一个 S3 操作(签名 PUT),再查询
   await s3Put(`http://127.0.0.1:${port}`, "int-bucket", "audit-obj.txt", "hello audit", "intkey", "intsecret");
-  const audit = await admin.audit(50);
+  const audit = await admin.audit({ limit: 50 });
   assert.ok(audit.audit.length >= 1, "audit must contain at least one S3 op");
   assert.ok(audit.audit.some((e) => e.op === "PutObject" || e.op === "put"));
 

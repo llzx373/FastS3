@@ -16,9 +16,24 @@ fn run(args: &[&str]) -> Output {
         .expect("run fasts3d")
 }
 
-fn init_img(dir: &Path, name: &str, size: &str) -> PathBuf {
+/// M6:init 向导非交互(--yes)初始化;配置/数据落在临时目录。
+fn init_img(dir: &Path, name: &str, size: &str, meta_dir: &Path) -> PathBuf {
     let img = dir.join(name);
-    let out = run(&["init", "--device", img.to_str().unwrap(), "--size", size]);
+    let out = run(&[
+        "init",
+        "--yes",
+        "--no-tls",
+        "--device",
+        img.to_str().unwrap(),
+        "--size",
+        size,
+        "--meta-dir",
+        meta_dir.to_str().unwrap(),
+        "--data-dir",
+        dir.to_str().unwrap(),
+        "--config",
+        dir.join("fasts3.toml").to_str().unwrap(),
+    ]);
     assert!(
         out.status.success(),
         "init failed: {}",
@@ -30,8 +45,8 @@ fn init_img(dir: &Path, name: &str, size: &str) -> PathBuf {
 #[test]
 fn init_put_get_ls_check_del_cycle() {
     let dir = tempfile::tempdir().unwrap();
-    let img = init_img(dir.path(), "disk.img", "64MiB");
     let meta = dir.path().join("meta");
+    let img = init_img(dir.path(), "disk.img", "64MiB", &meta);
     let b = "bkt";
 
     let small = dir.path().join("small.bin");
@@ -119,10 +134,10 @@ fn init_put_get_ls_check_del_cycle() {
 #[test]
 fn doctor_healthy_and_uninitialized() {
     let dir = tempfile::tempdir().unwrap();
-    let img = init_img(dir.path(), "d.img", "32MiB");
-    let cfg = dir.path().join("d.toml");
     let meta_d = dir.path().join("d-meta");
     std::fs::create_dir_all(&meta_d).unwrap();
+    let img = init_img(dir.path(), "d.img", "32MiB", &meta_d);
+    let cfg = dir.path().join("d.toml");
     std::fs::write(
         &cfg,
         format!(
@@ -160,8 +175,8 @@ fn doctor_healthy_and_uninitialized() {
 #[test]
 fn bench_and_stress_smoke() {
     let dir = tempfile::tempdir().unwrap();
-    let img = init_img(dir.path(), "b.img", "64MiB");
     let meta = dir.path().join("m");
+    let img = init_img(dir.path(), "b.img", "64MiB", &meta);
     // bench 引擎基准(小规模:1s write)
     let out = run(&[
         "bench",

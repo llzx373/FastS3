@@ -1,0 +1,57 @@
+# FastS3 管理面(systemd 单元,M6/K2):Node.js 管理 API + 静态控制台。
+#
+# 运行形态:web/server 的编译产物(node dist/index.js),提供
+#   - 管理 REST API(Fastify,JWT 登录、admin 通道代理、presign、multipart 编排);
+#   - --static 静态托管 web/console 构建产物(控制台 SPA)。
+# 本单元永不进入数据热路径;所有状态在 Rust 侧(fasts3.service)。
+#
+# 需要先启动数据面(admin unix socket / tcp 端点),因此排序在 fasts3.service 之后。
+
+[Unit]
+Description=FastS3 管理面(Node Fastify + Web 控制台)
+# 占位:替换为真实仓库/文档 URL(systemd 单元不支持行内注释,URL 独占一行)
+Documentation=https://github.com/example/fasts3
+After=fasts3.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# ── ExecStart(EXAMPLE_CMD 占位)───────────────────────────────────────────
+# 以 web/server/src/config.ts 为准:Node 侧当前实现**不解析命令行 --config**,
+# 配置来源优先级是 环境变量 > 配置文件 > 默认值:
+#   - 环境变量 FS3_WEB_CONFIG 指向 JSON 配置文件(推荐,见下);
+#   - 否则读取 dist 同级 config.json(安装到 /opt/fasts3/web/server/config.json);
+#   - 再否则使用环境变量/默认值(见 config.ts 各字段)。
+# 任务约定的形态「node dist/index.js --config /etc/fasts3/web.json」是规划中的
+# EXAMPLE_CMD;在路由 --config 参数实现前,请用环境变量方式(已启用):
+#
+#   # 规划形态(实现 --config 参数后取消注释):
+#   # ExecStart=/usr/bin/node /opt/fasts3/web/server/dist/index.js --config /etc/fasts3/web.json
+#
+#   # 当前实际形态(与 config.ts 一致):
+Environment=FS3_WEB_CONFIG=/etc/fasts3/web.json
+# 仅回环监听 127.0.0.1:8080 —— 管理面不对公网暴露;需要对外访问请经反向
+# 代理(TLS 终止),不要直接改绑 0.0.0.0。
+Environment=FS3_WEB_LISTEN=127.0.0.1:8080
+# 静态资源(控制台 dist)由 Node 内嵌提供;路径按安装布局 /opt/fasts3
+Environment=FS3_WEB_STATIC=/opt/fasts3/web/console/dist
+ExecStart=/usr/bin/node /opt/fasts3/web/server/dist/index.js
+Restart=on-failure
+RestartSec=2s
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# 加固:管理面无写盘需求,ReadWritePaths 不需要/最小(全只读);
+# 信任配置从 /etc/fasts3/web.json 只读加载,运行时零写路径。
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+UMask=0077
+# 不写任何 StateDirectory/RuntimeDirectory:状态全在 Rust 侧,Node 无状态。
+
+[Install]
+WantedBy=multi-user.target

@@ -5,7 +5,9 @@
 //! S3Service 共享(引擎 std Mutex 串行化)。thread-per-core 零拷贝优化在 M5。
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use fs3_s3::S3Service;
 use tokio::net::TcpListener;
@@ -55,7 +57,22 @@ impl Default for HttpServerConfig {
 
 /// 启动 HTTP 服务器(阻塞;每 worker 一个 runtime + SO_REUSEPORT listener)。
 /// TLS 启用时:并发起证书热加载轮询线程(5s;文件 mtime 变更即替换)。
+/// 等价于 `serve_with_shutdown(service, cfg, None, 5s)`(无优雅停机)。
 pub fn serve(service: Arc<S3Service>, cfg: &HttpServerConfig) -> std::io::Result<()> {
+    serve_with_shutdown(service, cfg, None, Duration::from_secs(5))
+}
+
+/// M6 / K4:带优雅停机的服务器入口。
+///
+/// `shutdown` 置位后:各 worker 停止接受新连接(≤200ms 轮询)、等待在途
+/// 请求完成(上限 `drain`),随后函数返回(所有 worker 线程退出)。
+/// 调用方应在返回后做引擎收尾(最终检查点 + 元数据关闭),再退出进程。
+pub fn serve_with_shutdown(
+    service: Arc<S3Service>,
+    cfg: &HttpServerConfig,
+    shutdown: Option<Arc<AtomicBool>>,
+    drain: Duration,
+) -> std::io::Result<()> {
     let workers = if cfg.workers == 0 {
         std::thread::available_parallelism()
             .map(|n| n.get())
@@ -71,19 +88,28 @@ pub fn serve(service: Arc<S3Service>, cfg: &HttpServerConfig) -> std::io::Result
         );
     }
     tracing::info!(
-        "fasts3d S3 http listening on {} ({} workers, SO_REUSEPORT, tls={})",
+        "fasts3d S3 http listening on {} ({} workers, SO_REUSEPORT, tls={}, drain={:?})",
         cfg.listen,
         workers,
-        tls.is_some()
+        tls.is_some(),
+        drain
     );
 
     // 证书热加载轮询(每 5s 查 mtime;换证书不断连,新连接用新配置)
     if let Some(state) = &tls {
         let state = state.clone();
+        let shutdown = shutdown.as_ref().map(Arc::clone);
         std::thread::Builder::new()
             .name("fs3-tls-reload".into())
             .spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_secs(5));
+                if shutdown
+                    .as_ref()
+                    .map(|f| f.load(Ordering::Relaxed))
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs(5));
                 state.reload_if_changed();
             })
             .map_err(std::io::Error::other)?;
@@ -98,6 +124,7 @@ pub fn serve(service: Arc<S3Service>, cfg: &HttpServerConfig) -> std::io::Result
         let listen = cfg.listen;
         let admission = admission.clone();
         let tls = tls.clone();
+        let shutdown = shutdown.as_ref().map(Arc::clone);
         handles.push(std::thread::spawn(move || {
             worker_main(
                 service,
@@ -106,6 +133,8 @@ pub fn serve(service: Arc<S3Service>, cfg: &HttpServerConfig) -> std::io::Result
                 header_timeout,
                 idle_timeout,
                 tls,
+                shutdown,
+                drain,
                 w,
             );
         }));
@@ -116,6 +145,7 @@ pub fn serve(service: Arc<S3Service>, cfg: &HttpServerConfig) -> std::io::Result
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn worker_main(
     service: Arc<S3Service>,
     listen: SocketAddr,
@@ -123,6 +153,8 @@ fn worker_main(
     header_timeout: std::time::Duration,
     idle_timeout: std::time::Duration,
     tls: Option<Arc<TlsState>>,
+    shutdown: Option<Arc<AtomicBool>>,
+    drain: Duration,
     worker_id: usize,
 ) {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -135,8 +167,26 @@ fn worker_main(
     rt.block_on(async move {
         let listener = bind_reuseport(listen).expect("bind SO_REUSEPORT");
         loop {
-            match listener.accept().await {
-                Ok((stream, peer)) => {
+            // M4/K4 优雅停机:先查标志,再带 200ms 超时 accept(轮询标志)
+            if shutdown
+                .as_ref()
+                .map(|f| f.load(Ordering::Relaxed))
+                .unwrap_or(false)
+            {
+                tracing::info!("worker {worker_id}: shutdown flag, draining");
+                break;
+            }
+            match tokio::time::timeout(Duration::from_millis(200), listener.accept()).await {
+                Ok(Ok((stream, peer))) => {
+                    if shutdown
+                        .as_ref()
+                        .map(|f| f.load(Ordering::Relaxed))
+                        .unwrap_or(false)
+                    {
+                        // 停机窗口抢到的连接:直接断开(不接受新请求)
+                        drop(stream);
+                        break;
+                    }
                     let service = service.clone();
                     let admission = admission.clone();
                     let tls = tls.clone();
@@ -178,13 +228,18 @@ fn worker_main(
                         }
                     });
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::warn!("accept error: {e}");
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
+                Err(_elapsed) => {} // 200ms 轮询窗口:回到循环顶部查停机标志
             }
         }
     });
+    // K4 排空:等待已 spawn 的在途请求完成(上限 drain;超时任务被 drop)。
+    // runtime drop 本身也会等待任务;shutdown_timeout 给出硬上限。
+    rt.shutdown_timeout(drain);
+    tracing::info!("worker {worker_id}: drained, exiting");
 }
 
 /// SocketAddr → libc sockaddr_storage。

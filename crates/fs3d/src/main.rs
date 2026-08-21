@@ -1,22 +1,38 @@
-//! fasts3d 入口(M0 引擎 PoC + M1 S3 协议层)。
+//! fasts3d 入口(M0 引擎 PoC + M1 S3 协议层;M6 init 向导/upgrade/优雅停机)。
 //!
-//! 命令:init / put / get / del / ls / check / checkpoint / bench / serve。
+//! 命令:init / put / get / del / ls / check / checkpoint / bench / serve /
+//! upgrade / doctor / compact / loadgen / stress。
 //! 支持 `--config fasts3.toml`(设计 §10 配置的子集)。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use fs3_engine::{Engine, EngineConfig};
 use fs3_meta::SyncMode;
+use tracing_subscriber::prelude::*;
 
 mod bench;
 mod config;
 mod doctor;
 mod loadgen;
+mod settings;
+mod signal;
 mod stress;
+mod upgrade;
+mod wizard;
 
 use config::load_config;
+
+/// 日志级别热重载句柄(M6 / J5 设置页 log_level 热改;main 初始化)。
+static LOG_RELOAD: std::sync::OnceLock<
+    tracing_subscriber::reload::Handle<
+        tracing_subscriber::EnvFilter,
+        tracing_subscriber::registry::Registry,
+    >,
+> = std::sync::OnceLock::new();
 
 #[derive(Parser)]
 #[command(
@@ -63,18 +79,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// 初始化设备布局(超级块 + 检查点区);重复执行会拒绝
-    Init {
-        /// 镜像文件大小(如 1GiB);块设备忽略
-        #[arg(long)]
-        size: Option<String>,
-        /// extent 大小(1MiB~16MiB,默认 4MiB)
-        #[arg(long, default_value = "4MiB")]
-        extent_size: String,
-        /// 覆盖已初始化布局(危险)
-        #[arg(long)]
-        force: bool,
-    },
+    /// 初始化设备布局 + 首对密钥 + TLS 引导 + 配置落盘的交互向导
+    /// (M6 K1;`--yes` 非交互,自动生成凭据并仅打印一次)
+    Init(wizard::WizardArgs),
+    /// 升级/回滚(M6 K4):布局版本迁移框架 + 备份 + 启动自检
+    Upgrade(upgrade::UpgradeArgs),
     /// 流式 PUT:文件或 stdin(-)到对象
     Put {
         /// 桶名(自动创建)
@@ -155,19 +164,29 @@ enum Cmd {
         /// 管理 API Bearer token
         #[arg(long)]
         admin_token: Option<String>,
+        /// 优雅停机排空上限秒数(K4;默认 5;SIGTERM/SIGINT 触发)
+        #[arg(long, default_value_t = 5)]
+        drain_secs: u64,
     },
 }
 
 fn main() {
     // 日志(写 stderr:stdout 可能承载对象数据流)
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+    // M6 / J5:过滤层可热重载(log_level 设置;reload::Layer)
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let (filter_layer, reload_handle) = tracing_subscriber::reload::Layer::new(env_filter);
+    let _ = LOG_RELOAD.set(reload_handle);
+    settings::init_log_level(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()));
+    // fmt 层在底,EnvFilter 层在顶(先过滤、后渲染)
+    let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
-        .compact()
-        .init();
+        .compact();
+    // EnvFilter 先入栈(下层),fmt 在上;过滤判定对所有层生效
+    let subscriber = tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(fmt_layer);
+    tracing::subscriber::set_global_default(subscriber).expect("global subscriber");
 
     let cli = Cli::parse();
     if let Err(e) = run(cli) {
@@ -177,12 +196,18 @@ fn main() {
 }
 
 fn run(cli: Cli) -> fs3_core::Result<()> {
-    let cfg = load_config(cli.config.as_deref())?;
+    // init 向导的 --config 是输出文件(可能尚不存在):跳过读取;
+    // 其余命令 --config 缺失即报错(与既有语义一致)
+    let cfg = if matches!(&cli.cmd, Cmd::Init(_)) {
+        config::RootConfig::default()
+    } else {
+        load_config(cli.config.as_deref())?
+    };
     let storage = cfg.storage.clone();
 
     // 命令行覆盖配置
-    let device = cli.device.or(storage.devices.first().cloned());
-    let meta_dir = cli.meta_dir.or(storage.meta_dir);
+    let device = cli.device.clone().or(storage.devices.first().cloned());
+    let meta_dir = cli.meta_dir.clone().or(storage.meta_dir);
     let sync_mode = match cli.sync_mode.as_deref().or(storage.sync_mode.as_deref()) {
         Some("group") | None => SyncMode::Group,
         Some("full") => SyncMode::Full,
@@ -196,11 +221,16 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
     let etag_mode = parse_etag_mode(cli.etag_mode.as_deref().or(storage.etag_mode.as_deref()))?;
 
     match cli.cmd {
-        Cmd::Init {
-            size,
-            extent_size,
-            force,
-        } => cmd_init(device, size, extent_size, force),
+        Cmd::Init(args) => {
+            let _ = wizard::run_wizard(&args, cli.config.as_deref())?;
+            Ok(())
+        }
+        Cmd::Upgrade(args) => upgrade::run_upgrade(
+            &args,
+            cli.config.as_deref(),
+            cli.device.clone(),
+            cli.meta_dir.clone(),
+        ),
         Cmd::Put { bucket, key, file } => {
             let engine_cfg = engine_config(
                 device,
@@ -339,6 +369,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
             max_inflight_bytes,
             admin_listen,
             admin_token,
+            drain_secs,
         } => {
             let engine_cfg = engine_config(
                 device,
@@ -360,12 +391,15 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 max_inflight_bytes,
                 admin_listen,
                 admin_token,
+                drain_secs.max(1),
             )
         }
     }
 }
 
 /// 启动 S3 服务:引擎 + S3Service + hyper 多 worker 监听 + 可选 admin API。
+/// M6 / K4 优雅停机:SIGTERM/SIGINT → 停止接受连接 → 排空(≤ drain)→
+/// 引擎收尾(最终检查点 + 元数据关闭)→ 退出(升级流程的前置条件)。
 #[allow(clippy::too_many_arguments)]
 fn cmd_serve(
     config_path: Option<PathBuf>,
@@ -378,6 +412,7 @@ fn cmd_serve(
     cli_max_inflight: Option<u64>,
     cli_admin_listen: Option<String>,
     cli_admin_token: Option<String>,
+    drain_secs: u64,
 ) -> fs3_core::Result<()> {
     let mut engine_cfg = engine_cfg.clone();
     engine_cfg.compaction.enabled = true; // 服务常驻:后台惰性压缩(ADR-9 §6)
@@ -446,7 +481,7 @@ fn cmd_serve(
             token: token.unwrap_or_default(),
         };
         // H3:配置热重载回调(重读配置文件,应用可重载子集:限速/匿名读/配置密钥)
-        let reload: Option<Arc<fs3_admin::ReloadFn>> = config_path.map(|path| {
+        let reload: Option<Arc<fs3_admin::ReloadFn>> = config_path.clone().map(|path| {
             let svc = service.clone();
             let f: Arc<fs3_admin::ReloadFn> = Arc::new(move || -> Result<String, String> {
                 let new_cfg = config::load_config(Some(&path)).map_err(|e| e.to_string())?;
@@ -472,6 +507,13 @@ fn cmd_serve(
         });
         let admin = fs3_admin::AdminServer::new(engine.clone(), service.clone(), admin_cfg)
             .with_reload(reload);
+        // M6 / J5:设置页供应器(admin GET/PATCH /v1/admin/config)
+        let provider = Arc::new(settings::SettingsProvider::new(
+            config_path.clone(),
+            service.clone(),
+        ));
+        let (cfg_get, cfg_patch) = provider.closures();
+        let admin = admin.with_config_providers(Some(cfg_get), Some(cfg_patch));
         std::thread::Builder::new()
             .name("fs3-admin".into())
             .spawn(move || {
@@ -524,7 +566,46 @@ fn cmd_serve(
     };
     let mut http_cfg = http_cfg;
     http_cfg.tls = tls;
-    fs3_http::serve(service, &http_cfg).map_err(fs3_core::Error::Io)
+
+    // M6 / K4:优雅停机(SIGTERM/SIGINT → 排空 → 引擎收尾)
+    let shutdown = Arc::new(AtomicBool::new(false));
+    signal::install(shutdown.clone())?;
+    let serve_result = fs3_http::serve_with_shutdown(
+        service,
+        &http_cfg,
+        Some(shutdown),
+        Duration::from_secs(drain_secs),
+    );
+    // serve 返回 → 所有 worker 已排空退出;引擎收尾(最终检查点 + meta 关闭)
+    tracing::info!("http workers drained; finalizing engine (checkpoint + meta close)");
+    let mut eng = engine.write();
+    eng.close()?;
+    tracing::info!("clean shutdown complete");
+    serve_result.map_err(fs3_core::Error::Io)
+}
+
+/// 简化引擎配置(upgrade 自检等场景;全默认参数)。
+pub(crate) fn engine_config_inner(
+    device: &Path,
+    meta_dir: &Path,
+) -> fs3_core::Result<EngineConfig> {
+    Ok(EngineConfig {
+        device: device.to_path_buf(),
+        meta_dir: meta_dir.to_path_buf(),
+        debug_io: None,
+        sync_mode: fs3_meta::SyncMode::Group,
+        group_commit_ms: fs3_core::DEFAULT_GROUP_COMMIT_MS,
+        checkpoint_interval_secs: fs3_core::DEFAULT_CHECKPOINT_INTERVAL_SECS,
+        verify_reads: false,
+        io_uring: true,
+        read_only: false,
+        small_object_limit: fs3_core::SMALL_OBJECT_LIMIT,
+        etag_mode: fs3_core::EtagMode::Md5,
+        compaction: fs3_engine::CompactionConfig {
+            enabled: false,
+            ..Default::default()
+        },
+    })
 }
 
 fn engine_config(
@@ -577,47 +658,6 @@ fn parse_etag_mode(s: Option<&str>) -> fs3_core::Result<fs3_core::EtagMode> {
             "unknown etag_mode {other} (md5 | crc32c)"
         ))),
     }
-}
-
-fn cmd_init(
-    device: Option<PathBuf>,
-    size: Option<String>,
-    extent_size: String,
-    force: bool,
-) -> fs3_core::Result<()> {
-    let device = device.ok_or_else(|| {
-        fs3_core::Error::InvalidArgument(
-            "missing device (--device or config storage.devices)".into(),
-        )
-    })?;
-    let extent_bytes = config::parse_size(&extent_size)?;
-
-    // 镜像文件不存在时按 --size 创建(块设备直接探测容量)
-    if !device.exists() {
-        let size_bytes = match size {
-            Some(s) => config::parse_size(&s)?,
-            None => {
-                return Err(fs3_core::Error::InvalidArgument(format!(
-                    "{} does not exist; pass --size to create an image file",
-                    device.display()
-                )))
-            }
-        };
-        let f = std::fs::File::create(&device)?;
-        f.set_len(size_bytes)?;
-        println!("created image {} ({} bytes)", device.display(), size_bytes);
-    }
-
-    let sb = fs3_device::init_device(&device, extent_bytes, 0, force)?;
-    println!(
-        "initialized {}: extent_size={}, extents={}, data_start={}, data_end={}",
-        device.display(),
-        sb.extent_size,
-        sb.extent_count(),
-        sb.data_start,
-        sb.data_end
-    );
-    Ok(())
 }
 
 fn cmd_put(cfg: &EngineConfig, bucket: &str, key: &str, file: &str) -> fs3_core::Result<()> {

@@ -39,6 +39,69 @@ impl Default for AuditRing {
     }
 }
 
+/// 审计过滤条件(M6 / J5 审计检索页;全部可选,AND 语义)。
+#[derive(Debug, Default, Clone)]
+pub struct AuditFilter {
+    /// 返回条数上限(默认 100,封顶 5000)。
+    pub limit: usize,
+    /// 起始时间(unix 秒,含)。
+    pub since: Option<i64>,
+    /// 结束时间(unix 秒,含)。
+    pub until: Option<i64>,
+    /// 操作精确匹配(不区分大小写),如 "PutObject"。
+    pub op: Option<String>,
+    /// 桶名精确匹配。
+    pub bucket: Option<String>,
+    /// 对象键前缀匹配。
+    pub key_prefix: Option<String>,
+    /// 操作者精确匹配(access key 或 "anonymous")。
+    pub who: Option<String>,
+    /// HTTP 状态码精确匹配。
+    pub status: Option<u16>,
+}
+
+impl AuditFilter {
+    fn matches(&self, e: &AuditEntry) -> bool {
+        let ts = e.ts as i64;
+        if let Some(s) = self.since {
+            if ts < s {
+                return false;
+            }
+        }
+        if let Some(u) = self.until {
+            if ts > u {
+                return false;
+            }
+        }
+        if let Some(op) = &self.op {
+            if !e.op.eq_ignore_ascii_case(op) {
+                return false;
+            }
+        }
+        if let Some(b) = &self.bucket {
+            if e.bucket != *b {
+                return false;
+            }
+        }
+        if let Some(kp) = &self.key_prefix {
+            if !e.key.starts_with(kp.as_str()) {
+                return false;
+            }
+        }
+        if let Some(w) = &self.who {
+            if e.who != *w {
+                return false;
+            }
+        }
+        if let Some(s) = self.status {
+            if e.status != s {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 impl AuditRing {
     pub fn new(cap: usize) -> Self {
         AuditRing {
@@ -74,6 +137,19 @@ impl AuditRing {
         let buf = self.buf.lock().unwrap();
         let n = limit.min(buf.len());
         buf.iter().rev().take(n).cloned().collect()
+    }
+
+    /// 检索(M6 / J5):按过滤条件查询,最新在前;limit 封顶 5000。
+    /// limit == 0 表示默认 100(与 recent 语义一致)。
+    pub fn search(&self, f: &AuditFilter) -> Vec<AuditEntry> {
+        let limit = if f.limit == 0 { 100 } else { f.limit.min(5000) };
+        let buf = self.buf.lock().unwrap();
+        buf.iter()
+            .rev()
+            .filter(|e| f.matches(e))
+            .take(limit)
+            .cloned()
+            .collect()
     }
 
     /// 当前条数。
@@ -116,5 +192,54 @@ mod tests {
         let ring = AuditRing::new(8);
         assert!(ring.is_empty());
         assert!(ring.recent(5).is_empty());
+    }
+
+    #[test]
+    fn search_filters() {
+        let ring = AuditRing::new(64);
+        ring.push("ak1", "PutObject", "b1", "k1", 200, "1.1.1.1:1");
+        ring.push("ak2", "GetObject", "b1", "k2", 200, "1.1.1.2:1");
+        ring.push("ak1", "GetObject", "b2", "x/k3", 404, "1.1.1.1:1");
+
+        // op 过滤(大小写不敏感)
+        let f = AuditFilter {
+            op: Some("getobject".into()),
+            ..Default::default()
+        };
+        assert_eq!(ring.search(&f).len(), 2);
+        // bucket + 前缀
+        let f = AuditFilter {
+            bucket: Some("b1".into()),
+            ..Default::default()
+        };
+        assert_eq!(ring.search(&f).len(), 2);
+        let f = AuditFilter {
+            bucket: Some("b2".into()),
+            key_prefix: Some("x/".into()),
+            ..Default::default()
+        };
+        assert_eq!(ring.search(&f).len(), 1);
+        // who + status
+        let f = AuditFilter {
+            who: Some("ak1".into()),
+            status: Some(404),
+            ..Default::default()
+        };
+        assert_eq!(ring.search(&f).len(), 1);
+        assert_eq!(ring.search(&f)[0].key, "x/k3");
+        // limit
+        let f = AuditFilter {
+            limit: 1,
+            ..Default::default()
+        };
+        assert_eq!(ring.search(&f).len(), 1);
+        assert_eq!(ring.search(&f)[0].key, "x/k3"); // 最新在前
+                                                    // 时间窗
+        let now = ring.recent(1)[0].ts as i64;
+        let f = AuditFilter {
+            since: Some(now + 100),
+            ..Default::default()
+        };
+        assert!(ring.search(&f).is_empty());
     }
 }

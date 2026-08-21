@@ -79,6 +79,8 @@ FastS3 的对策:**不做底层已经做过的事**。工程力量全部投入�
 
 ✅ **M4 加固完成(v0.5)。** 崩溃 1000 轮 + 断电模拟零撕裂/零泄漏/账目零漂移;故障注入(掉盘只读降级 + 告警 / 磁盘满 507 / 时钟回拨监控);H3/H4 运维命令(热重载、WS 推送、每密钥限速、超时控制);TLS(rustls 1.2/1.3 + SNI + 热加载);`fasts3d doctor` 能力自检、s3-tests 支持子集 gate 全绿、覆盖率 80.05%、扩展性 6000 万+对象恒定。
 
+✅ **M6 打包与开箱完成(v0.7)。** `fasts3d init` 交互向导(设备探测 + 文件系统签名强校验 R7 + 双确认 → 布局 → 管理员/首对密钥 → TLS 自签引导 → 配置落盘,`--yes` 非交互);`fasts3d upgrade` 升级回滚(layout_version 迁移框架 + 备份/自动回滚 + 启动自检 + N-1 原地升级实测);优雅停机(SIGTERM → 排空 ≤5s → 引擎收尾);systemd 加固单元 + 容器镜像/compose + `/health`、`/ready`(含设备可写探测)探针;admin 设置端点(GET/PATCH /v1/admin/config,热字段立即生效)+ 审计检索过滤;控制台首启向导/设置页/审计检索页;deb/rpm/tarball 打包 + CycloneDX SBOM + 产物签名 + `install.sh` 一条命令安装 + 发布流水线(release.yml/package.yml 含 ARM64 矩阵);文档站骨架 + Quickstart。门禁:**空白 VM 5 分钟演练实测 30s**(安装→init→建桶→上传下载→v0.6→v0.7 升级演练),RELEASES.md v0.7。
+
 ✅ **P1 打包存储 + M5 性能冲刺完成(v0.6)。** ADR-9 段模型(4KiB 变长段打包、跨对象开放 extent、段级派生账目、Tier2 惰性压缩、COW 段级化;利用率 ≥99%)+ M5 性能冲刺:`fs3_core::md5x4` SIMD 4 路多缓冲 MD5、etag=fast 降级开关(默认关)、运行时 A/B 结论(ADR-10:维持 thread-per-core + io_uring)、`deploy/tuning/` IRQ 亲和/NVMe scheduler 脚本、`fasts3d doctor --perf` 性能体检、loadgen 分布控制 + JSON 归档 + warp 封装、MinIO 同机对照脚本、Grafana 仪表盘 + Prometheus 告警、性能门禁入 CI(回退 >5% 禁止合并)。数值验收(§6.8 ≥90%、MinIO 对照)待真 NVMe runner,报告见 [docs/perf-M5.md](./docs/perf-M5.md)、调优见 [docs/tuning-M5.md](./docs/tuning-M5.md)。
 
 | 文档 | 内容 |
@@ -146,7 +148,7 @@ tests/crash/run_crash_test.sh 50
 
 ## 快速开始
 
-> 实现 M6 后可用,当前为规划形态。
+> 5 分钟开箱(M6 门禁实测通过);详细命令见 [docs/site/docs/getting-started/quickstart.md](./docs/site/docs/getting-started/quickstart.md)。
 
 ```bash
 # 一键安装(规划)

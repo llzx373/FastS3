@@ -50,6 +50,8 @@ pub struct ServerConfig {
     pub tls_cert: Option<std::path::PathBuf>,
     /// TLS 私钥 PEM。
     pub tls_key: Option<std::path::PathBuf>,
+    /// 读校验开关(M1 D3;默认关;设置页展示用,引擎级参数)。
+    pub verify_reads: Option<bool>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -91,6 +93,19 @@ pub fn load_config(path: Option<&Path>) -> Result<RootConfig> {
                 .map_err(|e| Error::InvalidArgument(format!("config {}: {e}", p.display())))?;
             Ok(cfg)
         }
+    }
+}
+
+/// 以通用 toml::Value 读配置(settings 页合并写回用;保留未知字段)。
+/// 文件不存在 → 空表(便于首次落盘)。
+pub fn load_raw_toml(path: &Path) -> Result<toml::Value> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => toml::from_str(&text)
+            .map_err(|e| Error::InvalidArgument(format!("config {}: {e}", path.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(toml::Value::Table(Default::default()))
+        }
+        Err(e) => Err(Error::Io(e)),
     }
 }
 

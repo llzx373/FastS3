@@ -8,6 +8,9 @@ publish = false
 # 注意:本 crate 独立于主 workspace(不参与 Cargo.lock / CI 编译),
 # 仅用于 G4 运行时 A/B 实验。monoio/glommio 需 nightly,tokio-uring 需
 # 独立运行(RUSTFLAGS 视工具链决定)。
+# 空的 [workspace] 表 = 本目录自成一个 workspace 根(rustc >= 1.75 的嵌套
+# crate 硬要求;2026-08 修复,否则 cargo build 报 "believes it's in a workspace")。
+[workspace]
 [dependencies]
 anyhow = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

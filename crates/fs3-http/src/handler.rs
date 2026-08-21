@@ -165,6 +165,71 @@ fn rand_u64() -> u64 {
     u64::from_le_bytes(b)
 }
 
+/// M6 / K2 探针应答:
+/// - `/health`:存活探测,恒 200 {"status":"ok"};
+/// - `/ready`:就绪探测,全部检查通过 → 200,否则 503
+///   (JSON:{"status":"ready|not_ready","checks":[{"name","ok","detail"}]})。
+///
+/// HEAD 请求只回状态头(探针脚本常用 HEAD 减流量)。
+fn probe_response(service: &S3Service, path: &str, method: &str) -> Response<RespBody> {
+    let head_only = method == "HEAD";
+    let (status, body) = match path {
+        "/health" => (
+            StatusCode::OK,
+            serde_json::json!({"status": "ok", "version": env!("CARGO_PKG_VERSION")}),
+        ),
+        "/ready" => match service.readiness() {
+            Ok(r) => {
+                let checks: Vec<serde_json::Value> = r
+                    .checks
+                    .iter()
+                    .map(|(name, ok, detail)| {
+                        serde_json::json!({"name": name, "ok": ok, "detail": detail})
+                    })
+                    .collect();
+                let ready = serde_json::json!({
+                    "status": if r.ready { "ready" } else { "not_ready" },
+                    "version": r.version,
+                    "device": r.device,
+                    "checks": checks,
+                });
+                (
+                    if r.ready {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    },
+                    ready,
+                )
+            }
+            Err(e) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({"status": "not_ready", "error": e.to_string()}),
+            ),
+        },
+        _ => unreachable!("probe_response only for /health|/ready"),
+    };
+    let body = if head_only {
+        Bytes::new()
+    } else {
+        Bytes::from(body.to_string())
+    };
+    let mut builder = Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .header("cache-control", "no-store");
+    if !head_only {
+        builder = builder.header("content-length", body.len().to_string());
+    }
+    builder
+        .body(
+            Full::new(body)
+                .map_err(|e| std::io::Error::other(e.to_string()))
+                .boxed(),
+        )
+        .unwrap()
+}
+
 async fn handle(
     service: Arc<S3Service>,
     admission: Arc<crate::Admission>,
@@ -175,6 +240,13 @@ async fn handle(
     let method = req.method().as_str().to_string();
     let uri = req.uri().clone();
     let raw_path = uri.path().to_string();
+
+    // M6 / K2 健康探针(免认证;任何 Host;容器/K8s/systemd 探针用):
+    //   GET /health → 200 存活(进程在即 ok)
+    //   GET /ready  → 200/503 就绪(含设备可写探测)
+    if raw_path == "/health" || raw_path == "/ready" {
+        return Ok(probe_response(service.as_ref(), raw_path.as_str(), &method));
+    }
     // h1:Host 头;h2::authority 由 hyper 合成进 uri(uri().authority())。
     // 路由用去端口 host;h2 缺 Host 头时按原始 authority 合成签名用 host。
     let host_raw = req

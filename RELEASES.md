@@ -1,3 +1,26 @@
+## v0.7 — M6 打包与开箱(2026-08-21)
+
+> 从「能跑的引擎」到「别人敢用的产品」:init 向导 / 一键安装 / systemd+容器双形态 /
+> TLS 引导 / 升级回滚 / 设置页与审计检索 / 打包签名与 SBOM。
+
+### 新能力
+
+- **`fasts3d init` 交互向导(K1)**:探测设备 → 强校验(**块设备类型 / ext4/xfs/btrfs/swap/ntfs/fat/gpt/mbr/lvm/md 文件系统签名 / 残留数据 / 二次路径回显确认**,红线 R7)→ 布局初始化 → 管理员账号 + 首对 S3 密钥(哈希+加密入库,仅打印一次)→ TLS 自签引导 → 生成 `fasts3.toml` + `web.json` → 可选 systemd 安装/启动;`--yes` 非交互模式(危险信号拒绝,需 `--force`)。
+- **`fasts3d upgrade`(K4)**:布局版本迁移框架(迁移注册表 + 迁移链)+ 迁移前备份(超级块 + 检查点双槽)+ **失败自动回滚** + 启动自检;引擎占用预检(rocksdb 锁);N-1 原地升级保证(**v0.6 设备可被 v0.7 直接打开**,升级演练实测);版本记录 `meta/fasts3-upgrade.json`。
+- **优雅停机(K4)**:SIGTERM/SIGINT → 停止接受新连接 → 排空在途请求(≤5s,可配 `--drain-secs`)→ 引擎收尾(最终检查点 + meta 关闭);实测 SIGTERM 后 ≈0.5s 干净退出。
+- **部署形态(K2)**:systemd 加固单元(数据面 `LimitMEMLOCK=infinity`/`NoNewPrivileges`/`ProtectSystem=strict` 等 + 管理面单元)+ 多阶段容器镜像(bookworm-slim 运行库说明)+ docker-compose + `/health`(存活)、`/ready`(就绪,**含设备可写无副作用探测**:超级块扇区同内容写回)探针。
+- **TLS 引导(K3)**:向导自签证书生成(rcgen,CN+SAN+私钥 0600);证书热加载(已有)与 ACME 可选手册/脚本(`deploy/tls/acme-setup.sh`)。
+- **设置页与审计检索(J5)**:admin `GET/PATCH /v1/admin/config`(热字段:限速/匿名读/日志级别立即生效;其余写文件标 restart_required)+ 审计检索过滤(since/until/op/bucket/key/who/status);控制台首启向导(三步:建桶→生成密钥→连接示例)、设置页(applied/restart_required 展示 + config/reload)、审计检索页(时间窗/操作/桶/状态码过滤 + 颜色标记)。
+- **打包与签名(A5/K5)**:`tools/package/` deb(rpm(spec + 脚本)/tarball 构建;`install.sh` 一条命令安装(det OS/arch,docker 备选提示);SBOM CycloneDX 1.5 生成器(`tools/sbom`,独立 crate,Cargo.lock + web workspace 包);产物签名(minisign,回退 openssl ed25519);发布流水线 `release.yml`(tag v* 构建 amd64/arm64 全产物 + 签名 + 上传 GitHub Release)+ `package.yml` 安装矩阵 CI(Debian/Ubuntu、Rocky 容器、ARM64 runner)。
+- **文档站骨架(L1)**:`docs/site/`(MkDocs:Quickstart 5 分钟开箱 / systemd / 容器 / 升级回滚 / CLI 参考)。
+
+### 验证(门禁)
+
+- `tests/install/vm-drill.sh`「空白 VM 5 分钟」演练:安装 → init 向导 → 启动(/health 就绪)→ 建桶上传下载(md5 校验)→ **v0.6→v0.7 升级演练**(UPGRADE_BIN 替换 → upgrade 自检 → 数据完好),阶段计时 + 总时长断言 < 300s;本地实测通过。
+- 单元/集成:cargo test 全绿(新增:设备探测签名识别、迁移链/备份回滚、优雅停机信号、向导凭据/unit 模板、审计过滤、TLS 自签、admin config 端点);web 集成测试(真实 fasts3d)通过;fmt/clippy 0 警告。
+- 新端点契约与 Web 侧联调通过(admin GET/PATCH /v1/admin/config、audit 过滤、/api/bootstrap)。
+
+# FastS3 发布记录
 ## v0.6 — P1 打包存储 + M5 性能冲刺(2026-08-21)
 
 > 两个里程碑合入 v0.6:存储层按 ADR-9 重新实现(布局版本 2,放弃旧布局前置兼容);

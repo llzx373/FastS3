@@ -1,0 +1,184 @@
+name: Release (M6 K5/A5)
+
+# 发布流水线:on push tags 'v*' 构建全部产物并附加到 GitHub Release。
+#
+#   amd64 : tarball + deb + SBOM(+签名,release job 统一签名)
+#   arm64 : tarball + deb(arm64 runner 原生构建)
+#   rpm   : rockylinux:9 容器全量构建(amd64)
+#   release:聚合下载 → 用 secrets.MINISIGN_PRIVATE_KEY 签名 → 上传 Release
+#
+# 触发(示例):git tag v0.7.0 && git push origin v0.7.0
+# 需在仓库 Secrets 配置 MINISIGN_PRIVATE_KEY(minisign 私钥文件内容;未配置则
+# 跳过签名但产物仍发布 —— 建议发布前必须配置)。
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  FASTS3_VERSION: ""            # 留空=脚本默认;发布 tag 与包版本一致性由调用方保证
+
+jobs:
+  build-linux-amd64:
+    name: amd64 tarball + deb + SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build fasts3d (release)
+        run: cargo build --release -p fs3d
+      - name: Build web assets
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+        working-directory: web
+      - run: pnpm -r build
+        working-directory: web
+      - name: Generate SBOM
+        run: tools/sbom/sbom.sh
+      - name: Build tarball
+        run: tools/package/build-tarball.sh
+      - name: Build deb
+        run: tools/package/build-deb.sh
+      - name: Upload amd64 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-amd64
+          path: |
+            tools/package/dist/fasts3-*.tar.gz
+            tools/package/dist/fasts3_*.deb
+            tools/package/dist/SBOM.json
+            tools/package/dist/sha256sums
+          if-no-files-found: error
+
+  build-linux-arm64:
+    name: arm64 tarball + deb
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install build deps (rocksdb)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libclang-dev clang g++
+      - name: Build fasts3d (release, aarch64)
+        run: cargo build --release -p fs3d
+      - name: Build tarball (aarch64)
+        run: tools/package/build-tarball.sh
+      - name: Build deb (arm64)
+        run: tools/package/build-deb.sh
+      - name: Upload arm64 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-arm64
+          path: |
+            tools/package/dist/fasts3-*linux-aarch64.tar.gz
+            tools/package/dist/fasts3_*arm64.deb
+          if-no-files-found: error
+
+  rpm-amd64:
+    name: rpm amd64 (rockylinux:9)
+    runs-on: ubuntu-latest
+    container: rockylinux:9
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps (rpm-build + Rust + rocksdb 构建依赖)
+        run: dnf install -y rpm-build gcc-c++ clang rust cargo
+      - name: Build fasts3d (release, inside rocky container)
+        run: cargo build --release -p fs3d
+      - name: Build rpm (含 tarball Source0)
+        run: tools/package/build-rpm.sh
+      - name: Upload rpm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-rpm
+          path: tools/package/dist/rpmbuild/RPMS/**/*.rpm
+          if-no-files-found: error
+
+  release:
+    name: 聚合 → 签名 → GitHub Release
+    needs: [build-linux-amd64, build-linux-arm64, rpm-amd64]
+    runs-on: ubuntu-latest
+    env:
+      MINISIGN_PRIVATE_KEY: ${{ secrets.MINISIGN_PRIVATE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist           # dist/pkg-amd64/... 各子目录
+          merge-multiple: false
+
+      - name: Merge into flat dist (签名工具按目录处理)
+        run: |
+          set -euo pipefail
+          mkdir -p dist/flat
+          find dist -type f \( -name '*.tar.gz' -o -name '*.deb' -o -name '*.rpm' \
+            -o -name 'SBOM.json' -o -name 'sha256sums' \) -exec cp {} dist/flat/ \;
+          ls -la dist/flat
+
+      - name: Sign artifacts (MINISIGN_PRIVATE_KEY)
+        if: env.MINISIGN_PRIVATE_KEY != ''
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$MINISIGN_PRIVATE_KEY" > /tmp/fasts3.key
+          command -v minisign >/dev/null 2>&1 || sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          tools/package/sign.sh /tmp/fasts3.key dist/flat/*
+        env:
+          SIGN_OUTDIR: dist/flat
+
+      - name: Regenerate sha256sums (含签名)
+        run: (cd dist/flat && sha256sum * | sort -k2 > sha256sums)
+
+      - name: Publish Release (softprops/action-gh-release)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/flat/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+  # ── 容器镜像构建(可选)──────────────────────────────────────────────────
+  # 无 registry secrets 时本 job 保持注释。接入方式(需 Secrets:DOCKER_USERNAME/
+  # DOCKER_PASSWORD 或 GHCR 的 GITHUB_TOKEN):
+  #
+  # build-image:
+  #   name: container image (ghcr)
+  #   runs-on: ubuntu-latest
+  #   needs: [release]
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: docker/setup-buildx-action@v3
+  #     - uses: docker/login-action@v3
+  #       with:
+  #         registry: ghcr.io
+  #         username: ${{ github.actor }}
+  #         password: ${{ secrets.GITHUB_TOKEN }}
+  #     - uses: docker/build-push-action@v6
+  #       with:
+  #         context: .
+  #         file: deploy/container/Dockerfile
+  #         push: true
+  #         tags: |
+  #           ghcr.io/${{ github.repository_owner }}/fasts3:${{ github.ref_name }}
+  #           ghcr.io/${{ github.repository_owner }}/fasts3:latest
+  #         platforms: linux/amd64,linux/arm64
+  #         # 需要 buildx 跨架构模拟(binfmt);或在两架构 runner 上分别 build
+  #         cache-from: type=gha
+  #         cache-to: type=gha,mode=max

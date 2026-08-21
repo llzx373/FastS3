@@ -172,6 +172,42 @@ pub const fn tls_versions() -> &'static [&'static str] {
     &["TLS 1.2", "TLS 1.3"]
 }
 
+/// 生成自签证书(M6 / K3 TLS 引导;init 向导用)。
+///
+/// - `cn` 主 CN/首选 SAN(如 `s3.example.com` 或主机名);
+/// - `sans` 附加 SAN 域名(虚拟主机风格桶可用 `*.example.com`);
+/// - 返回 (cert_pem, key_pem)。
+///
+/// 有效期使用 rcgen 默认(约一年内);生产环境建议 ACME/CA 签发
+/// (见 deploy/tls/acme-setup.sh),证书热加载已内置:替换文件即生效。
+pub fn generate_self_signed(cn: &str, sans: &[String]) -> std::io::Result<(String, String)> {
+    let mut names: Vec<String> = Vec::with_capacity(1 + sans.len());
+    names.push(cn.to_string());
+    names.extend(sans.iter().cloned());
+    let rcgen::CertifiedKey { cert, key_pair } =
+        rcgen::generate_simple_self_signed(names).map_err(std::io::Error::other)?;
+    Ok((cert.pem(), key_pair.serialize_pem()))
+}
+
+/// 将 PEM 证书/私钥写入路径(0600;向导用);父目录不存在则创建。
+pub fn write_pem_pair(
+    cert_pem: &str,
+    key_pem: &str,
+    cert_path: &Path,
+    key_path: &Path,
+) -> std::io::Result<()> {
+    for p in [cert_path, key_path] {
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(cert_path, cert_pem.as_bytes())?;
+    std::fs::write(key_path, key_pem.as_bytes())?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
 /// 通信套件探测(诊断;ring provider)。
 pub fn cipher_suites() -> Vec<String> {
     ensure_provider();
@@ -229,6 +265,29 @@ mod tests {
             key_path: dir.path().join("nope.key"),
         };
         assert!(TlsState::load(&cfg).is_err());
+    }
+
+    #[test]
+    fn self_signed_generates_loadable_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) =
+            generate_self_signed("fs3.example.com", &["*.fs3.example.com".into()]).unwrap();
+        let cp = dir.path().join("cert.pem");
+        let kp = dir.path().join("key.pem");
+        write_pem_pair(&cert, &key, &cp, &kp).unwrap();
+        // 私钥 0600
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&kp).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        // 可被 TlsState 加载(证书有效)
+        let state = TlsState::load(&TlsConfig {
+            cert_path: cp,
+            key_path: kp,
+        })
+        .unwrap();
+        assert_eq!(state.reloads(), 0);
+        assert!(cert.contains("BEGIN CERTIFICATE"));
+        assert!(key.contains("BEGIN PRIVATE KEY"));
     }
 
     #[test]

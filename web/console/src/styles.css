@@ -137,3 +137,10 @@ button.small { padding: 4px 10px; font-size: 12px; }
 .modal { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 22px; width: 460px; max-width: 92vw; }
 .modal h3 { margin-bottom: 14px; }
 .modal .actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 18px; }
+
+/* 首启向导 / 设置页:命令示例代码块 */
+.pre {
+  background: #0b1220; border: 1px solid var(--border); border-radius: 8px;
+  padding: 12px 14px; margin: 6px 0 14px; overflow-x: auto;
+  font-family: "Cascadia Code", Consolas, monospace; font-size: 12px; line-height: 1.7; color: var(--text);
+}

@@ -12,15 +12,17 @@ parking_lot.workspace = true
 fs3-device.workspace = true
 fs3-engine.workspace = true
 fs3-s3.workspace = true
+serde_json.workspace = true
 md-5.workspace = true
 sha2.workspace = true
 hex.workspace = true
 tempfile.workspace = true
-rcgen = { version = "0.13", features = ["pem", "crypto"] }
 
 [dependencies]
 fs3-core.workspace = true
 fs3-s3.workspace = true
+serde_json.workspace = true
+rcgen.workspace = true
 fs3-engine.workspace = true
 hyper = { version = "1.5", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }

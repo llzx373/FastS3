@@ -1,0 +1,71 @@
+# FastS3 容器编排示例(M6/K2)。
+# 两个服务共享同一镜像(镜像内含数据面 + 管理面),分开调度:
+#   - fasts3:数据面(9000 对外);
+#   - fasts3-web:管理面(8080 对外,依赖数据面)。
+# 单容器双进程形态(默认 ENTRYPOINT)亦可用:docker run -p 9000:9000 -p 8080:8080 ...
+#
+# 用法:
+#   docker compose up -d --build
+#   数据卷:./data 挂到 /var/lib/fasts3(磁盘镜像 + 元数据持久化)。
+
+services:
+  fasts3:
+    build:
+      context: ..
+      dockerfile: container/Dockerfile
+    image: fasts3:0.7.0
+    # 数据面 S3 端口;如需裸设备,追加 devices: [/dev/nvme0n1]
+    ports:
+      - "9000:9000"
+    # 数据卷:镜像文件 + 元数据持久化
+    volumes:
+      - ./data:/var/lib/fasts3
+      # 正式配置挂载(可选;不挂则 entrypoint 写开发默认)
+      - ./fasts3.toml:/etc/fasts3/fasts3.toml:ro
+    # 环境变量示例(覆盖配置项;data 面 env 见 crates/fs3d/src/config.rs 加载面)
+    environment:
+      FASTS3_CONFIG: /etc/fasts3/fasts3.toml
+      # 管理通道暴露给 fasts3-web 服务(TCP 形式;默认是 unix socket,容器间不通)
+      FASTS3_ARGS: --admin-listen tcp://0.0.0.0:9001 --admin-token change-me
+    # io_uring 注册缓冲需要 mlock;受限环境放开:
+    # ulimits: { memlock: { soft: -1, hard: -1 } }
+    # 全功能 io_uring(SQPOLL)/裸设备需要特权(二选一,按需取消注释):
+    # cap_add: [SYS_ADMIN, IPC_LOCK]
+    #   —— 若数据面只用镜像文件 + 自动降级 pread/iopoll=off,可去掉 cap_add,
+    #      并把 Dockerfile 的 USER fasts3 取消注释(需 chown ./data)。
+    # privileged: true   # 最宽松形态(不推荐,仅兜底)
+    healthcheck:
+      # 存活探针:/health 恒 200;TCP 兜底兼容老版本镜像(无 /health 端点)
+      test: ["CMD", "sh", "-c", "wget -qO- http://127.0.0.1:9000/health >/dev/null 2>&1 || (command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 9000)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  fasts3-web:
+    image: fasts3:0.7.0
+    build:
+      context: ..
+      dockerfile: container/Dockerfile
+    # 本服务只跑管理面:覆盖 ENTRYPOINT 直接起 Node
+    entrypoint: ["/usr/bin/node", "/opt/fasts3/web/server/dist/index.js"]
+    ports:
+      - "8080:8080"
+    depends_on:
+      - fasts3
+    environment:
+      # 管理面仅回环是 systemd 布置;容器内需对外,把服务绑到 0.0.0.0
+      FS3_WEB_LISTEN: 0.0.0.0:8080
+      FS3_WEB_STATIC: /opt/fasts3/web/console/dist
+      FS3_WEB_JWT_SECRET: change-me-jwt-secret
+      FS3_WEB_USER: admin
+      FS3_WEB_PASSWORD: admin123
+      # 连数据面 admin 通道(与 fasts3 服务 FASTS3_ARGS 对应)
+      FS3_ADMIN_LISTEN: tcp://fasts3:9001
+      FS3_ADMIN_TOKEN: change-me
+      # 连数据面 S3(浏览/编排用)
+      FS3_S3_ENDPOINT: http://fasts3:9000
+      FS3_S3_ACCESS_KEY: fasts3dev
+      FS3_S3_SECRET_KEY: fasts3dev
+    restart: unless-stopped

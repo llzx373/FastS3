@@ -14,7 +14,8 @@ checkpoint_interval = 30
 [server]
 listen = "0.0.0.0:9000"
 workers = 0
-max_inflight_bytes = "16GiB"
+# 全局在途字节上限(整数;16GiB,超限 503 SlowDown)
+max_inflight_bytes = 17179869184
 verify_reads = false
 
 [admin]

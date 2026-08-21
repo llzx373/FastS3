@@ -69,6 +69,19 @@ pub enum ResponseBody {
 /// 大对象 PUT 走流式(见 put_object_stream)。
 pub const BUFFERED_PUT_LIMIT: usize = 8 * 1024 * 1024;
 
+/// 就绪探针报告(M6 / K2 `/ready`;S3Service::readiness)。
+#[derive(Debug, Clone)]
+pub struct ReadinessReport {
+    /// 全部检查通过(可承接新请求)。
+    pub ready: bool,
+    /// 数据面版本。
+    pub version: String,
+    /// 设备 UUID(hex)。
+    pub device: String,
+    /// 检查明细:(名称, 通过, 说明)。
+    pub checks: Vec<(&'static str, bool, String)>,
+}
+
 pub struct S3Service {
     engine: Arc<parking_lot::RwLock<Engine>>,
     auth: Authenticator,
@@ -529,6 +542,64 @@ impl S3Service {
     /// 零拷贝 fd(无 O_DIRECT;sendfile/splice 用)。
     pub fn zc_fd(&self) -> Option<i32> {
         self.engine.read().zc_fd()
+    }
+
+    /// 就绪探针(M6 / K2,`/ready` 用):廉价检查引擎/元数据/设备可写性。
+    /// 任何一项失败 → ready=false(探针返回 503)。不调用全量 check_report
+    /// (那是 O(对象数) 扫描,不适合高频探针)。
+    pub fn readiness(&self) -> fs3_core::Result<ReadinessReport> {
+        let mut checks: Vec<(&'static str, bool, String)> = Vec::new();
+        let engine = self.engine.read();
+        let sb = engine.superblock();
+        // 1) 引擎以读写模式打开(只读降级/掉盘直接不 ready)
+        let read_only = engine.read_only();
+        checks.push((
+            "engine_rw",
+            !read_only,
+            if read_only {
+                "engine opened read-only (degraded)".into()
+            } else {
+                "engine open read-write".into()
+            },
+        ));
+        // 2) 元数据可达(rocksdb 活着)
+        let meta_ok = match engine.meta().last_seq() {
+            Ok(seq) => {
+                checks.push(("meta", true, format!("meta reachable (last_seq={seq})")));
+                true
+            }
+            Err(e) => {
+                checks.push(("meta", false, format!("meta unreachable: {e}")));
+                false
+            }
+        };
+        // 3) 设备可写探针(无副作用写回超级块扇区)
+        let writable = match engine.probe_writable() {
+            Ok(()) => {
+                checks.push((
+                    "device_writable",
+                    true,
+                    "device writable (no-op write-back ok)".into(),
+                ));
+                true
+            }
+            Err(e) => {
+                checks.push((
+                    "device_writable",
+                    false,
+                    format!("device not writable: {e}"),
+                ));
+                false
+            }
+        };
+        let ready = !read_only && meta_ok && writable;
+        let uuid: String = sb.uuid.iter().map(|b| format!("{b:02x}")).collect();
+        Ok(ReadinessReport {
+            ready,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            device: uuid,
+            checks,
+        })
     }
 
     fn new_request_id(&self) -> String {

@@ -1,0 +1,41 @@
+# FastS3 容器构建上下文忽略(仓库根 = Docker build context,M6/K2)
+# compose/手动 docker build 的 context 都是仓库根(deploy/container/Dockerfile),
+# Docker 只认 context 根部的 .dockerignore —— 本文件即生效版本;
+# deploy/container/.dockerignore 是同等内容的交付副本/参考。
+# 构建阶段只依赖:源码 + 锁文件 + 部署资产。
+
+# Rust 构建缓存与产物
+target/
+**/*.rs.bk
+
+# Node / pnpm
+web/node_modules/
+web/server/node_modules/
+web/console/node_modules/
+web/**/dist/
+web/**/*.tsbuildinfo
+
+# 本地数据与运行痕迹
+var/
+*.log
+tests/bench/results/
+tests/bench/archive/
+tests/crash/run/
+__pycache__/
+
+# VCS / 编辑器
+.git/
+.github/
+.gitignore
+*.swp
+.DS_Store
+
+# 打包产物(tools/package 输出;不进镜像)
+tools/package/dist/
+rpmbuild/
+*.tar.gz
+*.deb
+*.rpm
+*.sig
+*.minisig
+SBOM.json

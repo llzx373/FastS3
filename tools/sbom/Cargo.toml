@@ -1,0 +1,32 @@
+# FastS3 SBOM 生成器(M6/A5)—— 独立 workspace 先例参照 tools/runtime-ab:
+# 不进主 workspace / 主 Cargo.lock,自带锁文件(tools/sbom/Cargo.lock 必须提交)。
+#
+# 功能:把主仓库 Cargo.lock 解析为 CycloneDX 1.5 JSON(SBOM),并可按
+#   -n/--npm 附加 web 侧 package.json(name/version)组件(purl pkg:npm/...)。
+#
+# 用法:
+#   fasts3-sbom <主Cargo.lock> -o <out.json> [-n <package.json> ...]
+# 依赖最小化:serde / serde_json / toml;时间戳与 UUID 手写(无 chrono/uuid)。
+
+[package]
+name = "fasts3-sbom"
+version = "0.1.0"
+edition = "2021"
+description = "FastS3 M6/A5:主 Cargo.lock -> CycloneDX 1.5 SBOM(独立 crate,不入主 workspace)"
+license = "Apache-2.0"
+publish = false
+
+# 注意:本 crate 独立于主 workspace(不参与主 Cargo.lock / CI 编译),
+# 仅 tools/sbom/sbom.sh 按需构建。保持依赖极少。
+# 空的 [workspace] 表 = 本目录自成一个 workspace 根(现代 cargo 的嵌套 crate
+# 要求;参照 tools/runtime-ab,该处同需此行才能用 rustc >= 1.75 构建)。
+[workspace]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

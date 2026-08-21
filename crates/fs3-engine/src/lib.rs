@@ -1824,6 +1824,16 @@ impl Engine {
         self.device.raw_fd()
     }
 
+    /// 就绪探针(M6 / K2):无副作用写回超级块扇区(pread → pwrite 同内容),
+    /// 验证设备当前真实可写。设备只读/掉盘/IO 故障 → Err → /ready 503。
+    /// 不改变任何字节:写回的是刚读出的同一内容,崩溃安全。
+    pub fn probe_writable(&self) -> fs3_core::Result<()> {
+        let mut buf = fs3_device::AlignedBuffer::new(fs3_core::SUPERBLOCK_SIZE as usize)?;
+        self.device.pread_aligned(buf.as_mut_slice(), 0)?;
+        self.device.pwrite_aligned(buf.as_slice(), 0)?;
+        Ok(())
+    }
+
     /// 读校验开关(开启时禁零拷贝)。
     pub fn verify_reads_enabled(&self) -> bool {
         self.verify_reads

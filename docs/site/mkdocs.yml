@@ -1,0 +1,42 @@
+# FastS3 文档站骨架(M6/L1)
+# 完整内容在 M7(L2/L3/L5)。本骨架目标是:mkdocs build 可跑、导航结构定型、
+# Quickstart 可照做(5 分钟开箱门禁配套)。
+
+site_name: "FastS3 文档"          # 占位;GA 前换成正式名称(如 FastS3 Docs)
+site_description: FastS3 单机高性能 S3 服务 —— 安装、部署、运维、参考
+site_url: https://example.com/fasts3/docs   # 占位:替换为真实文档站 URL
+repo_url: https://github.com/example/fasts3 # 占位:替换为真实仓库
+edit_uri: blob/main/docs/site/docs/
+
+# 主题:readthedocs 占位(零依赖开箱);GA 前评估 material 换肤
+#   pip install mkdocs-material 后改 theme: name: material,
+#   并启用 features: navigation.tabs 等(见 M7)。
+theme:
+  name: readthedocs
+  # name: material
+  # features:
+  #   - navigation.tabs
+  #   - navigation.top
+  # palette: { scheme: default, primary: indigo }
+
+nav:
+  - 首页: index.md
+  - 快速开始:
+      - 5 分钟开箱: getting-started/quickstart.md
+  - 部署:
+      - systemd: deployment/systemd.md
+      - 容器: deployment/container.md
+  - 运维:
+      - 升级与回滚: operations/upgrade.md
+  - 参考:
+      - fasts3d 命令速查: reference/cli.md
+
+markdown_extensions:
+  - admonition
+  - toc:
+      permalink: true
+  - fenced_code
+
+# 发布(占位):完整站点托管在 M7 定稿(静态导出 + CI 发布):
+#   pip install mkdocs && mkdocs build -f docs/site/mkdocs.yml
+#   → docs/site/site/(静态产物,可托管到任意静态站)

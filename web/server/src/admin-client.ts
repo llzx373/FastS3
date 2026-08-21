@@ -21,8 +21,78 @@ export interface AdminApi {
   setKeyPolicy(accessKey: string, policy: string | null): Promise<Record<string, unknown>>;
   uploads(): Promise<{ uploads: UploadInfo[] }>;
   abortUpload(uploadId: string): Promise<Record<string, unknown>>;
-  audit(limit?: number): Promise<{ audit: AuditEntry[] }>;
+  audit(opts?: AuditQuery): Promise<{ audit: AuditEntry[] }>;
+  getConfig(): Promise<AdminConfig>;
+  patchConfig(patch: Record<string, unknown>): Promise<ConfigPatchResult>;
+  reloadConfig(): Promise<Record<string, unknown>>;
   repair(): Promise<Record<string, unknown>>;
+}
+
+/** 审计查询过滤(J5:与 limit 并存的 query 参数,全部转发 Rust 侧)。 */
+export interface AuditQuery {
+  /** 返回条数上限(默认 200) */
+  limit?: number;
+  /** 起始时间(unix 秒) */
+  since?: number;
+  /** 结束时间(unix 秒) */
+  until?: number;
+  /** 操作(filter,如 PutObject) */
+  op?: string;
+  /** 桶名 (filter) */
+  bucket?: string;
+  /** 对象键 (filter) */
+  key?: string;
+  /** 操作者 (filter) */
+  who?: string;
+  /** HTTP 状态码 (filter) */
+  status?: number;
+}
+
+/**
+ * GET /v1/admin/config 返回的配置形状(J5)。
+ * 所有字段都可能缺失 —— 消费方必须逐字段容错(default)。
+ */
+export interface AdminConfig {
+  /** 配置文件路径或 "defaults" */
+  source: string;
+  storage: {
+    devices: string[];
+    meta_dir: string;
+    sync_mode?: "group" | "full" | "none";
+    group_commit_ms?: number;
+    checkpoint_interval?: number;
+    etag_mode?: "md5" | "crc32c";
+    verify_reads?: boolean;
+  };
+  server: {
+    listen?: string;
+    workers?: number;
+    max_inflight_bytes?: number;
+    header_timeout_secs?: number;
+    idle_timeout_secs?: number;
+    tls_cert?: string | null;
+    tls_key?: string | null;
+  };
+  limits: {
+    key_rps?: number;
+  };
+  auth: {
+    region?: string;
+    allow_anonymous?: boolean;
+  };
+  log_level?: string;
+  /** 可热重载字段;其余字段改动需重启 */
+  hot?: string[];
+}
+
+/** PATCH /v1/admin/config 响应。 */
+export interface ConfigPatchResult {
+  /** 已热生效条目(如 "limits.key_rps=100") */
+  applied: string[];
+  /** 是否已写入配置文件 */
+  saved_to_file: boolean;
+  /** 已写入但需重启生效的条目(如 "storage.sync_mode") */
+  restart_required: string[];
 }
 
 export interface BucketInfo {
@@ -188,8 +258,34 @@ export class AdminClient implements AdminApi {
     return this.expect("POST", `/v1/admin/uploads/${encodeURIComponent(uploadId)}/abort`);
   }
 
-  audit(limit = 200): Promise<{ audit: AuditEntry[] }> {
-    return this.expect("GET", `/v1/admin/audit?limit=${limit}`);
+  /** J5:审计查询,透传 limit/since/until/op/bucket/key/who/status。 */
+  audit(opts: AuditQuery = {}): Promise<{ audit: AuditEntry[] }> {
+    const q = new URLSearchParams();
+    const limit = opts.limit ?? 200;
+    if (Number.isFinite(limit)) q.set("limit", String(limit));
+    if (opts.since !== undefined && Number.isFinite(opts.since)) q.set("since", String(opts.since));
+    if (opts.until !== undefined && Number.isFinite(opts.until)) q.set("until", String(opts.until));
+    if (opts.op) q.set("op", opts.op);
+    if (opts.bucket) q.set("bucket", opts.bucket);
+    if (opts.key) q.set("key", opts.key);
+    if (opts.who) q.set("who", opts.who);
+    if (opts.status !== undefined && Number.isFinite(opts.status)) q.set("status", String(opts.status));
+    return this.expect("GET", `/v1/admin/audit?${q.toString()}`);
+  }
+
+  /** J5:读取当前运行时配置(代理 GET /v1/admin/config)。 */
+  getConfig(): Promise<AdminConfig> {
+    return this.expect("GET", "/v1/admin/config");
+  }
+
+  /** J5:部分更新配置(热生效 + 落盘;响应原样透传)。 */
+  patchConfig(patch: Record<string, unknown>): Promise<ConfigPatchResult> {
+    return this.expect<ConfigPatchResult>("PATCH", "/v1/admin/config", patch);
+  }
+
+  /** M4/H3:热重载配置(admin 已有端点 POST /v1/admin/config/reload)。 */
+  reloadConfig(): Promise<Record<string, unknown>> {
+    return this.expect("POST", "/v1/admin/config/reload");
   }
 
   repair(): Promise<Record<string, unknown>> {

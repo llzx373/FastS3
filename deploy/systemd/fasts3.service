@@ -1,0 +1,77 @@
+# FastS3 数据面 systemd 单元(M6/K2)。
+#
+# 运行形态:一个常驻 fasts3d serve 进程,同时提供
+#   - S3 数据面(server.listen,默认 0.0.0.0:9000)
+#   - admin API(admin.listen,默认 unix:///run/fasts3/admin.sock)
+# 管理面(Web 控制台,Node)是独立单元 fasts3-web.service,不出现在本单元。
+#
+# 特权说明(重要):
+#   fasts3d 数据面需要:
+#     - 裸设备访问(O_DIRECT 打开 /dev/nvmeXnX 需要 root / 设备 ACL);
+#     - io_uring 注册缓冲需要 mlock(LimitMEMLOCK=infinity,见下);
+#     - 全功能 io_uring(SQPOLL 等)需要 CAP_SYS_ADMIN。
+#   因此本单元默认以 root 运行(不带 User= 行)。改用非 root 用户时请自行
+#   配置 User=/Group= + AmbientCapabilities=CAP_SYS_ADMIN CAP_IPC_LOCK,
+#   并给设备配置 ACL(udev TAG+="systemd", SYMLINK+="..." )。
+
+[Unit]
+Description=FastS3 数据面(S3 协议 + 裸盘引擎,io_uring/O_DIRECT)
+# 占位:替换为真实仓库/文档 URL(systemd 单元不支持行内注释,URL 独占一行)
+Documentation=https://github.com/example/fasts3
+# 等待网络就绪后再启动(管理面依赖数据面的 unix socket / TCP admin)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# 配置热更新:写 /etc/fasts3/fasts3.toml 后调用
+#   POST /v1/admin/config/reload(admin H3 热重载子集:限速/匿名读/配置密钥),
+# 未支持字段仍以重启生效。不提供 ExecReload:fasts3d 仅处理 SIGTERM/SIGINT
+# (优雅排空),SIGHUP 会触发默认动作导致进程退出 —— 勿用 systemctl reload。
+ExecStart=/usr/bin/fasts3d serve --config /etc/fasts3/fasts3.toml
+# 崩溃/失败自动拉起,2s 退避;不自动重启"正常退出"(如 systemctl stop)
+Restart=on-failure
+RestartSec=2s
+# 优雅排空:先 SIGTERM(fasts3d 排空在途请求、写检查点后退出),最多等 10s
+# 再 SIGKILL。M6/K4 正在把排空做成显式流程(≤5s),此处先给足窗口。
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# ── 加固(注释逐项说明作用)──
+# LimitMEMLOCK=infinity:io_uring 注册缓冲(register buffers)需要把缓冲钉在
+#   物理内存(mlock);默认 memlock 上限 64KiB 会导致注册失败,必须放开。
+LimitMEMLOCK=infinity
+# NoNewPrivileges=yes:禁止进程及其子进程通过 execve 提升权限(setuid/文件
+#   capabilities 失效),降低提权面;fasts3d 无需 setuid 能力。
+NoNewPrivileges=yes
+# ProtectSystem=strict:整个文件系统(/,/usr,/boot,/etc)只读挂载到本单元;
+#   数据面只写自己的数据路径(见 ReadWritePaths)。防止无关路径被改写。
+ProtectSystem=strict
+# ProtectHome=yes:/home /root /run/user 只读或不可见;数据面不读用户目录。
+ProtectHome=yes
+# PrivateTmp=yes:独立 /tmp、/var/tmp(挂载命名空间),防共享临时目录污染。
+PrivateTmp=yes
+# ProtectKernelTunables=yes:/proc/sys /sys 等内核可调参数只读——防止本单元
+#   篡改全局内核配置(如 swappiness、IRQ 亲和文件)。
+ProtectKernelTunables=yes
+# ProtectKernelModules=yes:禁止加载/卸载内核模块。
+ProtectKernelModules=yes
+# ProtectControlGroups=yes:cgroup 文件系统只读,禁止本单元改资源控制面。
+ProtectControlGroups=yes
+# ReadWritePaths:ProtectSystem=strict 下仅以下路径可写——
+#   /var/lib/fasts3 数据+元数据;/run/fasts3 admin 域套接字与运行时文件;
+#   /etc/fasts3 留出配置热更新写路径(admin H3 重载会重读,避免写入被拒)。
+ReadWritePaths=/var/lib/fasts3 /run/fasts3 /etc/fasts3
+# UMask=0077:新建文件默认仅属主可读写(密钥、审计日志不外泄)。
+UMask=0077
+
+# systemd 自动创建/管理运行时与状态目录(等价于手工 mkdir + 权限):
+#   /run/fasts3         (RuntimeDirectory;admin.sock 落在这里)
+#   /var/lib/fasts3     (StateDirectory;磁盘镜像/元数据)
+RuntimeDirectory=fasts3
+RuntimeDirectoryMode=0750
+StateDirectory=fasts3
+StateDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

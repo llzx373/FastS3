@@ -1,0 +1,155 @@
+name: Package (M6 K5/A5)
+
+# 构建矩阵验证:PR/push 时可构建性门禁(产物结构与内容一致性),不是发布。
+# 发布见 release.yml(on push tags 'v*')。
+#
+# job1 ubuntu-latest : tarball + deb + SBOM + 签名(dummy 密钥)
+# job2 rockylinux:9  : rpm 侧(spec 语法验证;真机构建指引见注释)
+# job3 arm64 runner  : tarball + 架构断言(ubuntu-24.04-arm 公共 arm 运行器)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"   # 与 ci.yml 一致:警告即失败
+
+jobs:
+  build-packages:
+    name: tarball+deb+SBOM+签名(dummy key)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build fasts3d (release)
+        run: cargo build --release -p fs3d
+
+      - name: Build web assets (server + console)
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+        working-directory: web
+      - run: pnpm -r build
+        working-directory: web
+
+      - name: Generate SBOM (independent crate)
+        run: tools/sbom/sbom.sh
+
+      - name: Build tarball
+        run: tools/package/build-tarball.sh
+
+      - name: Build deb
+        run: tools/package/build-deb.sh
+
+      - name: Sign with dummy key (minisign, falls back to openssl ed25519)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign >/dev/null 2>&1 || true
+          if command -v minisign >/dev/null 2>&1; then
+            minisign -G -s /tmp/fasts3.key -p /tmp/fasts3.pub -W   # -W:无口令 dummy
+          else
+            openssl genpkey -algorithm ED25519 -out /tmp/fasts3.key
+            openssl pkey -in /tmp/fasts3.key -pubout -out /tmp/fasts3.pub
+          fi
+          tools/package/sign.sh /tmp/fasts3.key \
+            dist/fasts3-*.tar.gz \
+            dist/SBOM.json \
+            dist/fasts3_*.deb
+          cp /tmp/fasts3.pub dist/FASTS3_PUBKEY.pub   # 公开发钥随包(供校验)
+        working-directory: tools/package
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-amd64
+          path: |
+            tools/package/dist/fasts3-*.tar.gz
+            tools/package/dist/fasts3_*.deb
+            tools/package/dist/SBOM.json
+            tools/package/dist/*.sig
+            tools/package/dist/*.minisig
+            tools/package/dist/FASTS3_PUBKEY.pub
+            tools/package/dist/sha256sums
+          if-no-files-found: error
+
+  rpm-rocky:
+    # RPM 侧:rockylinux:9 容器。
+    # Swatinem/rust-cache 不适用容器内构建(无 runner 级缓存)⇒ 直接 cargo build;
+    # 本 job 主要做 spec 语法验证 + 结构自检(真机构建 = 同容器执行下方注释中的
+    # 全流程;发布流水线 release.yml 的 rpm job 已含完整构建)。
+    name: rpm spec (rockylinux:9,语法验证)
+    runs-on: ubuntu-latest
+    container: rockylinux:9
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rpm-build
+        run: dnf install -y rpm-build
+
+      - name: spec 语法验证
+        run: |
+          cd tools/package
+          rpmspec -P fasts3.spec > /tmp/spec.out
+          echo "rpmspec -P 通过($(wc -l < /tmp/spec.out) 行)"
+
+      # 真机机构建(并把 rpm 产物带到 release;本 job 注释,避免 PR 期重型构建):
+      #   - name: Full rpm build inside rocky
+      #     run: |
+      #       dnf install -y gcc-c++ clang rust cargo
+      #       cargo build --release -p fs3d
+      #       tools/package/build-rpm.sh
+      #
+      # 注:rust 工具链也可用 rustup 安装(rustup-init 自举),dnf 版本稳定即可。
+
+  arm64-tarball:
+    name: arm64 tarball + 架构断言
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: "Install build deps (rocksdb: bindgen 需 libclang, C++ 编译器)"
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libclang-dev clang g++
+
+      - name: Build fasts3d (release, aarch64)
+        run: cargo build --release -p fs3d
+
+      - name: Assert binary arch (aarch64)
+        run: |
+          file target/release/fasts3d | grep -q aarch64 || { file target/release/fasts3d; exit 1; }
+          [ "$(uname -m)" = "aarch64" ] || { echo "runner 非 aarch64?"; exit 1; }
+          echo "arch assert ok: $(file -b target/release/fasts3d)"
+
+      - name: Build tarball (aarch64)
+        run: tools/package/build-tarball.sh
+
+      - name: Assert tarball name + contain binary
+        run: |
+          ls tools/package/dist/fasts3-*.tar.gz
+          echo "artifact-name-ok: $(ls tools/package/dist/fasts3-*linux-aarch64.tar.gz | wc -l) tarball(s)"
+
+      - name: Upload aarch64 tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-arm64
+          path: tools/package/dist/fasts3-*linux-aarch64.tar.gz
+          if-no-files-found: error

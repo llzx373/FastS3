@@ -63,6 +63,13 @@ impl Default for AdminConfig {
 /// 返回人类可读的变更摘要。
 pub type ReloadFn = dyn Fn() -> Result<String, String> + Send + Sync;
 
+/// 配置读取供应器(M6 / J5 设置页):返回当前配置 JSON 视图。
+pub type ConfigGetFn = dyn Fn() -> Result<serde_json::Value, String> + Send + Sync;
+/// 配置应用供应器(M6 / J5 设置页):接收部分更新 JSON,
+/// 返回 {applied, saved_to_file, restart_required}。
+pub type ConfigPatchFn =
+    dyn Fn(&serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync;
+
 /// 管理 API 服务(持有引擎与 S3 服务的共享引用)。
 pub struct AdminServer {
     engine: Arc<RwLock<Engine>>,
@@ -70,6 +77,10 @@ pub struct AdminServer {
     cfg: AdminConfig,
     /// 热重载回调(空 = 不启用 /v1/admin/config/reload)。
     reload: Option<Arc<ReloadFn>>,
+    /// 设置页读取供应器(空 = GET /v1/admin/config 返回 501)。
+    config_get: Option<Arc<ConfigGetFn>>,
+    /// 设置页应用供应器(空 = PATCH /v1/admin/config 返回 501)。
+    config_patch: Option<Arc<ConfigPatchFn>>,
 }
 
 impl AdminServer {
@@ -79,12 +90,25 @@ impl AdminServer {
             service,
             cfg,
             reload: None,
+            config_get: None,
+            config_patch: None,
         }
     }
 
     /// 注入配置热重载回调(H3)。
     pub fn with_reload(mut self, reload: Option<Arc<ReloadFn>>) -> Self {
         self.reload = reload;
+        self
+    }
+
+    /// 注入设置页供应器(M6 / J5;GET/PATCH /v1/admin/config)。
+    pub fn with_config_providers(
+        mut self,
+        get: Option<Arc<ConfigGetFn>>,
+        patch: Option<Arc<ConfigPatchFn>>,
+    ) -> Self {
+        self.config_get = get;
+        self.config_patch = patch;
         self
     }
 
@@ -157,6 +181,8 @@ impl AdminServer {
             service: self.service.clone(),
             cfg: self.cfg.clone(),
             reload: self.reload.clone(),
+            config_get: self.config_get.clone(),
+            config_patch: self.config_patch.clone(),
         })
     }
 
@@ -390,6 +416,8 @@ impl AdminServer {
             ("GET", ["uploads"]) => self.handle_uploads(),
             ("POST", ["uploads", id, "abort"]) => self.handle_upload_abort(id),
             ("GET", ["audit"]) => self.handle_audit(query),
+            ("GET", ["config"]) => self.handle_config_get(),
+            ("PATCH", ["config"]) => self.handle_config_patch(body),
             ("POST", ["repair"]) => self.handle_repair(),
             ("POST", ["config", "reload"]) => self.handle_config_reload(),
             _ => json::err(StatusCode::NOT_FOUND, "not_found", "unknown admin endpoint"),
@@ -818,15 +846,61 @@ impl AdminServer {
         }
     }
 
+    /// M6 / J5 审计检索:limit + since/until(op/bucket/key/who/status 过滤)。
     fn handle_audit(&self, query: &[(String, String)]) -> Response<String> {
-        let limit = query
-            .iter()
-            .find(|(k, _)| k == "limit")
-            .and_then(|(_, v)| v.parse::<usize>().ok())
+        let q = |k: &str| query.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone());
+        let limit = q("limit")
+            .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(100)
             .min(5000);
-        let entries = self.service.audit().recent(limit);
+        let filter = fs3_core::audit::AuditFilter {
+            limit,
+            since: q("since").and_then(|v| v.parse::<i64>().ok()),
+            until: q("until").and_then(|v| v.parse::<i64>().ok()),
+            op: q("op").filter(|v| !v.is_empty()),
+            bucket: q("bucket").filter(|v| !v.is_empty()),
+            key_prefix: q("key").filter(|v| !v.is_empty()),
+            who: q("who").filter(|v| !v.is_empty()),
+            status: q("status").and_then(|v| v.parse::<u16>().ok()),
+        };
+        let entries = self.service.audit().search(&filter);
         json::ok(serde_json::json!({"audit": entries}))
+    }
+
+    /// M6 / J5:当前配置视图(供应器由 fs3d 注入)。
+    fn handle_config_get(&self) -> Response<String> {
+        match &self.config_get {
+            None => json::err(
+                StatusCode::NOT_IMPLEMENTED,
+                "not_implemented",
+                "config provider not injected",
+            ),
+            Some(f) => match f() {
+                Ok(v) => json::ok(v),
+                Err(e) => json::err(StatusCode::INTERNAL_SERVER_ERROR, "config_error", &e),
+            },
+        }
+    }
+
+    /// M6 / J5:应用部分配置更新(热字段立即生效,其余写文件待重启)。
+    fn handle_config_patch(&self, body: &[u8]) -> Response<String> {
+        let parsed: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(_) => {
+                return json::err(StatusCode::BAD_REQUEST, "bad_request", "invalid JSON body")
+            }
+        };
+        match &self.config_patch {
+            None => json::err(
+                StatusCode::NOT_IMPLEMENTED,
+                "not_implemented",
+                "config provider not injected",
+            ),
+            Some(f) => match f(&parsed) {
+                Ok(v) => json::ok(v),
+                Err(e) => json::err(StatusCode::BAD_REQUEST, "config_error", &e),
+            },
+        }
     }
 
     /// POST /v1/admin/config/reload(H3):调用 fs3d 注入的回调热重载配置。

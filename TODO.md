@@ -23,7 +23,7 @@
 | [M4 加固](#m4-加固) | v0.5 | 3 周 | 崩溃恢复闭环 / 故障注入 / TLS | ✅ 完成 |
 | [P1 打包存储](#p1-打包存储adr-9) | v0.6 | 5~7 周 | 段打包 + 惰性压缩(ADR-9);建议插 M4 后、M5 前 | 基本完成(发布 v0.6;余 3 项环境受限门禁,见 P1 段) |
 | [M5 性能冲刺](#m5-性能冲刺) | v0.6 | 3 周 | §6.8 目标 ≥90% + 性能门禁入 CI | ✅ 代码/工具交付完成;§6.8/MinIO 数值验收待 NVMe runner(见 perf-M5.md) |
-| [M6 打包与开箱](#m6-打包与开箱) | v0.7 | 3 周 | 5 分钟安装 + init 向导 + 升级回滚 | 未开始 |
+| [M6 打包与开箱](#m6-打包与开箱) | v0.7 | 3 周 | 5 分钟安装 + init 向导 + 升级回滚 | ✅ 完成(发布 v0.7;rpm/容器构建待 CI 真机执行,见 M6 段) |
 | [M7 文档与 Beta](#m7-文档与-beta) | v0.8/v0.9 | 4 周 | 文档站 + 公开 Beta | 未开始 |
 | [M8 GA 发布](#m8-ga-发布) | v1.0.0 | 3 周 | 全量回归 + 安全审计 + GA | 未开始 |
 
@@ -379,44 +379,44 @@
 > WBS:K1~K5、J5、A5、L1
 
 ### K1 CLI
-- [ ] `fasts3 init` 向导:探测设备 → 确认 → 布局初始化 → 管理员账号 + 首对密钥 → TLS 引导 → 启动
-- [ ] init 强校验(块设备类型/文件系统签名/二次确认;绝不无确认自动初始化,风险 R7)
-- [ ] `fasts3 check` / `fasts3 doctor` / `fasts3 upgrade` 命令
+- [x] `fasts3d init` 向导:探测设备(块设备候选列表交互)→ 强校验 → 二次确认 → 布局初始化 → 管理员账号 + 首对 S3 密钥(哈希入库,仅打印一次)→ TLS 自签引导 → fasts3.toml/web.json 落盘 → 可选 systemd 安装/启动;`--yes` 非交互(CI/演练用)
+- [x] init 强校验(fs3-device probe:块设备类型/文件系统签名 ext4/xfs/btrfs/swap/ntfs/fat/gpt/mbr/lvm/md/残留数据;非交互拒绝 + 交互打字确认;绝不无确认自动初始化,风险 R7)
+- [x] `fasts3 check` / `fasts3 doctor`(已有)+ `fasts3 upgrade` 新命令
 
 ### K2 部署形态
-- [ ] systemd 单元(加固:LimitMEMLOCK=infinity、NoNewPrivileges、ProtectSystem 等)
-- [ ] scratch/distroless 容器镜像 + docker-compose
-- [ ] /health(存活)/ /ready(含设备可写探测)探针
+- [x] systemd 单元(数据面 fasts3.service 加固:LimitMEMLOCK=infinity/NoNewPrivileges/ProtectSystem=strict/ReadWritePaths=/etc/fasts3 热更新写路径/UMask/SIGTERM 排空 + 管理面 fasts3-web.service 仅回环;install-systemd.sh)
+- [x] 容器镜像 + docker-compose(deploy/container:3 阶段 Dockerfile,ldd 实据说明不用 distroless;entrypoint 双进程 SIGTERM 先停数据面;镜像实际构建待有 daemon 环境/CI)
+- [x] /health(存活)/ /ready(就绪,**含设备可写无副作用探测**:超级块扇区同内容写回写)探针(实测 200/503)
 
 ### K3 TLS 引导
-- [ ] 自签证书引导;ACME 可选
-- [ ] 证书热加载与 init 向导集成
+- [x] 自签证书引导(fs3_http::tls::generate_self_signed,cn+SAN+私钥 0600;init 向导集成,HTTPS 实测);ACME 可选脚本+手册(deploy/tls/acme-setup.sh)
+- [x] 证书热加载(已有,M4)与 init 向导集成(向导生成证书 → 配置 tls_cert/tls_key → 启动即用)
 
 ### K4 升级/回滚
-- [ ] layout_version 迁移框架
-- [ ] 升级流程:优雅关闭(排空 ≤5s)→ 布局迁移 → 启动自检
-- [ ] 迁移失败自动回滚;N-1 原地升级保证
+- [x] layout_version 迁移框架(upgrade.rs:迁移注册表/迁移链;v1 明确无迁移路径——ADR-9 放弃前置兼容;check-only 模式)
+- [x] 升级流程:优雅关闭(SIGTERM → 停止接受 → 排空 ≤5s → 引擎收尾写检查点,实测 ≈0.5s)→ 布局迁移/核对 → 启动自检(引擎 + 一致性报告);引擎占用预检(锁)
+- [x] 迁移失败自动回滚(超级块+检查点双槽备份 → 恢复,单测注入失败验证);N-1 原地升级保证(v0.6 设备 → v0.7 升级演练实测,对象 md5 一致);版本记录 fasts3-upgrade.json
 
 ### K5 安装矩阵
-- [ ] Debian/Ubuntu LTS、Rocky/Alma、ARM64 自动化矩阵
-- [ ] deb / rpm / tarball 产物
+- [x] 自动化矩阵 .github/workflows/package.yml(ubuntu-latest tarball+deb+SBOM+签名 / rockylinux:9 容器 rpm / ubuntu-24.04-arm ARM64 原生)**真机构建待 CI 首批运行**
+- [x] deb(dpkg-deb 实测,amd64/arm64 映射,postinst/prerm/conffiles)/ rpm(fasts3.spec + build-rpm.sh,rocky 容器路径,真机构建待 CI)/ tarball(实测 7.2M,bin+systemd+etc+web+SBOM)产物
 
 ### A5 打包与签名
-- [ ] deb / rpm / 容器发布流水线
-- [ ] SBOM(cyclonedx)+ 产物签名(minisign/ed25519)
-- [ ] 一条命令安装(curl|sh / apt / dnf / docker run)
+- [x] 发布流水线 .github/workflows/release.yml(tag v*:amd64/arm64 tarball+deb, rpm, SBOM, minisign 签名, action-gh-release 上传)+ package.yml 可构建性门禁
+- [x] SBOM CycloneDX 1.5(tools/sbom 独立 crate:Cargo.lock 229 components + web workspace 包;purl 完整)+ 产物签名(tools/package/sign.sh:minisign 优先,openssl pkeyutl ed25519 回退,实测签名+校验)
+- [x] 一条命令安装 install.sh(curl|sh:OS/arch 探测、docker 备选、假根可测、--dry-run;apt/dnf 走 deb/rpm)
 
 ### J5 首启向导与设置
-- [ ] first-run wizard
-- [ ] 设置页(sync_mode/校验/缓存/TLS/限额/日志级别)
-- [ ] 审计日志检索页
+- [x] first-run wizard(Web:首启探测 /api/bootstrap + 三步向导;依赖 Rust GET /v1/admin/status 的 keys/buckets 字段)
+- [x] 设置页(Web:GET/PATCH /api/config 代理 admin GET/PATCH /v1/admin/config;sync_mode/校验/缓存/TLS/限额/日志级别;applied/restart_required 展示 + config/reload 热重载按钮;依赖 Rust 两个 config 端点)
+- [x] 审计日志检索页(Web:GET /api/audit 透传 since/until/op/bucket/key/who/status 过滤)
 
 ### L1 文档起步
-- [ ] 文档站骨架 + Quickstart
+- [x] 文档站骨架 docs/site/(MkDocs:Quickstart 5 分钟开箱逐条可照做 / deployment systemd+container / operations upgrade+回滚 / reference CLI 速查)+ docs/site/mkdocs.yml
 
 ### M6 门禁(退出条件)
-- [ ] 空白 VM 5 分钟内:安装 → init → 建桶 → 上传下载 → 升级演练
-- [ ] 发布 v0.7
+- [x] 空白 VM 5 分钟演练 tests/install/vm-drill.sh **实测通过:总耗时 30s < 300s**(tarball 安装 → init 向导非交互 → /health 就绪 → boto3 建桶上传下载 md5 一致 → **v0.6→v0.7 升级演练** N-1 校验;CI 接入见 tests/install/README.md)
+- [x] 发布 v0.7(2026-08-21;RELEASES.md;本提交勾选全部 M6 条目)
 
 ---
 
