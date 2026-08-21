@@ -12,6 +12,7 @@ use fs3_meta::SyncMode;
 
 mod bench;
 mod config;
+mod doctor;
 mod loadgen;
 
 use config::load_config;
@@ -116,6 +117,8 @@ enum Cmd {
     },
     /// 立即写检查点
     Checkpoint {},
+    /// 能力自检与配置体检(B2 / M4):io_uring/设备/布局/元数据可写
+    Doctor {},
     /// 引擎级基准(设备层直测,不经协议)
     Bench(bench::BenchArgs),
     /// 协议层负载生成器(A4)
@@ -276,6 +279,13 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
             e.checkpoint()?;
             e.close()?;
             println!("checkpoint written");
+            Ok(())
+        }
+        Cmd::Doctor {} => {
+            let code = doctor::run(Some(&cfg))?;
+            if code != 0 {
+                std::process::exit(code as i32);
+            }
             Ok(())
         }
         Cmd::Bench(args) => {

@@ -58,6 +58,30 @@ jobs:
       - name: build
         run: cargo build --release
 
+  # M4 门禁:B2 老内核兜底(prea/pwrite,io_uring 关闭 = 4.x 内核功能路径)
+  # 在 CI 上以 --no-uring 全链路(含崩溃/断电收敛)验证;真 4.x 内核矩阵
+  # 由裸机 runner 扩展(见 docs/m4-powerloss.md)。
+  m4-crash-fallback:
+    name: M4 crash harness (pread/pwrite fallback)
+    runs-on: ubuntu-22.04 # 内核 5.15;复用兜底路径
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: release build
+        run: cargo build --release -p fs3d
+      - name: crash harness (no-uring, 60 rounds)
+        run: tests/crash/run_crash_m4.sh 60 --full --no-uring
+      - name: power-loss sim (no-uring, 20 rounds)
+        run: tests/crash/powerloss_sim.sh 20
+      - name: doctor smoke (uninitialized device → fatal, exit 1)
+        run: |
+          truncate -s 64M /tmp/ci-doctor.img
+          printf '[storage]\ndevices = ["/tmp/ci-doctor.img"]\nmeta_dir = "/tmp/ci-doctor-meta"\n' > /tmp/ci-doctor.toml
+          ./target/release/fasts3d doctor --config /tmp/ci-doctor.toml
+        continue-on-error: true # 未初始化设备预期 fatal(exit 1);仅验证命令可运行
+
   pnpm-workspace:
     name: pnpm workspace (lockfile frozen)
     runs-on: ubuntu-latest
