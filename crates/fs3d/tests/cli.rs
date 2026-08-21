@@ -210,7 +210,7 @@ fn loadgen_smoke() {
     let dir = tempfile::tempdir().unwrap();
     let out = Command::new(BIN)
         .current_dir(dir.path())
-        .args(&[
+        .args([
             "loadgen",
             "--endpoint",
             "127.0.0.1:1",
@@ -278,7 +278,7 @@ fn serve_network_and_loadgen_smoke() {
 
     // loadgen 子进程:先 put 再 mix(建桶 + 写读)
     let out = Command::new(BIN)
-        .args(&[
+        .args([
             "loadgen",
             "--endpoint",
             &format!("http://127.0.0.1:{port}"),

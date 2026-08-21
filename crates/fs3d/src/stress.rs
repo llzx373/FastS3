@@ -13,7 +13,6 @@ use std::time::Instant;
 
 use clap::Args;
 use fs3_engine::Engine;
-use fs3_meta::SyncMode;
 
 #[derive(Debug, Args)]
 pub struct StressArgs {
@@ -52,7 +51,7 @@ pub fn run(args: &StressArgs, cfg: &fs3_engine::EngineConfig) -> fs3_core::Resul
         let key = format!("k{:020}", done);
         engine.put(&bucket, &key, &mut Cursor::new(&data[..]))?;
         done += 1;
-        if args.checkpoint_every > 0 && done % args.checkpoint_every == 0 {
+        if args.checkpoint_every > 0 && done.is_multiple_of(args.checkpoint_every) {
             engine.checkpoint()?;
         }
         if last_report.elapsed().as_secs() >= 5 {
