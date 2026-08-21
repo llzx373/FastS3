@@ -857,8 +857,9 @@ fn auth_and_errors() {
     // 未实现子资源 → NotImplemented
     let r = svc.handle(&req_q("GET", "/bkt1", &[("policy", "")], vec![]));
     assert_eq!(err_code(&r), "NotImplemented");
+    // ListMultipartUploads 已实现(M4 修复);不存在桶 → NoSuchBucket
     let r = svc.handle(&req_q("GET", "/bkt1", &[("uploads", "")], vec![]));
-    assert_eq!(err_code(&r), "NotImplemented");
+    assert_ne!(err_code(&r), "NotImplemented");
 }
 
 /// 磁盘满 → 507 InsufficientStorage(不是 500 InternalError;DESIGN §6)。
@@ -891,4 +892,314 @@ fn device_full_maps_to_507() {
     let err = r.unwrap_err();
     assert_eq!(err.code.status(), 507);
     assert_eq!(err_code(&Err(err.clone())), "InsufficientStorage");
+}
+
+/// M4 覆盖门禁:高级操作全流程(multipart / copy / list-v1 / delete-objects /
+/// presign / 条件头 / 键策略拒绝)。直接经 S3Service(不经 HTTP)。
+#[test]
+fn advanced_ops_flow() {
+    let (_d, svc) = setup();
+    assert_ok(&svc.handle(&req("PUT", "/flow", vec![]))); // 建桶
+
+    // ── multipart 全流程 ──
+    let init = svc
+        .handle(&req_q("POST", "/flow/mp.bin", &[("uploads", "")], vec![]))
+        .unwrap();
+    let xml = std::str::from_utf8(&match init.body {
+        ResponseBody::Bytes(b) => b,
+        _ => panic!("init must return bytes"),
+    })
+    .unwrap()
+    .to_string();
+    let upload_id = extract(&xml, "UploadId");
+    assert!(!upload_id.is_empty());
+
+    // UploadPart(2 片)
+    let part1 = vec![0x31u8; 5 * 1024 * 1024];
+    let part2 = vec![0x32u8; 1024 * 1024];
+    let r1 = svc
+        .handle(&req_q(
+            "PUT",
+            "/flow/mp.bin",
+            &[("partNumber", "1"), ("uploadId", &upload_id)],
+            part1.clone(),
+        ))
+        .unwrap();
+    let etag1 = etag_of(&r1);
+    let r2 = svc
+        .handle(&req_q(
+            "PUT",
+            "/flow/mp.bin",
+            &[("partNumber", "2"), ("uploadId", &upload_id)],
+            part2.clone(),
+        ))
+        .unwrap();
+    let etag2 = etag_of(&r2);
+
+    // ListParts
+    let lp = svc
+        .handle(&req_q(
+            "GET",
+            "/flow/mp.bin",
+            &[("uploadId", &upload_id)],
+            vec![],
+        ))
+        .unwrap();
+    let lpxml = body_str(&lp);
+    assert!(lpxml.contains("Part"));
+    // ListParts 的 ETag 不带引号;UploadPart 返回的 ETag 带引号
+    assert!(
+        lpxml.contains(etag1.trim_matches('"')),
+        "listparts xml: {lpxml}"
+    );
+
+    // CompleteMultipartUpload(JSON 形 XML;etag 带引号剥离)
+    let et1 = etag1.trim_matches('"');
+    let et2 = etag2.trim_matches('"');
+    let complete_xml = format!(
+        r#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>&quot;{et1}&quot;</ETag></Part><Part><PartNumber>2</PartNumber><ETag>&quot;{et2}&quot;</ETag></Part></CompleteMultipartUpload>"#
+    );
+    let cmu = svc
+        .handle(&req_q(
+            "POST",
+            "/flow/mp.bin",
+            &[("uploadId", &upload_id)],
+            complete_xml.into_bytes(),
+        ))
+        .unwrap();
+    assert_eq!(cmu.status, 200);
+    // 拼接内容校验
+    let got = svc.handle(&req("GET", "/flow/mp.bin", vec![])).unwrap();
+    let mut expect = part1;
+    expect.extend_from_slice(&part2);
+    read_body(&svc, &got, &expect);
+
+    // ListMultipartUploads(完成态不在列表)
+    let lmu = svc
+        .handle(&req_q("GET", "/flow", &[("uploads", "")], vec![]))
+        .unwrap_or_else(|e| panic!("list uploads err: {:?}", e));
+    let lmu_xml = body_str(&lmu);
+    assert!(!lmu_xml.contains(&upload_id));
+
+    // ── CopyObject(COW) ──
+    let copy = svc
+        .handle(&signed_copy("/flow/mp.bin", "/flow/copy.bin"))
+        .unwrap();
+    assert_eq!(copy.status, 200);
+    let got2 = svc.handle(&req("GET", "/flow/copy.bin", vec![])).unwrap();
+    read_body(&svc, &got2, &expect);
+
+    // ── ListObjectsV1(marker/max-keys/delimiter) ──
+    let l1 = svc
+        .handle(&req_q("GET", "/flow", &[("max-keys", "1")], vec![]))
+        .unwrap();
+    let l1xml = body_str(&l1);
+    assert!(l1xml.contains("IsTruncated") && l1xml.contains("<Key>"));
+    let l2 = svc
+        .handle(&req_q("GET", "/flow", &[("delimiter", "/")], vec![]))
+        .unwrap();
+    assert_eq!(l2.status, 200);
+
+    // ── DeleteObjects(POST,Quiet/Verbose) ──
+    let del_xml = r#"<Delete><Object><Key>copy.bin</Key></Object><Object><Key>mp.bin</Key></Object></Delete>"#;
+    let del = svc
+        .handle(&req_q(
+            "POST",
+            "/flow",
+            &[("delete", "")],
+            del_xml.as_bytes().to_vec(),
+        ))
+        .unwrap();
+    assert_eq!(del.status, 200);
+    let delqx = svc
+        .handle(&req_q(
+            "POST",
+            "/flow",
+            &[("delete", "")],
+            br#"<Delete><Quiet>true</Quiet><Object><Key>xxx</Key></Object></Delete>"#.to_vec(),
+        ))
+        .unwrap();
+    assert_eq!(delqx.status, 200);
+
+    // ── 条件头(If-Match 412 / If-None-Match 304) ──
+    svc.handle(&req("PUT", "/flow/c1", vec![7u8; 32])).unwrap();
+    let im = signed_with_headers("GET", "/flow/c1", &[("if-match", "\"deadbeef\"")], vec![]);
+    assert_eq!(err_code(&svc.handle(&im)), "PreconditionFailed");
+    let inm = signed_with_headers(
+        "GET",
+        "/flow/c1",
+        &[(
+            "if-none-match",
+            etag_of(&svc.handle(&req("HEAD", "/flow/c1", vec![])).unwrap()).as_str(),
+        )],
+        vec![],
+    );
+    let r = svc.handle(&inm);
+    assert_eq!(status(&r), 304, "inm err: {:?}", r.as_ref().err());
+
+    // ── 键策略:写入 Deny s3:DeleteObject 后删除被拒 ──
+    svc.handle(&req("PUT", "/flow/kp", vec![1u8; 16])).unwrap();
+    svc.set_key_policy(
+        "test",
+        Some(
+            r#"{"Statement":[{"Effect":"Allow","Action":["s3:PutObject","s3:GetObject"],"Resource":["*"]},
+                            {"Effect":"Deny","Action":["s3:DeleteObject"],"Resource":["arn:aws:s3:::flow/*"]}]}"#
+                .into(),
+        ),
+    )
+    .unwrap();
+    let del2 = svc.handle(&req("DELETE", "/flow/kp", vec![]));
+    assert_eq!(err_code(&del2), "AccessDenied");
+    // Allow 路径放行
+    let get3 = svc.handle(&req("GET", "/flow/kp", vec![]));
+    assert!(get3.is_ok());
+    svc.set_key_policy("test", None).unwrap();
+    assert_ok(&svc.handle(&req("DELETE", "/flow/kp", vec![])));
+}
+
+fn assert_ok(err: &Result<ServiceResponse, fs3_s3::S3Error>) {
+    assert!(
+        err.is_ok(),
+        "expected ok: {}",
+        err.as_ref().unwrap_err().code_name()
+    );
+}
+
+/// 读取对象响应(body 可能是 Bytes 或 ObjectStream)并逐字节比对。
+fn read_body(svc: &S3Service, r: &ServiceResponse, expect: &[u8]) {
+    match &r.body {
+        ResponseBody::Bytes(b) => assert_eq!(b, expect),
+        ResponseBody::ObjectStream {
+            bucket,
+            key,
+            offset,
+            length,
+            ..
+        } => {
+            let mut buf = Vec::with_capacity(*length as usize);
+            let mut pos = 0u64;
+            let mut chunk = vec![0u8; 65536];
+            loop {
+                let n = svc
+                    .read_stream_chunk(bucket, key, *offset, *length, &mut pos, &mut chunk)
+                    .expect("read stream");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            assert_eq!(buf, expect);
+        }
+        _ => panic!("unexpected body type"),
+    }
+}
+
+fn body_str(r: &ServiceResponse) -> String {
+    match &r.body {
+        ResponseBody::Bytes(b) => std::str::from_utf8(b).unwrap().to_string(),
+        _ => "(stream)".into(),
+    }
+}
+
+fn etag_of(r: &ServiceResponse) -> String {
+    r.headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("etag"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default()
+}
+
+fn extract(xml: &str, tag: &str) -> String {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    match (xml.find(&open), xml.find(&close)) {
+        (Some(a), Some(b)) if b > a => xml[a + open.len()..b].to_string(),
+        _ => String::new(),
+    }
+}
+
+/// CopyObject 请求(x-amz-copy-source 头)。
+fn signed_copy(src: &str, dst: &str) -> S3Request {
+    let amz_date = auth::now_amz();
+    let cred = Credentials {
+        access_key: "test".into(),
+        secret_key: "secret123".into(),
+    };
+    let path = dst.to_string();
+    let empty_sha = hex::encode(Sha256::digest(b""));
+    let headers: Vec<(String, String)> = vec![
+        ("host".into(), "localhost:9000".into()),
+        ("x-amz-date".into(), amz_date.clone()),
+        ("x-amz-content-sha256".into(), empty_sha.clone()),
+        ("x-amz-copy-source".into(), src.to_string()),
+    ];
+    let auth_hdr = auth::sign_request(
+        &cred,
+        "us-east-1",
+        "PUT",
+        &path,
+        &[],
+        &headers,
+        &amz_date,
+        &PayloadHash::HexSha256(empty_sha),
+    )
+    .unwrap();
+    let mut headers = headers;
+    headers.push(("authorization".into(), auth_hdr));
+    S3Request {
+        method: "PUT".into(),
+        raw_path: path.clone(),
+        decoded_path: path,
+        host: "localhost".into(),
+        query: vec![],
+        headers,
+        body: vec![],
+    }
+}
+
+/// 带额外头的签名请求。
+fn signed_with_headers(
+    method: &str,
+    path: &str,
+    extra: &[(&str, &str)],
+    body: Vec<u8>,
+) -> S3Request {
+    let amz_date = auth::now_amz();
+    let cred = Credentials {
+        access_key: "test".into(),
+        secret_key: "secret123".into(),
+    };
+    let mut headers: Vec<(String, String)> = vec![
+        ("host".into(), "localhost:9000".into()),
+        ("x-amz-date".into(), amz_date.clone()),
+        ("x-amz-content-sha256".into(), auth_sha_of(&body)),
+    ];
+    for (k, v) in extra {
+        headers.push((k.to_string(), v.to_string()));
+    }
+    let auth_hdr = auth::sign_request(
+        &cred,
+        "us-east-1",
+        method,
+        path,
+        &[],
+        &headers,
+        &amz_date,
+        &PayloadHash::HexSha256(auth_sha_of(&body)),
+    )
+    .unwrap();
+    headers.push(("authorization".into(), auth_hdr));
+    S3Request {
+        method: method.into(),
+        raw_path: path.into(),
+        decoded_path: path.into(),
+        host: "localhost".into(),
+        query: vec![],
+        headers,
+        body,
+    }
+}
+
+fn auth_sha_of(body: &[u8]) -> String {
+    hex::encode(Sha256::digest(body))
 }

@@ -2419,10 +2419,12 @@ impl Engine {
             oe.watermark as u64, capacity,
             "end_segment requires full extent"
         );
-        debug_assert_eq!(
-            w.seg_written as u64,
-            capacity - w.seg_offset as u64,
-            "写满段的实际字节 == 段区间长"
+        // 修正(ADR-9 flush_acc):watermark 按 4KiB 对齐推进(物理),而段逻辑长
+        // 按实际字节记录。对象尾部若落在对齐块内,物理区 ≥ 逻辑段(尾垫死区);
+        // 此时最后一段逻辑长 < capacity - seg_offset 是正常现象,读按段长正确。
+        debug_assert!(
+            u64::from(w.seg_written) <= capacity - u64::from(w.seg_offset),
+            "段逻辑字节不得超过其物理区(watermark 对齐推进)"
         );
         let len = w.seg_written;
         let exclusive = oe.participants == 1;

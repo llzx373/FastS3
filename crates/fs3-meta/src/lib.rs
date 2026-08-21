@@ -933,6 +933,10 @@ impl MetaStore {
                 Some(s) => s,
                 None => continue,
             };
+            // AWS:已 Complete/Abort 的会话不再出现在 ListMultipartUploads
+            if sess.completed {
+                continue;
+            }
             // 前缀 + 游标过滤(游标 = (key, upload_id),字典序)
             if !prefix.is_empty() && !sess.key.starts_with(prefix) {
                 continue;

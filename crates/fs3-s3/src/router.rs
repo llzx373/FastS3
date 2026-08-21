@@ -300,6 +300,21 @@ impl Router {
                     keys: req.keys,
                 });
             }
+            // M4 修复:GET /bucket?uploads → ListMultipartUploads(此前被
+            // 未实现子资源表拦截,列表不可达)
+            if has_q("uploads") && method == "GET" {
+                return Ok(Operation::ListMultipartUploads {
+                    bucket,
+                    prefix: get_q("prefix").unwrap_or_default(),
+                    key_marker: get_q("key-marker")
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string()),
+                    upload_id_marker: get_q("upload-id-marker")
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string()),
+                    max_uploads: parse_max_keys(get_q("max-uploads").as_deref())?,
+                });
+            }
             // 不支持/未实现的子资源
             for unsupported in [
                 "acl",

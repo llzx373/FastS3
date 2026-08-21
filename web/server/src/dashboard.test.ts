@@ -3,7 +3,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildDashboard } from "./dashboard.js";
+import { buildDashboard, aggregateSnapshot, dashboardFromSnapshot } from "./dashboard.js";
 
 class FakeAdmin {
   private statusData: Record<string, unknown>;
@@ -138,4 +138,61 @@ test("empty metrics yields zero latency", async () => {
   const d = await buildDashboard(admin as never);
   assert.equal(d.latency.get.p50, 0);
   assert.equal(d.latency.put.p99, 0);
+});
+
+test("aggregateSnapshot builds unified shape from status + prometheus", () => {
+  const s = aggregateSnapshot(
+    {
+      uptime_secs: 42,
+      device_capacity: 1000,
+      live_bytes: 250,
+      buckets: 3,
+      objects: 10,
+      errors_total: 5,
+      bytes_read: 1000,
+      bytes_written: 2000,
+    },
+    sampleMetrics,
+    12345
+  );
+  assert.equal(s.t, 12345);
+  assert.equal(s.data.uptime, 42);
+  assert.equal(s.data.device_used, 250);
+  // put:2xx=50;get:2xx=100(4xx/5xx 缺失按 0)
+  assert.deepEqual(s.data.ops, { put: 50, get: 100, del: 0, list: 0, multipart: 0 });
+  assert.deepEqual(s.data.bytes, { in: 1000, out: 2000 });
+  assert.equal(s.data.errors, 5);
+  // 快照延迟取 get 分位
+  assert.equal(s.data.latency.p50, 0.004);
+  assert.equal(s.data.ring_depth, 0);
+  assert.deepEqual(s.data.group_commit, { count: 0, bytes: 0 });
+});
+
+test("dashboardFromSnapshot converts Rust WS snapshot to dashboard shape", () => {
+  const dash = dashboardFromSnapshot({
+    t: 12345,
+    data: {
+      uptime: 42,
+      degraded: true,
+      device_capacity: 1000,
+      device_used: 250,
+      buckets: 3,
+      objects: 10,
+      ops: { put: 50, get: 100, del: 0, list: 5, multipart: 2 },
+      bytes: { in: 1000, out: 2000 },
+      latency: { p50: 0.004, p99: 0.016, p999: 0.064 },
+      errors: 5,
+      ring_depth: 4,
+      group_commit: { count: 7, bytes: 100 },
+      pools: {},
+    },
+  });
+  assert.equal(dash.uptimeSecs, 42);
+  assert.equal(dash.node.watermark, 0.25);
+  assert.equal(dash.requests.total, 157);
+  assert.equal(dash.requests.errors, 5);
+  assert.equal(dash.healthy, false); // degraded → 不健康
+  assert.ok(dash.alerts.some((a) => a.includes("degraded")));
+  assert.equal(dash.latency.get.p99, 0.016);
+  assert.equal(dash.updatedAt, new Date(12345 * 1000).toISOString());
 });

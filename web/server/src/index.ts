@@ -11,10 +11,12 @@
  *   POST /api/buckets/{name}/presign      签发 PUT/GET 预签名 URL
  *   POST /api/buckets/{name}/multipart/{init|complete|abort}
  *   GET/POST/DELETE /api/keys[/{id}]      密钥管理(代理)
+ *   PUT  /api/keys/{access}/policy        密钥策略文档(代理 admin PATCH)
  *   GET  /api/uploads;POST /api/uploads/{id}/abort
  *   GET  /api/audit                       审计查询
  *   POST /api/repair                      泄漏修复
- *   WS   /api/ws                          实时指标推送
+ *   GET  /api/metrics/history?limit=N     指标历史(24h×5s 环形缓冲,I4)
+ *   WS   /api/ws                          实时指标推送(优先 Rust WS,回退轮询)
  *
  * 静态资源(控制台构建产物)由 --static 提供;数据流永不经过 Node。
  */
@@ -24,19 +26,24 @@ import { WebSocketServer } from "ws";
 import { loadConfig, listenHostPort, type WebConfig } from "./config.js";
 import { authPlugin, issueToken, requireRole, type JwtClaims } from "./auth.js";
 import { AdminClient } from "./admin-client.js";
+import { AdminWsClient } from "./admin-ws.js";
 import { S3Client } from "./s3-client.js";
 import { presignUrl } from "./presign.js";
-import { buildDashboard } from "./dashboard.js";
+import { buildDashboard, buildSnapshot, dashboardFromSnapshot } from "./dashboard.js";
+import { MetricsHistory } from "./metrics-history.js";
 
 export interface ServerDeps {
   admin: AdminClient;
   s3: S3Client;
   cfg: WebConfig;
+  /** 指标历史环形缓冲(共享实例;缺省时 buildServer 自建) */
+  metricsHistory?: MetricsHistory;
 }
 
 export function buildServer(deps: ServerDeps): FastifyInstance {
   const app = Fastify({ logger: true });
   const { admin, s3, cfg } = deps;
+  const history = deps.metricsHistory ?? new MetricsHistory();
 
   // ── 登录(无认证) ──
   app.post("/api/login", async (req, reply) => {
@@ -290,6 +297,34 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     }
   );
 
+  // J4:密钥策略文档(string JSON 或 null 清空);代理到 admin PATCH,由 Rust 侧持久化
+  app.put<{ Params: { access: string }; Body: { policy?: string | null } }>(
+    "/api/keys/:access/policy",
+    { preHandler: requireRole("admin") },
+    async (req, reply) => {
+      const policy = req.body?.policy ?? null;
+      if (policy !== null && typeof policy !== "string") {
+        return reply.code(400).send({
+          error: { code: "bad_request", message: "policy must be a JSON string or null" },
+        });
+      }
+      try {
+        return await admin.setKeyPolicy(req.params.access, policy);
+      } catch (e) {
+        return reply.code(502).send({ error: { code: "policy_error", message: (e as Error).message } });
+      }
+    }
+  );
+
+  // I4:指标历史查询(最近 N 个快照,旧→新)
+  app.get<{ Querystring: { limit?: string } }>("/api/metrics/history", async (req) => {
+    const limit = Number(req.query.limit ?? 200);
+    const n = Number.isFinite(limit)
+      ? Math.max(1, Math.min(Math.floor(limit), history.capacity))
+      : 200;
+    return { snapshots: history.history(n), size: history.size, capacity: history.capacity };
+  });
+
   // ── 在途 multipart 会话 ──
   app.get("/api/uploads", async (_req, reply) => {
     try {
@@ -351,7 +386,8 @@ export function startServer(): void {
     accessKey: cfg.s3.accessKey,
     secretKey: cfg.s3.secretKey,
   });
-  const app = buildServer({ admin, s3, cfg });
+  const history = new MetricsHistory();
+  const app = buildServer({ admin, s3, cfg, metricsHistory: history });
 
   const { host, port } = listenHostPort(cfg.listen);
   app.listen({ host, port }).catch((e) => {
@@ -359,16 +395,44 @@ export function startServer(): void {
     process.exit(1);
   });
 
-  // WS /api/ws:向浏览器推送实时指标(5s 快照轮询)
+  // WS /api/ws:向浏览器推送实时指标。
+  // I4:优先转发 Rust 侧 WS /v1/admin/ws(snapshot/audit/health 帧,帧形状不变,
+  // 仍为 {"type":"dashboard","data":Dashboard});WS 不可用/静默时回退 5s 轮询。
   const httpServer = app.server;
   const wss = new WebSocketServer({ server: httpServer, path: "/api/ws" });
+
+  const broadcast = (msg: string) => {
+    for (const c of wss.clients) {
+      if (c.readyState === c.OPEN) c.send(msg);
+    }
+  };
+
+  const adminWs = new AdminWsClient(cfg.admin, {
+    onSnapshot(t, data) {
+      history.push({ t, data });
+      broadcast(JSON.stringify({ type: "dashboard", data: dashboardFromSnapshot({ t, data }) }));
+    },
+    onAudit(data) {
+      broadcast(JSON.stringify({ type: "audit", data }));
+    },
+    onHealth(data) {
+      broadcast(JSON.stringify({ type: "health", data }));
+    },
+    onStatusChange(connected) {
+      app.log.info({ connected }, "admin ws connection changed");
+    },
+  });
+  adminWs.start();
+
+  // 回退轮询:Rust WS 未连接或 15s 内无帧时接管(同时填充历史缓冲);
+  // 快照帧由 WS 回调以 5s 节奏驱动,因此 WS 活跃时此循环直接跳过。
   const dashboardLoop = setInterval(async () => {
-    if (wss.clients.size === 0) return;
+    if (adminWs.isConnected() && adminWs.lastFrameAgeMs() < 15_000) return;
     try {
-      const d = await buildDashboard(admin);
-      const msg = JSON.stringify({ type: "dashboard", data: d });
-      for (const c of wss.clients) {
-        if (c.readyState === c.OPEN) c.send(msg);
+      const snap = await buildSnapshot(admin);
+      history.push(snap);
+      if (wss.clients.size > 0) {
+        broadcast(JSON.stringify({ type: "dashboard", data: dashboardFromSnapshot(snap) }));
       }
     } catch {
       /* admin 短暂不可达:跳过本轮 */
@@ -380,7 +444,10 @@ export function startServer(): void {
     void import("./static.js").then(({ mountStatic }) => mountStatic(app, cfg.staticDir!));
   }
 
-  app.addHook("onClose", async () => clearInterval(dashboardLoop));
+  app.addHook("onClose", async () => {
+    clearInterval(dashboardLoop);
+    adminWs.stop();
+  });
 }
 
 // 直接运行时启动(测试通过 buildServer 自行注入)

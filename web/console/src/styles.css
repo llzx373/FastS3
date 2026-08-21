@@ -96,6 +96,12 @@ button.small { padding: 4px 10px; font-size: 12px; }
 }
 .alert.warn { background: rgba(245, 158, 11, .12); border-color: var(--amber); color: #fcd34d; }
 
+/* 徽标(密钥策略状态等) */
+.badge {
+  display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px;
+  background: rgba(59, 130, 246, .15); color: #93c5fd; border: 1px solid rgba(59, 130, 246, .35);
+}
+
 /* 登录页 */
 .login-wrap { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
 .login-box { width: 340px; }

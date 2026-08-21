@@ -14,6 +14,7 @@ mod bench;
 mod config;
 mod doctor;
 mod loadgen;
+mod stress;
 
 use config::load_config;
 
@@ -123,6 +124,8 @@ enum Cmd {
     Bench(bench::BenchArgs),
     /// 协议层负载生成器(A4)
     Loadgen(loadgen::LoadgenArgs),
+    /// 批量对象压测(M4 门禁:1 亿对象,rockdb 扩展性 R5)
+    StressInsert(#[arg(name = "args", flatten)] stress::StressArgs),
     /// 启动 S3 数据面 HTTP 服务
     Serve {
         /// 监听地址(如 0.0.0.0:9000)
@@ -300,6 +303,17 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
             bench::run(&engine_cfg, args)
         }
         Cmd::Loadgen(args) => loadgen::run(&args),
+        Cmd::StressInsert(args) => {
+            let engine_cfg = engine_config(
+                device,
+                meta_dir,
+                sync_mode,
+                cli.group_commit_ms.or(storage.group_commit_ms),
+                cli.checkpoint_interval.or(storage.checkpoint_interval),
+                cli.no_uring,
+            )?;
+            stress::run(&args, &engine_cfg)
+        }
         Cmd::Serve {
             listen,
             workers,

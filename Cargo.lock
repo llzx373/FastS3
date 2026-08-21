@@ -598,6 +598,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "sha2",
+ "tempfile",
  "toml",
  "tracing",
  "tracing-subscriber",

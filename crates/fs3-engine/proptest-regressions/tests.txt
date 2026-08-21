@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc 0204dc13d26b56dfc3a59f1d325fdf262dd92442d51d3de679ad05cd95422aac # shrinks to ops = [0], sizes = [33792]
 cc a113adfa8e6ec38edffc517a5131ea75c2945a979522465809c0db7244be6f40 # shrinks to ops = [0, 3, 0, 4, 4, 0, 4, 4, 1, 3, 3, 3, 3, 2, 4, 0, 0, 0], sizes = [154609, 301827, 2867661, 2190689, 589530, 35048, 3023355, 2222280, 83011, 810695]
+cc caa627ac6ddf8671f0b63b3501972e93a8e03247f3c5c1f748054d98120e09d4 # shrinks to sizes = [7462913, 5100250], verify = false

@@ -41,6 +41,7 @@ export default function Uploads() {
               <th>桶</th>
               <th>键</th>
               <th>UploadId</th>
+              <th>分片</th>
               <th>创建时间</th>
               <th>状态</th>
               <th>操作</th>
@@ -54,6 +55,7 @@ export default function Uploads() {
                 <td className="mono muted" style={{ fontSize: 12 }}>
                   {u.upload_id.slice(0, 16)}…
                 </td>
+                <td className="muted">{u.parts !== undefined ? `${u.parts} 片` : "—"}</td>
                 <td className="muted">{fmtTime(u.created)}</td>
                 <td>{u.completed ? "已完成" : "进行中"}</td>
                 <td>
@@ -65,7 +67,7 @@ export default function Uploads() {
             ))}
             {uploads.length === 0 && (
               <tr>
-                <td colSpan={6} className="muted">
+                <td colSpan={7} className="muted">
                   暂无在途上传
                 </td>
               </tr>

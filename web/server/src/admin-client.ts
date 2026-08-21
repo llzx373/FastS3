@@ -18,6 +18,7 @@ export interface AdminApi {
   createKey(accessKey: string, note?: string): Promise<{ access_key: string; secret_key: string }>;
   deleteKey(accessKey: string): Promise<Record<string, unknown>>;
   setKeyEnabled(accessKey: string, enabled: boolean): Promise<Record<string, unknown>>;
+  setKeyPolicy(accessKey: string, policy: string | null): Promise<Record<string, unknown>>;
   uploads(): Promise<{ uploads: UploadInfo[] }>;
   abortUpload(uploadId: string): Promise<Record<string, unknown>>;
   audit(limit?: number): Promise<{ audit: AuditEntry[] }>;
@@ -47,6 +48,8 @@ export interface UploadInfo {
   key: string;
   created: number;
   completed: boolean;
+  /** 已上传分片数(Rust 侧提供时才有;用于控制台展示) */
+  parts?: number;
 }
 
 export interface AuditEntry {
@@ -170,6 +173,11 @@ export class AdminClient implements AdminApi {
 
   setKeyEnabled(accessKey: string, enabled: boolean): Promise<Record<string, unknown>> {
     return this.expect("PATCH", `/v1/admin/keys/${encodeURIComponent(accessKey)}`, { enabled });
+  }
+
+  setKeyPolicy(accessKey: string, policy: string | null): Promise<Record<string, unknown>> {
+    // Rust 侧 PATCH /v1/admin/keys/{access} 增加 policy 字段处理
+    return this.expect("PATCH", `/v1/admin/keys/${encodeURIComponent(accessKey)}`, { policy });
   }
 
   uploads(): Promise<{ uploads: UploadInfo[] }> {

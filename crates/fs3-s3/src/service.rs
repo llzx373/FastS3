@@ -305,13 +305,32 @@ impl S3Service {
     /// 设置/清除密钥策略(J4;AWS 策略 JSON 子集,写入前校验)。
     /// `policy: None` = 清除策略(恢复全放行)。持久化 + 内存缓存即时生效。
     pub fn set_key_policy(&self, access_key: &str, policy: Option<String>) -> Result<(), S3Error> {
-        let mut rec = self
+        let mut rec = match self
             .engine
             .read()
             .meta()
             .get_key(access_key)
             .map_err(|e| map_engine_error(e, "", ""))?
-            .ok_or_else(|| S3Error::new(S3ErrorCode::InvalidAccessKeyId))?;
+        {
+            Some(r) => r,
+            // 运行时密钥(配置/CLI 注入,未持久化到 meta):由内存表补建记录,
+            // 使策略同样可挂接
+            None => {
+                let secret = self
+                    .auth
+                    .find_key_by_access(access_key)
+                    .ok_or_else(|| S3Error::new(S3ErrorCode::InvalidAccessKeyId))?
+                    .secret_key;
+                let seed = self
+                    .engine
+                    .read()
+                    .meta()
+                    .seed_salt()
+                    .map_err(|e| map_engine_error(e, "", ""))?;
+                fs3_core::KeyRecord::new(access_key, &secret, &seed, Some("runtime".into()))
+                    .map_err(|e| map_engine_error(e, "", ""))?
+            }
+        };
         // 写入前校验(非法策略拒绝写入,防脏数据)
         if let Some(text) = &policy {
             if let Err(e) = crate::policy::Policy::parse(text) {

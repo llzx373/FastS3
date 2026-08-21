@@ -64,6 +64,29 @@ export interface UploadInfo {
   key: string;
   created: number;
   completed: boolean;
+  /** 已上传分片数(Rust 侧提供时才有) */
+  parts?: number;
+}
+
+export interface MetricsSnapshotData {
+  uptime: number;
+  degraded: boolean;
+  device_capacity: number;
+  device_used: number;
+  buckets: number;
+  objects: number;
+  ops: { put: number; get: number; del: number; list: number; multipart: number };
+  bytes: { in: number; out: number };
+  latency: { p50: number; p99: number; p999: number };
+  errors: number;
+  ring_depth: number;
+  group_commit: { count: number; bytes: number };
+  pools: Record<string, unknown>;
+}
+
+export interface MetricsSnapshot {
+  t: number;
+  data: MetricsSnapshotData;
 }
 
 export interface ListedObject {
@@ -168,6 +191,14 @@ export const api = {
   deleteKey: (accessKey: string) => request<{ deleted: string }>("DELETE", `/api/keys/${encodeURIComponent(accessKey)}`),
   setKeyEnabled: (accessKey: string, enabled: boolean) =>
     request<{ enabled: boolean }>("PATCH", `/api/keys/${encodeURIComponent(accessKey)}`, { enabled }),
+  setKeyPolicy: (accessKey: string, policy: string | null) =>
+    request<Record<string, unknown>>("PUT", `/api/keys/${encodeURIComponent(accessKey)}/policy`, { policy }),
+
+  metricsHistory: (limit = 200) =>
+    request<{ snapshots: MetricsSnapshot[]; size: number; capacity: number }>(
+      "GET",
+      `/api/metrics/history?limit=${limit}`
+    ),
 
   uploads: () => request<{ uploads: UploadInfo[] }>("GET", "/api/uploads"),
   abortUpload: (uploadId: string) =>
