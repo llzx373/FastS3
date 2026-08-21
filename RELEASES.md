@@ -21,6 +21,28 @@
 
 # FastS3 发布记录
 
+## v0.4 — M3 管理面 v1(2026-08-21)
+
+> 里程碑门禁全部达成:控制台"建桶 → 拖拽上传 → 下载 → 删桶"全流程演示通过;`fasts3d check`(+ `--fix`)可用;性能报告见 docs/perf-M3.md。
+
+### 新能力
+
+- **H1 admin API(新 crate `fs3-admin`)**:unix socket(0600)/TCP 回环 + Bearer token;`GET /v1/admin/status`(版本/uptime/设备/容量水位/池统计)、buckets CRUD + stats + 配额、keys CRUD(secret 加盐哈希 + AES-256-GCM 密文存储,明文只下发一次)、uploads 列表 + 强制 abort、`GET /v1/admin/metrics`(Prometheus 文本)、`GET /v1/admin/audit`、`POST /v1/admin/repair`(泄漏修复)、`/healthz` 免认证探针。
+- **H2 指标与审计**:fs3-core 新增 `metrics::Metrics`(请求量 × 状态类、错误码计数、延迟直方图 p50/p99/p999、字节计数、uptime)与 `audit::AuditRing`(S3 操作 who/what/when/result,固定容量环形);S3 服务全请求打点;Prometheus 额外暴露 io_uring ring 深度、WAL 组提交计数/字节、分配器水位。
+- **I1~I3 Node 管理 API(`web/server`,Fastify + TS)**:`POST /api/login`(JWT HS256,admin/readonly 角色,手写签发零额外依赖)、`GET /api/health`、admin 通道客户端(unix/TCP + Bearer)、全部代理端点、`GET /api/dashboard` 聚合(吞吐/IOPS/延迟分位/容量/健康/告警)、`POST /api/buckets/{name}/presign`(SigV4 预签名,与 Rust 侧同语义)、multipart init/complete/abort 分片编排、对象浏览(ListObjectsV2)、对象删除/复制、密钥管理、审计查询、`POST /api/repair`、`WS /api/ws` 实时推送。
+- **J1~J3 控制台(`web/console`,Vite + React + TS + uPlot)**:登录页、仪表盘(实时吞吐曲线 + 延迟分位 + 容量水位 + 健康告警)、桶管理(创建/删除/配额)、对象浏览(前缀导航、拖拽上传、大文件分片直传、下载/删除/复制/预签名/元数据)、在途上传管理、访问密钥、审计日志;构建产物纯静态,由 `fasts3-web` 托管(或未来 `fasts3d --web-root` 内嵌)。
+- **浏览器直连数据面**:上传/下载经预签名 URL 直连 Rust 数据面,流量不经过 Node(设计 §7.1 红线);已验证小文件直传与大文件 3 片 multipart 直传 + complete 零拷贝拼接。
+- **E4 桶统计与配额**:对象数/字节与对象元数据同事务记账(既有);桶配额在 put/multipart-complete/copy 三条入账路径执行,超限 → `403 QuotaExceeded`(AWS XML 语义)。
+- **C4 泄漏扫描与 check**:`fasts3d check` 只读报告(位图 vs 元数据可达性 mark-sweep);`fasts3d check --fix` 将泄漏 extent 回收入位图并写检查点(修复记录经 `a:` 事务落盘,崩溃重放幂等);admin `POST /v1/admin/repair` 等价在线修复。
+- **运行时密钥**:`POST /v1/admin/keys` 创建的密钥立即生效于 S3 认证;重启后从元数据解密恢复(种子盐持久化于 meta);禁用即从认证表移除。
+
+### 验证(门禁)
+
+- Rust:cargo test 全绿(新增 fs3-admin 6 个端到端测试、引擎配额/修复测试、core 指标/审计/密钥加密测试);clippy 0 警告;fmt 干净。
+- Node:`web/server` 单元测试 12 个(auth JWT / presign / dashboard 解析)+ 集成测试(真实 fasts3d:status/buckets/keys/uploads/audit/repair/签名 PUT);控制台 `vite build` 通过。
+- 端到端演示:登录 → 建桶 → 预签名直传 → 对象浏览 → 下载校验 → 仪表盘聚合 → 审计可见 → 删桶,全链路通过。
+- `fasts3 check` 与 `check --fix` 在真实设备上验证(修复幂等、零泄漏收敛)。
+
 ## v0.3 — M2 高级语义与零拷贝(2026-08-20)
 
 ### 新能力

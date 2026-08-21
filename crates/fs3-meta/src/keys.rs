@@ -7,6 +7,7 @@
 //! - `a:{seq be64}` 分配器变更记录
 //! - `t:{seq be64}` 事务提交标记
 //! - `s:seq` 系统单调计数器(ADR-5 新增内部键)
+//! - `k:{access_key}` 访问密钥(M3 密钥 CRUD,secret 哈希存储)
 //!
 //! 转义规则:0x00 → 0xFF 0x00;0xFF → 0xFF 0xFF;其余原样。
 //! 保证 `o:{bucket}\0` 前缀扫描恰好覆盖该桶全部对象。
@@ -24,9 +25,13 @@ pub const PREFIX_PART: &[u8] = b"p:";
 pub const PREFIX_ALLOC: &[u8] = b"a:";
 pub const PREFIX_TXN: &[u8] = b"t:";
 pub const PREFIX_SYS: &[u8] = b"s:";
+/// 访问密钥(`k:{access_key}` → KeyRecord;M3)。
+pub const PREFIX_KEY: &[u8] = b"k:";
 
 /// 系统单调计数器(每个事务 +1,单点序列化;ADR-5)。
 pub const SYS_SEQ: &[u8] = b"s:seq";
+/// 密钥加密种子盐(64 字节随机;首次启动生成,持久化;密钥派生 + 恢复用)。
+pub const SYS_KEY_SEED_SALT: &[u8] = b"s:key_seed_salt";
 
 /// 转义:S3 对象键可含任意字节,0x00/0xFF 需转义以保持键内无分隔符。
 pub fn escape(raw: &[u8]) -> Vec<u8> {
@@ -214,6 +219,22 @@ pub fn parse_alloc_seq(raw: &[u8]) -> Result<u64> {
         return Err(Error::Corrupt("alloc key malformed".into()));
     }
     Ok(u64::from_be_bytes(body.try_into().unwrap()))
+}
+
+/// 密钥主键:`k:{access_key}`。
+pub fn key_key(access_key: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(PREFIX_KEY.len() + access_key.len());
+    k.extend_from_slice(PREFIX_KEY);
+    k.extend_from_slice(access_key.as_bytes());
+    k
+}
+
+/// 解析 `k:` 键 → access_key。
+pub fn parse_key_key(raw: &[u8]) -> Result<String> {
+    let body = raw
+        .strip_prefix(PREFIX_KEY)
+        .ok_or_else(|| Error::Corrupt("key record missing prefix".into()))?;
+    String::from_utf8(body.to_vec()).map_err(|_| Error::Corrupt("access key not utf8".into()))
 }
 
 #[cfg(test)]

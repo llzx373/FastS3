@@ -6,7 +6,7 @@
 //! (ADR-8,替代 sled 内建 `flush_every_ms`)。
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -201,6 +201,24 @@ pub enum Op {
     PartDelete {
         key: Vec<u8>,
     },
+    /// 写访问密钥(`k:{access_key}` → KeyRecord;M3 密钥 CRUD)。
+    KeyPut {
+        access_key: String,
+        record: fs3_core::KeyRecord,
+    },
+    /// 删除访问密钥。
+    KeyDelete {
+        access_key: String,
+    },
+}
+
+/// 元数据层运行统计(H2 指标:WAL 组提交)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetaStats {
+    /// WAL 组提交 flush 次数。
+    pub wal_flush_count: u64,
+    /// 累计 WAL flush 字节数。
+    pub wal_flush_bytes: u64,
 }
 
 /// 组提交刷盘线程(sled `flush_every_ms` 语义的 rocksdb 等价物,ADR-8)。
@@ -212,13 +230,23 @@ struct Flusher {
     stop: Arc<AtomicBool>,
     wake: Arc<(Mutex<()>, Condvar)>,
     join: Option<JoinHandle<()>>,
+    /// 组提交统计(H2)。
+    stats: Arc<MetaStatsAtomic>,
+}
+
+#[derive(Debug, Default)]
+struct MetaStatsAtomic {
+    flush_count: AtomicU64,
+    flush_bytes: AtomicU64,
 }
 
 impl Flusher {
     fn spawn(db: Arc<OptimisticTransactionDB>, every_ms: u64) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let wake = Arc::new((Mutex::new(()), Condvar::new()));
+        let stats = Arc::new(MetaStatsAtomic::default());
         let (s, w) = (stop.clone(), wake.clone());
+        let st = stats.clone();
         let join = std::thread::Builder::new()
             .name("fs3-meta-flusher".to_string())
             .spawn(move || {
@@ -233,9 +261,20 @@ impl Flusher {
                         break;
                     }
                     // 组提交窗口到期:WAL 批量 write + fsync
-                    if let Err(e) = db.flush_wal(true) {
-                        // 刷盘失败不 panic:下一窗口重试,调用方仍可显式 flush
-                        eprintln!("fs3-meta: flush_wal failed: {e}");
+                    match db.flush_wal(true) {
+                        Ok(()) => {
+                            st.flush_count.fetch_add(1, Ordering::Relaxed);
+                            // rocksdb.wal-bytes 属性:当前 WAL 大小(近似累计)
+                            if let Ok(Some(sz)) = db.property_value("rocksdb.wal-bytes") {
+                                if let Ok(n) = sz.trim().parse::<u64>() {
+                                    st.flush_bytes.fetch_add(n, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            // 刷盘失败不 panic:下一窗口重试,调用方仍可显式 flush
+                            eprintln!("fs3-meta: flush_wal failed: {e}");
+                        }
                     }
                 }
             })
@@ -244,7 +283,15 @@ impl Flusher {
             stop,
             wake,
             join: Some(join),
+            stats,
         })
+    }
+
+    fn stats(&self) -> MetaStats {
+        MetaStats {
+            wal_flush_count: self.stats.flush_count.load(Ordering::Relaxed),
+            wal_flush_bytes: self.stats.flush_bytes.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -375,6 +422,14 @@ impl MetaStore {
 
     pub fn sync_mode(&self) -> SyncMode {
         self.sync_mode
+    }
+
+    /// 元数据层运行统计(H2 指标)。
+    pub fn stats(&self) -> MetaStats {
+        match &self.flusher {
+            Some(f) => f.stats(),
+            None => MetaStats::default(),
+        }
     }
 
     // —— 读路径 ——
@@ -589,11 +644,72 @@ impl MetaStore {
         }])
     }
 
+    // —— 密钥加密种子盐(M3 密钥 CRUD;首次启动生成,持久化) ——
+
+    /// 读种子盐(不存在 → 生成 64 字节随机并持久化,返回)。
+    pub fn seed_salt(&self) -> Result<Vec<u8>> {
+        if let Some(v) = self.db.get(SYS_KEY_SEED_SALT).map_err(rocks_err)? {
+            return Ok(v);
+        }
+        let mut salt = [0u8; 64];
+        fs3_core::random_bytes(&mut salt)?;
+        // 直接写(不走事务;无并发竞争——引擎单例 + 启动时调用)
+        self.db.put(SYS_KEY_SEED_SALT, salt).map_err(rocks_err)?;
+        self.db.flush_wal(true).map_err(rocks_err)?;
+        Ok(salt.to_vec())
+    }
+
     /// 桶删除。
     pub fn commit_bucket_delete(&self, name: &str) -> Result<u64> {
         self.commit(&[Op::BucketDelete {
             name: name.to_string(),
         }])
+    }
+
+    // —— 访问密钥(M3 密钥 CRUD;secret 哈希存储) ——
+
+    /// 写/更新访问密钥。
+    pub fn commit_key_put(&self, record: &fs3_core::KeyRecord) -> Result<u64> {
+        self.commit(&[Op::KeyPut {
+            access_key: record.access_key.clone(),
+            record: record.clone(),
+        }])
+    }
+
+    /// 删除访问密钥(不存在 → NotFound)。
+    pub fn commit_key_delete(&self, access_key: &str) -> Result<u64> {
+        self.commit(&[Op::KeyDelete {
+            access_key: access_key.to_string(),
+        }])
+    }
+
+    /// 读访问密钥。
+    pub fn get_key(&self, access_key: &str) -> Result<Option<fs3_core::KeyRecord>> {
+        let k = key_key(access_key);
+        match self.db.get(&k).map_err(rocks_err)? {
+            Some(v) => {
+                Ok(Some(decode(&v).map_err(|e| {
+                    Error::Corrupt(format!("key {access_key}: {e}"))
+                })?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// 列全部访问密钥(按 access_key 排序)。
+    pub fn list_keys(&self) -> Result<Vec<fs3_core::KeyRecord>> {
+        let mut out = Vec::new();
+        for item in self
+            .db
+            .iterator(IteratorMode::From(PREFIX_KEY, Direction::Forward))
+        {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(PREFIX_KEY) {
+                break;
+            }
+            out.push(decode(&v).map_err(|e| Error::Corrupt(format!("key record: {e}")))?);
+        }
+        Ok(out)
     }
 
     /// 对象 PUT + 分配记录 + 桶统计(ADR-4 同事务)。
@@ -1062,6 +1178,18 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
                 if tget(tx, key)?.is_some() {
                     tremove(tx, key)?;
                 }
+            }
+            Op::KeyPut { access_key, record } => {
+                let k = key_key(access_key);
+                tget(tx, &k)?;
+                tinsert(tx, k, encode(record)?)?;
+            }
+            Op::KeyDelete { access_key } => {
+                let k = key_key(access_key);
+                if tget(tx, &k)?.is_none() {
+                    return Err(Error::NotFound(format!("key {access_key}")));
+                }
+                tremove(tx, &k)?;
             }
         }
     }

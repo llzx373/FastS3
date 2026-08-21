@@ -49,6 +49,19 @@ pub trait IoEngine: Send {
     fn submit(&mut self, ops: &[IoOp]) -> io::Result<()>;
     /// 能力名(基准/日志用)。
     fn name(&self) -> &'static str;
+    /// 运行统计(ring 深度;H2 指标)。
+    fn stats(&self) -> IoStats {
+        IoStats::default()
+    }
+}
+
+/// I/O 引擎运行统计(H2 Prometheus 指标:ring 深度)。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IoStats {
+    /// 最近一批提交的在途 SQE 数(ring 深度)。
+    pub inflight: u64,
+    /// 当前待提交数(批量提交前积压)。
+    pub pending: u64,
 }
 
 /// 打开 I/O 引擎:优先 io_uring,失败降级 pread/pwrite。
@@ -159,6 +172,8 @@ pub struct IoUringEngine {
     fixed_pool: Vec<fs3_device::AlignedBuffer>,
     /// 池内缓冲占用标记(下标互斥)。
     fixed_used: Vec<bool>,
+    /// 最近一批提交的在途 SQE 数(H2 指标)。
+    last_inflight: std::sync::atomic::AtomicU64,
 }
 
 impl IoUringEngine {
@@ -170,6 +185,7 @@ impl IoUringEngine {
             depth: depth as usize,
             fixed_pool: Vec::new(),
             fixed_used: Vec::new(),
+            last_inflight: std::sync::atomic::AtomicU64::new(0),
         };
         // 尽力注册缓冲池(IORING_REGISTER_BUFFERS;内核不支持则禁用)
         let mut pool = Vec::with_capacity(FIXED_POOL_SIZE);
@@ -300,6 +316,8 @@ impl IoUringEngine {
         if pending == 0 {
             return Ok(());
         }
+        self.last_inflight
+            .store(pending as u64, std::sync::atomic::Ordering::Relaxed);
         self.ring.submit_and_wait(pending)?;
         let cq = self.ring.completion();
         let mut count = 0usize;
@@ -328,6 +346,15 @@ impl IoEngine for IoUringEngine {
 
     fn name(&self) -> &'static str {
         "io_uring"
+    }
+
+    fn stats(&self) -> IoStats {
+        IoStats {
+            inflight: self
+                .last_inflight
+                .load(std::sync::atomic::Ordering::Relaxed),
+            pending: 0,
+        }
     }
 }
 

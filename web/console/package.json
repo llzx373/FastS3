@@ -1,6 +1,24 @@
 {
   "name": "@fasts3/console",
   "private": true,
-  "version": "0.1.0",
-  "description": "FastS3 Web 控制台(React + Vite);M3 起实现,当前为 workspace 占位"
+  "version": "0.4.0",
+  "type": "module",
+  "description": "FastS3 Web 控制台(React + Vite + uPlot)",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "uplot": "^1.6.31"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.3"
+  }
 }

@@ -6,7 +6,9 @@
 use crate::consts::*;
 use crate::crc32c::crc32c;
 use crate::error::{Error, Result};
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use sha2::Digest as _;
 
 /// 段(ADR-9 §4.1):对象 → 设备的引用单位(替代 v1 的 ExtentRef;offset 语义化)。
 ///
@@ -135,6 +137,125 @@ pub struct BucketMeta {
 pub struct BucketStats {
     pub objects: u64,
     pub bytes: u64,
+}
+
+/// S3 访问密钥记录(键 `k:{access_key}`;DESIGN §9 密钥存储)。
+///
+/// secret 磁盘存储 = 加盐哈希(校验)+ AES-256-GCM 密文(重启恢复明文,
+/// 密钥派生自持久化种子盐);admin API 只在创建时下发一次明文。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyRecord {
+    pub access_key: String,
+    /// secret 的加盐哈希(hex)。
+    pub secret_hash: String,
+    /// 随机盐(hex;哈希用)。
+    pub salt: String,
+    /// secret 密文(base64: nonce||ct;AES-256-GCM,密钥 = SHA-256(seed_salt))。
+    pub secret_cipher: String,
+    /// 是否启用(禁用后认证拒绝)。
+    pub enabled: bool,
+    /// 创建时间(unix 秒)。
+    pub created: i64,
+    /// 策略 JSON(AWS 策略语法子集;可空)。
+    pub policy: Option<String>,
+    /// 备注(可选)。
+    pub note: Option<String>,
+}
+
+impl KeyRecord {
+    /// 计算加盐哈希:HMAC-SHA256(salt, secret) → hex。
+    pub fn hash_secret(salt: &str, secret: &str) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(salt.as_bytes()).expect("hmac accepts any key");
+        mac.update(secret.as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    /// 校验 secret 是否匹配(恒定时间比较)。
+    pub fn verify_secret(&self, secret: &str) -> bool {
+        let got = Self::hash_secret(&self.salt, secret);
+        // 长度一致时恒定时间比较
+        got.len() == self.secret_hash.len()
+            && constant_time_eq(got.as_bytes(), self.secret_hash.as_bytes())
+    }
+
+    /// 用种子盐加密 secret(AES-256-GCM;密钥 = SHA-256(seed_salt))。
+    pub fn encrypt_secret(seed_salt: &[u8], secret: &str) -> Result<String> {
+        use aes_gcm::aead::{Aead, KeyInit};
+        use aes_gcm::{Aes256Gcm, Nonce};
+        let key = sha2::Sha256::digest(seed_salt);
+        let cipher = Aes256Gcm::new_from_slice(&key)
+            .map_err(|_| Error::InvalidArgument("aes-gcm key init failed".into()))?;
+        let mut nonce = [0u8; 12];
+        crate::random_bytes(&mut nonce)?;
+        let ct = cipher
+            .encrypt(Nonce::from_slice(&nonce), secret.as_bytes())
+            .map_err(|_| Error::InvalidArgument("secret encrypt failed".into()))?;
+        let mut out = Vec::with_capacity(nonce.len() + ct.len());
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&ct);
+        Ok(base64::engine::general_purpose::STANDARD.encode(out))
+    }
+
+    /// 用种子盐解密 secret(重启恢复明文;密文损坏 → Err)。
+    pub fn decrypt_secret(&self, seed_salt: &[u8]) -> Result<String> {
+        use aes_gcm::aead::{Aead, KeyInit};
+        use aes_gcm::{Aes256Gcm, Nonce};
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&self.secret_cipher)
+            .map_err(|_| Error::Corrupt("key cipher not base64".into()))?;
+        if raw.len() < 13 {
+            return Err(Error::Corrupt("key cipher too short".into()));
+        }
+        let key = sha2::Sha256::digest(seed_salt);
+        let cipher = Aes256Gcm::new_from_slice(&key)
+            .map_err(|_| Error::InvalidArgument("aes-gcm key init failed".into()))?;
+        let (nonce, ct) = raw.split_at(12);
+        let pt = cipher
+            .decrypt(Nonce::from_slice(nonce), ct)
+            .map_err(|_| Error::Corrupt("key cipher decrypt failed".into()))?;
+        String::from_utf8(pt).map_err(|_| Error::Corrupt("key plaintext not utf8".into()))
+    }
+
+    /// 创建新密钥记录(生成随机 salt;secret 由调用方生成)。
+    pub fn new(
+        access_key: &str,
+        secret: &str,
+        seed_salt: &[u8],
+        note: Option<String>,
+    ) -> Result<Self> {
+        let mut salt_bytes = [0u8; 16];
+        crate::random_bytes(&mut salt_bytes)?;
+        let salt = hex::encode(salt_bytes);
+        let secret_hash = Self::hash_secret(&salt, secret);
+        let secret_cipher = Self::encrypt_secret(seed_salt, secret)?;
+        Ok(KeyRecord {
+            access_key: access_key.to_string(),
+            secret_hash,
+            salt,
+            secret_cipher,
+            enabled: true,
+            created: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+            policy: None,
+            note,
+        })
+    }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// 超级块(DESIGN §4.2;0..4KiB)。
@@ -673,5 +794,24 @@ mod tests {
             let dec: Segment = postcard::from_bytes(&enc).unwrap();
             assert_eq!(s, dec);
         }
+    }
+
+    #[test]
+    fn key_record_crypto_roundtrip() {
+        // 创建 → 哈希校验 → 解密恢复明文
+        let seed = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let rec = KeyRecord::new("AKIA_TEST", "s3cr3t-value", seed, None).unwrap();
+        assert!(rec.verify_secret("s3cr3t-value"));
+        assert!(!rec.verify_secret("wrong"));
+        assert_eq!(rec.decrypt_secret(seed).unwrap(), "s3cr3t-value");
+        // 错误种子盐 → 解密失败
+        assert!(rec
+            .decrypt_secret(b"different-seed-salt-00000000000000000000000000000000000000000000")
+            .is_err());
+        // 序列化往返(KeyRecord 持久化到 rocksdb)
+        let enc = postcard::to_allocvec(&rec).unwrap();
+        let dec: KeyRecord = postcard::from_bytes(&enc).unwrap();
+        assert_eq!(rec, dec);
+        assert_eq!(dec.decrypt_secret(seed).unwrap(), "s3cr3t-value");
     }
 }

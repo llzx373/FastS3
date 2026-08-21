@@ -505,6 +505,25 @@ impl Allocator {
             .collect()
     }
 
+    /// 释放一个泄漏 extent(C4 修复):位图清位 + 记账,记入 draft
+    /// (ref_dec → 随事务写 `a:` 记录,崩溃重放幂等)。
+    ///
+    /// 前提:调用方已确认该 extent 无任何元数据可达(泄漏扫描结论);
+    /// 若位图未置位或 live_bytes > 0(防御性,状态已漂移)则跳过。
+    pub fn release_leaked(&self, draft: &mut Staged, id: u64) -> bool {
+        if !self.bitmap.test(id) || self.live_bytes_of(id) != 0 {
+            return false;
+        }
+        self.bitmap.clear_bit(id);
+        self.refcounts[id as usize].store(0, Ordering::Release);
+        self.live_bytes[id as usize].store(0, Ordering::Release);
+        self.state[id as usize].store(ExtentState::Free as u8, Ordering::Release);
+        self.total_free.fetch_add(1, Ordering::Relaxed);
+        draft.ref_dec.push(id);
+        draft.cleared.push(id);
+        true
+    }
+
     /// 段是否被多个对象持有(COW 共享;压缩发现阶段跳过共享段,ADR-9 §6.5)。
     pub fn is_shared(&self, seg: &Segment) -> bool {
         self.shared

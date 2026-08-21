@@ -1239,3 +1239,124 @@ fn bench_flush_components() {
     let dt = t0.elapsed().as_secs_f64();
     eprintln!("std Mutex lock x2000: {:.3}us/op", dt * 1e6 / 2000.0);
 }
+
+// ─────────────────────────── E4 配额 ───────────────────────────
+
+/// 桶配额执行:put 超限拒绝、覆盖放行、删除后恢复。
+#[test]
+fn quota_enforcement() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    // 设配额 100KiB
+    let mut b = e.meta().get_bucket("b1").unwrap().unwrap();
+    b.quota = Some(100 * 1024);
+    e.meta().commit_bucket_put("b1", &b).unwrap();
+
+    // 60KiB 成功
+    e.put("b1", "a", &mut Cursor::new(rnd(60 * 1024, 1)))
+        .unwrap();
+    // 60KiB 再放 → 超限
+    let err = e
+        .put("b1", "b", &mut Cursor::new(rnd(60 * 1024, 2)))
+        .unwrap_err();
+    assert!(matches!(err, Error::QuotaExceeded(_)), "got {err:?}");
+    // 未提交:对象不可见
+    assert!(e.meta().get_object("b1", "b").unwrap().is_none());
+    // 覆盖 a(60KiB→40KiB):净增量 -20KiB → 放行
+    e.put("b1", "a", &mut Cursor::new(rnd(40 * 1024, 3)))
+        .unwrap();
+    // 统计:40KiB
+    let b = e.meta().get_bucket("b1").unwrap().unwrap();
+    assert_eq!(b.stats.bytes, 40 * 1024);
+    // 内联对象也受配额约束(小对象 1KiB)
+    let err = e
+        .put("b1", "c", &mut Cursor::new(rnd(80 * 1024, 4)))
+        .unwrap_err();
+    assert!(matches!(err, Error::QuotaExceeded(_)));
+}
+
+/// 配额拒绝后无泄漏:位图与元数据一致(check 收敛)。
+#[test]
+fn quota_rejection_leaves_no_leaks() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let mut b = e.meta().get_bucket("b1").unwrap().unwrap();
+    b.quota = Some(10 * 1024);
+    e.meta().commit_bucket_put("b1", &b).unwrap();
+    // 大对象(> 内联阈值)超限:数据已写盘但事务回滚 → 无泄漏
+    let err = e
+        .put("b1", "big", &mut Cursor::new(rnd(2 * 1024 * 1024, 5)))
+        .unwrap_err();
+    assert!(matches!(err, Error::QuotaExceeded(_)));
+    let r = e.check_report().unwrap();
+    assert!(
+        r.leaks.is_empty(),
+        "leaks after quota rejection: {:?}",
+        r.leaks
+    );
+}
+
+// ─────────────────────────── C4 泄漏修复 ───────────────────────────
+
+/// 手工制造泄漏(绕过元数据直接置位 + 注入 alloc 记录)→ 修复回收。
+#[test]
+fn repair_leaks_recovers_bitmap() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    // 分配一个 extent(正常写对象,占用首个 extent)
+    e.put("b1", "x", &mut Cursor::new(rnd(64 * 1024, 7)))
+        .unwrap();
+    let before = e.check_report().unwrap();
+    assert!(before.leaks.is_empty());
+
+    // 手工注入泄漏:把第 1 个 extent 置位但不写元数据
+    let alloc = e.allocator();
+    let leaked_id = 0u64;
+    // 直接置位(模拟崩溃后位图与元数据不一致)
+    {
+        use fs3_alloc::Staged;
+        let mut draft = Staged::default();
+        // 用 allocator 公开接口构造:allocate 一个再当作泄漏
+        let ids = alloc.allocate(&mut draft, 1).unwrap();
+        let id = ids[0];
+        e.meta()
+            .commit(&[Op::Alloc {
+                draft: fs3_meta::AllocDraft {
+                    alloc: draft.alloc.clone(),
+                    ref_inc: vec![],
+                    ref_dec: vec![],
+                },
+            }])
+            .unwrap();
+        let _ = (leaked_id, id);
+    }
+    // 泄漏检测应发现
+    let r = e.check_report().unwrap();
+    assert!(!r.leaks.is_empty(), "expected leaks");
+    let leaks_before = r.leaks.len() as u64;
+
+    // 修复
+    let rep = e.repair_leaks().unwrap();
+    assert_eq!(rep.leaks_found, leaks_before);
+    assert_eq!(rep.freed_extents, leaks_before);
+    assert!(rep.bytes_reclaimed > 0);
+
+    // 修复后收敛
+    let r2 = e.check_report().unwrap();
+    assert!(r2.leaks.is_empty(), "leaks after repair: {:?}", r2.leaks);
+}
+
+/// 无泄漏时修复为幂等空操作。
+#[test]
+fn repair_no_leaks_is_noop() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    e.put("b1", "x", &mut Cursor::new(rnd(32 * 1024, 8)))
+        .unwrap();
+    let rep = e.repair_leaks().unwrap();
+    assert_eq!(rep.leaks_found, 0);
+    assert_eq!(rep.freed_extents, 0);
+    assert_eq!(rep.bytes_reclaimed, 0);
+    // 对象完好
+    assert!(e.meta().get_object("b1", "x").unwrap().is_some());
+}

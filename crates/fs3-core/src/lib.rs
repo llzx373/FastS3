@@ -2,9 +2,11 @@
 //!
 //! 本 crate 不依赖任何外部存储/IO 库,是所有上层 crate 的公共底座。
 
+pub mod audit;
 pub mod consts;
 pub mod crc32c;
 pub mod error;
+pub mod metrics;
 pub mod types;
 pub mod util;
 

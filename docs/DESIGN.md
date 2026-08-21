@@ -676,11 +676,21 @@ echo none > /sys/block/nvme0n1/queue/scheduler    # 直通,免合并层
 | --- | --- |
 | 传输 | rustls TLS 1.2/1.3;虚拟主机桶用通配符证书;支持外部 LB 终结 TLS |
 | S3 鉴权 | SigV4 + 预签名 + 桶策略(AWS 语法子集:Allow/Deny、Principal、Action、Resource、Condition 常用键)+ 匿名公共读 |
-| 密钥存储 | access key 明文索引 + secret 仅存加盐哈希(启动种子盐);admin API 只下发一次 secret |
+| 密钥存储 | access key 明文索引 + secret 磁盘存储 = 加盐哈希(HMAC-SHA256)+ AES-256-GCM 密文(密钥 = SHA-256(持久化种子盐),重启恢复明文供 SigV4 验证);admin API 只下发一次 secret(ADR:M3 实现细化,见 §9.1) |
 | 管理面 | admin 通道 unix socket/回环 + token;控制台 JWT;角色分离 |
 | 限额与抗滥用 | 每桶配额、每密钥限速、全局在途字节上限、超时(header 30s / idle 60s) |
 | 数据静态保护 | V1 信任底层卷(加密盘/云盘加密);应用层加密(SSE-C 路线图) |
 | 依赖面 | Rust 单一静态二进制 + 最小容器(scratch/distroless),攻击面最小化 |
+
+### 9.1 密钥存储实现细化(M3 ADR)
+
+设计原文"secret 仅存加盐哈希(启动种子盐)"与 SigV4 运行时验证(必须持有明文 secret)存在张力,M3 实现按下述落地(不推翻原设计意图,磁盘静态泄露仍拿不到明文):
+
+- **持久层(`k:{access_key}` → KeyRecord)**:`secret_hash` = HMAC-SHA256(每密钥随机 salt, secret)(校验/防篡改);`secret_cipher` = AES-256-GCM(密钥 = SHA-256(seed_salt))密文,nonce 前置 base64 —— 磁盘泄露只有哈希与密文;
+- **种子盐(`s:key_seed_salt`)**:64 字节随机,首次启动生成并持久化于 meta(WAL fsync);用于重启后解密恢复;
+- **内存认证表**:启动时 = 配置/CLI 密钥 + meta 解密恢复的运行时密钥;`add_key/remove_key/set_key_enabled` 同步更新 meta 与内存表,立即生效;
+- **下发语义**:`POST /v1/admin/keys` 生成随机 secret(30 字符字母数字)并返回一次;列表/详情接口永不返回 secret_hash/salt/cipher;
+- 新增依赖:`aes-gcm`(理由:密钥可逆加密存储,满足安全红线"secret 仅哈希存储"意图同时保证重启可用)。
 
 ---
 

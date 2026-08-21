@@ -1,0 +1,199 @@
+/**
+ * 控制台 → Node 管理 API 客户端(设计 §7.3 端点)。
+ */
+export interface Dashboard {
+  version: string;
+  uptimeSecs: number;
+  node: {
+    device: string;
+    ioEngine: string;
+    deviceCapacity: number;
+    extentSize: number;
+    extentCount: number;
+    allocatedExtents: number;
+    liveBytes: number;
+    watermark: number;
+    keys: number;
+    checkpointSeq: number;
+    lastSeq: number;
+  };
+  buckets: number;
+  objects: number;
+  objectBytes: number;
+  requests: { total: number; errors: number; errorRate: number; bytesRead: number; bytesWritten: number };
+  latency: {
+    get: { p50: number; p99: number; p999: number };
+    put: { p50: number; p99: number; p999: number };
+  };
+  leaks: number;
+  healthy: boolean;
+  alerts: string[];
+  updatedAt: string;
+}
+
+export interface BucketInfo {
+  name: string;
+  created: number;
+  owner: string;
+  objects: number;
+  bytes: number;
+  quota: number | null;
+}
+
+export interface KeyInfo {
+  access_key: string;
+  enabled: boolean;
+  created: number;
+  policy: string | null;
+  note: string | null;
+}
+
+export interface AuditEntry {
+  ts: number;
+  who: string;
+  op: string;
+  bucket: string;
+  key: string;
+  status: number;
+  peer: string;
+}
+
+export interface UploadInfo {
+  upload_id: string;
+  bucket: string;
+  key: string;
+  created: number;
+  completed: boolean;
+}
+
+export interface ListedObject {
+  key: string;
+  size: number;
+  etag: string;
+  lastModified: string;
+}
+
+export interface ListResult {
+  objects: ListedObject[];
+  prefixes: string[];
+  isTruncated: boolean;
+  nextContinuationToken: string | null;
+  keyCount: number;
+}
+
+const TOKEN_KEY = "fasts3_token";
+
+export function getToken(): string | null {
+  return localStorage.getItem(TOKEN_KEY);
+}
+export function setToken(t: string): void {
+  localStorage.setItem(TOKEN_KEY, t);
+}
+export function clearToken(): void {
+  localStorage.removeItem(TOKEN_KEY);
+}
+
+async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const headers: Record<string, string> = {};
+  const token = getToken();
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  let payload: string | undefined;
+  if (body !== undefined) {
+    headers["Content-Type"] = "application/json";
+    payload = JSON.stringify(body);
+  }
+  const res = await fetch(path, { method, headers, body: payload });
+  if (res.status === 401) {
+    clearToken();
+    window.location.hash = "#/login";
+    throw new Error("unauthorized");
+  }
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    const msg = data?.error?.message ?? `HTTP ${res.status}`;
+    throw new Error(msg);
+  }
+  return data as T;
+}
+
+export const api = {
+  login: (username: string, password: string) =>
+    request<{ token: string; role: string; username: string }>("POST", "/api/login", { username, password }),
+
+  dashboard: () => request<Dashboard>("GET", "/api/dashboard"),
+
+  buckets: () => request<{ buckets: BucketInfo[] }>("GET", "/api/buckets"),
+  createBucket: (name: string, quota?: number) =>
+    request<{ name: string }>("POST", "/api/buckets", { name, quota }),
+  setBucketQuota: (name: string, quota: number | null) =>
+    request<BucketInfo>("PATCH", `/api/buckets/${encodeURIComponent(name)}`, { quota }),
+  deleteBucket: (name: string, force: boolean) =>
+    request<{ deleted: string }>("DELETE", `/api/buckets/${encodeURIComponent(name)}?force=${force}`),
+
+  listObjects: (bucket: string, prefix: string, token?: string, flat = false) => {
+    const q = new URLSearchParams({ prefix });
+    if (token) q.set("token", token);
+    if (flat) q.set("flat", "true");
+    return request<ListResult>("GET", `/api/buckets/${encodeURIComponent(bucket)}/objects?${q}`);
+  },
+  presign: (bucket: string, key: string, method: "PUT" | "GET" | "DELETE", expires = 3600, contentType?: string) =>
+    request<{ url: string; headers: Record<string, string>; expiresAt: number }>(
+      "POST",
+      `/api/buckets/${encodeURIComponent(bucket)}/presign`,
+      { key, method, expires, contentType }
+    ),
+  multipartInit: (bucket: string, key: string) =>
+    request<{ uploadId: string }>("POST", `/api/buckets/${encodeURIComponent(bucket)}/multipart/init`, { key }),
+  multipartComplete: (bucket: string, key: string, uploadId: string, parts: { etag: string; partNumber: number }[]) =>
+    request<{ etag: string }>("POST", `/api/buckets/${encodeURIComponent(bucket)}/multipart/complete`, {
+      key,
+      uploadId,
+      parts,
+    }),
+  multipartAbort: (bucket: string, key: string, uploadId: string) =>
+    request<{ aborted: boolean }>("POST", `/api/buckets/${encodeURIComponent(bucket)}/multipart/abort`, {
+      key,
+      uploadId,
+    }),
+  objectAction: (bucket: string, action: "delete" | "copy", key: string, destKey?: string) =>
+    request<Record<string, unknown>>("POST", `/api/buckets/${encodeURIComponent(bucket)}/objects/action`, {
+      action,
+      key,
+      destKey,
+    }),
+
+  keys: () => request<{ keys: KeyInfo[] }>("GET", "/api/keys"),
+  createKey: (accessKey: string, note?: string) =>
+    request<{ access_key: string; secret_key: string }>("POST", "/api/keys", { access_key: accessKey, note }),
+  deleteKey: (accessKey: string) => request<{ deleted: string }>("DELETE", `/api/keys/${encodeURIComponent(accessKey)}`),
+  setKeyEnabled: (accessKey: string, enabled: boolean) =>
+    request<{ enabled: boolean }>("PATCH", `/api/keys/${encodeURIComponent(accessKey)}`, { enabled }),
+
+  uploads: () => request<{ uploads: UploadInfo[] }>("GET", "/api/uploads"),
+  abortUpload: (uploadId: string) =>
+    request<{ aborted: boolean }>("POST", `/api/uploads/${encodeURIComponent(uploadId)}/abort`),
+
+  audit: (limit = 200) => request<{ audit: AuditEntry[] }>("GET", `/api/audit?limit=${limit}`),
+  repair: () => request<{ freed_extents: number; leaks_found: number; bytes_reclaimed: number }>(
+    "POST",
+    "/api/repair",
+    { confirm: true }
+  ),
+};
+
+/** 字节/容量格式化。 */
+export function fmtBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  const units = ["KiB", "MiB", "GiB", "TiB", "PiB"];
+  let v = n;
+  let i = -1;
+  do {
+    v /= 1024;
+    i++;
+  } while (v >= 1024 && i < units.length - 1);
+  return `${v.toFixed(v >= 100 ? 0 : 1)} ${units[i]}`;
+}
+
+export function fmtTime(ts: number): string {
+  return new Date(ts * 1000).toLocaleString();
+}

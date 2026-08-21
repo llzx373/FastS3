@@ -29,6 +29,12 @@ pub async fn serve_connection(
     if let Some(fd) = service.zc_fd() {
         crate::zero_copy::register_trusted_fd(fd);
     }
+    // 审计用客户端地址(H2)
+    let peer = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+    service.set_peer(&peer);
     let zc_ctx = crate::zero_copy::ZeroCtx::new();
     let io = TokioIo::new(crate::zero_copy::ZeroCopyIo::new(stream, &zc_ctx));
     let service_fn = hyper::service::service_fn(move |req| {

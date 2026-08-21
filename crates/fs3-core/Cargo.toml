@@ -9,6 +9,14 @@ rust-version.workspace = true
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true
+# 密钥加盐哈希(KeyRecord::hash_secret;HMAC-SHA256)
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true
+# 密钥密文(AES-256-GCM;ADR:secret 磁盘存储 = 加盐哈希 + 种子盐派生
+# 密钥加密,重启可恢复明文用于 SigV4 验证;admin API 只下发一次)
+aes-gcm = "0.10"
+base64.workspace = true
 # 对象元数据值编码(ADR-9 §13:[版本字节] + postcard);本 crate 提供
 # ObjectMeta::encode_value/decode_value,供 fs3-meta 存储层使用。
 postcard.workspace = true

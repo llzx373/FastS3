@@ -2,6 +2,7 @@
 //!
 //! 实现以 aws-sig-v4-test-suite 官方向量验证(见 tests)。
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use hmac::{Hmac, Mac};
@@ -327,15 +328,21 @@ pub fn now_amz() -> String {
     fmt_now(SystemTime::now())
 }
 
-/// 认证器:持有密钥表与区域;时间校验按请求实时取服务器时钟。
+/// 认证器:持有共享密钥表与区域;时间校验按请求实时取服务器时钟。
+///
+/// 密钥表为 `Arc<RwLock<..>>`:admin API(M3 密钥 CRUD)可运行时增删,
+/// S3 认证每次请求取读锁(短临界区,非数据热路径瓶颈)。
 pub struct Authenticator {
-    keys: Vec<Credentials>,
+    keys: Arc<parking_lot::RwLock<Vec<Credentials>>>,
     region: String,
 }
 
 impl Authenticator {
     pub fn new(keys: Vec<Credentials>, region: String, _now: SystemTime) -> Self {
-        Authenticator { keys, region }
+        Authenticator {
+            keys: Arc::new(parking_lot::RwLock::new(keys)),
+            region,
+        }
     }
 
     /// 当前服务器时间(每次请求实时获取,避免长时间运行后时钟漂移)。
@@ -347,16 +354,27 @@ impl Authenticator {
         &self.region
     }
 
-    fn find_key(&self, access_key: &str) -> Option<&Credentials> {
-        self.keys.iter().find(|k| k.access_key == access_key)
+    fn find_key(&self, access_key: &str) -> Option<Credentials> {
+        self.keys
+            .read()
+            .iter()
+            .find(|k| k.access_key == access_key)
+            .cloned()
     }
 
     /// 按 access key 查凭据(流式 chunked 校验用)。
     pub fn find_key_by_access(&self, access_key: &str) -> Option<Credentials> {
-        self.keys
-            .iter()
-            .find(|k| k.access_key == access_key)
-            .cloned()
+        self.find_key(access_key)
+    }
+
+    /// 共享密钥表(admin API 通过它运行时增删密钥)。
+    pub fn key_table(&self) -> &Arc<parking_lot::RwLock<Vec<Credentials>>> {
+        &self.keys
+    }
+
+    /// 当前密钥数(admin status 用)。
+    pub fn key_count(&self) -> usize {
+        self.keys.read().len()
     }
 
     /// 校验 header 认证(Authorization 头)。

@@ -1,0 +1,19 @@
+{
+  "listen": "0.0.0.0:9090",
+  "staticDir": "../console/dist",
+  "jwtSecret": "dev-insecure-secret",
+  "users": [
+    { "username": "admin", "password": "admin123", "role": "admin" },
+    { "username": "viewer", "password": "view123", "role": "readonly" }
+  ],
+  "admin": {
+    "listen": "tcp://127.0.0.1:9001",
+    "token": "change-me"
+  },
+  "s3": {
+    "endpoint": "http://127.0.0.1:9000",
+    "region": "us-east-1",
+    "accessKey": "fasts3dev",
+    "secretKey": "fasts3dev"
+  }
+}

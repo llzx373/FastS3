@@ -73,7 +73,9 @@ FastS3 的对策:**不做底层已经做过的事**。工程力量全部投入�
 
 ✅ **M1 S3 核心语义完成(v0.2)。** S3 协议面:路径/虚拟主机路由、SigV4 header + 预签名认证、桶/对象 CRUD、ListObjectsV1/V2(分页/StartAfter/delimiter)、Range 与条件头、DeleteObjects、小对象内联(E3)、hyper + SO_REUSEPORT 流式接入;门禁全过:aws cli / boto3 / mc / rclone 4 客户端冒烟 ✅、CEPH s3-tests 核心子集 68/68 ✅、HTTP 崩溃 harness 100 轮 + CLI 50 轮零撕裂 ✅、覆盖率 ≥60% ✅、cargo audit 漏洞清零 ✅。
 
-✅ **M2 高级语义与零拷贝完成(v0.3)。** Multipart 上传(分片/列表/完成/中止、extent 零数据搬运组合、ETag=MD5+“-N”)、CopyObject COW(引用计数共享)、UploadPartCopy、零拷贝读路径(h1 标记帧协议 + sendfile/splice + 注册缓冲池)、HTTP/2(h2c)、背压(503 SlowDown + Retry-After)、自研 loadgen;门禁:CEPH s3-tests M1+M2 合并 107/107 ✅、崩溃 harness 100 轮 ✅、覆盖率 73.9% ✅、audit 清零 ✅、混载无 OOM ✅。性能基线见 docs/perf-M2.md。下一步:M3 管理面 v1。
+✅ **M2 高级语义与零拷贝完成(v0.3)。** Multipart 上传(分片/列表/完成/中止、extent 零数据搬运组合、ETag=MD5+“-N”)、CopyObject COW(引用计数共享)、UploadPartCopy、零拷贝读路径(h1 标记帧协议 + sendfile/splice + 注册缓冲池)、HTTP/2(h2c)、背压(503 SlowDown + Retry-After)、自研 loadgen;门禁:CEPH s3-tests M1+M2 合并 107/107 ✅、崩溃 harness 100 轮 ✅、覆盖率 73.9% ✅、audit 清零 ✅、混载无 OOM ✅。性能基线见 docs/perf-M2.md。
+
+✅ **M3 管理面 v1 完成(v0.4)。** admin API(新 crate `fs3-admin`:unix socket 0600/TCP 回环 + Bearer token;status/buckets/keys/uploads/metrics/audit/repair)、Prometheus 指标与审计环形缓冲(H2)、Node 管理 API(Fastify + TS:JWT 登录 + admin/readonly 角色、admin 通道代理、dashboard 聚合、SigV4 预签名、multipart 分片编排、WS 推送)、Web 控制台(Vite + React + uPlot:登录/仪表盘/桶管理/对象浏览/密钥/审计/在途上传)、桶配额执行(403 QuotaExceeded)、`fasts3d check --fix` 泄漏修复;门禁:控制台"建桶 → 拖拽上传 → 下载 → 删桶"全流程演示 ✅、check 可用 ✅、v0.4 发布 + 性能报告 ✅。管理面开销数据见 docs/perf-M3.md。下一步:M4 加固。
 
 | 文档 | 内容 |
 | --- | --- |
@@ -82,6 +84,23 @@ FastS3 的对策:**不做底层已经做过的事**。工程力量全部投入�
 | [TODO.md](./TODO.md) | 执行清单:M0~M8 逐条任务与门禁,勾选跟踪实现进度 |
 
 路线图:9 个里程碑(M0~M8,合计约 7 个月)→ v1.0 GA;v0.1 起逐版本发布(引擎 PoC → S3 核心 → 高级语义 → 管理面 → 加固 → 性能冲刺 → 打包开箱 → 文档与 Beta → GA)。
+
+## 快速启动(含管理面)
+
+```bash
+# 1) 初始化数据盘(64MiB 测试镜像)
+fasts3d init --device /tmp/fs3.img --size 64MiB
+
+# 2) 启动数据面 + admin API(unix socket + token)
+fasts3d serve --device /tmp/fs3.img --admin-listen unix:///tmp/fs3-admin.sock --admin-token sekret --key fasts3dev:fasts3dev
+
+# 3) 启动管理 API + 控制台(web/server/config.json 指向 admin 通道与数据面)
+cd web/server && node dist/index.js     # 打开 http://127.0.0.1:9090(默认 admin/admin123)
+
+# 4) 一致性检查 / 泄漏修复(离线)
+fasts3d check --device /tmp/fs3.img --meta-dir /tmp/fs3-meta
+fasts3d check --fix --device /tmp/fs3.img --meta-dir /tmp/fs3-meta
+```
 
 ## M1 S3 核心(当前)
 
@@ -171,15 +190,14 @@ FastS3/
 
 ## 构建
 
-> Rust 数据面已可用(M0);Node 管理面在 M3 起实现。
-
 ```bash
-cargo build --release          # Rust 数据面(单一静态二进制 fasts3d)
-cargo test                     # 单元 + 属性测试(63 个)
+cargo build --release          # Rust 数据面(单一静态二进制 fasts3d,含 admin API)
+cargo test                     # 单元 + 属性测试(全 workspace)
 cargo clippy -- -D warnings    # lint 门禁
 cargo audit                    # 依赖漏洞扫描(0 漏洞)
 
-cd web && pnpm install && pnpm -r build   # Node 管理 API + 控制台(M3 起)
+cd web && pnpm install && pnpm -r build   # Node 管理 API(fasts3-web)+ 控制台
+cd web/server && node dist/index.js       # 启动管理 API(默认 9090;需先启动 fasts3d serve --admin-listen ...)
 ```
 
 ## 许可证

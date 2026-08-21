@@ -103,7 +103,11 @@ enum Cmd {
         prefix: String,
     },
     /// 一致性检查(只读):位图 vs 元数据核对 + 泄漏报告
-    Check {},
+    Check {
+        /// 修复泄漏(M3 C4:泄漏 extent 回收入位图并写检查点)
+        #[arg(long)]
+        fix: bool,
+    },
     /// 前台惰性压缩(ADR-9 Tier 2):在线迁移碎片 extent,打印报告
     Compact {
         /// 轮数(默认 1;0 = 直到无候选)
@@ -133,6 +137,12 @@ enum Cmd {
         /// 全局在途字节上限(字节;默认 16GiB;超限 503 SlowDown)
         #[arg(long)]
         max_inflight_bytes: Option<u64>,
+        /// 管理 API 监听(unix:///path 或 127.0.0.1:9001;默认关)
+        #[arg(long)]
+        admin_listen: Option<String>,
+        /// 管理 API Bearer token
+        #[arg(long)]
+        admin_token: Option<String>,
     },
 }
 
@@ -227,7 +237,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
             )?;
             cmd_ls(&engine_cfg, bucket.as_deref(), &prefix)
         }
-        Cmd::Check {} => {
+        Cmd::Check { fix } => {
             let engine_cfg = engine_config(
                 device,
                 meta_dir,
@@ -236,7 +246,11 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.checkpoint_interval.or(storage.checkpoint_interval),
                 cli.no_uring,
             )?;
-            cmd_check(&engine_cfg)
+            if fix {
+                cmd_check_fix(&engine_cfg)
+            } else {
+                cmd_check(&engine_cfg)
+            }
         }
         Cmd::Compact { rounds } => {
             let engine_cfg = engine_config(
@@ -282,6 +296,8 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
             key,
             allow_anonymous,
             max_inflight_bytes,
+            admin_listen,
+            admin_token,
         } => {
             let engine_cfg = engine_config(
                 device,
@@ -299,12 +315,14 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 key,
                 allow_anonymous,
                 max_inflight_bytes,
+                admin_listen,
+                admin_token,
             )
         }
     }
 }
 
-/// 启动 S3 服务:引擎 + S3Service + hyper 多 worker 监听。
+/// 启动 S3 服务:引擎 + S3Service + hyper 多 worker 监听 + 可选 admin API。
 #[allow(clippy::too_many_arguments)]
 fn cmd_serve(
     engine_cfg: &EngineConfig,
@@ -314,6 +332,8 @@ fn cmd_serve(
     cli_keys: Vec<String>,
     cli_allow_anonymous: bool,
     cli_max_inflight: Option<u64>,
+    cli_admin_listen: Option<String>,
+    cli_admin_token: Option<String>,
 ) -> fs3_core::Result<()> {
     let mut engine_cfg = engine_cfg.clone();
     engine_cfg.compaction.enabled = true; // 服务常驻:后台惰性压缩(ADR-9 §6)
@@ -353,12 +373,44 @@ fn cmd_serve(
         .clone()
         .unwrap_or_else(|| "us-east-1".into());
     let allow_anonymous = cli_allow_anonymous || cfg.auth.allow_anonymous;
-    let service = Arc::new(fs3_s3::S3Service::new(
-        engine,
+    let metrics = Arc::new(fs3_core::metrics::Metrics::new());
+    let audit = Arc::new(fs3_core::audit::AuditRing::default());
+    let service = Arc::new(fs3_s3::S3Service::with_observability(
+        engine.clone(),
         keys,
         region,
         allow_anonymous,
+        metrics,
+        audit,
     ));
+    // 从 meta 恢复运行时密钥(M3 密钥 CRUD;配置密钥优先,同 access 不覆盖)
+    match service.restore_keys_from_meta() {
+        Ok(n) => {
+            if n > 0 {
+                tracing::info!("restored {n} runtime key(s) from metadata");
+            }
+        }
+        Err(e) => tracing::warn!("restore runtime keys failed: {e}"),
+    }
+
+    // 管理 API(H1;可选)
+    let admin_listen = cli_admin_listen.or_else(|| cfg.admin.listen.clone());
+    if let Some(listen) = admin_listen {
+        let token = cli_admin_token.or_else(|| cfg.admin.token.clone());
+        let admin_cfg = fs3_admin::AdminConfig {
+            listen,
+            token: token.unwrap_or_default(),
+        };
+        let admin = fs3_admin::AdminServer::new(engine.clone(), service.clone(), admin_cfg);
+        std::thread::Builder::new()
+            .name("fs3-admin".into())
+            .spawn(move || {
+                if let Err(e) = admin.serve() {
+                    tracing::error!("admin api exited: {e}");
+                }
+            })
+            .map_err(fs3_core::Error::Io)?;
+    }
 
     let addr: std::net::SocketAddr = listen
         .or_else(|| cfg.server.listen.clone())
@@ -647,6 +699,34 @@ fn cmd_check(cfg: &EngineConfig) -> fs3_core::Result<()> {
             r.leaks.len()
         )))
     }
+}
+
+/// 一致性检查 + 泄漏修复(M3 C4):`fasts3d check --fix`。
+/// 先只读报告,再回收入位图并写检查点。
+fn cmd_check_fix(cfg: &EngineConfig) -> fs3_core::Result<()> {
+    let mut e = Engine::open(cfg)?;
+    let r = e.check_report()?;
+    println!("device:       {}", r.device);
+    println!("capacity:     {} bytes", r.device_capacity);
+    println!(
+        "extents:      {} total, {} allocated",
+        r.extent_count, r.allocated_extents
+    );
+    if r.leaks.is_empty() {
+        println!("leaks:        none (bitmap consistent with metadata)");
+        println!("repair:       nothing to do");
+        e.close()?;
+        return Ok(());
+    }
+    println!("leaks:        {} leaked extents", r.leaks.len());
+    let rep = e.repair_leaks()?;
+    e.close()?;
+    println!(
+        "repair:       freed {} extents, reclaimed {} bytes",
+        rep.freed_extents, rep.bytes_reclaimed
+    );
+    println!("repair:       checkpoint written");
+    Ok(())
 }
 
 /// 解析 Range:0-1023 / 100- / -50(后缀)

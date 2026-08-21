@@ -57,6 +57,10 @@ pub enum Error {
     /// multipart:会话不存在(AWS NoSuchUpload)。
     #[error("no such upload: {0}")]
     NoSuchUpload(String),
+
+    /// 桶配额超限(E4;S3 层映射 QuotaExceeded)。
+    #[error("bucket quota exceeded: {0}")]
+    QuotaExceeded(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -11,6 +11,18 @@ pub struct RootConfig {
     pub server: ServerConfig,
     #[serde(default)]
     pub auth: AuthConfig,
+    #[serde(default)]
+    pub admin: AdminConfig,
+}
+
+/// 管理面配置(DESIGN §10.1 [admin])。
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+pub struct AdminConfig {
+    /// 监听:unix socket(`unix:///run/fasts3/admin.sock`)或 TCP 回环
+    /// (`127.0.0.1:9001`)。空 = 不启动 admin。
+    pub listen: Option<String>,
+    /// Bearer token(TCP 模式必填;unix socket 模式建议)。
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]

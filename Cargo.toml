@@ -10,6 +10,7 @@ members = [
     "crates/fs3-engine",
     "crates/fs3-s3",
     "crates/fs3-http",
+    "crates/fs3-admin",
     "crates/fs3d",
 ]
 
@@ -27,6 +28,7 @@ fs3-meta = { path = "crates/fs3-meta" }
 fs3-engine = { path = "crates/fs3-engine" }
 fs3-s3 = { path = "crates/fs3-s3" }
 fs3-http = { path = "crates/fs3-http" }
+fs3-admin = { path = "crates/fs3-admin" }
 
 # —— 依赖最小化原则(ROADMAP §2 / 风险 R9):新增依赖须说明理由 ——
 thiserror = "2.0"

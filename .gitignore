@@ -9,3 +9,4 @@ web/**/dist/
 __pycache__/
 var/
 tools/
+*.tsbuildinfo

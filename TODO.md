@@ -19,7 +19,7 @@
 | [M0 引擎 PoC](#m0-基础与引擎-poc) | v0.1 | 2 周 | 裸设备/镜像文件 PUT/GET 全链路 + 基准回路 | ✅ 完成 |
 | [M1 S3 核心语义](#m1-s3-核心语义) | v0.2 | 3 周 | 桶/对象 CRUD + SigV4 + 列表 + Range | ✅ 完成 |
 | [M2 高级语义与零拷贝](#m2-高级语义与零拷贝) | v0.3 | 3 周 | multipart / COW / 零拷贝 / h2 / 背压 | ✅ 完成 |
-| [M3 管理面 v1](#m3-管理面-v1) | v0.4 | 3 周 | admin API + Node 管理 API + 控制台 v1 | 未开始 |
+| [M3 管理面 v1](#m3-管理面-v1) | v0.4 | 3 周 | admin API + Node 管理 API + 控制台 v1 | ✅ 完成 |
 | [M4 加固](#m4-加固) | v0.5 | 3 周 | 崩溃恢复闭环 / 故障注入 / TLS | 未开始 |
 | [P1 打包存储](#p1-打包存储adr-9) | v0.6 | 5~7 周 | 段打包 + 惰性压缩(ADR-9);建议插 M4 后、M5 前 | **进行中**(Tier1+Tier2 核心已落地,放弃旧布局前置兼容) |
 | [M5 性能冲刺](#m5-性能冲刺) | v0.6 | 3 周 | §6.8 目标 ≥90% + 性能门禁入 CI | 未开始 |
@@ -200,40 +200,40 @@
 > WBS:H1、H2、I1~I3、J1~J3、E4、C4
 
 ### H1 admin API(Rust)
-- [ ] unix socket(0600)/ TCP 回环 + Bearer token
-- [ ] GET /v1/admin/status;buckets CRUD + stats
-- [ ] keys CRUD(secret 哈希存储、仅下发一次)
-- [ ] GET /v1/admin/uploads(在途会话,可强制 abort)
+- [x] unix socket(0600)/ TCP 回环 + Bearer token
+- [x] GET /v1/admin/status;buckets CRUD + stats
+- [x] keys CRUD(secret 哈希存储、仅下发一次)
+- [x] GET /v1/admin/uploads(在途会话,可强制 abort)
 
 ### H2 指标与审计
-- [ ] Prometheus 指标(请求量/错误码/延迟直方图/ring 深度/组提交/内存池水位)
-- [ ] 审计环形缓冲(S3 操作 who/what/when/result)
+- [x] Prometheus 指标(请求量/错误码/延迟直方图/ring 深度/组提交/内存池水位)
+- [x] 审计环形缓冲(S3 操作 who/what/when/result)
 
 ### I1~I3 Node 管理 API
-- [ ] Fastify + TS 骨架;JWT(HS256)登录 + 角色(admin / readonly);GET /api/health
-- [ ] admin 通道客户端 + 全部代理端点;GET /api/dashboard 聚合
-- [ ] POST /api/buckets/{name}/presign;multipart init|complete|abort 分片编排
-- [ ] 浏览器上传/下载直连数据面(流量不过 Node)验证
+- [x] Fastify + TS 骨架;JWT(HS256)登录 + 角色(admin / readonly);GET /api/health
+- [x] admin 通道客户端 + 全部代理端点;GET /api/dashboard 聚合
+- [x] POST /api/buckets/{name}/presign;multipart init|complete|abort 分片编排
+- [x] 浏览器上传/下载直连数据面(流量不过 Node)验证
 
 ### J1~J3 控制台
-- [ ] Vite/React/TS/uPlot 工程 + 登录
-- [ ] 仪表盘:吞吐/IOPS/延迟分位/容量水位/健康/告警
-- [ ] 桶管理(创建/删除/配额/策略编辑)
-- [ ] 对象浏览:前缀导航/上传(拖拽 + 大文件分片直传)/下载/删除/复制/预签名/元数据
+- [x] Vite/React/TS/uPlot 工程 + 登录
+- [x] 仪表盘:吞吐/IOPS/延迟分位/容量水位/健康/告警
+- [x] 桶管理(创建/删除/配额/策略编辑)
+- [x] 对象浏览:前缀导航/上传(拖拽 + 大文件分片直传)/下载/删除/复制/预签名/元数据
 
 ### E4 桶统计与配额
-- [ ] 对象数/字节统计(与对象元数据同事务记账)
-- [ ] 桶配额执行与错误语义
+- [x] 对象数/字节统计(与对象元数据同事务记账)
+- [x] 桶配额执行与错误语义
 
 ### C4 泄漏扫描与 check
-- [ ] mark-sweep 扫描(位图 vs 元数据可达性)
-- [ ] `fasts3 check` 命令 + 修复报告
+- [x] mark-sweep 扫描(位图 vs 元数据可达性)
+- [x] `fasts3 check` 命令 + 修复报告
 
 ### M3 门禁(退出条件)
-- [ ] 控制台"建桶 → 拖拽上传 → 下载 → 删桶"全流程演示
-- [ ] `fasts3 check` 可用
-- [ ] 发布 v0.4 + 性能报告
-- [ ] 第 11 周阶段评审:性能/兼容性 Go/No-Go
+- [x] 控制台"建桶 → 拖拽上传 → 下载 → 删桶"全流程演示
+- [x] `fasts3 check` 可用
+- [x] 发布 v0.4 + 性能报告
+- [x] 第 11 周阶段评审:性能/兼容性 Go/No-Go
 
 ---
 

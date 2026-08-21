@@ -33,7 +33,7 @@ use fs3_core::{
 use fs3_device::{open_device, BlockDevice};
 use fs3_meta::keys::part_key;
 use fs3_meta::{
-    AllocDraft, MetaConfig, MetaStore, MultipartSession, PartMeta, StatsDelta, SyncMode,
+    AllocDraft, MetaConfig, MetaStore, MultipartSession, Op, PartMeta, StatsDelta, SyncMode,
 };
 use md5::Digest;
 
@@ -396,6 +396,27 @@ impl Engine {
         Ok(())
     }
 
+    /// 桶配额检查(E4):`delta` 为本操作对桶字节数的净增量(可负)。
+    /// 超过配额 → `Error::QuotaExceeded`;未设配额(None)不检查。
+    /// 调用方在数据落盘、元数据提交前调用;超限时由调用方回滚暂存分配。
+    pub fn check_quota(&self, bucket: &str, delta: i64) -> Result<()> {
+        let Some(meta) = self.meta.get_bucket(bucket)? else {
+            return Err(Error::NotFound(format!("bucket {bucket}")));
+        };
+        let Some(quota) = meta.quota else {
+            return Ok(());
+        };
+        let after = meta.stats.bytes as i128 + delta as i128;
+        if after > quota as i128 {
+            return Err(Error::QuotaExceeded(format!(
+                "bucket {bucket}: quota {} bytes, would exceed by {} bytes",
+                quota,
+                after - quota as i128
+            )));
+        }
+        Ok(())
+    }
+
     /// 列出桶。
     pub fn list_buckets(&self) -> Result<Vec<(String, BucketMeta)>> {
         self.meta.list_buckets()
@@ -489,6 +510,8 @@ impl Engine {
                 objects: if old_segments.is_empty() { 1 } else { 0 },
                 bytes: size as i64 - old_size,
             };
+            // E4:配额检查(超限不落盘、不入账)
+            self.check_quota(bucket, delta.bytes)?;
             return match self.meta.commit_object_put(
                 bucket,
                 key,
@@ -583,6 +606,12 @@ impl Engine {
             objects: if old_segments.is_empty() { 1 } else { 0 },
             bytes: size as i64 - old_size,
         };
+        // E4:配额检查(超限回滚暂存分配,数据段已写盘但未提交 → 泄漏面
+        // 由分配回滚覆盖,不产生账目漂移)
+        if let Err(e) = self.check_quota(bucket, delta.bytes) {
+            self.abort_draft(&draft);
+            return Err(e);
+        }
         match self
             .meta
             .commit_object_put(bucket, key, &meta, to_alloc_draft(&draft), delta)
@@ -1525,6 +1554,8 @@ impl Engine {
                 objects: if old.is_some() { 0 } else { 1 },
                 bytes: total_size as i64 - old.as_ref().map(|o| o.size as i64).unwrap_or(0),
             };
+            // E4:配额检查(multipart complete 是字节入账点)
+            self.check_quota(bucket, delta.bytes)?;
             self.meta.complete_multipart(
                 bucket,
                 key,
@@ -1691,6 +1722,11 @@ impl Engine {
             objects: if old.is_some() { 0 } else { 1 },
             bytes: meta.size as i64 - old.as_ref().map(|o| o.size as i64).unwrap_or(0),
         };
+        // E4:配额检查(copy 目标桶入账点)
+        if let Err(e) = self.check_quota(dst_bucket, delta.bytes) {
+            self.abort_draft(&draft);
+            return Err(e);
+        }
         match self
             .meta
             .commit_object_put(dst_bucket, dst_key, &meta, to_alloc_draft(&draft), delta)
@@ -1762,6 +1798,33 @@ impl Engine {
         self.zc_fd
     }
 
+    /// I/O 引擎运行统计(H2 指标:ring 深度)。
+    pub fn io_stats(&self) -> crate::io::IoStats {
+        self.io.lock().unwrap().stats()
+    }
+
+    /// 元数据层统计(H2 指标:WAL 组提交)。
+    pub fn meta_stats(&self) -> fs3_meta::MetaStats {
+        self.meta.stats()
+    }
+
+    /// 创建设置配额的桶(E4;admin API 用)。已存在 → InvalidArgument。
+    pub fn create_bucket_with_quota(&mut self, name: &str, quota: Option<u64>) -> Result<()> {
+        if self.meta.get_bucket(name)?.is_some() {
+            return Err(Error::InvalidArgument(format!(
+                "bucket {name} already exists"
+            )));
+        }
+        let meta = BucketMeta {
+            created: now_ts(),
+            owner: "admin".into(),
+            stats: BucketStats::default(),
+            quota,
+        };
+        self.meta.commit_bucket_put(name, &meta)?;
+        Ok(())
+    }
+
     /// 设备是否为普通文件(决定 sendfile vs splice)。
     pub fn device_is_file(&self) -> bool {
         self.device.is_file()
@@ -1799,6 +1862,63 @@ impl Engine {
             last_seq,
         })
     }
+
+    /// 泄漏修复(C4 mark-sweep 的 sweep 侧):把泄漏 extent 释放回位图,
+    /// 修复记录与检查点同事务落盘(崩溃重放幂等)。返回修复报告。
+    ///
+    /// 设计语义(DESIGN §4.9):"位图说已分配但元数据不可达的 extent =
+    /// 泄漏,回收入位图"。只读模式拒绝。
+    pub fn repair_leaks(&mut self) -> Result<LeakRepairReport> {
+        if self.read_only {
+            return Err(Error::InvalidArgument(
+                "repair requires read-write engine (read_only engine)".into(),
+            ));
+        }
+        let leaks = self.alloc.leaks();
+        let mut draft = Staged::default();
+        let mut freed = 0u64;
+        for &id in &leaks {
+            if self.alloc.release_leaked(&mut draft, id) {
+                freed += 1;
+            }
+        }
+        let report = LeakRepairReport {
+            scanned: self.sb.extent_count(),
+            leaks_found: leaks.len() as u64,
+            freed_extents: freed,
+            bytes_reclaimed: freed * self.sb.extent_size,
+        };
+        if freed == 0 {
+            return Ok(report);
+        }
+        // 修复记录以独立事务落盘(与检查点无关;重放时按 t: 标记生效)
+        let alloc_draft = to_alloc_draft(&draft);
+        match self.meta.commit(&[Op::Alloc { draft: alloc_draft }]) {
+            Ok(_) => {
+                // 修复后立即写检查点,固化位图(避免重放窗口内重复修复)
+                self.checkpoint()?;
+                Ok(report)
+            }
+            Err(e) => {
+                // 回滚用原始 Staged(位图清位等内存态已在 release_leaked 生效)
+                self.abort_draft(&draft);
+                Err(e)
+            }
+        }
+    }
+}
+
+/// C4 泄漏修复报告。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LeakRepairReport {
+    /// 扫描的 extent 总数。
+    pub scanned: u64,
+    /// 发现的泄漏数(扫描时刻)。
+    pub leaks_found: u64,
+    /// 实际释放的 extent 数。
+    pub freed_extents: u64,
+    /// 回收字节数。
+    pub bytes_reclaimed: u64,
 }
 
 impl Drop for Engine {

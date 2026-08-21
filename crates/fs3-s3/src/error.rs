@@ -79,6 +79,8 @@ pub enum S3ErrorCode {
     RequestTimeout,
     RequestTimeTooSkewed,
     RequestTorrentOfBucketError,
+    /// 桶配额超限(E4;与 AWS QuotaExceeded 语义一致,403)。
+    QuotaExceeded,
     SignatureDoesNotMatch,
     ServiceUnavailable,
     SlowDown,
@@ -168,6 +170,7 @@ impl S3ErrorCode {
             RequestTimeout => "Your socket connection to the server was not read from or written to within the timeout period.",
             RequestTimeTooSkewed => "The difference between the request time and the server's time is too large.",
             RequestTorrentOfBucketError => "Requesting the torrent file of a bucket is not permitted.",
+            QuotaExceeded => "The bucket quota has been exceeded.",
             SignatureDoesNotMatch => "The request signature we calculated does not match the signature you provided. Check your key and signing method.",
             ServiceUnavailable => "Reduce your request rate.",
             SlowDown => "Please reduce your request rate.",
@@ -190,7 +193,8 @@ impl S3ErrorCode {
             | RequestTimeTooSkewed
             | InvalidSignature
             | InvalidToken
-            | TokenRefreshRequired => 403,
+            | TokenRefreshRequired
+            | QuotaExceeded => 403,
             BucketAlreadyExists | BucketAlreadyOwnedByYou | BucketNotEmpty | OperationAborted => {
                 409
             }
@@ -230,6 +234,13 @@ impl S3Error {
         }
     }
 
+    /// 人类可读描述(管理面/日志用)。
+    pub fn describe(&self) -> String {
+        match &self.message_override {
+            Some(m) => format!("{}: {m}", self.code_name()),
+            None => format!("{}: {}", self.code_name(), self.code.message()),
+        }
+    }
     pub fn with_extra(mut self, k: &str, v: &str) -> Self {
         self.extra.push((k.to_string(), v.to_string()));
         self
@@ -271,6 +282,14 @@ impl S3Error {
         name
     }
 }
+
+impl std::fmt::Display for S3Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.describe())
+    }
+}
+
+impl std::error::Error for S3Error {}
 
 /// XML 转义(& < > 等)。
 pub fn escape_xml(s: &str) -> String {
@@ -360,6 +379,7 @@ mod tests {
             S3ErrorCode::NotImplemented,
             S3ErrorCode::NotModified,
             S3ErrorCode::PreconditionFailed,
+            S3ErrorCode::QuotaExceeded,
             S3ErrorCode::RequestTimeTooSkewed,
             S3ErrorCode::SignatureDoesNotMatch,
             S3ErrorCode::SlowDown,

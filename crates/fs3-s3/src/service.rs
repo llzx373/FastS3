@@ -78,6 +78,12 @@ pub struct S3Service {
     host_id: String,
     /// 所有者标识(CanonicalUser ID/DisplayName):取首个凭据 access key。
     owner: String,
+    /// 指标注册表(H2;admin `/v1/admin/metrics`)。
+    metrics: Arc<fs3_core::metrics::Metrics>,
+    /// 审计环形缓冲(H2;admin `/v1/admin/audit`)。
+    audit: Arc<fs3_core::audit::AuditRing>,
+    /// 客户端地址(最近一次请求;审计用)。每请求更新,低精度可接受。
+    last_peer: std::sync::Mutex<String>,
 }
 
 fn header<'a>(req: &'a S3Request, name: &str) -> Option<&'a str> {
@@ -94,6 +100,25 @@ impl S3Service {
         region: String,
         allow_anonymous: bool,
     ) -> Self {
+        S3Service::with_observability(
+            engine,
+            keys,
+            region,
+            allow_anonymous,
+            Arc::new(fs3_core::metrics::Metrics::new()),
+            Arc::new(fs3_core::audit::AuditRing::default()),
+        )
+    }
+
+    /// 带指标/审计的构造(admin API 共享同一注册表)。
+    pub fn with_observability(
+        engine: Arc<parking_lot::RwLock<Engine>>,
+        keys: Vec<Credentials>,
+        region: String,
+        allow_anonymous: bool,
+        metrics: Arc<fs3_core::metrics::Metrics>,
+        audit: Arc<fs3_core::audit::AuditRing>,
+    ) -> Self {
         let host_id = format!("{:x}", rand_hex());
         let owner = keys
             .first()
@@ -107,11 +132,192 @@ impl S3Service {
             region,
             host_id,
             owner,
+            metrics,
+            audit,
+            last_peer: std::sync::Mutex::new(String::new()),
         }
     }
 
     pub fn engine(&self) -> &Arc<parking_lot::RwLock<Engine>> {
         &self.engine
+    }
+
+    /// 指标注册表引用(admin API)。
+    pub fn metrics(&self) -> &Arc<fs3_core::metrics::Metrics> {
+        &self.metrics
+    }
+
+    /// 审计环形缓冲引用(admin API)。
+    pub fn audit(&self) -> &Arc<fs3_core::audit::AuditRing> {
+        &self.audit
+    }
+
+    /// 记录审计条目(S3 操作 who/what/when/result)。
+    fn audit_record(&self, access: Option<&str>, op: &str, bucket: &str, key: &str, status: u16) {
+        let peer = self.last_peer.lock().unwrap().clone();
+        self.audit.push(
+            access.unwrap_or("anonymous"),
+            op,
+            bucket,
+            key,
+            status,
+            &peer,
+        );
+    }
+
+    /// 设置客户端地址(HTTP 层每连接调用;审计用)。
+    pub fn set_peer(&self, peer: &str) {
+        *self.last_peer.lock().unwrap() = peer.to_string();
+    }
+
+    /// 运行时添加访问密钥(M3 密钥 CRUD):写 meta 持久化 + 更新认证表。
+    /// 返回创建后的记录(secret 明文只在此刻持有,调用方负责下发一次)。
+    pub fn add_key(
+        &self,
+        access_key: &str,
+        secret: &str,
+        note: Option<String>,
+    ) -> Result<fs3_core::KeyRecord, S3Error> {
+        let seed = self
+            .engine
+            .read()
+            .meta()
+            .seed_salt()
+            .map_err(|e| map_engine_error(e, "", ""))?;
+        let rec = fs3_core::KeyRecord::new(access_key, secret, &seed, note)
+            .map_err(|e| map_engine_error(e, "", ""))?;
+        self.engine
+            .read()
+            .meta()
+            .commit_key_put(&rec)
+            .map_err(|e| map_engine_error(e, "", ""))?;
+        // 更新内存认证表(同 access key 替换,不重复)
+        {
+            let mut table = self.auth.key_table().write();
+            table.retain(|k| k.access_key != access_key);
+            table.push(Credentials {
+                access_key: access_key.to_string(),
+                secret_key: secret.to_string(),
+            });
+        }
+        Ok(rec)
+    }
+
+    /// 删除访问密钥(meta + 认证表)。
+    pub fn remove_key(&self, access_key: &str) -> Result<(), S3Error> {
+        self.engine
+            .read()
+            .meta()
+            .commit_key_delete(access_key)
+            .map_err(|e| map_engine_error(e, "", ""))?;
+        self.auth
+            .key_table()
+            .write()
+            .retain(|k| k.access_key != access_key);
+        Ok(())
+    }
+
+    /// 启停密钥(禁用后认证拒绝;meta 持久化 + 内存表生效)。
+    pub fn set_key_enabled(&self, access_key: &str, enabled: bool) -> Result<(), S3Error> {
+        let mut rec = self
+            .engine
+            .read()
+            .meta()
+            .get_key(access_key)
+            .map_err(|e| map_engine_error(e, "", ""))?
+            .ok_or_else(|| S3Error::new(S3ErrorCode::InvalidAccessKeyId))?;
+        rec.enabled = enabled;
+        self.engine
+            .read()
+            .meta()
+            .commit_key_put(&rec)
+            .map_err(|e| map_engine_error(e, "", ""))?;
+        // 内存表:禁用即移除(认证表只有明文 secret,无 enabled 概念;
+        // 禁用通过移除实现,重新启用需从 meta 解密恢复)
+        let mut table = self.auth.key_table().write();
+        if enabled {
+            if let Ok(seed) = self
+                .engine
+                .read()
+                .meta()
+                .seed_salt()
+                .map_err(|e| map_engine_error(e, "", ""))
+            {
+                if let Ok(secret) = rec.decrypt_secret(&seed) {
+                    if !table.iter().any(|k| k.access_key == access_key) {
+                        table.push(Credentials {
+                            access_key: access_key.to_string(),
+                            secret_key: secret,
+                        });
+                    }
+                }
+            }
+        } else {
+            table.retain(|k| k.access_key != access_key);
+        }
+        Ok(())
+    }
+
+    /// 从 meta 恢复全部运行时密钥到认证表(启动时调用;跳过禁用/解密失败)。
+    pub fn restore_keys_from_meta(&self) -> Result<usize, S3Error> {
+        let engine = self.engine.read();
+        let seed = engine
+            .meta()
+            .seed_salt()
+            .map_err(|e| map_engine_error(e, "", ""))?;
+        let mut restored = 0usize;
+        let mut table = self.auth.key_table().write();
+        for rec in engine
+            .meta()
+            .list_keys()
+            .map_err(|e| map_engine_error(e, "", ""))?
+        {
+            if !rec.enabled {
+                continue;
+            }
+            if let Ok(secret) = rec.decrypt_secret(&seed) {
+                if !table.iter().any(|k| k.access_key == rec.access_key) {
+                    table.push(Credentials {
+                        access_key: rec.access_key,
+                        secret_key: secret,
+                    });
+                    restored += 1;
+                }
+            } else {
+                tracing::warn!("key {}: decrypt failed, skipped", rec.access_key);
+            }
+        }
+        Ok(restored)
+    }
+
+    /// 密钥数量(admin status 用)。
+    pub fn key_count(&self) -> usize {
+        self.auth.key_count()
+    }
+
+    /// 按 access key 查凭据(测试/管理面)。
+    pub fn find_key_by_access(&self, access_key: &str) -> Option<Credentials> {
+        self.auth.find_key_by_access(access_key)
+    }
+
+    /// 主入口包装:计时 + 指标 + 审计(H2)。
+    pub fn handle(&self, req: &S3Request) -> Result<ServiceResponse, S3Error> {
+        let start = std::time::Instant::now();
+        // 审计需要 who(access key):提前认证一次(仅查表/HMAC,无副作用;
+        // 内部 handle_inner 仍会认证——M5 性能冲刺时合并)
+        let access = self.authenticate(req).ok().flatten();
+        let (op, name, bucket, key) = route_op_bucket_key(req);
+        let result = self.handle_inner(req);
+        let status = match &result {
+            Ok(r) => r.status,
+            Err(e) => {
+                self.metrics.record_error(&e.code_name());
+                e.status()
+            }
+        };
+        self.metrics.record(op, status, start.elapsed(), 0);
+        self.audit_record(access.as_deref(), &name, &bucket, &key, status);
+        result
     }
 
     /// 对象数据段(设备偏移+长度;内联/空对象 → Some(vec![]);缺失 → None)。
@@ -219,7 +425,8 @@ impl S3Service {
     // ─────────────────────────── 主入口 ───────────────────────────
 
     /// 处理非流式请求(小 PUT / XML / 桶操作 / 列表)。
-    pub fn handle(&self, req: &S3Request) -> Result<ServiceResponse, S3Error> {
+    /// 内部实现(包装前的主体;由 handle 计时/打点/审计)。
+    fn handle_inner(&self, req: &S3Request) -> Result<ServiceResponse, S3Error> {
         let mut op = self.router.route(
             &req.method,
             &req.host,
@@ -436,8 +643,30 @@ impl S3Service {
     }
 
     /// 流式 PUT(大对象 / aws-chunked)。返回后校验载荷哈希/Content-MD5,
-    /// 不匹配则删除对象并返回错误。
+    /// 不匹配则删除对象并返回错误。包装:计时 + 指标 + 审计。
     pub fn put_object_stream(
+        &self,
+        req: &S3Request,
+        reader: &mut dyn Read,
+    ) -> Result<ServiceResponse, S3Error> {
+        let start = std::time::Instant::now();
+        let access = self.authenticate(req).ok().flatten();
+        let (op, name, bucket, key) = route_op_bucket_key(req);
+        let result = self.put_object_stream_inner(req, reader);
+        let status = match &result {
+            Ok(r) => r.status,
+            Err(e) => {
+                self.metrics.record_error(&e.code_name());
+                e.status()
+            }
+        };
+        self.metrics.record(op, status, start.elapsed(), 0);
+        self.audit_record(access.as_deref(), &name, &bucket, &key, status);
+        result
+    }
+
+    /// 流式 PUT 内部实现。
+    fn put_object_stream_inner(
         &self,
         req: &S3Request,
         reader: &mut dyn Read,
@@ -1998,6 +2227,31 @@ fn parse_http_date(s: &str) -> Option<i64> {
     Some(days * 86400 + h * 3600 + mi * 60 + sec)
 }
 
+/// 轻量路由:从请求解析 (指标 op, 审计 op 名, bucket, key)。
+/// 不依赖 router(router 解析 body 较贵);用于指标/审计打点。
+fn route_op_bucket_key(req: &S3Request) -> (fs3_core::metrics::Op, String, String, String) {
+    use fs3_core::metrics::Op;
+    let m = req.method.as_str();
+    let path = req.decoded_path.trim_start_matches('/');
+    let mut parts = path.splitn(2, '/');
+    let bucket = parts.next().unwrap_or("").to_string();
+    let key = parts.next().unwrap_or("").to_string();
+
+    let (op, name) = match (m, bucket.as_str(), key.as_str()) {
+        ("GET", "", _) => (Op::ListBuckets, "ListBuckets"),
+        ("PUT", _, "") => (Op::CreateBucket, "CreateBucket"),
+        ("DELETE", _, "") => (Op::DeleteBucket, "DeleteBucket"),
+        ("HEAD", _, "") => (Op::Other, "HeadBucket"),
+        ("GET", _, _) => (Op::Get, "GetObject"),
+        ("HEAD", _, _) => (Op::Head, "HeadObject"),
+        ("PUT", _, _) => (Op::Put, "PutObject"),
+        ("DELETE", _, _) => (Op::Delete, "DeleteObject"),
+        ("POST", _, _) => (Op::Multipart, "Multipart"),
+        _ => (Op::Other, "Other"),
+    };
+    (op, name.to_string(), bucket, key)
+}
+
 /// 引擎错误 → S3 错误。
 /// 解析 HTTP-date(IMF-fixdate / RFC 850 / asctime)→ Unix 秒。
 fn map_engine_error(e: CoreError, bucket: &str, key: &str) -> S3Error {
@@ -2022,6 +2276,7 @@ fn map_engine_error(e: CoreError, bucket: &str, key: &str) -> S3Error {
         CoreError::NoSuchUpload(m) => {
             S3Error::new(S3ErrorCode::NoSuchUpload).with_extra("UploadId", &m)
         }
+        CoreError::QuotaExceeded(m) => S3Error::new(S3ErrorCode::QuotaExceeded).with_message(m),
         other => {
             S3Error::new(S3ErrorCode::InternalError).with_message(format!("engine error: {other}"))
         }
