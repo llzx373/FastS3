@@ -308,6 +308,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.no_uring,
             )?;
             cmd_serve(
+                cli.config.clone(),
                 &engine_cfg,
                 &cfg,
                 listen,
@@ -325,6 +326,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
 /// 启动 S3 服务:引擎 + S3Service + hyper 多 worker 监听 + 可选 admin API。
 #[allow(clippy::too_many_arguments)]
 fn cmd_serve(
+    config_path: Option<PathBuf>,
     engine_cfg: &EngineConfig,
     cfg: &config::RootConfig,
     listen: Option<String>,
@@ -401,7 +403,33 @@ fn cmd_serve(
             listen,
             token: token.unwrap_or_default(),
         };
-        let admin = fs3_admin::AdminServer::new(engine.clone(), service.clone(), admin_cfg);
+        // H3:配置热重载回调(重读配置文件,应用可重载子集:限速/匿名读/配置密钥)
+        let reload: Option<Arc<fs3_admin::ReloadFn>> = config_path.map(|path| {
+            let svc = service.clone();
+            let f: Arc<fs3_admin::ReloadFn> = Arc::new(move || -> Result<String, String> {
+                let new_cfg = config::load_config(Some(&path)).map_err(|e| e.to_string())?;
+                let mut applied = Vec::new();
+                let rps = new_cfg.limits.key_rps.unwrap_or(0);
+                svc.set_rate_limit(rps);
+                applied.push(format!("limits.key_rps={rps}"));
+                svc.set_allow_anonymous(new_cfg.auth.allow_anonymous);
+                applied.push(format!(
+                    "auth.allow_anonymous={}",
+                    new_cfg.auth.allow_anonymous
+                ));
+                for k in &new_cfg.auth.keys {
+                    if svc.find_key_by_access(&k.access_key).is_none() {
+                        svc.add_key(&k.access_key, &k.secret_key, Some("config".into()))
+                            .map_err(|e| e.describe())?;
+                        applied.push(format!("auth.keys+={}", k.access_key));
+                    }
+                }
+                Ok(applied.join("; "))
+            });
+            f
+        });
+        let admin = fs3_admin::AdminServer::new(engine.clone(), service.clone(), admin_cfg)
+            .with_reload(reload);
         std::thread::Builder::new()
             .name("fs3-admin".into())
             .spawn(move || {

@@ -18,8 +18,10 @@
 //! - `POST /v1/admin/uploads/{id}/abort`        强制中止会话
 //! - `GET  /v1/admin/audit?limit=`              审计日志
 //! - `POST /v1/admin/repair`                    泄漏扫描修复(C4)
+//! - `POST /v1/admin/config/reload`             热重载配置(H3;fs3d 提供回调)
+//! - `WS   /v1/admin/ws?token=`                 实时推送(H3):snapshot 5s/audit 尾随/health/ping
 //!
-//! 认证:除 `/healthz` 外全部要求 `Authorization: Bearer <token>`。
+//! 认证:除 `/healthz` 外全部要求 `Authorization: Bearer <token>`(WS 亦接受 query token)。
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -34,6 +36,7 @@ use hyper_util::rt::TokioIo;
 use parking_lot::RwLock;
 
 mod json;
+mod ws;
 
 pub use json::ApiError;
 
@@ -56,11 +59,17 @@ impl Default for AdminConfig {
     }
 }
 
+/// 配置热重载回调(H3):fs3d 注入,重读配置文件并应用可重载子集。
+/// 返回人类可读的变更摘要。
+pub type ReloadFn = dyn Fn() -> Result<String, String> + Send + Sync;
+
 /// 管理 API 服务(持有引擎与 S3 服务的共享引用)。
 pub struct AdminServer {
     engine: Arc<RwLock<Engine>>,
     service: Arc<S3Service>,
     cfg: AdminConfig,
+    /// 热重载回调(空 = 不启用 /v1/admin/config/reload)。
+    reload: Option<Arc<ReloadFn>>,
 }
 
 impl AdminServer {
@@ -69,7 +78,14 @@ impl AdminServer {
             engine,
             service,
             cfg,
+            reload: None,
         }
+    }
+
+    /// 注入配置热重载回调(H3)。
+    pub fn with_reload(mut self, reload: Option<Arc<ReloadFn>>) -> Self {
+        self.reload = reload;
+        self
     }
 
     /// 启动(阻塞)。unix socket 监听设置 0600 权限。
@@ -140,6 +156,7 @@ impl AdminServer {
             engine: self.engine.clone(),
             service: self.service.clone(),
             cfg: self.cfg.clone(),
+            reload: self.reload.clone(),
         })
     }
 
@@ -147,10 +164,12 @@ impl AdminServer {
         self: &Arc<AdminServer>,
         io: TokioIo<tokio::net::UnixStream>,
     ) -> std::io::Result<()> {
-        let svc = service_fn(move |req| {
-            let this = self.clone();
+        let this = self.clone();
+        let svc = service_fn(move |req: Request<Incoming>| {
+            let this = this.clone();
             async move { this.route(req).await }
         });
+        // unix socket 不支持 WS(管理通道;Node 侧走 TCP WS);升级请求按普通 404
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
             .serve_connection(io, svc)
             .await
@@ -161,17 +180,56 @@ impl AdminServer {
         self: &Arc<AdminServer>,
         io: TokioIo<tokio::net::TcpStream>,
     ) -> std::io::Result<()> {
-        let svc = service_fn(move |req| {
-            let this = self.clone();
-            async move { this.route(req).await }
+        // WS 升级槽(H3):/v1/admin/ws 请求在 service_fn 内创建 OnUpgrade,
+        // 连接结束后取出交付 WS 会话。
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        let this = self.clone();
+        let svc_slot = slot.clone();
+        let svc = service_fn(move |mut req: Request<Incoming>| {
+            let this = this.clone();
+            let slot = svc_slot.clone();
+            async move {
+                let path = req.uri().path().to_string();
+                if path == "/v1/admin/ws" {
+                    // 升级必须在 body 消费前发起
+                    let upgrade = hyper::upgrade::on(&mut req);
+                    let resp = this.ws_handshake(&req);
+                    if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+                        *slot.lock().unwrap() = Some(upgrade);
+                    }
+                    return Ok(resp);
+                }
+                this.route(req).await
+            }
         });
-        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-            .serve_connection(io, svc)
-            .await
-            .map_err(std::io::Error::other)
+        let result =
+            hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                .serve_connection_with_upgrades(io, svc)
+                .await;
+        // 连接结束:若有升级,启动 WS 会话(metrics/audit/health 推送)
+        if let Some(on_upgrade) = slot.lock().unwrap().take() {
+            let engine = self.engine.clone();
+            let service = self.service.clone();
+            tokio::spawn(async move {
+                match on_upgrade.await {
+                    Ok(upgraded) => crate::ws::session(engine, service, upgraded).await,
+                    Err(e) => tracing::warn!("admin ws upgrade failed: {e}"),
+                }
+            });
+        }
+        result.map_err(std::io::Error::other)
     }
 
+    /// 请求路由(WS 升级由 TCP 连接层先拦截;此处仅剩 unix socket 途径)。
     async fn route(&self, req: Request<Incoming>) -> Result<Response<String>, hyper::Error> {
+        // unix socket 不支持 WS:明确拒绝
+        if req.uri().path() == "/v1/admin/ws" {
+            return Ok(json::err(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "websocket is only available over TCP listen",
+            ));
+        }
         // 健康检查免认证(设计 §8 健康探针)
         if req.uri().path() == "/healthz" {
             return Ok(json::ok(serde_json::json!({"status": "ok"})));
@@ -211,6 +269,74 @@ impl AdminServer {
                 .collect()
         };
         Ok(self.dispatch(&method, &path, &query, &body))
+    }
+
+    /// WS 握手应答:校验 token(query `?token=` 或 Authorization 头)与
+    /// Sec-WebSocket-Key;通过则 101 + Sec-WebSocket-Accept(hyper-util
+    /// 的 with_upgrades 会把连接交还给调用方)。
+    fn ws_handshake(&self, req: &Request<Incoming>) -> Response<String> {
+        // token:query 优先,其次 Authorization 头
+        let token_from_query = req
+            .uri()
+            .query()
+            .and_then(|q| {
+                q.split('&')
+                    .find_map(|kv| kv.strip_prefix("token=").map(|v| v.to_string()))
+            })
+            .unwrap_or_default();
+        let ok = if !token_from_query.is_empty() {
+            !self.cfg.token.is_empty() && token_from_query == self.cfg.token
+        } else {
+            self.token_ok(req.headers())
+        };
+        if !ok {
+            return json::err(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "missing or invalid Bearer token",
+            );
+        }
+        let is_upgrade = req
+            .headers()
+            .get("upgrade")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.eq_ignore_ascii_case("websocket"))
+            .unwrap_or(false);
+        let key = req
+            .headers()
+            .get("sec-websocket-key")
+            .and_then(|v| v.to_str().ok());
+        if !is_upgrade {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "missing Upgrade: websocket header",
+            );
+        }
+        let accept = match key {
+            Some(k) => tokio_tungstenite::tungstenite::handshake::derive_accept_key(k.as_bytes()),
+            None => {
+                return json::err(
+                    StatusCode::BAD_REQUEST,
+                    "bad_request",
+                    "missing Sec-WebSocket-Key",
+                )
+            }
+        };
+        Response::builder()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .header("upgrade", "websocket")
+            .header("connection", "upgrade")
+            .header("sec-websocket-accept", accept)
+            .body(String::new())
+            .map_err(|e| {
+                tracing::error!("ws handshake response build failed: {e}");
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(String::new())
+                    .unwrap()
+            })
+            .unwrap()
     }
 
     fn token_ok(&self, headers: &hyper::HeaderMap) -> bool {
@@ -265,6 +391,7 @@ impl AdminServer {
             ("POST", ["uploads", id, "abort"]) => self.handle_upload_abort(id),
             ("GET", ["audit"]) => self.handle_audit(query),
             ("POST", ["repair"]) => self.handle_repair(),
+            ("POST", ["config", "reload"]) => self.handle_config_reload(),
             _ => json::err(StatusCode::NOT_FOUND, "not_found", "unknown admin endpoint"),
         }
     }
@@ -700,6 +827,21 @@ impl AdminServer {
             .min(5000);
         let entries = self.service.audit().recent(limit);
         json::ok(serde_json::json!({"audit": entries}))
+    }
+
+    /// POST /v1/admin/config/reload(H3):调用 fs3d 注入的回调热重载配置。
+    fn handle_config_reload(&self) -> Response<String> {
+        match &self.reload {
+            None => json::err(
+                StatusCode::NOT_IMPLEMENTED,
+                "not_implemented",
+                "config reload not enabled (no config file)",
+            ),
+            Some(f) => match f() {
+                Ok(summary) => json::ok(serde_json::json!({"reloaded": true, "summary": summary})),
+                Err(e) => json::err(StatusCode::BAD_REQUEST, "reload_failed", &e),
+            },
+        }
     }
 
     fn handle_repair(&self) -> Response<String> {

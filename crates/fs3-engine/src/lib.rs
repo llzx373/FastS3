@@ -146,6 +146,8 @@ pub struct Engine {
     compactor: Option<Arc<Compactor>>,
     _compactor_thread: Option<CompactorHandle>,
     closed: bool,
+    /// 设备降级标记(M4 D4:掉盘/IO 故障 → 只读降级 + 告警;粘性,重启清除)。
+    degraded: bool,
 }
 
 impl Engine {
@@ -266,6 +268,7 @@ impl Engine {
             compactor,
             _compactor_thread: compactor_thread,
             closed: false,
+            degraded: false,
         })
     }
 
@@ -1796,6 +1799,26 @@ impl Engine {
     /// 零拷贝 fd(sendfile/splice;None = 不可用)。
     pub fn zc_fd(&self) -> Option<i32> {
         self.zc_fd
+    }
+
+    /// 设备降级标志(M4 D4):掉盘/连续 IO 故障 → true;粘性,重启清除。
+    pub fn degraded(&self) -> bool {
+        self.degraded
+    }
+
+    /// 标记设备降级(只读降级 + 告警;由写路径 IO 错误触发)。
+    pub fn mark_degraded(&mut self) {
+        if !self.degraded {
+            self.degraded = true;
+            tracing::error!(
+                "DEVICE DEGRADED: storage I/O failing; service switched to read-only mode"
+            );
+        }
+    }
+
+    /// 主机名/设备只读打开状态(S3 层写拒绝用)。
+    pub fn read_only(&self) -> bool {
+        self.read_only
     }
 
     /// I/O 引擎运行统计(H2 指标:ring 深度)。

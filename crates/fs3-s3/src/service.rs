@@ -73,7 +73,7 @@ pub struct S3Service {
     engine: Arc<parking_lot::RwLock<Engine>>,
     auth: Authenticator,
     router: Router,
-    allow_anonymous: bool,
+    allow_anonymous: std::sync::atomic::AtomicBool,
     region: String,
     host_id: String,
     /// 所有者标识(CanonicalUser ID/DisplayName):取首个凭据 access key。
@@ -133,7 +133,7 @@ impl S3Service {
             engine,
             auth: Authenticator::new(keys, region.clone(), std::time::SystemTime::now()),
             router: Router::new(vec!["s3.example.com".into()]),
-            allow_anonymous,
+            allow_anonymous: std::sync::atomic::AtomicBool::new(allow_anonymous),
             region,
             host_id,
             owner,
@@ -357,6 +357,25 @@ impl S3Service {
         }
     }
 
+    /// M4 D4 掉盘只读降级:写方法(PUT/POST/DELETE)在降级期一律拒绝,
+    /// 读(GetObject/HeadObject/List*)不受影响。
+    fn check_writable(&self, req: &S3Request) -> Result<(), S3Error> {
+        let is_write = matches!(req.method.as_str(), "PUT" | "POST" | "DELETE");
+        if is_write && self.engine.read().degraded() {
+            return Err(S3Error::new(S3ErrorCode::ServiceUnavailable).with_message(
+                "Storage device is degraded; writes are temporarily disabled (read-only mode).",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 允许匿名读(热重载可调)。
+    pub fn set_allow_anonymous(&self, v: bool) {
+        self.allow_anonymous
+            .store(v, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(allow_anonymous = v, "anonymous access policy updated");
+    }
+
     /// 从 meta 恢复全部运行时密钥到认证表(启动时调用;跳过禁用/解密失败)。
     pub fn restore_keys_from_meta(&self) -> Result<usize, S3Error> {
         let engine = self.engine.read();
@@ -425,6 +444,8 @@ impl S3Service {
         }
         // J4 密钥策略执行(Deny 优先;无匹配默认拒绝)
         self.authorize(access.as_deref(), &name, &bucket, &key)?;
+        // M4 D4 掉盘只读降级:写方法在降级期拒绝(读不受影响)
+        self.check_writable(req)?;
         let result = self.handle_inner(req);
         let status = match &result {
             Ok(r) => r.status,
@@ -534,7 +555,11 @@ impl S3Service {
 
     fn require_auth(&self, req: &S3Request) -> Result<Option<String>, S3Error> {
         let access = self.authenticate(req)?;
-        if access.is_none() && !self.allow_anonymous {
+        if access.is_none()
+            && !self
+                .allow_anonymous
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return Err(S3Error::new(S3ErrorCode::AccessDenied));
         }
         Ok(access)
@@ -773,6 +798,12 @@ impl S3Service {
         // J4 密钥策略执行(流式 PUT / UploadPart 同语义;认证失败在此体现为
         // handle_inner 的 AccessDenied,策略判定对未认证请求直接放行)
         if let Err(e) = self.authorize(access.as_deref(), &name, &bucket, &key) {
+            self.metrics.record_error(&e.code_name());
+            self.audit_record(access.as_deref(), &name, &bucket, &key, e.status());
+            return Err(e);
+        }
+        // M4 D4 掉盘只读降级:写方法在降级期拒绝
+        if let Err(e) = self.check_writable(req) {
             self.metrics.record_error(&e.code_name());
             self.audit_record(access.as_deref(), &name, &bucket, &key, e.status());
             return Err(e);
