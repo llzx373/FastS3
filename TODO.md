@@ -523,10 +523,16 @@
 
 ## 远期版本(9 ~ 24 个月,立项后再拆细)
 
+> 详细设计稿(决策点/数据结构/实现步骤/门禁/风险)见
+> [docs/DESIGN-FUTURE.md](./docs/DESIGN-FUTURE.md),企业级缺口全景与优先级论证见
+> [docs/S3-GAP.md](./docs/S3-GAP.md)。立项时按 DESIGN-FUTURE §11 决策清单逐条评审 → 落地 ADR → 在本文件新增里程碑段。
+
 | 版本 | 主题 | 主要内容 | 前置条件 |
 | --- | --- | --- | --- |
-| v1.1 | 版本控制 | S3 Versioning(版本化键空间、删除标记、ListObjectVersions) | 布局预留已验证 |
-| v1.2 | 生命周期与加密 | Lifecycle 规则引擎;SSE-C / SSE-S3 | 审计日志完备 |
-| v1.3 | 合规与 WORM | Object Lock(治理/合规保留) | 可信时钟告警 |
-| v1.4 | 容量与底座 | 多设备在线扩容;设备内元数据区(BlueFS 风格);zstd 压缩(可选) | 迁移工具成熟 |
-| v2.0 | 集中纳管与生态 | 多节点纳管平台;HTTP/3;Terraform / K8s Operator(评估) | 1.x 用户反馈 |
+| v1.1 | 版本控制 | S3 Versioning(版本化键空间 `o:` 键加 VersionId 后缀、删除标记、ListObjectVersions、版本寻址、版本化条件写;未版本化桶零改动) | 值版本字节通道已具备(v1.0) |
+| v1.2 | 生命周期与加密 | Lifecycle 规则引擎;SSE-C / SSE-S3;checksum 家族 + GetObjectAttributes;审计持久化 | v1.1 |
+| v1.3 | 合规与 WORM | Object Lock(治理/合规保留);可信时钟(持久化单调) | v1.1、v1.2 审计持久化 |
+| v1.4 | 容量与底座 | 多设备在线扩容与再平衡;设备内元数据区(BlueFS 风格);zstd 压缩(可选) | Tier2 迁移框架、meta-export/import(v1.0 已具备) |
+| v2.0 | 集中纳管与生态 | 多节点纳管平台;HTTP/3;热对象缓存;Terraform / K8s Operator(评估) | 1.x 用户反馈 |
+
+> 增补建议(S3-GAP §7,评审决定后回写本表):v1.1.x 或 v1.2 同步纳入对象标签、CORS、桶级策略、POST 表单 4 个低成本协议补全项;v1.0.x 补丁轨道修协议正确性 12 项。
