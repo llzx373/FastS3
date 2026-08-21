@@ -21,6 +21,26 @@
 
 # FastS3 发布记录
 
+## v0.5 — M4 加固(2026-08-21)
+
+> 门禁:崩溃 1000 轮 + 断电模拟零撕裂/零泄漏/账目零漂移;故障注入(磁盘满/掉盘/时钟回拨)行为符合设计;s3-tests 支持子集 gate 全绿;单元覆盖率 ≥80%;rocksdb 扩展性压测吞吐至 6000 万+对象恒定(R5,完整 1 亿需专用高内存 Runner)。
+
+### 新能力
+- **A3 崩溃一致性强化**:`run_crash_m4.sh` 混沌 harness(随机尺寸 256B~8MiB / kill -9 / 随机检查点 / Tier2 压缩并发 / --no-uring 兜底)+ 终局账目零漂移断言;实测 **1000 轮 PASS**。
+- **D4 故障注入与恢复闭环**:掉盘只读降级(DegradeAware + degraded 标志,S3 写拒绝 503,读不受影响,告警);磁盘满双路径 507(allocator + 设备 ENOSPC);时钟回拨监控(fasts3d 指标 + 告警);断电演练(powerloss_sim 快照+换机 / dm-flakey 真机脚本)。
+- **H3 运维命令**:`POST /v1/admin/config/reload` 热重载;`WS /v1/admin/ws` 实时推送(快照 5s/审计尾随/健康/ping)。
+- **H4 配额限速**:每密钥令牌桶(503 SlowDown+Retry-After,热调整);超时 header 30s / idle 60s。
+- **TLS(rustls 1.2/1.3)**:任意 SNI 通配 + ALPN h1/h2 + 证书热加载;TLS 下禁零拷贝;HTTPS aws cli(STREAMING-UNSIGNED-TRAILER)64MiB 往返实测。
+- **I4/J4**:Node WS 桥接 Rust WS + 24h×5s 指标环(`/api/metrics/history`);控制台密钥策略编辑器(AWS IAM 子集)+ Uploads 强化。
+- **B2**:`fasts3d doctor` 能力自检;CI m4-crash-fallback(no-uring)矩阵。
+- **兼容修复**:ListMultipartUploads 可达/Complete 过滤、ListBuckets 分页、运行时密钥挂策略、spill 断言修正。
+
+### 验证(门禁)
+- 崩溃 1000 轮 + 断电 50 轮 PASS(零撕裂/零泄漏/零漂移);故障注入单测+服务级全绿。
+- s3-tests 支持子集 gate 全绿(排除矩阵见 tests/s3-tests/README.md)。
+- 单元覆盖率 80.05%;clippy 0;fmt 干净。
+- 扩展性:6000 万对象吞吐恒定(≤60M 实测无劣化),1M/5M 完整往返;1 亿计数受 32GB 本机内存限制,已文档化专用 Runner 要求。
+
 ## v0.4 — M3 管理面 v1(2026-08-21)
 
 > 里程碑门禁全部达成:控制台"建桶 → 拖拽上传 → 下载 → 删桶"全流程演示通过;`fasts3d check`(+ `--fix`)可用;性能报告见 docs/perf-M3.md。

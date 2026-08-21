@@ -1089,7 +1089,7 @@ impl S3Service {
 
     // ─────────────────────────── 桶操作 ───────────────────────────
 
-fn op_list_buckets(&self, req: &S3Request) -> ServiceResponse {
+    fn op_list_buckets(&self, req: &S3Request) -> ServiceResponse {
         let q = |k: &str| {
             req.query
                 .iter()

@@ -533,7 +533,12 @@ pub fn render_list_buckets(
     let _ = write!(xml, "</Buckets>");
     if truncated {
         if let Some(m) = next_marker {
-            let _ = write!(xml, "<NextMarker>{}</NextMarker>", escape_xml(m));
+            // 新版 ListBuckets 用不透明 ContinuationToken(与 continuation-token 查询对应)
+            let _ = write!(
+                xml,
+                "<ContinuationToken>{}</ContinuationToken>",
+                escape_xml(m)
+            );
         }
     }
     xml.push_str("</ListAllMyBucketsResult>");

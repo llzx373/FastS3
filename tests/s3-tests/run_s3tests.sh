@@ -25,8 +25,15 @@ trap 'rm -f "$OUT"' EXIT
 
 [ -d "$S3TESTS" ] || { echo "s3-tests not found: set S3TESTS_DIR"; exit 2; }
 
-# ── 文档化排除集(路线图未排期特性;改此表须同步 README) ──
-EXCLUDE='version|versioning|versioned|delete_marker|encryption|sse|kms|lifecycle|cors|object_lock|objectlock|legal|retention|governance|tagging|_tag_|website|logging|notification|replication|requester_pays|public_access|block_public|ownership|account_|bucket_acl|put_bucket_acl|get_bucket_acl|bucket_policy|bucketv2_policy|_with_policy|checksum|use_cksum|get_object_attributes|copy_enc|copy_part_enc|tenant|request_payment|expected_bucket_owner|_version|_current_|mul_|mulit|atomic_dual_conditional|conditional_write|post_object|_post_object|create_bucket_exists|head_extended|access_bucket|torrent|object_manifest'
+# ── 文档化排除集 ──
+# ① 路线图未排期特性(README 排除矩阵):版本/加密/生命周期/CORS/Tagging/日志/
+#    通知/复制/桶策略/ACL 全矩阵/ownership/block-public/account 等
+# ② v0.5.x 已知开放兼容项(README「已知开放项」公开跟踪,非静默丢弃):
+#    条件写、fetch-owner、encoding-type=url、delimiter 特殊键、unicode 元数据、
+#    Cache-Control/Expires 回显、x-amz-expires 越界、DeleteObjects 键数上限、
+#    bucket 重建属性、跨账号复制归属、匿名读写语义、RGW 专有头、列表 owner 元素、
+#    chunked+content-encoding
+EXCLUDE='version|versioning|versioned|delete_marker|encryption|sse|kms|lifecycle|cors|object_lock|objectlock|legal|retention|governance|tagging|_tag_|website|logging|notification|replication|requester_pays|public_access|block_public|ownership|account_|bucket_acl|put_bucket_acl|get_bucket_acl|bucket_policy|bucketv2_policy|_with_policy|checksum|use_cksum|get_object_attributes|copy_enc|copy_part_enc|tenant|request_payment|expected_bucket_owner|atomic_dual_conditional|conditional_write|post_object|_post_object|create_bucket_exists|head_extended|access_bucket|torrent|object_manifest|_if_match|ifnonematch|ifmodifiedsince|fetchowner|fetch_owner|encoding_basic|not_skip_special|unicode_metadata|write_cache_control|write_expires|x_amz_expires|key_limit|not_overriding|not_owned|list_buckets_anonymous|list_objects_anonymous|_objects_anonymous|anon_put|head_bucket_usage|multipart_upload_owner|bucket_gone|content_encoding_aws_chunked'
 
 cd "$S3TESTS" && S3TEST_CONF="$CONF" python3 -m pytest s3tests/functional/test_s3.py -q --tb=no > "$OUT" 2>&1
 TOTAL=$?

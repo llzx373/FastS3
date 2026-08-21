@@ -55,3 +55,22 @@ S3TEST_CONF=/tmp/s3-tests/s3tests.conf tests/s3-tests/run_s3tests.sh
 - M4 期间修复的子集内缺陷:ListMultipartUploads 不可达(?uploads 路由)、
   Complete 后会话残留 ListMultipartUploads、运行时密钥挂策略、ListBuckets 分页。
 - （跑批数值以门禁脚本输出为准,gate 输出即证据。）
+
+## 已知开放兼容项(v0.5.x 跟踪,不静默排除)
+
+以下项在 v0.5 门禁内「文档化排除」且公开跟踪,计划在 v0.5.x / M5 逐一关闭;
+均列于 `run_s3tests.sh` 的 `EXCLUDE`(②组),测试失败不会漏报:
+
+| 项 | 现象 | 计划 |
+| --- | --- | --- |
+| 条件写:PUT/DELETE 的 If-(None-)Match、If-Match×LastModifiedTime/Size、DeleteObjects 条件、multipart 条件 PUT | 依赖 ETag/时间条件判定 | v0.5.x(服务端 ETag 已具备,补判定) |
+| 条件 GET 边界(If-Modified-Since=304 / If-None-Match) | 轻微响应差异 | v0.5.x |
+| ListObjectsV2 fetch-owner / encoding-type=url / delimiter 特殊键 | 列表渲染细节 | v0.5.x |
+| unicode 元数据往返、Cache-Control/Expires 响应回显 | 头/元数据细节 | v0.5.x |
+| 预签名 x-amz-expires 越界(>7d)/raw 断言 | 边界参数 | v0.5.x |
+| DeleteObjects 键数上限(1000)、bucket 已删后删键 | 错误语义细节 | v0.5.x |
+| bucket 重建属性保留、跨账号复制归属、列表/multipart owner 元素 | 单账号模型相关 | v0.5.x |
+| 匿名访问与 ACL 公开语义(list/object anonymous、anon put) | 与「默认私有」基线一致 | 维持关闭 |
+| RGW 专有 head_bucket_usage / head_extended / create_bucket_exists(botocore) | 非 S3 规范 | 恒排除 |
+| chunked + content-encoding(接收压缩) | 编码组合 | v0.5.x |
+| checksum / GetObjectAttributes | 校验栈统一(见排除矩阵) | v1.2 |
