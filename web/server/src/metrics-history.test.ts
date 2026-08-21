@@ -93,3 +93,27 @@ test("normalizeSnapshotData tolerates garbage input", () => {
   assert.deepEqual(d3.bytes, emptySnapshotData().bytes);
   assert.deepEqual(d3.latency, emptySnapshotData().latency);
 });
+
+// REVIEW §3.6:ops 数字形状与 {ok,client,server} 对象形状都能正确归一化;
+// delete/list_objects 别名键映射到 del/list。
+test("normalizeSnapshotData handles numeric and object ops shapes (REVIEW 3.6)", () => {
+  // 新 Rust WS 形状:5 键纯数字
+  const numeric = normalizeSnapshotData({ ops: { put: 1, get: 2, del: 3, list: 4, multipart: 5 } });
+  assert.deepEqual(numeric.ops, { put: 1, get: 2, del: 3, list: 4, multipart: 5 });
+  // 旧 Rust WS 形状:{ok,client,server} 对象(REVIEW 指出 Node 会解析为 0)
+  const objShape = normalizeSnapshotData({
+    ops: {
+      get: { ok: 7, client: 1, server: 2 },
+      put: { ok: 1, client: 0, server: 0 },
+    },
+  });
+  assert.equal(objShape.ops.get, 10, "object ops must sum ok+client+server");
+  assert.equal(objShape.ops.put, 1);
+  // 别名键:delete→del、list_objects→list
+  const aliased = normalizeSnapshotData({
+    ops: { delete: 9, list_objects: 8, get: 1 },
+  });
+  assert.equal(aliased.ops.del, 9);
+  assert.equal(aliased.ops.list, 8);
+  assert.equal(aliased.ops.get, 1);
+});

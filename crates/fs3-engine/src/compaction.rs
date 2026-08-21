@@ -65,21 +65,31 @@ impl Default for CompactionConfig {
 pub struct CompactionReport {
     pub candidates: usize,
     pub objects_scanned: usize,
+    /// REVIEW §3.8:发现阶段扫描的分片数(p: 前缀)。
+    pub parts_scanned: usize,
     pub skipped_shared: usize,
     pub migrated_objects: usize,
+    /// REVIEW §3.8:成功迁移的分片数(p: 前缀分片同样参与压缩迁移)。
+    pub migrated_parts: usize,
     pub conflicts: usize,
     pub errors: usize,
     pub copied_bytes: u64,
     pub freed_extents: usize,
 }
 
-/// 迁移计划项:一个对象 + 其在候选 extent 中的段(按对象 extents 列表顺序)。
+/// 迁移目标:对象或分片(REVIEW §3.8:发现阶段覆盖 o: 与 p: 双前缀)。
+#[derive(Debug, Clone)]
+enum PlanTarget {
+    Object { bucket: String, key: String },
+    Part { upload_id: String, part_no: u32 },
+}
+
+/// 迁移计划项:一个目标 + 其在候选 extent 中的段(按 extents 列表顺序)。
 struct PlanItem {
-    bucket: String,
-    key: String,
+    target: PlanTarget,
     old_segments: Vec<Segment>,
     new_segments: Vec<Segment>,
-    /// 拷贝是否完整(速率预算中断时可能半拷贝 → 该对象整轮跳过)。
+    /// 拷贝是否完整(速率预算中断时可能半拷贝 → 该目标整轮跳过)。
     copied_full: bool,
 }
 
@@ -152,12 +162,14 @@ impl Compactor {
             ..Default::default()
         };
 
-        // —— 阶段 1 发现:快照扫描构建 候选 extent → 对象 映射 ——
+        // —— 阶段 1 发现:快照扫描构建 候选 extent → 对象/分片 映射 ——
         // (rocksdb snapshot,MVCC,与并发写完全隔离;ADR-9 §6.2)
+        // REVIEW §3.8:o: 对象与 p: 分片双前缀都参与发现(此前分片被忽略,
+        // 开放分片写入的旧 extent 永远无法因分片数据迁移而回收)。
         let objects = self.meta.snapshot_all_objects()?;
         let parts = self.meta.snapshot_all_parts()?;
-        let _ = parts; // 分片段不迁移(分片写入开放 extent;详见模块文档)
         report.objects_scanned = objects.len();
+        report.parts_scanned = parts.len();
         let mut plan: Vec<PlanItem> = Vec::new();
         for (bucket, key, m) in &objects {
             let old: Vec<Segment> = m
@@ -175,8 +187,34 @@ impl Compactor {
                 continue;
             }
             plan.push(PlanItem {
-                bucket: bucket.clone(),
-                key: key.clone(),
+                target: PlanTarget::Object {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                },
+                old_segments: old,
+                new_segments: Vec::new(),
+                copied_full: false,
+            });
+        }
+        for (upload_id, part_no, p) in &parts {
+            let old: Vec<Segment> = p
+                .extents
+                .iter()
+                .filter(|s| candidates.contains(&(s.extent_id as u64)))
+                .cloned()
+                .collect();
+            if old.is_empty() {
+                continue;
+            }
+            if old.iter().any(|s| self.alloc.is_shared(s)) {
+                report.skipped_shared += 1;
+                continue;
+            }
+            plan.push(PlanItem {
+                target: PlanTarget::Part {
+                    upload_id: upload_id.clone(),
+                    part_no: *part_no,
+                },
                 old_segments: old,
                 new_segments: Vec::new(),
                 copied_full: false,
@@ -201,7 +239,14 @@ impl Compactor {
             // 突发额度(小批量一次完成),之后按 rate × 已过时间 节流
             let elapsed = started.elapsed().as_secs_f64();
             let grace = 0.1f64;
-            let allowed = (self.cfg.rate_limit_bytes_per_sec as f64 * elapsed.max(grace)) as u64;
+            let mut allowed =
+                (self.cfg.rate_limit_bytes_per_sec as f64 * elapsed.max(grace)) as u64;
+            // REVIEW §3.8 / ADR-9 §6.4:容量水位提速——使用率 > 85% 时预算 ×4
+            // (空间比延迟更稀缺时提高压缩优先级)。
+            let total_cap = self.alloc.len() * capacity;
+            if total_cap > 0 && self.alloc.live_bytes_total() * 100 / total_cap > 85 {
+                allowed = allowed.saturating_mul(4);
+            }
             if report.copied_bytes > allowed {
                 break;
             }
@@ -225,7 +270,7 @@ impl Compactor {
             }
         }
 
-        // —— 阶段 3 切换:每对象一条短事务(唯一排队点) ——
+        // —— 阶段 3 切换:每对象/分片一条短事务(唯一排队点) ——
         for item in &plan {
             if !item.copied_full || item.new_segments.is_empty() {
                 continue;
@@ -237,16 +282,29 @@ impl Compactor {
             }
             self.alloc.add_object(&mut d, &item.new_segments);
             self.alloc.release_object(&mut d, &item.old_segments);
-            match self.meta.commit_object_migrate(
-                &item.bucket,
-                &item.key,
-                &item.old_segments,
-                &item.new_segments,
-                to_alloc_draft(&d),
-            ) {
+            let migrate = match &item.target {
+                PlanTarget::Object { bucket, key } => self.meta.commit_object_migrate(
+                    bucket,
+                    key,
+                    &item.old_segments,
+                    &item.new_segments,
+                    to_alloc_draft(&d),
+                ),
+                PlanTarget::Part { upload_id, part_no } => self.meta.commit_part_migrate(
+                    upload_id,
+                    *part_no,
+                    &item.old_segments,
+                    &item.new_segments,
+                    to_alloc_draft(&d),
+                ),
+            };
+            match migrate {
                 Ok(_) => {
                     first_committed = true;
-                    report.migrated_objects += 1;
+                    match &item.target {
+                        PlanTarget::Object { .. } => report.migrated_objects += 1,
+                        PlanTarget::Part { .. } => report.migrated_parts += 1,
+                    }
                 }
                 Err(e) => {
                     self.alloc.rollback(&d);
@@ -622,6 +680,166 @@ mod tests {
             e.get_to("b1", k, 0..u64::MAX, &mut out).unwrap();
             assert_eq!(&out, d);
         }
+        e.close().unwrap();
+    }
+
+    // ── REVIEW §3.8:压缩发现必须覆盖 p: 分片前缀 ──
+    // 回归:此前 snapshot_all_parts 结果被 `let _ = parts;` 丢弃,分片所在
+    // 开放 extent 永远无法因分片数据迁移而回收。
+    #[test]
+    fn compaction_migrates_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("disk.img");
+        std::fs::File::create(&img)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
+        let cfg = crate::EngineConfig {
+            device: img,
+            meta_dir: dir.path().join("meta"),
+            compaction: CompactionConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut e = Engine::open(&cfg).unwrap();
+        e.ensure_bucket("b1").unwrap();
+
+        // 4 个 multipart 会话,各 1 个 1MiB 分片:extent 0 写满(4MiB-4KiB 容量)
+        // 后被自动封口(spill 到 extent 1)。
+        let payload = vec![0x5Au8; 1024 * 1024];
+        let mut uids = Vec::new();
+        let mut metas = Vec::new();
+        for i in 0..4 {
+            let uid = e
+                .create_multipart("b1", &format!("big{i}"), None, vec![])
+                .unwrap();
+            let pm = e
+                .upload_part(&uid, 1, &mut Cursor::new(payload.clone()))
+                .unwrap();
+            uids.push(uid);
+            metas.push(pm);
+        }
+        // 前 3 个分片在 extent 0,第 4 个跨界到 extent 1
+        assert_eq!(metas[0].extents[0].extent_id, 0);
+        assert!(metas
+            .iter()
+            .skip(1)
+            .all(|p| p.extents[0].extent_id == 0 || p.extents[0].extent_id == 1));
+
+        // abort 3 个会话:extent 0 只剩 1MiB 活段(33% < 50%)→ seal-on-delete + 候选
+        e.abort_multipart(&uids[0]).unwrap();
+        e.abort_multipart(&uids[1]).unwrap();
+        e.abort_multipart(&uids[2]).unwrap();
+        let live0 = e.allocator().live_bytes_of(0);
+        assert!(
+            live0 > 0 && live0 < (4 * 1024 * 1024 - 4096) / 2,
+            "extent 0 应为低活候选: live={live0}"
+        );
+
+        // 压缩:剩余分片(第 4 个,1MiB)必须被迁移;旧 extent 释放
+        // (注:extent 0 为唯一候选;extent 1 活段 1MiB 同理候选,但 top 排序
+        //  浪费量相同 → 按 id 升序,extent 0 先迁;若两轮都不足为奇,见下方断言)
+        let r = e.compact_once().unwrap();
+        assert!(r.candidates >= 1, "{r:?}");
+        assert!(r.migrated_parts >= 1, "分片必须参与压缩迁移: {r:?}");
+        assert!(r.migrated_objects == 0, "本场景无对象迁移: {r:?}");
+        let freed0 = !e.allocator().test_bit(0);
+        assert!(freed0, "旧 extent 0 应释放: {r:?}");
+
+        // 剩余会话仍可完成,数据完好
+        let m = e
+            .complete_multipart("b1", "big3", &uids[3], &[(1, metas[3].etag_hex())])
+            .unwrap();
+        assert_eq!(m.size, payload.len() as u64);
+        let mut out = Vec::new();
+        e.get_to("b1", "big3", 0..u64::MAX, &mut out).unwrap();
+        assert_eq!(out, payload);
+        // 无泄漏
+        assert!(
+            e.allocator().leaks().is_empty(),
+            "no leaks after part migration"
+        );
+        e.close().unwrap();
+    }
+
+    // ── REVIEW §3.8:崩溃注入覆盖阶段 2(拷贝后、提交前崩溃)──
+    // 阶段 3(提交后)已有 compaction_crash_consistency;此处补:压缩 extent
+    // 数据已拷贝但切换事务未提交即断电 → 重启后旧段仍有效、孤儿判 free、零泄漏。
+    #[test]
+    fn compaction_crash_after_copy_before_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("disk.img");
+        std::fs::File::create(&img)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
+        let cfg = crate::EngineConfig {
+            device: img,
+            meta_dir: dir.path().join("meta"),
+            compaction: CompactionConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let datasets: (String, String) = {
+            let mut e = Engine::open(&cfg).unwrap();
+            e.ensure_bucket("b1").unwrap();
+            let data = vec![0x77u8; 1024 * 1024];
+            e.put("b1", "k0", &mut Cursor::new(data.clone())).unwrap();
+            // 分片同样写 extent 0:p: 前缀对象
+            let uid = e.create_multipart("b1", "big", None, vec![]).unwrap();
+            let pm = e
+                .upload_part(&uid, 1, &mut Cursor::new(data.clone()))
+                .unwrap();
+            e.delete("b1", "k0").unwrap(); // seal-on-delete + 候选(活段 1MiB)
+                                           // 手动阶段 2:分配压缩 extent + 拷贝分片数据,但不提交迁移事务
+            let compactor = e.compactor().unwrap();
+            let capacity = compactor.sb.extent_capacity();
+            let candidates = compactor.alloc.compaction_candidates(0.5, 64, capacity);
+            assert_eq!(candidates, vec![0], "extent 0 必须是唯一候选");
+            let mut rd = Staged::default();
+            let eid = compactor.alloc.allocate(&mut rd, 1).unwrap().remove(0) as u32;
+            compactor.alloc.mark_open(eid as u64);
+            let mut wm = 0u32;
+            for old in &pm.extents {
+                compactor
+                    .copy_segment(eid, &mut wm, old)
+                    .expect("phase-2 copy must succeed");
+            }
+            // 不调用 commit_*_migrate → 模拟阶段 2 结束即断电
+            e.meta().flush().unwrap();
+            e.abort(); // kill -9 语义
+            (uid, pm.etag_hex())
+        };
+        // 重启:分片仍读旧段(数据完好);压缩 extent 孤儿判 free;零泄漏
+        let mut e = Engine::open(&cfg).unwrap();
+        assert!(
+            e.allocator().test_bit(0),
+            "旧 extent 0 仍被引用(迁移未提交)"
+        );
+        let (uid, etag) = datasets;
+        // 完成 multipart → 数据从旧段读出,必须完好
+        let m = e
+            .complete_multipart("b1", "big", &uid, &[(1, etag)])
+            .unwrap();
+        assert_eq!(m.size, 1024 * 1024);
+        let mut out = Vec::new();
+        e.get_to("b1", "big", 0..u64::MAX, &mut out).unwrap();
+        assert_eq!(
+            out,
+            vec![0x77u8; 1024 * 1024],
+            "part data intact via old segments"
+        );
+        assert!(
+            e.allocator().leaks().is_empty(),
+            "no leaks after phase-2 crash"
+        );
+        assert_eq!(e.allocator().live_bytes_of(0), 1024 * 1024);
         e.close().unwrap();
     }
 }

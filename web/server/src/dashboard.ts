@@ -161,13 +161,15 @@ function parseLatency(text: string): {
   };
 }
 
-/** 从 Prometheus 文本解析按 op 累计的请求量(3 个状态类求和)。 */
+/** 从 Prometheus 文本解析按 op 累计的请求量(3 个状态类求和)。
+ *  REVIEW §3.6:把 Rust 的 delete/list_objects 键归一化为快照的 del/list。 */
 function parseOpCounts(text: string): Record<string, number> {
   const re = /fasts3_requests_total\{op="(\w+)",class="(?:2xx|4xx|5xx)"\} (\d+)/g;
   const out: Record<string, number> = {};
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
-    out[m[1]] = (out[m[1]] ?? 0) + Number(m[2]);
+    const key = m[1] === "delete" ? "del" : m[1] === "list_objects" ? "list" : m[1];
+    out[key] = (out[key] ?? 0) + Number(m[2]);
   }
   return out;
 }

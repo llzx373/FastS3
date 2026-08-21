@@ -324,6 +324,12 @@ impl Engine {
         }
     }
 
+    /// 压缩器句柄(crate 内测试/崩溃注入用;REVIEW §3.8 阶段 2 模拟)。
+    #[cfg(test)]
+    pub(crate) fn compactor(&self) -> Option<Arc<Compactor>> {
+        self.compactor.clone()
+    }
+
     /// 压缩暂停原语(ADR-9 §6.4;管理面/admin API 可调用)。
     pub fn set_compaction_paused(&self, paused: bool) {
         if let Some(h) = &self._compactor_thread {
@@ -1429,6 +1435,20 @@ impl Engine {
         if client_parts.is_empty() {
             return Err(Error::InvalidArgument("empty parts list".into()));
         }
+        // REVIEW §3.10:AWS 要求客户端列表按 partNumber 严格递增;
+        // 乱序列表必须 400 InvalidPartOrder(此前 BTreeMap 自动排序被静默接受)。
+        let mut prev = 0u32;
+        for (no, _) in client_parts {
+            if *no == 0 || *no > fs3_core::MAX_PARTS {
+                return Err(Error::InvalidPart(format!("part number {no} out of range")));
+            }
+            if *no <= prev {
+                return Err(Error::InvalidPartOrder(format!(
+                    "part number {no} is not strictly increasing (previous {prev})"
+                )));
+            }
+            prev = *no;
+        }
         // 幂等:已 completed 且无分片记录 → 重放当前对象
         if session.completed && self.meta.list_parts(upload_id)?.is_empty() {
             if let Some(m) = self.meta.get_object(bucket, key)? {
@@ -1442,21 +1462,14 @@ impl Engine {
         for (no, p) in &stored {
             by_no.insert(*no, p.clone());
         }
-        // 客户端列表按 part_no 建图(同名多次出现取最后,RGW 语义;
-        // s3-tests test_multipart_resend_first_finishes_last 依赖),
-        // 再按 part_no 升序校验:存在 + ETag 匹配。
-        let mut client_map: std::collections::BTreeMap<u32, &str> =
-            std::collections::BTreeMap::new();
+        // 客户端列表已保证严格递增;逐项校验 存在 + ETag 匹配,
+        // 并只取**请求列表**对应的分片(未列出者不参与组合——AWS 语义)。
+        let mut total: u64 = 0;
+        let mut combined: Vec<(u32, PartMeta)> = Vec::with_capacity(client_parts.len());
         for (no, etag_hex) in client_parts {
             if *no == 0 || *no > fs3_core::MAX_PARTS {
                 return Err(Error::InvalidPart(format!("part number {no} out of range")));
             }
-            client_map.insert(*no, etag_hex);
-        }
-        let mut total: u64 = 0;
-        let mut max_no = 0u32;
-        for (no, etag_hex) in &client_map {
-            max_no = max_no.max(*no);
             let stored_meta = by_no
                 .get(no)
                 .ok_or_else(|| Error::InvalidPart(format!("part {no} not found")))?;
@@ -1467,13 +1480,16 @@ impl Engine {
                 )));
             }
             total += stored_meta.size;
+            combined.push((*no, stored_meta.clone()));
         }
         if total > fs3_core::MAX_OBJECT_SIZE {
             return Err(Error::InvalidArgument("object exceeds 5TiB limit".into()));
         }
-        // 非最后分片 ≥ 5MiB(AWS EntityTooSmall)
-        for (no, p) in &stored {
-            if *no < max_no && p.size < fs3_core::MIN_PART_SIZE {
+        // 非最后分片 ≥ 5MiB(AWS EntityTooSmall):只检查**请求子集**,
+        // 不含未列出的已存分片(REVIEW §4.12)。
+        let last = combined.last().map(|(no, _)| *no).unwrap_or(0);
+        for (no, p) in &combined {
+            if *no < last && p.size < fs3_core::MIN_PART_SIZE {
                 return Err(Error::PartTooSmall(format!(
                     "part {no} size {} < {}",
                     p.size,
@@ -1482,19 +1498,17 @@ impl Engine {
             }
         }
 
-        // 组合策略
-        let all_inline = stored.iter().all(|(_, p)| p.inline.is_some());
-        let all_extent = stored.iter().all(|(_, p)| p.inline.is_none());
+        // 组合策略(全内联 / 全 extent / 混合,均只取请求子集)
+        let all_inline = combined.iter().all(|(_, p)| p.inline.is_some());
+        let all_extent = combined.iter().all(|(_, p)| p.inline.is_none());
         let total_size = total;
-        let part_sizes: Vec<u64> = (0..max_no)
-            .map(|i| by_no.get(&(i + 1)).map(|p| p.size).unwrap_or(0))
-            .collect();
+        // REVIEW §4.12:parts 向量按请求分片顺序紧凑排列(空洞分片号不占位),
+        // 使 ETag-N 等于请求分片数(与 AWS 一致;此前按最大分片号补齐 0)。
+        let part_sizes: Vec<u64> = combined.iter().map(|(_, p)| p.size).collect();
         let etag: [u8; 16] = {
             let mut concat = String::new();
-            for (no, p) in &stored {
-                if *no <= max_no {
-                    concat.push_str(&p.etag_hex());
-                }
+            for (_, p) in &combined {
+                concat.push_str(&p.etag_hex());
             }
             md5::Md5::digest(concat.as_bytes()).into()
         };
@@ -1507,13 +1521,11 @@ impl Engine {
         let mut draft = Staged::default();
         let result = (|| -> Result<ObjectMeta> {
             let meta = if all_inline && total_size <= self.small_object_limit as u64 {
-                // 全内联:拼接数据,零设备 I/O
+                // 全内联:拼接数据,零设备 I/O(仅请求子集,REVIEW §4.12)
                 let mut data = Vec::with_capacity(total_size as usize);
-                for (no, p) in &stored {
-                    if *no <= max_no {
-                        if let Some(d) = &p.inline {
-                            data.extend_from_slice(d);
-                        }
+                for (_, p) in &combined {
+                    if let Some(d) = &p.inline {
+                        data.extend_from_slice(d);
                     }
                 }
                 ObjectMeta {
@@ -1528,12 +1540,10 @@ impl Engine {
                 }
             } else if all_extent {
                 // 零数据搬运:段列表按序拼接(所有权从分片转移给对象;
-                // 无分配器变更——段仍是同一批活段)
+                // 无分配器变更——段仍是同一批活段;仅请求子集,REVIEW §4.12)
                 let mut extents: Vec<Segment> = Vec::new();
-                for (no, p) in &stored {
-                    if *no <= max_no {
-                        extents.extend_from_slice(&p.extents);
-                    }
+                for (_, p) in &combined {
+                    extents.extend_from_slice(&p.extents);
                 }
                 ObjectMeta {
                     size: total_size,
@@ -1546,22 +1556,18 @@ impl Engine {
                     parts: part_sizes,
                 }
             } else {
-                // 混合(小分片 + 大分片):数据路径组合
+                // 混合(小分片 + 大分片):数据路径组合(仅请求子集,REVIEW §4.12)
                 let mut sink = Vec::with_capacity(total_size.min(64 * 1024 * 1024) as usize);
-                for (no, p) in &stored {
-                    if *no <= max_no {
-                        self.read_part_to(p, &mut sink)?;
-                    }
+                for (_, p) in &combined {
+                    self.read_part_to(p, &mut sink)?;
                 }
                 let (extents, size, _) =
                     self.stream_to_extents(&mut std::io::Cursor::new(sink), &mut draft)?;
                 debug_assert_eq!(size, total_size);
-                // 分片旧段释放(同事务;ADR-9 §5.4 覆盖语义)
+                // 分片旧段释放(同事务;ADR-9 §5.4 覆盖语义;仅请求子集)
                 let mut part_segments: Vec<Segment> = Vec::new();
-                for (no, p) in &stored {
-                    if *no <= max_no {
-                        part_segments.extend(p.extents.iter().cloned());
-                    }
+                for (_, p) in &combined {
+                    part_segments.extend(p.extents.iter().cloned());
                 }
                 self.alloc.add_object(&mut draft, &extents);
                 self.alloc.release_object(&mut draft, &part_segments);

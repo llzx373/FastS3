@@ -569,17 +569,24 @@ fn multipart_validation_errors() {
         e.complete_multipart("b1", "k", &uid, &[(1, p.etag_hex()), (3, p2.etag_hex())]),
         Err(Error::PartTooSmall(_))
     ));
-    // 乱序 part_no:map 语义(仅校验存在 + ETag);part 1 非最后且 < 5MiB → PartTooSmall
+    // 乱序 part_no:REVIEW §3.10 后客户端列表必须严格递增 → InvalidPartOrder
+    // (此前 BTreeMap 自动排序被静默接受,乱序 + 小分片只能报 PartTooSmall)
     assert!(matches!(
         e.complete_multipart("b1", "k", &uid, &[(3, p2.etag_hex()), (1, p.etag_hex())]),
-        Err(Error::PartTooSmall(_))
+        Err(Error::InvalidPartOrder(_))
     ));
-    // 重复 part_no:最后一次生效(resend_first_finishes_last 语义)
+    // 重复 part_no 同样非严格递增 → InvalidPartOrder
+    assert!(matches!(
+        e.complete_multipart("b1", "k", &uid, &[(1, p.etag_hex()), (1, p2.etag_hex())]),
+        Err(Error::InvalidPartOrder(_))
+    ));
+    // resend_first_finishes_last 语义:重新上传同一分片号(覆盖)后,
+    // complete 列表只含该分片号一次、用新 ETag → 新数据生效
     let big = e
         .upload_part(&uid, 1, &mut Cursor::new(vec![0x55u8; 5 * 1024 * 1024]))
         .unwrap();
     let m = e
-        .complete_multipart("b1", "k", &uid, &[(1, p.etag_hex()), (1, big.etag_hex())])
+        .complete_multipart("b1", "k", &uid, &[(1, big.etag_hex())])
         .unwrap();
     assert_eq!(m.size, 5 * 1024 * 1024);
     let mut out = Vec::new();
@@ -1554,5 +1561,67 @@ fn etag_md5_mode_default() {
     let m = e.put("b1", "k", &mut Cursor::new(data.clone())).unwrap();
     let want: [u8; 16] = md5::Md5::digest(&data).into();
     assert_eq!(m.etag, want, "default etag = md5");
+    e.close().unwrap();
+}
+
+/// REVIEW §4.12:multipart 空洞——只完成分片 1、3(2 号未传),对象必须只含
+/// 请求子集;ETag-N 的 N = 请求分片数(2,此前按最大分片号=3 补齐 0 得 "-3");
+/// EntityTooSmall 只检查请求内非末分片(未列出的 1 号小分片不触发)。
+#[test]
+fn multipart_complete_with_holes_uses_request_subset() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let uid = e.create_multipart("b1", "sub", None, vec![]).unwrap();
+    // 1 号分片极小(<5MiB,若被检查 EntityTooSmall 必失败;此处刻意不列
+    // 入 complete 请求,验证不参与检查)
+    let _p1 = e
+        .upload_part(&uid, 1, &mut Cursor::new(vec![0x11u8; 100]))
+        .unwrap();
+    // 2 号分片存在但**不**出现在 complete 请求里(5MiB)
+    let p2 = e
+        .upload_part(&uid, 2, &mut Cursor::new(vec![0x22u8; 5 * 1024 * 1024]))
+        .unwrap();
+    // 3 号分片 5MiB
+    let p3 = e
+        .upload_part(&uid, 3, &mut Cursor::new(vec![0x33u8; 5 * 1024 * 1024]))
+        .unwrap();
+
+    // 只完成 [1, 3]:1 是非末分片但 <5MiB → 按请求子集检查应报 EntityTooSmall
+    // (这是 AWS 语义:首片 <5MiB 本来就非法;REVIEW 场景是「大分片 + 空洞」)
+
+    // 先验证正常的空洞场景:完成 [2, 3](1 号未列出、虽然小,但不参与检查)
+    let m = e
+        .complete_multipart("b1", "sub", &uid, &[(2, p2.etag_hex()), (3, p3.etag_hex())])
+        .unwrap();
+    assert_eq!(m.size, 10 * 1024 * 1024, "only parts 2+3 combined");
+    assert_eq!(
+        m.parts,
+        vec![5 * 1024 * 1024, 5 * 1024 * 1024],
+        "parts 数组紧凑无空洞占位"
+    );
+    // ETag-N:N = 请求分片数 = 2(此前按最大分片号 3 补齐 → "-3")
+    let full = m.etag_full();
+    assert!(
+        full.ends_with("-2"),
+        "ETag-N must equal requested part count: {full}"
+    );
+    // 内容 = p2 ++ p3
+    let mut out = Vec::new();
+    e.get_to("b1", "sub", 0..m.size, &mut out).unwrap();
+    assert_eq!(&out[..5 * 1024 * 1024], &vec![0x22u8; 5 * 1024 * 1024][..]);
+    assert_eq!(&out[5 * 1024 * 1024..], &vec![0x33u8; 5 * 1024 * 1024][..]);
+    // 未列出的小分片 p1 不触发 EntityTooSmall(已按请求子集完成)
+
+    // 单独验证 EntityTooSmall 仍对请求内非末分片生效:新会话,完成 [1, 2]
+    // 必须先重开(上一个会话已 completed)
+    let uid2 = e.create_multipart("b1", "sub2", None, vec![]).unwrap();
+    let a = e
+        .upload_part(&uid2, 1, &mut Cursor::new(vec![0xAAu8; 100]))
+        .unwrap();
+    let b = e
+        .upload_part(&uid2, 2, &mut Cursor::new(vec![0xBBu8; 5 * 1024 * 1024]))
+        .unwrap();
+    let r = e.complete_multipart("b1", "sub2", &uid2, &[(1, a.etag_hex()), (2, b.etag_hex())]);
+    assert!(matches!(r, Err(Error::PartTooSmall(_))), "{r:?}");
     e.close().unwrap();
 }

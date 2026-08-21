@@ -510,6 +510,14 @@ impl AdminServer {
             "fasts3_alloc_live_bytes {}\n",
             engine.allocator().live_bytes_total()
         ));
+        // REVIEW §3.7:掉盘降级状态入 Prometheus(1 = degraded / 只读),
+        // 供 alerts.yml FastS3DeviceDegraded 直接告警(替换原恒假占位表达式)。
+        text.push_str("# HELP fasts3_device_degraded Device degraded (read-only); 1 = degraded\n");
+        text.push_str("# TYPE fasts3_device_degraded gauge\n");
+        text.push_str(&format!(
+            "fasts3_device_degraded {}\n",
+            if engine.degraded() { 1 } else { 0 }
+        ));
         Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/plain; version=0.0.4")

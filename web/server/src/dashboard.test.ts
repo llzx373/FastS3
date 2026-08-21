@@ -196,3 +196,21 @@ test("dashboardFromSnapshot converts Rust WS snapshot to dashboard shape", () =>
   assert.equal(dash.latency.get.p99, 0.016);
   assert.equal(dash.updatedAt, new Date(12345 * 1000).toISOString());
 });
+
+// REVIEW §3.6:prometheus 文本的 delete/list_objects 键归一化为 del/list。
+test("aggregateSnapshot maps delete/list_objects op keys (REVIEW 3.6)", () => {
+  const metricsWithAliases = `${sampleMetrics}
+fasts3_requests_total{op="delete",class="2xx"} 11
+fasts3_requests_total{op="delete",class="4xx"} 2
+fasts3_requests_total{op="list_objects",class="2xx"} 33
+`;
+  const s = aggregateSnapshot(
+    { uptime_secs: 1, device_capacity: 1, live_bytes: 1, buckets: 1, objects: 1 },
+    metricsWithAliases,
+    1
+  );
+  assert.equal(s.data.ops.del, 13, "delete key must map to del");
+  assert.equal(s.data.ops.list, 33, "list_objects key must map to list");
+  assert.equal(s.data.ops.get, 100); // 原有键不受影响
+  assert.equal(s.data.ops.put, 50);
+});

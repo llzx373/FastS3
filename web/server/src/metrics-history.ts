@@ -82,6 +82,32 @@ function toNum(v: unknown): number {
   return typeof v === "number" && Number.isFinite(v) ? v : 0;
 }
 
+/**
+ * 把 ops 条目归一化为数字:
+ * - 纯数字:直接取;
+ * - `{ok,client,server}` 对象(旧 Rust WS 形状):三者求和;
+ * - 其他(缺失/非法):0。
+ * REVIEW §3.6:两种形状都兼容,避免任一形状被归一化为 0。
+ */
+function opsNum(v: unknown): number {
+  if (typeof v === "number") return Number.isFinite(v) ? v : 0;
+  if (v && typeof v === "object" && !Array.isArray(v)) {
+    const o = v as Record<string, unknown>;
+    if ("ok" in o || "client" in o || "server" in o) {
+      return toNum(o.ok) + toNum(o.client) + toNum(o.server);
+    }
+  }
+  return 0;
+}
+
+/** op 键别名:Rust 用 delete/list_objects,Node 快照用 del/list。 */
+function opKey(raw: Record<string, unknown>, canonical: string, ...aliases: string[]): number {
+  for (const k of [canonical, ...aliases]) {
+    if (k in raw) return opsNum(raw[k]);
+  }
+  return 0;
+}
+
 function toRecord(v: unknown): Record<string, unknown> {
   return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
 }
@@ -104,11 +130,11 @@ export function normalizeSnapshotData(raw: unknown): MetricsSnapshotData {
     buckets: toNum(d.buckets),
     objects: toNum(d.objects),
     ops: {
-      put: toNum(ops.put),
-      get: toNum(ops.get),
-      del: toNum(ops.del),
-      list: toNum(ops.list),
-      multipart: toNum(ops.multipart),
+      put: opKey(ops, "put"),
+      get: opKey(ops, "get"),
+      del: opKey(ops, "del", "delete"),
+      list: opKey(ops, "list", "list_objects"),
+      multipart: opKey(ops, "multipart"),
     },
     bytes: { in: toNum(bytes.in), out: toNum(bytes.out) },
     latency: { p50: toNum(latency.p50), p99: toNum(latency.p99), p999: toNum(latency.p999) },

@@ -2,8 +2,9 @@
 //!
 //! 帧格式(文本 JSON):
 //! - `{"type":"snapshot","t":<unix秒>,"data":{uptime,degraded,device_capacity,
-//!   device_used,watermark,buckets,objects,ops:{...},bytes:{in,out},
-//!   latency:{p50,p99,p999},errors}}` —— 每 5s;
+//!   device_used,watermark,buckets,objects,ops:{put,get,del,list,multipart},
+//!   bytes:{in,out},latency:{p50,p99,p999},errors}}` —— 每 5s(ops 为数字累计;
+//!   REVIEW §3.6:与 Node 侧 metrics-history normalize 形状对齐);
 //! - `{"type":"audit","data":{t,who,action,bucket,key,result}}` —— 新审计即推(1s 轮询);
 //! - `{"type":"health","data":{ok,degraded,message}}` —— 随 snapshot 一并下发;
 //! - 心跳:`{"type":"ping"}`(30s)→ 对端回 `{"type":"pong"}`。
@@ -72,18 +73,21 @@ fn snapshot_json(engine: &RwLock<Engine>, service: &S3Service) -> serde_json::Va
             sum / n as f64
         }
     };
-    let ops = fs3_core::metrics::Op::ALL
-        .iter()
-        .map(|op| {
-            let ok = metrics.request_count(*op, fs3_core::metrics::StatusClass::Success);
-            let client = metrics.request_count(*op, fs3_core::metrics::StatusClass::Client);
-            let server = metrics.request_count(*op, fs3_core::metrics::StatusClass::Server);
-            (
-                op.as_str().to_string(),
-                json!({"ok": ok, "client": client, "server": server}),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>();
+    // REVIEW §3.6:ops 按 Node 侧期望的 5 键数字形状输出(put/get/del/list/multipart;
+    // 不再下发 {ok,client,server} 对象——Node 按纯数字解析,对象形状会被归一化为 0)。
+    // 各操作取三类状态之和(与 Prometheus fasts3_requests_total 口径一致)。
+    let sum_of = |op: fs3_core::metrics::Op| {
+        metrics.request_count(op, fs3_core::metrics::StatusClass::Success)
+            + metrics.request_count(op, fs3_core::metrics::StatusClass::Client)
+            + metrics.request_count(op, fs3_core::metrics::StatusClass::Server)
+    };
+    let ops = json!({
+        "put": sum_of(fs3_core::metrics::Op::Put),
+        "get": sum_of(fs3_core::metrics::Op::Get),
+        "del": sum_of(fs3_core::metrics::Op::Delete),
+        "list": sum_of(fs3_core::metrics::Op::ListObjects),
+        "multipart": sum_of(fs3_core::metrics::Op::Multipart),
+    });
     let degraded = e.degraded();
     json!({
         "uptime": metrics.uptime_secs(),

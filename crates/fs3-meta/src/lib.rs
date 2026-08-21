@@ -164,6 +164,15 @@ pub enum Op {
         old_segments: Vec<Segment>,
         new_segments: Vec<Segment>,
     },
+    /// 压缩迁移的分片变体(REVIEW §3.8:ADR-9 §6.2「o:+p: 双前缀」兑现;
+    /// 事务内读分片并校验旧段仍被引用,替换 extents;分片被 abort/覆盖 →
+    /// Error::ObjectChanged,调用方放弃该分片,下轮再来)。
+    PartMigrate {
+        upload_id: String,
+        part_no: u32,
+        old_segments: Vec<Segment>,
+        new_segments: Vec<Segment>,
+    },
     ObjectDelete {
         bucket: String,
         key: String,
@@ -830,6 +839,26 @@ impl MetaStore {
         ])
     }
 
+    /// 压缩迁移事务的分片变体(REVIEW §3.8:p: 前缀分片段迁移与对象同语义)。
+    pub fn commit_part_migrate(
+        &self,
+        upload_id: &str,
+        part_no: u32,
+        old_segments: &[Segment],
+        new_segments: &[Segment],
+        draft: AllocDraft,
+    ) -> Result<u64> {
+        self.commit(&[
+            Op::PartMigrate {
+                upload_id: upload_id.to_string(),
+                part_no,
+                old_segments: old_segments.to_vec(),
+                new_segments: new_segments.to_vec(),
+            },
+            Op::Alloc { draft },
+        ])
+    }
+
     /// 全量对象快照扫描(o: 前缀;rocksdb MVCC 快照,与并发写完全隔离)。
     /// 压缩发现阶段用(ADR-9 §6.2 阶段 1)。
     pub fn snapshot_all_objects(&self) -> Result<Vec<(String, String, ObjectMeta)>> {
@@ -1147,6 +1176,42 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
                 }
                 meta.extents = out;
                 tinsert(tx, k, meta.encode_value()?)?;
+            }
+            Op::PartMigrate {
+                upload_id,
+                part_no,
+                old_segments,
+                new_segments,
+            } => {
+                let k = part_key(upload_id, *part_no);
+                let cur = tget(tx, &k)?.ok_or_else(|| {
+                    Error::ObjectChanged(format!(
+                        "part {part_no} of upload {upload_id} deleted during compaction"
+                    ))
+                })?;
+                let mut meta: PartMeta = decode(&cur)?;
+                if old_segments.len() != new_segments.len() {
+                    return Err(Error::ObjectChanged(format!(
+                        "part {part_no} of upload {upload_id} segment mapping mismatch"
+                    )));
+                }
+                let mut ptr = 0usize;
+                let mut out: Vec<Segment> = Vec::with_capacity(meta.extents.len());
+                for s in &meta.extents {
+                    if ptr < old_segments.len() && *s == old_segments[ptr] {
+                        out.push(new_segments[ptr].clone());
+                        ptr += 1;
+                    } else {
+                        out.push(s.clone());
+                    }
+                }
+                if ptr != old_segments.len() {
+                    return Err(Error::ObjectChanged(format!(
+                        "part {part_no} of upload {upload_id} segments changed during compaction"
+                    )));
+                }
+                meta.extents = out;
+                tinsert(tx, k, encode(&meta)?)?;
             }
             Op::ObjectDelete { bucket, key } => {
                 let k = object_key(bucket, key);
