@@ -1111,3 +1111,131 @@ proptest::proptest! {
         e2.close().unwrap();
     }
 }
+
+// ─────────────────────────── 读写调用栈基准 ───────────────────────────
+
+/// 引擎级读写路径基准(调用栈开销测量;非门禁):
+/// 10MiB 对象 get_to/read_at 全量读回,报告 MB/s。
+/// 运行: cargo test -p fs3-engine bench_read_path -- --ignored --nocapture
+#[test]
+#[ignore]
+fn bench_read_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("disk.img");
+    std::fs::File::create(&img)
+        .unwrap()
+        .set_len(512 * 1024 * 1024)
+        .unwrap();
+    fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
+    let cfg = EngineConfig {
+        device: img,
+        meta_dir: dir.path().join("meta"),
+        compaction: CompactionConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut e = open_engine(&cfg);
+    let size = 10 * 1024 * 1024;
+    let data = rnd(size, 3);
+    e.put("b1", "big", &mut Cursor::new(data.clone())).unwrap();
+    e.close().unwrap();
+    drop(e);
+
+    let mut e = open_engine(&cfg);
+    // 预热
+    for _ in 0..3 {
+        let mut out = Vec::with_capacity(size);
+        e.get_to("b1", "big", 0..u64::MAX, &mut out).unwrap();
+        assert_eq!(out.len(), size);
+    }
+    let rounds = 20;
+    let t0 = std::time::Instant::now();
+    for _ in 0..rounds {
+        let mut out = Vec::with_capacity(size);
+        e.get_to("b1", "big", 0..u64::MAX, &mut out).unwrap();
+        assert_eq!(out.len(), size);
+    }
+    let dt = t0.elapsed().as_secs_f64();
+    let mb = (size * rounds) as f64 / (1024.0 * 1024.0);
+    eprintln!("get_to  10MiB x{rounds}: {:.1} MiB/s ({:.2}s)", mb / dt, dt);
+
+    // read_at 路径(HTTP 流式语义;4MiB 缓冲,与 handler.rs 一致)
+    for (label, bufsz) in [
+        ("read_at(64KiB)", 64 * 1024),
+        ("read_at(4MiB)", 4 * 1024 * 1024),
+    ] {
+        let t0 = std::time::Instant::now();
+        let mut total = 0usize;
+        let mut buf = vec![0u8; bufsz];
+        for _ in 0..rounds {
+            let mut off = 0usize;
+            while off < size {
+                let n = e.read_at("b1", "big", off as u64, &mut buf).unwrap();
+                assert!(n > 0);
+                off += n;
+            }
+            total += off;
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        let mb = total as f64 / (1024.0 * 1024.0);
+        eprintln!("{label} 10MiB x{rounds}: {:.1} MiB/s ({:.2}s)", mb / dt, dt);
+    }
+
+    // PUT 路径
+    let t0 = std::time::Instant::now();
+    for i in 0..rounds {
+        e.put("b1", &format!("k{i}"), &mut Cursor::new(data.clone()))
+            .unwrap();
+    }
+    let dt = t0.elapsed().as_secs_f64();
+    let mb = (size * rounds) as f64 / (1024.0 * 1024.0);
+    eprintln!("put     10MiB x{rounds}: {:.1} MiB/s ({:.2}s)", mb / dt, dt);
+    e.close().unwrap();
+}
+
+/// 组件级计时:定位 flush 路径隐藏开销(临时诊断)。
+#[test]
+#[ignore]
+fn bench_flush_components() {
+    use fs3_core::crc32c::crc32c;
+    use md5::Digest;
+    let buf = rnd(64 * 1024, 1);
+    let mut hasher = md5::Md5::new();
+    // md5.update 64KiB
+    let t0 = std::time::Instant::now();
+    for _ in 0..2000 {
+        hasher.update(&buf);
+    }
+    let dt = t0.elapsed().as_secs_f64();
+    eprintln!("md5.update 64KiB x2000: {:.1}us/op", dt * 1e6 / 2000.0);
+    // crc32c 64KiB
+    let t0 = std::time::Instant::now();
+    let mut c = 0u32;
+    for _ in 0..2000 {
+        c = crc32c(&buf, c);
+    }
+    let dt = t0.elapsed().as_secs_f64();
+    eprintln!("crc32c    64KiB x2000: {:.1}us/op", dt * 1e6 / 2000.0);
+    // io.lock + submit(单 op)
+    let dev = fs3_device::open_device(std::path::Path::new("/tmp/bench.img"), false).unwrap();
+    let mut io = crate::io::open_io_engine(true).unwrap();
+    let mut w = fs3_device::AlignedBuffer::new(64 * 1024).unwrap();
+    w.as_mut_slice().copy_from_slice(&buf);
+    let t0 = std::time::Instant::now();
+    for i in 0..2000u64 {
+        let off = 1_056_768 + (i % 5000) * 65_536;
+        crate::io::write_all(&mut *io, dev.raw_fd(), w.as_slice(), off).unwrap();
+    }
+    let dt = t0.elapsed().as_secs_f64();
+    eprintln!("uring write 64KiB x2000: {:.1}us/op", dt * 1e6 / 2000.0);
+    // std Mutex 空锁
+    let m = std::sync::Mutex::new(());
+    let t0 = std::time::Instant::now();
+    for _ in 0..2000 {
+        let _g = m.lock().unwrap();
+    }
+    let dt = t0.elapsed().as_secs_f64();
+    eprintln!("std Mutex lock x2000: {:.3}us/op", dt * 1e6 / 2000.0);
+}

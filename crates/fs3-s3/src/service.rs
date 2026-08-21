@@ -628,7 +628,8 @@ impl S3Service {
             return Ok(0);
         }
         let want = ((length - *pos) as usize).min(buf.len());
-        let mut engine = self.engine.write();
+        // 读路径:读锁(读并发;write 锁会让流式 GET 互相串行)
+        let engine = self.engine.read();
         engine
             .read_at(bucket, key, offset + *pos, &mut buf[..want])
             .inspect(|&n| {

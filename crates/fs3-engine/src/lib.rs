@@ -38,7 +38,7 @@ use fs3_meta::{
 use md5::Digest;
 
 use crate::compaction::{Compactor, CompactorHandle};
-use crate::io::{fsync, open_io_engine, read_exact, write_all, IoEngine};
+use crate::io::{fsync, open_io_engine, read_exact, read_exact_batch, write_all, IoEngine};
 
 pub use crate::compaction::{CompactionConfig, CompactionReport};
 
@@ -782,11 +782,66 @@ impl Engine {
         self.sb.data_start + extent_id * self.sb.extent_size + EXTENT_HEADER_SIZE
     }
 
+    /// 批量读设备区间 `[dev_off, dev_off+len)`:4KiB 对齐裁剪,每批 ≤16×64KiB
+    /// 一次 submit(io_uring 单次 enter + 单次 io 锁);逐块回调 `emit`。
+    ///
+    /// 调用栈优化:逐块路径每块一次堆分配 + 一次锁 + 一次 syscall;
+    /// 本路径复用线程局部 scratch(只扩不缩),单段读通常 1~2 次 submit。
+    /// 读范围与逐块路径逐字节一致(末块对齐补读)。
+    fn read_batched_blocks(
+        &self,
+        dev_off: u64,
+        len: usize,
+        mut emit: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<usize> {
+        const MAX_BLOCKS: usize = 16;
+        let chunk = self.chunk_size;
+        let mut written = 0usize;
+        let mut cur = dev_off;
+        let end = dev_off + len as u64;
+        while cur < end {
+            let block_off = cur - (cur % SECTOR_SIZE);
+            let skip = (cur - block_off) as usize;
+            let n_blocks =
+                ((end - block_off).div_ceil(chunk as u64)).min(MAX_BLOCKS as u64) as usize;
+            READ_SCRATCH.with(|sc| -> Result<()> {
+                let mut sc = sc.borrow_mut();
+                while sc.len() < n_blocks {
+                    sc.push(fs3_device::AlignedBuffer::new(chunk)?);
+                }
+                // 一次性迭代取互斥切片(逐元素 &mut 会与先前借用冲突)
+                let mut blocks: Vec<(&mut [u8], u64)> = Vec::with_capacity(n_blocks);
+                for (i, buf) in sc[..n_blocks].iter_mut().enumerate() {
+                    let off = block_off + (i as u64) * chunk as u64;
+                    let blk_len = align_up((end - off).min(chunk as u64), SECTOR_SIZE) as usize;
+                    blocks.push((&mut buf.as_mut_slice()[..blk_len], off));
+                }
+                {
+                    let mut io = self.io.lock().unwrap();
+                    read_exact_batch(&mut **io, self.device.raw_fd(), blocks)?;
+                }
+                for i in 0..n_blocks {
+                    let off = block_off + (i as u64) * chunk as u64;
+                    let blk_len = ((end - off).min(chunk as u64)) as usize;
+                    let usable_start = if i == 0 { skip } else { 0 };
+                    let usable_len = blk_len.saturating_sub(usable_start).min(len - written);
+                    if usable_len > 0 {
+                        emit(&sc[i].as_slice()[usable_start..usable_start + usable_len])?;
+                        written += usable_len;
+                    }
+                }
+                Ok(())
+            })?;
+            cur = block_off + (n_blocks as u64) * chunk as u64;
+        }
+        Ok(written)
+    }
+
     // ─────────────────────────── GET ───────────────────────────
 
     /// 读对象内容到 out(支持 Range;verify_reads 时逐段校验)。
     pub fn get_to(
-        &mut self,
+        &self,
         bucket: &str,
         key: &str,
         range: std::ops::Range<u64>,
@@ -829,28 +884,13 @@ impl Engine {
             if self.verify_reads {
                 self.read_verified_segment(seg, payload_off, len, out, &mut written)?;
             } else {
+                // 批量读:整段 ≤16×64KiB 一批,一次 submit(调用栈优化)
                 let dev_off =
                     self.extent_data_offset(seg.extent_id as u64) + seg.offset as u64 + payload_off;
-                let mut done = 0usize;
-                while done < len {
-                    let cur_off = dev_off + done as u64;
-                    // 对齐到 4KiB 块边界读取,再裁剪
-                    let block_off = cur_off - (cur_off % SECTOR_SIZE);
-                    let skip = (cur_off - block_off) as usize;
-                    let want = ((len - done) + skip).min(self.chunk_size);
-                    let block_len = align_up(want as u64, SECTOR_SIZE) as usize;
-                    let mut rbuf = fs3_device::AlignedBuffer::new(block_len)?;
-                    read_exact(
-                        &mut **self.io.lock().unwrap(),
-                        self.device.raw_fd(),
-                        rbuf.as_mut_slice(),
-                        block_off,
-                    )?;
-                    let usable = &rbuf.as_slice()[skip..skip + (want - skip).min(len - done)];
-                    out.write_all(usable)?;
-                    done += usable.len();
-                    written += usable.len() as u64;
-                }
+                written += self.read_batched_blocks(dev_off, len, |data| {
+                    out.write_all(data)?;
+                    Ok(())
+                })? as u64;
             }
         }
         Ok(written)
@@ -859,7 +899,7 @@ impl Engine {
     /// verify_reads:逐段校验(ADR-9 §4.3 CRC 双来源)——独占段读 extent 头
     /// CRC 表(现状);打包段读段内 64KiB 网格 CRC(元数据)。开销约 3~5%。
     fn read_verified_segment(
-        &mut self,
+        &self,
         seg: &Segment,
         payload_off: u64,
         len: usize,
@@ -965,13 +1005,7 @@ impl Engine {
     /// 内联对象直接拷贝;extent 对象按段定位后以 4KiB 对齐块读取裁剪。
     /// 供 HTTP 层边读边发(每 chunk 上锁,见 fs3-s3/fs3-http)。
     /// verify_reads 校验走 get_to(整段路径)。
-    pub fn read_at(
-        &mut self,
-        bucket: &str,
-        key: &str,
-        offset: u64,
-        buf: &mut [u8],
-    ) -> Result<usize> {
+    pub fn read_at(&self, bucket: &str, key: &str, offset: u64, buf: &mut [u8]) -> Result<usize> {
         let meta = self
             .meta
             .get_object(bucket, key)?
@@ -1002,25 +1036,13 @@ impl Engine {
             let take = want.min(avail);
             let dev_base =
                 self.extent_data_offset(seg.extent_id as u64) + seg.offset as u64 + in_seg;
-            let mut got = 0usize;
-            while got < take {
-                let cur = dev_base + got as u64;
-                let block_off = cur - (cur % SECTOR_SIZE);
-                let skip = (cur - block_off) as usize;
-                let step = (take - got + skip).min(self.chunk_size);
-                let read_len = align_up(step as u64, SECTOR_SIZE) as usize;
-                let mut rbuf = fs3_device::AlignedBuffer::new(read_len)?;
-                read_exact(
-                    &mut **self.io.lock().unwrap(),
-                    self.device.raw_fd(),
-                    rbuf.as_mut_slice(),
-                    block_off,
-                )?;
-                let usable = &rbuf.as_slice()[skip..skip + (take - got).min(step - skip)];
-                buf[done..done + usable.len()].copy_from_slice(usable);
-                got += usable.len();
-                done += usable.len();
-            }
+            // 批量读(调用栈优化:一次 submit,无每块堆分配)
+            let n = self.read_batched_blocks(dev_base, take, |data| {
+                buf[done..done + data.len()].copy_from_slice(data);
+                done += data.len();
+                Ok(())
+            })?;
+            debug_assert_eq!(n, take, "read_at must fill the requested window");
             break;
         }
         Ok(done)
@@ -1983,6 +2005,13 @@ fn read_up_to(r: &mut dyn Read, buf: &mut [u8]) -> Result<usize> {
         total += n;
     }
     Ok(total)
+}
+
+thread_local! {
+    /// 读路径线程局部 scratch(64KiB 对齐缓冲池;只扩不缩,免每块堆分配)。
+
+    static READ_SCRATCH: std::cell::RefCell<Vec<fs3_device::AlignedBuffer>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn now_ts() -> i64 {

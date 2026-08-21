@@ -351,6 +351,25 @@ pub fn read_exact(io: &mut dyn IoEngine, fd: RawFd, buf: &mut [u8], offset: u64)
     }])
 }
 
+/// 批量读:一次 submit 完成多块(io_uring 单次 enter;缓冲须存活至返回)。
+/// 读路径调用栈优化:1 次锁 + 1 次 syscall 取代 N 次(热路径见 engine)。
+pub fn read_exact_batch(
+    io: &mut dyn IoEngine,
+    fd: RawFd,
+    blocks: Vec<(&mut [u8], u64)>,
+) -> io::Result<()> {
+    let mut ops = Vec::with_capacity(blocks.len());
+    for (buf, off) in blocks {
+        ops.push(IoOp::Read {
+            fd,
+            buf: buf.as_mut_ptr(),
+            len: buf.len() as u32,
+            offset: off,
+        });
+    }
+    io.submit(&ops)
+}
+
 /// 设备 fsync。
 pub fn fsync(io: &mut dyn IoEngine, fd: RawFd) -> io::Result<()> {
     io.submit(&[IoOp::Fsync { fd }])
