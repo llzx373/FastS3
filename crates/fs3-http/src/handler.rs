@@ -19,10 +19,16 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
 /// 单连接服务(hyper auto builder,HTTP/1.1 keep-alive;h2 prior-knowledge)。
+///
+/// H4 超时控制:header_read_timeout(默认 30s,连接建立后/请求间隙内
+/// 未收全请求头即断开)+ keep_alive_timeout(默认 60s,空闲超时断开);
+/// h2 用 keep-alive PING 间隔 + 应答超时。超时由 hyper 内部 Timer 驱动。
 pub async fn serve_connection(
     service: Arc<S3Service>,
     admission: Arc<crate::Admission>,
     stream: TcpStream,
+    header_timeout: std::time::Duration,
+    idle_timeout: std::time::Duration,
 ) -> std::io::Result<()> {
     // 零拷贝(B3/D2):注册设备 fd 白名单,包裹 socket 识别标记帧
     crate::zero_copy::register_trusted_fd(service.device_fd());
@@ -36,14 +42,31 @@ pub async fn serve_connection(
         .unwrap_or_default();
     service.set_peer(&peer);
     let zc_ctx = crate::zero_copy::ZeroCtx::new();
-    let io = TokioIo::new(crate::zero_copy::ZeroCopyIo::new(stream, &zc_ctx));
+    // H4:DeadlinedIo 提供 30s 首读(header)/ 60s 每读(idle)截止
+    let io = TokioIo::new(crate::DeadlinedIo::new(
+        crate::zero_copy::ZeroCopyIo::new(stream, &zc_ctx),
+        header_timeout,
+        idle_timeout,
+    ));
     let service_fn = hyper::service::service_fn(move |req| {
         let service = service.clone();
         let admission = admission.clone();
         let zc_ctx = zc_ctx;
         async move { handle(service, admission, zc_ctx, req).await }
     });
-    hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+    let mut builder =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    // 首读截止由 DeadlinedIo(header_timeout)担当;hyper 的 header 截止放
+    // 宽到 idle(覆盖 keep-alive 空闲 60s)
+    builder
+        .http1()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(Some(idle_timeout));
+    builder
+        .http2()
+        .keep_alive_interval(Some(std::time::Duration::from_secs(30)))
+        .keep_alive_timeout(idle_timeout);
+    builder
         .serve_connection(io, service_fn)
         .await
         .map_err(std::io::Error::other)
@@ -85,14 +108,18 @@ impl Drop for AdmitGuard {
 fn error_response(e: &S3Error, host_id: &str) -> Response<RespBody> {
     let request_id = format!("{:08X}", rand_u64());
     let xml = e.render_xml(&request_id, host_id);
-    Response::builder()
-        .status(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
+    let status = StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut builder = Response::builder()
+        .status(status)
         .header("content-type", "application/xml")
         .header("x-amz-request-id", request_id)
         .header("x-amz-id-2", host_id)
-        .header("content-length", xml.len().to_string())
-        .body(bytes_body(xml.into_bytes()))
-        .unwrap()
+        .header("content-length", xml.len().to_string());
+    // AWS 节流语义(准入/限速):503 恒带 Retry-After
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        builder = builder.header("retry-after", "5");
+    }
+    builder.body(bytes_body(xml.into_bytes())).unwrap()
 }
 
 fn rand_u64() -> u64 {

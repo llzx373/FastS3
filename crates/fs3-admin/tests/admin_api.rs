@@ -318,4 +318,3 @@ fn curl_available() {
     let out = Command::new("curl").arg("--version").output();
     assert!(out.is_ok(), "curl required for admin tests");
 }
-

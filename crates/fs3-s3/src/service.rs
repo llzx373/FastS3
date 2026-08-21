@@ -84,6 +84,11 @@ pub struct S3Service {
     audit: Arc<fs3_core::audit::AuditRing>,
     /// 客户端地址(最近一次请求;审计用)。每请求更新,低精度可接受。
     last_peer: std::sync::Mutex<String>,
+    /// 每密钥限速(H4;rps=0 关闭)。热重载可动态调整。
+    limiter: Arc<crate::ratelimit::KeyLimiter>,
+    /// 密钥策略缓存(J4:access → Policy;None = 无策略 = 放行)。
+    /// 与 meta 中 KeyRecord.policy 保持同步(启动恢复/写入时更新)。
+    policies: std::sync::Mutex<std::collections::HashMap<String, Option<crate::policy::Policy>>>,
 }
 
 fn header<'a>(req: &'a S3Request, name: &str) -> Option<&'a str> {
@@ -135,7 +140,25 @@ impl S3Service {
             metrics,
             audit,
             last_peer: std::sync::Mutex::new(String::new()),
+            limiter: Arc::new(crate::ratelimit::KeyLimiter::new()),
+            policies: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// 每密钥限速(H4):设置 rps(0 = 关闭;热重载即时生效)。
+    pub fn set_rate_limit(&self, rps: u64) {
+        self.limiter.set_rps(rps);
+        tracing::info!(rps, "per-key rate limit updated");
+    }
+
+    /// 每密钥限速配置(管理面展示)。
+    pub fn rate_limit_rps(&self) -> u64 {
+        self.limiter.rps()
+    }
+
+    /// 限速累计拒绝数(指标/告警)。
+    pub fn rate_limit_rejected(&self) -> u64 {
+        self.limiter.rejected()
     }
 
     pub fn engine(&self) -> &Arc<parking_lot::RwLock<Engine>> {
@@ -258,6 +281,82 @@ impl S3Service {
         Ok(())
     }
 
+    /// 设置/清除密钥策略(J4;AWS 策略 JSON 子集,写入前校验)。
+    /// `policy: None` = 清除策略(恢复全放行)。持久化 + 内存缓存即时生效。
+    pub fn set_key_policy(&self, access_key: &str, policy: Option<String>) -> Result<(), S3Error> {
+        let mut rec = self
+            .engine
+            .read()
+            .meta()
+            .get_key(access_key)
+            .map_err(|e| map_engine_error(e, "", ""))?
+            .ok_or_else(|| S3Error::new(S3ErrorCode::InvalidAccessKeyId))?;
+        // 写入前校验(非法策略拒绝写入,防脏数据)
+        if let Some(text) = &policy {
+            if let Err(e) = crate::policy::Policy::parse(text) {
+                return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                    .with_message(format!("invalid policy: {e}")));
+            }
+        }
+        rec.policy = policy.clone();
+        self.engine
+            .read()
+            .meta()
+            .commit_key_put(&rec)
+            .map_err(|e| map_engine_error(e, "", ""))?;
+        self.policies.lock().unwrap().insert(
+            access_key.to_string(),
+            policy.and_then(|t| crate::policy::Policy::parse(&t).ok()),
+        );
+        Ok(())
+    }
+
+    /// 密钥策略文本(管理面展示)。
+    pub fn key_policy(&self, access_key: &str) -> Option<String> {
+        self.engine
+            .read()
+            .meta()
+            .get_key(access_key)
+            .ok()
+            .flatten()
+            .and_then(|r| r.policy)
+    }
+
+    /// J4 策略执行:已认证请求按密钥策略判定(默认拒绝)。
+    /// `action` 为审计操作名(如 PutObject);`bucket`/`key` 构成资源 ARN。
+    /// 无策略/未知密钥 → 放行(密钥有效性已由认证把关)。
+    fn authorize(
+        &self,
+        access: Option<&str>,
+        action: &str,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(), S3Error> {
+        let Some(ak) = access else {
+            return Ok(());
+        };
+        let policy = match self.policies.lock().unwrap().get(ak) {
+            Some(Some(p)) => p.clone(),
+            _ => return Ok(()),
+        };
+        let resource = if bucket.is_empty() {
+            "*".to_string()
+        } else if key.is_empty() {
+            format!("arn:aws:s3:::{bucket}")
+        } else {
+            format!("arn:aws:s3:::{bucket}/{key}")
+        };
+        if policy.evaluate(action, &resource) {
+            Ok(())
+        } else {
+            Err(
+                S3Error::new(S3ErrorCode::AccessDenied).with_message(format!(
+                    "access key {ak} is not authorized for {action} on {resource}"
+                )),
+            )
+        }
+    }
+
     /// 从 meta 恢复全部运行时密钥到认证表(启动时调用;跳过禁用/解密失败)。
     pub fn restore_keys_from_meta(&self) -> Result<usize, S3Error> {
         let engine = self.engine.read();
@@ -267,11 +366,19 @@ impl S3Service {
             .map_err(|e| map_engine_error(e, "", ""))?;
         let mut restored = 0usize;
         let mut table = self.auth.key_table().write();
+        let mut policies = self.policies.lock().unwrap();
         for rec in engine
             .meta()
             .list_keys()
             .map_err(|e| map_engine_error(e, "", ""))?
         {
+            // J4 策略缓存(无论启用与否都缓存,禁用密钥不产生请求)
+            policies.insert(
+                rec.access_key.clone(),
+                rec.policy
+                    .as_deref()
+                    .and_then(|t| crate::policy::Policy::parse(t).ok()),
+            );
             if !rec.enabled {
                 continue;
             }
@@ -307,6 +414,17 @@ impl S3Service {
         // 内部 handle_inner 仍会认证——M5 性能冲刺时合并)
         let access = self.authenticate(req).ok().flatten();
         let (op, name, bucket, key) = route_op_bucket_key(req);
+        // H4 每密钥限速:超限 503 SlowDown + Retry-After(AWS 节流语义)
+        if let Some(ak) = &access {
+            if !self.limiter.check(ak) {
+                self.metrics.record_error("SlowDown");
+                self.audit_record(Some(ak), &name, &bucket, &key, 503);
+                return Err(S3Error::new(S3ErrorCode::SlowDown)
+                    .with_message("Rate limit exceeded for this access key."));
+            }
+        }
+        // J4 密钥策略执行(Deny 优先;无匹配默认拒绝)
+        self.authorize(access.as_deref(), &name, &bucket, &key)?;
         let result = self.handle_inner(req);
         let status = match &result {
             Ok(r) => r.status,
@@ -652,6 +770,13 @@ impl S3Service {
         let start = std::time::Instant::now();
         let access = self.authenticate(req).ok().flatten();
         let (op, name, bucket, key) = route_op_bucket_key(req);
+        // J4 密钥策略执行(流式 PUT / UploadPart 同语义;认证失败在此体现为
+        // handle_inner 的 AccessDenied,策略判定对未认证请求直接放行)
+        if let Err(e) = self.authorize(access.as_deref(), &name, &bucket, &key) {
+            self.metrics.record_error(&e.code_name());
+            self.audit_record(access.as_deref(), &name, &bucket, &key, e.status());
+            return Err(e);
+        }
         let result = self.put_object_stream_inner(req, reader);
         let status = match &result {
             Ok(r) => r.status,

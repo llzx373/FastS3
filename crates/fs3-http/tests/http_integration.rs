@@ -168,8 +168,14 @@ async fn spawn_server(service: Arc<S3Service>) -> std::net::SocketAddr {
             let (stream, _) = listener.accept().await.unwrap();
             let svc = service.clone();
             tokio::spawn(async move {
-                let _ = fs3_http::serve_connection(svc, fs3_http::Admission::new(1 << 30), stream)
-                    .await;
+                let _ = fs3_http::serve_connection(
+                    svc,
+                    fs3_http::Admission::new(1 << 30),
+                    stream,
+                    std::time::Duration::from_secs(30),
+                    std::time::Duration::from_secs(60),
+                )
+                .await;
             });
         }
     });

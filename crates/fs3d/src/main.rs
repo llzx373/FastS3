@@ -423,7 +423,13 @@ fn cmd_serve(
         max_inflight_bytes: cli_max_inflight
             .or(cfg.server.max_inflight_bytes)
             .unwrap_or(16 * 1024 * 1024 * 1024),
+        header_timeout: std::time::Duration::from_secs(
+            cfg.server.header_timeout_secs.unwrap_or(30),
+        ),
+        idle_timeout: std::time::Duration::from_secs(cfg.server.idle_timeout_secs.unwrap_or(60)),
     };
+    // H4 每密钥限速(0 = 关闭)
+    service.set_rate_limit(cfg.limits.key_rps.unwrap_or(0));
     fs3_http::serve(service, &http_cfg).map_err(fs3_core::Error::Io)
 }
 

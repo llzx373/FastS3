@@ -12,9 +12,11 @@ use tokio::net::TcpListener;
 
 mod admission;
 mod handler;
+mod timeout_io;
 mod zero_copy;
 
 pub use admission::Admission;
+pub use timeout_io::DeadlinedIo;
 pub use zero_copy::{probe_fd_capability, ZeroCopyIo, ZeroCtx};
 
 /// 单连接处理(测试与内嵌复用)。
@@ -28,6 +30,10 @@ pub struct HttpServerConfig {
     pub workers: usize,
     /// 全局在途字节上限(G3;超限 503 SlowDown + Retry-After)。
     pub max_inflight_bytes: u64,
+    /// 请求头读取超时(H4;默认 30s;超时关闭连接)。
+    pub header_timeout: std::time::Duration,
+    /// keep-alive 空闲超时(H4;默认 60s;超时关闭连接)。
+    pub idle_timeout: std::time::Duration,
 }
 
 impl Default for HttpServerConfig {
@@ -36,6 +42,8 @@ impl Default for HttpServerConfig {
             listen: "0.0.0.0:9000".parse().unwrap(),
             workers: 0,
             max_inflight_bytes: 16 * 1024 * 1024 * 1024, // DESIGN §6.5:16GiB
+            header_timeout: std::time::Duration::from_secs(30), // DESIGN §9:header 30s
+            idle_timeout: std::time::Duration::from_secs(60), // DESIGN §9:idle 60s
         }
     }
 }
@@ -56,13 +64,15 @@ pub fn serve(service: Arc<S3Service>, cfg: &HttpServerConfig) -> std::io::Result
     );
 
     let admission = Admission::new(cfg.max_inflight_bytes);
+    let header_timeout = cfg.header_timeout;
+    let idle_timeout = cfg.idle_timeout;
     let mut handles = Vec::new();
     for w in 0..workers {
         let service = service.clone();
         let listen = cfg.listen;
         let admission = admission.clone();
         handles.push(std::thread::spawn(move || {
-            worker_main(service, listen, admission, w);
+            worker_main(service, listen, admission, header_timeout, idle_timeout, w);
         }));
     }
     for h in handles {
@@ -75,6 +85,8 @@ fn worker_main(
     service: Arc<S3Service>,
     listen: SocketAddr,
     admission: Arc<Admission>,
+    header_timeout: std::time::Duration,
+    idle_timeout: std::time::Duration,
     worker_id: usize,
 ) {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -92,7 +104,14 @@ fn worker_main(
                     let service = service.clone();
                     let admission = admission.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handler::serve_connection(service, admission, stream).await
+                        if let Err(e) = handler::serve_connection(
+                            service,
+                            admission,
+                            stream,
+                            header_timeout,
+                            idle_timeout,
+                        )
+                        .await
                         {
                             tracing::debug!("connection {peer} ended: {e}");
                         }

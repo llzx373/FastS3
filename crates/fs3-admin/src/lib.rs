@@ -599,6 +599,8 @@ impl AdminServer {
         }
     }
 
+    /// PATCH /v1/admin/keys/{access}:body 可含 `enabled`(bool)与/或
+    /// `policy`(策略 JSON 文本或 null 清除)。非法策略 → 400。
     fn handle_key_patch(&self, access: &str, body: &[u8]) -> Response<String> {
         let parsed: serde_json::Value = match serde_json::from_slice(body) {
             Ok(v) => v,
@@ -606,24 +608,50 @@ impl AdminServer {
                 return json::err(StatusCode::BAD_REQUEST, "bad_request", "invalid JSON body")
             }
         };
-        let enabled = match parsed.get("enabled").and_then(|v| v.as_bool()) {
-            Some(b) => b,
-            None => {
-                return json::err(
-                    StatusCode::BAD_REQUEST,
-                    "bad_request",
-                    "missing required field: enabled",
-                )
+        // policy 先于 enabled 应用;两个字段至少出现一个
+        let mut applied = Vec::new();
+        let mut resp = serde_json::json!({"access_key": access});
+        if let Some(policy) = parsed.get("policy") {
+            let policy = match policy {
+                serde_json::Value::Null => None,
+                serde_json::Value::String(s) => Some(s.clone()),
+                other => {
+                    return json::err(
+                        StatusCode::BAD_REQUEST,
+                        "bad_request",
+                        &format!("policy must be a JSON string or null, got {other}"),
+                    )
+                }
+            };
+            match self.service.set_key_policy(access, policy) {
+                Ok(()) => applied.push("policy"),
+                Err(e) => {
+                    return json::err(StatusCode::BAD_REQUEST, "invalid_policy", &e.describe())
+                }
             }
-        };
-        match self.service.set_key_enabled(access, enabled) {
-            Ok(()) => json::ok(serde_json::json!({"access_key": access, "enabled": enabled})),
-            Err(e) => json::err(
-                StatusCode::NOT_FOUND,
-                "no_such_key",
-                &format!("key {access}: {}", e.describe()),
-            ),
+            resp["policy"] = serde_json::json!(self.service.key_policy(access));
         }
+        if let Some(enabled) = parsed.get("enabled").and_then(|v| v.as_bool()) {
+            match self.service.set_key_enabled(access, enabled) {
+                Ok(()) => applied.push("enabled"),
+                Err(e) => {
+                    return json::err(
+                        StatusCode::NOT_FOUND,
+                        "no_such_key",
+                        &format!("key {access}: {}", e.describe()),
+                    )
+                }
+            }
+            resp["enabled"] = serde_json::json!(enabled);
+        }
+        if applied.is_empty() {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "missing required field: enabled and/or policy",
+            );
+        }
+        json::ok(resp)
     }
 
     fn handle_uploads(&self) -> Response<String> {

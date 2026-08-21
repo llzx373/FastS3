@@ -13,6 +13,15 @@ pub struct RootConfig {
     pub auth: AuthConfig,
     #[serde(default)]
     pub admin: AdminConfig,
+    #[serde(default)]
+    pub limits: LimitsConfig,
+}
+
+/// 限额与抗滥用(H4,DESIGN §9「限额与抗滥用」)。
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+pub struct LimitsConfig {
+    /// 每密钥每秒请求上限(0 = 关闭;超限 503 SlowDown)。
+    pub key_rps: Option<u64>,
 }
 
 /// 管理面配置(DESIGN §10.1 [admin])。
@@ -33,6 +42,10 @@ pub struct ServerConfig {
     pub workers: Option<usize>,
     /// 全局在途字节上限(G3;默认 16GiB;超限 503 SlowDown)。
     pub max_inflight_bytes: Option<u64>,
+    /// 请求头读取超时秒数(H4;默认 30;超时断开连接)。
+    pub header_timeout_secs: Option<u64>,
+    /// keep-alive 空闲超时秒数(H4;默认 60;超时断开连接)。
+    pub idle_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
