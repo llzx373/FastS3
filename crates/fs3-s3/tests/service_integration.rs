@@ -860,3 +860,35 @@ fn auth_and_errors() {
     let r = svc.handle(&req_q("GET", "/bkt1", &[("uploads", "")], vec![]));
     assert_eq!(err_code(&r), "NotImplemented");
 }
+
+/// 磁盘满 → 507 InsufficientStorage(不是 500 InternalError;DESIGN §6)。
+#[test]
+fn device_full_maps_to_507() {
+    let (_d, svc) = setup();
+    let _ = svc.handle(&req("PUT", "/bkt", vec![])); // 建桶
+                                                     // 填满设备:15 extents × 4MiB,每个对象 1MiB(内联阈值之上)
+                                                     // 填满设备(对象 1MiB;内联阈值之上走 extent);满后 PUT 开始失败即停
+    let mut i = 0u32;
+    while i < 128 {
+        let body = vec![i as u8; 1024 * 1024];
+        let r = svc.handle(&req("PUT", &format!("/bkt/o{i}"), body));
+        match r {
+            Ok(_) => i += 1,
+            Err(e) => {
+                // 第一个失败必须是 NoSpace(而非其它错误)
+                assert_eq!(e.code.status(), 507, "fill must stop at 507");
+                break;
+            }
+        }
+    }
+    assert!(
+        i >= 12,
+        "应至少写入 12 个 1MiB 对象(15 extents × 4MiB 容量)"
+    );
+    assert!(i < 128, "设备应被填满");
+    // 设备已满:下一个 PUT → 507 InsufficientStorage
+    let r = svc.handle(&req("PUT", "/bkt/full", vec![9u8; 1024 * 1024]));
+    let err = r.unwrap_err();
+    assert_eq!(err.code.status(), 507);
+    assert_eq!(err_code(&Err(err.clone())), "InsufficientStorage");
+}

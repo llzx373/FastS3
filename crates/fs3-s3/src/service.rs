@@ -2010,8 +2010,8 @@ fn map_engine_error(e: CoreError, bucket: &str, key: &str) -> S3Error {
                     .with_message(msg)
             }
         }
-        CoreError::NoSpace => S3Error::new(S3ErrorCode::InternalError)
-            .with_message("We encountered an internal error. Please try again."),
+        CoreError::NoSpace => S3Error::new(S3ErrorCode::InsufficientStorage)
+            .with_message("The storage device is out of space."),
         CoreError::InvalidArgument(m) => S3Error::new(S3ErrorCode::InvalidArgument).with_message(m),
         CoreError::InvalidPart(m) => S3Error::new(S3ErrorCode::InvalidPart).with_message(m),
         CoreError::InvalidPartOrder(m) => {
