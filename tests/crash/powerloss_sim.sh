@@ -31,7 +31,7 @@ trap cleanup EXIT
 [ -x "$BIN" ] || { echo "error: $BIN not found"; exit 2; }
 
 echo "== FastS3 power-loss sim: rounds=$ROUNDS =="
-"$BIN" init --device "$IMG" --size 512MiB >/dev/null || exit 1
+"$BIN" init --device "$IMG" --size 512MiB --yes >/dev/null 2>&1 || exit 1
 : > "$MANIFEST"
 FAILED=0
 

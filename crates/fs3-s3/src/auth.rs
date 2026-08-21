@@ -484,7 +484,7 @@ impl Authenticator {
                         S3Error::new(S3ErrorCode::InvalidRequest)
                             .with_message("X-Amz-Expires is required")
                     })?
-                    .parse::<u64>()
+                    .parse::<i64>()
                     .map_err(|_| {
                         S3Error::new(S3ErrorCode::InvalidRequest)
                             .with_message("invalid X-Amz-Expires")
@@ -497,8 +497,18 @@ impl Authenticator {
                     .collect();
 
                 // 过期检查:now 在 [date, date+expires] 之外 → 拒绝
+                // (M8/s3-tests:负数 ExpiresIn 生成 X-Amz-Expires=-1000,
+                // AWS/RGW 语义 = 已过期 → 403 AccessDenied,而非 400)
                 let issued = parse_amz_datetime(&amz_date)?;
                 let now = self.now();
+                if expires < 0
+                    || now.duration_since(issued).unwrap_or_default()
+                        > Duration::from_secs(expires as u64)
+                {
+                    return Err(
+                        S3Error::new(S3ErrorCode::AccessDenied).with_message("Request has expired")
+                    );
+                }
                 if now < issued {
                     // 时钟未到签发时间:容差内允许(与 AWS 行为一致:按 skew 处理)
                     let diff = issued.duration_since(now).unwrap_or_default();
@@ -506,12 +516,6 @@ impl Authenticator {
                         return Err(S3Error::new(S3ErrorCode::AccessDenied)
                             .with_message("Request is not yet valid"));
                     }
-                } else if now.duration_since(issued).unwrap_or_default()
-                    > Duration::from_secs(expires)
-                {
-                    return Err(
-                        S3Error::new(S3ErrorCode::AccessDenied).with_message("Request has expired")
-                    );
                 }
 
                 let cred = self.find_key(cred_parts[0]).ok_or_else(|| {

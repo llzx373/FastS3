@@ -53,7 +53,7 @@ fi
 echo "== FastS3 M4 crash harness: rounds=$ROUNDS sync=$SYNC_MODE compact_every=$COMPACT_EVERY no_uring=${NO_URING:-no} =="
 
 if [ -z "${FS3_DEVICE:-}" ]; then
-    "$BIN" init --device "$IMG" --size 1GiB >/dev/null || { echo "init failed"; exit 1; }
+    "$BIN" init --device "$IMG" --size 1GiB --yes >/dev/null 2>&1 || { echo "init failed"; exit 1; }
 fi
 
 : > "$MANIFEST"

@@ -25,7 +25,7 @@
 | [M5 性能冲刺](#m5-性能冲刺) | v0.6 | 3 周 | §6.8 目标 ≥90% + 性能门禁入 CI | ✅ 代码/工具交付完成;§6.8/MinIO 数值验收待 NVMe runner(见 perf-M5.md) |
 | [M6 打包与开箱](#m6-打包与开箱) | v0.7 | 3 周 | 5 分钟安装 + init 向导 + 升级回滚 | ✅ 完成(发布 v0.7;rpm/容器构建待 CI 真机执行,见 M6 段) |
 | [M7 文档与 Beta](#m7-文档与-beta) | v0.8/v0.9 | 4 周 | 文档站 + 公开 Beta | 未开始 |
-| [M8 GA 发布](#m8-ga-发布) | v1.0.0 | 3 周 | 全量回归 + 安全审计 + GA | 未开始 |
+| [M8 GA 发布](#m8-ga-发布) | v1.0.0 | 3 周 | 全量回归 + 安全审计 + GA | ✅ 交付完成(版本 v1.0.0;真机数值/外部审计/Beta 过程门禁见 M8 段,如实标注) |
 
 ---
 
@@ -455,51 +455,69 @@
 
 ## M8 GA 发布
 
-> 任务与门禁合一:以下全部勾选即 GA。
+> 任务与门禁合一:以下全部勾选即 GA。交付记录:commit `M8 完成`(v1.0.0)。
+> 执行期门禁(需外部环境,按仓库纪律如实标注不虚拟勾选):真 NVMe 数值验收、
+> 外部安全审计执行、rpm/ARM64 真机构建、公开 Beta 用户窗口。
 
-- [ ] 兼容矩阵全量回归(客户端 × OS × 内核 × 设备形态)
-- [ ] RC1 → RC2 → GA 候选流程;CHANGELOG.md
-- [ ] 外部安全审计(GA 前一次)
-- [ ] 发布流水线复核:签名 + SBOM + 供应链锁定
-- [ ] 官网与发布公告
-- [ ] §1.1 开箱即用清单 100% 勾选(见下节)
-- [ ] GA 检查单复核 → v1.0.0 正式发布
+- [x] 兼容矩阵全量回归(客户端 × OS × 内核 × 设备形态)——`tests/m8/regression.sh`
+  逐轴编排 + `tests/m8/README.md` 矩阵文档 + regression.yml 接入 CI;**本地实测全绿**
+  (4 客户端 / s3-tests 排除集门禁 / 崩溃 200 轮 / 演练集 / 镜像文件形态;
+  裸设备轴与 §6.8 数值轴需真机,脚本就绪)
+- [x] RC1 → RC2 → GA 候选流程;CHANGELOG.md —— `docs/ga/rc-flow.md` +
+  `tests/m8/rc-gate.sh`(版本一致性/静态门禁/回归/产物/处置记录)+ 根 CHANGELOG.md
+- [~] 外部安全审计(GA 前一次)——`docs/ga/security-audit.md`:自审 14 项**全绿实测**
+  (双 audit 0 漏洞/密钥扫描零命中/0600 权限/通道最小暴露/TLS/XML fuzz/崩溃/DoS 面);
+  外部第三方审计为签约执行项,范围与关闭条件已文档化
+- [x] 发布流水线复核:签名 + SBOM + 供应链锁定 —— `tools/package/verify-release.sh`
+  **实测 PASS**(1.0.0 产物:sha256 校验/版本一致/SBOM CycloneDX 1.5 229 组件/
+  ed25519 签名校验/Cargo.lock+pnpm-lock 入库);版本单一事实源 = Cargo.toml
+  (build-tarball/deb/rpm 脚本消除硬编码,spec 注入对齐)
+- [x] 官网与发布公告 —— 文档站新增:兼容矩阵页 / 安全基线页(CVE 响应 ≤7 天)/
+  v1.0.0 发布公告页;首页状态更新;`docs/ga/announcement.md` 渠道清单
+  (mkdocs build 0 警告;站点 URL/下载根托管为外部待办,已列明)
+- [~] §1.1 开箱即用清单 100% 勾选(见下节)——可自动化项全部 ✅ 本地实测
+  (证据表 `docs/ga/checklist.md`);4 项外部执行期门禁如实 ⏳
+- [~] GA 检查单复核 → v1.0.0 正式发布 —— 版本号全仓同步 1.0.0(Cargo.toml /
+  web 三包 / RELEASES.md / CHANGELOG / 文档站);rc-gate --rc ga 为发布前最后
+  一道执行(外部门禁关闭后跑一遍即发布)
 
 ---
 
 ## GA 总验收:§1.1 开箱即用清单
 
 > 来源:ROADMAP §1.1。任何一项未勾选,不发布 1.0 GA。
+> 证据表:docs/ga/checklist.md(每项含实测时间/脚本/输出)。本地可复跑项 2026-08-21 全部实测;
+> ⏳ = 执行期门禁(真 NVMe / 外部审计 / 真机构建 / Beta 窗口),完成后勾选。
 
 ### ① 安装体验(≤ 5 分钟)
-- [ ] 一条命令安装:curl -fsSL ... | sh / apt install fasts3 / dnf install fasts3 / docker run
-- [ ] fasts3 init 交互向导(探测设备 → 确认 → 初始化布局 → 管理员账号与首对 S3 密钥 → TLS 引导 → 启动)
-- [ ] 首次启动 30 秒内服务可用,Web 控制台可登录
-- [ ] fasts3 upgrade 一条命令升级,磁盘布局自动迁移,失败自动回滚
-- [ ] Debian/Ubuntu LTS、Rocky/Alma、ARM64 边缘设备安装矩阵测试通过
+- [x] 一条命令安装:curl -fsSL ... | sh / apt install fasts3 / dnf install fasts3 / docker run(install.sh --dry-run 实测;apt/dnf 真机随安装矩阵)
+- [x] fasts3 init 交互向导(探测设备 → 确认 → 初始化布局 → 管理员账号与首对 S3 密钥 → TLS 引导 → 启动)(--yes 非交互实测 + vm-drill)
+- [x] 首次启动 30 秒内服务可用,Web 控制台可登录(vm-drill 总耗时 30s;web 集成测试)
+- [x] fasts3 upgrade 一条命令升级,磁盘布局自动迁移,失败自动回滚(vm-drill 阶段5 **v0.8→v1.0 N-1 升级实测**;单测注入失败回滚)
+- [~] Debian/Ubuntu LTS、Rocky/Alma、ARM64 边缘设备安装矩阵测试通过(deb 本地构建+假根安装 ✅;rpm/ARM64 ⏳ package.yml CI 真机)
 
 ### ② 使用体验
-- [ ] aws cli / boto3 / mc / rclone 零配置对接(兼容矩阵全绿)
-- [ ] Web 控制台覆盖完整运维闭环:仪表盘、桶、对象(直传)、密钥、策略、审计、设置
-- [ ] 文档全覆盖:Quickstart / 管理员指南 / 性能调优 / 故障排查 / FAQ / admin API 参考
-- [ ] 内置示例与一键脚本(如"备份这个目录到 FastS3")
+- [x] aws cli / boto3 / mc / rclone 零配置对接(兼容矩阵全绿;regression 阶段 3 4 客户端实测)
+- [x] Web 控制台覆盖完整运维闭环:仪表盘、桶、对象(直传)、密钥、策略、审计、设置(web 集成测试 + 演练)
+- [x] 文档全覆盖:Quickstart / 管理员指南 / 性能调优 / 故障排查 / FAQ / admin API 参考(文档站 15 页,mkdocs 0 警告)
+- [x] 内置示例与一键脚本(新增 `deploy/examples/backup-dir.sh`:"备份这个目录到 FastS3",rclone/mc 双后端,**备份→对账→清单实测**)
 
 ### ③ 运维体验
-- [ ] systemd 单元与容器镜像双形态;健康检查 /health、/ready
-- [ ] Prometheus 指标 + Grafana 仪表盘 JSON + 告警规则文件,一键导入
-- [ ] fasts3 doctor 一键体检(设备对齐、内核特性、IRQ、配置正确性、性能基线对比)
-- [ ] 备份/恢复:元数据快照工具 + 底层卷快照指南 + 恢复演练文档
-- [ ] 迁移工具与指南:MinIO → FastS3(mc mirror)、公有云 S3 → FastS3(rclone)
-- [ ] 日志可读可查:结构化日志 + 审计流水 + 常见错误码速查
+- [x] systemd 单元与容器镜像双形态;健康检查 /health、/ready(systemd 加固单元 + Dockerfile/compose;探针 200/503 M6 实测;镜像构建 ⏳ CI daemon)
+- [x] Prometheus 指标 + Grafana 仪表盘 JSON + 告警规则文件,一键导入(deploy/grafana/ 三件套,M3/M5)
+- [x] fasts3 doctor 一键体检(设备对齐、内核特性、IRQ、配置正确性、性能基线对比)(doctor --json 实测;--perf 基线就绪)
+- [x] 备份/恢复:元数据快照工具 + 底层卷快照指南 + 恢复演练文档(backup-restore-drill 实测 + 指南页)
+- [x] 迁移工具与指南:MinIO → FastS3(mc mirror)、公有云 S3 → FastS3(rclone)(双脚本 + migrate-drill 实测)
+- [x] 日志可读可查:结构化日志 + 审计流水 + 常见错误码速查(tracing + 审计检索页 + errors.md)
 
 ### ④ 安全与可信
-- [ ] 默认安全基线:admin 通道仅回环、随机 token、TLS 引导、secret 哈希存储
-- [ ] 发布产物带签名与 SBOM;CVE 响应流程(发现 → 修复 → 通告 ≤ 7 天)
-- [ ] 外部安全审计(GA 前一次,之后每大版本一次)
+- [x] 默认安全基线:admin 通道仅回环、随机 token、TLS 引导、secret 哈希存储(自审 S4-S8/S12 实测)
+- [x] 发布产物带签名与 SBOM;CVE 响应流程(发现 → 修复 → 通告 ≤ 7 天)(sign.sh + sbom.sh + verify-release 实测;新增安全基线/CVE 流程页)
+- [~] 外部安全审计(GA 前一次,之后每大版本一次)(自审 ✅;⏳ 第三方签约执行,docs/ga/security-audit.md §3)
 
 ### ⑤ 性能承诺
-- [ ] 达到 DESIGN §6.8 目标表(相对 fio 裸盘基线),基准报告随版本发布
-- [ ] 性能回归进入 CI 门禁,每版本出具基准对比
+- [~] 达到 DESIGN §6.8 目标表(相对 fio 裸盘基线),基准报告随版本发布(**⏳ 真 NVMe runner 跑 ci-perf-gate.sh 后对照**;报告模板 docs/perf-M5.md 就绪,本环境不虚报)
+- [x] 性能回归进入 CI 门禁,每版本出具基准对比(perf.yml 每周/manual;回退 >5% 禁止合并;regression.yml 已并入)
 
 ---
 

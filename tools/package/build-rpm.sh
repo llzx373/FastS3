@@ -12,7 +12,7 @@
 # 用法:
 #   ./build-rpm.sh [outdir]
 # 环境变量:
-#   FASTS3_VERSION   版本号(默认与 spec 内 Version 对齐:0.8.0)
+#   FASTS3_VERSION   版本号(默认读 Cargo.toml workspace version;spec 内 Version 由本脚本注入对齐)
 #   FASTS3D / WEB_*  透传 build-tarball.sh
 #   FASTS3_RPMBUILD  显式指定 rpmbuild 二进制
 #   WITH_SBOM=1      打包 SBOM(默认关:spec 用 %if 0%{?with_sbom:1} 控制;
@@ -26,7 +26,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 OUTDIR="${1:-$ROOT/tools/package/dist}"
-VERSION="${FASTS3_VERSION:-0.8.0}"
+WORKSPACE_VERSION="$(grep -m1 '^version' "$ROOT/Cargo.toml" | awk '{print $3}' | tr -d '"')"
+VERSION="${FASTS3_VERSION:-${WORKSPACE_VERSION:-0.0.0}}"
 SPEC="$ROOT/tools/package/fasts3.spec"
 
 # ── 检测 rpmbuild ─────────────────────────────────────────────────────────
@@ -57,7 +58,7 @@ fi
 RPMTOP="$OUTDIR/rpmbuild"
 rm -rf "$RPMTOP"
 mkdir -p "$RPMTOP"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
-cp "$SPEC" "$RPMTOP/SPECS/"
+sed "s/^Version:.*/Version: $VERSION/" "$SPEC" > "$RPMTOP/SPECS/fasts3.spec"
 cp "$TARBALL" "$RPMTOP/SOURCES/"
 
 DEFINES=(

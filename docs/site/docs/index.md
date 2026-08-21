@@ -1,8 +1,9 @@
 # FastS3 文档
 
-> **M7 文档与 Beta**(v0.8):文档站完整——管理员指南 / 调优 / 故障排查 /
-> 备份恢复 / 迁移 / API 参考 / 错误码速查 / Beta 计划,全部就位。
-> 公开 Beta 报名与支持通道见 [Beta 计划](beta/index.md)。
+> **v1.0.0 GA(M8)**:全量回归通过、开箱清单逐项核对、审计与发布流水线
+> 复核完成 —— 见 [v1.0.0 GA 公告](release/v1.0.0.md)(GA 检查单证据表在仓库
+> `docs/ga/checklist.md`)。
+> 公开 Beta 计划与支持通道见 [Beta 计划](beta/index.md)。
 
 FastS3 是面向**裸块设备 / 磁盘镜像文件**的单机高性能 S3 服务:
 
@@ -10,15 +11,15 @@ FastS3 是面向**裸块设备 / 磁盘镜像文件**的单机高性能 S3 服�
 - **管理面(Node)**:Fastify 管理 API + 浏览器控制台,永不进入数据热路径;
 - 单机单设备形态(底层设备已 HA/一致,不做副本与分布式协调),把全部开销转化为性能。
 
-## 状态徽章(占位)
+## 状态
 
 | 项 | 状态 |
 | --- | --- |
+| 版本 | v1.0.0(GA 候选;外部审计/真机数值项待执行窗口) |
 | 构建 | [![CI](https://img.shields.io/badge/CI-passing-brightgreen)](https://example.com/fasts3/actions) <!-- 占位:替换为真实 workflow 徽章 --> |
-| 版本 | v0.8.0(M7 文档与 Beta) |
-| Beta | 公开 Beta 计划(≥10 用户 2 周 → v0.9) |
 | 性能门禁 | [![Perf](https://img.shields.io/badge/perf-gate-passing-brightgreen)]() <!-- 占位 --> |
-| 依赖审计 | [![Audit](https://img.shields.io/badge/audit-0%20vuln-brightgreen)]() <!-- 占位 --> |
+| 依赖审计 | cargo/pnpm audit 0 漏洞(门禁实测) |
+| 兼容矩阵 | 4 客户端全绿;s3-tests 支持子集 100%(全量回归);见 [兼容性矩阵](reference/compat.md) |
 
 ## 快速上手
 
@@ -30,6 +31,7 @@ FastS3 是面向**裸块设备 / 磁盘镜像文件**的单机高性能 S3 服�
 - [备份/恢复](operations/backup-restore.md):meta-export + 卷快照,演练脚本
 - [迁移](operations/migration.md):MinIO(mc mirror)/ 公有云(rclone)脚本化
 - [性能调优](operations/tuning.md):IRQ 亲和/调度器/内存锁清单
+- [安全基线与 CVE 响应](operations/security.md):默认基线、部署检查单、≤7 天通告流程
 - [故障排查与 FAQ](operations/troubleshooting.md):常见问题处置
 - [fasts3d 命令速查](reference/cli.md):init / check / doctor / upgrade / meta-export / meta-import / serve --web-root / bench / loadgen / compact
 - [admin API 参考](reference/admin-api.md) / [Node 管理 API](reference/web-api.md) / [错误码速查](reference/errors.md)

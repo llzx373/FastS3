@@ -94,7 +94,7 @@ systemctl start fasts3
 - 禁用/启用:`PATCH /v1/admin/keys/{access} {"enabled":false}`(立即生效);
 - 审计:密钥增删改均有审计记录(op=key_create/key_delete/key_enable/...)。
 
-最小权限建议:每应用一密钥 + [策略 JSON](../reference/web-api.md#密钥策略)(AWS 策略语法
+最小权限建议:每应用一密钥 + [策略 JSON](../reference/web-api.md#密钥与策略)(AWS 策略语法
 子集,`s3:GetObject`/`s3:PutObject`/桶范围);存储型密钥策略化,管理型密钥
 仅保留在管理面。
 

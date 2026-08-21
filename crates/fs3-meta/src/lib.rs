@@ -143,6 +143,9 @@ pub enum Op {
     BucketPut {
         name: String,
         meta: BucketMeta,
+        /// 创建时 LocationConstraint(M8 回显语义;None/"" = us-east-1 默认)。
+        /// Op 不落盘(瞬态事务指令),扩字段无版本兼容问题。
+        location: Option<String>,
     },
     BucketDelete {
         name: String,
@@ -636,12 +639,34 @@ impl MetaStore {
         }
     }
 
-    /// 桶 PUT(创建/更新)。
+    /// 桶 PUT(创建/更新;location 不写,保持旧语义)。
     pub fn commit_bucket_put(&self, name: &str, meta: &BucketMeta) -> Result<u64> {
         self.commit(&[Op::BucketPut {
             name: name.to_string(),
             meta: meta.clone(),
+            location: None,
         }])
+    }
+
+    /// 桶 PUT 并记录 LocationConstraint(同事务,M8 回显语义)。
+    pub fn commit_bucket_put_with_location(
+        &self,
+        name: &str,
+        meta: &BucketMeta,
+        location: &str,
+    ) -> Result<u64> {
+        self.commit(&[Op::BucketPut {
+            name: name.to_string(),
+            meta: meta.clone(),
+            location: Some(location.to_string()),
+        }])
+    }
+
+    /// 读桶 LocationConstraint(未设置/旧桶 → "")。
+    pub fn bucket_location(&self, name: &str) -> Result<String> {
+        let v = self.db.get(bucket_location_key(name)).map_err(rocks_err)?;
+        Ok(v.map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default())
     }
 
     // —— 密钥加密种子盐(M3 密钥 CRUD;首次启动生成,持久化) ——
@@ -1055,11 +1080,21 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
 
     for op in ops {
         match op {
-            Op::BucketPut { name, meta } => {
+            Op::BucketPut {
+                name,
+                meta,
+                location,
+            } => {
                 let k = bucket_key(name);
                 // 读以建立冲突集(并发修改则重试)
                 tget(tx, &k)?;
                 tinsert(tx, k, encode(meta)?)?;
+                let lk = bucket_location_key(name);
+                tget(tx, &lk)?;
+                match location.as_deref() {
+                    Some(loc) => tinsert(tx, lk, loc.as_bytes().to_vec())?,
+                    None => tremove(tx, &lk)?,
+                }
             }
             Op::BucketDelete { name } => {
                 let k = bucket_key(name);
@@ -1067,6 +1102,7 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
                     return Err(Error::NotFound(format!("bucket {name}")));
                 }
                 tremove(tx, &k)?;
+                tremove(tx, &bucket_location_key(name))?;
             }
             Op::ObjectPut { bucket, key, meta } => {
                 if tget(tx, &bucket_key(bucket))?.is_none() {
@@ -1263,6 +1299,31 @@ mod tests {
         assert_eq!(s.list_buckets().unwrap().len(), 1);
         s.commit_bucket_delete("b1").unwrap();
         assert!(s.get_bucket("b1").unwrap().is_none());
+    }
+
+    #[test]
+    fn bucket_location_roundtrip() {
+        // M8:LocationConstraint 与桶同事务持久化 + 删除清理
+        let (_d, s) = open_tmp();
+        assert_eq!(s.bucket_location("b1").unwrap(), "", "无桶 → 默认空");
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        assert_eq!(
+            s.bucket_location("b1").unwrap(),
+            "",
+            "旧语义 PUT → 无 location"
+        );
+        s.commit_bucket_put_with_location("b1", &bucket_meta("b1"), "s3")
+            .unwrap();
+        assert_eq!(s.bucket_location("b1").unwrap(), "s3", "回显约束");
+        s.commit_bucket_put_with_location("b1", &bucket_meta("b1"), "")
+            .unwrap();
+        assert_eq!(s.bucket_location("b1").unwrap(), "", "清空约束");
+        s.commit_bucket_delete("b1").unwrap();
+        assert_eq!(
+            s.bucket_location("b1").unwrap(),
+            "",
+            "删除桶 → location 清理"
+        );
     }
 
     #[test]

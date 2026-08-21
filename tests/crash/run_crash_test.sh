@@ -42,7 +42,7 @@ fi
 echo "== FastS3 crash harness: rounds=$ROUNDS sync_mode=$SYNC_MODE =="
 echo "workdir: $WORK"
 
-"$BIN" init --device "$IMG" --size 512MiB >/dev/null || { echo "init failed"; exit 1; }
+"$BIN" init --device "$IMG" --size 512MiB --yes >/dev/null 2>&1 || { echo "init failed"; exit 1; }
 
 : > "$MANIFEST"
 FAILED=0

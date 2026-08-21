@@ -33,11 +33,15 @@ nav:
       - 迁移(MinIO/公有云): operations/migration.md
       - 性能调优: operations/tuning.md
       - 故障排查与 FAQ: operations/troubleshooting.md
+      - 安全基线与 CVE 响应: operations/security.md
   - 参考:
       - fasts3d 命令速查: reference/cli.md
       - admin API 参考: reference/admin-api.md
       - Node 管理 API 参考: reference/web-api.md
       - 错误码速查: reference/errors.md
+      - 兼容性矩阵: reference/compat.md
+  - 发布:
+      - v1.0.0 GA 公告: release/v1.0.0.md
   - Beta:
       - Beta 计划与反馈: beta/index.md
       - Beta 评审清单: beta/review.md

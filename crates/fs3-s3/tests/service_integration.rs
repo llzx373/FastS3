@@ -116,6 +116,33 @@ fn bucket_and_object_flow() {
     let r = svc.handle(&req("GET", "/bkt1", vec![]));
     assert!(status(&r) == 200);
 
+    // M8:LocationConstraint 回显语义(s3-tests test_bucket_get_location)
+    // 创建时带任意约束 → GetBucketLocation 原样回显(RGW/MinIO 兼容)
+    let xml = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>s3</LocationConstraint></CreateBucketConfiguration>".to_vec();
+    let r = svc.handle(&req("PUT", "/bkt-loc", xml));
+    assert_eq!(status(&r), 200, "{:?}", r);
+    let r = svc.handle(&req_q("GET", "/bkt-loc", &[("location", "")], vec![]));
+    let body = match r.unwrap().body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!("expected xml body"),
+    };
+    assert!(
+        body.contains("<LocationConstraint") && body.contains(">s3</LocationConstraint>"),
+        "expected echo: {body}"
+    );
+    // 无约束创建(us-east-1 默认)→ 空元素
+    let r = svc.handle(&req("PUT", "/bkt-none", vec![]));
+    assert_eq!(status(&r), 200, "{:?}", r);
+    let r = svc.handle(&req_q("GET", "/bkt-none", &[("location", "")], vec![]));
+    let body = match r.unwrap().body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!("expected xml body"),
+    };
+    assert!(
+        body.contains("<LocationConstraint") && body.contains("/>"),
+        "expected empty element: {body}"
+    );
+
     // PutObject(小 → 内联)
     let data = b"hello inline object".to_vec();
     let mut rq = req("PUT", "/bkt1/k1", data.clone());

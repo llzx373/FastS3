@@ -722,9 +722,10 @@ pub fn render_list_object_versions(
     );
     xml
 }
-/// GetBucketLocation 响应(us-east-1 返回空元素,与 AWS 一致)。
+/// GetBucketLocation 响应(us-east-1/无约束 返回空元素,与 AWS 一致;
+/// 显式约束回显——M8 兼容 s3-tests test_bucket_get_location)。
 pub fn render_location(region: &str) -> String {
-    if region == "us-east-1" {
+    if region.is_empty() || region == "us-east-1" {
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<LocationConstraint xmlns=\"{XMLNS}\"/>"
         )

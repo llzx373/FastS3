@@ -21,7 +21,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  FASTS3_VERSION: ""            # 留空=脚本默认;发布 tag 与包版本一致性由调用方保证
+  FASTS3_VERSION: ""            # 留空=读 Cargo.toml workspace 版本(M8 发布流水线复核:单一事实源)
 
 jobs:
   build-linux-amd64:

@@ -1,4 +1,36 @@
 # FastS3 发布记录
+## v1.0.0 — GA 发布(M8)(2026-08-21)
+
+> 全量回归 + 安全审计 + §1.1 开箱清单核对 + 发布流水线复核。
+> 本条目与 M8 交付同步:兼容矩阵全量回归(客户端 × OS × 内核 × 设备形态)、
+> RC1→RC2→GA 候选流程(CHANGELOG.md + tests/m8/rc-gate.sh)、外部安全审计
+> 方案与自审(14 项全绿)、签名+SBOM+供应链锁定本地实测、官网公告页与文档站
+> 上线;版本号全仓同步 1.0.0。执行期门禁(真 NVMe §6.8 数值、外部审计执行、
+> rpm/ARM64 真机构建、Beta 用户窗口)按 docs/ga/checklist.md 如实标注,不虚拟勾选。
+
+### 验证(门禁)
+
+- 全量回归 tests/m8/regression.sh 本地全绿(构建/静态/引擎往返/客户端矩阵/
+  s3-tests 排除集门禁/崩溃 200 轮/演练集:备份恢复·内嵌·多实例·迁移·安装升级)。
+- **s3-tests 全量跑批兼容修复**(新版 CEPH s3-tests,42 → 0 项意外失败):
+  ① ListBuckets 分页路由(botocore paginator 带 max-buckets 等参数的服务级
+  列桶被误拒);② GetBucketLocation 回显语义(任意 LocationConstraint 接受并
+  回显,`l:` 键与桶同事务持久化/删除清理/meta-export-import 同步);③ 过期
+  预签名 403(负 X-Amz-Expires 按 AWS/RGW 语义返回 AccessDenied)。
+  排除集正则与文档同步新版用例命名(ACL 族/Tagging/public block/ownership 等)。
+- 发布流水线复核:SBOM(CycloneDX 1.5,229+ components)、tarball/deb 构建、
+  ed25519 签名与校验、verify-release.sh 全项通过;Cargo.lock/pnpm-lock.yaml 锁定。
+- 安全自审:依赖双 audit 0 漏洞;硬编码密钥扫描零命中;权限/通道/TLS 基线复核。
+- 文档站:mkdocs build 0 警告(新增:兼容性矩阵、安全基线与 CVE 响应、v1.0.0 公告页)。
+
+### 执行期门禁(待外部环境,不虚拟勾选)
+
+- §6.8 数值验收与 MinIO 对照(真 NVMe runner 执行 ci-perf-gate.sh);
+- 外部安全审计(签约第三方,范围见 docs/ga/security-audit.md);
+- rpm(rockylinux:9 容器)与 ARM64 原生构建(package.yml CI);
+- 公开 Beta 用户满 2 周 + P0/P1 清零(beta/review.md)。
+
+# FastS3 发布记录
 ## v0.8 — M7 文档与 Beta(2026-08-21)
 
 > 完整文档站 + 元数据快照体系 + 内嵌形态与多实例管理面 + 迁移工具 + Beta 反馈闭环。

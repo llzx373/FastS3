@@ -1,0 +1,76 @@
+name: GA Regression (M8 兼容矩阵全量回归)
+
+# M8 GA 门禁回归:客户端 × OS × 内核 × 设备形态 的可自动执行部分。
+#   - PR / push main:快速回归(构建/静态门禁/引擎往返/客户端冒烟)
+#   - 每周 + 手动 + tag v1.0.0*:全量回归(含崩溃 200 轮与演练集)
+#   - 真机矩阵项(裸设备轴/rpm/ARM64/§6.8 数值)由 package.yml + perf.yml
+#     + NVMe runner 承担,见 tests/m8/README.md 矩阵表。
+
+on:
+  push:
+    branches: [main]
+    tags: ['v1.0.0*']
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 4 * * 1"   # 每周一 04:00 UTC 全量
+  workflow_dispatch:
+    inputs:
+      full:
+        description: "全量回归(true=含崩溃/演练/s3-tests)"
+        default: "false"
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  regression:
+    name: regression(${{ github.event_name }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked || true
+      - name: Build (release)
+        run: cargo build --release -p fs3d
+      - name: Setup clients (mc/rclone/aws)
+        run: |
+          mkdir -p /tmp/clients
+          curl -sL -o /tmp/clients/mc https://dl.min.io/client/mc/release/linux-amd64/mc && chmod +x /tmp/clients/mc || true
+          curl -sL -o /tmp/clients/rclone.zip https://downloads.rclone.org/rclone-current-linux-amd64.zip && unzip -q -o /tmp/clients/rclone.zip -d /tmp/clients && cp /tmp/clients/rclone-*/rclone /tmp/clients/ && chmod +x /tmp/clients/rclone || true
+          curl -sL -o /tmp/clients/awscliv2.zip https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip && unzip -q /tmp/clients/awscliv2.zip -d /tmp/clients && /tmp/clients/aws/install -i /tmp/clients/aws-install -b /tmp/clients/aws-bin >/dev/null 2>&1 || true
+          ln -sfn $(ls -d /tmp/clients/aws-install/v2/*/dist | head -1 | xargs basename | sed 's|.*/||') /tmp/clients/aws-install/v2/dist 2>/dev/null || true
+      - name: Clone s3-tests (gate 前置)
+        run: |
+          git clone --depth 1 https://github.com/ceph/s3-tests.git /tmp/s3-tests || true
+          pip install --user -q -r /tmp/s3-tests/requirements.txt 2>/dev/null || true
+      - name: Determin mode (PR=quick, schedule/manual/tag=full)
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ] || [ "${{ github.event_name }}" = "push" ]; then
+            echo "args=--quick" >> $GITHUB_OUTPUT
+          else
+            echo "args=" >> $GITHUB_OUTPUT
+          fi
+      - name: Run M8 regression
+        run: bash tests/m8/regression.sh ${{ steps.mode.outputs.args }} --rounds 200
+        env:
+          CLIENTS_DIR: /tmp/clients
+          S3TESTS_DIR: /tmp/s3-tests

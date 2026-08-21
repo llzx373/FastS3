@@ -13,7 +13,7 @@
 # 用法:
 #   ./build-deb.sh [outdir]
 # 环境变量:
-#   FASTS3_VERSION   版本号(默认 0.8.0)
+#   FASTS3_VERSION   版本号(默认读 Cargo.toml workspace version,单一事实源)
 #   FASTS3D / WEB_* / SBOM   透传给 build-tarball.sh
 #   MAINTAINER / HOMEPAGE / DESCRIPTION 覆盖 control 字段(默认 FastS3 Project)
 #   NO_FAKEROOT=1    非 root 时不尝试 fakeroot(直接提示)
@@ -25,7 +25,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 OUTDIR="${1:-$ROOT/tools/package/dist}"
-VERSION="${FASTS3_VERSION:-0.8.0}"
+WORKSPACE_VERSION="$(grep -m1 '^version' "$ROOT/Cargo.toml" | awk '{print $3}' | tr -d '"')"
+VERSION="${FASTS3_VERSION:-${WORKSPACE_VERSION:-0.0.0}}"
 
 # 架构映射:uname -m → Debian 架构
 case "$(uname -m)" in

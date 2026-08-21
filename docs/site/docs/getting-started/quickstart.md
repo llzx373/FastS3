@@ -26,9 +26,9 @@ curl -fsSL https://download.example.com/fasts3/install.sh | sh
 备选形态:
 
 ```bash
-# apt(本地/仓库形态):  sudo dpkg -i fasts3_0.8.0_amd64.deb
-# dnf(仓库形态):        sudo rpm -ivh fasts3-0.8.0-1.el9.x86_64.rpm
-# 容器:                 docker run ... fasts3:0.8.0(见 deployment/container.md)
+# apt(本地/仓库形态):  sudo dpkg -i fasts3_1.0.0_amd64.deb
+# dnf(仓库形态):        sudo rpm -ivh fasts3-1.0.0-1.el9.x86_64.rpm
+# 容器:                 docker run ... fasts3:1.0.0(见 deployment/container.md)
 ```
 
 ## 2) 初始化(init 向导,v0.7 已实现)

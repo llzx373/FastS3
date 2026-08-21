@@ -15,6 +15,8 @@
 use fs3_core::{Error, Result};
 
 pub const PREFIX_BUCKET: &[u8] = b"b:";
+/// 桶 LocationConstraint(M8 回显语义;键 `l:{bucket}`,值 UTF-8 字符串)。
+pub const PREFIX_BUCKET_LOC: &[u8] = b"l:";
 pub const PREFIX_OBJECT: &[u8] = b"o:";
 /// 分片上传会话(主键:`u:{uploadId}`,值 = MultipartSession)。
 pub const PREFIX_UPLOAD: &[u8] = b"u:";
@@ -83,6 +85,14 @@ pub fn unescape(esc: &[u8]) -> Result<Vec<u8>> {
 pub fn bucket_key(name: &str) -> Vec<u8> {
     let mut k = Vec::with_capacity(PREFIX_BUCKET.len() + name.len());
     k.extend_from_slice(PREFIX_BUCKET);
+    k.extend_from_slice(name.as_bytes());
+    k
+}
+
+/// 桶 LocationConstraint 键(`l:{bucket}`;桶名不含 0x00,无需转义)。
+pub fn bucket_location_key(name: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(PREFIX_BUCKET_LOC.len() + name.len());
+    k.extend_from_slice(PREFIX_BUCKET_LOC);
     k.extend_from_slice(name.as_bytes());
     k
 }

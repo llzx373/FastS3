@@ -1213,15 +1213,9 @@ impl S3Service {
         location: Option<&str>,
     ) -> Result<ServiceResponse, S3Error> {
         validate_bucket_name(bucket)?;
-        if let Some(loc) = location {
-            if !loc.is_empty() && loc != self.region {
-                return Err(S3Error::new(S3ErrorCode::IllegalLocationConstraintException)
-                    .with_message(format!(
-                        "The unspecified location constraint is incompatible for the region specific endpoint this request was sent to. (location: {loc}, region: {})",
-                        self.region
-                    )));
-            }
-        }
+        // M8/s3-tests:接受任意 LocationConstraint 并回显(RGW/MinIO 测试器语义;
+        // AWS:合法性校验仅对真实区域有意义;单机服务不做区域表)。无约束 = ""
+        // = us-east-1 默认语义,GetBucketLocation 返回空元素。
         let engine = self.engine.write();
         if engine
             .meta()
@@ -1241,7 +1235,7 @@ impl S3Service {
         };
         engine
             .meta()
-            .commit_bucket_put(bucket, &meta)
+            .commit_bucket_put_with_location(bucket, &meta, location.unwrap_or(""))
             .map_err(|e| map_engine_error(e, bucket, ""))?;
         Ok(ServiceResponse {
             status: 200,
@@ -1303,7 +1297,13 @@ impl S3Service {
         {
             return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
         }
-        let xml = xml::render_location(&self.region);
+        // M8:回显创建时的 LocationConstraint(RGW/MinIO 兼容语义;默认 "" =
+        // us-east-1 语义 → 空元素);旧桶(l: 键缺失)亦然。
+        let loc = engine
+            .meta()
+            .bucket_location(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        let xml = xml::render_location(&loc);
         Ok(ServiceResponse {
             status: 200,
             headers: vec![

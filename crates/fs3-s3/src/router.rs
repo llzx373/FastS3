@@ -231,13 +231,25 @@ impl Router {
         };
         let has_q = |name: &str| query.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
 
-        // 服务级:无桶
         let bucket = match bucket {
             None => {
-                // AWS SDK 系客户端(如 rclone 的 Go SDK)以 GET /?x-id=ListBuckets
-                // 调用服务级列表;x-id 为 SDK 内部标记,忽略其值。
-                let only_xid = query.iter().all(|(k, _)| k.eq_ignore_ascii_case("x-id"));
-                if method == "GET" && (query.is_empty() || only_xid) {
+                // 服务级:无桶。GET / 且 query 仅含 ListBuckets 参数
+                // (x-id 为 SDK 内部标记,忽略其值;prefix/marker/max-buckets/
+                // max-keys/continuation-token 为分页参数,M4 兼容)。
+                // botocore paginator 会带 max-buckets 等参数调用服务级列桶
+                // (M8/s3-tests test_list_buckets_paginated 修复)。
+                let list_q = [
+                    "x-id",
+                    "prefix",
+                    "marker",
+                    "max-buckets",
+                    "max-keys",
+                    "continuation-token",
+                ];
+                let only_list_q = query
+                    .iter()
+                    .all(|(k, _)| list_q.iter().any(|s| k.eq_ignore_ascii_case(s)));
+                if method == "GET" && only_list_q {
                     return Ok(Operation::ListBuckets);
                 }
                 return Err(
@@ -544,6 +556,20 @@ mod tests {
             )
             .unwrap();
         assert_eq!(op, Operation::ListBuckets);
+        // M8/s3-tests:botocore paginator 带分页参数的服务级列桶
+        // (test_list_buckets_paginated;params = x-id + max-buckets/marker/prefix)
+        for q in [
+            vec![("max-buckets".into(), "5".into())],
+            vec![
+                ("x-id".into(), "ListBuckets".into()),
+                ("max-buckets".into(), "5".into()),
+                ("marker".into(), "b2".into()),
+            ],
+            vec![("prefix".into(), "fasts3-".into())],
+        ] {
+            let op = r.route("GET", "localhost", "/", &q, b"").unwrap();
+            assert_eq!(op, Operation::ListBuckets, "query={q:?}");
+        }
         // 服务级其他查询仍拒绝(不是桶操作)
         let bad = r.route(
             "GET",

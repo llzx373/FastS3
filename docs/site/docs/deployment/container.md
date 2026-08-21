@@ -22,13 +22,13 @@
 ## 构建与运行
 
 ```bash
-docker build -f deploy/container/Dockerfile -t fasts3:0.8.0 .
+docker build -f deploy/container/Dockerfile -t fasts3:1.0.0 .
 docker run -d --name fasts3 \
   -p 9000:9000 -p 8080:8080 \
   -v "$(pwd)/data:/var/lib/fasts3" \
   -v "$(pwd)/fasts3.toml:/etc/fasts3/fasts3.toml:ro" \
   --ulimit memlock=-1:-1 \
-  fasts3:0.8.0
+  fasts3:1.0.0
 # 初始化(镜像文件): docker exec -it fasts3 fasts3d init \
 #   --config /etc/fasts3/fasts3.toml --device /var/lib/fasts3/disk.img --size 20GiB
 ```
@@ -75,7 +75,7 @@ tls_key  = "/etc/fasts3/tls/privkey.pem"
 
 ```bash
 docker run -d --name fasts3 -p 9000:9000 \
-  -v $PWD/data:/var/lib/fasts3 fasts3:0.8.0 \
+  -v $PWD/data:/var/lib/fasts3 fasts3:1.0.0 \
   ... --web-root /opt/fasts3/web/console/dist
 # 浏览器访问 http://host:9000/(大对象仍走预签名直连数据面)
 ```
@@ -84,9 +84,9 @@ docker run -d --name fasts3 -p 9000:9000 \
 
 ```bash
 # 换镜像标签即可,数据卷不动(N-1 原地升级保证):
-docker build -f deploy/container/Dockerfile -t fasts3:0.8.0 .
+docker build -f deploy/container/Dockerfile -t fasts3:1.0.0 .
 docker stop fasts3 && docker rm fasts3
-docker run -d --name fasts3 ... fasts3:0.8.0    # 同一组 -v 数据卷
+docker run -d --name fasts3 ... fasts3:1.0.0    # 同一组 -v 数据卷
 docker exec fasts3 fasts3d upgrade --config /etc/fasts3/fasts3.toml   # 布局迁移
 # 回滚:退回旧镜像标签;布局迁移失败自动回滚
 ```

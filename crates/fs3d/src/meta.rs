@@ -219,6 +219,9 @@ pub struct BucketDto {
     pub objects: u64,
     pub bytes: u64,
     pub quota: Option<u64>,
+    /// 创建时 LocationConstraint(M8 回显语义;旧导出无此字段 → 默认 "")。
+    #[serde(default)]
+    pub location: Option<String>,
 }
 
 /// 导出文件顶层结构。
@@ -291,12 +294,13 @@ pub fn run_meta_export(
         .list_buckets()?
         .into_iter()
         .map(|(name, m)| BucketDto {
-            name,
+            name: name.clone(),
             created: m.created,
             owner: m.owner,
             objects: m.stats.objects,
             bytes: m.stats.bytes,
             quota: m.quota,
+            location: Some(store.bucket_location(&name).unwrap_or_default()),
         })
         .collect();
 
@@ -438,7 +442,11 @@ pub fn run_meta_import(
             },
             quota: b.quota,
         };
-        store.commit_bucket_put(&b.name, &meta)?;
+        store.commit_bucket_put_with_location(
+            &b.name,
+            &meta,
+            &b.location.clone().unwrap_or_default(),
+        )?;
     }
 
     // 5) 访问密钥(secret_hash/salt/密文原样;种子盐已恢复,可解密)
