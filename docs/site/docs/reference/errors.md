@@ -32,7 +32,9 @@ AWS 客户端按规范映射。
 | `NoSuchUpload` | 404 | multipart 会话不存在/已中止 |
 | `InvalidPart` / `InvalidPartOrder` | 400 | 分片缺失或不按序 |
 | `EntityTooSmall` / `EntityTooLarge` | 400 | 分片 <5MiB / 对象超限 |
-| `InvalidRange` | 416 | Range 越界(带 `x-amz-actual-object-size`) |
+| `InvalidRange` | 416 | Range 越界(带 `x-amz-actual-object-size`;多段 Range → 206 multipart/byteranges) |
+| `XAmzContentSHA256Mismatch` | 400 | `x-amz-content-sha256` 声明与实际载荷不符(M9;BadDigest 仅用于 Content-MD5) |
+| `InvalidStorageClass` | 400 | `x-amz-storage-class` 非 STANDARD(M9 显式拒绝,不静默) |
 | `PreconditionFailed` | 412 | 条件头(If-Match 等)失败 |
 | `NotModified` | 304 | If-None-Match 命中 |
 | `NoSuchVersion` | 404 | `VersionId` 不存在(版本控制未启用) |
@@ -45,10 +47,10 @@ AWS 客户端按规范映射。
 | `SlowDown` | 503 | 限速/准入节流;恒带 `Retry-After: 5` |
 | `ServiceUnavailable` | 503 | 读时掉盘降级等 |
 | `QuotaExceeded` | 400 | 桶配额超限(admin 侧亦同码) |
-| `InvalidRequest` / `MalformedXML` / `MissingContentLength` / `IncompleteBody` | 400 | 请求/XML/体错误 |
-| `BadDigest` | 400 | Content-MD5 不符 |
+| `InvalidRequest` / `MalformedXML` / `MissingContentLength` / `IncompleteBody` | 400 | 请求/XML/体错误;DeleteObjects 键数 >1000 亦为 400(M9) |
+| `BadDigest` | 400 | Content-MD5 不符(Content-SHA256 不符用 `XAmzContentSHA256Mismatch`) |
 | `MethodNotAllowed` | 405 | 方法不支持 |
-| `NotImplemented` | 501 | 未实现特性(版本控制/加密等) |
+| `NotImplemented` | 501 | 未实现特性(版本控制/加密等);**携带 SSE/tagging/Object Lock/网站重定向等未实现头的请求显式拒绝(M9),不静默忽略** |
 
 ## 2. admin API 错误码(JSON)
 

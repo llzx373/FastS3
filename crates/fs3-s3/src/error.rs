@@ -90,6 +90,9 @@ pub enum S3ErrorCode {
     UnexpectedContent,
     UnresolvableGrantByEmailAddress,
     UserKeyMustBeSpecified,
+    /// `x-amz-content-sha256` 声明值与实际接收载荷不符(M9/B2;替代
+    /// BadDigest——BadDigest 保留给 Content-MD5 路径,与 AWS 一致)。
+    XAmzContentSHA256Mismatch,
 }
 
 impl S3ErrorCode {
@@ -180,6 +183,9 @@ impl S3ErrorCode {
             UnexpectedContent => "This request does not support content.",
             UnresolvableGrantByEmailAddress => "The email address you provided does not match any account on record.",
             UserKeyMustBeSpecified => "The bucket POST must contain the specified field name. If it is specified, check the order of the fields.",
+            XAmzContentSHA256Mismatch => {
+                "The provided 'x-amz-content-sha256' header does not match what was computed."
+            }
         }
     }
 

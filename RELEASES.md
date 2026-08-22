@@ -1,4 +1,38 @@
 # FastS3 发布记录
+## v1.0.1 — M9 协议卫生补丁(月度 patch 轨道)(2026-08-22)
+
+> 发布状态:本条目与 M9 交付同步(v1.0.0 GA 候选口径不变,见上条执行期
+> 门禁)。月度 patch 轨道聚焦「已支持功能行为对齐 AWS」,无新特性。
+
+### 变更(TODO M9 A~D 全项)
+
+- **头显式化(红线 6)**:SSE 家族/`x-amz-sse-kms-key-id`/`x-amz-tagging`/
+  Object Lock/网站重定向头 → 501 NotImplemented;`x-amz-storage-class` 非
+  STANDARD → 400 InvalidStorageClass——不再静默忽略(合规误判风险消除)。
+- **正确性契约(ADR-14)**:multipart 复合 ETag = `MD5(binary(分片 MD5 拼接))-N`
+  (AWS 标准;新写入生效,存量对象影响文档化);`x-amz-content-sha256` 不符 →
+  `XAmzContentSHA256Mismatch`;416 带 `x-amz-actual-object-size` 头;多段
+  Range → 206 multipart/byteranges(RFC 7233 合并/忽略语义)。
+- **列表与元数据**:`encoding-type=url`(V1/V2,特殊键名往返)、V2 `fetch-owner`
+  门控 Owner;unicode 元数据逐字节往返;Cache-Control/Expires/Content-Encoding
+  (去 aws-chunked)元数据化回显;ListParts/版本条目 Owner 统一输出;桶重建
+  语义(幂等 200 / 带 ACL 409 / 删除重建全新属性)。
+- **边界与语义**:DeleteObjects ≤1000 键(超限 400);预签名 X-Amz-Expires
+  >7 天 403;匿名+预签名流式 PUT 与缓冲统一;`x-amz-id-2` = 每请求 trace id;
+  无 CORS 时 OPTIONS 显式 400。
+- **数据面演进**:ObjectMeta/MultipartSession 尾部追加 resp_headers 字段,
+  双读兼容存量(零迁移);meta-export/import DTO 同步。
+
+### 验证(门禁)
+
+- `cargo test / clippy(-D warnings) / fmt` 全绿;cargo audit 0 漏洞;
+  新增 M9 单测/集成测试(逐头拒绝、复合 ETag 官方公式、多段 Range、
+  unicode/回显头往返、预签名流式 PUT、键数上限等)。
+- s3-tests 全量 gate 绿:②组关闭项从 EXCLUDE 移除(encoding/fetch-owner/
+  unicode 元数据/cache-control/expires/x-amz-expires/key-limit/重建语义/
+  content-encoding);保留项如实标注(条件写 → M10;multipart owner 用例 →
+  单账号模型限制)。
+
 ## v1.0.0 — GA 候选(M8)(2026-08-21)
 
 > **发布状态(REVIEW §3.9 口径统一)**:当前为 **GA 候选**,尚非正式 GA——

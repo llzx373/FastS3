@@ -304,6 +304,64 @@ B+ 树实现在超大对象数(风险 R5)下的扩展性未经验证。本 ADR �
   工程量大且引入 unsafe SIMD;当前标量交错仅在有大量独立小缓冲时与单缓冲打平。
 - **决策:保留 md5x4 原语(供未来批处理/校验路径),热路径按结论 2 用 etag=fast;
   防止把「多缓冲」误用为单对象 ETag 加速(物理不可行)写进文档**。
+
+#### ADR-14(M9 实现确认):multipart 复合 ETag 修复与多段 Range 契约
+
+**背景**:M9「协议卫生与正确性补丁」(TODO M9 B1/B4)修复两项「已支持功能与
+AWS 有差异」的正确性契约,均属兼容行为变更,按 ADR 纪律落盘
+(S3-GAP §3.7 #2/#3)。
+
+**结论 1 —— multipart 复合 ETag 改为 AWS 标准(二进制拼接)**:
+
+- **变更**:CompleteMultipartUpload 后对象 ETag = `MD5(binary(各 part MD5
+  摘要拼接))-"N"`(AWS 标准;此前为 hex 拼接后 MD5,与 AWS 不符,对账工具
+  会误判)。
+- **变更理由**:ETag 是 multipart 对账/重试/条件请求的正确性契约(S3-GAP
+  A 档 #1/#2);hex 拼接实现与 boto3/aws cli 上传产物的 ETag 不一致,跨
+  服务迁移校验(如 mc mirror --check)会误报。
+- **存量影响**:仅影响 **新写入的 multipart 对象**;存量对象保持 hex 拼接
+  ETag 不变(值格式未变,读取无需迁移)。ETag 为弱校验语义(客户端仅做
+  相等比较与 If-Match),新旧并存无功能性影响;升级后新 Complete 立即按
+  标准输出。
+- **实现**:`fs3-engine::complete_multipart` 拼接各 `PartMeta.etag` 二进制
+  字节后 MD5;`etag=fast`(ADR-10)模式同理(分片 ETag 为 CRC32C 时复合值
+  = MD5(二进制 CRC 值),契约不变)。
+- **验证**:s3-tests multipart 族全程通过;新增集成测试
+  `multipart_composite_etag_binary` 按官方公式逐位断言。
+
+**结论 2 —— 多段 Range 实现 206 multipart/byteranges(不再静默回整对象)**:
+
+- **变更**:`Range: bytes=0-0,4-5` 等多段请求返回 `206 multipart/byteranges`
+  (RFC 7233 边界帧 + 每段 Content-Range);此前静默回整对象(断点续传/
+  分段下载会拿到错数据)。
+- **语义细则(与 AWS/RFC 7233 对齐)**:单段保持 206 + Content-Range;
+  语法错误(无 `bytes=` 前缀、非数字)→ 400 InvalidArgument;不可满足段
+  忽略、其余段照常;全部不可满足(含空对象)→ 416 InvalidRange;重叠/
+  相邻段合并;多段合并后剩 1 段 → 普通单段 206(合法合并语义)。
+- **迁移声明**:响应形态由「200 整对象」变为「206 分块」,是正确性修复
+  (此前行为是缺陷);客户端按 Content-Range/206 处理即兼容,无需迁移。
+- **实现**:`parse_range_multi` 归一化 + `ResponseBody::MultiRange` 流式
+  渲染(HTTP 层逐段输出,零拷贝禁用;Content-Length 服务层精确计算)。
+- **验证**:单测 `range_header_parsing`/`multipart_range_length` + 集成测试
+  `multi_range_multipart_byteranges`。
+
+**附带登记(M9 其余行为声明/演进,非契约变更)**:
+
+- `x-amz-acl`/`x-amz-grant-*` 头在对象创建路径(建桶/PUT/CopyObject/
+  CreateMultipartUpload)**接受但不生效**(单账号模型,恒私有默认 ACL);
+  canned 值合法性显式校验,未知值 400 InvalidArgument——不静默忽略
+  (TODO M9 A1/C5;红线 6 的文档化声明)。
+- 桶「删除后重建」= 全新属性(AWS 语义);未删除的重复创建无 ACL 头 →
+  200 幂等 no-op、带 ACL 头 → 409 BucketAlreadyExists(s3-tests
+  recreate_overwrite/not_overriding 兼容;与原 BucketAlreadyOwnedByYou
+  行为差异为与测试器语义对齐,单账号模型下无歧义)。
+- ObjectMeta/MultipartSession 序列化尾部追加 `resp_headers` 字段
+  (Content-Encoding/Cache-Control/Expires 回显);值版本字节仍为 2,
+  解码实现「新格式优先、v1.0.0 格式回退」双读,存量值零迁移读取;
+  **回滚注意**:写入新格式对象后降级到 v1.0.0 二进制将无法解码该对象
+  (与 ADR-9 旧布局不前置兼容同例;升级通道由 N-1 自动回滚框架约束)。
+- `x-amz-id-2` 注入每请求 trace id(`{request-id}/{host-id}`,替代恒值
+  "fasts3";TODO M9 D4),错误 XML HostId 与响应头同源。
 ---
 
 ## 4. 存储引擎设计(Rust)

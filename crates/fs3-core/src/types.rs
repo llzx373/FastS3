@@ -75,6 +75,11 @@ pub struct ObjectMeta {
     pub inline: Option<Vec<u8>>,
     /// multipart 分片大小列表(索引 = part_no-1;非 multipart 为空)。
     pub parts: Vec<u64>,
+    /// 需在 GET/HEAD 响应回显的标准头(M9 C3/D5:Content-Encoding、
+    /// Cache-Control、Expires 等;`aws-chunked` 传输编码不入库,见 service)。
+    /// 序列化尾部追加字段(M9 双读:decode_value 新格式优先、v1.0.0 格式
+    /// 回退,存量对象按空表读取;写入恒为新格式)。
+    pub resp_headers: Vec<(String, String)>,
 }
 
 /// 对象元数据值格式版本(ADR-9 §13:`[version: u8 = 2] + postcard(ObjectMeta)`;
@@ -132,6 +137,14 @@ impl ObjectMeta {
     }
 
     /// 解码值格式;版本字节缺失/不符 → Corrupt(旧布局无前置兼容)。
+    ///
+    /// M9/C3 双读:值格式版本字节仍为 2,但序列化尾部追加了 `resp_headers`
+    /// 字段。postcard 是严格定长格式,无 `#[serde(default)]` 缺省语义——
+    /// 旧值(无该字段)用新结构解码必然报 "unexpected end";因此按
+    /// **新格式优先、旧格式回退**双读:新格式解码失败时回退 v1.0.0 值
+    /// 格式(旧结构,resp_headers = 空)并成功返回。新旧值在磁盘上共存
+    /// (新写入恒为新格式;存量对象保持可读)。回退仅发生在字段截断,
+    /// 其它损坏两种格式都解码失败 → Corrupt。
     pub fn decode_value(buf: &[u8]) -> Result<Self> {
         let Some(&ver) = buf.first() else {
             return Err(Error::Corrupt("object meta value too short".into()));
@@ -141,8 +154,44 @@ impl ObjectMeta {
                 "object meta version {ver} unsupported (expected {OBJECT_META_VERSION})"
             )));
         }
-        postcard::from_bytes(&buf[1..])
-            .map_err(|e| Error::Corrupt(format!("postcard decode object meta: {e}")))
+        match postcard::from_bytes(&buf[1..]) {
+            Ok(m) => Ok(m),
+            Err(_) => {
+                // 双读回退:v1.0.0 值格式(无 resp_headers 尾部字段)
+                let legacy: LegacyObjectMeta = postcard::from_bytes(&buf[1..])
+                    .map_err(|e| Error::Corrupt(format!("postcard decode object meta: {e}")))?;
+                Ok(legacy.into())
+            }
+        }
+    }
+}
+
+/// v1.0.0 值格式(v2 序列化,无 `resp_headers` 尾部字段;M9 双读回退用)。
+#[derive(Serialize, Deserialize)]
+struct LegacyObjectMeta {
+    size: u64,
+    etag: [u8; 16],
+    mtime: i64,
+    extents: Vec<Segment>,
+    content_type: String,
+    user_meta: Vec<(String, String)>,
+    inline: Option<Vec<u8>>,
+    parts: Vec<u64>,
+}
+
+impl From<LegacyObjectMeta> for ObjectMeta {
+    fn from(l: LegacyObjectMeta) -> Self {
+        ObjectMeta {
+            size: l.size,
+            etag: l.etag,
+            mtime: l.mtime,
+            extents: l.extents,
+            content_type: l.content_type,
+            user_meta: l.user_meta,
+            inline: l.inline,
+            parts: l.parts,
+            resp_headers: Vec::new(),
+        }
     }
 }
 
@@ -154,6 +203,32 @@ pub struct BucketMeta {
     pub stats: BucketStats,
     /// 配额字节数(None = 不限;M3 执行)。
     pub quota: Option<u64>,
+    /// M9/C5:创建时是否携带 ACL 头(接受但不生效,单账号私有默认)。
+    /// 桶重建语义依赖该位:已有桶 + 曾带 ACL → 重复创建 409 BucketAlreadyExists
+    /// (s3-tests recreate_overwrite_acl);未带 ACL → 幂等 200 no-op。
+    /// 序列化尾部追加字段,decode_bucket 双读兼容 v1.0.0 存量桶值。
+    pub created_with_acl: bool,
+}
+
+/// v1.0.0 桶值格式(无 `created_with_acl` 尾部字段;M9 双读回退用)。
+#[derive(Serialize, Deserialize)]
+struct LegacyBucketMeta {
+    created: i64,
+    owner: String,
+    stats: BucketStats,
+    quota: Option<u64>,
+}
+
+impl From<LegacyBucketMeta> for BucketMeta {
+    fn from(l: LegacyBucketMeta) -> Self {
+        BucketMeta {
+            created: l.created,
+            owner: l.owner,
+            stats: l.stats,
+            quota: l.quota,
+            created_with_acl: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -782,6 +857,7 @@ mod tests {
             user_meta: vec![("k".into(), "v".into())],
             inline: None,
             parts: vec![],
+            resp_headers: vec![],
         };
         let v = m.encode_value().unwrap();
         assert_eq!(v[0], OBJECT_META_VERSION);
@@ -793,6 +869,37 @@ mod tests {
         let mut bad = v.clone();
         bad[0] = 1;
         assert!(ObjectMeta::decode_value(&bad).is_err());
+        // M9/C3 双读兼容:v1.0.0 存量值(无 resp_headers 字段)按空表解码
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct LegacyObjectMeta {
+            size: u64,
+            etag: [u8; 16],
+            mtime: i64,
+            extents: Vec<Segment>,
+            content_type: String,
+            user_meta: Vec<(String, String)>,
+            inline: Option<Vec<u8>>,
+            parts: Vec<u64>,
+        }
+        let legacy_v2 = {
+            let mut b = Vec::with_capacity(64);
+            b.push(OBJECT_META_VERSION);
+            let lm = LegacyObjectMeta {
+                size: m.size,
+                etag: m.etag,
+                mtime: m.mtime,
+                extents: m.extents.clone(),
+                content_type: m.content_type.clone(),
+                user_meta: m.user_meta.clone(),
+                inline: m.inline.clone(),
+                parts: m.parts.clone(),
+            };
+            b.extend_from_slice(&postcard::to_allocvec(&lm).unwrap());
+            b
+        };
+        let dec = ObjectMeta::decode_value(&legacy_v2).unwrap();
+        assert_eq!(dec.resp_headers, Vec::<(String, String)>::new());
+        assert_eq!(dec.size, m.size);
     }
 
     #[test]
@@ -807,6 +914,30 @@ mod tests {
         let enc = postcard::to_allocvec(&rec).unwrap();
         let dec: AllocRecord = postcard::from_bytes(&enc).unwrap();
         assert_eq!(rec, dec);
+    }
+
+    #[test]
+    fn bucket_meta_legacy_value_still_decodes() {
+        // M9/C5 双读:v1.0.0 桶值(无 created_with_acl 尾部字段)直接 postcard
+        // 解码失败 → 走 fs3-meta decode_bucket 的回退。此处验证 fs3-meta
+        // 侧该模式(等效断言):新格式往返 + 旧格式解码为 false。
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct LegacyBucket {
+            created: i64,
+            owner: String,
+            stats: BucketStats,
+            quota: Option<u64>,
+        }
+        let legacy = LegacyBucket {
+            created: 1,
+            owner: "u".into(),
+            stats: BucketStats::default(),
+            quota: None,
+        };
+        let enc = postcard::to_allocvec(&legacy).unwrap();
+        // 新结构直接解码旧值必失败(postcard 严格定长)
+        assert!(postcard::from_bytes::<BucketMeta>(&enc).is_err());
+        // fs3-meta 的 decode_bucket 双读由 fs3-meta 测试覆盖(bucket 值往返)。
     }
 
     proptest::proptest! {

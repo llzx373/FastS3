@@ -1,6 +1,6 @@
 # docs/ga/rc-flow.md — RC1 → RC2 → GA 候选流程
 
-> TODO.md M8 交付②「RC1 → RC2 → GA 候选流程;CHANGELOG.md」。
+> [docs/archive/TODO-v1.0.0.md](./archive/TODO-v1.0.0.md) M8 交付②「RC1 → RC2 → GA 候选流程;CHANGELOG.md」。
 > 与 ROADMAP §7(版本与发布策略)、§8(验收总表 GA 列)对齐。
 > 执行入口脚本:`tests/m8/rc-gate.sh`(硬门禁逐项执行并生成处置记录)。
 

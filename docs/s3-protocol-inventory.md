@@ -134,28 +134,35 @@ AccessDenied、AccountProblem、AmbiguousGrantByEmailAddress、AuthorizationHead
 
 ## 7. 协议怪癖 / 企业客户端对接风险点
 
+> **M9(v1.0.1)修复状态**:下列 #2/#3/#4/#5/#10/#12 已修复(ADR-14 与
+> TODO M9 全项);#8/#11 已按 M9/D4 与文档化处理更新;#6/#7/#9/#1 维持
+> 远期/文档化。详见 [ADR-14](DESIGN.md §3.3)与 tests/s3-tests/README M9 记录。
+
 1. **NotImplemented 采用 501 + 标准 message**,但错误 message 是通用“A header you provided implies functionality...”(`error.rs:161`),路由层用 `.with_message` 覆盖为“subresource X is not implemented”,客户端若按 Code 文案判定会拿不到具体缺口名;且桶级子资源 501 与对象级 PUT ?acl 的 501 语义一致但触发点分散。
-2. **`x-amz-actual-object-size` 头 vs XML `ActualObjectSize` 不一致**:errors.md:111 称带该头,代码实际写进 XML extra(`service.rs:1693-1694`),依赖头判定的客户端会失败。
-3. **多段 Range 静默回整对象**(`service.rs:2471-2474`),而非 206 multipart/byteranges——依赖分片断点续传(range 合并)的下载工具可能出现数据量/语义偏差。
-4. **ETag 校验为 hex(md5),完整对象 ETag 无 `-N` multipart 后缀**——`etag_full()` 用于单体与 multipart 完成对象,multipart 完成对象的 ETag 不是标准 `md5-拼份数` 形式(`service.rs:1930,1937`),依赖 multipart ETag 对账的工具(如 rclone check)可能误判。
-5. **`x-amz-content-sha256` 不匹配报 `BadDigest` 而非 `XAmzContentSHA256Mismatch`**(`service.rs:1060-1061,1568`),AWS SDK 重试/归类依赖该码名的客户端可能不触发预期重试。
-6. **禁用密钥 = 从内存表移除 → InvalidAccessKeyId**,企业希望区分“禁用”与“不存在”时无法表达(无 `InvalidToken`/专属禁用语义)。
-7. **region/service 严格匹配**,任何 client 算出的非自配 region 都会被拒(`auth.rs:425-428`);未做 `s3-express`/新 service 容忍。
-8. **`host_id` 恒为 "fasts3"**(`handler.rs:248`),`x-amz-id-2` 不具备真实请求追踪价值(单点)。
-9. **DeleteObjects 无键数上限(1000)+ 无逐键条件版本语义**(README ②组/TODO 明确);`VersionId` 仅 null 接受。
-10. **SSE-C 头、storage-class、tagging 相关头完全静默忽略**(未进 user_meta,不报错),客户端上传带这些头会得到“静默未生效”而非标准报错/未启用提示,存在合规误判风险。
-11. **h2 下 SigV4 依赖合成 Host 头**(`handler.rs:328-331`),若客户端 SignedHeaders 不含 host 而签了 `:authority` 会签名不匹配。
-12. **流式 PUT 路径把认证从 `put_object_stream` 内重做**,并拒绝 Anonymous(`service.rs:1013`),而 buffered PUT 允许 Anonymous 走 UNSIGNED-PAYLOAD——匿名 + 大对象组合在不允许匿名时行为不一致(前者 AccessDenied,后者允许匿名语义由 require_auth 把关,`service.rs:1552-1553`)。
+2. **~~`x-amz-actual-object-size` 头 vs XML `ActualObjectSize` 不一致~~** — ✅ M9/B3 已修复:416 响应带 `x-amz-actual-object-size` 头(HTTP 层按 extra 注入),XML extra 保留为冗余兼容。
+3. **~~多段 Range 静默回整对象~~** — ✅ M9/B4 已修复:206 multipart/byteranges(RFC 7233 合并/忽略语义)。
+4. **~~multipart ETag 非标准~~** — ✅ M9/B1 已修复:Complete 后 ETag = `MD5(binary(分片 MD5 拼接))-N`;存量对象影响见 ADR-14。
+5. **~~`x-amz-content-sha256` 不匹配报 `BadDigest`~~** — ✅ M9/B2 已修复:报 `XAmzContentSHA256Mismatch`;BadDigest 仅用于 Content-MD5。
+6. **禁用密钥 = 从内存表移除 → InvalidAccessKeyId**,企业希望区分“禁用”与“不存在”时无法表达(无 `InvalidToken`/专属禁用语义)——维持远期(密钥状态语义)。
+7. **region/service 严格匹配**,任何 client 算出的非自配 region 都会被拒(`auth.rs:425-428`);未做 `s3-express`/新 service 容忍——维持文档化(单机产品合理)。
+8. **~~`host_id` 恒为 "fasts3"~~** — ✅ M9/D4 已修复:`x-amz-id-2 = {request-id}/{host-id}` 每请求唯一,错误 XML HostId 同源。h2 合成 Host 的签名局限(#11)维持文档化。
+9. **DeleteObjects 无键数上限(1000)+ 无逐键条件版本语义** — ✅ 上限已加(M9/D1,>1000 → 400);条件版本语义 🔜 M10。
+10. **~~SSE-C 头、storage-class、tagging 相关头完全静默忽略~~** — ✅ M9/A1 已修复:SSE 家族/tagging/Object Lock/网站重定向 → 501;storage-class 非 STANDARD → 400;ACL 头接受不生效(单账号声明)。
+11. **h2 下 SigV4 依赖合成 Host 头**(`handler.rs:328-331`),若客户端 SignedHeaders 不含 host 而签了 `:authority` 会签名不匹配——维持文档化(主流客户端兼容)。
+12. **~~流式 PUT 路径认证与缓冲 PUT 不一致~~** — ✅ M9/D3 已修复:header 认证缺席时回退 query(预签名)认证,匿名+流式与缓冲语义统一。
 
 ## 最优先缺口 Top10
 
-1. **SSE-C / SSE-S3 / 桶加密全套缺失**(路由/头/错误码路径均无)——`x-amz-server-side-encryption*` 静默忽略最危险。
-2. **x-amz-tagging / Object Tagging 缺失**(静默忽略,非 501)。
-3. **storage-class 缺失**(静默忽略,恒 STANDARD)。
-4. **`XAmzContentSHA256Mismatch`(及 checksum 族)**:现行 BadDigest 命名 + 无 CRC 校验头。
-5. **多段 Range 静默回整对象**(非 206 multipart)。
-6. **multipart ETag 非标准 `md5-拼份数` 形式**,破坏 rclone 等对账。
-7. **SigV2 完全不支持**(s3cmd 老客户端不可用)。
-8. **POST 表单预签名上传(POST policy)完全缺失**。
-9. **版本化写路径缺失**(?versioning PUT / ?versionId 寻址 / 删除标记)。
-10. **`x-amz-actual-object-size` 头缺失**(仅 XML extra),文档与实现不一致。
+> M9 修复状态:✅ 1/2/3/4/5/10 已按 TODO M9 关闭;**7/8/9(M10 版本化)、
+> SigV2、POST 表单** 维持路线图排期。
+
+1. **SSE-C / SSE-S3 / 桶加密全套缺失** — ✅ M9/A1 起显式 501 拒绝(不再静默);完整实现 🔜 v1.2(M11)。
+2. **x-amz-tagging / Object Tagging 缺失** — ✅ M9/A1 起显式 501;完整实现 🔜 v1.1(M10 S1)。
+3. **storage-class 缺失** — ✅ M9/A1 起非 STANDARD 显式 400 InvalidStorageClass;多存储类 🔜 远期。
+4. **~~`XAmzContentSHA256Mismatch`~~** — ✅ M9/B2 已修复;CRC 校验头族 🔜 v1.2。
+5. **~~多段 Range 静默回整对象~~** — ✅ M9/B4 已修复(206 multipart/byteranges)。
+6. **~~multipart ETag 非标准 `md5-拼份数` 形式~~** — ✅ M9/B1 已修复(AWS 二进制拼接)。
+7. **SigV2 完全不支持**(s3cmd 老客户端不可用)——维持(远期评估)。
+8. **POST 表单预签名上传(POST policy)完全缺失** —— 🔜 M10(S4)。
+9. **版本化写路径缺失**(?versioning PUT / ?versionId 寻址 / 删除标记) —— 🔜 M10。
+10. **~~`x-amz-actual-object-size` 头缺失~~** — ✅ M9/B3 已修复(416 带头)。

@@ -82,6 +82,10 @@ pub struct MultipartSession {
     /// CreateMultipartUpload 携带的 Content-Type(Complete 时落到对象上)。
     pub content_type: String,
     pub user_meta: Vec<(String, String)>,
+    /// Create 时携带的回显头(M9 C3/D5:Content-Encoding/Cache-Control/Expires;
+    /// Complete 时落到对象。序列化尾部追加字段,decode_session 双读兼容
+    /// v1.0.0 存量会话值)。
+    pub resp_headers: Vec<(String, String)>,
     pub created: i64,
     /// 已完成标记:二次 Complete 幂等返回;分片重传后清位(reactivate)。
     pub completed: bool,
@@ -105,12 +109,14 @@ impl MultipartSession {
         key: &str,
         content_type: &str,
         user_meta: Vec<(String, String)>,
+        resp_headers: Vec<(String, String)>,
     ) -> Self {
         MultipartSession {
             bucket: bucket.to_string(),
             key: key.to_string(),
             content_type: content_type.to_string(),
             user_meta,
+            resp_headers,
             created: now_ts(),
             completed: false,
             final_etag: [0u8; 16],
@@ -347,8 +353,66 @@ fn decode<T: serde::de::DeserializeOwned>(v: &[u8]) -> Result<T> {
     postcard::from_bytes(v).map_err(|e| Error::Corrupt(format!("postcard decode: {e}")))
 }
 
+/// M9/C3 双读:MultipartSession 值格式尾部追加 `resp_headers` 字段;
+/// 新格式优先,失败回退 v1.0.0 格式(空表),存量会话保持可读。
+fn decode_session(v: &[u8]) -> Result<MultipartSession> {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct LegacySession {
+        bucket: String,
+        key: String,
+        content_type: String,
+        user_meta: Vec<(String, String)>,
+        created: i64,
+        completed: bool,
+        final_etag: [u8; 16],
+        final_size: u64,
+        final_mtime: i64,
+    }
+    match postcard::from_bytes::<MultipartSession>(v) {
+        Ok(s) => Ok(s),
+        Err(_) => {
+            let legacy: LegacySession = postcard::from_bytes(v)
+                .map_err(|e| Error::Corrupt(format!("postcard decode session: {e}")))?;
+            Ok(MultipartSession {
+                bucket: legacy.bucket,
+                key: legacy.key,
+                content_type: legacy.content_type,
+                user_meta: legacy.user_meta,
+                resp_headers: Vec::new(),
+                created: legacy.created,
+                completed: legacy.completed,
+                final_etag: legacy.final_etag,
+                final_size: legacy.final_size,
+                final_mtime: legacy.final_mtime,
+            })
+        }
+    }
+}
+
 fn decode_bucket(v: &[u8]) -> Result<BucketMeta> {
-    decode(v).map_err(|e| Error::Corrupt(format!("bucket meta: {e}")))
+    // M9/C5 双读:桶值尾部追加 created_with_acl 字段;新格式优先,
+    // 失败回退 v1.0.0 格式(created_with_acl=false),存量桶零迁移读取。
+    match postcard::from_bytes::<BucketMeta>(v) {
+        Ok(m) => Ok(m),
+        Err(_) => {
+            #[derive(serde::Serialize, serde::Deserialize)]
+            struct LegacyBucket {
+                created: i64,
+                owner: String,
+                stats: fs3_core::BucketStats,
+                quota: Option<u64>,
+            }
+            let l: LegacyBucket =
+                postcard::from_bytes(v).map_err(|e| Error::Corrupt(format!("bucket meta: {e}")))?;
+            Ok(BucketMeta {
+                created: l.created,
+                owner: l.owner,
+                stats: l.stats,
+                quota: l.quota,
+                created_with_acl: false,
+            })
+        }
+    }
 }
 
 fn decode_object(v: &[u8]) -> Result<ObjectMeta> {
@@ -539,21 +603,23 @@ impl MetaStore {
             }
             // 条目化:键 → 输出条目。带 delimiter 时,键在 prefix 之后首个
             // delimiter 之前的段归组为公共前缀条目;键自身等于公共前缀
-            // (如 "boo/")或不含 delimiter 时,条目即键本身。
-            let entry: String = match delimiter {
+            // (如 "0/")时也按 **公共前缀** 输出——AWS/RGW 不把以 delimiter
+            // 结尾的键单独列为 Contents(s3-tests
+            // test_bucket_list_delimiter_not_skip_special)。
+            let (entry, is_prefix_entry): (String, bool) = match delimiter {
                 Some(d) if !d.is_empty() => {
                     let rest = &key[prefix.len().min(key.len())..];
                     match rest.find(d) {
-                        Some(i) if i + d.len() < rest.len() => {
+                        Some(i) => {
                             let mut c = String::with_capacity(prefix.len() + i + d.len());
                             c.push_str(prefix);
                             c.push_str(&rest[..i + d.len()]);
-                            c
+                            (c, true)
                         }
-                        _ => key.clone(),
+                        _ => (key.clone(), false),
                     }
                 }
-                _ => key.clone(),
+                _ => (key.clone(), false),
             };
             // 条目级严格大于游标:游标为公共前缀(如 "boo/")时,该组全部
             // 键(boo/bar、boo/baz/…)的条目 ≤ 游标,整组跳过 —— 与
@@ -571,10 +637,10 @@ impl MetaStore {
                 page.truncated = true;
                 break;
             }
-            if entry == key {
-                page.items.push((key, decode_object(&v)?));
-            } else {
+            if is_prefix_entry || entry != key {
                 page.common_prefixes.push(entry.clone());
+            } else {
+                page.items.push((key, decode_object(&v)?));
             }
             last_entry = Some(entry.clone());
             last_emitted = Some(entry);
@@ -915,7 +981,8 @@ impl MetaStore {
 
     pub fn get_multipart(&self, upload_id: &str) -> Result<Option<MultipartSession>> {
         match self.db.get(session_key(upload_id)).map_err(rocks_err)? {
-            Some(v) => Ok(Some(decode(&v)?)),
+            // M9/C3 双读(存量会话值无 resp_headers 尾部字段)
+            Some(v) => Ok(Some(decode_session(&v)?)),
             None => Ok(None),
         }
     }
@@ -1340,6 +1407,7 @@ mod tests {
             owner: name.to_string(),
             stats: BucketStats::default(),
             quota: None,
+            created_with_acl: false,
         }
     }
 
@@ -1353,6 +1421,7 @@ mod tests {
             user_meta: vec![],
             inline: None,
             parts: vec![],
+            resp_headers: vec![],
         }
     }
 
@@ -1731,8 +1800,11 @@ mod tests {
         }
         // multipart 分片也进入快照扫描(恢复可达性 + 压缩发现)
         let uid = "upload-1";
-        s.create_multipart(uid, &MultipartSession::new("b1", "big", "text/x", vec![]))
-            .unwrap();
+        s.create_multipart(
+            uid,
+            &MultipartSession::new("b1", "big", "text/x", vec![], vec![]),
+        )
+        .unwrap();
         let part = PartMeta {
             size: 100,
             etag: [1u8; 16],
@@ -1883,5 +1955,62 @@ mod tests {
         assert_eq!(p.common_prefixes, ["cquux/"]);
         assert_eq!(p.last_scanned.as_deref(), Some("cquux/"));
         assert!(!p.truncated);
+    }
+
+    #[test]
+    fn delimiter_key_equals_common_prefix_is_prefix() {
+        // M9/②组:test_bucket_list_delimiter_not_skip_special —— 键 "0/"
+        // (以 delimiter 结尾)不作为 Contents,按公共前缀归组;
+        // 键 "1999#"/"1999+" 等特殊字符键不得被跳过。
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        for k in ["0/", "0/1000", "0/1998", "1999", "1999#", "1999+", "2000"] {
+            s.commit_object_put(
+                "b1",
+                k,
+                &object_meta(1),
+                AllocDraft::default(),
+                StatsDelta::default(),
+            )
+            .unwrap();
+        }
+        let p = s
+            .list_objects_page("b1", "", Some("/"), None, 1000)
+            .unwrap();
+        let keys: Vec<String> = p.items.iter().map(|(k, _)| k.clone()).collect();
+        assert_eq!(keys, ["1999", "1999#", "1999+", "2000"]);
+        assert_eq!(p.common_prefixes, ["0/"]);
+        assert!(!p.truncated);
+    }
+
+    #[test]
+    fn bucket_legacy_value_dual_read() {
+        // M9/C5:v1.0.0 桶值(无 created_with_acl)经 decode_bucket 双读
+        // 解码为 false;新格式往返保持。
+        let (_d, s) = open_tmp();
+        #[derive(serde::Serialize)]
+        struct LegacyBucket {
+            created: i64,
+            owner: String,
+            stats: fs3_core::BucketStats,
+            quota: Option<u64>,
+        }
+        let legacy = LegacyBucket {
+            created: 1,
+            owner: "u".into(),
+            stats: fs3_core::BucketStats::default(),
+            quota: None,
+        };
+        s.db.put(bucket_key("b1"), postcard::to_allocvec(&legacy).unwrap())
+            .unwrap();
+        let m = s.get_bucket("b1").unwrap().unwrap();
+        assert!(!m.created_with_acl);
+        assert_eq!(m.owner, "u");
+        // 新格式往返
+        let mut m2 = m.clone();
+        m2.created_with_acl = true;
+        s.commit_bucket_put("b1", &m2).unwrap();
+        assert!(s.get_bucket("b1").unwrap().unwrap().created_with_acl);
+        assert_eq!(s.get_bucket("b1").unwrap().unwrap().owner, "u");
     }
 }

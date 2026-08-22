@@ -421,6 +421,7 @@ impl Engine {
             owner: "default".into(),
             stats: BucketStats::default(),
             quota: None,
+            created_with_acl: false,
         };
         self.meta.commit_bucket_put(name, &meta)?;
         Ok(())
@@ -486,7 +487,7 @@ impl Engine {
 
     /// 流式 PUT(便捷入口:默认无自定义头)。
     pub fn put(&mut self, bucket: &str, key: &str, reader: &mut dyn Read) -> Result<ObjectMeta> {
-        self.put_with_meta(bucket, key, reader, None, Vec::new())
+        self.put_with_meta(bucket, key, reader, None, Vec::new(), Vec::new())
     }
 
     /// PUT 全路径:先读前缀判定内联(E3);超过阈值走 extent 流水线。
@@ -500,6 +501,7 @@ impl Engine {
         reader: &mut dyn Read,
         content_type: Option<&str>,
         user_meta: Vec<(String, String)>,
+        resp_headers: Vec<(String, String)>,
     ) -> Result<ObjectMeta> {
         if self.meta.get_bucket(bucket)?.is_none() {
             return Err(Error::NotFound(format!("bucket {bucket}")));
@@ -542,6 +544,7 @@ impl Engine {
                 user_meta,
                 inline: Some(prefix),
                 parts: vec![],
+                resp_headers,
             };
             let mut draft = Staged::default();
             if !old_segments.is_empty() {
@@ -586,6 +589,7 @@ impl Engine {
             old_segments,
             content_type,
             user_meta,
+            resp_headers,
         });
         match result {
             Ok(meta) => {
@@ -610,6 +614,7 @@ impl Engine {
             old_segments,
             content_type,
             user_meta,
+            resp_headers,
         } = ctx;
         let mut draft = Staged::default();
         let (segments, size, etag) = match self.stream_to_extents(reader, &mut draft) {
@@ -633,6 +638,7 @@ impl Engine {
             user_meta,
             inline: None,
             parts: vec![],
+            resp_headers,
         };
 
         // 覆盖语义(ADR-9 §5.4):新段记账必须在旧段释放**之前**——开放 extent
@@ -1192,6 +1198,7 @@ impl Engine {
         key: &str,
         content_type: Option<&str>,
         user_meta: Vec<(String, String)>,
+        resp_headers: Vec<(String, String)>,
     ) -> Result<String> {
         if self.meta.get_bucket(bucket)?.is_none() {
             return Err(Error::NotFound(format!("bucket {bucket}")));
@@ -1204,6 +1211,7 @@ impl Engine {
             key,
             content_type.unwrap_or("application/octet-stream"),
             user_meta,
+            resp_headers,
         );
         self.meta.create_multipart(&upload_id, &session)?;
         Ok(upload_id)
@@ -1505,12 +1513,16 @@ impl Engine {
         // REVIEW §4.12:parts 向量按请求分片顺序紧凑排列(空洞分片号不占位),
         // 使 ETag-N 等于请求分片数(与 AWS 一致;此前按最大分片号补齐 0)。
         let part_sizes: Vec<u64> = combined.iter().map(|(_, p)| p.size).collect();
+        // M9/B1(ADR-14):复合 ETag = MD5(各分片 ETag **二进制** MD5 摘要拼接),
+        // 与 AWS 标准一致;此前 hex 拼接是错误实现(对账工具会误判)。
+        // 影响:仅新写入对象;存量对象 ETag 保持 hex 拼接语义不变(客户端弱
+        // ETag 用法不受影响),升级后新 Complete 立即按标准输出。
         let etag: [u8; 16] = {
-            let mut concat = String::new();
+            let mut concat = Vec::with_capacity(16 * combined.len());
             for (_, p) in &combined {
-                concat.push_str(&p.etag_hex());
+                concat.extend_from_slice(&p.etag);
             }
-            md5::Md5::digest(concat.as_bytes()).into()
+            md5::Md5::digest(&concat).into()
         };
         let mtime = now_ts();
 
@@ -1537,6 +1549,7 @@ impl Engine {
                     user_meta: session.user_meta.clone(),
                     inline: Some(data),
                     parts: part_sizes,
+                    resp_headers: session.resp_headers.clone(),
                 }
             } else if all_extent {
                 // 零数据搬运:段列表按序拼接(所有权从分片转移给对象;
@@ -1554,6 +1567,7 @@ impl Engine {
                     user_meta: session.user_meta.clone(),
                     inline: None,
                     parts: part_sizes,
+                    resp_headers: session.resp_headers.clone(),
                 }
             } else {
                 // 混合(小分片 + 大分片):数据路径组合(仅请求子集,REVIEW §4.12)
@@ -1580,6 +1594,7 @@ impl Engine {
                     user_meta: session.user_meta.clone(),
                     inline: None,
                     parts: part_sizes,
+                    resp_headers: session.resp_headers.clone(),
                 }
             };
 
@@ -1727,7 +1742,8 @@ impl Engine {
     // ─────────────────────────── CopyObject(F6,COW) ───────────────────────────
 
     /// 服务端复制:同设备 = 元数据操作(段级共享,零数据 I/O;ADR-9 §5.5)。
-    /// `REPLACE` 指令传新 content_type/user_meta;`COPY` 传 None(沿用源)。
+    /// `REPLACE` 指令传新 content_type/user_meta/resp_headers;`COPY` 传 None(沿用源)。
+    #[allow(clippy::too_many_arguments)]
     pub fn copy_object(
         &mut self,
         src_bucket: &str,
@@ -1736,6 +1752,7 @@ impl Engine {
         dst_key: &str,
         replace_content_type: Option<&str>,
         replace_user_meta: Option<&[(String, String)]>,
+        replace_resp_headers: Option<&[(String, String)]>,
     ) -> Result<ObjectMeta> {
         let src = self
             .meta
@@ -1750,6 +1767,9 @@ impl Engine {
         }
         if let Some(um) = replace_user_meta {
             meta.user_meta = um.to_vec();
+        }
+        if let Some(rh) = replace_resp_headers {
+            meta.resp_headers = rh.to_vec();
         }
         let mut draft = Staged::default();
         // 源为内联 → 数据拷贝进新内联;否则共享段列表(稀疏共享表)
@@ -1894,6 +1914,7 @@ impl Engine {
             owner: "admin".into(),
             stats: BucketStats::default(),
             quota,
+            created_with_acl: false,
         };
         self.meta.commit_bucket_put(name, &meta)?;
         Ok(())
@@ -2012,6 +2033,7 @@ struct PutCtx<'a> {
     old_segments: Vec<Segment>,
     content_type: Option<&'a str>,
     user_meta: Vec<(String, String)>,
+    resp_headers: Vec<(String, String)>,
 }
 
 /// 前缀 + 原 reader 拼接(内联判定后的流续接)。

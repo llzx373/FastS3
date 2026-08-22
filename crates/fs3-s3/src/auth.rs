@@ -18,6 +18,8 @@ pub const SERVICE: &str = "s3";
 pub const ALGORITHM: &str = "AWS4-HMAC-SHA256";
 /// 时间容差(±15 分钟)。
 pub const MAX_SKEW: Duration = Duration::from_secs(15 * 60);
+/// 预签名有效期上限(7 天 = 604800s;M9/D2 越界即拒)。
+pub const WEEK_SECS: i64 = 7 * 24 * 60 * 60;
 
 #[derive(Debug, Clone)]
 pub struct Credentials {
@@ -499,9 +501,12 @@ impl Authenticator {
                 // 过期检查:now 在 [date, date+expires] 之外 → 拒绝
                 // (M8/s3-tests:负数 ExpiresIn 生成 X-Amz-Expires=-1000,
                 // AWS/RGW 语义 = 已过期 → 403 AccessDenied,而非 400)
+                // M9/D2:`X-Amz-Expires` 越界(>7 天 = 604800s)同样按已过期
+                // 403 拒绝(s3-tests raw-get 越界族断言 403;与 AWS 预签名
+                // 边界语义一致)。
                 let issued = parse_amz_datetime(&amz_date)?;
                 let now = self.now();
-                if expires < 0
+                if !(0..=WEEK_SECS).contains(&expires)
                     || now.duration_since(issued).unwrap_or_default()
                         > Duration::from_secs(expires as u64)
                 {

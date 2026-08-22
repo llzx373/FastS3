@@ -77,6 +77,10 @@ pub struct ObjectDto {
     /// 内联小对象数据(base64;导出时 ≤ small_object_limit 才可能非空)。
     pub inline_b64: Option<String>,
     pub parts: Vec<u64>,
+    /// 回显头(M9 C3/D5:Content-Encoding/Cache-Control/Expires;v1.0.0
+    /// 存量导出 JSON 无此字段 → 按空表导入)。
+    #[serde(default)]
+    pub resp_headers: Vec<(String, String)>,
 }
 
 impl ObjectDto {
@@ -88,6 +92,7 @@ impl ObjectDto {
             extents: m.extents.iter().map(SegmentDto::from).collect(),
             content_type: m.content_type.clone(),
             user_meta: m.user_meta.clone(),
+            resp_headers: m.resp_headers.clone(),
             inline_b64: m
                 .inline
                 .as_ref()
@@ -113,6 +118,7 @@ impl ObjectDto {
             extents: self.extents.iter().map(SegmentDto::to_segment).collect(),
             content_type: self.content_type.clone(),
             user_meta: self.user_meta.clone(),
+            resp_headers: self.resp_headers.clone(),
             inline,
             parts: self.parts.clone(),
         })
@@ -170,6 +176,9 @@ pub struct UploadDto {
     pub key: String,
     pub content_type: String,
     pub user_meta: Vec<(String, String)>,
+    /// 回显头(M9/C3;v1.0.0 存量导出 JSON 无此字段 → 按空表导入)。
+    #[serde(default)]
+    pub resp_headers: Vec<(String, String)>,
     pub created: i64,
     pub completed: bool,
     pub final_etag_hex: String,
@@ -190,6 +199,7 @@ impl UploadDto {
             key: s.key.clone(),
             content_type: s.content_type.clone(),
             user_meta: s.user_meta.clone(),
+            resp_headers: s.resp_headers.clone(),
             created: s.created,
             completed: s.completed,
             final_etag_hex: s.final_etag.iter().map(|b| format!("{b:02x}")).collect(),
@@ -222,6 +232,9 @@ pub struct BucketDto {
     /// 创建时 LocationConstraint(M8 回显语义;旧导出无此字段 → 默认 "")。
     #[serde(default)]
     pub location: Option<String>,
+    /// M9/C5:创建时是否带 ACL 头(重建语义;旧导出无此字段 → false)。
+    #[serde(default)]
+    pub created_with_acl: bool,
 }
 
 /// 导出文件顶层结构。
@@ -301,6 +314,7 @@ pub fn run_meta_export(
             bytes: m.stats.bytes,
             quota: m.quota,
             location: Some(store.bucket_location(&name).unwrap_or_default()),
+            created_with_acl: m.created_with_acl,
         })
         .collect();
 
@@ -441,6 +455,7 @@ pub fn run_meta_import(
                 bytes: b.bytes,
             },
             quota: b.quota,
+            created_with_acl: b.created_with_acl,
         };
         store.commit_bucket_put_with_location(
             &b.name,
@@ -491,6 +506,7 @@ pub fn run_meta_import(
             key: u.key.clone(),
             content_type: u.content_type.clone(),
             user_meta: u.user_meta.clone(),
+            resp_headers: u.resp_headers.clone(),
             created: u.created,
             completed: u.completed,
             final_etag: hex_to_etag(&u.final_etag_hex)?,

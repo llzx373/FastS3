@@ -310,6 +310,7 @@ pub fn render_list_parts(
     parts: &[(u32, u64, String, i64)],
     is_truncated: bool,
     next_part_number_marker: Option<u32>,
+    owner: &str,
 ) -> String {
     let mut xml = String::with_capacity(1024);
     let _ = write!(
@@ -320,6 +321,16 @@ pub fn render_list_parts(
         escape_xml(key)
     );
     let _ = write!(xml, "<UploadId>{}</UploadId>", escape_xml(upload_id));
+    // M9/C4:Initiator/Owner 统一输出(单账号模型;与 ListMultipartUploads 同源)
+    let _ = write!(
+        xml,
+        "<Initiator><ID>{}</ID><DisplayName>{}</DisplayName></Initiator>\
+         <Owner><ID>{}</ID><DisplayName>{}</DisplayName></Owner>",
+        escape_xml(owner),
+        escape_xml(owner),
+        escape_xml(owner),
+        escape_xml(owner)
+    );
     if let Some(m) = part_number_marker {
         let _ = write!(xml, "<PartNumberMarker>{m}</PartNumberMarker>");
     } else {
@@ -545,20 +556,57 @@ pub fn render_list_buckets(
     xml
 }
 
-/// 对象列表项(Contents 元素;含 Owner,与 AWS ListObjectsV1 一致)。
-fn render_contents(xml: &mut String, owner: &str, key: &str, meta: &ObjectMeta) {
+/// 对象列表项(Contents 元素;V1 恒带 Owner;V2 按 fetch-owner 门控,
+/// M9/C1/C4 与 AWS 一致:默认缺省、请求 fetch-owner=true 才输出)。
+fn render_contents(
+    xml: &mut String,
+    owner: &str,
+    key: &str,
+    meta: &ObjectMeta,
+    include_owner: bool,
+) {
     let _ = write!(
         xml,
         "<Contents><Key>{}</Key><LastModified>{}</LastModified><ETag>&quot;{}&quot;</ETag>\
-         <Size>{}</Size><StorageClass>STANDARD</StorageClass>\
-         <Owner><ID>{}</ID><DisplayName>{}</DisplayName></Owner></Contents>",
+         <Size>{}</Size><StorageClass>STANDARD</StorageClass>",
         escape_xml(key),
         ts_to_rfc3339(meta.mtime),
         meta.etag_full(),
-        meta.size,
-        escape_xml(owner),
-        escape_xml(owner)
+        meta.size
     );
+    if include_owner {
+        let _ = write!(
+            xml,
+            "<Owner><ID>{}</ID><DisplayName>{}</DisplayName></Owner>",
+            escape_xml(owner),
+            escape_xml(owner)
+        );
+    }
+    xml.push_str("</Contents>");
+}
+
+/// encoding-type=url 时按 AWS 语义编码键/前缀/游标(AWS 保留 `/`,编码
+/// 其余非无条件字符;与 SigV4 uri_encode 一致但 `/` 例外——s3-tests
+/// test_bucket_list_encoding_basic 断言 `foo%2B1/` 形态)。
+fn url_encode_key(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// 列表响应值按 encoding-type 统一编码(None = 原样)。
+fn enc<'a>(encoding: Option<&str>, s: &'a str) -> std::borrow::Cow<'a, str> {
+    match encoding {
+        Some("url") => std::borrow::Cow::Owned(url_encode_key(s)),
+        _ => std::borrow::Cow::Borrowed(s),
+    }
 }
 
 /// ListObjects V1 响应。
@@ -574,6 +622,7 @@ pub fn render_list_objects_v1(
     common_prefixes: &[String],
     truncated: bool,
     next_marker: Option<&str>,
+    encoding_type: Option<&str>,
 ) -> String {
     let mut xml = String::with_capacity(1024);
     let _ = write!(
@@ -582,26 +631,44 @@ pub fn render_list_objects_v1(
          <Name>{}</Name><Prefix>{}</Prefix><Marker>{}</Marker><MaxKeys>{}</MaxKeys>\
          <IsTruncated>{}</IsTruncated>",
         escape_xml(bucket),
+        // M9/C1 兼容修正:botocore 对 ListObjects(V1)的 after-call 解码列表
+        // **不含 Prefix/Marker**(仅 Delimiter/Marker/NextMarker/Contents Key/
+        // CommonPrefixes);encoding-type=url 由 botocore 自动置位时,Prefix
+        // 若编码回显客户端将拿到 '%0A' 形态 —— 故 V1 的 Prefix/Marker 回显
+        // 保持原文(与旧实现一致),其余元素按 url 编码(s3-tests
+        // prefix_unreadable/encoding_basic 双通过)。
         escape_xml(prefix),
         escape_xml(marker),
         max_keys,
         if truncated { "true" } else { "false" }
     );
+    if encoding_type == Some("url") {
+        let _ = write!(xml, "<EncodingType>url</EncodingType>");
+    }
     for (key, meta) in items {
-        render_contents(&mut xml, owner, key, meta);
+        let k = enc(encoding_type, key);
+        render_contents(&mut xml, owner, &k, meta, true);
     }
     if let Some(nm) = next_marker {
-        let _ = write!(xml, "<NextMarker>{}</NextMarker>", escape_xml(nm));
+        let _ = write!(
+            xml,
+            "<NextMarker>{}</NextMarker>",
+            escape_xml(&enc(encoding_type, nm))
+        );
     }
     for cp in common_prefixes {
         let _ = write!(
             xml,
             "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
-            escape_xml(cp)
+            escape_xml(&enc(encoding_type, cp))
         );
     }
     if let Some(d) = delimiter {
-        let _ = write!(xml, "<Delimiter>{}</Delimiter>", escape_xml(d));
+        let _ = write!(
+            xml,
+            "<Delimiter>{}</Delimiter>",
+            escape_xml(&enc(encoding_type, d))
+        );
     }
     xml.push_str("</ListBucketResult>");
     xml
@@ -622,6 +689,8 @@ pub fn render_list_objects_v2(
     truncated: bool,
     next_continuation: Option<&str>,
     key_count: usize,
+    fetch_owner: bool,
+    encoding_type: Option<&str>,
 ) -> String {
     let mut xml = String::with_capacity(1024);
     let _ = write!(
@@ -630,40 +699,52 @@ pub fn render_list_objects_v2(
          <Name>{}</Name><Prefix>{}</Prefix><KeyCount>{}</KeyCount><MaxKeys>{}</MaxKeys>\
          <IsTruncated>{}</IsTruncated>",
         escape_xml(bucket),
-        escape_xml(prefix),
+        escape_xml(&enc(encoding_type, prefix)),
         key_count,
         max_keys,
         if truncated { "true" } else { "false" }
     );
+    if encoding_type == Some("url") {
+        let _ = write!(xml, "<EncodingType>url</EncodingType>");
+    }
     if let Some(c) = continuation {
         let _ = write!(
             xml,
             "<ContinuationToken>{}</ContinuationToken>",
-            escape_xml(c)
+            escape_xml(&enc(encoding_type, c))
         );
     }
     if let Some(sa) = start_after {
-        let _ = write!(xml, "<StartAfter>{}</StartAfter>", escape_xml(sa));
+        let _ = write!(
+            xml,
+            "<StartAfter>{}</StartAfter>",
+            escape_xml(&enc(encoding_type, sa))
+        );
     }
     for (key, meta) in items {
-        render_contents(&mut xml, owner, key, meta);
+        let k = enc(encoding_type, key);
+        render_contents(&mut xml, owner, &k, meta, fetch_owner);
     }
     if let Some(nc) = next_continuation {
         let _ = write!(
             xml,
             "<NextContinuationToken>{}</NextContinuationToken>",
-            escape_xml(nc)
+            escape_xml(&enc(encoding_type, nc))
         );
     }
     for cp in common_prefixes {
         let _ = write!(
             xml,
             "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
-            escape_xml(cp)
+            escape_xml(&enc(encoding_type, cp))
         );
     }
     if let Some(d) = delimiter {
-        let _ = write!(xml, "<Delimiter>{}</Delimiter>", escape_xml(d));
+        let _ = write!(
+            xml,
+            "<Delimiter>{}</Delimiter>",
+            escape_xml(&enc(encoding_type, d))
+        );
     }
     xml.push_str("</ListBucketResult>");
     xml
@@ -682,6 +763,7 @@ pub fn render_list_object_versions(
     max_keys: u32,
     items: &[(String, ObjectMeta)],
     truncated: bool,
+    owner: &str,
 ) -> String {
     let mut xml = String::with_capacity(1024);
     let _ = write!(
@@ -699,11 +781,14 @@ pub fn render_list_object_versions(
             xml,
             "<Version><Key>{}</Key><VersionId>null</VersionId><IsLatest>true</IsLatest>\
              <LastModified>{}</LastModified><ETag>&quot;{}&quot;</ETag><Size>{}</Size>\
-             <StorageClass>STANDARD</StorageClass></Version>",
+             <StorageClass>STANDARD</StorageClass>\
+             <Owner><ID>{}</ID><DisplayName>{}</DisplayName></Owner></Version>",
             escape_xml(key),
             ts_to_rfc3339(meta.mtime),
             meta.etag_full(),
-            meta.size
+            meta.size,
+            escape_xml(owner),
+            escape_xml(owner)
         );
     }
     if truncated {
@@ -852,6 +937,7 @@ mod tests {
             owner: "u".into(),
             stats: Default::default(),
             quota: None,
+            created_with_acl: false,
         };
         let xml = render_list_buckets("owner1", &[("b1".into(), meta)], false, None);
         assert!(xml.contains(
@@ -872,7 +958,9 @@ mod tests {
             user_meta: vec![],
             inline: None,
             parts: vec![],
+            resp_headers: vec![],
         };
+        // fetch-owner=true → Contents 带 Owner
         let xml = render_list_objects_v2(
             "owner1",
             "b1",
@@ -881,11 +969,13 @@ mod tests {
             None,
             1000,
             None,
-            &[("pre/a.txt".into(), meta)],
+            &[("pre/a.txt".into(), meta.clone())],
             &[],
             true,
             Some("next"),
             1,
+            true,
+            None,
         );
         assert!(xml.contains("<IsTruncated>true</IsTruncated>"));
         assert!(xml.contains("<Key>pre/a.txt</Key>"));
@@ -893,6 +983,24 @@ mod tests {
         assert!(xml.contains("<NextContinuationToken>next</NextContinuationToken>"));
         assert!(xml.contains("<KeyCount>1</KeyCount>"));
         assert!(xml.contains("<Owner><ID>owner1</ID><DisplayName>owner1</DisplayName></Owner>"));
+        // M9/C1:fetch-owner 缺省 → 无 Owner 元素
+        let xml_no_owner = render_list_objects_v2(
+            "owner1",
+            "b1",
+            "pre",
+            None,
+            None,
+            1000,
+            None,
+            &[("pre/a.txt".into(), meta)],
+            &[],
+            false,
+            None,
+            1,
+            false,
+            None,
+        );
+        assert!(!xml_no_owner.contains("<Owner>"));
     }
 
     #[test]
@@ -910,6 +1018,8 @@ mod tests {
             false,
             None,
             0,
+            false,
+            None,
         );
         assert!(xml.contains("<StartAfter>bar</StartAfter>"));
         let xml = render_list_objects_v2(
@@ -925,8 +1035,79 @@ mod tests {
             false,
             None,
             0,
+            false,
+            None,
         );
         assert!(!xml.contains("<StartAfter>"));
+    }
+
+    #[test]
+    fn list_objects_encoding_url() {
+        // M9/C1:encoding-type=url — '/' 保留,其余特殊字符 %XX 编码
+        let meta = ObjectMeta {
+            size: 0,
+            etag: [0u8; 16],
+            mtime: 0,
+            extents: vec![],
+            content_type: "application/octet-stream".into(),
+            user_meta: vec![],
+            inline: None,
+            parts: vec![],
+            resp_headers: vec![],
+        };
+        let xml = render_list_objects_v2(
+            "o",
+            "b1",
+            "foo+1/",
+            None,
+            None,
+            1000,
+            Some("/"),
+            &[("asdf+b".into(), meta)],
+            &["foo+1/".into(), "quux ab/".into()],
+            false,
+            None,
+            3,
+            false,
+            Some("url"),
+        );
+        assert!(xml.contains("<EncodingType>url</EncodingType>"));
+        assert!(xml.contains("<Key>asdf%2Bb</Key>"));
+        assert!(xml.contains("<Prefix>foo%2B1/</Prefix>"));
+        assert!(xml.contains("<CommonPrefixes><Prefix>quux%20ab/</Prefix></CommonPrefixes>"));
+        assert!(xml.contains("<Delimiter>/</Delimiter>"));
+        // 未请求编码 → 原样
+        let xml2 = render_list_objects_v2(
+            "o",
+            "b1",
+            "foo+1/",
+            None,
+            None,
+            1000,
+            Some("/"),
+            &[(
+                "asdf+b".into(),
+                ObjectMeta {
+                    size: 0,
+                    etag: [0u8; 16],
+                    mtime: 0,
+                    extents: vec![],
+                    content_type: "application/octet-stream".into(),
+                    user_meta: vec![],
+                    inline: None,
+                    parts: vec![],
+                    resp_headers: vec![],
+                },
+            )],
+            &[],
+            false,
+            None,
+            1,
+            false,
+            None,
+        );
+        assert!(!xml2.contains("<EncodingType>"));
+        assert!(xml2.contains("<Key>asdf+b</Key>"));
     }
 
     #[test]
@@ -952,11 +1133,12 @@ mod tests {
                     user_meta: vec![],
                     inline: None,
                     parts: vec![],
+                    resp_headers: vec![],
                 },
             )
         };
         // 截断页:每个对象一个 Version 条目,VersionId=null,IsLatest=true
-        let xml = render_list_object_versions("b1", "", "", 1, &[mk("a.txt", 5)], true);
+        let xml = render_list_object_versions("b1", "", "", 1, &[mk("a.txt", 5)], true, "o1");
         assert!(xml.contains("<Name>b1</Name>"));
         assert!(xml.contains("<MaxKeys>1</MaxKeys>"));
         assert!(xml.contains("<IsTruncated>true</IsTruncated>"));
@@ -964,15 +1146,17 @@ mod tests {
             "<Version><Key>a.txt</Key><VersionId>null</VersionId><IsLatest>true</IsLatest>"
         ));
         assert!(xml.contains("<Size>5</Size>"));
+        // M9/C4:Version 条目带 Owner(单账号模型统一输出)
+        assert!(xml.contains("<Owner><ID>o1</ID><DisplayName>o1</DisplayName></Owner>"));
         assert!(xml.contains(
             "<NextKeyMarker>a.txt</NextKeyMarker><NextVersionIdMarker>null</NextVersionIdMarker>"
         ));
         // 未截断页:不输出 NextKeyMarker
-        let xml2 = render_list_object_versions("b1", "", "", 1000, &[mk("a.txt", 5)], false);
+        let xml2 = render_list_object_versions("b1", "", "", 1000, &[mk("a.txt", 5)], false, "o1");
         assert!(xml2.contains("<IsTruncated>false</IsTruncated>"));
         assert!(!xml2.contains("<NextKeyMarker>"));
         // prefix / key-marker 回显
-        let xml3 = render_list_object_versions("b1", "pre/", "pre/m", 1000, &[], false);
+        let xml3 = render_list_object_versions("b1", "pre/", "pre/m", 1000, &[], false, "o1");
         assert!(xml3.contains("<Prefix>pre/</Prefix>"));
         assert!(xml3.contains("<KeyMarker>pre/m</KeyMarker>"));
     }

@@ -43,6 +43,8 @@ pub enum Operation {
         marker: String,
         max_keys: u32,
         delimiter: Option<String>,
+        /// M9/C1:`encoding-type=url` 时响应键/前缀/分页游标 URL 编码。
+        encoding_type: Option<String>,
     },
     ListObjectsV2 {
         bucket: String,
@@ -51,6 +53,10 @@ pub enum Operation {
         start_after: Option<String>,
         max_keys: u32,
         delimiter: Option<String>,
+        /// M9/C1:`fetch-owner=true` 时 Contents 携带 Owner 元素(默认缺省)。
+        fetch_owner: bool,
+        /// M9/C1:`encoding-type=url` 时响应键/前缀/分页游标 URL 编码。
+        encoding_type: Option<String>,
     },
     // —— 复制(F6)/分片复制 ——
     CopyObject {
@@ -300,6 +306,9 @@ impl Router {
                     max_keys: parse_max_keys(get_q("max-keys").as_deref())?,
                     // 空 delimiter 视为未提供(AWS:响应不回显 Delimiter)
                     delimiter: get_q("delimiter").filter(|d| !d.is_empty()),
+                    // M9/C1:fetch-owner=true 才输出 Owner 元素(默认 false)
+                    fetch_owner: get_q("fetch-owner").as_deref() == Some("true"),
+                    encoding_type: get_q("encoding-type").filter(|s| !s.is_empty()),
                 });
             }
             if has_q("delete") {
@@ -379,6 +388,7 @@ impl Router {
                     max_keys: parse_max_keys(get_q("max-keys").as_deref())?,
                     // 空 delimiter 视为未提供(AWS:响应不回显 Delimiter)
                     delimiter: get_q("delimiter").filter(|d| !d.is_empty()),
+                    encoding_type: get_q("encoding-type").filter(|s| !s.is_empty()),
                 }),
                 _ => Err(S3Error::new(S3ErrorCode::MethodNotAllowed)),
             };
@@ -625,8 +635,39 @@ mod tests {
                 start_after: None,
                 max_keys: 1000,
                 delimiter: None,
+                fetch_owner: false,
+                encoding_type: None,
             }
         );
+        // M9/C1:fetch-owner=true + encoding-type=url 透传
+        let q2 = vec![
+            ("list-type".into(), "2".into()),
+            ("fetch-owner".into(), "true".into()),
+            ("encoding-type".into(), "url".into()),
+        ];
+        let op2 = r.route("GET", "localhost", "/b1", &q2, b"").unwrap();
+        assert_eq!(
+            op2,
+            Operation::ListObjectsV2 {
+                bucket: "b1".into(),
+                prefix: "".into(),
+                continuation_token: None,
+                start_after: None,
+                max_keys: 1000,
+                delimiter: None,
+                fetch_owner: true,
+                encoding_type: Some("url".into()),
+            }
+        );
+        let q3 = vec![("encoding-type".into(), "url".into())];
+        let op3 = r.route("GET", "localhost", "/b1", &q3, b"").unwrap();
+        assert!(matches!(
+            op3,
+            Operation::ListObjectsV1 {
+                encoding_type: Some(..),
+                ..
+            }
+        ));
         let q = vec![("location".into(), "".into())];
         let op = r.route("GET", "localhost", "/b1", &q, b"").unwrap();
         assert_eq!(

@@ -368,10 +368,15 @@ fn inline_with_meta_headers() {
             &mut Cursor::new(data),
             Some("text/plain"),
             vec![("x-amz-meta-foo".into(), "bar".into())],
+            vec![("cache-control".into(), "max-age=60".into())],
         )
         .unwrap();
     assert_eq!(m.content_type, "text/plain");
     assert_eq!(m.user_meta, vec![("x-amz-meta-foo".into(), "bar".into())]);
+    assert_eq!(
+        m.resp_headers,
+        vec![("cache-control".into(), "max-age=60".into())]
+    );
     e.close().unwrap();
 }
 
@@ -398,6 +403,7 @@ fn multipart_upload_complete_roundtrip() {
             "big",
             Some("text/bla"),
             vec![("k".into(), "v".into())],
+            vec![("content-encoding".into(), "gzip".into())],
         )
         .unwrap();
     assert_eq!(uid.len(), 32);
@@ -461,7 +467,9 @@ fn multipart_upload_complete_roundtrip() {
 fn multipart_extent_concat_no_copy() {
     let (_d, cfg) = setup();
     let mut e = open_engine(&cfg);
-    let uid = e.create_multipart("b1", "big", None, vec![]).unwrap();
+    let uid = e
+        .create_multipart("b1", "big", None, vec![], vec![])
+        .unwrap();
     let mut total_refs = 0usize;
     let mut parts_meta = Vec::new();
     for i in 0..3 {
@@ -491,7 +499,9 @@ fn multipart_extent_concat_no_copy() {
 fn multipart_parts_pack_with_objects() {
     let (_d, cfg) = setup();
     let mut e = open_engine(&cfg);
-    let uid = e.create_multipart("b1", "big", None, vec![]).unwrap();
+    let uid = e
+        .create_multipart("b1", "big", None, vec![], vec![])
+        .unwrap();
     // 5MiB 分片:独占整块 + 尾段(1028KiB,开放)
     let p1 = e
         .upload_part(&uid, 1, &mut Cursor::new(vec![1u8; 5 * 1024 * 1024]))
@@ -532,7 +542,7 @@ fn multipart_parts_pack_with_objects() {
 fn multipart_validation_errors() {
     let (_d, cfg) = setup();
     let mut e = open_engine(&cfg);
-    let uid = e.create_multipart("b1", "k", None, vec![]).unwrap();
+    let uid = e.create_multipart("b1", "k", None, vec![], vec![]).unwrap();
 
     // 未知会话
     assert!(matches!(
@@ -604,7 +614,7 @@ fn multipart_validation_errors() {
 fn multipart_abort_frees_extents() {
     let (_d, cfg) = setup();
     let mut e = open_engine(&cfg);
-    let uid = e.create_multipart("b1", "k", None, vec![]).unwrap();
+    let uid = e.create_multipart("b1", "k", None, vec![], vec![]).unwrap();
     e.upload_part(&uid, 1, &mut Cursor::new(vec![1u8; 5 * 1024 * 1024]))
         .unwrap();
     assert!(e.alloc.allocated_count() >= 1);
@@ -630,7 +640,9 @@ fn copy_object_cow_share_and_release() {
 
     // COW 复制:共享段,无新分配
     let before = e.alloc.allocated_count();
-    let c = e.copy_object("b1", "src", "b1", "dst", None, None).unwrap();
+    let c = e
+        .copy_object("b1", "src", "b1", "dst", None, None, None)
+        .unwrap();
     assert_eq!(e.alloc.allocated_count(), before);
     assert_eq!(c.extents, src.extents);
     // 内容一致
@@ -656,13 +668,18 @@ fn copy_object_cow_share_and_release() {
             "dst",
             Some("text/x"),
             Some(&[("m".into(), "n".into())]),
+            Some(&[("content-encoding".into(), "gzip".into())]),
         )
         .unwrap();
     assert_eq!(c2.content_type, "text/x");
     assert_eq!(c2.user_meta, vec![("m".into(), "n".into())]);
+    assert_eq!(
+        c2.resp_headers,
+        vec![("content-encoding".into(), "gzip".into())]
+    );
     // 源不存在 → NotFound
     assert!(matches!(
-        e.copy_object("b1", "nope", "b1", "x", None, None),
+        e.copy_object("b1", "nope", "b1", "x", None, None, None),
         Err(Error::NotFound(_))
     ));
     e.close().unwrap();
@@ -673,7 +690,7 @@ fn copy_object_cow_share_and_release() {
 fn multipart_sweep_expired() {
     let (_d, cfg) = setup();
     let mut e = open_engine(&cfg);
-    let uid = e.create_multipart("b1", "k", None, vec![]).unwrap();
+    let uid = e.create_multipart("b1", "k", None, vec![], vec![]).unwrap();
     e.upload_part(&uid, 1, &mut Cursor::new(vec![1u8; 5 * 1024 * 1024]))
         .unwrap();
     let n = e.sweep_expired_sessions(0).unwrap();
@@ -855,7 +872,8 @@ fn cow_packed_segment_sharing() {
         "同 extent 打包"
     );
     // COW 复制 a → a2:共享 a 的段(非整 extent)
-    e.copy_object("b1", "a", "b1", "a2", None, None).unwrap();
+    e.copy_object("b1", "a", "b1", "a2", None, None, None)
+        .unwrap();
     assert_eq!(e.allocator().refcount(e0), 3, "a+b+a2 引用同一 extent");
     let lb = e.allocator().live_bytes_of(e0);
     // 删除 a:a 的段仍被 a2 共享,extent 保持、live_bytes 不减
@@ -1085,7 +1103,7 @@ proptest::proptest! {
                 2 => {
                     if let Some(src) = state.get(&key).cloned() {
                         let dst = format!("copy-{i}");
-                        e.copy_object("b1", &key, "b1", &dst, None, None).unwrap();
+                        e.copy_object("b1", &key, "b1", &dst, None, None, None).unwrap();
                         state.insert(dst, src);
                     }
                 }
@@ -1528,7 +1546,13 @@ fn etag_fast_crc32c_mode() {
 
     // 3) multipart 分片(内联分片)
     let upload = e
-        .create_multipart("b1", "mp", Some("application/octet-stream"), Vec::new())
+        .create_multipart(
+            "b1",
+            "mp",
+            Some("application/octet-stream"),
+            Vec::new(),
+            vec![],
+        )
         .unwrap();
     let part_data = rnd(16 * 1024, 13);
     e.upload_part(&upload, 1, &mut Cursor::new(part_data.clone()))
@@ -1571,7 +1595,9 @@ fn etag_md5_mode_default() {
 fn multipart_complete_with_holes_uses_request_subset() {
     let (_d, cfg) = setup();
     let mut e = open_engine(&cfg);
-    let uid = e.create_multipart("b1", "sub", None, vec![]).unwrap();
+    let uid = e
+        .create_multipart("b1", "sub", None, vec![], vec![])
+        .unwrap();
     // 1 号分片极小(<5MiB,若被检查 EntityTooSmall 必失败;此处刻意不列
     // 入 complete 请求,验证不参与检查)
     let _p1 = e
@@ -1614,7 +1640,9 @@ fn multipart_complete_with_holes_uses_request_subset() {
 
     // 单独验证 EntityTooSmall 仍对请求内非末分片生效:新会话,完成 [1, 2]
     // 必须先重开(上一个会话已 completed)
-    let uid2 = e.create_multipart("b1", "sub2", None, vec![]).unwrap();
+    let uid2 = e
+        .create_multipart("b1", "sub2", None, vec![], vec![])
+        .unwrap();
     let a = e
         .upload_part(&uid2, 1, &mut Cursor::new(vec![0xAAu8; 100]))
         .unwrap();

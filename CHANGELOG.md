@@ -5,6 +5,34 @@
 > 详细发布记录见 [RELEASES.md](./RELEASES.md);RC/GA 候选流程见
 > [docs/ga/rc-flow.md](./docs/ga/rc-flow.md)。
 
+## [Unreleased] — v1.0.1(月度 patch 轨道;M9 协议卫生与正确性补丁)
+
+M9 全部任务完成(TODO.md M9 全勾选);协议一致性与工具链门禁全绿:
+
+- **A 头显式化(红线 6)**:SSE 家族(`x-amz-server-side-encryption*`/`x-amz-sse-kms-key-id`)、
+  对象标签(`x-amz-tagging`)、Object Lock、网站重定向头 → 501 NotImplemented;
+  `x-amz-storage-class` 非 STANDARD → 400 InvalidStorageClass;均为标准错误 XML,
+  逐头回归测试(fs3-s3 单测)。
+- **B 正确性契约(ADR-14)**:multipart 复合 ETag 改 AWS 标准
+  `MD5(binary(分片 MD5 拼接))-N`;`x-amz-content-sha256` 不符报
+  `XAmzContentSHA256Mismatch`(BadDigest 留给 Content-MD5);416 补
+  `x-amz-actual-object-size` 头;多段 Range 实现 206 multipart/byteranges
+  (不再静默回整对象;RFC 7233 合并/忽略语义)。
+- **C 列表与元数据**:ListObjectsV1/V2 `encoding-type=url`(+ 特殊键名往返)、
+  ListObjectsV2 `fetch-owner` 门控 Owner 元素;unicode 元数据头逐字节往返
+  (请求侧 UTF-8 canonical 一致、回显侧 Latin-1 字节还原);`Cache-Control`/
+  `Expires`/`Content-Encoding`(去 aws-chunked)存元数据并回显;ListParts/
+  ListObjectVersions Owner 统一输出;桶重建语义(重复创建幂等 200 / 带 ACL
+  或 ACL 历史 409 BucketAlreadyExists / 删除重建 = 全新属性)。
+- **D 边界与语义**:DeleteObjects 键数上限 1000(400);预签名 `X-Amz-Expires`
+  越界(>7 天)403;匿名+预签名流式 PUT 与缓冲 PUT 统一;`x-amz-id-2` 注入
+  每请求 trace id(替代恒值 "fasts3");chunked+content-encoding 组合按 AWS
+  语义接收/回显。
+- **数据面演进**:ObjectMeta/MultipartSession 尾部追加 resp_headers 字段,
+  双读兼容存量值(零迁移);meta-export/import DTO 同步;ADO 序列:
+  `cargo test / clippy / fmt` 全绿;cargo audit 清零维持。
+- s3-tests 全量 gate 绿:②组已关闭项从 EXCLUDE 移除(见 tests/s3-tests/README)。
+
 ## [Unreleased] — v1.0.0 GA(候选)
 
 REVIEW.md 一致性修复批次(2026-08-22;逐项修复 + 针对验证,门禁保持全绿):

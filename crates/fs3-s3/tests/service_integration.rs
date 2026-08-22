@@ -3,6 +3,7 @@
 use fs3_engine::Engine;
 use fs3_s3::auth::{self, Credentials, PayloadHash};
 use fs3_s3::{ResponseBody, S3Request, S3Service, ServiceResponse};
+use hmac::Mac;
 use sha2::{Digest, Sha256};
 
 fn setup() -> (tempfile::TempDir, S3Service) {
@@ -36,6 +37,104 @@ use std::sync::Arc;
 /// 构造已签名请求。
 fn req(method: &str, path: &str, body: Vec<u8>) -> S3Request {
     req_q(method, path, &[], body)
+}
+
+/// 带 head 的已签名请求(头值参与签名,与真实客户端一致;同名头后者覆盖,
+/// 与客户端"设置头"语义一致)。
+fn req_h(method: &str, path: &str, h: &[(&str, &str)], body: Vec<u8>) -> S3Request {
+    let amz_date = auth::now_amz();
+    let hash = hex::encode(Sha256::digest(&body));
+    let mut headers: Vec<(String, String)> = Vec::new();
+    for (k, v) in h {
+        headers.retain(|(kk, _)| !kk.eq_ignore_ascii_case(k));
+        headers.push((k.to_string(), v.to_string()));
+    }
+    let base: [(&str, String); 3] = [
+        ("host", "localhost:9000".into()),
+        ("x-amz-date", amz_date.clone()),
+        ("x-amz-content-sha256", hash.clone()),
+    ];
+    for (k, v) in base {
+        if !headers.iter().any(|(kk, _)| kk.eq_ignore_ascii_case(k)) {
+            headers.push((k.to_string(), v));
+        }
+    }
+    let cred = Credentials {
+        access_key: "test".into(),
+        secret_key: "secret123".into(),
+    };
+    let auth_hdr = auth::sign_request(
+        &cred,
+        "us-east-1",
+        method,
+        path,
+        &[],
+        &headers,
+        &amz_date,
+        &PayloadHash::HexSha256(hash),
+    )
+    .unwrap();
+    headers.push(("authorization".into(), auth_hdr));
+    S3Request {
+        method: method.into(),
+        raw_path: path.into(),
+        decoded_path: path.into(),
+        host: "localhost".into(),
+        query: vec![],
+        headers,
+        body,
+    }
+}
+
+/// 带 head 的已签名请求,payload hash 显式指定(错误声明场景用)。
+fn req_h_payload(
+    method: &str,
+    path: &str,
+    h: &[(&str, &str)],
+    body: Vec<u8>,
+    payload: &PayloadHash,
+) -> S3Request {
+    let amz_date = auth::now_amz();
+    let hash = hex::encode(Sha256::digest(&body));
+    let mut headers: Vec<(String, String)> = Vec::new();
+    for (k, v) in h {
+        headers.retain(|(kk, _)| !kk.eq_ignore_ascii_case(k));
+        headers.push((k.to_string(), v.to_string()));
+    }
+    for (k, v) in [
+        ("host", "localhost:9000".into()),
+        ("x-amz-date", amz_date.clone()),
+        ("x-amz-content-sha256", hash.clone()),
+    ] {
+        if !headers.iter().any(|(kk, _)| kk.eq_ignore_ascii_case(k)) {
+            headers.push((k.to_string(), v));
+        }
+    }
+    let cred = Credentials {
+        access_key: "test".into(),
+        secret_key: "secret123".into(),
+    };
+    let auth_hdr = auth::sign_request(
+        &cred,
+        "us-east-1",
+        method,
+        path,
+        &[],
+        &headers,
+        &amz_date,
+        payload,
+    )
+    .unwrap();
+    headers.push(("authorization".into(), auth_hdr));
+    S3Request {
+        method: method.into(),
+        raw_path: path.into(),
+        decoded_path: path.into(),
+        host: "localhost".into(),
+        query: vec![],
+        headers,
+        body,
+    }
 }
 
 /// 带 query 的已签名请求。
@@ -99,9 +198,18 @@ fn bucket_and_object_flow() {
     // CreateBucket
     let r = svc.handle(&req("PUT", "/bkt1", vec![]));
     assert_eq!(status(&r), 200, "{:?}", r);
-    // 重复创建 → 409 BucketAlreadyOwnedByYou
+    // M9/C5:重复创建(无 ACL 头)→ 200 幂等 no-op(属性不覆盖;
+    // s3-tests test_bucket_recreate_not_overriding 语义)
     let r = svc.handle(&req("PUT", "/bkt1", vec![]));
-    assert_eq!(err_code(&r), "BucketAlreadyOwnedByYou");
+    assert_eq!(status(&r), 200, "{:?}", r);
+    // 重复创建 + ACL 头 → 409 BucketAlreadyExists(重建属性冲突语义)
+    let r = svc.handle(&req_h(
+        "PUT",
+        "/bkt1",
+        &[("x-amz-acl", "public-read")],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "BucketAlreadyExists");
     // 非法桶名
     let r = svc.handle(&req("PUT", "/Bad_Name!", vec![]));
     assert_eq!(err_code(&r), "InvalidBucketName");
@@ -1377,4 +1485,338 @@ fn multipart_complete_rejects_out_of_order_parts() {
     // 递增 [1, 2] → 成功(对象可见)
     let r_ok = complete(vec![(1, etag1), (2, etag2)]);
     assert_eq!(status(&r_ok), 200, "{:?}", r_ok);
+}
+
+// ─────────────────────────── M9 协议卫生补丁 ───────────────────────────
+
+/// M9/B2:内容 SHA256 不符 → XAmzContentSHA256Mismatch;Content-MD5 不符
+/// → BadDigest(错误码分工与 AWS 一致)。
+#[test]
+fn content_sha256_mismatch_error_code() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/dig-bucket", vec![]))), 200);
+
+    // 篡改 x-amz-content-sha256 头(声明 64 个 0):请求**按该声明值签名**
+    // (真实客户端在发送前就知道载荷哈希;此处模拟错误声明),认证通过,
+    // body 校验在 op_put_object_buffered → XAmzContentSHA256Mismatch
+    let fake = "0000000000000000000000000000000000000000000000000000000000000000";
+    let r = req_h_payload(
+        "PUT",
+        "/dig-bucket/obj",
+        &[("x-amz-content-sha256", fake)],
+        b"hello world".to_vec(),
+        &PayloadHash::HexSha256(fake.into()),
+    );
+    let resp = svc.handle(&r);
+    assert_eq!(err_code(&resp), "XAmzContentSHA256Mismatch", "{:?}", resp);
+    assert_eq!(status(&resp), 400);
+
+    // Content-MD5 路径仍为 BadDigest
+    let wrong_md5 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        md5::Md5::digest(b"other"),
+    );
+    let r2 = req_h(
+        "PUT",
+        "/dig-bucket/obj",
+        &[("content-md5", &wrong_md5)],
+        b"hello world".to_vec(),
+    );
+    let resp2 = svc.handle(&r2);
+    assert_eq!(err_code(&resp2), "BadDigest", "{:?}", resp2);
+}
+
+/// M9/C3+D5:Content-Encoding(去 aws-chunked)/Cache-Control/Expires
+/// 存元数据并在 GET/HEAD 回显;aws-chunked 纯组合不残留。
+#[test]
+fn resp_headers_roundtrip_echo() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/rh-bucket", vec![]))), 200);
+
+    let r = req_h(
+        "PUT",
+        "/rh-bucket/obj",
+        &[
+            ("content-encoding", "gzip, aws-chunked"),
+            ("cache-control", "public, max-age=14400"),
+            ("expires", "Tue, 20 Aug 2024 12:00:00 GMT"),
+        ],
+        b"data".to_vec(),
+    );
+    assert_eq!(status(&svc.handle(&r)), 200, "{:?}", r);
+
+    let head = svc.handle(&req("HEAD", "/rh-bucket/obj", vec![])).unwrap();
+    let h = |k: &str| {
+        head.headers
+            .iter()
+            .find(|(kk, _)| kk == k)
+            .map(|(_, v)| v.clone())
+    };
+    assert_eq!(h("content-encoding").as_deref(), Some("gzip"));
+    assert_eq!(h("cache-control").as_deref(), Some("public, max-age=14400"));
+    assert_eq!(
+        h("expires").as_deref(),
+        Some("Tue, 20 Aug 2024 12:00:00 GMT")
+    );
+
+    // GET 同样回显
+    let get = svc.handle(&req("GET", "/rh-bucket/obj", vec![])).unwrap();
+    let gh = |k: &str| {
+        get.headers
+            .iter()
+            .find(|(kk, _)| kk == k)
+            .map(|(_, v)| v.clone())
+    };
+    assert_eq!(gh("content-encoding").as_deref(), Some("gzip"));
+
+    // 覆盖写入(无头)→ 旧回显头清除
+    let r2 = req_h("PUT", "/rh-bucket/obj", &[], b"new".to_vec());
+    assert_eq!(status(&svc.handle(&r2)), 200);
+    let head2 = svc.handle(&req("HEAD", "/rh-bucket/obj", vec![])).unwrap();
+    assert!(!head2.headers.iter().any(|(k, _)| k == "content-encoding"));
+    assert!(!head2.headers.iter().any(|(k, _)| k == "cache-control"));
+}
+
+/// M9/C2:unicode 元数据头往返(服务层;HTTP 层字节保真在 fs3-http,
+/// 此处验证存储与回显链路对非 ASCII 值不丢不坏)。
+#[test]
+fn unicode_metadata_roundtrip() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/u-bucket", vec![]))), 200);
+    let val = "Hello World\u{e9}"; // é(U+00E9,与 Latin-1 字节往返对应)
+    let r = req_h(
+        "PUT",
+        "/u-bucket/obj",
+        &[("x-amz-meta-meta1", val)],
+        b"bar".to_vec(),
+    );
+    assert_eq!(status(&svc.handle(&r)), 200, "{:?}", r);
+    let get = svc.handle(&req("GET", "/u-bucket/obj", vec![])).unwrap();
+    let got = get
+        .headers
+        .iter()
+        .find(|(k, _)| k == "x-amz-meta-meta1")
+        .map(|(_, v)| v.clone())
+        .unwrap();
+    assert_eq!(got, val);
+}
+
+/// M9/B4:多段 Range → 206 multipart/byteranges(不再静默回整对象);
+/// 单段 → 206 + Content-Range;不可满足 → 416。
+#[test]
+fn multi_range_multipart_byteranges() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/mr-bucket", vec![]))), 200);
+    let body = b"0123456789".to_vec(); // 10 字节
+    let r = req_h("PUT", "/mr-bucket/obj", &[], body);
+    assert_eq!(status(&svc.handle(&r)), 200);
+
+    // 多段:bytes=0-0,4-5,8-9 → 206 multipart + 3 段闭区间
+    let get = svc.handle(&req_h(
+        "GET",
+        "/mr-bucket/obj",
+        &[("range", "bytes=0-0,4-5,8-9")],
+        vec![],
+    ));
+    let resp = get.unwrap();
+    assert_eq!(resp.status, 206, "{:?}", resp);
+    let ct = resp
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.clone())
+        .unwrap();
+    assert!(ct.starts_with("multipart/byteranges; boundary="), "{ct}");
+    match resp.body {
+        fs3_s3::ResponseBody::MultiRange { ranges, total, .. } => {
+            assert_eq!(ranges, vec![(0, 0), (4, 5), (8, 9)]);
+            assert_eq!(total, 10);
+        }
+        _ => panic!("expected MultiRange body"),
+    }
+    // 相邻/重叠段合并(RFC 7233 允许):0-3 与 3-5 合并 → 1 段 0-5,
+    // 越界段 99999-999999 忽略;合并后单段 → 普通 206 单段响应
+    let get2 = svc.handle(&req_h(
+        "GET",
+        "/mr-bucket/obj",
+        &[("range", "bytes=0-3,3-5,99999-999999")],
+        vec![],
+    ));
+    let resp2 = get2.unwrap();
+    assert_eq!(resp2.status, 206);
+    let cr2 = resp2
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-range"))
+        .map(|(_, v)| v.clone())
+        .unwrap();
+    assert_eq!(cr2, "bytes 0-5/10", "adjacent ranges must coalesce");
+
+    // 单段 → 206 + Content-Range
+    let single = svc
+        .handle(&req_h(
+            "GET",
+            "/mr-bucket/obj",
+            &[("range", "bytes=2-4")],
+            vec![],
+        ))
+        .unwrap();
+    assert_eq!(single.status, 206);
+    let cr = single
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-range"))
+        .map(|(_, v)| v.clone())
+        .unwrap();
+    assert_eq!(cr, "bytes 2-4/10");
+
+    // 全部不可满足 → 416 InvalidRange
+    let bad = svc
+        .handle(&req_h(
+            "GET",
+            "/mr-bucket/obj",
+            &[("range", "bytes=100-200,300-400")],
+            vec![],
+        ))
+        .unwrap_err();
+    assert_eq!(bad.code, fs3_s3::S3ErrorCode::InvalidRange);
+    assert_eq!(bad.status(), 416);
+    assert!(bad
+        .extra
+        .iter()
+        .any(|(k, v)| k == "ActualObjectSize" && v == "10"));
+}
+
+/// M9/B1:multipart 复合 ETag = MD5(各分片二进制 MD5 拼接)-N(AWS 标准)。
+#[test]
+fn multipart_composite_etag_binary() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/et-bucket", vec![]))), 200);
+    let init = svc.handle(&req_q("POST", "/et-bucket/obj", &[("uploads", "")], vec![]));
+    let text = match init.unwrap().body {
+        fs3_s3::ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!("init body"),
+    };
+    let upload_id = text
+        .split("<UploadId>")
+        .nth(1)
+        .and_then(|s| s.split("</UploadId>").next())
+        .unwrap()
+        .to_string();
+    let upload = |no: &str, data: Vec<u8>| {
+        svc.handle(&req_q(
+            "PUT",
+            "/et-bucket/obj",
+            &[("partNumber", no), ("uploadId", &upload_id)],
+            data,
+        ))
+    };
+    // 非末分片 ≥5MiB(AWS EntityTooSmall 门槛)
+    let p1 = upload("1", vec![0x11u8; 6 * 1024 * 1024]).unwrap();
+    let p2 = upload("2", vec![0x22u8; 6 * 1024 * 1024]).unwrap();
+    let etag1 = p1
+        .headers
+        .iter()
+        .find(|(k, _)| k == "ETag")
+        .map(|(_, v)| v.trim_matches('"').to_string())
+        .unwrap();
+    let etag2 = p2
+        .headers
+        .iter()
+        .find(|(k, _)| k == "ETag")
+        .map(|(_, v)| v.trim_matches('"').to_string())
+        .unwrap();
+    // 标准:MD5(hex 解码的各分片 ETag 二进制拼接)-2
+    let mut concat = Vec::new();
+    for hex in [&etag1, &etag2] {
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        concat.extend_from_slice(&bytes);
+    }
+    let expect = format!("\"{}-2\"", hex::encode(md5::Md5::digest(&concat)));
+    let complete = {
+        let mut xml = String::from("<CompleteMultipartUpload>");
+        for (no, e) in [("1", &etag1), ("2", &etag2)] {
+            xml.push_str(&format!(
+                "<Part><PartNumber>{no}</PartNumber><ETag>{e}</ETag></Part>"
+            ));
+        }
+        xml.push_str("</CompleteMultipartUpload>");
+        svc.handle(&req_q(
+            "POST",
+            "/et-bucket/obj",
+            &[("uploadId", &upload_id)],
+            xml.into_bytes(),
+        ))
+    };
+    let resp = complete.unwrap();
+    let etag = resp
+        .headers
+        .iter()
+        .find(|(k, _)| k == "ETag")
+        .map(|(_, v)| v.clone())
+        .unwrap();
+    assert_eq!(etag, expect, "composite etag must be md5(binary concat)-N");
+    // Header 与 GET 一致
+    let get = svc.handle(&req("GET", "/et-bucket/obj", vec![])).unwrap();
+    let get_etag = get
+        .headers
+        .iter()
+        .find(|(k, _)| k == "ETag")
+        .map(|(_, v)| v.clone())
+        .unwrap();
+    assert_eq!(get_etag, expect);
+}
+
+/// M9/D3:预签名(仅 query 认证)流式 PUT 与缓冲 PUT 行为一致。
+#[test]
+fn presigned_streaming_put_matches_buffered() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/ps-bucket", vec![]))), 200);
+    // 构造预签名 PUT(仅 query,无 Authorization 头;UNSIGNED-PAYLOAD)
+    let cred = Credentials {
+        access_key: "test".into(),
+        secret_key: "secret123".into(),
+    };
+    let amz_date = auth::now_amz();
+    let date = &amz_date[0..8];
+    let mut query: Vec<(String, String)> = vec![
+        ("X-Amz-Algorithm".into(), auth::ALGORITHM.into()),
+        (
+            "X-Amz-Credential".into(),
+            format!("test/{date}/us-east-1/s3/aws4_request"),
+        ),
+        ("X-Amz-Date".into(), amz_date.clone()),
+        ("X-Amz-Expires".into(), "3600".into()),
+        ("X-Amz-SignedHeaders".into(), "host".into()),
+    ];
+    let q = auth::canonical_query(&query, &["X-Amz-Signature"]);
+    let creq = format!("PUT\n/ps-bucket/big\n{q}\nhost:localhost:9000\n\nhost\nUNSIGNED-PAYLOAD");
+    let sts = auth::string_to_sign(&amz_date, date, "us-east-1", &creq);
+    let key = auth::signing_key(&cred.secret_key, date, "us-east-1");
+    type HmacSha256 = hmac::Hmac<Sha256>;
+    let mut mac = <HmacSha256 as hmac::Mac>::new_from_slice(&key).unwrap();
+    mac.update(sts.as_bytes());
+    let sig = hex::encode(mac.finalize().into_bytes());
+    query.push(("X-Amz-Signature".into(), sig));
+    let headers = vec![("host".into(), "localhost:9000".into())];
+    let mut s3req = S3Request {
+        method: "PUT".into(),
+        raw_path: "/ps-bucket/big".into(),
+        decoded_path: "/ps-bucket/big".into(),
+        host: "localhost".into(),
+        query,
+        headers,
+        body: vec![],
+    };
+    // 流式路径(无 body、无 content-length → 走 put_object_stream 判定)
+    s3req.headers.push(("content-length".into(), "5".into()));
+    let mut reader = std::io::Cursor::new(b"hello".to_vec());
+    let r = svc.put_object_stream(&s3req, &mut reader);
+    assert_eq!(status(&r), 200, "presigned streaming PUT rejected: {r:?}");
+    // 对象落盘且内容一致
+    let get = svc.handle(&req("GET", "/ps-bucket/big", vec![])).unwrap();
+    assert_eq!(get.status, 200);
 }

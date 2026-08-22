@@ -63,6 +63,20 @@ pub enum ResponseBody {
         /// 读校验开关(开启时禁零拷贝)。
         zc_verify: bool,
     },
+    /// M9/B4:多段 Range → 206 multipart/byteranges。HTTP 层按段输出
+    /// 边界帧 + 段数据(零拷贝禁用;Content-Length 已由服务层算好)。
+    MultiRange {
+        bucket: String,
+        key: String,
+        /// 归一化段列表(闭区间 [start, end])。
+        ranges: Vec<(u64, u64)>,
+        /// 对象总长(Content-Range 分母)。
+        total: u64,
+        /// multipart boundary。
+        boundary: String,
+        /// 每段头里的 Content-Type。
+        part_content_type: String,
+    },
 }
 
 /// 小请求体缓冲阈值:Content-Length ≤ 该值走 handle(可校验载荷哈希)。
@@ -606,10 +620,22 @@ impl S3Service {
         format!("{:08X}", rand_hex())
     }
 
+    /// M9/D4:`x-amz-id-2` 注入真实请求 trace id(替代恒值):
+    /// `x-amz-id-2 = {request_id}/{host_id}`——错误 XML 的 HostId 与响应头
+    /// 一一对应,支持端到端追踪。
+    pub fn request_trace(&self, request_id: &str) -> String {
+        format!("{request_id}/{}", self.host_id)
+    }
+
+    pub fn host_id(&self) -> &str {
+        &self.host_id
+    }
+
     fn base_headers(&self) -> Vec<(String, String)> {
+        let rid = self.new_request_id();
         vec![
-            ("x-amz-request-id".into(), self.new_request_id()),
-            ("x-amz-id-2".into(), self.host_id.clone()),
+            ("x-amz-request-id".into(), rid.clone()),
+            ("x-amz-id-2".into(), self.request_trace(&rid)),
             (
                 "Date".into(),
                 xml::http_date(
@@ -625,13 +651,18 @@ impl S3Service {
     #[allow(dead_code)] // HTTP 层使用(错误响应渲染)
     fn error_response(&self, e: &S3Error) -> ServiceResponse {
         let request_id = self.new_request_id();
+        let trace = self.request_trace(&request_id);
         let mut headers = self.base_headers();
-        // 把 request_id 换成错误体里的(保持一致)
-        if let Some(h) = headers.iter_mut().find(|(k, _)| k == "x-amz-request-id") {
-            h.1 = request_id.clone();
+        // 把 request_id/trace 换成错误体里的(保持一致)
+        for (k, v) in headers.iter_mut() {
+            if k == "x-amz-request-id" {
+                *v = request_id.clone();
+            } else if k == "x-amz-id-2" {
+                *v = trace.clone();
+            }
         }
         let status = e.status();
-        let body = e.render_xml(&request_id, &self.host_id);
+        let body = e.render_xml(&request_id, &trace);
         headers.push(("Content-Type".into(), "application/xml".into()));
         headers.push(("Content-Length".into(), body.len().to_string()));
         ServiceResponse {
@@ -666,16 +697,83 @@ impl S3Service {
         }
     }
 
+    /// M9/A1:未实现头显式拒绝(红线 6:静默忽略客户端头 = 拒绝合入)。
+    ///
+    /// - SSE 家族 / 对象标签 / Object Lock / 网站重定向 → 501 NotImplemented
+    ///   (错误码自带语义 "A header you provided implies functionality that is not implemented");
+    /// - `x-amz-storage-class` 非 STANDARD → 400 InvalidStorageClass(与 AWS 同码);
+    /// - ACL 家族在对象创建路径上**接受但不生效**(单账号私有默认;值合法性
+    ///   单独校验,M9/C5 在 op_create_bucket/op_put_object_buffered 声明),
+    ///   不在此拒绝(兼容 s3-tests 建桶/传对象携带 ACL 的合法调用)。
+    fn check_unimplemented_headers(&self, req: &S3Request) -> Result<(), S3Error> {
+        const UNSUPPORTED: &[&str] = &[
+            "x-amz-server-side-encryption",
+            "x-amz-server-side-encryption-aws-kms-key-id",
+            "x-amz-server-side-encryption-context",
+            "x-amz-server-side-encryption-bucket-key-enabled",
+            "x-amz-server-side-encryption-customer-algorithm",
+            "x-amz-server-side-encryption-customer-key",
+            "x-amz-server-side-encryption-customer-key-md5",
+            "x-amz-sse-kms-key-id",
+            "x-amz-tagging",
+            "x-amz-object-lock-mode",
+            "x-amz-object-lock-retain-until-date",
+            "x-amz-object-lock-legal-hold",
+            "x-amz-website-redirect-location",
+        ];
+        for (k, _) in &req.headers {
+            if UNSUPPORTED.iter().any(|u| k.eq_ignore_ascii_case(u)) {
+                return Err(
+                    S3Error::new(S3ErrorCode::NotImplemented).with_message(format!(
+                        "The header '{k}' implies functionality that is not implemented."
+                    )),
+                );
+            }
+        }
+        if let Some(sc) = header(req, "x-amz-storage-class") {
+            if !sc.eq_ignore_ascii_case("STANDARD") {
+                return Err(S3Error::new(S3ErrorCode::InvalidStorageClass)
+                    .with_message("The storage class you specified is not valid."));
+            }
+        }
+        Ok(())
+    }
+
     fn require_auth(&self, req: &S3Request) -> Result<Option<String>, S3Error> {
         let access = self.authenticate(req)?;
         if access.is_none() {
             // REVIEW §3.5:allow_anonymous 仅开放「匿名公共读」(GET/HEAD),
             // 写操作(PUT/DELETE/POST 等)即使开启也必须携带有效签名。
             let read_only = matches!(req.method.as_str(), "GET" | "HEAD");
-            if !read_only
-                || !self
-                    .allow_anonymous
-                    .load(std::sync::atomic::Ordering::Relaxed)
+            if !read_only {
+                // M9/②组(s3-tests test_object_delete_key_bucket_gone):
+                // 匿名 DELETE 的桶已不存在 → NoSuchBucket(404)优先于通用
+                // AccessDenied(与桶存在时拒绝的 RGW/AWS 语义一致)。
+                if req.method == "DELETE" {
+                    let bucket = req
+                        .decoded_path
+                        .trim_start_matches('/')
+                        .split('/')
+                        .next()
+                        .unwrap_or("");
+                    let missing = !bucket.is_empty()
+                        && self
+                            .engine
+                            .read()
+                            .meta()
+                            .get_bucket(bucket)
+                            .map(|m| m.is_none())
+                            .unwrap_or(false);
+                    if missing {
+                        return Err(S3Error::new(S3ErrorCode::NoSuchBucket)
+                            .with_extra("BucketName", bucket));
+                    }
+                }
+                return Err(S3Error::new(S3ErrorCode::AccessDenied));
+            }
+            if !self
+                .allow_anonymous
+                .load(std::sync::atomic::Ordering::Relaxed)
             {
                 return Err(S3Error::new(S3ErrorCode::AccessDenied));
             }
@@ -739,11 +837,13 @@ impl S3Service {
             }
         }
         self.require_auth(req)?;
+        // M9/A1:未实现头显式拒绝(先认证后验头,与 AWS 顺序一致)
+        self.check_unimplemented_headers(req)?;
         let mut headers = self.base_headers();
         let resp = match op {
             Operation::ListBuckets => Ok(self.op_list_buckets(req)),
             Operation::CreateBucket { bucket, location } => {
-                Ok(self.op_create_bucket(&bucket, location.as_deref())?)
+                Ok(self.op_create_bucket(req, &bucket, location.as_deref())?)
             }
             Operation::DeleteBucket { bucket } => Ok(self.op_delete_bucket(&bucket)?),
             Operation::HeadBucket { bucket } => Ok(self.op_head_bucket(&bucket)?),
@@ -763,12 +863,14 @@ impl S3Service {
                 marker,
                 max_keys,
                 delimiter,
+                encoding_type,
             } => Ok(self.op_list_objects_v1(
                 &bucket,
                 &prefix,
                 &marker,
                 max_keys,
                 delimiter.as_deref(),
+                encoding_type.as_deref(),
             )?),
             Operation::ListObjectsV2 {
                 bucket,
@@ -777,6 +879,8 @@ impl S3Service {
                 start_after,
                 max_keys,
                 delimiter,
+                fetch_owner,
+                encoding_type,
             } => Ok(self.op_list_objects_v2(
                 &bucket,
                 &prefix,
@@ -784,6 +888,8 @@ impl S3Service {
                 start_after.as_deref(),
                 max_keys,
                 delimiter.as_deref(),
+                fetch_owner,
+                encoding_type.as_deref(),
             )?),
             Operation::CreateMultipartUpload { bucket, key } => {
                 Ok(self.op_create_multipart_upload(req, &bucket, &key)?)
@@ -994,6 +1100,8 @@ impl S3Service {
             }
         };
         let _access = self.require_auth(req)?;
+        // M9/A1:未实现头显式拒绝(流式 PUT/UploadPart 与缓冲路径同语义)
+        self.check_unimplemented_headers(req)?;
 
         // REVIEW §3.10:流式路径按 Content-Length 提前拒绝超限请求
         // (单片 >5GiB → InvalidPart;整对象 >5TiB → EntityTooLarge,免写半程回滚)。
@@ -1032,10 +1140,20 @@ impl S3Service {
             }
         }
 
-        // 载荷哈希处理
-        let outcome =
+        // 载荷哈希处理(M9/D3:与缓冲 PUT 同一认证语义——header 认证
+        // 失败/缺席时回退预签名 query 认证,保证匿名+预签名流式 PUT 与
+        // 缓冲 PUT 行为一致;仍无签名 → AccessDenied,由 require_auth 兜底)
+        let mut outcome =
             self.auth
                 .verify_header_auth(&req.method, &req.raw_path, &req.query, &req.headers)?;
+        if matches!(outcome, AuthOutcome::Anonymous) {
+            outcome = self.auth.verify_query_auth(
+                &req.method,
+                &req.raw_path,
+                &req.query,
+                &req.headers,
+            )?;
+        }
         let (payload_hash, seed_sig, amz_date) = match outcome {
             AuthOutcome::Authenticated {
                 payload_hash,
@@ -1043,7 +1161,9 @@ impl S3Service {
                 amz_date,
                 ..
             } => (payload_hash, seed_signature, amz_date),
-            AuthOutcome::Anonymous => return Err(S3Error::new(S3ErrorCode::AccessDenied)),
+            // 无任何签名:与缓冲路径一致按 Unsigned 处理(require_auth 已按
+            // 匿名写策略拒绝或放行;这里不再二次拒绝)
+            AuthOutcome::Anonymous => (PayloadHash::Unsigned, None, String::new()),
         };
 
         let mut engine = self.engine.write();
@@ -1051,11 +1171,12 @@ impl S3Service {
         let write_once = |engine: &mut Engine,
                           reader: &mut dyn Read,
                           content_type: Option<&str>,
-                          user_meta: Vec<(String, String)>|
+                          user_meta: Vec<(String, String)>,
+                          resp_headers: Vec<(String, String)>|
          -> Result<[u8; 16], S3Error> {
             match &target {
                 StreamTarget::Object { bucket, key } => engine
-                    .put_with_meta(bucket, key, reader, content_type, user_meta)
+                    .put_with_meta(bucket, key, reader, content_type, user_meta, resp_headers)
                     .map(|m| m.etag)
                     .map_err(|e| map_engine_error(e, bucket, key)),
                 StreamTarget::Part {
@@ -1086,13 +1207,16 @@ impl S3Service {
                     &mut hashing,
                     header(req, "content-type"),
                     user_meta(req),
+                    resp_headers_from(req),
                 )?;
                 let actual = hex::encode(hashing.finalize());
                 if !actual.eq_ignore_ascii_case(&expected) {
                     rollback(&mut engine);
-                    return Err(S3Error::new(S3ErrorCode::BadDigest).with_message(
-                        "The Content-SHA256 you specified did not match what we received.",
-                    ));
+                    // M9/B2:与缓冲路径同码 XAmzContentSHA256Mismatch
+                    return Err(S3Error::new(S3ErrorCode::XAmzContentSHA256Mismatch)
+                        .with_message(
+                            "The provided 'x-amz-content-sha256' header does not match what was computed.",
+                        ));
                 }
                 etag
             }
@@ -1101,6 +1225,7 @@ impl S3Service {
                 reader,
                 header(req, "content-type"),
                 user_meta(req),
+                resp_headers_from(req),
             )?,
             PayloadHash::Streaming | PayloadHash::StreamingSignedTrailer => {
                 // aws-chunked(signed):逐 chunk 校验签名后解码为原始流;尾部 trailer 消费
@@ -1119,6 +1244,7 @@ impl S3Service {
                     &mut chunked,
                     header(req, "content-type"),
                     user_meta(req),
+                    resp_headers_from(req),
                 )?
             }
             PayloadHash::StreamingUnsignedTrailer => {
@@ -1129,6 +1255,7 @@ impl S3Service {
                     &mut chunked,
                     header(req, "content-type"),
                     user_meta(req),
+                    resp_headers_from(req),
                 )?
             }
         };
@@ -1240,31 +1367,50 @@ impl S3Service {
         }
     }
 
+    // M9/C5:桶重建语义(与 s3-tests 对齐;RGW 兼容行为):
+    /// - 桶已存在 + 请求带 ACL 家族头 → 409 BucketAlreadyExists(属性冲突);
+    /// - 桶已存在 + 创建时曾带 ACL(created_with_acl)→ 409 BucketAlreadyExists
+    ///   (recreate_overwrite_acl 语义:ACL 参与过的桶不可幂等重建);
+    /// - 桶已存在 + 无 ACL 历史 → **200 幂等 no-op**(不覆盖任何既有属性/对象,
+    ///   test_bucket_recreate_not_overriding 语义);
+    /// - 新建桶:LocationConstraint 回显语义不变;ACL 头接受但不生效
+    ///   (单账号私有默认;值非法 → 400,显式不静默),created_with_acl 落盘。
     fn op_create_bucket(
         &self,
+        req: &S3Request,
         bucket: &str,
         location: Option<&str>,
     ) -> Result<ServiceResponse, S3Error> {
         validate_bucket_name(bucket)?;
-        // M8/s3-tests:接受任意 LocationConstraint 并回显(RGW/MinIO 测试器语义;
-        // AWS:合法性校验仅对真实区域有意义;单机服务不做区域表)。无约束 = ""
-        // = us-east-1 默认语义,GetBucketLocation 返回空元素。
         let engine = self.engine.write();
-        if engine
+        let existing = engine
             .meta()
             .get_bucket(bucket)
-            .map_err(|e| map_engine_error(e, bucket, ""))?
-            .is_some()
-        {
-            return Err(
-                S3Error::new(S3ErrorCode::BucketAlreadyOwnedByYou).with_extra("BucketName", bucket)
-            );
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        if let Some(meta) = existing {
+            if has_acl_headers(req) || meta.created_with_acl {
+                return Err(
+                    S3Error::new(S3ErrorCode::BucketAlreadyExists).with_extra("BucketName", bucket)
+                );
+            }
+            // 幂等重建:属性保留现状(删除后重建 = 全新属性,AWS 语义;
+            // 未删除的重复创建 = no-op,不覆盖)
+            return Ok(ServiceResponse {
+                status: 200,
+                headers: vec![("Location".into(), format!("/{bucket}"))],
+                body: ResponseBody::Empty,
+            });
         }
+        // 新建:ACL 值合法性显式校验(接受但不生效,单账号模型声明)。
+        // M8/s3-tests:接受任意 LocationConstraint 并回显(RGW/MinIO 测试器
+        // 语义;单机服务不做区域表)。无约束 = "" = us-east-1 默认语义。
+        validate_canned_acl(req)?;
         let meta = BucketMeta {
             created: now_ts(),
             owner: "fasts3".into(),
             stats: Default::default(),
             quota: None,
+            created_with_acl: has_acl_headers(req),
         };
         engine
             .meta()
@@ -1407,6 +1553,7 @@ impl S3Service {
             max_keys.min(1000),
             &items,
             truncated,
+            &self.owner,
         );
         Ok(ServiceResponse {
             status: 200,
@@ -1427,6 +1574,7 @@ impl S3Service {
         marker: &str,
         max_keys: u32,
         delimiter: Option<&str>,
+        encoding_type: Option<&str>,
     ) -> Result<ServiceResponse, S3Error> {
         let engine = self.engine.read();
         if engine
@@ -1466,6 +1614,7 @@ impl S3Service {
             &page.common_prefixes,
             truncated,
             next_marker.as_deref(),
+            encoding_type,
         );
         Ok(ServiceResponse {
             status: 200,
@@ -1477,6 +1626,7 @@ impl S3Service {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn op_list_objects_v2(
         &self,
         bucket: &str,
@@ -1485,6 +1635,8 @@ impl S3Service {
         start_after: Option<&str>,
         max_keys: u32,
         delimiter: Option<&str>,
+        fetch_owner: bool,
+        encoding_type: Option<&str>,
     ) -> Result<ServiceResponse, S3Error> {
         let engine = self.engine.read();
         if engine
@@ -1558,6 +1710,8 @@ impl S3Service {
             truncated,
             next.as_deref(),
             key_count,
+            fetch_owner,
+            encoding_type,
         );
         Ok(ServiceResponse {
             status: 200,
@@ -1602,9 +1756,12 @@ impl S3Service {
         if let PayloadHash::HexSha256(expected) = &payload_hash {
             let actual = hex::encode(Sha256::digest(&req.body));
             if !actual.eq_ignore_ascii_case(expected) {
-                return Err(S3Error::new(S3ErrorCode::BadDigest).with_message(
-                    "The Content-SHA256 you specified did not match what we received.",
-                ));
+                // M9/B2:`x-amz-content-sha256` 不符报 XAmzContentSHA256Mismatch
+                // (BadDigest 保留给 Content-MD5 路径,与 AWS 错误码分工一致)
+                return Err(S3Error::new(S3ErrorCode::XAmzContentSHA256Mismatch)
+                    .with_message(
+                        "The provided 'x-amz-content-sha256' header does not match what was computed.",
+                    ));
             }
         }
         // Content-MD5
@@ -1635,6 +1792,9 @@ impl S3Service {
         }
 
         let mut engine = self.engine.write();
+        // M9/A1 配套:ACL 家族头显式校验(接受但不生效,单账号私有默认语义;
+        // 非法值显式报错,不静默)
+        validate_canned_acl(req)?;
         let meta = engine
             .put_with_meta(
                 bucket,
@@ -1642,6 +1802,7 @@ impl S3Service {
                 &mut std::io::Cursor::new(req.body.clone()),
                 header(req, "content-type"),
                 user_meta(req),
+                resp_headers_from(req),
             )
             .map_err(|e| map_engine_error(e, bucket, key))?;
         if md5_ok == Some(false) {
@@ -1708,30 +1869,75 @@ impl S3Service {
             }
         }
 
-        // Range
+        // Range(M9/B4:单段保持 206 + Content-Range;多段实现
+        // 206 multipart/byteranges,不再静默回整对象)
+        let mut range_parts: Option<Vec<RangePart>> = None;
+        if let Some(range) = header(req, "range") {
+            let parts = parse_range_multi(range, meta.size)?;
+            if parts.is_empty() {
+                // 全部不可满足(含空对象)→ 416;M9/B3 带头
+                // x-amz-actual-object-size(HTTP 层按 extra 注入)
+                return Err(S3Error::new(S3ErrorCode::InvalidRange)
+                    .with_extra("ActualObjectSize", &meta.size.to_string())
+                    .with_message("The requested range is not satisfiable"));
+            }
+            range_parts = Some(parts);
+        }
+        match &range_parts {
+            Some(parts) if parts.len() > 1 => {
+                // —— 多段:multipart/byteranges 206 ——
+                let boundary = format!("fasts3-{:016x}", rand_hex());
+                let mut headers = vec![
+                    (
+                        "Content-Type".into(),
+                        format!("multipart/byteranges; boundary={boundary}"),
+                    ),
+                    ("ETag".into(), format!("\"{}\"", meta.etag_full())),
+                    ("Last-Modified".into(), xml::http_date(meta.mtime)),
+                    ("Accept-Ranges".into(), "bytes".into()),
+                    ("Content-Length".into(), "0".into()),
+                ];
+                for (k, v) in &meta.user_meta {
+                    headers.push((k.clone(), v.clone()));
+                }
+                for (k, v) in &meta.resp_headers {
+                    headers.push((k.clone(), v.clone()));
+                }
+                let total = meta.size;
+                let len = multipart_byte_length(&boundary, &meta.content_type, parts, total);
+                for (k, v) in headers.iter_mut() {
+                    if k == "Content-Length" {
+                        *v = len.to_string();
+                    }
+                }
+                let status = 206;
+                return Ok(ServiceResponse {
+                    status,
+                    headers,
+                    body: if head_only {
+                        ResponseBody::Empty
+                    } else {
+                        ResponseBody::MultiRange {
+                            bucket: bucket.to_string(),
+                            key: key.to_string(),
+                            ranges: parts.iter().map(|p| (p.start, p.end)).collect(),
+                            total,
+                            boundary,
+                            part_content_type: meta.content_type.clone(),
+                        }
+                    },
+                });
+            }
+            _ => {}
+        }
         let mut start = 0u64;
         let mut end = meta.size; // 开区间
         let mut is_range = false;
-        if let Some(range) = header(req, "range") {
-            let parsed = parse_range_header(range, meta.size)?;
-            match parsed {
-                RangeSpec::Full => {}
-                RangeSpec::Single { start: s, end: e } => {
-                    is_range = true;
-                    start = s;
-                    end = e.min(meta.size);
-                }
-                RangeSpec::Suffix(n) => {
-                    is_range = true;
-                    start = meta.size.saturating_sub(n);
-                    end = meta.size;
-                }
-                RangeSpec::Invalid => {
-                    return Err(S3Error::new(S3ErrorCode::InvalidRange)
-                        .with_extra("ActualObjectSize", &meta.size.to_string())
-                        .with_message("The requested range is not satisfiable"));
-                }
-            }
+        if let Some(parts) = &range_parts {
+            let p = parts[0];
+            is_range = true;
+            start = p.start;
+            end = p.end + 1;
         }
         if start >= meta.size && is_range {
             // 空对象(或 range 起点越界)+ 显式 range → 416
@@ -1749,6 +1955,10 @@ impl S3Service {
         headers.push(("Accept-Ranges".into(), "bytes".into()));
         headers.push(("Content-Length".into(), content_length.to_string()));
         for (k, v) in &meta.user_meta {
+            headers.push((k.clone(), v.clone()));
+        }
+        // M9/C3:回显头(Content-Encoding/Cache-Control/Expires)
+        for (k, v) in &meta.resp_headers {
             headers.push((k.clone(), v.clone()));
         }
         if is_range {
@@ -1838,7 +2048,15 @@ impl S3Service {
         // 惰性过期回收(每次创建顺带扫一遍,成本可忽略的规模)
         let _ = engine.sweep_expired_sessions(fs3_core::MULTIPART_TTL_SECS);
         let uid = engine
-            .create_multipart(bucket, key, header(req, "content-type"), user_meta(req))
+            .create_multipart(
+                bucket,
+                key,
+                header(req, "content-type"),
+                user_meta(req),
+                // M9/C3:Create 时携带的回显头(Content-Encoding 等)随会话
+                // 落到 Complete 后的对象上
+                resp_headers_from(req),
+            )
             .map_err(|e| map_engine_error(e, bucket, key))?;
         let xml = xml::render_initiate_multipart(bucket, key, &uid);
         Ok(ServiceResponse {
@@ -2114,6 +2332,7 @@ impl S3Service {
             &page,
             truncated,
             next,
+            &self.owner,
         );
         Ok(ServiceResponse {
             status: 200,
@@ -2291,13 +2510,14 @@ impl S3Service {
                 }
             }
         }
-        let (ct, um) = if directive == "REPLACE" {
+        let (ct, um, rh) = if directive == "REPLACE" {
             (
                 Some(header(req, "content-type").unwrap_or("application/octet-stream")),
                 Some(user_meta(req)),
+                Some(resp_headers_from(req)),
             )
         } else {
-            (None, None)
+            (None, None, None)
         };
         let meta = engine
             .copy_object(
@@ -2307,6 +2527,7 @@ impl S3Service {
                 key,
                 ct,
                 um.as_deref(),
+                rh.as_deref(),
             )
             .map_err(|e| map_engine_error(e, &copy_source.bucket, &copy_source.key))?;
         let xml = xml::render_copy_object(&meta.etag_full(), &xml::ts_to_rfc3339(meta.mtime));
@@ -2322,6 +2543,16 @@ impl S3Service {
 
     fn op_delete_object(&self, bucket: &str, key: &str) -> Result<ServiceResponse, S3Error> {
         let mut engine = self.engine.write();
+        // M9/②组:桶已删除后再删键 → NoSuchBucket(AWS/RGW 语义;
+        // s3-tests test_object_delete_key_bucket_gone)
+        if engine
+            .meta()
+            .get_bucket(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?
+            .is_none()
+        {
+            return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
+        }
         // S3 语义:删除不存在的对象返回 204(幂等)
         let _ = engine
             .delete(bucket, key)
@@ -2339,6 +2570,12 @@ impl S3Service {
         quiet: bool,
         keys: &[(String, Option<String>)],
     ) -> Result<ServiceResponse, S3Error> {
+        // M9/D1:单请求键数上限 1000(AWS 语义;超限显式 400,防超大体 DoS)
+        if keys.len() > 1000 {
+            return Err(S3Error::new(S3ErrorCode::MalformedXML).with_message(
+                "The XML you provided was not well-formed or did not validate against our published schema (maximum 1000 keys per DeleteObjects request)",
+            ));
+        }
         let mut engine = self.engine.write();
         if engine
             .meta()
@@ -2464,6 +2701,63 @@ fn user_meta(req: &S3Request) -> Vec<(String, String)> {
         .collect()
 }
 
+/// M9/C3+D5:从请求提取需在 GET/HEAD 回显的标准头:
+/// Content-Encoding(剔除 `aws-chunked` 传输编码标记)、Cache-Control、Expires。
+/// 值原样保存(客户端 Expires 的 ISO8601/RFC1123 形态原样回显,
+/// 保证 s3-tests `_compare_dates` 语义:回显即精确相等)。
+fn resp_headers_from(req: &S3Request) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Some(ce) = header(req, "content-encoding") {
+        // aws-chunked 是传输层编码(HTTP 层已解码),语义上不是内容编码:
+        // 逗号 token 剔除后回显剩余项(AWS 行为,s3-tests 逐组合断言)。
+        let stripped: Vec<&str> = ce
+            .split(',')
+            .map(|t| t.trim())
+            .filter(|t| !t.eq_ignore_ascii_case("aws-chunked"))
+            .collect();
+        if !stripped.is_empty() {
+            out.push(("content-encoding".into(), stripped.join(", ")));
+        }
+    }
+    if let Some(cc) = header(req, "cache-control") {
+        out.push(("cache-control".into(), cc.to_string()));
+    }
+    if let Some(exp) = header(req, "expires") {
+        out.push(("expires".into(), exp.to_string()));
+    }
+    out
+}
+
+/// M9/A1+C5:ACL 家族头显式校验——**接受但不生效**(单账号模型,对象/桶
+/// 恒为私有默认 ACL;行为声明见 README「已知开放项」与 ADR-14)。
+/// x-amz-acl 值必须是 AWS 已知 canned ACL(大小写不敏感);未知值 → 400
+/// InvalidArgument(显式报错,不静默)。x-amz-grant-* 仅校验存在性。
+fn validate_canned_acl(req: &S3Request) -> Result<(), S3Error> {
+    const KNOWN: &[&str] = &[
+        "private",
+        "public-read",
+        "public-read-write",
+        "authenticated-read",
+        "aws-exec-read",
+        "bucket-owner-read",
+        "bucket-owner-full-control",
+    ];
+    for (k, v) in &req.headers {
+        if k.eq_ignore_ascii_case("x-amz-acl") && !KNOWN.iter().any(|c| v.eq_ignore_ascii_case(c)) {
+            return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                .with_message(format!("The canned ACL you provided is not valid: {v}")));
+        }
+    }
+    Ok(())
+}
+
+/// 请求是否携带 ACL 家族头(CreateBucket 重建语义判定用,M9/C5)。
+fn has_acl_headers(req: &S3Request) -> bool {
+    req.headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("x-amz-acl") || k.starts_with("x-amz-grant-"))
+}
+
 /// 桶名校验(AWS 规则子集)。
 fn validate_bucket_name(name: &str) -> Result<(), S3Error> {
     // AWS:禁止形如 IPv4 地址的桶名(如 192.168.5.123)
@@ -2497,58 +2791,101 @@ fn validate_bucket_name(name: &str) -> Result<(), S3Error> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum RangeSpec {
-    Full,
-    Single { start: u64, end: u64 },
-    Suffix(u64),
-    Invalid,
+/// 归一化后的 Range 段(闭区间 [start, end];由 parse_range_multi 保证有序且
+/// 不重叠——相邻段已合并,与 RFC 7233 服务器合并语义一致)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RangePart {
+    start: u64,
+    end: u64,
 }
 
-/// 解析 Range 头(单段;多段 → Invalid,与 AWS 单段语义近似)。
-fn parse_range_header(h: &str, size: u64) -> Result<RangeSpec, S3Error> {
+/// M9/B4:多段 Range 解析(AWS/RFC 7233 语义):
+/// - `bytes=` 前缀缺失或体为空 → 400 InvalidArgument;
+/// - 任一子段语法错误(非数字等)→ 400 InvalidArgument;
+/// - 语义不可满足的子段(start ≥ size / start > end / suffix=0)→ **忽略**,
+///   其余有效段照常返回(多段场景;单段不可满足 → 空结果 → 416);
+/// - 子段截断到对象长度;重叠/相邻段合并。
+fn parse_range_multi(h: &str, size: u64) -> Result<Vec<RangePart>, S3Error> {
+    let invalid = || S3Error::new(S3ErrorCode::InvalidArgument).with_message("invalid Range");
     let h = h.trim();
-    let body = h
-        .strip_prefix("bytes=")
-        .ok_or_else(|| S3Error::new(S3ErrorCode::InvalidArgument).with_message("invalid Range"))?;
-    if body.contains(',') {
-        // 多段:M1 不支持,返回整对象(AWS 对不可满足多段返回整对象)
-        return Ok(RangeSpec::Full);
+    let body = h.strip_prefix("bytes=").ok_or_else(invalid)?;
+    if body.is_empty() {
+        return Err(invalid());
     }
-    let (a, b) = body
-        .split_once('-')
-        .ok_or_else(|| S3Error::new(S3ErrorCode::InvalidArgument).with_message("invalid Range"))?;
-    if a.is_empty() && b.is_empty() {
-        return Ok(RangeSpec::Invalid);
-    }
-    if a.is_empty() {
-        // suffix:bytes=-N
-        let n: u64 = b.parse().map_err(|_| {
-            S3Error::new(S3ErrorCode::InvalidArgument).with_message("invalid Range")
-        })?;
-        if n == 0 {
-            return Ok(RangeSpec::Invalid);
+    let mut out: Vec<RangePart> = Vec::new();
+    for raw in body.split(',') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
         }
-        return Ok(RangeSpec::Suffix(n));
+        let (a, b) = raw.split_once('-').ok_or_else(invalid)?;
+        if a.is_empty() && b.is_empty() {
+            continue; // "bytes=-" 不可满足,忽略
+        }
+        if a.is_empty() {
+            // suffix:bytes=-N
+            let n: u64 = b.parse().map_err(|_| invalid())?;
+            if n == 0 {
+                continue; // bytes=-0 不可满足,忽略
+            }
+            if size == 0 {
+                continue;
+            }
+            let start = size.saturating_sub(n);
+            out.push(RangePart {
+                start,
+                end: size - 1,
+            });
+            continue;
+        }
+        let start: u64 = a.parse().map_err(|_| invalid())?;
+        if start >= size {
+            continue; // 起点越界 → 该段不可满足,忽略
+        }
+        let end: u64 = if b.is_empty() {
+            size - 1
+        } else {
+            let e: u64 = b.parse().map_err(|_| invalid())?;
+            e.min(size - 1)
+        };
+        if end < start {
+            continue; // start > end → 不可满足,忽略
+        }
+        out.push(RangePart { start, end });
     }
-    let start: u64 = a
-        .parse()
-        .map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument).with_message("invalid Range"))?;
-    if start >= size {
-        return Ok(RangeSpec::Invalid);
+    // 归一化:按起点排序,合并重叠/相邻段(RFC 7233 允许合并)
+    out.sort_by_key(|p| p.start);
+    let mut merged: Vec<RangePart> = Vec::with_capacity(out.len());
+    for p in out {
+        match merged.last_mut() {
+            Some(l) if p.start <= l.end.saturating_add(1) => l.end = l.end.max(p.end),
+            _ => merged.push(p),
+        }
     }
-    let end: u64 = if b.is_empty() {
-        size
-    } else {
-        let end: u64 = b.parse().map_err(|_| {
-            S3Error::new(S3ErrorCode::InvalidArgument).with_message("invalid Range")
-        })?;
-        end.min(size).max(start)
+    Ok(merged)
+}
+
+/// multipart/byteranges 响应体总长(RFC 7233):
+/// 每段 = `--boundary\r\n` + 头块(`Content-Type`/`Content-Range` +
+/// 空行)+ 段数据 + `\r\n`;收尾 = `--boundary--\r\n`。
+fn multipart_byte_length(
+    boundary: &str,
+    part_content_type: &str,
+    ranges: &[RangePart],
+    total: u64,
+) -> u64 {
+    let per_part_header = |p: &RangePart| {
+        format!(
+            "--{boundary}\r\nContent-Type: {part_content_type}\r\nContent-Range: bytes {}-{}/{total}\r\n\r\n",
+            p.start, p.end
+        )
+        .len() as u64
     };
-    Ok(RangeSpec::Single {
-        start,
-        end: if end < size { end + 1 } else { size },
-    })
+    let data: u64 = ranges.iter().map(|p| p.end - p.start + 1).sum();
+    let headers: u64 = ranges.iter().map(per_part_header).sum();
+    let crlf: u64 = 2 * ranges.len() as u64;
+    let tail = format!("--{boundary}--\r\n").len() as u64;
+    headers + data + crlf + tail
 }
 
 /// 解析 HTTP 日期(IMF-fixdate,秒级)。
@@ -2790,39 +3127,83 @@ mod tests {
 
     #[test]
     fn range_header_parsing() {
+        // 单段闭区间
         assert_eq!(
-            parse_range_header("bytes=0-99", 1000).unwrap(),
-            RangeSpec::Single { start: 0, end: 100 }
+            parse_range_multi("bytes=0-99", 1000).unwrap(),
+            vec![RangePart { start: 0, end: 99 }]
         );
+        // 开区间 → 截断到对象尾
         assert_eq!(
-            parse_range_header("bytes=100-", 1000).unwrap(),
-            RangeSpec::Single {
+            parse_range_multi("bytes=100-", 1000).unwrap(),
+            vec![RangePart {
                 start: 100,
-                end: 1000
-            }
+                end: 999
+            }]
+        );
+        // suffix
+        assert_eq!(
+            parse_range_multi("bytes=-50", 1000).unwrap(),
+            vec![RangePart {
+                start: 950,
+                end: 999
+            }]
+        );
+        // 越界起点 → 不可满足被忽略 → 空(M9/B4 语义:416 由调用方判定)
+        assert_eq!(parse_range_multi("bytes=5000-6000", 1000).unwrap(), vec![]);
+        // 多段:两段均有效 → 双段(M9/B4:不再静默回整对象)
+        assert_eq!(
+            parse_range_multi("bytes=0-1,4-5", 1000).unwrap(),
+            vec![
+                RangePart { start: 0, end: 1 },
+                RangePart { start: 4, end: 5 }
+            ]
+        );
+        // 截断到对象尾
+        assert_eq!(
+            parse_range_multi("bytes=0-999999", 1000).unwrap(),
+            vec![RangePart { start: 0, end: 999 }]
+        );
+        // 语法错误 → InvalidArgument
+        assert!(parse_range_multi("0-1", 1000).is_err());
+        assert!(parse_range_multi("bytes=", 1000).is_err());
+        assert!(parse_range_multi("bytes=abc-def", 1000).is_err());
+        // 混合:有效段 + 不可满足段 → 只留有效段;重叠/相邻合并
+        assert_eq!(
+            parse_range_multi("bytes=0-5,999999-9999999,6-10", 1000).unwrap(),
+            vec![RangePart { start: 0, end: 10 }]
         );
         assert_eq!(
-            parse_range_header("bytes=-50", 1000).unwrap(),
-            RangeSpec::Suffix(50)
+            parse_range_multi("bytes=0-3,3-5", 1000).unwrap(),
+            vec![RangePart { start: 0, end: 5 }]
         );
-        // 越界起点 → Invalid(416)
-        assert_eq!(
-            parse_range_header("bytes=5000-6000", 1000).unwrap(),
-            RangeSpec::Invalid
-        );
-        // 多段 → Full(AWS 对多段不可满足返回整对象;M1 简化)
-        assert_eq!(
-            parse_range_header("bytes=0-1,4-5", 1000).unwrap(),
-            RangeSpec::Full
-        );
-        // 截断
-        assert_eq!(
-            parse_range_header("bytes=0-999999", 1000).unwrap(),
-            RangeSpec::Single {
-                start: 0,
-                end: 1000
-            }
-        );
+    }
+
+    #[test]
+    fn multipart_range_length() {
+        // 对照手工计算:单段 5 字节 + 边界帧
+        let ranges = vec![RangePart { start: 0, end: 4 }];
+        let len = multipart_byte_length("B", "text/plain", &ranges, 11);
+        let expected = "--B\r\nContent-Type: text/plain\r\nContent-Range: bytes 0-4/11\r\n\r\n"
+            .len() as u64
+            + 5
+            + 2
+            + "--B--\r\n".len() as u64;
+        assert_eq!(len, expected);
+        // 双段
+        let ranges2 = vec![
+            RangePart { start: 0, end: 0 },
+            RangePart { start: 5, end: 9 },
+        ];
+        let len2 = multipart_byte_length("B", "text/plain", &ranges2, 11);
+        let p1 = "--B\r\nContent-Type: text/plain\r\nContent-Range: bytes 0-0/11\r\n\r\n".len()
+            as u64
+            + 1
+            + 2;
+        let p2 = "--B\r\nContent-Type: text/plain\r\nContent-Range: bytes 5-9/11\r\n\r\n".len()
+            as u64
+            + 5
+            + 2;
+        assert_eq!(len2, p1 + p2 + "--B--\r\n".len() as u64);
     }
 
     #[test]
@@ -2857,5 +3238,208 @@ mod tests {
                 ("x-amz-meta-b".into(), "2".into())
             ]
         );
+    }
+
+    // ── M9/A1:未实现头显式拒绝(逐头覆盖) ──
+
+    fn headers_req(headers: &[(&str, &str)]) -> S3Request {
+        S3Request {
+            method: "PUT".into(),
+            raw_path: "/b/k".into(),
+            decoded_path: "/b/k".into(),
+            host: "localhost".into(),
+            query: vec![],
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            body: vec![],
+        }
+    }
+
+    #[test]
+    fn unimplemented_headers_explicitly_rejected() {
+        let (_d, _engine, service) = service_fixture();
+        // A1:SSE 家族 + tagging + object-lock + website 重定向 → 501 NotImplemented
+        for h in [
+            "x-amz-server-side-encryption",
+            "x-amz-server-side-encryption-aws-kms-key-id",
+            "x-amz-server-side-encryption-context",
+            "x-amz-server-side-encryption-bucket-key-enabled",
+            "x-amz-server-side-encryption-customer-algorithm",
+            "x-amz-server-side-encryption-customer-key",
+            "x-amz-server-side-encryption-customer-key-md5",
+            "x-amz-sse-kms-key-id",
+            "x-amz-tagging",
+            "x-amz-object-lock-mode",
+            "x-amz-object-lock-retain-until-date",
+            "x-amz-object-lock-legal-hold",
+            "x-amz-website-redirect-location",
+        ] {
+            let req = headers_req(&[(h, "some-value")]);
+            let err = service.check_unimplemented_headers(&req).unwrap_err();
+            assert_eq!(err.code, S3ErrorCode::NotImplemented, "header {h}");
+            assert_eq!(err.status(), 501, "header {h}");
+        }
+        // storage-class:STANDARD 接受(显式 no-op);其它 → InvalidStorageClass
+        let ok = headers_req(&[("x-amz-storage-class", "STANDARD")]);
+        assert!(service.check_unimplemented_headers(&ok).is_ok());
+        for v in ["STANDARD_IA", "GLACIER", "REDUCED_REDUNDANCY", "bogus"] {
+            let req = headers_req(&[("x-amz-storage-class", v)]);
+            let err = service.check_unimplemented_headers(&req).unwrap_err();
+            assert_eq!(err.code, S3ErrorCode::InvalidStorageClass, "class {v}");
+            assert_eq!(err.status(), 400, "class {v}");
+        }
+        // 无未实现头 → 放行
+        let plain = headers_req(&[
+            ("content-type", "text/plain"),
+            ("x-amz-meta-ok", "1"),
+            ("cache-control", "max-age=10"),
+        ]);
+        assert!(service.check_unimplemented_headers(&plain).is_ok());
+    }
+
+    #[test]
+    fn unimplemented_error_xml_is_standard_and_clean() {
+        // A2:拒绝响应为标准错误 XML;不泄露内部细节(无引擎/设备信息)
+        let err = S3Error::new(S3ErrorCode::NotImplemented).with_message(
+            "The header 'x-amz-sse-kms-key-id' implies functionality that is not implemented.",
+        );
+        let xml = err.render_xml("REQ1", "REQ1/HOST");
+        assert!(xml.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error>"));
+        assert!(xml.contains("<Code>NotImplemented</Code>"));
+        assert!(xml.contains("<RequestId>REQ1</RequestId>"));
+        assert!(xml.contains("<HostId>REQ1/HOST</HostId>"));
+        assert!(xml.ends_with("</Error>"));
+        // 内部实现字样不得出现在错误面
+        for leak in ["engine", "rocksdb", "extent", "device", "panic", "fs3-"] {
+            assert!(!xml.to_lowercase().contains(leak), "leak: {leak}");
+        }
+        let err2 = S3Error::new(S3ErrorCode::InvalidStorageClass);
+        assert_eq!(err2.status(), 400);
+        assert!(err2
+            .render_xml("R", "H")
+            .contains("<Code>InvalidStorageClass</Code>"));
+    }
+
+    #[test]
+    fn canned_acl_validation() {
+        // 已知 canned 值 → 接受不生效;未知值 → InvalidArgument
+        for v in [
+            "private",
+            "public-read",
+            "public-read-write",
+            "authenticated-read",
+        ] {
+            let ok_req = headers_req(&[("x-amz-acl", v)]);
+            assert!(validate_canned_acl(&ok_req).is_ok(), "acl {v}");
+        }
+        let bad = headers_req(&[("x-amz-acl", "everyone")]);
+        let err = validate_canned_acl(&bad).unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::InvalidArgument);
+        // grant 头仅校验存在性(接受)
+        let grants = headers_req(&[("x-amz-grant-read", "id=abc")]);
+        assert!(validate_canned_acl(&grants).is_ok());
+    }
+
+    // ── M9/C3+D5:回显头采集 ──
+
+    #[test]
+    fn resp_headers_extraction_strips_aws_chunked() {
+        let req = headers_req(&[
+            ("content-encoding", "gzip"),
+            ("cache-control", "public, max-age=14400"),
+            ("expires", "Tue, 20 Aug 2024 12:00:00 GMT"),
+        ]);
+        assert_eq!(
+            resp_headers_from(&req),
+            vec![
+                ("content-encoding".into(), "gzip".into()),
+                ("cache-control".into(), "public, max-age=14400".into()),
+                ("expires".into(), "Tue, 20 Aug 2024 12:00:00 GMT".into()),
+            ]
+        );
+        // aws-chunked 是传输编码:剔除,不残留
+        let ce = headers_req(&[("content-encoding", "gzip, aws-chunked")]);
+        assert_eq!(
+            resp_headers_from(&ce),
+            vec![("content-encoding".into(), "gzip".into())]
+        );
+        let ce2 = headers_req(&[("content-encoding", "aws-chunked, gzip")]);
+        assert_eq!(
+            resp_headers_from(&ce2),
+            vec![("content-encoding".into(), "gzip".into())]
+        );
+        let ce3 = headers_req(&[("content-encoding", "aws-chunked")]);
+        assert!(resp_headers_from(&ce3).is_empty());
+        let ce4 = headers_req(&[("content-encoding", "aws-chunked, aws-chunked")]);
+        assert!(resp_headers_from(&ce4).is_empty());
+        let ce5 = headers_req(&[("content-encoding", "deflate, gzip")]);
+        assert_eq!(
+            resp_headers_from(&ce5),
+            vec![("content-encoding".into(), "deflate, gzip".into())]
+        );
+        // 无相关头 → 空
+        let none = headers_req(&[("content-type", "text/plain")]);
+        assert!(resp_headers_from(&none).is_empty());
+    }
+
+    // ── M9/D1:DeleteObjects 键数上限 ──
+
+    #[test]
+    fn delete_objects_key_limit() {
+        let (_d, engine, service) = service_fixture();
+        {
+            let e = engine.write();
+            e.meta()
+                .commit_bucket_put(
+                    "b1",
+                    &BucketMeta {
+                        created: 1,
+                        owner: "u".into(),
+                        stats: Default::default(),
+                        quota: None,
+                        created_with_acl: false,
+                    },
+                )
+                .unwrap();
+        }
+        // 1000 键 → 允许;1001 键 → 400 MalformedXML
+        let keys1000: Vec<(String, Option<String>)> =
+            (0..1000).map(|i| (format!("k{i}"), None)).collect();
+        let r1000 = service.op_delete_objects("b1", true, &keys1000);
+        assert!(r1000.is_ok());
+        let keys1001: Vec<(String, Option<String>)> =
+            (0..1001).map(|i| (format!("k{i}"), None)).collect();
+        let err = service
+            .op_delete_objects("b1", true, &keys1001)
+            .unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::MalformedXML);
+        assert_eq!(err.status(), 400);
+    }
+
+    // ── M9/D4:每请求 trace id ──
+
+    #[test]
+    fn request_trace_contains_host_and_request_id() {
+        let (_d, _engine, service) = service_fixture();
+        let rid = "ABC123";
+        let trace = service.request_trace(rid);
+        assert!(trace.starts_with("ABC123/"));
+        assert!(trace.len() > rid.len());
+        // 与错误渲染同源:XML HostId == x-amz-id-2(每请求不同)
+        let headers = service.base_headers();
+        let id2 = headers
+            .iter()
+            .find(|(k, _)| k == "x-amz-id-2")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        let rid2 = headers
+            .iter()
+            .find(|(k, _)| k == "x-amz-request-id")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert_eq!(id2, format!("{rid2}/{}", service.host_id()));
+        assert_ne!(id2, "fasts3");
     }
 }

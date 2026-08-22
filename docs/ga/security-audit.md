@@ -1,6 +1,6 @@
 # docs/ga/security-audit.md — 外部安全审计(GA 前一次)与自审记录
 
-> TODO.md M8 交付③「外部安全审计(GA 前一次)」;ROADMAP §3.4 安全实践
+> [docs/archive/TODO-v1.0.0.md](./archive/TODO-v1.0.0.md) M8 交付③「外部安全审计(GA 前一次)」;ROADMAP §3.4 安全实践
 > 「审查:GA 前一次外部审计;此后每大版本一次;修复窗口 SLA(§7.4)」。
 >
 > 本文件 = 审计方案(范围/RFP/检查表)+ **自审实测记录**(本仓库环境可执行项,

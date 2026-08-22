@@ -58,23 +58,64 @@ S3TEST_CONF=/tmp/s3-tests/s3tests.conf tests/s3-tests/run_s3tests.sh
 
 ## 已知开放兼容项(v0.5.x 跟踪,不静默排除)
 
-以下项在 v0.5 门禁内「文档化排除」且公开跟踪,计划在 v0.5.x / M5 逐一关闭;
-均列于 `run_s3tests.sh` 的 `EXCLUDE`(②组),测试失败不会漏报:
+以下项在 v0.5 门禁内「文档化排除」且公开跟踪;M9(v1.0.1)已按 TODO M9
+逐项关闭并**从 `run_s3tests.sh` 的 `EXCLUDE` 移除**(复跑全量验证,见
+「M9 实测记录」);关闭证明 = 对应 s3-tests 用例通过,不再列于排除集:
 
-| 项 | 现象 | 计划 |
+| 项 | 关闭版本 | 关闭内容 |
 | --- | --- | --- |
-| 条件写:PUT/DELETE 的 If-(None-)Match、If-Match×LastModifiedTime/Size、DeleteObjects 条件、multipart 条件 PUT | 依赖 ETag/时间条件判定 | v0.5.x(服务端 ETag 已具备,补判定) |
-| 条件 GET 边界(If-Modified-Since=304 / If-None-Match) | 轻微响应差异 | v0.5.x |
-| ListObjectsV2 fetch-owner / encoding-type=url / delimiter 特殊键 | 列表渲染细节 | v0.5.x |
-| unicode 元数据往返、Cache-Control/Expires 响应回显 | 头/元数据细节 | v0.5.x |
-| 预签名 x-amz-expires 越界(>7d)/raw 断言 | 边界参数 | v0.5.x |
-| DeleteObjects 键数上限(1000)、bucket 已删后删键 | 错误语义细节 | v0.5.x |
-| bucket 重建属性保留、跨账号复制归属、列表/multipart owner 元素 | 单账号模型相关 | v0.5.x |
-| 匿名访问与 ACL 公开语义(list/object anonymous、anon put) | 与「默认私有」基线一致 | 维持关闭 |
-| RGW 专有 head_bucket_usage / head_extended / create_bucket_exists(botocore) | 非 S3 规范 | 恒排除 |
-| chunked + content-encoding(接收压缩) | 编码组合 | v0.5.x |
-| checksum / GetObjectAttributes | 校验栈统一(见排除矩阵) | v1.2 |
-| 新 ACL 族(object_acl*/canned/header_acl)、匿名 raw_get 族、special_key_names(尾部 PutObjectAcl)、Tagging、public block、bucket-owner 新语义、PUT 条件写新用例 | 2026 新版 s3-tests 用例命名,与排除矩阵语义同集 | 见排除矩阵(远期/v1.1/v1.2) |
+| ListObjectsV2 fetch-owner / encoding-type=url / delimiter 特殊键 | ✅ M9/C1 | fetch-owner 门控 Owner;V1/V2 `encoding-type=url`(含特殊键名往返)、delimiter 特殊键列表 |
+| unicode 元数据往返 | ✅ M9/C2 | 请求侧 UTF-8 解码(签名/回显一致)+ 回显侧字节还原,非 ASCII 元数据往返通过 |
+| Cache-Control/Expires 响应回显 | ✅ M9/C3 | 存元数据并回显(Content-Encoding 同机制,去 aws-chunked) |
+| 预签名 x-amz-expires 越界(>7d)/raw 断言 | ✅ M9/D2 | 越界 403 + OPTIONS 400(无 CORS)+ raw-get 断言族 |
+| DeleteObjects 键数上限(1000) | ✅ M9/D1 | >1000 键 → 400 MalformedXML |
+| 条件 GET 边界(If-Modified-Since=304 / If-None-Match) | 🟡 维持排除 | 服务端已按 AWS 顺序处理(412 → 304);s3-tests 断言差异仍在 `ifmodifiedsince` 排除项跟踪,M10 前复查 |
+| 多段 Range 静默回整对象 | ✅ M9/B4 | 206 multipart/byteranges(ADR-14) |
+| chunked + content-encoding | ✅ M9/D5 | aws-chunked 剔除 + 其余编码接收/回显 |
+| bucket 重建属性保留 | ✅ M9/C5 | 重复创建幂等 200 / 带 ACL 409 / 删除重建 = 全新属性 |
+| 条件写(PUT/DELETE 的 If-(None-)Match 等) | 🔜 M10 | 版本化条件写(依赖版本语义,TODO M10 V3-4) |
+| 列表/multipart owner 元素 | ✅ M9/C4(部分) | ListParts/版本条目 Owner 统一输出;`multipart_upload_owner` 用例依赖**多账号身份映射**(s3tests.conf 主/备用户共享同一 access key,服务端无法区分上传者),单账号模型下不可关闭 → 该用例移入「单账号模型限制」恒排除 |
+| 匿名访问与 ACL 公开语义(list/object anonymous、anon put) | 维持关闭 | 与「默认私有」基线一致 |
+| RGW 专有 head_bucket_usage / head_extended / create_bucket_exists(botocore) | 恒排除 | 非 S3 规范 |
+| checksum / GetObjectAttributes | 🔜 v1.2 | 校验栈统一(见排除矩阵) |
+| 新 ACL 族(object_acl*/canned/header_acl)、匿名 raw_get 族、special_key_names(尾部 PutObjectAcl)、Tagging、public block、bucket-owner 新语义、PUT 条件写新用例 | 见排除矩阵 | 2026 新版 s3-tests 用例命名,与排除矩阵语义同集 |
+
+### 单账号模型限制(恒排除,附理由)
+
+| 用例 | 不可关闭原因 |
+| --- | --- |
+| `test_list_multipart_upload_owner` | 断言 Initiator/Owner = s3tests.conf 中**每用户**的 user_id/display_name;本仓库测试配置主/备/租户用户共用同一对 access key(`tests/m8/regression.sh` 生成),单账号服务无法区分上传者 → 期望不满足。关闭需多账号身份映射(远期,与密钥状态语义同批评估)。服务端行为:每上传会话 Owner = 创建者 access key(单账号下统一),元素结构与 AWS 一致。 |
+| `test_object_copy_not_owned_bucket` / `test_object_copy_not_owned_object_bucket` | 断言**跨账号**复制被拒(源桶/对象不属于请求者);单账号模型下所有密钥同属一账号,复制必然允许 → 期望不满足(「跨账号复制归属」②组项)。关闭需多账号模型。 |
+| `test_bucket_create_exists_nonowner` | 断言备用账号建同名桶 409;单账号 +「重复创建幂等 200」语义下不成立(RGW"非 S3 规范"恒排项,botocore 版本差异亦曾导致 .status 不可用)。 |
+| `test_multipart_resend_first_finishes_last` | 客户端在**读体回调中同步发起同号分片重传**,Complete 得到重复分片号 [1,1];服务端按 REVIEW §3.10/AWS 严格递增校验 → 400 InvalidPartOrder。RGW 对该竞态有容忍;严格递增是本实现已落地的正确性门禁(AWS 同),该用例的竞态结果不进入排除集判定依据(专用回归见 fs3-engine)。 |
+
+### SSE 族显式拒绝(排除集内,M9/A1 预期行为)
+
+| 用例 | 说明 |
+| --- | --- |
+| `test_encrypted_transfer_*`(1b/1kb/1MB/13b) | botocore 托管传输开启 SSE-C 后向 PUT 携带 `x-amz-server-side-encryption-customer-*` 头;M9/A1 起服务端**显式 501 NotImplemented**(不再静默忽略),故用例失败属预期,归属排除矩阵「SSE-C / SSE-S3 / 桶加密 → v1.2」。加密栈实现后(M11)随族出排除集。 |
+
+## M9 实测记录(2026-08-22,v1.0.1 协议卫生补丁全量 gate)
+
+- 全量跑批(760+ 用例,新版 s3-tests)通过排除集 gate;M9 修复并关闭 ②组:
+  - **multipart 复合 ETag 标准修复**(ADR-14):Complete 后 ETag =
+    `MD5(binary(分片 MD5 拼接))-N`(s3-tests multipart 族全绿);
+  - **错误码分工**:`x-amz-content-sha256` 不符 → 400
+    XAmzContentSHA256Mismatch;Content-MD5 仍 BadDigest;
+  - **416 带头**:`x-amz-actual-object-size`(与 errors.md/AWS 对齐);
+  - **多段 Range**:206 multipart/byteranges(不再回整对象;RFC 7233
+    合并/忽略语义,ADR-14);
+  - **列表**:ListObjectsV1/V2 `encoding-type=url`(delimiter 特殊键 +
+    `not_skip_special` 通过)、V2 `fetch-owner` 门控 Owner;
+  - **元数据**:unicode 元数据逐字节往返(`test_object_set_get_unicode_metadata`
+    通过)、Cache-Control/Expires/Content-Encoding 回显
+    (`write_cache_control`/`write_expires`/`content_encoding_aws_chunked` 通过,
+    aws-chunked 剔除语义逐组合断言);
+  - **边界**:DeleteObjects >1000 键 400(`key_limit` 族通过)、预签名
+    X-Amz-Expires 越界 403 + OPTIONS 400 + raw-get 断言族(`x_amz_expires`
+    族通过)、桶重建幂等/409 语义(`not_overriding`/`recreate_overwrite` 通过)。
+- 未达关闭项的如实保留:条件写(🔜 M10)、条件 GET 边界(🟡 复查)、
+  `multipart_upload_owner`(单账号模型限制,见上表)。
 
 ## M8 实测记录(2026-08-21,GA 全量回归)
 

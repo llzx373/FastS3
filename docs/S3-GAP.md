@@ -162,21 +162,25 @@
 ### 3.7 协议正确性风险点(建议 v1.0.x 补丁轨道,共 12 项)
 
 > 这些不是"缺功能",而是"已支持功能的行为与 AWS 有差异",在企业客户端上会以怪异方式暴露。完整取证见 [s3-protocol-inventory.md](./s3-protocol-inventory.md) §7。
+>
+> **M9(v1.0.1)关闭状态**:✅ = 已修复(#1/#2/#3/#4/#5/#6/#8/#10/#12);
+> #7(密钥状态语义)、#9/#11(文档化合理项)维持。实现证据:ADR-14、
+> TODO M9 全项、tests/s3-tests/README M9 记录。
 
 | # | 风险点 | 现象 | 建议 |
 | --- | --- | --- | --- |
-| 1 | SSE/tagging/storage-class 头静默忽略 | 客户端以为加密/标签生效,实际没有——**合规误判风险最高** | v1.0.x:带这些头的请求显式返回 InvalidRequest/NotImplemented(§2.5 原则 6) |
-| 2 | 多段 Range 静默回整对象 | 断点续传/分段下载拿到错数据 | v1.0.x:实现 multipart/byteranges 206 或显式 416/501 |
-| 3 | multipart ETag 二进制 vs hex | 对账工具误判 | v1.0.x 修复新写入(文档化存量影响) |
-| 4 | Content-SHA256 不符报 BadDigest | AWS 为 XAmzContentSHA256Mismatch,SDK 重试分类依赖码名 | v1.0.x 补错误码 |
-| 5 | 416 响应用 XML extra 而非 `x-amz-actual-object-size` 头 | errors.md 声称带头,实现不符 | v1.0.x 对齐(带头) |
-| 6 | DeleteObjects 无 1000 键上限 | 超大请求 DoS 面 | v1.0.x 加限制 |
+| 1 | SSE/tagging/storage-class 头静默忽略 | 客户端以为加密/标签生效,实际没有——**合规误判风险最高** | ✅ M9/A1:501 NotImplemented / 400 InvalidStorageClass |
+| 2 | 多段 Range 静默回整对象 | 断点续传/分段下载拿到错数据 | ✅ M9/B4:206 multipart/byteranges |
+| 3 | multipart ETag 二进制 vs hex | 对账工具误判 | ✅ M9/B1:二进制拼接 MD5-N(存量影响文档化) |
+| 4 | Content-SHA256 不符报 BadDigest | AWS 为 XAmzContentSHA256Mismatch,SDK 重试分类依赖码名 | ✅ M9/B2:补错误码 |
+| 5 | 416 响应用 XML extra 而非 `x-amz-actual-object-size` 头 | errors.md 声称带头,实现不符 | ✅ M9/B3:带头 |
+| 6 | DeleteObjects 无 1000 键上限 | 超大请求 DoS 面 | ✅ M9/D1:超限 400 |
 | 7 | 禁用密钥 = InvalidAccessKeyId(与不存在同义) | 审计/运维无法区分 | 远期(密钥状态语义) |
-| 8 | host_id 恒为 "fasts3" | x-amz-id-2 无追踪价值 | 远期(注入请求 trace id) |
+| 8 | host_id 恒为 "fasts3" | x-amz-id-2 无追踪价值 | ✅ M9/D4:每请求 trace id |
 | 9 | h2 下 SigV4 依赖合成 Host 头 | 签 :authority 的客户端签名不匹配 | 文档化(主流客户端兼容) |
-| 10 | 匿名 + 流式 PUT 与缓冲 PUT 行为不一致 | 边界语义 | v1.0.x 统一 |
+| 10 | 匿名 + 流式 PUT 与缓冲 PUT 行为不一致 | 边界语义 | ✅ M9/D3:query 认证回退统一 |
 | 11 | region/service 严格匹配 | 非本区签名一律拒 | 文档化(单机产品合理) |
-| 12 | ListObjectsV2 fetch-owner / encoding-type=url 缺失 | 特殊键名(含 URL 需转义)客户端异常 | v1.0.x(encoding-type 低成本) |
+| 12 | ListObjectsV2 fetch-owner / encoding-type=url 缺失 | 特殊键名(含 URL 需转义)客户端异常 | ✅ M9/C1:V1/V2 均支持 |
 
 ## 4. 企业场景需求映射
 

@@ -215,6 +215,17 @@ fn empty_body() -> RespBody {
         .boxed()
 }
 
+/// 多段 Range 流:非空字节即发(空发返回 true 保持语义简单)。
+async fn send_range_bytes(
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    bytes: &[u8],
+) -> bool {
+    if !bytes.is_empty() && tx.send(Ok(Bytes::copy_from_slice(bytes))).await.is_err() {
+        return false;
+    }
+    true
+}
+
 fn bytes_body(b: Vec<u8>) -> RespBody {
     Full::new(Bytes::from(b))
         .map_err(|e| std::io::Error::other(e.to_string()))
@@ -239,16 +250,25 @@ impl Drop for AdmitGuard {
     }
 }
 
-fn error_response(e: &S3Error, host_id: &str) -> Response<RespBody> {
-    let request_id = format!("{:08X}", rand_u64());
-    let xml = e.render_xml(&request_id, host_id);
+fn error_response(e: &S3Error, host_id: &str, request_id: &str) -> Response<RespBody> {
+    // M9/D4:每请求 trace id:x-amz-id-2 = {request_id}/{host_id},与错误
+    // XML 的 HostId 元素一致(端到端追踪)。
+    let id2 = format!("{request_id}/{host_id}");
+    let xml = e.render_xml(request_id, &id2);
     let status = StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut builder = Response::builder()
         .status(status)
         .header("content-type", "application/xml")
         .header("x-amz-request-id", request_id)
-        .header("x-amz-id-2", host_id)
+        .header("x-amz-id-2", id2)
         .header("content-length", xml.len().to_string());
+    // M9/B3:416 InvalidRange 补 `x-amz-actual-object-size` 头(errors.md
+    // 声称带头,此前仅 XML extra;与 AWS 一致)
+    if e.code == fs3_s3::S3ErrorCode::InvalidRange {
+        if let Some((_, v)) = e.extra.iter().find(|(k, _)| k == "ActualObjectSize") {
+            builder = builder.header("x-amz-actual-object-size", v);
+        }
+    }
     // AWS 节流语义(准入/限速):503 恒带 Retry-After
     if status == StatusCode::SERVICE_UNAVAILABLE {
         builder = builder.header("retry-after", "5");
@@ -327,6 +347,21 @@ fn probe_response(service: &S3Service, path: &str, method: &str) -> Response<Res
         .unwrap()
 }
 
+/// M9/C2:请求头值按 UTF-8 解码(损失式;实测 botocore/urllib3 传输层对
+/// 非 ASCII 头值按 UTF-8 字节发送,而 SigV4 canonical 两侧都按 UTF-8 对
+/// 同一码点串哈希——服务端按 UTF-8 解码即可逐字节复原 canonical,
+/// unicode 元数据的签名/存储/回显全链路一致)。
+fn utf8_decode(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// M9/C2:回显头编码——客户端(http.client/urllib3)解码响应头按 Latin-1,
+/// 故按 Latin-1 码点→原字节发送(HeaderValue 允许 obs-text),unicode
+/// 元数据在客户端侧还原为原始码点(与 put 侧 UTF-8 canonical 解耦)。
+fn latin1_encode(s: &str) -> Vec<u8> {
+    s.chars().map(|c| c as u8).collect()
+}
+
 async fn handle(
     service: Arc<S3Service>,
     admission: Arc<crate::Admission>,
@@ -334,7 +369,10 @@ async fn handle(
     web_root: Option<std::path::PathBuf>,
     req: Request<Incoming>,
 ) -> Result<Response<RespBody>, std::convert::Infallible> {
-    let host_id = "fasts3";
+    // M9/D4:host_id 来自服务实例(随机 64 位 hex,替代恒值 "fasts3");
+    // 每请求 trace id = {request_id}/{host_id}(错误响应 XML HostId 同源)。
+    let host_id = service.host_id().to_string();
+    let request_id = format!("{:08X}", rand_u64());
     let method = req.method().as_str().to_string();
     // 协议感知(h2c prior-knowledge / ALPN h2):falsy 时关闭零拷贝渲染,
     // 防止 28 字节标记帧被当普通数据嵌入响应(REVIEW §2.2)。
@@ -347,6 +385,15 @@ async fn handle(
     //   GET /ready  → 200/503 就绪(含设备可写探测)
     if raw_path == "/health" || raw_path == "/ready" {
         return Ok(probe_response(service.as_ref(), raw_path.as_str(), &method));
+    }
+    // M9/D2 配套(s3-tests raw-get 预签名族断言):未配置 CORS 时 OPTIONS
+    // 显式 400(浏览器预检无 CORS 配置 = 跨源不可用;RGW 同语义)。
+    // serve_common 的预检分支只在配置了允许源且 Origin 命中时先行应答,
+    // 到不了这里。
+    if method == "OPTIONS" {
+        let err = S3Error::new(fs3_s3::S3ErrorCode::InvalidRequest)
+            .with_message("CORS is not enabled for this bucket.");
+        return Ok(error_response(&err, &host_id, &request_id));
     }
     // h1:Host 头;h2::authority 由 hyper 合成进 uri(uri().authority())。
     // 路由用去端口 host;h2 缺 Host 头时按原始 authority 合成签名用 host。
@@ -413,7 +460,8 @@ async fn handle(
         .map(|(k, v)| {
             (
                 k.as_str().to_lowercase(),
-                v.to_str().unwrap_or("").to_string(),
+                // M9/C2:按 UTF-8 解码保留码点(unicode 元数据签名/回显一致)
+                utf8_decode(v.as_bytes()),
             )
         })
         .collect();
@@ -458,7 +506,7 @@ async fn handle(
         if !admission.try_acquire(inflight) {
             let err = S3Error::new(fs3_s3::S3ErrorCode::SlowDown)
                 .with_message("Reduce your request rate.");
-            let mut resp = error_response(&err, "fasts3");
+            let mut resp = error_response(&err, &host_id, &request_id);
             resp.headers_mut()
                 .insert("retry-after", "5".parse().unwrap());
             return Ok(resp);
@@ -505,7 +553,8 @@ async fn handle(
         return Ok(render_with(
             service,
             result,
-            host_id,
+            &host_id,
+            &request_id,
             Some(admission.clone()),
             zc_ctx.map(|c| (c, is_h2)),
         ));
@@ -517,7 +566,7 @@ async fn handle(
         Err(e) => {
             let err = S3Error::new(fs3_s3::S3ErrorCode::IncompleteBody)
                 .with_message(format!("failed to read request body: {e}"));
-            return Ok(error_response(&err, host_id));
+            return Ok(error_response(&err, &host_id, &request_id));
         }
     };
     let mut s3req = s3req;
@@ -526,7 +575,8 @@ async fn handle(
     Ok(render_with(
         service,
         result,
-        host_id,
+        &host_id,
+        &request_id,
         Some(admission),
         zc_ctx.map(|c| (c, is_h2)),
     ))
@@ -537,16 +587,24 @@ fn render_with(
     service: Arc<S3Service>,
     result: Result<ServiceResponse, S3Error>,
     host_id: &str,
+    request_id: &str,
     admission: Option<Arc<crate::Admission>>,
     zc: Option<(crate::zero_copy::ZeroCtx, bool)>,
 ) -> Response<RespBody> {
     let resp = match result {
         Ok(r) => r,
-        Err(e) => return error_response(&e, host_id),
+        Err(e) => return error_response(&e, host_id, request_id),
     };
     let mut builder = Response::builder().status(StatusCode::from_u16(resp.status).unwrap());
     for (k, v) in &resp.headers {
-        builder = builder.header(k, v);
+        // M9/C2:响应头按 Latin-1 重编码(builder.header 对非 ASCII 会 panic;
+        // HeaderValue::from_bytes 允许 obs-text 字节,unicode 元数据可往返)
+        if let (Ok(name), Ok(val)) = (
+            hyper::header::HeaderName::try_from(k.as_str()),
+            hyper::header::HeaderValue::from_bytes(&latin1_encode(v)),
+        ) {
+            builder = builder.header(name, val);
+        }
     }
     match resp.body {
         ResponseBody::Empty => builder.body(empty_body()),
@@ -591,7 +649,7 @@ fn render_with(
                 Some(a) if !a.try_acquire(length) => {
                     let err = S3Error::new(fs3_s3::S3ErrorCode::SlowDown)
                         .with_message("Reduce your request rate.");
-                    let mut resp = error_response(&err, host_id);
+                    let mut resp = error_response(&err, host_id, request_id);
                     resp.headers_mut()
                         .insert("retry-after", "5".parse().unwrap());
                     return resp;
@@ -647,6 +705,84 @@ fn render_with(
                 }
             });
             // Frame 包装:StreamBody 需要 Stream<Item = Result<Frame<D>, E>>
+            let stream = ReceiverStream::new(rx).map(|r| r.map(hyper::body::Frame::data));
+            let body = StreamBody::new(stream).boxed();
+            builder.body(body)
+        }
+        // M9/B4:多段 Range 206 multipart/byteranges——逐段输出边界帧 +
+        // 段数据(零拷贝禁用;Content-Length 由服务层按字节精确算好)。
+        ResponseBody::MultiRange {
+            bucket,
+            key,
+            ranges,
+            total,
+            boundary,
+            part_content_type,
+        } => {
+            let total_len: u64 = ranges
+                .iter()
+                .map(|(s, e)| e.saturating_sub(*s) + 1)
+                .sum::<u64>()
+                + 5 * ranges.len() as u64
+                + total.to_string().len() as u64 * ranges.len() as u64;
+            // 准入按对象总长(近似;多段响应体略大于数据本身)
+            let admit = match &admission {
+                Some(a) if !a.try_acquire(total_len.max(total)) => {
+                    let err = S3Error::new(fs3_s3::S3ErrorCode::SlowDown)
+                        .with_message("Reduce your request rate.");
+                    let mut resp = error_response(&err, host_id, request_id);
+                    resp.headers_mut()
+                        .insert("retry-after", "5".parse().unwrap());
+                    return resp;
+                }
+                Some(a) => Some((a.clone(), total_len.max(total))),
+                None => None,
+            };
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+            let svc = service.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4 * 1024 * 1024];
+                for (s, e) in &ranges {
+                    let header = format!(
+                        "--{boundary}\r\nContent-Type: {part_content_type}\r\nContent-Range: bytes {s}-{e}/{total}\r\n\r\n"
+                    );
+                    if !send_range_bytes(&tx, header.as_bytes()).await {
+                        break;
+                    }
+                    let len = e - s + 1;
+                    let mut pos = 0u64;
+                    loop {
+                        let n = match svc.read_stream_chunk(&bucket, &key, *s, len, &mut pos, &mut buf)
+                        {
+                            Ok(n) => n,
+                            Err(err) => {
+                                let _ = tx
+                                    .send(Err(std::io::Error::other(err.render_xml("", ""))))
+                                    .await;
+                                break;
+                            }
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        if tx
+                            .send(Ok(Bytes::copy_from_slice(&buf[..n])))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    if !send_range_bytes(&tx, b"\r\n").await {
+                        break;
+                    }
+                }
+                let tail = format!("--{boundary}--\r\n");
+                let _ = send_range_bytes(&tx, tail.as_bytes()).await;
+                if let Some((a, n)) = &admit {
+                    a.release(*n);
+                }
+            });
             let stream = ReceiverStream::new(rx).map(|r| r.map(hyper::body::Frame::data));
             let body = StreamBody::new(stream).boxed();
             builder.body(body)

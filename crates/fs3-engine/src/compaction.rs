@@ -571,7 +571,8 @@ mod tests {
         e.put("b1", "a", &mut Cursor::new(d1.clone())).unwrap();
         e.put("b1", "b", &mut Cursor::new(d2.clone())).unwrap();
         // COW 复制 a → a2:共享 a 的段
-        e.copy_object("b1", "a", "b1", "a2", None, None).unwrap();
+        e.copy_object("b1", "a", "b1", "a2", None, None, None)
+            .unwrap();
         // 删除 b:extent 0 只剩 a+a2(共享)→ 活段 1MiB < 50% → 候选,但共享段跳过
         e.delete("b1", "b").unwrap();
         let r = e.compact_once().unwrap();
@@ -714,7 +715,7 @@ mod tests {
         let mut metas = Vec::new();
         for i in 0..4 {
             let uid = e
-                .create_multipart("b1", &format!("big{i}"), None, vec![])
+                .create_multipart("b1", &format!("big{i}"), None, vec![], vec![])
                 .unwrap();
             let pm = e
                 .upload_part(&uid, 1, &mut Cursor::new(payload.clone()))
@@ -792,7 +793,9 @@ mod tests {
             let data = vec![0x77u8; 1024 * 1024];
             e.put("b1", "k0", &mut Cursor::new(data.clone())).unwrap();
             // 分片同样写 extent 0:p: 前缀对象
-            let uid = e.create_multipart("b1", "big", None, vec![]).unwrap();
+            let uid = e
+                .create_multipart("b1", "big", None, vec![], vec![])
+                .unwrap();
             let pm = e
                 .upload_part(&uid, 1, &mut Cursor::new(data.clone()))
                 .unwrap();
