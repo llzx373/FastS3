@@ -5,6 +5,47 @@
 > 详细发布记录见 [RELEASES.md](./RELEASES.md);RC/GA 候选流程见
 > [docs/ga/rc-flow.md](./docs/ga/rc-flow.md)。
 
+## [Unreleased] — v1.1.0(季度 minor 轨道;M10 版本控制 + 4 补全项)
+
+M10 全部任务完成(TODO.md M10 全勾选);决策落盘 ADR-11(DESIGN.md §3.3,
+含实施期补遗 D1a/D7/D8/D9/D10);门禁全绿(实测记录见 TODO.md M10 段):
+
+- **版本控制(V1~V5)**:PutBucketVersioning(Off/Enabled/Suspended,Enabled→Off
+  拒绝;MfaDelete=Enabled 显式拒绝)+ GetBucketVersioning 真实配置;版本化键空间
+  `o:{bucket}\0{esc}\0{vk16}`(未版本化桶零改动,ADR-11 D1);删除标记(布尔位)+
+  `?versionId` 寻址(GET/HEAD/DELETE,标记 404/405 + x-amz-delete-marker);
+  ListObjectVersions 全语义(Version/DeleteMarker 条目、KeyMarker/VersionIdMarker
+  分页、delimiter、encoding-type);CopyObject 源版本寻址;multipart Complete =
+  新版本;跨状态转换当前版本解析(D1a:mtime 裁决 + 写侧保序,AWS null 版本语义)。
+- **条件写(D6)**:PUT If-Match(ETag/*)/If-None-Match: */×LastModifiedTime/×Size
+  (写锁内判定,412/404 语义对齐 AWS);DELETE/DeleteObjects 条件版本删除;
+  DeleteObjects LastModifiedTime 兼容 RFC7231/ISO8601 双格式。
+- **条件 GET 边界收敛(V4-4)**:304 响应补 ETag/Last-Modified 头;ifmodifiedsince/
+  ifnonematch 族出排除集。
+- **对象标签(S1)**:x-amz-tagging 头 + Put/Get/DeleteObjectTagging +
+  桶级 Tagging;ObjectMeta v3 tags 字段(ADR-11 D8);CopyObject tagging-directive。
+- **CORS(S2)**:Put/Get/DeleteBucketCors + 预检 OPTIONS(规则匹配 + Access-Control-*
+  响应;与 server.cors_allow_origins 并集放行);NoSuchCORSConfiguration 触发路径。
+- **桶策略(S3)**:Put/Get/DeleteBucketPolicy;policy.rs 扩展 Principal +
+  最小 Condition 键(IpAddress/StringLike 前缀);桶策略 × 密钥策略求交
+  (Deny 优先、已认证并集、匿名仅桶策略 Allow);NoSuchBucketPolicy/MalformedPolicy。
+- **POST 表单(S4)**:browser-based POST(multipart/form-data + base64 policy
+  文档校验 + SigV4/SigV2 表单签名;success_action_status/redirect;表单标签)。
+- **ownership controls(S7)**:Get/Put/DeleteBucketOwnershipControls 最小集
+  (单账号模型语义恒等,实测裁决);CreateBucket x-amz-object-ownership 头。
+- **数据面演进**:ObjectMeta v3 / BucketMeta v2 值格式(一次性预留 v1.2/v1.3
+  字段,ADR-11 D0;双读单写);`fasts3d rewrite-values` 在线值格式重写
+  (节流/暂停/幂等;重写完成前禁回滚);meta-export/import v2(版本条目/null 槽,
+  v1 JSON 双读);桶级配置键前缀族(D9:bc:/bt:/bo:/bp:,三处同步)。
+- **管理面(V7/S6)**:控制台对象详情「版本」区(浏览/恢复/永久删除)与标签编辑;
+  桶设置四 Tab(配额/版本化/CORS/策略);版本清理运维入口;审计检索覆盖全部新操作。
+- **缺陷修复(过程发现)**:fs3-alloc dec_live 压缩竞态(V4);压缩 extent 打包溢出
+  (S5);D1a 同秒误判(V6-1);GetObjectAttributes 显式 501(反静默)。已知跟进:
+  S8 压缩 × 流式读竞态根治(v1.1.x patch;`storage.compaction_enabled` 开关已缓解)。
+- **门禁**:s3-tests 全量 356/94/388/0 PASS;崩溃 500 轮零泄漏零漂移;升级演练
+  v1.0→v1.1 + 回滚全过;perf 未版本化回退 <5%(F-1 修复闭环,perf-M10.md);
+  覆盖率 81.82%(≥80%);cargo audit 0 漏洞;客户端矩阵含 restic/duplicati 实跑。
+
 ## [Unreleased] — v1.0.1(月度 patch 轨道;M9 协议卫生与正确性补丁)
 
 M9 全部任务完成(TODO.md M9 全勾选);协议一致性与工具链门禁全绿:

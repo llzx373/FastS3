@@ -14,4 +14,4 @@ pub mod util;
 pub use consts::*;
 pub use error::{Error, Result};
 pub use types::*;
-pub use util::random_bytes;
+pub use util::{new_version_vk, random_bytes, vk_time_us};

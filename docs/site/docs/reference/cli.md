@@ -100,6 +100,24 @@ fasts3d meta-import --config fasts3.toml --input meta-export.json [--force]
 不删除)。导入后引擎自动重放分配记录并写新检查点;对象内容位于设备数据区,
 元数据恢复后即重新可见。
 
+## rewrite-values —— 值格式在线重写(M10 V5-3;ADR-11 D0)
+
+```bash
+fasts3d rewrite-values --config fasts3.toml [--rate 500] [--pause-file /tmp/pause]
+```
+
+把存量 ObjectMeta v2 值(v1.0.x 写入)逐键重编码为 v3:快照全量扫描,
+已 v3 值与删除标记跳过,幂等可续跑;`--rate` 为每秒重写上限(Tier2
+节流,0 = 不限速),`--pause-file` 存在即暂停(轮询 1s,移除恢复)。
+**停机/维护窗口执行**(rocksdb 目录锁,与 serve 互斥);只触碰元数据,
+不改统计/分配,设备数据区不动。输出 `scanned=N rewritten=N ...` 摘要。
+
+**回滚纪律(DESIGN-FUTURE §2.4)**:重写完成(落持久标记
+`s:value_rewrite_v3_done`)前禁止回滚到 v1.0.x 二进制 —— v1.1 新写入
+与被重写的值均为 v3,旧二进制拒绝解码;此期间唯一回滚通道 =
+「meta-export 快照 + 底层卷快照」恢复。引擎启动时检测到残留 v2 值会
+打警告日志提示补跑。
+
 ## bench —— 引擎级基准(设备层直测)
 
 ## bench —— 引擎级基准(设备层直测)
@@ -131,6 +149,11 @@ fasts3d compact --config fasts3.toml --rounds 1   # 0 = 直到无候选
 ```
 
 在线迁移碎片 extent,打印报告;serve 常驻时后台自动运行(compaction.enabled)。
+
+> 已知限制(ADR-11 D10):压缩发现阶段跳过**版本条目与删除标记**
+> (`Op::ObjectMigrate` 只写未版本化键),版本化桶的打包空间回收暂不享受
+> 压缩收益(安全地不回收,绝不误写);版本条目段迁移(ObjectMigrateVersion)
+> 留 v1.x 跟进。
 
 ## 其它
 

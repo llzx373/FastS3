@@ -256,7 +256,7 @@ AWS 版本化桶可要求删除操作携带 MFA 一次性码。**推荐:v1.1 不
                                 checksum: Option<ChecksumInfo>,  // v1.2 填充,§4
                                 retention: Option<Retention>,    // v1.3 填充,§5
                                 legal_hold: bool,                // v1.3
-                                tags_hash: Option<u64> }         // tagging(远期)占位
+                                tags: Vec<(String,String)> }       // tagging(ADR-11 D8:真实字段,替代原 tags_hash 占位)
   桶配置:b:{bucket} → BucketMetaV2 = BucketMeta + { versioning: VersioningState(Off/Enabled/Suspended),
                                                     ...v1.2/v1.3 桶级配置占位 }
 ```
@@ -781,6 +781,7 @@ admin 通道已完备:unix/TCP + Bearer、keys/buckets/config(GET-PATCH,热字�
 | Access Points / Multi-Region Access Points | **不做**:多权限视图在单机产品中可用"多密钥 + 策略"表达;多区域入口与单机定位冲突 | 明确文档化 |
 | Directory Buckets / S3 Express One Zone | **不做**:单 AZ 高性能定位恰是 FastS3 本体(单机即 Express);目录桶的扁平键空间与 S3 语义差异大 | 文档化:FastS3 单机形态的延迟/IOPS 目标即对标 Express |
 | Object Lambda | **不做** | 可被"读代理/预签名 + 应用层"替代 |
+| Transfer Acceleration | **不做**:单机定位无边缘加速网络;加速由客户端就近部署/网关层承担 | 文档化 |
 | 归档存储类 / Glacier 分层 / RestoreObject | **评估**:若企业冷数据成本诉求强烈,以"zstd 压缩(v1.4)+ 生命周期(v1.2)"组合近似;真正的介质分层(HDD 层)依赖多设备(v1.4)作为底座 | 列入 v2.x 评估清单 |
 | S3 Batch Operations / Inventory | **评估**:Inventory(CSV 清单导出)复用 ListObjects 即可低成本实现(0.5~1 pw),Batch Operations 依赖通知/复制底座,后置 | Inventory 可作为 v1.x 运维增值 |
 
@@ -836,12 +837,12 @@ v1.0 基线 <256MiB 空载。远期特性开启态的常驻增量:多设备位�
 
 | 版本 | 主题 | 工作包合计(pw) | 2 人并行工期 | 说明 |
 | --- | --- | --- | --- | --- |
-| v1.1 | 版本控制 | ≈9.5 | ≈5 周 | 含条件写、在线值格式重写 |
+| v1.1 | 版本控制 | ≈13.5(9.5 + 4 补全) | ≈7 周 | 含条件写、在线值格式重写;补全 = S3-GAP §7 建议 1(标签/CORS/桶策略/POST) |
 | v1.2 | 生命周期 + 加密 + checksum | ≈13 | ≈7 周 | 三工作流可独立 RC |
 | v1.3 | Object Lock | ≈6 | ≈3 周 | 依赖 v1.1/v1.2 |
 | v1.4 | 多设备 + 元数据区(过渡)+ zstd | ≈12(不含 BlueFS B2) | ≈6 周 | B2 spike 后立项追加 5~7 pw |
-| v2.0 | 纳管 + HTTP/3 + 缓存 | ≈13.5 | ≈7 周 | 纳管 9 + H3 3.5 + 缓存 1.5 |
-| 合计 | — | ≈54 + 追加 | ≈28 周(约 7 个月) | 与 ROADMAP 9~24 个月窗口相符(含评审/修复缓冲) |
+| v2.0 | 纳管 + HTTP/3 + 缓存 | ≈14 | ≈7 周 | 纳管 9 + H3 3.5 + 缓存 1.5 |
+| 合计 | — | ≈58.5 + 追加 | ≈28 周(约 7 个月) | 与 ROADMAP 9~24 个月窗口相符(含评审/修复缓冲) |
 
 ### 10.2 风险与预案(远期专项)
 
@@ -880,7 +881,9 @@ v1.0 基线 <256MiB 空载。远期特性开启态的常驻增量:多设备位�
 | DE3 | §4.2 | SSE-C 复制语义 | 目标未加密 → InvalidRequest 显式报错 | — |
 | DE4 | §4.2 | 预签名/表单 | 预签名天然支持(签名头);POST 表单不做 | — |
 | DS1 | §4.3 | SSE-S3 密钥架构 | KEK(可轮换)+ 每对象 DEK(wrapped 存元数据) | — |
-| DS2 | §4.3 | SSE-KMS | 不做,KMS 参数显式拒绝 | — |
+| DS2 | §4.3 | SSE-S3 桶级配置语义 | PUT/GET/DELETE ?encryption + AES256 对象头回显 | — |
+| DS3 | §4.3 | 桶默认加密 | BucketMeta v2 default_encryption;未带头 PUT 自动加密 | — |
+| DS4 | §4.3 | SSE-KMS | 不做,KMS 参数显式拒绝 | — |
 | DL6 | §5.3 | 可信时钟 | a:持久化 wall+mono 对 + 单调推导 + 回拨取下界 | ADR-13 |
 | DL7 | §5.3 | 治理 bypass 授权 | 策略引擎加两个 Condition 键 + 强制审计 | — |
 | DL8 | §5.3 | 生命周期×锁次序 | 生命周期跳过锁定对象并计指标 | — |

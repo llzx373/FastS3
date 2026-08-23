@@ -273,8 +273,27 @@ impl Allocator {
 
     /// 递减 live_bytes;归零 → 清位图 + 记 ref_dec(同 draft 同事务)。
     fn dec_live(&self, draft: &mut Staged, id: u64, len: u32) {
-        let prev = self.live_bytes[id as usize].fetch_sub(len, Ordering::AcqRel);
-        debug_assert!(prev >= len, "live_bytes underflow for extent {id}");
+        // CAS 递减(防御):压缩器不经引擎大锁(ADR-9 §6.3),其「先暂存释放、
+        // 切换事务校验回滚」的流水与并发写释放同段存在竞态——段可能已被
+        // 释放(余额不足)。此时**不做任何变更**(尤其不动位图:extent 可能
+        // 已重分配给新对象,误清 = 数据损坏);切换事务的段校验将失败并回滚
+        // (ObjectChanged,compaction 阶段 3)。引擎写路径经大锁串行,余额
+        // 必然充足,不会走此分支(同 refcount 的幂等防御,release_object)。
+        let mut prev = self.live_bytes[id as usize].load(Ordering::Acquire);
+        loop {
+            if prev < len {
+                return;
+            }
+            match self.live_bytes[id as usize].compare_exchange_weak(
+                prev,
+                prev - len,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(cur) => prev = cur,
+            }
+        }
         if prev > len {
             draft.live_dec.push((id, len));
             return;
@@ -669,6 +688,43 @@ mod tests {
         assert_eq!(d.ref_dec.len(), n_before + 1);
         assert_eq!(a.state_of(id), ExtentState::Free);
         assert_eq!(a.leaks(), vec![]);
+        Ok(())
+    }
+
+    #[test]
+    fn release_stale_segment_underflow_is_noop() -> Result<()> {
+        // V4-4 回归:压缩器(无引擎锁)与并发写释放同段的竞态下,过期释放
+        // (余额不足)必须是无副作用 no-op——不 panic、不动 live_bytes/位图/
+        // 状态。原 debug_assert 在此竞态下 panic,毒化 shared 锁拖垮全部
+        // HTTP worker(PoisonError 级联);release 模式则可能误清已重分配
+        // extent 的位图(数据损坏窗口)。
+        let a = Allocator::new(16);
+        let mut d = Staged::default();
+        let id = a.allocate(&mut d, 1)?[0];
+        a.mark_open(id);
+        let s1 = seg(id as u32, 0, 100 * 4096);
+        a.add_object(&mut d, std::slice::from_ref(&s1));
+        // 正常释放一次:归零清位
+        let mut d2 = Staged::default();
+        a.release_object(&mut d2, std::slice::from_ref(&s1));
+        assert_eq!(a.live_bytes_of(id), 0);
+        assert!(!a.test_bit(id));
+        // 过期重放同段:不 panic、账目零变化、无新账簿记录
+        let mut d3 = Staged::default();
+        a.release_object(&mut d3, std::slice::from_ref(&s1));
+        assert_eq!(a.live_bytes_of(id), 0, "重复释放不改账目");
+        assert!(d3.live_dec.is_empty() && d3.ref_dec.is_empty());
+        // extent 重分配后,过期大段释放不得误扣/误清
+        let mut d4 = Staged::default();
+        let id2 = a.allocate(&mut d4, 1)?[0];
+        assert_eq!(id2, id, "回收后重分配同一 extent");
+        a.mark_open(id2);
+        let s2 = seg(id2 as u32, 0, 4096);
+        a.add_object(&mut d4, std::slice::from_ref(&s2));
+        let mut d5 = Staged::default();
+        a.release_object(&mut d5, &[seg(id2 as u32, 0, 65536)]);
+        assert_eq!(a.live_bytes_of(id2), 4096, "过期大段释放被跳过");
+        assert!(a.test_bit(id2), "位图不被误清");
         Ok(())
     }
 

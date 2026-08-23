@@ -369,6 +369,8 @@ fn inline_with_meta_headers() {
             Some("text/plain"),
             vec![("x-amz-meta-foo".into(), "bar".into())],
             vec![("cache-control".into(), "max-age=60".into())],
+            vec![],
+            None,
         )
         .unwrap();
     assert_eq!(m.content_type, "text/plain");
@@ -404,6 +406,7 @@ fn multipart_upload_complete_roundtrip() {
             Some("text/bla"),
             vec![("k".into(), "v".into())],
             vec![("content-encoding".into(), "gzip".into())],
+            Vec::new(),
         )
         .unwrap();
     assert_eq!(uid.len(), 32);
@@ -468,7 +471,7 @@ fn multipart_extent_concat_no_copy() {
     let (_d, cfg) = setup();
     let mut e = open_engine(&cfg);
     let uid = e
-        .create_multipart("b1", "big", None, vec![], vec![])
+        .create_multipart("b1", "big", None, vec![], Vec::new(), vec![])
         .unwrap();
     let mut total_refs = 0usize;
     let mut parts_meta = Vec::new();
@@ -500,7 +503,7 @@ fn multipart_parts_pack_with_objects() {
     let (_d, cfg) = setup();
     let mut e = open_engine(&cfg);
     let uid = e
-        .create_multipart("b1", "big", None, vec![], vec![])
+        .create_multipart("b1", "big", None, vec![], Vec::new(), vec![])
         .unwrap();
     // 5MiB 分片:独占整块 + 尾段(1028KiB,开放)
     let p1 = e
@@ -542,7 +545,9 @@ fn multipart_parts_pack_with_objects() {
 fn multipart_validation_errors() {
     let (_d, cfg) = setup();
     let mut e = open_engine(&cfg);
-    let uid = e.create_multipart("b1", "k", None, vec![], vec![]).unwrap();
+    let uid = e
+        .create_multipart("b1", "k", None, vec![], Vec::new(), vec![])
+        .unwrap();
 
     // 未知会话
     assert!(matches!(
@@ -614,7 +619,9 @@ fn multipart_validation_errors() {
 fn multipart_abort_frees_extents() {
     let (_d, cfg) = setup();
     let mut e = open_engine(&cfg);
-    let uid = e.create_multipart("b1", "k", None, vec![], vec![]).unwrap();
+    let uid = e
+        .create_multipart("b1", "k", None, vec![], Vec::new(), vec![])
+        .unwrap();
     e.upload_part(&uid, 1, &mut Cursor::new(vec![1u8; 5 * 1024 * 1024]))
         .unwrap();
     assert!(e.alloc.allocated_count() >= 1);
@@ -690,7 +697,9 @@ fn copy_object_cow_share_and_release() {
 fn multipart_sweep_expired() {
     let (_d, cfg) = setup();
     let mut e = open_engine(&cfg);
-    let uid = e.create_multipart("b1", "k", None, vec![], vec![]).unwrap();
+    let uid = e
+        .create_multipart("b1", "k", None, vec![], Vec::new(), vec![])
+        .unwrap();
     e.upload_part(&uid, 1, &mut Cursor::new(vec![1u8; 5 * 1024 * 1024]))
         .unwrap();
     let n = e.sweep_expired_sessions(0).unwrap();
@@ -1552,6 +1561,7 @@ fn etag_fast_crc32c_mode() {
             Some("application/octet-stream"),
             Vec::new(),
             vec![],
+            Vec::new(),
         )
         .unwrap();
     let part_data = rnd(16 * 1024, 13);
@@ -1596,7 +1606,7 @@ fn multipart_complete_with_holes_uses_request_subset() {
     let (_d, cfg) = setup();
     let mut e = open_engine(&cfg);
     let uid = e
-        .create_multipart("b1", "sub", None, vec![], vec![])
+        .create_multipart("b1", "sub", None, vec![], Vec::new(), vec![])
         .unwrap();
     // 1 号分片极小(<5MiB,若被检查 EntityTooSmall 必失败;此处刻意不列
     // 入 complete 请求,验证不参与检查)
@@ -1641,7 +1651,7 @@ fn multipart_complete_with_holes_uses_request_subset() {
     // 单独验证 EntityTooSmall 仍对请求内非末分片生效:新会话,完成 [1, 2]
     // 必须先重开(上一个会话已 completed)
     let uid2 = e
-        .create_multipart("b1", "sub2", None, vec![], vec![])
+        .create_multipart("b1", "sub2", None, vec![], Vec::new(), vec![])
         .unwrap();
     let a = e
         .upload_part(&uid2, 1, &mut Cursor::new(vec![0xAAu8; 100]))
@@ -1652,4 +1662,1259 @@ fn multipart_complete_with_holes_uses_request_subset() {
     let r = e.complete_multipart("b1", "sub2", &uid2, &[(1, a.etag_hex()), (2, b.etag_hex())]);
     assert!(matches!(r, Err(Error::PartTooSmall(_))), "{r:?}");
     e.close().unwrap();
+}
+
+// ─────────────────── 版本化(M10/ADR-11,V2 引擎分叉) ───────────────────
+
+/// 测试直写桶版本化状态(V3 PutBucketVersioning 落地前的元数据层入口)。
+fn set_versioning(e: &Engine, state: VersioningState) {
+    let mut m = e.meta().get_bucket("b1").unwrap().unwrap();
+    m.versioning = state;
+    e.meta().commit_bucket_put("b1", &m).unwrap();
+}
+
+/// 测试辅助:确定性改写版本键/单键条目的 mtime(D1a 的 mtime 裁决需要
+/// 确定性时间序;引擎写路径 mtime 取墙钟秒,快路径测试内多次写会同秒)。
+/// `vk = None` 指遗留未版本化单键;统计零 delta(仅改时间戳)。
+fn set_entry_mtime(e: &Engine, bucket: &str, key: &str, vk: &[u8; 16], mtime: i64) {
+    let mut m = if *vk == VK_NULL {
+        // null 族:null 槽或遗留单键,哪个存在取哪个(D1a-4 同口径)
+        match e.meta().get_object_version(bucket, key, &VK_NULL).unwrap() {
+            Some(m) => (m, Some(VK_NULL)),
+            None => (e.meta().get_object(bucket, key).unwrap().unwrap(), None),
+        }
+    } else {
+        (
+            e.meta()
+                .get_object_version(bucket, key, vk)
+                .unwrap()
+                .unwrap(),
+            Some(*vk),
+        )
+    };
+    m.0.mtime = mtime;
+    let (meta, target) = (m.0, m.1);
+    if meta.is_delete_marker {
+        e.meta()
+            .commit_object_delete_current(
+                bucket,
+                key,
+                target.as_ref(),
+                &meta,
+                AllocDraft::default(),
+                StatsDelta::default(),
+            )
+            .unwrap();
+    } else {
+        match target {
+            Some(vk) => e
+                .meta()
+                .commit_object_put_version(
+                    bucket,
+                    key,
+                    &vk,
+                    &meta,
+                    AllocDraft::default(),
+                    StatsDelta::default(),
+                )
+                .unwrap(),
+            None => e
+                .meta()
+                .commit_object_put(
+                    bucket,
+                    key,
+                    &meta,
+                    AllocDraft::default(),
+                    StatsDelta::default(),
+                )
+                .unwrap(),
+        };
+    }
+}
+
+fn stats_of(e: &Engine) -> (u64, u64) {
+    let b = e.meta().get_bucket("b1").unwrap().unwrap();
+    (b.stats.objects, b.stats.bytes)
+}
+
+fn read_all(e: &Engine, bucket: &str, key: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    e.get_to(bucket, key, 0..u64::MAX, &mut out).unwrap();
+    out
+}
+
+fn read_version(e: &Engine, bucket: &str, key: &str, vk: &[u8; 16]) -> Vec<u8> {
+    let mut out = Vec::new();
+    e.get_to_version(bucket, key, Some(vk), 0..u64::MAX, &mut out)
+        .unwrap();
+    out
+}
+
+#[test]
+fn versioned_put_keeps_old_version_segments() {
+    // V2-2 Enabled:覆盖写 = 新版本;旧版本段不释放(旧版本元数据继续持有)。
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    set_versioning(&e, VersioningState::Enabled);
+    let d1 = rnd(100_000, 1); // extent 路径(> small_object_limit)
+    let d2 = rnd(200_000, 2);
+    let v1 = e
+        .put("b1", "k", &mut Cursor::new(d1.clone()))
+        .unwrap()
+        .version_id
+        .expect("Enabled 桶 PUT 返回 vk");
+    let v2 = e
+        .put("b1", "k", &mut Cursor::new(d2.clone()))
+        .unwrap()
+        .version_id
+        .unwrap();
+    assert!(v2 > v1, "vk 字典序 = 时间序");
+    // 当前版本 = 新写入;旧版本段不动、可精确读
+    assert_eq!(read_all(&e, "b1", "k"), d2);
+    assert_eq!(e.head_version("b1", "k", None).unwrap().size, 200_000);
+    assert_eq!(read_version(&e, "b1", "k", &v1), d1);
+    // 统计 D5:两个版本都入账(覆盖写 += 新版本,旧版本不扣)
+    assert_eq!(stats_of(&e), (2, 300_000));
+    assert_eq!(e.meta().list_key_versions("b1", "k").unwrap().len(), 2);
+    // 物理删除两版本 → 段逐一释放归零、统计归零
+    assert!(e.delete_version("b1", "k", Some(v1)).unwrap().is_some());
+    assert_eq!(stats_of(&e), (1, 200_000));
+    assert!(e.delete_version("b1", "k", Some(v2)).unwrap().is_some());
+    assert_eq!(stats_of(&e), (0, 0));
+    assert_eq!(e.allocator().allocated_count(), 0, "版本段全部释放");
+    e.close().unwrap();
+}
+
+#[test]
+fn versioned_delete_marker_and_version_delete() {
+    // V2-3 Enabled:无 versionId DELETE = 删除标记(不动数据段,零 delta);
+    // 带 versionId = 物理删除(幂等);当前回退语义。
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    set_versioning(&e, VersioningState::Enabled);
+    let d1 = rnd(100_000, 3);
+    let v1 = e
+        .put("b1", "k", &mut Cursor::new(d1.clone()))
+        .unwrap()
+        .version_id
+        .unwrap();
+    // 无 versionId DELETE → 删除标记
+    let dm = e.delete("b1", "k").unwrap().unwrap();
+    assert!(dm.is_delete_marker);
+    let vdm = dm.version_id.unwrap();
+    assert!(vdm > v1);
+    assert_eq!(stats_of(&e), (1, 100_000), "删除标记零 delta");
+    // 无 versionId 命中当前标记 → 可区分错误变体(协议层 404)
+    let err = e.head_version("b1", "k", None).unwrap_err();
+    assert!(
+        matches!(err, Error::DeleteMarker(ref m) if *m == hex::encode(vdm)),
+        "got {err:?}"
+    );
+    let err = e
+        .get_to_version("b1", "k", None, 0..u64::MAX, &mut Vec::new())
+        .unwrap_err();
+    assert!(matches!(err, Error::DeleteMarker(_)));
+    // 带 versionId 命中标记 → 同一变体(协议层 405)
+    let err = e.head_version("b1", "k", Some(&vdm)).unwrap_err();
+    assert!(matches!(err, Error::DeleteMarker(_)));
+    // 数据段未被标记触碰:旧版本仍可读
+    assert_eq!(read_version(&e, "b1", "k", &v1), d1);
+    // 列表隐藏当前为标记的 key
+    assert!(e.list_objects("b1", "").unwrap().is_empty());
+    assert!(e
+        .list_objects_page("b1", "", None, None, 10)
+        .unwrap()
+        .items
+        .is_empty());
+    // 重复 DELETE = 再插一条标记(vk 递增,与 AWS 一致)
+    let dm2 = e.delete("b1", "k").unwrap().unwrap();
+    let vdm2 = dm2.version_id.unwrap();
+    assert!(vdm2 > vdm);
+    // 版本不存在 → 幂等 Ok(None)(AWS 语义)
+    assert!(e
+        .delete_version("b1", "k", Some([0x99u8; 16]))
+        .unwrap()
+        .is_none());
+    // 删除两条标记版本(零 delta)→ 当前回退到 v1 数据版本
+    assert!(
+        e.delete_version("b1", "k", Some(vdm2))
+            .unwrap()
+            .unwrap()
+            .is_delete_marker
+    );
+    assert_eq!(stats_of(&e), (1, 100_000), "标记版本删除零 delta");
+    assert!(e.delete_version("b1", "k", Some(vdm)).unwrap().is_some());
+    assert_eq!(
+        read_all(&e, "b1", "k"),
+        d1,
+        "标记消失后当前回退到次新数据版本"
+    );
+    // Off 桶带 versionId → InvalidArgument(协议层拦截兜底)
+    e.ensure_bucket("b2").unwrap();
+    assert!(matches!(
+        e.delete_version("b2", "k", Some([1u8; 16])),
+        Err(Error::InvalidArgument(_))
+    ));
+    e.close().unwrap();
+}
+
+#[test]
+fn off_fast_path_state_aware_reads_equivalent() {
+    // F-1:桶状态感知读变体(head_version_for / read_at_version_for /
+    // object_segments_version_for / delete_version_for)在 Off 桶走单键
+    // 点读快速路径(不反扫),语义与全量 D1a 逐值等价;版本化桶行为不变。
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    // Off 桶(默认):内联小对象 + extent 大对象两形态
+    let small = rnd(100, 7);
+    let big = rnd(100_000, 8);
+    e.put("b1", "s", &mut Cursor::new(small.clone())).unwrap();
+    e.put("b1", "g", &mut Cursor::new(big.clone())).unwrap();
+    for (key, data) in [("s", &small), ("g", &big)] {
+        // head:状态感知变体 = 全量 D1a
+        let base = e.head_version("b1", key, None).unwrap();
+        let fast = e
+            .head_version_for("b1", key, None, VersioningState::Off)
+            .unwrap();
+        assert_eq!(base, fast);
+        // read_at:数据逐字节一致
+        let mut b1 = vec![0u8; data.len()];
+        let n1 = e.read_at_version("b1", key, None, 0, &mut b1).unwrap();
+        let mut b2 = vec![0u8; data.len()];
+        let n2 = e
+            .read_at_version_for("b1", key, None, 0, &mut b2, VersioningState::Off)
+            .unwrap();
+        assert_eq!(n1, n2);
+        assert_eq!(b1, b2);
+        assert_eq!(b2, *data);
+        // segments:裁剪结果一致
+        let seg = |segs: Option<Vec<DevSegment>>| {
+            segs.unwrap()
+                .iter()
+                .map(|s| (s.dev_offset, s.len))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            seg(e
+                .object_segments_version("b1", key, None, 0, data.len() as u64)
+                .unwrap()),
+            seg(e
+                .object_segments_version_for(
+                    "b1",
+                    key,
+                    None,
+                    0,
+                    data.len() as u64,
+                    VersioningState::Off
+                )
+                .unwrap()),
+        );
+    }
+    // Off 桶不存在键 → NotFound(协议层 404;快速路径同样判定)
+    let err = e
+        .head_version_for("b1", "ghost", None, VersioningState::Off)
+        .unwrap_err();
+    assert!(matches!(err, Error::NotFound(_)));
+    assert!(e
+        .object_segments_version_for("b1", "ghost", None, 0, 1, VersioningState::Off)
+        .unwrap()
+        .is_none());
+    // delete_version_for(Off)= 物理删除,与 delete_version 同语义
+    assert!(e
+        .delete_version_for("b1", "s", None, VersioningState::Off)
+        .unwrap()
+        .is_some());
+    assert!(e.head("b1", "s").unwrap().is_none());
+    assert!(e
+        .delete_version_for("b1", "ghost", None, VersioningState::Off)
+        .unwrap()
+        .is_none());
+    // Off 桶带非 null versionId → InvalidArgument(同 delete_version 口径)
+    assert!(matches!(
+        e.delete_version_for("b1", "g", Some([1u8; 16]), VersioningState::Off),
+        Err(Error::InvalidArgument(_))
+    ));
+
+    // —— 版本化桶:_for 与基础变体同路,行为不变 ——
+    set_versioning(&e, VersioningState::Enabled);
+    e.put("b1", "k", &mut Cursor::new(rnd(1000, 9))).unwrap();
+    e.put("b1", "k", &mut Cursor::new(rnd(2000, 10))).unwrap();
+    let base = e.head_version("b1", "k", None).unwrap();
+    let fast = e
+        .head_version_for("b1", "k", None, VersioningState::Enabled)
+        .unwrap();
+    assert_eq!(base, fast);
+    assert_eq!(fast.size, 2000);
+    // 当前为删除标记:两变体同报 DeleteMarker
+    e.delete("b1", "k").unwrap();
+    let e1 = e.head_version("b1", "k", None).unwrap_err();
+    let e2 = e
+        .head_version_for("b1", "k", None, VersioningState::Enabled)
+        .unwrap_err();
+    assert!(matches!(e1, Error::DeleteMarker(_)));
+    assert!(matches!(e2, Error::DeleteMarker(_)));
+    e.close().unwrap();
+}
+
+#[test]
+fn suspended_null_slot_semantics() {
+    // V2-2/V2-3 Suspended:写/删落 null 槽原地覆盖;旧 null 数据版本
+    // release + 统计先扣后加;对外 VersionId = "null"。
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    set_versioning(&e, VersioningState::Suspended);
+    let d1 = rnd(100_000, 4);
+    let d2 = rnd(60_000, 5);
+    let m1 = e.put("b1", "k", &mut Cursor::new(d1.clone())).unwrap();
+    assert_eq!(m1.version_id, None, "null 槽 version_id = None");
+    assert_eq!(read_all(&e, "b1", "k"), d1);
+    assert_eq!(stats_of(&e), (1, 100_000));
+    // null 槽原地覆盖:条目数不变,统计净额正确
+    let m2 = e.put("b1", "k", &mut Cursor::new(d2.clone())).unwrap();
+    assert_eq!(m2.version_id, None);
+    assert_eq!(read_all(&e, "b1", "k"), d2);
+    assert_eq!(stats_of(&e), (1, 60_000), "覆盖 null = 先扣旧再加新");
+    assert_eq!(
+        e.meta().list_key_versions("b1", "k").unwrap().len(),
+        1,
+        "原地覆盖,版本条目数不变"
+    );
+    // DELETE → 标记落 null 槽(覆盖旧 null 数据版本:release + 扣减)
+    let dm = e.delete("b1", "k").unwrap().unwrap();
+    assert!(dm.is_delete_marker && dm.version_id.is_none());
+    assert_eq!(stats_of(&e), (0, 0));
+    let err = e.head_version("b1", "k", None).unwrap_err();
+    assert!(matches!(err, Error::DeleteMarker(ref m) if m == "null"));
+    // 标记上再写 = 覆盖标记(标记未入账 → +1)
+    let d3 = rnd(1_000, 6); // 内联路径
+    e.put("b1", "k", &mut Cursor::new(d3.clone())).unwrap();
+    assert_eq!(read_all(&e, "b1", "k"), d3);
+    assert_eq!(stats_of(&e), (1, 1_000));
+    // 物理删 null 槽(模拟 ?versionId=null)
+    assert!(e
+        .delete_version("b1", "k", Some(VK_NULL))
+        .unwrap()
+        .is_some());
+    assert_eq!(stats_of(&e), (0, 0));
+    assert!(matches!(
+        e.head_version("b1", "k", None),
+        Err(Error::NotFound(_))
+    ));
+    assert_eq!(e.allocator().allocated_count(), 0);
+    e.close().unwrap();
+}
+
+#[test]
+fn enabled_to_suspended_transition_reads() {
+    // Enabled 时代版本 + Suspended 时代 null 槽共存(D1a 裁决):
+    // 当前版本 = {null 槽, 最大真实 vk} 取 mtime 最大,mtime 相等取真实版本;
+    // Enabled 时代版本仍可精确寻址。
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    set_versioning(&e, VersioningState::Enabled);
+    let d1 = rnd(50_000, 7);
+    let v1 = e
+        .put("b1", "k", &mut Cursor::new(d1.clone()))
+        .unwrap()
+        .version_id
+        .unwrap();
+    let m1 = e.head_version("b1", "k", None).unwrap().mtime;
+    set_versioning(&e, VersioningState::Suspended);
+    let d2 = rnd(40_000, 8);
+    let m2 = e.put("b1", "k", &mut Cursor::new(d2.clone())).unwrap();
+    assert_eq!(m2.version_id, None);
+    // D1a:null 槽 mtime ≥ 真实版本;同秒相等时真实版本胜出(引擎写 mtime
+    // 取墙钟秒,测试内同秒)——把 null 槽 mtime 确定性拨快,恢复「挂起期
+    // 写入更晚」的真实时序
+    set_entry_mtime(&e, "b1", "k", &VK_NULL, m1 + 10);
+    assert_eq!(read_all(&e, "b1", "k"), d2, "null 槽 mtime 更大 → 当前版本");
+    assert_eq!(read_version(&e, "b1", "k", &v1), d1);
+    assert_eq!(stats_of(&e), (2, 90_000));
+    // D1a 同秒 tie → 真实版本为当前(重启用后的写必然后于挂起期写)
+    set_entry_mtime(&e, "b1", "k", &VK_NULL, m1);
+    assert_eq!(read_all(&e, "b1", "k"), d1, "mtime 相等取真实版本");
+    e.close().unwrap();
+}
+
+#[test]
+fn copy_object_version_addressing() {
+    // V2-4:源版本寻址(指定 → 精确读;未指定 → 当前版本);目标复用写分叉;
+    // 段共享零 I/O;复制删除标记 → 目标同落标记;标记 → Off 桶拒绝。
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    e.ensure_bucket("b2").unwrap(); // Off 桶
+    set_versioning(&e, VersioningState::Enabled); // b1 Enabled
+    let d1 = rnd(100_000, 9);
+    let d2 = rnd(100_000, 10);
+    let v1 = e
+        .put("b1", "src", &mut Cursor::new(d1.clone()))
+        .unwrap()
+        .version_id
+        .unwrap();
+    let v2 = e
+        .put("b1", "src", &mut Cursor::new(d2.clone()))
+        .unwrap()
+        .version_id
+        .unwrap();
+    // 未指定版本 → 复制当前版本(d2);目标 = 新版本(段共享,零数据 I/O)
+    let mc = e
+        .copy_object("b1", "src", "b1", "dst", None, None, None)
+        .unwrap();
+    let vc = mc.version_id.unwrap();
+    assert!(vc > v2, "复制落新版本");
+    assert_eq!(read_all(&e, "b1", "dst"), d2);
+    assert_eq!(
+        mc.extents,
+        e.head_version("b1", "src", None).unwrap().extents,
+        "段共享(share_object,无数据拷贝)"
+    );
+    // 指定历史版本 → 精确复制 d1
+    let mh = e
+        .copy_object_version(
+            "b1",
+            "src",
+            Some(&v1),
+            "b1",
+            "dst-hist",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(read_all(&e, "b1", "dst-hist"), d1);
+    assert!(mh.version_id.unwrap() > vc);
+    assert_eq!(stats_of(&e), (4, 400_000));
+    // 源历史版本删除后,复制目标仍可读(共享段引用计数)
+    assert!(e.delete_version("b1", "src", Some(v1)).unwrap().is_some());
+    assert_eq!(read_all(&e, "b1", "dst-hist"), d1);
+    assert_eq!(stats_of(&e), (3, 300_000));
+    // 复制删除标记(源 = 标记版本)→ 目标同落标记,零入账
+    let dm = e.delete("b1", "src").unwrap().unwrap();
+    let vdm = dm.version_id.unwrap();
+    let md = e
+        .copy_object_version(
+            "b1",
+            "src",
+            Some(&vdm),
+            "b1",
+            "dst-dm",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    assert!(md.is_delete_marker && md.version_id.is_some());
+    assert!(md.extents.is_empty() && md.inline.is_none());
+    assert!(matches!(
+        e.head_version("b1", "dst-dm", None),
+        Err(Error::DeleteMarker(_))
+    ));
+    assert_eq!(stats_of(&e), (3, 300_000), "标记复制零入账");
+    // 未指定版本且源当前 = 标记 → 同样复制标记(§3.4.5)
+    let md2 = e
+        .copy_object("b1", "src", "b1", "dst-dm2", None, None, None)
+        .unwrap();
+    assert!(md2.is_delete_marker);
+    // 复制标记到 Off 桶 → InvalidArgument
+    assert!(matches!(
+        e.copy_object_version("b1", "src", Some(&vdm), "b2", "x", None, None, None, None),
+        Err(Error::InvalidArgument(_))
+    ));
+    // Off → Enabled 复制:目标落新版本
+    e.put("b2", "s", &mut Cursor::new(rnd(1_000, 11))).unwrap();
+    let mx = e
+        .copy_object("b2", "s", "b1", "from-off", None, None, None)
+        .unwrap();
+    assert!(mx.version_id.is_some());
+    e.close().unwrap();
+}
+
+#[test]
+fn complete_multipart_lands_new_version() {
+    // V2-5:Complete = 新版本(Enabled)/覆盖 null 槽(Suspended);
+    // 会话/分片键不变;幂等重放不重复入账。
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    set_versioning(&e, VersioningState::Enabled);
+    let p1 = rnd(100_000, 12);
+    let uid = e
+        .create_multipart("b1", "mp", None, vec![], Vec::new(), vec![])
+        .unwrap();
+    let part = e
+        .upload_part(&uid, 1, &mut Cursor::new(p1.clone()))
+        .unwrap();
+    let m = e
+        .complete_multipart("b1", "mp", &uid, &[(1, part.etag_hex())])
+        .unwrap();
+    let v1 = m.version_id.expect("Complete 落新版本");
+    assert_eq!(read_all(&e, "b1", "mp"), p1);
+    assert_eq!(stats_of(&e), (1, 100_000));
+    // 幂等重放:相同 ETag,不重复入账
+    let replay = e
+        .complete_multipart("b1", "mp", &uid, &[(1, part.etag_hex())])
+        .unwrap();
+    assert_eq!(replay.etag, m.etag);
+    assert_eq!(stats_of(&e), (1, 100_000));
+    // 第二次 Complete(新会话)= 第二个版本;旧版本可读
+    let p2 = rnd(120_000, 13);
+    let uid2 = e
+        .create_multipart("b1", "mp", None, vec![], Vec::new(), vec![])
+        .unwrap();
+    let part2 = e
+        .upload_part(&uid2, 1, &mut Cursor::new(p2.clone()))
+        .unwrap();
+    let m3 = e
+        .complete_multipart("b1", "mp", &uid2, &[(1, part2.etag_hex())])
+        .unwrap();
+    assert!(m3.version_id.unwrap() > v1);
+    assert_eq!(read_all(&e, "b1", "mp"), p2);
+    assert_eq!(read_version(&e, "b1", "mp", &v1), p1);
+    assert_eq!(stats_of(&e), (2, 220_000));
+    // Suspended:Complete 覆盖 null 槽(version_id = None)
+    set_versioning(&e, VersioningState::Suspended);
+    let p3 = rnd(80_000, 14);
+    let uid3 = e
+        .create_multipart("b1", "mp", None, vec![], Vec::new(), vec![])
+        .unwrap();
+    let part3 = e
+        .upload_part(&uid3, 1, &mut Cursor::new(p3.clone()))
+        .unwrap();
+    let m4 = e
+        .complete_multipart("b1", "mp", &uid3, &[(1, part3.etag_hex())])
+        .unwrap();
+    assert_eq!(m4.version_id, None, "Suspended Complete 落 null 槽");
+    // D1a:null 槽与真实版本同秒时真实版本胜出;确定性拨快 null 槽 mtime,
+    // 恢复「挂起期写入更晚」的真实时序后再断言当前版本
+    let latest_real = e.meta().max_real_vk("b1", "mp").unwrap().unwrap();
+    let real_mtime = e
+        .head_version("b1", "mp", Some(&latest_real))
+        .unwrap()
+        .mtime;
+    set_entry_mtime(&e, "b1", "mp", &VK_NULL, real_mtime + 10);
+    assert_eq!(read_all(&e, "b1", "mp"), p3);
+    assert_eq!(stats_of(&e), (3, 300_000));
+    e.close().unwrap();
+}
+
+#[test]
+fn vk_anti_rollback_engine_level() {
+    // V2-1 防回拨:注入远未来版本(模拟回拨前高水位),新写 vk 仍严格递增。
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    set_versioning(&e, VersioningState::Enabled);
+    let d0 = rnd(1_000, 15);
+    let m0 = e.put("b1", "k", &mut Cursor::new(d0)).unwrap();
+    // 远未来版本条目(时钟回拨场景的高水位;直写版本键)
+    let future_vk = new_version_vk(now_us() + 10_000_000_000_000, None).unwrap();
+    let mut fm = m0.clone();
+    fm.version_id = Some(future_vk);
+    e.meta()
+        .commit_object_put_version(
+            "b1",
+            "k",
+            &future_vk,
+            &fm,
+            AllocDraft::default(),
+            StatsDelta {
+                objects: 1,
+                bytes: fm.size as i64,
+            },
+        )
+        .unwrap();
+    // 新写:prev_ts = 远未来 → 新 vk 时间戳 = prev+1,字典序仍最大
+    let d1 = rnd(2_000, 16);
+    let v1 = e
+        .put("b1", "k", &mut Cursor::new(d1.clone()))
+        .unwrap()
+        .version_id
+        .unwrap();
+    assert!(v1 > future_vk, "时钟回拨后新 vk 仍递增");
+    assert_eq!(read_all(&e, "b1", "k"), d1, "当前版本 = 新写入");
+    e.close().unwrap();
+}
+
+#[test]
+fn delete_bucket_force_releases_all_versions() {
+    // V2-3 delete_bucket:枚举全部版本条目(含删除标记)逐一释放。
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    set_versioning(&e, VersioningState::Enabled);
+    e.put("b1", "a", &mut Cursor::new(rnd(50_000, 17))).unwrap();
+    e.put("b1", "a", &mut Cursor::new(rnd(50_000, 18))).unwrap();
+    e.put("b1", "b", &mut Cursor::new(rnd(1_000, 19))).unwrap();
+    e.delete("b1", "b").unwrap(); // 删除标记残留
+    assert!(e.delete_bucket("b1", false).is_err(), "版本残留 → 非空拒绝");
+    e.delete_bucket("b1", true).unwrap();
+    assert!(e.meta().get_bucket("b1").unwrap().is_none());
+    assert_eq!(e.allocator().allocated_count(), 0, "全部版本段释放");
+    e.close().unwrap();
+}
+
+#[test]
+fn unversioned_bucket_paths_untouched() {
+    // D1 硬承诺:Off 桶路径零改动——无版本键残留、version_id 恒 None、
+    // 带 versionId 删除被拒绝、DELETE 幂等。
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let m = e.put("b1", "k", &mut Cursor::new(rnd(1_000, 20))).unwrap();
+    assert_eq!(m.version_id, None);
+    assert!(!m.is_delete_marker);
+    assert!(e.meta().list_key_versions("b1", "k").unwrap().is_empty());
+    let entries = e.meta().list_object_entries("b1").unwrap();
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].1.is_none(), "Off 桶恒为未版本化单键");
+    assert!(matches!(
+        e.delete_version("b1", "k", Some([1u8; 16])),
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(e.delete("b1", "k").unwrap().is_some());
+    assert!(e.delete("b1", "k").unwrap().is_none());
+    e.close().unwrap();
+}
+
+#[test]
+fn versioned_engine_reopen_recovers() {
+    // §3.4.6:版本化数据崩溃重开 = 恢复零改动(可达性扫描覆盖版本键,
+    // 无泄漏误报;重开后版本寻址/当前解析正常)。
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    set_versioning(&e, VersioningState::Enabled);
+    let d1 = rnd(100_000, 21);
+    let d2 = rnd(100_000, 22);
+    let v1 = e
+        .put("b1", "k", &mut Cursor::new(d1.clone()))
+        .unwrap()
+        .version_id
+        .unwrap();
+    e.put("b1", "k", &mut Cursor::new(d2.clone())).unwrap();
+    e.delete("b1", "ghost").unwrap(); // 标记条目(无段引用)
+    e.close().unwrap();
+    drop(e); // 释放 rocksdb LOCK 后重开
+             // 重开:恢复扫描必须识别版本键段引用(o: 前缀双形态)
+    let mut e = Engine::open(&cfg).unwrap();
+    assert_eq!(read_all(&e, "b1", "k"), d2);
+    assert_eq!(read_version(&e, "b1", "k", &v1), d1);
+    assert_eq!(stats_of(&e), (2, 200_000));
+    // 无泄漏:删除全部版本后位图归零
+    let v2 = e.head_version("b1", "k", None).unwrap().version_id.unwrap();
+    e.delete_version("b1", "k", Some(v1)).unwrap();
+    e.delete_version("b1", "k", Some(v2)).unwrap();
+    assert_eq!(e.allocator().allocated_count(), 0);
+    e.close().unwrap();
+}
+
+#[test]
+fn check_versioned_mixed_bucket_converges() {
+    // V5-2:混合版本桶(Off 遗留单键 + Enabled 多版本 + 删除标记 +
+    // Suspended null 槽数据/标记)重开引擎(check 可达性重建全路径)→
+    // 零误报泄漏;再注入游离段 → check 必须检出(零漏报)。
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    e.put("b1", "legacy", &mut Cursor::new(rnd(100_000, 60))) // Off 时代遗留单键(段形态)
+        .unwrap();
+    set_versioning(&e, VersioningState::Enabled);
+    e.put("b1", "k1", &mut Cursor::new(rnd(90_000, 61)))
+        .unwrap();
+    e.put("b1", "k1", &mut Cursor::new(rnd(800, 62))).unwrap(); // 内联形态版本
+    e.put("b1", "k2", &mut Cursor::new(rnd(70_000, 63)))
+        .unwrap();
+    assert!(e.delete("b1", "k2").unwrap().unwrap().is_delete_marker); // 标记当前
+    set_versioning(&e, VersioningState::Suspended);
+    e.put("b1", "k3", &mut Cursor::new(rnd(60_000, 64)))
+        .unwrap(); // null 槽数据
+    assert!(e.delete("b1", "k4").unwrap().unwrap().is_delete_marker); // null 槽标记
+    e.close().unwrap();
+    drop(e); // 释放 rocksdb LOCK 后重开(可达性重建覆盖全形态条目)
+
+    let e = Engine::open(&cfg).unwrap();
+    let r = e.check_report().unwrap();
+    assert!(
+        r.leaks.is_empty(),
+        "混合版本桶重建后零误报泄漏: {:?}",
+        r.leaks
+    );
+    // 删除标记/空 extents 条目不误判:桶统计口径另行覆盖(D5);
+    // 注入游离段(置位 + a: 记录,无元数据引用)→ 必须检出
+    {
+        use fs3_alloc::Staged;
+        let mut draft = Staged::default();
+        let ids = e.allocator().allocate(&mut draft, 1).unwrap();
+        e.meta()
+            .commit(&[Op::Alloc {
+                draft: fs3_meta::AllocDraft {
+                    alloc: draft.alloc.clone(),
+                    ref_inc: vec![],
+                    ref_dec: vec![],
+                },
+            }])
+            .unwrap();
+        let r2 = e.check_report().unwrap();
+        assert!(
+            r2.leaks.contains(&ids[0]),
+            "注入的游离段 {} 必须被 check 检出: {:?}",
+            ids[0],
+            r2.leaks
+        );
+    }
+    e.abort();
+}
+
+// ─────────────────── D1a 跨状态转换(ADR-11 D1a;V3-0) ───────────────────
+
+#[test]
+fn d1a_off_to_enabled_legacy_shadowing() {
+    // Off→Enabled 遗留键遮蔽回归:遗留未版本化单键与新真实版本共存时,
+    // 当前版本 = mtime 最大者(新写入);?versionId=null 寻址遗留单键;
+    // 真实版本删除后遗留回升;?versionId=null 删除物理移除遗留单键。
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let d0 = rnd(100_000, 30);
+    e.put("b1", "k", &mut Cursor::new(d0.clone())).unwrap(); // Off 时代遗留
+    assert_eq!(stats_of(&e), (1, 100_000));
+    set_versioning(&e, VersioningState::Enabled);
+    let d1 = rnd(100_000, 31);
+    let v1 = e
+        .put("b1", "k", &mut Cursor::new(d1.clone()))
+        .unwrap()
+        .version_id
+        .unwrap();
+    // 新真实版本(mtime ≥ 遗留)遮蔽遗留单键
+    assert_eq!(read_all(&e, "b1", "k"), d1, "Off→Enabled:新版本遮蔽遗留键");
+    // ?versionId=null 寻址遗留单键(VK_NULL 通道)
+    assert_eq!(read_version(&e, "b1", "k", &VK_NULL), d0);
+    assert_eq!(read_version(&e, "b1", "k", &v1), d1);
+    assert_eq!(stats_of(&e), (2, 200_000));
+    // 删除真实版本 → 遗留单键回升为当前(AWS null 版本语义)
+    assert!(e.delete_version("b1", "k", Some(v1)).unwrap().is_some());
+    assert_eq!(read_all(&e, "b1", "k"), d0);
+    // ?versionId=null 删除 → 物理删遗留单键;对象消失
+    assert!(e
+        .delete_version("b1", "k", Some(VK_NULL))
+        .unwrap()
+        .is_some());
+    assert!(matches!(
+        e.head_version("b1", "k", None),
+        Err(Error::NotFound(_))
+    ));
+    assert_eq!(stats_of(&e), (0, 0));
+    assert_eq!(e.allocator().allocated_count(), 0);
+    e.close().unwrap();
+}
+
+#[test]
+fn d1a_suspended_overwrites_legacy_inplace() {
+    // D1a-1:Suspended 桶写/删除标记原地覆盖遗留单键(对外 VersionId 恒
+    // "null"),不写 null 槽;遗留单键与 null 槽不共存。
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let d0 = rnd(100_000, 32);
+    e.put("b1", "k", &mut Cursor::new(d0.clone())).unwrap(); // Off 时代遗留
+    set_versioning(&e, VersioningState::Suspended);
+    // Suspended 写:原地覆盖遗留单键(不落版本键)
+    let d1 = rnd(60_000, 33);
+    let m1 = e.put("b1", "k", &mut Cursor::new(d1.clone())).unwrap();
+    assert_eq!(m1.version_id, None);
+    assert_eq!(read_all(&e, "b1", "k"), d1);
+    assert!(
+        e.meta().list_key_versions("b1", "k").unwrap().is_empty(),
+        "遗留单键原地覆盖:不产生 null 槽/版本键"
+    );
+    assert_eq!(stats_of(&e), (1, 60_000), "覆盖遗留 = 先扣后加");
+    // Suspended DELETE:标记原地覆盖遗留单键
+    let dm = e.delete("b1", "k").unwrap().unwrap();
+    assert!(dm.is_delete_marker && dm.version_id.is_none());
+    assert!(
+        e.meta()
+            .get_object("b1", "k")
+            .unwrap()
+            .unwrap()
+            .is_delete_marker
+    );
+    assert!(e.meta().list_key_versions("b1", "k").unwrap().is_empty());
+    assert_eq!(stats_of(&e), (0, 0));
+    assert!(matches!(
+        e.head_version("b1", "k", None),
+        Err(Error::DeleteMarker(ref m)) if m == "null"
+    ));
+    // 标记上再写 = 覆盖标记(未入账 → +1)
+    let d2 = rnd(1_000, 34);
+    e.put("b1", "k", &mut Cursor::new(d2.clone())).unwrap();
+    assert_eq!(read_all(&e, "b1", "k"), d2);
+    assert_eq!(stats_of(&e), (1, 1_000));
+    // ?versionId=null 删除 = 物理删遗留单键
+    assert!(e
+        .delete_version("b1", "k", Some(VK_NULL))
+        .unwrap()
+        .is_some());
+    assert_eq!(stats_of(&e), (0, 0));
+    assert_eq!(e.allocator().allocated_count(), 0);
+    e.close().unwrap();
+}
+
+#[test]
+fn d1a_suspended_to_enabled_null_slot_shadowing() {
+    // Suspended→Enabled null 槽遮蔽回归(D1a-2):重启用后的新真实版本
+    // (即使与 null 槽同秒)遮蔽 null 槽;null 槽仍可 ?versionId=null 寻址。
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    set_versioning(&e, VersioningState::Enabled);
+    let d1 = rnd(50_000, 35);
+    let v1 = e
+        .put("b1", "k", &mut Cursor::new(d1.clone()))
+        .unwrap()
+        .version_id
+        .unwrap();
+    set_versioning(&e, VersioningState::Suspended);
+    let d2 = rnd(40_000, 36);
+    e.put("b1", "k", &mut Cursor::new(d2.clone())).unwrap(); // null 槽
+                                                             // 确定性时序:null 槽 mtime 拨晚 → null 槽为当前
+    let m1 = e.head_version("b1", "k", Some(&v1)).unwrap().mtime;
+    set_entry_mtime(&e, "b1", "k", &VK_NULL, m1 + 10);
+    assert_eq!(read_all(&e, "b1", "k"), d2);
+    // 重启用:null 槽 mtime 拨回同秒(重启用后的写必然后于挂起期写,
+    // 同秒 tie 取真实版本);新真实版本遮蔽 null 槽(vk 防回拨不纳入
+    // null 槽,D1a-5)
+    set_entry_mtime(&e, "b1", "k", &VK_NULL, m1);
+    set_versioning(&e, VersioningState::Enabled);
+    let d3 = rnd(70_000, 37);
+    let v3 = e
+        .put("b1", "k", &mut Cursor::new(d3.clone()))
+        .unwrap()
+        .version_id
+        .unwrap();
+    assert!(v3 > v1, "null 槽不参与防回拨基址");
+    assert_eq!(
+        read_all(&e, "b1", "k"),
+        d3,
+        "重启用后的写遮蔽 null 槽(tie 取真实版本)"
+    );
+    // null 槽仍按 mtime 插入列表序列且可寻址
+    assert_eq!(read_version(&e, "b1", "k", &VK_NULL), d2);
+    let vers = e.meta().list_key_versions("b1", "k").unwrap();
+    assert_eq!(vers.len(), 3, "v1 + null 槽 + v3");
+    // 清场:三个条目逐一物理删除
+    e.delete_version("b1", "k", Some(v1)).unwrap();
+    e.delete_version("b1", "k", Some(v3)).unwrap();
+    e.delete_version("b1", "k", Some(VK_NULL)).unwrap();
+    assert_eq!(stats_of(&e), (0, 0));
+    assert_eq!(e.allocator().allocated_count(), 0);
+    e.close().unwrap();
+}
+
+// ─────────────────── V4-1 Suspended null 槽边界矩阵(ADR-11 D1a;统计对账) ───────────────────
+
+#[test]
+fn suspended_null_slot_overwrite_stats_boundary() {
+    // Suspended 连续 PUT:null 槽原地覆盖,统计先扣旧再加新(extent→extent
+    // →inline→extent 全形态);版本条目恒 1;位图无泄漏。
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    set_versioning(&e, VersioningState::Suspended);
+    for (size, seed) in [
+        (100_000usize, 50u8),
+        (60_000, 51),
+        (1_000, 52),
+        (200_000, 53),
+    ] {
+        let d = rnd(size, seed);
+        e.put("b1", "k", &mut Cursor::new(d.clone())).unwrap();
+        assert_eq!(read_all(&e, "b1", "k"), d);
+        assert_eq!(
+            stats_of(&e),
+            (1, size as u64),
+            "覆盖 null 槽 = 先扣后加(size={size})"
+        );
+        assert_eq!(
+            e.meta().list_key_versions("b1", "k").unwrap().len(),
+            1,
+            "null 槽原地覆盖:条目数不变(size={size})"
+        );
+    }
+    // 清场:物理删 null 槽 → 统计归零、位图归零
+    assert!(e
+        .delete_version("b1", "k", Some(VK_NULL))
+        .unwrap()
+        .is_some());
+    assert_eq!(stats_of(&e), (0, 0));
+    assert_eq!(e.allocator().allocated_count(), 0);
+    e.close().unwrap();
+}
+
+#[test]
+fn suspended_repeated_delete_marker_idempotent() {
+    // Suspended DELETE 幂等:重复删除 = 再插标记覆盖 null 槽旧标记,统计
+    // 零漂移、条目恒 1;不存在键 DELETE 同样落 null 槽标记(AWS 204 语义)。
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    set_versioning(&e, VersioningState::Suspended);
+    let d = rnd(80_000, 54);
+    e.put("b1", "k", &mut Cursor::new(d)).unwrap();
+    assert_eq!(stats_of(&e), (1, 80_000));
+    for round in 0..2 {
+        let dm = e.delete("b1", "k").unwrap().unwrap();
+        assert!(dm.is_delete_marker && dm.version_id.is_none());
+        assert_eq!(stats_of(&e), (0, 0), "第 {round} 次删除后统计归零");
+        assert_eq!(
+            e.meta().list_key_versions("b1", "k").unwrap().len(),
+            1,
+            "重复删除仍只一条 null 槽标记"
+        );
+        assert!(matches!(
+            e.head_version("b1", "k", None),
+            Err(Error::DeleteMarker(ref m)) if m == "null"
+        ));
+    }
+    // 不存在键 DELETE → 落 null 槽标记;统计零 delta
+    assert!(e.delete("b1", "ghost").unwrap().unwrap().is_delete_marker);
+    assert_eq!(stats_of(&e), (0, 0));
+    assert!(matches!(
+        e.head_version("b1", "ghost", None),
+        Err(Error::DeleteMarker(ref m)) if m == "null"
+    ));
+    // 清场:两条标记版本删除零 delta
+    assert!(e
+        .delete_version("b1", "k", Some(VK_NULL))
+        .unwrap()
+        .is_some());
+    assert!(e
+        .delete_version("b1", "ghost", Some(VK_NULL))
+        .unwrap()
+        .is_some());
+    assert_eq!(stats_of(&e), (0, 0));
+    assert_eq!(e.allocator().allocated_count(), 0);
+    e.close().unwrap();
+}
+
+#[test]
+fn enabled_suspended_enabled_cycle_stats_reconcile() {
+    // Enabled→Suspended→Enabled 全循环统计对账:每步 objects/bytes 精确
+    // 断言,全程零漂移;清场后归零、位图归零。
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    set_versioning(&e, VersioningState::Enabled);
+    // Enabled:A(100_000)→ v1,B(50_000)→ v2(纯追加)
+    let v1 = e
+        .put("b1", "k", &mut Cursor::new(rnd(100_000, 55)))
+        .unwrap()
+        .version_id
+        .unwrap();
+    assert_eq!(stats_of(&e), (1, 100_000));
+    let v2 = e
+        .put("b1", "k", &mut Cursor::new(rnd(50_000, 56)))
+        .unwrap()
+        .version_id
+        .unwrap();
+    assert_eq!(stats_of(&e), (2, 150_000));
+    // Suspended:C(40_000)→ null 槽;D(20_000)覆盖 null(先扣后加)
+    set_versioning(&e, VersioningState::Suspended);
+    e.put("b1", "k", &mut Cursor::new(rnd(40_000, 57))).unwrap();
+    assert_eq!(stats_of(&e), (3, 190_000));
+    e.put("b1", "k", &mut Cursor::new(rnd(20_000, 58))).unwrap();
+    assert_eq!(stats_of(&e), (3, 170_000));
+    // DELETE → null 标记覆盖 null 数据(扣 D);再写 E(10_000)覆盖标记(未入账 → +1)
+    assert!(e.delete("b1", "k").unwrap().unwrap().is_delete_marker);
+    assert_eq!(stats_of(&e), (2, 150_000));
+    e.put("b1", "k", &mut Cursor::new(rnd(10_000, 59))).unwrap();
+    assert_eq!(stats_of(&e), (3, 160_000));
+    // 重启用:F(5_000)→ v3(纯追加);当前 = v3(同秒 tie 取真实版本)
+    set_versioning(&e, VersioningState::Enabled);
+    let d_f = rnd(5_000, 60);
+    let v3 = e
+        .put("b1", "k", &mut Cursor::new(d_f.clone()))
+        .unwrap()
+        .version_id
+        .unwrap();
+    assert!(v3 > v2);
+    assert_eq!(stats_of(&e), (4, 165_000));
+    assert_eq!(read_all(&e, "b1", "k"), d_f);
+    assert_eq!(e.meta().list_key_versions("b1", "k").unwrap().len(), 4);
+    // 清场:逐版本物理删除,逐步扣减对账至零
+    e.delete_version("b1", "k", Some(v1)).unwrap();
+    assert_eq!(stats_of(&e), (3, 65_000));
+    e.delete_version("b1", "k", Some(v2)).unwrap();
+    assert_eq!(stats_of(&e), (2, 15_000));
+    e.delete_version("b1", "k", Some(VK_NULL)).unwrap(); // null 槽数据 E
+    assert_eq!(stats_of(&e), (1, 5_000));
+    e.delete_version("b1", "k", Some(v3)).unwrap();
+    assert_eq!(stats_of(&e), (0, 0));
+    assert_eq!(e.allocator().allocated_count(), 0);
+    e.close().unwrap();
+}
+
+#[test]
+fn suspended_null_marker_delete_version_fallback() {
+    // null 槽为删除标记时,?versionId=null 删除 = 物理删标记(零 delta),
+    // 当前版本回退到 Enabled 时代真实版本(AWS null 版本语义)。
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    set_versioning(&e, VersioningState::Enabled);
+    let d1 = rnd(30_000, 61);
+    let v1 = e
+        .put("b1", "k", &mut Cursor::new(d1.clone()))
+        .unwrap()
+        .version_id
+        .unwrap();
+    let m1 = e.head_version("b1", "k", Some(&v1)).unwrap().mtime;
+    set_versioning(&e, VersioningState::Suspended);
+    e.put("b1", "k", &mut Cursor::new(rnd(20_000, 62))).unwrap(); // null 槽
+    assert!(e.delete("b1", "k").unwrap().unwrap().is_delete_marker);
+    assert_eq!(stats_of(&e), (1, 30_000), "标记覆盖 null 数据:扣 20_000");
+    // 确定性时序:null 标记 mtime 拨晚 → 标记为当前
+    set_entry_mtime(&e, "b1", "k", &VK_NULL, m1 + 10);
+    assert!(matches!(
+        e.head_version("b1", "k", None),
+        Err(Error::DeleteMarker(ref m)) if m == "null"
+    ));
+    // ?versionId=null 删除标记 → 零 delta;当前回退到 v1
+    let removed = e.delete_version("b1", "k", Some(VK_NULL)).unwrap().unwrap();
+    assert!(removed.is_delete_marker);
+    assert_eq!(stats_of(&e), (1, 30_000), "删标记零 delta");
+    assert_eq!(read_all(&e, "b1", "k"), d1, "回退到 Enabled 时代版本");
+    assert_eq!(e.meta().list_key_versions("b1", "k").unwrap().len(), 1);
+    // 清场
+    e.delete_version("b1", "k", Some(v1)).unwrap();
+    assert_eq!(stats_of(&e), (0, 0));
+    assert_eq!(e.allocator().allocated_count(), 0);
+    e.close().unwrap();
+}
+
+#[test]
+fn conditional_put_preconditions() {
+    // ADR-11 D6:PUT 条件写(引擎写锁内对当前版本判定;Off/Enabled 同语义)。
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let d1 = rnd(1_000, 40);
+    let m1 = e.put("b1", "k", &mut Cursor::new(d1.clone())).unwrap();
+    let etag1 = m1.etag_full();
+    let none_match_star = || WritePrecondition {
+        if_none_match: Some(vec!["*".to_string()]),
+        ..Default::default()
+    };
+    // If-None-Match: * 于已存在对象 → PreconditionFailed
+    assert!(matches!(
+        e.put_with_meta(
+            "b1",
+            "k",
+            &mut Cursor::new(rnd(1_000, 41)),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            Some(&none_match_star()),
+        ),
+        Err(Error::PreconditionFailed(_))
+    ));
+    // If-None-Match: * 于不存在键 → 放行
+    e.put_with_meta(
+        "b1",
+        "new",
+        &mut Cursor::new(rnd(1_000, 42)),
+        None,
+        vec![],
+        vec![],
+        vec![],
+        Some(&none_match_star()),
+    )
+    .unwrap();
+    // If-Match 命中当前 ETag → 放行;不匹配 → 412
+    let if_match_hit = || WritePrecondition {
+        if_match: Some(vec![etag1.clone()]),
+        ..Default::default()
+    };
+    e.put_with_meta(
+        "b1",
+        "k",
+        &mut Cursor::new(d1.clone()),
+        None,
+        vec![],
+        vec![],
+        vec![],
+        Some(&if_match_hit()),
+    )
+    .unwrap();
+    let if_match_miss = || WritePrecondition {
+        if_match: Some(vec!["deadbeef".to_string()]),
+        ..Default::default()
+    };
+    assert!(matches!(
+        e.put_with_meta(
+            "b1",
+            "k",
+            &mut Cursor::new(d1.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            Some(&if_match_miss()),
+        ),
+        Err(Error::PreconditionFailed(_))
+    ));
+    // If-Match 于不存在键 → NotFound(协议层 404 NoSuchKey,s3-tests 口径)
+    assert!(matches!(
+        e.put_with_meta(
+            "b1",
+            "ghost",
+            &mut Cursor::new(d1.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            Some(&if_match_miss()),
+        ),
+        Err(Error::NotFound(_))
+    ));
+    // size/mtime 组合:size 不符 → 412;mtime 覆盖当前 → 放行
+    let cur = e.head("b1", "k").unwrap().unwrap();
+    let bad_size = WritePrecondition {
+        if_match: Some(vec!["*".to_string()]),
+        if_match_size: Some(cur.size + 1),
+        ..Default::default()
+    };
+    assert!(matches!(
+        e.put_with_meta(
+            "b1",
+            "k",
+            &mut Cursor::new(d1.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            Some(&bad_size),
+        ),
+        Err(Error::PreconditionFailed(_))
+    ));
+    let good_combo = WritePrecondition {
+        if_match: Some(vec!["*".to_string()]),
+        if_match_size: Some(cur.size),
+        if_match_mtime: Some(cur.mtime),
+        ..Default::default()
+    };
+    e.put_with_meta(
+        "b1",
+        "k",
+        &mut Cursor::new(d1.clone()),
+        None,
+        vec![],
+        vec![],
+        vec![],
+        Some(&good_combo),
+    )
+    .unwrap();
+    // Enabled 桶:判定对 D1a 当前版本执行(与 Off 同语义)
+    set_versioning(&e, VersioningState::Enabled);
+    assert!(matches!(
+        e.put_with_meta(
+            "b1",
+            "k",
+            &mut Cursor::new(d1.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            Some(&none_match_star()),
+        ),
+        Err(Error::PreconditionFailed(_))
+    ));
+    // 当前 = 删除标记 = 不存在:If-None-Match:* 放行,If-Match:* → NotFound
+    e.delete("b1", "k").unwrap();
+    e.put_with_meta(
+        "b1",
+        "k",
+        &mut Cursor::new(d1.clone()),
+        None,
+        vec![],
+        vec![],
+        vec![],
+        Some(&none_match_star()),
+    )
+    .unwrap();
+    e.delete("b1", "k").unwrap();
+    let if_match_star = WritePrecondition {
+        if_match: Some(vec!["*".to_string()]),
+        ..Default::default()
+    };
+    // 当前为删除标记:If-Match:* 按不存在处理(NotFound → 协议层 404)
+    assert!(matches!(
+        e.put_with_meta(
+            "b1",
+            "k",
+            &mut Cursor::new(d1.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            Some(&if_match_star),
+        ),
+        Err(Error::NotFound(_))
+    ));
+    e.close().unwrap();
+}
+
+#[test]
+fn write_precondition_delete_semantics() {
+    // check_delete 纯单元语义:目标不存在 → 放行(幂等 204);存在(含
+    // 删除标记)→ 逐条判定。
+    let mut meta = object_meta_for_precond(100, 7000);
+    let p = WritePrecondition {
+        if_match: Some(vec!["*".to_string()]),
+        ..Default::default()
+    };
+    assert!(p.check_delete(None).is_ok(), "不存在 → 幂等放行");
+    assert!(p.check_delete(Some(&meta)).is_ok());
+    let bad = WritePrecondition {
+        if_match: Some(vec!["nomatch".to_string()]),
+        ..Default::default()
+    };
+    assert!(matches!(
+        bad.check_delete(Some(&meta)),
+        Err(Error::PreconditionFailed(_))
+    ));
+    // 删除标记是合法判定目标(V2 语义:标记可删)
+    meta.is_delete_marker = true;
+    meta.etag = [0u8; 16];
+    assert!(p.check_delete(Some(&meta)).is_ok());
+    assert!(matches!(
+        bad.check_delete(Some(&meta)),
+        Err(Error::PreconditionFailed(_))
+    ));
+    // mtime/size 判定
+    let mt = WritePrecondition {
+        if_match_mtime: Some(6999),
+        ..Default::default()
+    };
+    meta.is_delete_marker = false;
+    meta.mtime = 7000;
+    assert!(matches!(
+        mt.check_delete(Some(&meta)),
+        Err(Error::PreconditionFailed(_))
+    ));
+    let sz = WritePrecondition {
+        if_match_size: Some(100),
+        ..Default::default()
+    };
+    assert!(sz.check_delete(Some(&meta)).is_ok());
+}
+
+/// 条件写单元测试用对象(meta 层 object_meta 不可见,本地构造)。
+fn object_meta_for_precond(size: u64, mtime: i64) -> ObjectMeta {
+    ObjectMeta {
+        size,
+        etag: [9u8; 16],
+        mtime,
+        extents: vec![],
+        content_type: "application/octet-stream".into(),
+        user_meta: vec![],
+        inline: None,
+        parts: vec![],
+        resp_headers: vec![],
+        version_id: None,
+        is_delete_marker: false,
+        tags: vec![],
+        sse: None,
+        checksum: None,
+        retention: None,
+        legal_hold: false,
+    }
 }

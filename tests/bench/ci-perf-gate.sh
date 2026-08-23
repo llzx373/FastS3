@@ -30,7 +30,7 @@ echo "== ci-perf-gate: tolerance=${TOL}% baseline=$BASELINE =="
 
 # 基准镜像(2GiB,稀疏;bench 需 superblock)
 truncate -s 2G "$IMG"
-"$FASTS3D" --device "$IMG" init --size 2GiB --extent-size 4MiB --force >/dev/null 2>&1
+"$FASTS3D" --device "$IMG" init --size 2GiB --extent-size 4MiB --yes --force --data-dir "$TMPDIR" >/dev/null 2>&1
 
 run_named() {
     local name="$1"; shift

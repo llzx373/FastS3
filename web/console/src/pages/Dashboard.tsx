@@ -36,7 +36,7 @@ export default function Dashboard() {
       // isDelta=false(历史快照):直接取累计差;实时帧按增量换算
       const total = "requests" in d ? d.requests.total : snapTotal(d);
       const bytes = "requests" in d ? d.requests.bytesRead + d.requests.bytesWritten : snapBytes(d);
-      const p99 = "latency" in d && "get" in d.latency ? d.latency.get.p99 : d.latency.p99;
+      const p99 = "get" in d.latency ? d.latency.get.p99 : d.latency.p99;
       series.t.push(t);
       series.iops.push(isDelta ? Math.max(0, total - prev.total) / 5 : total - prev.total);
       series.mbps.push(

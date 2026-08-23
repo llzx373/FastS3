@@ -26,19 +26,43 @@ trap 'rm -f "$OUT"' EXIT
 [ -d "$S3TESTS" ] || { echo "s3-tests not found: set S3TESTS_DIR"; exit 2; }
 
 # ── 文档化排除集 ──
-# ① 路线图未排期特性(README 排除矩阵):版本/加密/生命周期/CORS/Tagging/日志/
-#    通知/复制/桶策略/ACL 全矩阵/ownership/block-public/account 等
-# ② v0.5.x 已知开放兼容项(README「已知开放项」公开跟踪,非静默丢弃):
-#    条件写、fetch-owner、encoding-type=url、delimiter 特殊键、unicode 元数据、
-#    Cache-Control/Expires 回显、x-amz-expires 越界、DeleteObjects 键数上限、
-#    bucket 重建属性、跨账号复制归属、匿名读写语义、RGW 专有头、列表 owner 元素、
-#    chunked+content-encoding
+# ① 路线图未排期特性(README 排除矩阵):加密/生命周期/日志/
+#    通知/复制/ACL 全矩阵/block-public/account 等
+#    (M10 S5 出集:Tagging/CORS/桶策略/POST 表单/ownership 纯配置族已交付并移出,
+#     gate 服务按 README「运行」节带 --allow-anonymous;
+#     M10 V6-1 出集:Versioning/条件写族已交付并移出)
+# ② v0.5.x 已知开放兼容项残余(README「已知开放项」公开跟踪,非静默丢弃;
+#    M9 已关闭 fetch-owner/encoding-type=url/unicode 元数据/Cache-Control·Expires 回显/
+#    x-amz-expires 越界/DeleteObjects 键数上限/bucket 重建属性/chunked+content-encoding 并出集;
+#    M10/V4-4 已关闭条件 GET 边界——304 补带 ETag/Last-Modified 头,
+#    ifmodifiedsince/ifnonematch 出集):
+#    跨账号复制归属、匿名读写语义、
+#    RGW 专有头、multipart_upload_owner(单账号模型恒排)
 # ③ M8 补充(2026-08-21,上游 s3-tests 新用例命名同步):
 #    新 ACL 族(object_acl/canned/header_acl/special_key_names 尾部 ACL 调用)、
-#    PUT 条件写(ifmatch/ifnonmatch/current_object_if_none_match)、Tagging 族
-#    (_tags/with_tags)、public block 族、GetObjectAttributes multipart 族、
-#    bucket-owner 新语义(create_bucket_object_writer 含 GetBucketOwnershipControls,未实现)、匿名 public-read 族(raw_get/raw_put)
-EXCLUDE='version|versioning|versioned|delete_marker|encryption|sse|kms|lifecycle|cors|object_lock|objectlock|legal|retention|governance|tagging|_tag_|website|logging|notification|replication|requester_pays|public_access|block_public|ownership|account_|bucket_acl|put_bucket_acl|get_bucket_acl|bucket_policy|bucketv2_policy|_with_policy|checksum|use_cksum|get_object_attributes|copy_enc|copy_part_enc|tenant|request_payment|expected_bucket_owner|atomic_dual_conditional|conditional_write|post_object|_post_object|bucket_create_exists|head_extended|access_bucket|torrent|object_manifest|_if_match|ifnonematch|ifmodifiedsince|head_bucket_usage|multipart_upload_owner|list_buckets_anonymous|list_objects_anonymous|_objects_anonymous|anon_put|not_owned|encrypted_transfer|multipart_resend_first_finishes_last|special_key_names|object_acl|canned|header_acl|ifmatch|ifnonmatch|current_object_if_none_match|with_tags|_tags|public_block|ignore_public|multipart_object_attributes|bucket_owner|object_writer|raw_get|raw_put'
+#    public block 族、GetObjectAttributes multipart 族、
+#    bucket-owner 新语义(create_bucket_object_writer 等跨账号 owner 断言)、匿名 public-read 族
+# ④ M10 S5 补充(2026-08-23,族出集后保留的文档化 token,逐用例核对):
+#    _v2(SigV2 预签名,未实现)|existing_tag|request_obj_tag|put_obj_grant|s3_noenc|
+#    copy_source|IfExists(桶策略 Condition 超集,显式 MalformedPolicy 红线)|
+#    policy_acl|put_obj_acl(策略×ACL 组合,Put*Acl 501)|policy_multipart|
+#    policy_upload_part_copy|404_with_policy(单账号:alt 身份不可区分)|
+#    policy_status(GetBucketPolicyStatus 501,PublicAccessBlock 组)|
+#    anonymous_request|success_code(匿名 POST 写,依赖 public-read-write 桶 ACL)|
+#    put_acl(test_object_put_acl_mtime,PutObjectAcl 显式 501 恒排)|
+#    raw_get_object_acl|anon_put_write_access(匿名族在 --allow-anonymous 下的剩余失败项;
+#    list_buckets_anonymous/raw_get/raw_put 其余项已翻绿出集)
+# ⑤ M10 V6-1 补充(2026-08-23,version/条件写族出集后保留的文档化 token):
+#    return_version_id(Suspended PUT/Complete 回 VersionId:"null" 为 AWS 口径,
+#    用例断言无此头 = RGW 口径,逐名裁决取 AWS)|delete_marker_nonversioned
+#    (未版本化桶删除后 HEAD 404 无 x-amz-delete-marker 头 = AWS 口径,用例断言
+#    'false' = RGW 口径)|delete_object_current_if_match( -|$)(锚定:仅精确名;
+#    版本化桶 DELETE 不存在键插入删除标记 = AWS 口径,用例按目录桶/RGW 口径
+#    断言无标记;fails_on_aws 族;last_modified_time/size 变体已通过不误放)|
+#    delete_marker_expiration(依赖 PutBucketLifecycle 501,lifecycle 行)|
+#    multipart_copy_versioned(UploadPartCopy 源 versionId 显式 501 红线)|
+#    versioned_object_attributes(GetObjectAttributes 显式 501,checksum 族 v1.2)
+EXCLUDE='encryption|sse|kms|lifecycle|object_lock|objectlock|legal|retention|governance|website|logging|notification|replication|requester_pays|public_access|block_public|account_|bucket_acl|put_bucket_acl|get_bucket_acl|checksum|use_cksum|get_object_attributes|copy_enc|copy_part_enc|tenant|request_payment|expected_bucket_owner|bucket_create_exists|head_extended|access_bucket|torrent|object_manifest|head_bucket_usage|multipart_upload_owner|_objects_anonymous|anon_put_write_access|not_owned|encrypted_transfer|multipart_resend_first_finishes_last|special_key_names|object_acl|canned|header_acl|public_block|ignore_public|multipart_object_attributes|bucket_owner|object_writer|raw_get_object_acl|_v2|existing_tag|request_obj_tag|put_obj_grant|s3_noenc|copy_source|IfExists|policy_acl|put_obj_acl|policy_multipart|policy_upload_part_copy|404_with_policy|policy_status|anonymous_request|success_code|put_acl|return_version_id|delete_marker_nonversioned|delete_object_current_if_match( -|$)|delete_marker_expiration|multipart_copy_versioned|versioned_object_attributes'
 
 cd "$S3TESTS" && S3TEST_CONF="$CONF" python3 -m pytest s3tests/functional/test_s3.py -q --tb=no > "$OUT" 2>&1
 TOTAL=$?

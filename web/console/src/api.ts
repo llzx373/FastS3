@@ -154,6 +154,39 @@ export interface ListedObject {
   lastModified: string;
 }
 
+/** M10:对象版本条目(版本或删除标记)。 */
+export interface ObjectVersion {
+  key: string;
+  versionId: string;
+  isLatest: boolean;
+  lastModified: string;
+  size: number;
+  etag: string;
+  isDeleteMarker: boolean;
+}
+
+export interface ListVersionsResult {
+  versions: ObjectVersion[];
+  isTruncated: boolean;
+  nextKeyMarker: string | null;
+  nextVersionIdMarker: string | null;
+}
+
+/** M10:桶级 CORS 规则(AWS CORSRule 子集)。 */
+export interface BucketCorsRule {
+  AllowedOrigins: string[];
+  AllowedMethods: string[];
+  AllowedHeaders?: string[];
+  ExposeHeaders?: string[];
+  MaxAgeSeconds?: number;
+}
+
+/** M10:标签键值对。 */
+export interface S3Tag {
+  key: string;
+  value: string;
+}
+
 export interface ListResult {
   objects: ListedObject[];
   prefixes: string[];
@@ -249,6 +282,58 @@ export const api = {
       action,
       key,
       destKey,
+    }),
+
+  // ── M10:版本化 / 标签 / CORS / 桶策略 ──
+  listVersions: (bucket: string, prefix = "", keyMarker?: string, versionIdMarker?: string) => {
+    const q = new URLSearchParams();
+    if (prefix) q.set("prefix", prefix);
+    if (keyMarker) q.set("keyMarker", keyMarker);
+    if (versionIdMarker) q.set("versionIdMarker", versionIdMarker);
+    const qs = q.toString();
+    return request<ListVersionsResult>(
+      "GET",
+      `/api/buckets/${encodeURIComponent(bucket)}/versions${qs ? `?${qs}` : ""}`
+    );
+  },
+  versionAction: (bucket: string, action: "restore" | "delete", key: string, versionId: string) =>
+    request<Record<string, unknown>>("POST", `/api/buckets/${encodeURIComponent(bucket)}/versions/action`, {
+      action,
+      key,
+      versionId,
+    }),
+  getVersioning: (bucket: string) =>
+    request<{ Status: string }>("GET", `/api/buckets/${encodeURIComponent(bucket)}/versioning`),
+  putVersioning: (bucket: string, status: "Enabled" | "Suspended") =>
+    request<{ Status: string }>("PUT", `/api/buckets/${encodeURIComponent(bucket)}/versioning`, {
+      Status: status,
+    }),
+  getCors: (bucket: string) =>
+    request<{ CORSRules: BucketCorsRule[] }>("GET", `/api/buckets/${encodeURIComponent(bucket)}/cors`),
+  putCors: (bucket: string, rules: BucketCorsRule[]) =>
+    request<{ CORSRules: BucketCorsRule[] }>("PUT", `/api/buckets/${encodeURIComponent(bucket)}/cors`, {
+      CORSRules: rules,
+    }),
+  deleteCors: (bucket: string) =>
+    request<Record<string, unknown>>("DELETE", `/api/buckets/${encodeURIComponent(bucket)}/cors`),
+  getBucketPolicy: (bucket: string) =>
+    request<{ Policy: string }>("GET", `/api/buckets/${encodeURIComponent(bucket)}/policy`),
+  putBucketPolicy: (bucket: string, policy: string) =>
+    request<{ Policy: string }>("PUT", `/api/buckets/${encodeURIComponent(bucket)}/policy`, {
+      Policy: policy,
+    }),
+  deleteBucketPolicy: (bucket: string) =>
+    request<Record<string, unknown>>("DELETE", `/api/buckets/${encodeURIComponent(bucket)}/policy`),
+  getObjectTags: (bucket: string, key: string) =>
+    request<{ tags: S3Tag[] }>(
+      "GET",
+      `/api/buckets/${encodeURIComponent(bucket)}/object-tags?key=${encodeURIComponent(key)}`
+    ),
+  putObjectTags: (bucket: string, key: string, tags: S3Tag[]) =>
+    request<Record<string, unknown>>("POST", `/api/buckets/${encodeURIComponent(bucket)}/object-tags/action`, {
+      action: "put",
+      key,
+      tags,
     }),
 
   keys: () => request<{ keys: KeyInfo[] }>("GET", "/api/keys"),

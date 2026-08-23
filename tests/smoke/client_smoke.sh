@@ -87,6 +87,36 @@ else
     bad "aws s3 cp roundtrip"
 fi
 
+# 版本化往返(M10 门禁:开版本 → 覆盖 → 版本寻址回读 → 列版本)
+if "$AWS" s3api put-bucket-versioning --bucket "$BUCKET" \
+    --versioning-configuration Status=Enabled --endpoint-url "$EP" >/dev/null 2>&1 \
+    && [ "$("$AWS" s3api get-bucket-versioning --bucket "$BUCKET" --endpoint-url "$EP" --query Status --output text 2>/dev/null)" = "Enabled" ]; then
+    ok "put/get-bucket-versioning"
+else
+    bad "put/get-bucket-versioning"
+fi
+echo -n "v1" > /tmp/client-smoke-v.txt
+VID1=$("$AWS" s3api put-object --bucket "$BUCKET" --key v.txt --body /tmp/client-smoke-v.txt \
+    --endpoint-url "$EP" --query VersionId --output text 2>/dev/null)
+echo -n "v2" > /tmp/client-smoke-v.txt
+"$AWS" s3api put-object --bucket "$BUCKET" --key v.txt --body /tmp/client-smoke-v.txt \
+    --endpoint-url "$EP" >/dev/null 2>&1
+if [ -n "$VID1" ] && [ "$VID1" != "None" ] \
+    && "$AWS" s3api get-object --bucket "$BUCKET" --key v.txt --version-id "$VID1" \
+        /tmp/client-smoke-v.out --endpoint-url "$EP" >/dev/null 2>&1 \
+    && [ "$(cat /tmp/client-smoke-v.out)" = "v1" ] \
+    && "$AWS" s3api list-object-versions --bucket "$BUCKET" --prefix v.txt --endpoint-url "$EP" 2>/dev/null | grep -q "$VID1"; then
+    ok "versioned put/get/list roundtrip"
+else
+    bad "versioned put/get/list roundtrip"
+fi
+# 清场:逐版本物理删除
+"$AWS" s3api list-object-versions --bucket "$BUCKET" --prefix v.txt --endpoint-url "$EP" \
+    --query 'Versions[].VersionId' --output text 2>/dev/null | tr '\t' '\n' | while read -r vid; do
+    [ -n "$vid" ] && [ "$vid" != "None" ] && \
+        "$AWS" s3api delete-object --bucket "$BUCKET" --key v.txt --version-id "$vid" --endpoint-url "$EP" >/dev/null 2>&1
+done
+
 # ────────────────────────── boto3 ──────────────────────────
 step "boto3"
 if ! python3 -c "import boto3" 2>/dev/null; then
@@ -141,6 +171,44 @@ try:
     raise SystemExit("expected NoSuchKey")
 except s3.exceptions.ClientError as e:
     assert e.response["Error"]["Code"] in ("404", "NoSuchKey"), e
+# 版本化往返(M10 门禁:开版本 → 覆盖 3 次 → 列版本 → 恢复第 1 版一致)
+s3.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+v_datas = [b"version-one", b"version-two", b"version-three"]
+vids = []
+for d in v_datas:
+    vids.append(s3.put_object(Bucket=bucket, Key="vkey", Body=d)["VersionId"])
+vers = s3.list_object_versions(Bucket=bucket, Prefix="vkey")
+assert len(vers.get("Versions", [])) == 3, vers
+assert s3.get_object(Bucket=bucket, Key="vkey", VersionId=vids[0])["Body"].read() == v_datas[0]
+# 条件写:If-None-Match: * 于存在键 → 412(botocore 过旧无该参数则跳过)
+import botocore.exceptions
+try:
+    s3.put_object(Bucket=bucket, Key="vkey", Body=b"x", IfNoneMatch="*")
+    raise SystemExit("expected 412 PreconditionFailed")
+except botocore.exceptions.ParamValidationError:
+    print("  skip: botocore too old for put_object IfNoneMatch")
+except s3.exceptions.ClientError as e:
+    assert e.response["ResponseMetadata"]["HTTPStatusCode"] == 412, e
+# 恢复第 1 版(服务端复制历史版本覆盖当前;自复制须 REPLACE)
+s3.copy_object(Bucket=bucket, Key="vkey",
+               CopySource={"Bucket": bucket, "Key": "vkey", "VersionId": vids[0]},
+               MetadataDirective="REPLACE", ContentType="text/plain")
+assert s3.get_object(Bucket=bucket, Key="vkey")["Body"].read() == v_datas[0]
+# 删除标记 → 当前 404
+d = s3.delete_object(Bucket=bucket, Key="vkey")
+assert d.get("DeleteMarker") is True and d.get("VersionId")
+try:
+    s3.get_object(Bucket=bucket, Key="vkey")
+    raise SystemExit("expected 404 after delete marker")
+except s3.exceptions.ClientError as e:
+    assert e.response["ResponseMetadata"]["HTTPStatusCode"] == 404, e
+# 逐版本物理删除清场
+vers = s3.list_object_versions(Bucket=bucket, Prefix="vkey")
+for v in vers.get("Versions", []) + vers.get("DeleteMarkers", []):
+    s3.delete_object(Bucket=bucket, Key="vkey", VersionId=v["VersionId"])
+left = s3.list_object_versions(Bucket=bucket, Prefix="vkey")
+assert not left.get("Versions") and not left.get("DeleteMarkers"), left
+print("  ok: boto3 versioning roundtrip")
 # 清桶
 for k in ["big"]:
     s3.delete_object(Bucket=bucket, Key=k)

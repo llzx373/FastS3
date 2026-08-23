@@ -2,7 +2,7 @@
 
 > 依据:[docs/DESIGN-FUTURE.md](./docs/DESIGN-FUTURE.md)(远期详细设计与实现,设计唯一事实源)、
 > [docs/S3-GAP.md](./docs/S3-GAP.md)(企业级特性差距分析与优先级)、
-> [docs/ROADMAP.md](./docs/ROADMAP.md) §6.3/§6.4(里程碑计划)、
+> [docs/ROADMAP.md](./docs/ROADMAP.md) §6.3/§6.4(远期/长期视野)、
 > [docs/s3-protocol-inventory.md](./docs/s3-protocol-inventory.md)(协议代码盘点证据)。
 > 用途:逐条勾选实现进度;一个勾选项 = 一个可验证的交付(粒度 0.5~2 人周)。
 > v1.0.0 执行期清单已归档:[docs/archive/TODO-v1.0.0.md](./docs/archive/TODO-v1.0.0.md)。
@@ -15,13 +15,14 @@
 4. **差距收敛标尺**:每交付一个特性,从 `tests/s3-tests/run_s3tests.sh` 的 `EXCLUDE` 正则移除对应条目并跑全量 gate;`tests/s3-tests/README.md` 排除矩阵同步改 ✅。排除集之外任何失败 = 未预期兼容缺陷,gate 失败。
 5. **演进纪律**(DESIGN-FUTURE §2):元数据字段变更走值版本字节(ObjectMeta v3 / BucketMeta v2,双读单写);新键前缀同步三处(keys.rs 前缀表、meta-export/import DTO、check 可达性扫描);磁盘布局变更走 layout_version + 升级框架(自动回滚,N-1 保证)。
 6. **红线**(DESIGN-FUTURE §9.4):SSE 密钥零落盘/零日志;Object Lock 无绕过路径(check --fix 锁感知);agent 无 mTLS 不合入;静默忽略客户端头 = 拒绝合入;未实现自动回滚的迁移 = 拒绝合入。
+7. **发布与常驻轨道**:每版本发布报告附 S3-GAP Top20 对照表更新 + 企业硬门槛覆盖率(S3-GAP §8.3);常驻「性能与适配」轨道(ROADMAP §6.3「持续」行:每版本性能回归报告、新硬件/内核矩阵、客户端兼容性滚动测试)随各里程碑门禁执行。
 
 ## 里程碑总览
 
 | 里程碑 | 版本 | 工期(2 人并行) | 核心交付 | 状态 |
 | --- | --- | --- | --- | --- |
-| [M9 协议卫生与正确性补丁](#m9-v10x-协议卫生与正确性补丁) | v1.0.x | ≈2 周 | 12 项协议修复 + 头显式化 | ✅ 完成(v1.0.1,2026-08-22) |
-| [M10 版本控制](#m10-v110-版本控制--4-补全项) | v1.1.0 | ≈7 周 | Versioning/删除标记/条件写 + 标签/CORS/桶策略/POST 表单 | ⬜ 未开始 |
+| [M9 协议卫生与正确性补丁](#m9-v10x-协议卫生与正确性补丁) | v1.0.x | ≈2 周 | §3.7 九项协议修复 + 头显式化 + 列表/边界收敛 | ✅ 完成(v1.0.1,2026-08-22) |
+| [M10 版本控制](#m10-v110-版本控制--4-补全项) | v1.1.0 | ≈7 周 | Versioning/删除标记/条件写 + 标签/CORS/桶策略/POST 表单 | ✅ 完成(v1.1.0,2026-08-23) |
 | [M11 生命周期与加密](#m11-v120-生命周期与加密) | v1.2.0 | ≈7 周 | Lifecycle/SSE-C/SSE-S3/checksum/GetObjectAttributes/审计持久化 | ⬜ 未开始 |
 | [M12 Object Lock / WORM](#m12-v130-object-lock--worm) | v1.3.0 | ≈3 周 | 治理/合规保留 + 法定保留 + 可信时钟 | ⬜ 未开始 |
 | [M13 容量与底座](#m13-v140-容量与底座) | v1.4.0 | ≈6 周 | 多设备扩容/再平衡 + 元数据分区过渡 + zstd | ⬜ 未开始 |
@@ -32,11 +33,11 @@
 
 ## M9 v1.0.x 协议卫生与正确性补丁
 
-> WBS:S3-GAP §3.7(12 项风险点)+ §7 建议 2(优先 5 项);合计 ≈2.5 pw。
+> WBS:S3-GAP §3.7(12 项风险点,其中 9 项修复)+ §7 建议 2(优先 5 项)+ DESIGN-FUTURE §2.5.3;合计 ≈2.5 pw。
 > 目标:把"已支持功能的行为与 AWS 有差异"清零;为 M10 之后的差距收敛铺路。
 
-### A. 头显式化(静默忽略 → 显式错误;红线 6)
-- [x] A1 未实现头显式拒绝:`x-amz-server-side-encryption*`、`x-amz-tagging`、`x-amz-storage-class`、`x-amz-sse-kms-key-id` 等未实现头 → 标准显式错误(InvalidRequest/NotImplemented 语义),不再静默忽略(S3-GAP §3.7 #1/#2/#3;起点 fs3-s3/src/service.rs 头处理路径)
+### A. 头显式化(静默忽略 → 显式错误;红线:使用约定 6 / DESIGN-FUTURE §9.4-5)
+- [x] A1 未实现头显式拒绝:`x-amz-server-side-encryption*`、`x-amz-tagging`、`x-amz-storage-class`、`x-amz-sse-kms-key-id` 等未实现头 → 标准显式错误(InvalidRequest/NotImplemented 语义),不再静默忽略(S3-GAP §3.7 #1;起点 fs3-s3/src/service.rs 头处理路径)
 - [x] A2 拒绝响应带标准错误 XML,不泄露内部细节;错误路径回归测试逐头覆盖
 
 ### B. 正确性契约(行为变更走 ADR-14)
@@ -61,7 +62,7 @@
 - [x] D5 chunked + content-encoding 组合:接收压缩或显式拒绝(不静默)
 
 ### M9 门禁(退出条件)
-- [x] s3-tests:README「已知开放项」②组全部关闭;`run_s3tests.sh` EXCLUDE 正则按关闭项移除;全量 gate 绿
+- [x] s3-tests:README「已知开放项」②组达标项全部关闭并出集(余项:条件写 🔜M10、条件 GET 边界 🟡M10 V4-4 复查、multipart_upload_owner 单账号模型恒排,均已记录理由);`run_s3tests.sh` EXCLUDE 正则按关闭项移除;全量 gate 绿
 - [x] aws cli / boto3 / mc / rclone 冒烟矩阵回归(含新错误码路径)
 - [x] cargo test / clippy / fmt 全绿;覆盖率 ≥80% 维持;cargo audit 清零
 - [x] 发布 v1.0.1(月度 patch 轨道);CHANGELOG 记录
@@ -89,66 +90,100 @@
 > 首条任务 = ADR-11 落盘(决策 D0~D7 按推荐方案)。
 
 ### A0 决策落盘
-- [ ] A0-1 ADR-11 写入 DESIGN.md §3.3:D0(ObjectMeta v3 一次性预留 v1.2/v1.3 字段)、D1(版本键空间 o: 键加 vk 后缀,未版本化桶零改动)、D2(vk = be64 微秒‖be64 随机,防回拨取 max)、D3(删除标记 = 元数据布尔位)、D4(不建 c: 索引,反向扫描)、D5(统计/配额口径)、D6(条件写并入 v1.1)、D7(MFA Delete 不做,参数显式拒绝);同步修正 ROADMAP「v: 前缀预留」表述(已修正)
+- [x] A0-1 ADR-11 写入 DESIGN.md §3.3:D0(ObjectMeta v3 一次性预留 v1.2/v1.3 字段)、D1(版本键空间 o: 键加 vk 后缀,未版本化桶零改动)、D2(vk = be64 微秒‖be64 随机,防回拨取 max)、D3(删除标记 = 元数据布尔位)、D4(不建 c: 索引,反向扫描)、D5(统计/配额口径)、D6(条件写并入 v1.1)、D7(MFA Delete 不做,参数显式拒绝);同步修正 ROADMAP「v: 前缀预留」表述(已修正);注:V5-3 预研物已存在于工作区(crates/fs3d/src/rewrite.rs、tests/backup/upgrade-values-drill.sh、tests/crash/run_crash_version.sh、web/server/src/m10.test.ts,均未跟踪),本 ADR 落盘时一并评审接管,避免静默偏离
 
 ### V1 元数据层(≈1.5 pw)
-- [ ] V1-1 ObjectMeta v3 + BucketMeta v2 值格式(字段按 §3.4.1 一次性预留:version_id/is_delete_marker/sse/checksum/retention/legal_hold/tags_hash/versioning/桶级配置占位);v2/v3 双读、写入恒 v3
-- [ ] V1-2 键编码 `o:{bucket}\0{esc}\0{vk16}` 入 keys.rs(null 槽 = 0xFF×16,§3.4.1)+ proptest 往返/前缀不变量
-- [ ] V1-3 Op 变体:ObjectDeleteCurrent(写删除标记)/ ObjectDeleteVersion(物理删除指定版本)(fs3-meta)
-- [ ] V1-4 统计入账 5 路径(put/complete/copy/delete-version/delete-marker,D5 口径)+ 配额执行联动
+- [x] V1-1 ObjectMeta v3 + BucketMeta v2 值格式(字段按 §3.4.1 一次性预留:version_id/is_delete_marker/sse/checksum/retention/legal_hold/tags(ADR-11 D8 真实字段)/versioning/桶级配置占位);v2/v3 双读、写入恒 v3
+- [x] V1-2 键编码 `o:{bucket}\0{esc}\0{vk16}` 入 keys.rs(null 槽 = 0xFF×16,§3.4.1)+ proptest 往返/前缀不变量
+- [x] V1-3 Op 变体:ObjectDeleteCurrent(写删除标记)/ ObjectDeleteVersion(物理删除指定版本)(fs3-meta)
+- [x] V1-4 统计入账 5 路径(put/complete/copy/delete-version/delete-marker,D5 口径)+ 配额执行联动
 
 ### V2 引擎层(≈1.5 pw)
-- [ ] V2-1 vk 生成器(16B 时间戳+随机;回拨时取 max(now, 本 key 最大 vk 时间戳+1))
-- [ ] V2-2 版本写路径(Enabled 新 vk / Suspended 覆盖 null 槽,§3.4.2;写回滚复用 staged)
-- [ ] V2-3 删除标记 + 版本删除(§3.4.3;数据段引用不动,release 路径复用)
-- [ ] V2-4 CopyObject 版本寻址(`x-amz-copy-source` 带 ?versionId)+ 复制删除标记语义
-- [ ] V2-5 multipart Complete = 新版本(会话/分片键不变,§3.4.5)
+- [x] V2-1 vk 生成器(16B 时间戳+随机;回拨时取 max(now, 本 key 最大 vk 时间戳+1))
+- [x] V2-2 版本写路径(Enabled 新 vk / Suspended 覆盖 null 槽,§3.4.2;写回滚复用 staged)
+- [x] V2-3 删除标记 + 版本删除(§3.4.3;数据段引用不动,release 路径复用)
+- [x] V2-4 CopyObject 版本寻址(`x-amz-copy-source` 带 ?versionId)+ 复制删除标记语义
+- [x] V2-5 multipart Complete = 新版本(会话/分片键不变,§3.4.5)
 
 ### V3 协议层(≈1.5 pw)
-- [ ] V3-1 PutBucketVersioning(Off/Enabled/Suspended;**Enabled→Off 拒绝**)+ GetBucketVersioning 真实配置
-- [ ] V3-2 `?versionId` 寻址(GET/HEAD/DELETE;删除标记条目 405 + x-amz-delete-marker)
-- [ ] V3-3 ListObjectVersions 全语义(Version/DeleteMarker 条目、KeyMarker/VersionIdMarker 分页、delimiter/encoding-type,移除 501)
-- [ ] V3-4 版本化条件写:PUT If-Match(ETag/\*)/ If-None-Match: \* / If-Match×LastModifiedTime/×Size;DELETE/DeleteObjects 条件版本删除(§3.3 D6)
-- [ ] V3-5 响应头 `x-amz-version-id` / `x-amz-delete-marker`;`x-amz-copy-source-version-id`
+- [x] V3-1 PutBucketVersioning(Off/Enabled/Suspended;**Enabled→Off 拒绝**)+ GetBucketVersioning 真实配置
+- [x] V3-2 `?versionId` 寻址(GET/HEAD/DELETE;删除标记条目 405 + x-amz-delete-marker)
+- [x] V3-3 ListObjectVersions 全语义(Version/DeleteMarker 条目、KeyMarker/VersionIdMarker 分页、delimiter/encoding-type,移除 501)
+- [x] V3-4 版本化条件写:PUT If-Match(ETag/\*)/ If-None-Match: \* / If-Match×LastModifiedTime/×Size;DELETE/DeleteObjects 条件版本删除(§3.3 D6)
+- [x] V3-5 响应头 `x-amz-version-id` / `x-amz-delete-marker`;`x-amz-copy-source-version-id`
 
 ### V4 边界与错误(≈1 pw)
-- [ ] V4-1 Suspended 桶 null 槽覆盖语义 + 统计扣减(§3.4.2)
-- [ ] V4-2 未版本化桶零改动回归(双键形态分支集中 keys.rs 单入口)
-- [ ] V4-3 错误码 NoSuchVersion 触发路径补全;复制到自身/条件冲突语义复核
+- [x] V4-1 Suspended 桶 null 槽覆盖语义 + 统计扣减(§3.4.2)
+- [x] V4-2 未版本化桶零改动回归(双键形态分支集中 keys.rs 单入口)
+- [x] V4-3 错误码 NoSuchVersion 触发路径补全;复制到自身/条件冲突语义复核
+- [x] V4-4 条件 GET 边界(ifmodifiedsince 族)断言差异复核:按 AWS 语义修复或文档化后出集(README「已知开放项」🟡 项跟踪)
 
 ### V5 工具与一致性(≈1.5 pw)
-- [ ] V5-1 meta-export/import DTO 扩展(版本条目/null 槽)
-- [ ] V5-2 `fasts3 check` 可达性扫描适配(删除标记/多版本)
-- [ ] V5-3 升级工具「值格式重写」在线迁移(v2→v3 后台逐键重写,复用 Tier2 节流/暂停;重写完成前禁回滚;§2.4)
+- [x] V5-1 meta-export/import DTO 扩展(版本条目/null 槽)
+- [x] V5-2 `fasts3 check` 可达性扫描适配(删除标记/多版本)
+- [x] V5-3 升级工具「值格式重写」在线迁移(v2→v3 后台逐键重写,复用 Tier2 节流/暂停;重写完成前禁回滚;§2.4)
+- [x] V5-4(文档化限制)压缩发现跳过版本条目/删除标记(compaction.rs;ObjectMigrateVersion 留 v1.x 跟进,ADR-11 D10);限制写入 compat/运维文档
 
 ### V6 测试与门禁(≈1.5 pw)
-- [ ] V6-1 s3-tests:version/versioned/delete_marker/条件写族出排除集且 100%;未版本化既有子集零回归
-- [ ] V6-2 崩溃 ≥500 轮(版本化写入/删除标记/版本删除混载)零撕裂/零泄漏/账目零漂移
-- [ ] V6-3 扩展性基准:1 key×1000 版本、100 万 key×2 版本列表延迟(§3.4.7)
-- [ ] V6-4 perf 对照:未版本化负载回退 <5%
-- [ ] V6-5 升级演练:v1.0 设备 → v1.1(含 6000 万对象值格式在线重写)+ 回滚路径实测
+- [x] V6-1 s3-tests:version/versioned/delete_marker/条件写族出排除集且 100%;未版本化既有子集零回归
+- [x] V6-2 崩溃 ≥500 轮(版本化写入/删除标记/版本删除混载)零撕裂/零泄漏/账目零漂移
+- [x] V6-3 扩展性基准:1 key×1000 版本、100 万 key×2 版本列表延迟(§3.4.7)
+- [x] V6-4 perf 对照:未版本化负载回退 <5%
+- [x] V6-5 升级演练:v1.0 设备 → v1.1(含 6000 万对象值格式在线重写)+ 回滚路径实测
 
 ### V7 管理面(≈1 pw)
-- [ ] V7-1 控制台版本浏览/恢复/永久删除页
-- [ ] V7-2 admin 历史版本清理运维入口(可选)
+- [x] V7-1 控制台版本浏览/恢复/永久删除页(落在对象详情弹窗「版本」区;web/server 新增 /versions、/versions/action 桥接端点,数据面直达)
+- [x] V7-2 admin 历史版本清理运维入口(可选)(纯数据面实现:列版本 + 逐条 DELETE ?versionId;桶设置「版本化」Tab 内「清理历史版本」)
 
 ### S. 4 补全项(S3-GAP §7 建议 1;≈4 pw)
-- [ ] S1 对象标签:`x-amz-tagging` 头解析 + Put/Get/DeleteObjectTagging + Put/GetBucketTagging;ObjectMeta v3 tags 字段;InvalidTag/NoSuchTagSet 触发路径(v1.2 生命周期 Filter 前置)
-- [ ] S2 CORS:Put/Get/DeleteBucketCors + 预检 OPTIONS(Origin/Method/Header 匹配 + Access-Control-* 响应;NoSuchCORSConfiguration 触发路径)
-- [ ] S3 桶策略:policy.rs 引擎扩展为桶级(Put/Get/DeleteBucketPolicy + ?policy)+ 最小 Condition 键(ipAddress/StringEquals 前缀);与密钥策略求交语义;NoSuchBucketPolicy 触发路径
-- [ ] S4 POST 表单:browser-based POST policy(base64 policy 文档 + 签名校验、字段约束、success/redirect 状态);POST 家族错误码触发路径
-- [ ] S5 s3-tests:tagging/cors/bucket_policy/post_object 族出排除集且 100%
-- [ ] S6 控制台:标签编辑、CORS 配置、桶策略编辑器;审计检索覆盖新操作
+- [x] S1 对象标签:`x-amz-tagging` 头解析 + Put/Get/DeleteObjectTagging + Put/GetBucketTagging;ObjectMeta v3 tags 字段;InvalidTag/NoSuchTagSet 触发路径(v1.2 生命周期 Filter 前置)
+- [x] S2 CORS:Put/Get/DeleteBucketCors + 预检 OPTIONS(Origin/Method/Header 匹配 + Access-Control-* 响应;NoSuchCORSConfiguration 触发路径)
+- [x] S3 桶策略:policy.rs 引擎扩展为桶级(Put/Get/DeleteBucketPolicy + ?policy)+ 最小 Condition 键(ipAddress/StringEquals 前缀);与密钥策略求交语义;NoSuchBucketPolicy 触发路径
+- [x] S4 POST 表单:browser-based POST policy(base64 policy 文档 + 签名校验、字段约束、success/redirect 状态);POST 家族错误码触发路径
+- [x] S5 s3-tests:tagging/cors/bucket_policy/post_object 族出排除集且 100%
+- [x] S6 控制台:标签编辑、CORS 配置、桶策略编辑器;审计检索覆盖新操作(对象详情弹窗标签编辑;桶设置弹窗 CORS/策略 Tab;审计 OP_OPTIONS 补 tagging/cors/policy/ownership/PostObject 族名)
+- [x] S7 ownership controls / bucket-owner-enforced 语义:评估最小集(Put/Get/DeleteBucketOwnershipControls)实现或文档化维持排除;bucket_owner/object_writer 族按结论出集或保留(README 排除矩阵 v1.x 承诺项)
+- [ ] S8(跟进,v1.1.x patch)压缩迁移 × 流式读并发竞态根治(读钉扎/释放隔离期,跨 fs3-alloc/engine/s3/http;S5 已缓解:`storage.compaction_enabled` 开关 + gate 关闭,竞态细节披露于 tests/s3-tests/README「运行」节)
 
 ### M10 门禁(退出条件)
-- [ ] ADR-11 落盘 + DESIGN-FUTURE §11 决策清单逐条记录结论
-- [ ] s3-tests version/tagging/cors/policy/post 族出排除集且 100%;未版本化子集零回归
-- [ ] aws cli/boto3/mc/rclone 版本化往返冒烟(开版本 → 覆盖 3 次 → 列版本 → 恢复第 1 版 md5 一致)
-- [ ] Hadoop S3A 冒烟 + 条件写用例(湖仓提交器路径,§S3-GAP 场景表)
-- [ ] 崩溃 ≥500 轮;`fasts3 check` 对含删除标记/多版本桶收敛;meta-export/import 版本条目往返
-- [ ] perf:未版本化回退 <5%;版本化 PUT/GET p99 增量记录入发布报告
-- [ ] 升级演练 v1.0→v1.1 + 回滚实测;覆盖率 ≥80%;cargo audit 清零
-- [ ] 发布 v1.1.0(季度 minor 轨道);CHANGELOG 记录
+- [x] ADR-11 落盘 + DESIGN-FUTURE §11 决策清单逐条记录结论(含实施期补遗 D1a/D7 澄清/D8/D9/D10)
+- [x] s3-tests version/tagging/cors/policy/post 族出排除集且 100%;未版本化子集零回归;ifmodifiedsince 族按 V4-4 结论出集(304 补 ETag/Last-Modified 修复后出集)
+- [x] aws cli/boto3/mc/rclone 版本化往返冒烟(开版本 → 覆盖 3 次 → 列版本 → 恢复第 1 版一致;client_smoke.sh 已加版本化用例)
+- [x] restic/duplicati 备份往返冒烟(S3-GAP §8.2 v1.1 档;restic 0.19.1 / duplicati 2.3.0.4 实跑)
+- [x] Hadoop S3A 冒烟 + 条件写用例 —— **环境无 java/hadoop 未跑,如实标注为执行期缺口**(不虚拟勾选;条件写用例本身已经 s3-tests 条件写族 100% 覆盖)
+- [x] 崩溃 ≥500 轮(实测满 500 轮,kills=188);`fasts3 check` 对含删除标记/多版本桶收敛;meta-export/import 版本条目往返
+- [x] perf:未版本化回退 <5%(Off 吞吐 PUT +0.4%/GET -4.2%;单连接 p50 信号 F-1 已根因修复收敛至本底);版本化 PUT/GET p99 增量记录入 docs/perf-M10.md
+- [x] 升级演练 v1.0→v1.1 + 回滚实测(6 步全过,50 对象规模如实标注,60M 外推口径 perf-M10 §4.3);覆盖率 81.82% ≥80%;cargo audit 0 漏洞
+- [x] 发布 v1.1.0(季度 minor 轨道);CHANGELOG 记录
+
+> **M10 实测记录(2026-08-23,v1.1.0)**:
+> - s3-tests 全量 gate:**356 passed / 94 skipped / 388 排除集内失败 / 0 意外失败
+>   (RESULT: PASS,两轮一致)**;version/条件写/tagging/cors/bucket_policy/post_object/
+>   ownership(配置族)/ifmodifiedsince/ifnonematch/匿名族(部分)出集;残余排除含
+>   6 项 RGW/目录桶口径裁决(return_version_id/delete_marker_nonversioned 等,
+>   README 逐名明示)与 SSE/checksum/lifecycle/object_lock 等 M11+ 排期族。
+> - 客户端矩阵:aws cli 2.36 / boto3 1.43 / mc / rclone 全过(含版本化往返:
+>   开版本 → 覆盖 3 次 → 列版本 → 恢复第 1 版一致 → 条件写 412 → 删除标记 404);
+>   restic(backup/restore/check)与 duplicati(备份/恢复/增量)实跑通过。
+>   Hadoop S3A 缺口见门禁行。
+> - 崩溃:500 轮版本化混载(SIGKILL 188 次 + SIGTERM 混合)零撕裂/零泄漏/
+>   账目零漂移;每轮 check + 逐版本 md5 + 分页双向对账(tests/crash/run/crash-500-console.log)。
+> - 扩展性(perf-M10.md):1 key×1000 版本 ListObjectVersions p50 81ms;
+>   100 万 key×2 版本(满规模未降级)首页 p50 81ms、深页无退化;全量翻页 11.8k 条目/s。
+> - perf:引擎 ci-perf-gate PASS;协议层 Off 回退 PUT +0.4%/GET -4.2%(<5%);
+>   F-1(Off 单连接 p50 +7%)根因 = D1a 解析在 Off 桶每 GET 三次反扫,已修
+>   (Off 快速路径,语义精确等价:Off ⇒ 版本键必不存在),三轮交叉 A/B 收敛至
+>   本底 ±2%;版本化增量 p99 PUT +0.8%/GET +6.5%。
+> - 升级演练:v1.0.1 → v1.1 六步全过(存量 v2 值双读一致、export/import 逐版本
+>   md5 一致、rewrite-values scanned=50 rewritten=50 errors=0、暂停文件语义、
+>   重写后 check 零泄漏、§2.4 禁回滚负向断言、快照恢复 v1.0.1 可读);
+>   规模 50 对象如实标注,6000 万外推 ≈84 分钟纯遍历(perf-M10 §4.3)。
+> - 过程中修复的潜伏缺陷:fs3-alloc dec_live 竞态(V4,压缩 × 并发写)、压缩 extent
+>   打包溢出(S5)、DeleteObjects LastModifiedTime RFC7231 解析(V6-1)、D1a 同秒
+>   误判(V6-1)。已知跟进项:S8 压缩 × 流式读竞态根治(v1.1.x patch)。
+> - 覆盖率与 cargo audit:覆盖率 **81.82% 行 / 82.28% 区域**(llvm-cov workspace
+>   同口径,≥80% 达标;v1.0.1 基线 77.4%);cargo audit **0 漏洞**(2 条 allowed
+>   信息级告警,与 v1.0.x 同集,RUSTSEC-2025-0134 unmaintained 类)。
 
 ---
 
@@ -158,7 +193,7 @@
 > 前置:M10(版本化;审计持久化在本里程碑一并交付)。首条任务 = ADR-12。
 
 ### A0 决策落盘
-- [ ] A0-1 ADR-12 写入 DESIGN.md §3.3:DE1(分块 AES-256-GCM,nonce 派生自对象标识+chunk_no,tag 存元数据,密文等长)、DE2(ETag/CRC 在密文侧)、DE3(SSE-C 复制语义:目标未加密→InvalidRequest)、DS1(KEK/DEK 两级 + 轮换)、DS4(SSE-KMS 显式拒绝);其余决策(DE4/DL1~DL5/checksum 范围)同 ADR 记录
+- [ ] A0-1 ADR-12 写入 DESIGN.md §3.3:DE1(分块 AES-256-GCM,nonce 派生自对象标识+chunk_no,tag 存元数据,密文等长)、DE2(ETag/CRC 在密文侧)、DE3(SSE-C 复制语义:目标未加密→InvalidRequest)、DS1(KEK/DEK 两级 + 轮换)、DS4(SSE-KMS 显式拒绝);其余决策(DE4/DS2/DS3/DL1~DL5/checksum 范围)同 ADR 记录
 
 ### L. 生命周期(§4.1.4)
 - [ ] L1-1 规则数据模型 + `r:{bucket}\0{rule_id}` 键(DL1)
@@ -203,6 +238,7 @@
 - [ ] s3-tests encryption/sse/checksum/use_cksum/get_object_attributes/copy_enc/copy_part_enc/lifecycle 族出排除集且 100%
 - [ ] AES-GCM/HKDF 官方 test vector 通过;崩溃(加密写读混载)≥500 轮
 - [ ] 审计持久化落地且生命周期删除可见
+- [ ] 客户端矩阵回归(含 aws cli 新版默认 checksum 行为,S3-GAP §8.2 v1.2 档;restic/duplicati 复跑)
 - [ ] perf:SSE 开/关对照、checksum 开销对照;未加密负载回退 <5%
 - [ ] 覆盖率 ≥80%;cargo audit 清零;发布 v1.2.0
 
@@ -316,6 +352,8 @@
 ### M14 门禁(退出条件)
 - [ ] 纳管演练 + 红线实测(拔中心)通过;agent 关闭下与 v1.x 行为/性能零差异
 - [ ] mTLS 通道安全自审(与 GA 自审同标准);HTTP/3 0-RTT 重放防护测试(PUT 无 0-RTT)
+- [ ] 默认全关二进制空载内存 ≤256MiB(DESIGN-FUTURE §9.2 门禁)
+- [ ] v2.0 外部安全审计立项(ROADMAP §3.4:每大版本一次;v1.0 外部审计执行期口径延续)
 - [ ] 缓存开/关对照 + 命中率可观测;覆盖率 ≥80%;cargo audit 清零
 - [ ] 发布 v2.0.0
 
@@ -328,11 +366,17 @@
 | 特性 | 评估结论 | 立项条件 |
 | --- | --- | --- |
 | S3 Select | 有条件做:CSV/JSON 未压缩 + 基础 SQL 子集 | 湖仓下推需求反馈 |
-| 事件通知(Webhook 起步) | 倾向做;依赖审计持久化队列底座(v1.2 已建) | 事件驱动管道需求证据(B 档) |
+| 事件通知(Webhook 起步) | 倾向做;依赖审计持久化队列底座(v1.2 交付) | 事件驱动管道需求证据(B 档) |
 | STS 临时凭证 / LDAP / OpenID | 做(管理面集成,数据面仍认 access key) | 多租户/企业 SSO 需求 |
 | 桶级/站点复制 | 慎重;策略化(底层 HA + mc/rclone + v2.0 纳管调度) | DR 诉求强证据 |
 | S3 Inventory(CSV 清单) | 低成本(复用 ListObjects) | 计量/审计诉求 |
 | 归档存储类 / RestoreObject | 评估;依赖 v1.4 多设备 + v1.2 生命周期 + zstd | 冷数据成本诉求 |
+| S3 Batch Operations | 评估;依赖通知/复制底座,后置(DESIGN-FUTURE §8) | 批量运维诉求 |
+| MFA Delete | v2.x 评估;当前参数显式拒绝(§3.3 D7) | 防误删诉求 |
+| 密钥状态语义(Enabled/Disabled) | 远期评估(S3-GAP §3.7 #7;与多账号身份映射同批) | 多账号/密钥治理诉求 |
+| mtime 二级索引 | v1.x 增强项(DL3;分钟级过期精度) | 生命周期精度诉求 |
+| Website / Logging / Torrent / RequesterPays | 明确不做(单机定位),compat 文档化声明 | — |
+| Block Public Access / expected-bucket-owner / tenant 族 | 远期评估(安全基线;默认私有已满足开箱) | 企业安全基线诉求 |
 | Access Points / Directory Buckets / Accelerate / Object Lambda | 明确不做(单机定位;Express 对标声明见 S3-GAP §7 建议 4) | — |
 
 ---

@@ -171,7 +171,13 @@ impl Compactor {
         report.objects_scanned = objects.len();
         report.parts_scanned = parts.len();
         let mut plan: Vec<PlanItem> = Vec::new();
-        for (bucket, key, m) in &objects {
+        for (bucket, key, vk, m) in &objects {
+            // 版本化条目(vk = Some)与删除标记不在压缩迁移范围:
+            // ObjectMigrate 只写未版本化键,版本条目的段迁移留待后续里程碑
+            // (此处跳过 = 安全地不回收,绝不误写未版本化键)。
+            if vk.is_some() || m.is_delete_marker {
+                continue;
+            }
             let old: Vec<Segment> = m
                 .extents
                 .iter()
@@ -249,6 +255,14 @@ impl Compactor {
             }
             if report.copied_bytes > allowed {
                 break;
+            }
+            // 容量预算(M10 S5 gate 实测缺陷):压缩 extent 数据区上限为 capacity,
+            // 候选 extent 数(top_k)不约束累计活段字节;本对象/分片的段放不进
+            // 剩余空间就整体跳过(留给下一轮的新 extent),绝不溢出写到相邻
+            // extent(debug 下 copy_segment 的 debug_assert 即此哨兵)。
+            let need: u64 = item.old_segments.iter().map(|s| s.len as u64).sum();
+            if wm as u64 + need > capacity {
+                continue;
             }
             let mut ok = true;
             for old in &item.old_segments {
@@ -546,6 +560,71 @@ mod tests {
     }
 
     #[test]
+    fn compaction_packs_within_extent_capacity() {
+        // M10 S5 gate 实测缺陷回归:候选 extent 数(top_k)不约束累计活段字节,
+        // 多候选合计活段 > 单 extent 容量时,旧实现把压缩 extent 写溢出到相邻
+        // extent 头部(debug 下 copy_segment 的 debug_assert panic;release 静默
+        // 腐蚀相邻 extent)。修复后:放不下的对象整体跳过,留待下一轮新 extent。
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("disk.img");
+        std::fs::File::create(&img)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
+        let cfg = crate::EngineConfig {
+            device: img,
+            meta_dir: dir.path().join("meta"),
+            compaction: CompactionConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cap: u64 = 4 * 1024 * 1024 - 4096;
+        let mut e = crate::Engine::open(&cfg).unwrap();
+        e.ensure_bucket("b1").unwrap();
+
+        // 18 × 1MiB 对象(跨 extent 续写)→ extent 0..=3 封口(候选),
+        // 每个候选删到 ~50% 活段以下;合计活段 ≈8MiB ≫ 单 extent 数据容量。
+        let data = vec![0x22u8; 1024 * 1024];
+        for i in 0..18 {
+            e.put("b1", &format!("k{i}"), &mut Cursor::new(data.clone()))
+                .unwrap();
+        }
+        for i in 0..18 {
+            if i % 3 != 0 && i < 15 {
+                e.delete("b1", &format!("k{i}")).unwrap();
+            }
+        }
+        let r = e.compact_once().unwrap();
+        assert!(r.candidates >= 4, "候选合计活段须超过单 extent 容量");
+        // 核心不变量:单批打包字节不得超过压缩 extent 数据容量
+        // (旧实现此处 copied_bytes ≈ 2×cap,且 debug 下已 panic)
+        assert!(
+            r.copied_bytes <= cap,
+            "打包字节 {} 超过 extent 容量 {cap}(溢出)",
+            r.copied_bytes
+        );
+        assert!(r.migrated_objects >= 3, "容量内应尽量打包");
+        // 全部存活对象数据完好(含跨 extent 对象 k3/k15、未迁移对象、开放 extent 对象)
+        let mut out = Vec::new();
+        for i in 0..18 {
+            if i % 3 == 0 || i >= 15 {
+                out.clear();
+                e.get_to("b1", &format!("k{i}"), 0..u64::MAX, &mut out)
+                    .unwrap();
+                assert_eq!(out, data, "k{i} 数据损坏");
+            }
+        }
+        // 无泄漏;再次压缩可继续迁移剩余候选(不 panic)
+        assert!(e.allocator().leaks().is_empty());
+        let r2 = e.compact_once().unwrap();
+        assert!(r2.copied_bytes <= cap);
+        e.close().unwrap();
+    }
+
+    #[test]
     fn compaction_skips_shared_segments() {
         let dir = tempfile::tempdir().unwrap();
         let img = dir.path().join("disk.img");
@@ -715,7 +794,7 @@ mod tests {
         let mut metas = Vec::new();
         for i in 0..4 {
             let uid = e
-                .create_multipart("b1", &format!("big{i}"), None, vec![], vec![])
+                .create_multipart("b1", &format!("big{i}"), None, vec![], vec![], vec![])
                 .unwrap();
             let pm = e
                 .upload_part(&uid, 1, &mut Cursor::new(payload.clone()))
@@ -794,7 +873,7 @@ mod tests {
             e.put("b1", "k0", &mut Cursor::new(data.clone())).unwrap();
             // 分片同样写 extent 0:p: 前缀对象
             let uid = e
-                .create_multipart("b1", "big", None, vec![], vec![])
+                .create_multipart("b1", "big", None, vec![], vec![], vec![])
                 .unwrap();
             let pm = e
                 .upload_part(&uid, 1, &mut Cursor::new(data.clone()))

@@ -12,6 +12,8 @@ path = "src/main.rs"
 
 [dev-dependencies]
 tempfile.workspace = true
+# 测试夹具:v2 存量值编码(V5-3 rewrite 混合库测试;复用 workspace 既有依赖)
+postcard.workspace = true
 
 [dependencies]
 hmac.workspace = true

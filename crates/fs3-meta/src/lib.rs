@@ -93,6 +93,9 @@ pub struct MultipartSession {
     pub final_etag: [u8; 16],
     pub final_size: u64,
     pub final_mtime: i64,
+    /// Create 时 x-amz-tagging 头携带的对象标签(M10 S1;Complete 时落到
+    /// 对象。序列化尾部追加字段,decode_session 三读回退,存量会话按空表)。
+    pub tags: Vec<(String, String)>,
 }
 
 /// 当前 Unix 秒(会话时间戳用)。
@@ -110,6 +113,7 @@ impl MultipartSession {
         content_type: &str,
         user_meta: Vec<(String, String)>,
         resp_headers: Vec<(String, String)>,
+        tags: Vec<(String, String)>,
     ) -> Self {
         MultipartSession {
             bucket: bucket.to_string(),
@@ -122,6 +126,7 @@ impl MultipartSession {
             final_etag: [0u8; 16],
             final_size: 0,
             final_mtime: 0,
+            tags,
         }
     }
 }
@@ -140,6 +145,44 @@ pub struct PartMeta {
 impl PartMeta {
     pub fn etag_hex(&self) -> String {
         self.etag.iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
+/// D9 桶级配置文档类型(ADR-11 D9;M10 S1/S2/S3/S7):独立键前缀存储,不并入
+/// BucketMeta 值(配置文档可达数 KB,避免桶记录膨胀;M8 `l:` location 先例)。
+/// 值 = 协议层校验后的规范化文档(S3 桶策略为原始 JSON 文本;其余为规范化
+/// XML);删桶时与同事务清理。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketConf {
+    /// CORS 配置(S2;键 `bc:{bucket}`)。
+    Cors,
+    /// 桶级标签(S1;键 `bt:{bucket}`;ADR-11 D8)。
+    Tagging,
+    /// Ownership Controls(S7;键 `bo:{bucket}`)。
+    Ownership,
+    /// 桶策略(S3;键 `bp:{bucket}`;值 = 原始 JSON 文本,逐字节回显)。
+    Policy,
+}
+
+impl BucketConf {
+    /// 全部配置文档前缀(delete_bucket 事务清理用;新增 D9 前缀须在此登记,
+    /// 并同步 fs3d meta-export/import DTO——演进纪律 DESIGN-FUTURE §2.2;
+    /// check 可达性扫描只读 `o:`/`p:` 段引用键,对配置键天然安全)。
+    pub const ALL: [BucketConf; 4] = [
+        BucketConf::Cors,
+        BucketConf::Tagging,
+        BucketConf::Ownership,
+        BucketConf::Policy,
+    ];
+
+    pub fn key(self, bucket: &str) -> Vec<u8> {
+        let prefix = match self {
+            BucketConf::Cors => PREFIX_BUCKET_CORS,
+            BucketConf::Tagging => PREFIX_BUCKET_TAGGING,
+            BucketConf::Ownership => PREFIX_BUCKET_OWNERSHIP,
+            BucketConf::Policy => PREFIX_BUCKET_POLICY,
+        };
+        bucket_conf_key(prefix, bucket)
     }
 }
 
@@ -179,9 +222,78 @@ pub enum Op {
         old_segments: Vec<Segment>,
         new_segments: Vec<Segment>,
     },
+    /// 桶版本化状态单事务更新(ADR-11 D1;V3 PutBucketVersioning):
+    /// 只改写 BucketMeta.versioning,其余字段(含 l: location)原样保留;
+    /// 桶不存在 → NotFound。状态机合法性(Enabled→Off 禁止等)由调用方
+    /// (协议层)判定。
+    BucketSetVersioning {
+        name: String,
+        state: fs3_core::VersioningState,
+    },
+    /// D9 桶级配置文档写入(M10 S1/S2/S7;值 = 规范化 XML;覆盖语义)。
+    /// 桶不存在 → NotFound(与 BucketSetVersioning 同事务内校验)。
+    BucketConfPut {
+        bucket: String,
+        conf: BucketConf,
+        value: Vec<u8>,
+    },
+    /// D9 桶级配置文档删除(幂等:无配置同样 Ok;DeleteBucketTagging 等
+    /// 的 AWS 幂等语义)。桶不存在 → NotFound。
+    BucketConfDelete {
+        bucket: String,
+        conf: BucketConf,
+    },
+    /// 对象标签单事务读改写(M10 S1;PutObjectTagging/DeleteObjectTagging
+    /// 落地):`vk = None` → 未版本化单键 `o:{b}\0{k}`;`Some(vk)` → 版本键
+    /// (含 VK_NULL null 槽)。仅 tags 字段变更,不触碰数据段/统计;
+    /// 目标条目不存在 → NotFound。删除标记判定在引擎层先于提交完成。
+    ObjectSetTags {
+        bucket: String,
+        key: String,
+        vk: Option<[u8; 16]>,
+        tags: Vec<(String, String)>,
+    },
     ObjectDelete {
         bucket: String,
         key: String,
+    },
+    /// 删除当前版本(ADR-11 §3.4.3;版本化桶):写删除标记条目。
+    /// `vk = Some`:版本键 `o:{bucket}\0{esc(key)}\0{vk16}`(Enabled = 调用方
+    /// 生成的新 vk,Suspended = VK_NULL 槽位原地覆盖);`vk = None`:D1a-1
+    /// ——Suspended 桶存在 Off 时代遗留未版本化单键时**原地覆盖该单键**
+    /// (对外 VersionId 恒 "null",遗留单键与 null 槽不共存)。
+    /// marker 由调用方构造(is_delete_marker=true、size=0、extents/inline
+    /// 空,事务臂校验);不触碰数据段。未版本化桶仍走 ObjectDelete 物理删除。
+    ObjectDeleteCurrent {
+        bucket: String,
+        key: String,
+        vk: Option<[u8; 16]>,
+        marker: ObjectMeta,
+    },
+    /// 物理删除指定版本(DELETE ?versionId 语义):删除版本键条目;
+    /// 段释放与统计扣减由同事务的 Alloc/Stats 携带(调用方计算)。
+    ObjectDeleteVersion {
+        bucket: String,
+        key: String,
+        vk: [u8; 16],
+    },
+    /// 版本化对象 PUT(ADR-11 D1;V2 引擎分叉):写版本键
+    /// `o:{bucket}\0{esc(key)}\0{vk16}`(Enabled = 调用方生成的新 vk;
+    /// Suspended = VK_NULL 槽原地覆盖,同事务读改写)。不触碰旧版本条目;
+    /// 覆盖写的新段记账与旧 null 版本段释放由同事务 Alloc/Stats 携带。
+    ObjectPutVersion {
+        bucket: String,
+        key: String,
+        vk: [u8; 16],
+        meta: ObjectMeta,
+    },
+    /// 值格式在线重写(M10 V5-3;ADR-11 D0):按**原始键**单事务重编码
+    /// 对象值(写入恒 v3),不改统计/分配、不校验桶存在与删除标记契约
+    /// —— 值内容原样往返,仅值格式版本字节 +1。键必须已存在(否则
+    /// NotFound);供 `fasts3d rewrite-values` 离线/维护窗口使用。
+    ObjectMetaRewrite {
+        key: Vec<u8>,
+        meta: ObjectMeta,
     },
     /// 分配器变更(写入 a:{seq} + t:{seq};seq 由事务内部分配)
     Alloc {
@@ -355,6 +467,8 @@ fn decode<T: serde::de::DeserializeOwned>(v: &[u8]) -> Result<T> {
 
 /// M9/C3 双读:MultipartSession 值格式尾部追加 `resp_headers` 字段;
 /// 新格式优先,失败回退 v1.0.0 格式(空表),存量会话保持可读。
+/// M10/S1:尾部再追加 `tags` 字段,回退链扩为三层(含 resp_headers 无
+/// tags 的 v1.1.0 格式 → tags 空表)。
 fn decode_session(v: &[u8]) -> Result<MultipartSession> {
     #[derive(serde::Serialize, serde::Deserialize)]
     struct LegacySession {
@@ -368,51 +482,61 @@ fn decode_session(v: &[u8]) -> Result<MultipartSession> {
         final_size: u64,
         final_mtime: i64,
     }
+    /// v1.1.0 会话格式(含 resp_headers,无 tags;M10 回退用)。
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct SessionV11 {
+        bucket: String,
+        key: String,
+        content_type: String,
+        user_meta: Vec<(String, String)>,
+        resp_headers: Vec<(String, String)>,
+        created: i64,
+        completed: bool,
+        final_etag: [u8; 16],
+        final_size: u64,
+        final_mtime: i64,
+    }
     match postcard::from_bytes::<MultipartSession>(v) {
         Ok(s) => Ok(s),
-        Err(_) => {
-            let legacy: LegacySession = postcard::from_bytes(v)
-                .map_err(|e| Error::Corrupt(format!("postcard decode session: {e}")))?;
-            Ok(MultipartSession {
-                bucket: legacy.bucket,
-                key: legacy.key,
-                content_type: legacy.content_type,
-                user_meta: legacy.user_meta,
-                resp_headers: Vec::new(),
-                created: legacy.created,
-                completed: legacy.completed,
-                final_etag: legacy.final_etag,
-                final_size: legacy.final_size,
-                final_mtime: legacy.final_mtime,
-            })
-        }
+        Err(_) => match postcard::from_bytes::<SessionV11>(v) {
+            Ok(s) => Ok(MultipartSession {
+                bucket: s.bucket,
+                key: s.key,
+                content_type: s.content_type,
+                user_meta: s.user_meta,
+                resp_headers: s.resp_headers,
+                created: s.created,
+                completed: s.completed,
+                final_etag: s.final_etag,
+                final_size: s.final_size,
+                final_mtime: s.final_mtime,
+                tags: Vec::new(),
+            }),
+            Err(_) => {
+                let legacy: LegacySession = postcard::from_bytes(v)
+                    .map_err(|e| Error::Corrupt(format!("postcard decode session: {e}")))?;
+                Ok(MultipartSession {
+                    bucket: legacy.bucket,
+                    key: legacy.key,
+                    content_type: legacy.content_type,
+                    user_meta: legacy.user_meta,
+                    resp_headers: Vec::new(),
+                    created: legacy.created,
+                    completed: legacy.completed,
+                    final_etag: legacy.final_etag,
+                    final_size: legacy.final_size,
+                    final_mtime: legacy.final_mtime,
+                    tags: Vec::new(),
+                })
+            }
+        },
     }
 }
 
 fn decode_bucket(v: &[u8]) -> Result<BucketMeta> {
-    // M9/C5 双读:桶值尾部追加 created_with_acl 字段;新格式优先,
-    // 失败回退 v1.0.0 格式(created_with_acl=false),存量桶零迁移读取。
-    match postcard::from_bytes::<BucketMeta>(v) {
-        Ok(m) => Ok(m),
-        Err(_) => {
-            #[derive(serde::Serialize, serde::Deserialize)]
-            struct LegacyBucket {
-                created: i64,
-                owner: String,
-                stats: fs3_core::BucketStats,
-                quota: Option<u64>,
-            }
-            let l: LegacyBucket =
-                postcard::from_bytes(v).map_err(|e| Error::Corrupt(format!("bucket meta: {e}")))?;
-            Ok(BucketMeta {
-                created: l.created,
-                owner: l.owner,
-                stats: l.stats,
-                quota: l.quota,
-                created_with_acl: false,
-            })
-        }
-    }
+    // M10/ADR-11:值 = [BUCKET_META_VERSION] + postcard(BucketMeta);
+    // 存量无版本字节值(v1.1.0/v1.0.0)由 fs3-core 双读回退,零迁移读取。
+    BucketMeta::decode_value(v)
 }
 
 fn decode_object(v: &[u8]) -> Result<ObjectMeta> {
@@ -445,6 +569,85 @@ pub struct ListPage {
     pub truncated: bool,
     /// 最后一个被扫描到的原始键(续扫游标,严格大于)。
     pub last_scanned: Option<String>,
+}
+
+/// ListObjectVersions 条目(ADR-11 §3.4.4 + D1a-3;V3)。
+#[derive(Debug, Clone)]
+pub struct VersionListEntry {
+    pub key: String,
+    /// 展示 vk(null 族——遗留单键/null 槽——恒为 VK_NULL,协议层渲染 "null")。
+    pub vk: [u8; 16],
+    pub meta: ObjectMeta,
+    /// D1a 当前版本判定(键内 mtime 裁决,与列表位置独立)。
+    pub is_latest: bool,
+}
+
+/// ListObjectVersions 页(版本/删除标记条目混合,is_delete_marker 区分)。
+#[derive(Debug, Clone, Default)]
+pub struct VersionListPage {
+    pub entries: Vec<VersionListEntry>,
+    pub common_prefixes: Vec<String>,
+    pub truncated: bool,
+    /// 续扫游标:(键, Some(vk)) = 版本条目;(公共前缀, None) = 前缀条目。
+    pub last_scanned: Option<(String, Option<[u8; 16]>)>,
+}
+
+/// 桶内对象条目(双形态,ADR-11 D1):(key, Option<vk>, meta);
+/// vk = None 为未版本化单键,Some 为版本条目(含 VK_NULL 槽与删除标记)。
+pub type ObjectEntry = (String, Option<[u8; 16]>, ObjectMeta);
+
+/// 全量对象快照条目(双形态):(bucket, key, Option<vk>, meta)。
+pub type ObjectSnapshotEntry = (String, String, Option<[u8; 16]>, ObjectMeta);
+
+/// 全量对象快照条目(字节层形态;M10 V5-3 值格式重写工具专用):
+/// 在双形态解析之上额外携带**原始键**(重写按原键回写,避免键重编码)
+/// 与**值版本字节**(双读归一后判别 v2/v3 的唯一途径)。常规扫描
+/// (恢复可达性/压缩发现/导出)用 snapshot_all_objects,不暴露字节层。
+#[derive(Debug, Clone)]
+pub struct RawObjectEntry {
+    /// o: 原始键(未版本化单键或版本键,原样)。
+    pub raw_key: Vec<u8>,
+    pub bucket: String,
+    pub key: String,
+    /// None = 未版本化单键;Some = 版本条目(含 VK_NULL 槽与删除标记)。
+    pub vk: Option<[u8; 16]>,
+    /// 值首字节(ADR-9 §13 版本字节;现存合法值 = 2/3)。
+    pub value_version: u8,
+    pub meta: ObjectMeta,
+}
+
+/// 版本前缀反扫「槽尖」(D1a 候选):(null 槽条目, 最大真实 vk 条目)。
+type VersionTip = (Option<ObjectMeta>, Option<([u8; 16], ObjectMeta)>);
+
+/// D1a 当前版本裁决(ADR-11 D1a-2;get_current_version / 版本化列表共用):
+/// null 族(遗留单键/null 槽,不共存,防御性并存取 mtime 大者)与最大真实
+/// vk 条目之间,null 族胜出 ⟺ 其 mtime **严格大于**最大真实 vk 的时间戳
+/// 分量(微秒换算到秒);打平取真实版本。写侧保序(V6-1):null 族写入
+/// 保证其 mtime > 既有最大真实 vk 秒分量(同秒写 +1s),新真实 vk 防回拨
+/// 基址含 null 族 mtime(打平 ⇒ 真实版本确为后写)——双向同秒序均正确。
+/// null 族胜出时返回 vk = VK_NULL(对外 VersionId "null")。
+fn d1a_pick_current(
+    legacy: Option<ObjectMeta>,
+    null_slot: Option<ObjectMeta>,
+    max_real: Option<([u8; 16], ObjectMeta)>,
+) -> Option<([u8; 16], ObjectMeta)> {
+    let null_family = match (legacy, null_slot) {
+        (Some(l), Some(n)) => Some(if l.mtime >= n.mtime { l } else { n }),
+        (Some(l), None) => Some(l),
+        (None, n) => n,
+    };
+    match (null_family, max_real) {
+        (Some(n), Some((rvk, r))) => {
+            let real_secs = (fs3_core::vk_time_us(&rvk) / 1_000_000) as i64;
+            if n.mtime > real_secs {
+                Some((VK_NULL, n))
+            } else {
+                Some((rvk, r))
+            }
+        }
+        (Some(n), None) => Some((VK_NULL, n)),
+        (None, r) => r,
+    }
 }
 
 impl MetaStore {
@@ -524,6 +727,156 @@ impl MetaStore {
         }
     }
 
+    // —— 版本化读路径(ADR-11 D1/D4;V2) ——
+
+    /// 桶版本化状态(桶不存在 → Off;list 过滤分叉用)。
+    fn bucket_versioning(&self, bucket: &str) -> Result<fs3_core::VersioningState> {
+        Ok(self
+            .get_bucket(bucket)?
+            .map(|b| b.versioning)
+            .unwrap_or_default())
+    }
+
+    /// 指定版本精确读(DELETE/GET ?versionId 语义):版本键点读。
+    pub fn get_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        vk: &[u8; 16],
+    ) -> Result<Option<ObjectMeta>> {
+        match self
+            .db
+            .get(object_version_key(bucket, key, vk))
+            .map_err(rocks_err)?
+        {
+            Some(v) => Ok(Some(decode_object(&v)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 版本前缀反扫取「槽尖」:一次迭代同时取出 null 槽条目与最大真实 vk
+    /// 条目(D1a 候选解析用)。
+    ///
+    /// 反扫技巧:版本键全部落在 `[prefix, upper)` 区间(upper = prefix 末字
+    /// 节 0x00→0x01;object_key_prefix 恒以 0x00 收尾,进位安全),从 upper
+    /// 反向迭代;upper 本身可能是真实对象键(`o:{b}\0k\x01`)需跳过,首个
+    /// 命中 prefix 的条目即键序最大。null 槽(VK_NULL)恒为键序最大:首条
+    /// 命中若为 null 槽则记录后继续向下,再取首条真实 vk = 最大真实 vk;
+    /// 首条命中即真实 vk 时 null 槽必不存在(它若存在必排最前)。
+    fn version_scan_tip(&self, bucket: &str, key: &str) -> Result<VersionTip> {
+        let prefix = object_key_prefix(bucket, key);
+        let mut upper = prefix.clone();
+        *upper.last_mut().unwrap() += 1;
+        let mut null_slot = None;
+        let mut max_real = None;
+        for item in self
+            .db
+            .iterator(IteratorMode::From(upper.as_slice(), Direction::Reverse))
+        {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(&prefix) {
+                if k.as_ref() < prefix.as_slice() {
+                    break;
+                }
+                // k == upper(真实对象键):跳过继续向下
+                continue;
+            }
+            let (_, _, vk) = parse_object_version_key(&k)?;
+            let vk = vk.ok_or_else(|| Error::Corrupt("version entry missing vk".into()))?;
+            if vk == VK_NULL {
+                null_slot = Some(decode_object(&v)?);
+                continue;
+            }
+            max_real = Some((vk, decode_object(&v)?));
+            break;
+        }
+        Ok((null_slot, max_real))
+    }
+
+    /// 本 key 最大真实 vk(vk 防回拨比较基址,ADR-11 D1a-5:null 槽时间戳
+    /// 分量恒 u64::MAX、遗留单键无 vk,均不纳入)。
+    pub fn max_real_vk(&self, bucket: &str, key: &str) -> Result<Option<[u8; 16]>> {
+        Ok(self.version_scan_tip(bucket, key)?.1.map(|(vk, _)| vk))
+    }
+
+    /// 本 key 的版本扫描哨兵(V6-1 D1a 写侧保序用):(null 槽条目, 最大真实
+    /// vk 条目)——一次反扫同取;遗留单键不在内(get_object 单读)。
+    pub fn version_tip(&self, bucket: &str, key: &str) -> Result<VersionTip> {
+        self.version_scan_tip(bucket, key)
+    }
+
+    /// 当前版本解析(ADR-11 D4 + D1a 跨状态转换补遗):候选集 = {遗留
+    /// 未版本化单键 / null 槽条目, 最大真实 vk 条目},取 **mtime 最大**者,
+    /// mtime 相等取真实版本(重启用后的写必然后于挂起期写)。
+    ///
+    /// - 遗留单键与 null 槽不共存(引擎 Suspended 写路径保证;防御性并存时
+    ///   取 mtime 大者);
+    /// - 返回条目的 vk:null 族(遗留单键/null 槽)= VK_NULL(对外 VersionId
+    ///   恒 "null",?versionId=null 寻址二者之一);
+    /// - **删除标记亦为当前版本**,由调用方按 `is_delete_marker` 判定
+    ///   404/列表隐藏。
+    pub fn get_current_version(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<([u8; 16], ObjectMeta)>> {
+        let legacy = self.get_object(bucket, key)?;
+        let (null_slot, max_real) = self.version_scan_tip(bucket, key)?;
+        Ok(d1a_pick_current(legacy, null_slot, max_real))
+    }
+
+    /// get_current_version 的桶状态感知形态(F-1 Off 快速路径):
+    /// `versioning == Off` 时桶内**绝不可能存在版本键**(状态机:
+    /// Enabled/Suspended → Off 被禁,版本键仅在 Enabled/Suspended 期间
+    /// 写入;删桶全量清理),候选集退化为遗留单键——直接点读返回
+    /// (vk 恒 VK_NULL,与 d1a_pick_current 对仅存单键的裁决一致),
+    /// 跳过版本前缀反扫 seek,语义精确等价;Enabled/Suspended 保持
+    /// 全量 D1a 不变。调用方须持有桶版本化状态(桶不存在按 Off 处理,
+    /// 与 bucket_versioning 缺省口径一致)。
+    pub fn get_current_version_for(
+        &self,
+        bucket: &str,
+        key: &str,
+        versioning: fs3_core::VersioningState,
+    ) -> Result<Option<([u8; 16], ObjectMeta)>> {
+        if versioning == fs3_core::VersioningState::Off {
+            return Ok(self.get_object(bucket, key)?.map(|m| (VK_NULL, m)));
+        }
+        self.get_current_version(bucket, key)
+    }
+
+    /// 该 key 全版本列举(ListObjectVersions 用):vk 升序(= 创建时间序);
+    /// null 槽条目 vk = VK_NULL(对外 VersionId = "null",协议层渲染)。
+    pub fn list_key_versions(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Vec<([u8; 16], ObjectMeta)>> {
+        let prefix = object_key_prefix(bucket, key);
+        let mut out = Vec::new();
+        for item in scan_prefix(&self.db, &prefix) {
+            let (k, v) = item?;
+            let (_, _, vk) = parse_object_version_key(&k)?;
+            let vk = vk.ok_or_else(|| Error::Corrupt("version entry missing vk".into()))?;
+            out.push((vk, decode_object(&v)?));
+        }
+        Ok(out)
+    }
+
+    /// 枚举桶全部对象条目(双形态;含历史版本与删除标记;delete_bucket
+    /// 全量释放与运维扫描用)。返回 (key, Option<vk>, meta),键序升序。
+    pub fn list_object_entries(&self, bucket: &str) -> Result<Vec<ObjectEntry>> {
+        let mut out = Vec::new();
+        let start = object_prefix(bucket);
+        for item in scan_prefix(&self.db, &start) {
+            let (k, v) = item?;
+            let (b, key, vk) = parse_object_version_key(&k)?;
+            debug_assert_eq!(b, bucket);
+            out.push((key, vk, decode_object(&v)?));
+        }
+        Ok(out)
+    }
+
     pub fn list_buckets(&self) -> Result<Vec<(String, BucketMeta)>> {
         let mut out = Vec::new();
         for item in scan_prefix(&self.db, PREFIX_BUCKET) {
@@ -536,7 +889,62 @@ impl MetaStore {
     }
 
     /// 前缀扫描某桶全部对象(`o:{bucket}\0` 前缀)。
+    ///
+    /// 版本化桶(ADR-11 §3.4.4 + D1a):每 key 只输出当前版本——候选 {遗留
+    /// 单键/null 槽, 最大真实 vk} 取 mtime 最大(相等取真实版本);当前为
+    /// 删除标记的 key 不出现。未版本化桶逐字节同旧路径。
     pub fn list_objects(&self, bucket: &str, prefix: &str) -> Result<Vec<(String, ObjectMeta)>> {
+        if self.bucket_versioning(bucket)? == fs3_core::VersioningState::Off {
+            return self.list_objects_plain(bucket, prefix);
+        }
+        let mut out = Vec::new();
+        let start = object_prefix(bucket);
+        // 同 key 条目连续(未版本化条目在前,版本条目 vk 升序、null 槽收尾):
+        // 组内按 D1a 裁决当前版本(组尾键序最大 ≠ 当前,mtime 才是序)
+        let mut cur_key: Option<String> = None;
+        let mut cur_legacy: Option<ObjectMeta> = None;
+        let mut cur_null: Option<ObjectMeta> = None;
+        let mut cur_real: Option<([u8; 16], ObjectMeta)> = None;
+        for item in self
+            .db
+            .iterator(IteratorMode::From(start.as_slice(), Direction::Forward))
+        {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(&start) {
+                break;
+            }
+            let (b, key, vk) = parse_object_version_key(&k)?;
+            debug_assert_eq!(b, bucket);
+            if cur_key.as_deref() != Some(key.as_str()) {
+                if let Some(ck) = cur_key.take() {
+                    if let Some((_, cm)) =
+                        d1a_pick_current(cur_legacy.take(), cur_null.take(), cur_real.take())
+                    {
+                        if !cm.is_delete_marker && (prefix.is_empty() || ck.starts_with(prefix)) {
+                            out.push((ck, cm));
+                        }
+                    }
+                }
+                cur_key = Some(key);
+            }
+            match vk {
+                None => cur_legacy = Some(decode_object(&v)?),
+                Some(VK_NULL) => cur_null = Some(decode_object(&v)?),
+                Some(vk) => cur_real = Some((vk, decode_object(&v)?)),
+            }
+        }
+        if let Some(ck) = cur_key {
+            if let Some((_, cm)) = d1a_pick_current(cur_legacy, cur_null, cur_real) {
+                if !cm.is_delete_marker && (prefix.is_empty() || ck.starts_with(prefix)) {
+                    out.push((ck, cm));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// 未版本化桶前缀扫描(list_objects 的 Off 分支,旧路径原样保留)。
+    fn list_objects_plain(&self, bucket: &str, prefix: &str) -> Result<Vec<(String, ObjectMeta)>> {
         let mut out = Vec::new();
         let start = object_prefix(bucket);
         for item in self
@@ -561,7 +969,27 @@ impl MetaStore {
     /// 条目 = 对象 + 公共前缀,均计入 max;截断时 last_scanned 为最后
     /// **已发出**的条目(Contents 键或公共前缀串;严格大于它即可续扫
     /// 不重不漏,与 AWS NextMarker/NextContinuationToken 语义一致)。
+    ///
+    /// 版本化桶(ADR-11 §3.4.4):每 key 只输出当前版本(当前 = 删除标记
+    /// 则该 key 不出现);游标/分组语义不变。未版本化桶走 Off 分支,逐字节
+    /// 同旧路径。
     pub fn list_objects_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        after: Option<&str>,
+        max: usize,
+    ) -> Result<ListPage> {
+        if self.bucket_versioning(bucket)? == fs3_core::VersioningState::Off {
+            self.list_objects_page_plain(bucket, prefix, delimiter, after, max)
+        } else {
+            self.list_objects_page_versioned(bucket, prefix, delimiter, after, max)
+        }
+    }
+
+    /// 未版本化桶分页列举(list_objects_page 的 Off 分支,旧路径原样保留)。
+    fn list_objects_page_plain(
         &self,
         bucket: &str,
         prefix: &str,
@@ -650,6 +1078,301 @@ impl MetaStore {
         Ok(page)
     }
 
+    /// 版本化桶分页列举(ADR-11 §3.4.4 + D1a):同 key 条目连续(未版本化
+    /// 条目在前,版本条目 vk 升序、null 槽收尾),组内按 D1a 裁决当前版本
+    /// (mtime 最大,相等取真实版本);当前为删除标记的 key 不出现。
+    /// 游标/delimiter 分组/截断语义与 Off 分支一致(条目空间严格大于游标,
+    /// 截断游标 = 最后已发出条目)。
+    fn list_objects_page_versioned(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        after: Option<&str>,
+        max: usize,
+    ) -> Result<ListPage> {
+        let mut page = ListPage::default();
+        let base = object_prefix(bucket);
+        let after_esc = after.map(|a| escape(a.as_bytes()));
+        let start: Vec<u8> = match &after_esc {
+            Some(a) => {
+                let mut k = base.clone();
+                k.extend_from_slice(a);
+                k
+            }
+            None => base,
+        };
+        let mut entries = 0usize;
+        let mut last_emitted: Option<String> = None;
+        let mut last_entry: Option<String> = None;
+        // 发出一个 key 的当前版本(D1a 裁决);返回 false = 已截断,停止扫描
+        let mut emit = |key: &str, meta: &ObjectMeta, page: &mut ListPage| -> bool {
+            // 当前 = 删除标记 → 该 key 不出现(§3.4.4)
+            if meta.is_delete_marker {
+                return true;
+            }
+            if !prefix.is_empty() && !key.starts_with(prefix) {
+                return true;
+            }
+            // 条目化(与 Off 分支同一规则):delimiter 归组为公共前缀条目
+            let (entry, is_prefix_entry): (String, bool) = match delimiter {
+                Some(d) if !d.is_empty() => {
+                    let rest = &key[prefix.len().min(key.len())..];
+                    match rest.find(d) {
+                        Some(i) => {
+                            let mut c = String::with_capacity(prefix.len() + i + d.len());
+                            c.push_str(prefix);
+                            c.push_str(&rest[..i + d.len()]);
+                            (c, true)
+                        }
+                        _ => (key.to_string(), false),
+                    }
+                }
+                _ => (key.to_string(), false),
+            };
+            if let Some(m) = after {
+                if entry.as_str() <= m {
+                    return true;
+                }
+            }
+            if last_entry.as_deref() == Some(entry.as_str()) {
+                return true;
+            }
+            if entries >= max {
+                return false;
+            }
+            if is_prefix_entry || entry != key {
+                page.common_prefixes.push(entry.clone());
+            } else {
+                page.items.push((key.to_string(), meta.clone()));
+            }
+            last_entry = Some(entry.clone());
+            last_emitted = Some(entry);
+            entries += 1;
+            true
+        };
+        let mut truncated = false;
+        let mut cur_key: Option<String> = None;
+        let mut cur_legacy: Option<ObjectMeta> = None;
+        let mut cur_null: Option<ObjectMeta> = None;
+        let mut cur_real: Option<([u8; 16], ObjectMeta)> = None;
+        for item in self
+            .db
+            .iterator(IteratorMode::From(start.as_slice(), Direction::Forward))
+        {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(&object_prefix(bucket)) {
+                break;
+            }
+            let (b, key, vk) = parse_object_version_key(&k)?;
+            debug_assert_eq!(b, bucket);
+            if cur_key.as_deref() != Some(key.as_str()) {
+                // 组边界:D1a 裁决上一组的当前版本并发出
+                if let Some(ck) = cur_key.take() {
+                    if let Some((_, cm)) =
+                        d1a_pick_current(cur_legacy.take(), cur_null.take(), cur_real.take())
+                    {
+                        if !emit(&ck, &cm, &mut page) {
+                            truncated = true;
+                            break;
+                        }
+                    }
+                }
+                cur_key = Some(key);
+            }
+            match vk {
+                None => cur_legacy = Some(decode_object(&v)?),
+                Some(VK_NULL) => cur_null = Some(decode_object(&v)?),
+                Some(vk) => cur_real = Some((vk, decode_object(&v)?)),
+            }
+        }
+        if !truncated {
+            if let Some(ck) = cur_key {
+                if let Some((_, cm)) = d1a_pick_current(cur_legacy, cur_null, cur_real) {
+                    if !emit(&ck, &cm, &mut page) {
+                        truncated = true;
+                    }
+                }
+            }
+        }
+        page.truncated = truncated;
+        page.last_scanned = last_emitted;
+        Ok(page)
+    }
+
+    /// ListObjectVersions 分页列举(ADR-11 §3.4.4 + D1a-3;V3):
+    /// 键字典序升序;**键内条目按 mtime 降序**(null 条目按 mtime 插入真实
+    /// 版本序列,不按键位;mtime 相等时真实版本在前、真实版本之间 vk 降序
+    /// ——vk 单调,即创建序的逆序,与 AWS「最新在前」一致)。
+    ///
+    /// - 游标 = (key_marker, version_id_marker) 条目级严格大于(ADR-6);
+    ///   key == key_marker 组内从 version_id_marker 之后续传(version_id_
+    ///   marker 缺席 → 整组跳过,与未版本化桩语义一致;标记版本已被并发
+    ///   删除而定位不到 → 跳过该组,分页继续);
+    /// - delimiter:版本条目按 key 的公共前缀归组为 CommonPrefixes(键本身
+    ///   等于公共前缀时同样归组,与 list_objects_page 同规则);
+    /// - IsLatest = D1a 当前版本(mtime 裁决,与列表位置独立);
+    /// - 未版本化桶天然兼容:每组仅遗留单键一条,VersionId="null"、
+    ///   IsLatest=true(现状桩语义,s3-tests 清理依赖)。
+    pub fn list_versions_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        key_marker: Option<&str>,
+        version_id_marker: Option<&[u8; 16]>,
+        max: usize,
+    ) -> Result<VersionListPage> {
+        let mut page = VersionListPage::default();
+        let base = object_prefix(bucket);
+        let start: Vec<u8> = match key_marker {
+            Some(m) => {
+                let mut k = base.clone();
+                k.extend_from_slice(&escape(m.as_bytes()));
+                k
+            }
+            None => base.clone(),
+        };
+        let mut emitted = 0usize;
+        let mut last_emitted: Option<(String, Option<[u8; 16]>)> = None;
+        // 组缓冲:(展示 vk, meta);遗留单键与 null 槽的展示 vk 均 VK_NULL
+        let mut cur_key: Option<String> = None;
+        let mut group: Vec<([u8; 16], ObjectMeta)> = Vec::new();
+        // 发出一个 key 组;返回 false = 已截断
+        let mut flush = |key: &str,
+                         group: &mut Vec<([u8; 16], ObjectMeta)>,
+                         page: &mut VersionListPage|
+         -> Result<bool> {
+            if !prefix.is_empty() && !key.starts_with(prefix) {
+                group.clear();
+                return Ok(true);
+            }
+            // 条目化(delimiter 归组;与 list_objects_page 同一规则)
+            let (entry, is_prefix_entry): (String, bool) = match delimiter {
+                Some(d) if !d.is_empty() => {
+                    let rest = &key[prefix.len().min(key.len())..];
+                    match rest.find(d) {
+                        Some(i) => {
+                            let mut c = String::with_capacity(prefix.len() + i + d.len());
+                            c.push_str(prefix);
+                            c.push_str(&rest[..i + d.len()]);
+                            (c, true)
+                        }
+                        _ => (key.to_string(), false),
+                    }
+                }
+                _ => (key.to_string(), false),
+            };
+            // 游标:条目字符串严格小于 key_marker → 整组跳过;等于时公共
+            // 前缀组(已发出)或无 version_id_marker 的键组同样整组跳过
+            if let Some(m) = key_marker {
+                if entry.as_str() < m
+                    || (entry.as_str() == m && (is_prefix_entry || version_id_marker.is_none()))
+                {
+                    group.clear();
+                    return Ok(true);
+                }
+            }
+            // 键内排序:mtime 降序;相等时真实版本在前(D1a 同值取真实版本),
+            // 真实版本之间 vk 降序(vk 单调 ⇒ 创建逆序)
+            group.sort_by(|(avk, a), (bvk, b)| {
+                b.mtime
+                    .cmp(&a.mtime)
+                    .then_with(|| (*avk == VK_NULL).cmp(&(*bvk == VK_NULL)))
+                    .then_with(|| bvk.cmp(avk))
+            });
+            // D1a 当前版本判定(IsLatest;与排序位置独立)
+            let latest_vk = {
+                let null_family = group
+                    .iter()
+                    .filter(|(vk, _)| *vk == VK_NULL)
+                    .map(|(_, m)| m.clone())
+                    .max_by_key(|m| m.mtime);
+                let max_real = group
+                    .iter()
+                    .filter(|(vk, _)| *vk != VK_NULL)
+                    .map(|(vk, m)| (*vk, m.clone()))
+                    .max_by_key(|(vk, _)| *vk);
+                d1a_pick_current(None, null_family, max_real).map(|(vk, _)| vk)
+            };
+            if is_prefix_entry || entry != key {
+                // 分组去重:相邻键组折叠出的同一公共前缀只发一次(与
+                // list_objects_page 的 last_entry 去重同语义)
+                if page.common_prefixes.last() == Some(&entry) {
+                    group.clear();
+                    return Ok(true);
+                }
+                if emitted >= max {
+                    group.clear();
+                    return Ok(false);
+                }
+                page.common_prefixes.push(entry.clone());
+                last_emitted = Some((entry, None));
+                emitted += 1;
+                group.clear();
+                return Ok(true);
+            }
+            // 版本条目逐条发出;key == key_marker 时从 version_id_marker 后续传
+            let mut skip_until_marker = match (key_marker, version_id_marker) {
+                (Some(m), Some(vm)) if m == key => Some(*vm),
+                _ => None,
+            };
+            for (vk, meta) in group.drain(..) {
+                if let Some(vm) = skip_until_marker {
+                    if vk == vm {
+                        skip_until_marker = None;
+                    }
+                    continue;
+                }
+                if emitted >= max {
+                    return Ok(false);
+                }
+                page.entries.push(VersionListEntry {
+                    key: key.to_string(),
+                    vk,
+                    is_latest: Some(vk) == latest_vk,
+                    meta,
+                });
+                last_emitted = Some((key.to_string(), Some(vk)));
+                emitted += 1;
+            }
+            Ok(true)
+        };
+        let mut truncated = false;
+        for item in self
+            .db
+            .iterator(IteratorMode::From(start.as_slice(), Direction::Forward))
+        {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(&base) {
+                break;
+            }
+            let (b, key, vk) = parse_object_version_key(&k)?;
+            debug_assert_eq!(b, bucket);
+            if cur_key.as_deref() != Some(key.as_str()) {
+                if let Some(ck) = cur_key.take() {
+                    if !flush(&ck, &mut group, &mut page)? {
+                        truncated = true;
+                        break;
+                    }
+                }
+                cur_key = Some(key);
+            }
+            // 遗留单键(None)与 null 槽(VK_NULL)对外展示 vk 均为 VK_NULL
+            group.push((vk.unwrap_or(VK_NULL), decode_object(&v)?));
+        }
+        if !truncated {
+            if let Some(ck) = cur_key {
+                if !flush(&ck, &mut group, &mut page)? {
+                    truncated = true;
+                }
+            }
+        }
+        page.truncated = truncated;
+        page.last_scanned = last_emitted;
+        Ok(page)
+    }
+
     /// 列出 seq > after 的全部分配记录(恢复重放)。
     pub fn list_alloc_records(&self, after: u64) -> Result<Vec<AllocRecord>> {
         let mut out = Vec::new();
@@ -662,7 +1385,6 @@ impl MetaStore {
         }
         Ok(out)
     }
-
     /// 最新事务序号(s:seq)。
     pub fn last_seq(&self) -> Result<u64> {
         Ok(self
@@ -757,6 +1479,65 @@ impl MetaStore {
         self.db.put(SYS_KEY_SEED_SALT, salt).map_err(rocks_err)?;
         self.db.flush_wal(true).map_err(rocks_err)?;
         Ok(salt.to_vec())
+    }
+
+    /// 桶版本化状态更新(单事务读改写;l: location 等其余字段不动;
+    /// V3 PutBucketVersioning 落地路径)。
+    pub fn commit_bucket_set_versioning(
+        &self,
+        name: &str,
+        state: fs3_core::VersioningState,
+    ) -> Result<u64> {
+        self.commit(&[Op::BucketSetVersioning {
+            name: name.to_string(),
+            state,
+        }])
+    }
+
+    // —— D9 桶级配置文档(M10 S1/S2/S7;ADR-11 D9) ——
+
+    /// 读桶级配置文档(无配置 → None;值 = 规范化 XML 字节)。
+    pub fn bucket_conf(&self, bucket: &str, conf: BucketConf) -> Result<Option<Vec<u8>>> {
+        self.db.get(conf.key(bucket)).map_err(rocks_err)
+    }
+
+    /// 写桶级配置文档(覆盖语义;桶不存在 → NotFound)。
+    pub fn commit_bucket_conf_put(
+        &self,
+        bucket: &str,
+        conf: BucketConf,
+        value: &[u8],
+    ) -> Result<u64> {
+        self.commit(&[Op::BucketConfPut {
+            bucket: bucket.to_string(),
+            conf,
+            value: value.to_vec(),
+        }])
+    }
+
+    /// 删桶级配置文档(幂等;桶不存在 → NotFound)。
+    pub fn commit_bucket_conf_delete(&self, bucket: &str, conf: BucketConf) -> Result<u64> {
+        self.commit(&[Op::BucketConfDelete {
+            bucket: bucket.to_string(),
+            conf,
+        }])
+    }
+
+    /// 对象标签单事务读改写(M10 S1):`vk = None` → 未版本化单键;
+    /// `Some(vk)` → 版本键(含 VK_NULL null 槽)。目标不存在 → NotFound。
+    pub fn commit_object_set_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        vk: Option<[u8; 16]>,
+        tags: Vec<(String, String)>,
+    ) -> Result<u64> {
+        self.commit(&[Op::ObjectSetTags {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            vk,
+            tags,
+        }])
     }
 
     /// 桶删除。
@@ -881,6 +1662,104 @@ impl MetaStore {
         ])
     }
 
+    /// 写删除标记 + 分配记录 + 桶统计(ADR-11 D5 口径:删除标记本身零
+    /// delta;`vk = Some` 写版本键(Enabled 新 vk / Suspended VK_NULL 槽),
+    /// `vk = None` 原地覆盖遗留未版本化单键(D1a-1);覆盖旧 null 族数据
+    /// 版本时,旧版本的段释放(ref_dec)与扣减由调用方计算后经
+    /// `draft`/`delta` 同事务入账;Enabled 路径不触碰数据段,draft 为空
+    /// 则不写 a: 记录)。
+    pub fn commit_object_delete_current(
+        &self,
+        bucket: &str,
+        key: &str,
+        vk: Option<&[u8; 16]>,
+        marker: &ObjectMeta,
+        draft: AllocDraft,
+        delta: StatsDelta,
+    ) -> Result<u64> {
+        self.commit(&[
+            Op::ObjectDeleteCurrent {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                vk: vk.copied(),
+                marker: marker.clone(),
+            },
+            Op::Alloc { draft },
+            Op::Stats {
+                bucket: bucket.to_string(),
+                delta,
+            },
+        ])
+    }
+
+    /// 版本化对象 PUT + 分配记录 + 桶统计(ADR-11 D1;Enabled 新 vk /
+    /// Suspended 覆盖 null 槽;不触碰旧版本条目)。
+    pub fn commit_object_put_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        vk: &[u8; 16],
+        meta: &ObjectMeta,
+        draft: AllocDraft,
+        delta: StatsDelta,
+    ) -> Result<u64> {
+        if meta.size > MAX_OBJECT_SIZE {
+            return Err(Error::InvalidArgument(format!(
+                "object size {} exceeds max {}",
+                meta.size, MAX_OBJECT_SIZE
+            )));
+        }
+        self.commit(&[
+            Op::ObjectPutVersion {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                vk: *vk,
+                meta: meta.clone(),
+            },
+            Op::Alloc { draft },
+            Op::Stats {
+                bucket: bucket.to_string(),
+                delta,
+            },
+        ])
+    }
+
+    /// 值格式在线重写(M10 V5-3):按原始键单事务重编码对象值为 v3,
+    /// **不改统计/分配**(无 Alloc/Stats 伴随 op;经 s:seq 单点序列化,
+    /// 与全部写路径同一冲突域)。键不存在 → NotFound。
+    /// 供 `fasts3d rewrite-values` 使用;raw_key 来自
+    /// snapshot_all_objects_raw(原样回写,避免键重编码)。
+    pub fn commit_object_meta_update(&self, raw_key: &[u8], meta: &ObjectMeta) -> Result<u64> {
+        self.commit(&[Op::ObjectMetaRewrite {
+            key: raw_key.to_vec(),
+            meta: meta.clone(),
+        }])
+    }
+
+    /// 物理删除指定版本 + 分配记录 + 桶统计(扣减由调用方按该版本
+    /// size 计算;删除标记版本零 delta)。
+    pub fn commit_object_delete_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        vk: &[u8; 16],
+        draft: AllocDraft,
+        delta: StatsDelta,
+    ) -> Result<u64> {
+        self.commit(&[
+            Op::ObjectDeleteVersion {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                vk: *vk,
+            },
+            Op::Alloc { draft },
+            Op::Stats {
+                bucket: bucket.to_string(),
+                delta,
+            },
+        ])
+    }
+
     /// 压缩迁移事务(ADR-9 §6.2 阶段 3):单对象段列表更新(旧段→新段)+
     /// 分配/释放记录,同事务;**不触碰桶统计**(数据量不变)。
     ///
@@ -927,7 +1806,11 @@ impl MetaStore {
 
     /// 全量对象快照扫描(o: 前缀;rocksdb MVCC 快照,与并发写完全隔离)。
     /// 压缩发现阶段用(ADR-9 §6.2 阶段 1)。
-    pub fn snapshot_all_objects(&self) -> Result<Vec<(String, String, ObjectMeta)>> {
+    ///
+    /// ADR-11 D1 双形态:版本化条目(`o:{b}\0{esc}\0{vk16}`)逐条返回,
+    /// 元组第三位 = Some(vk)(同 key 多条;含删除标记);未版本化条目 =
+    /// None。恢复可达性扫描需要**全部**版本条目的段引用(§3.4.6)。
+    pub fn snapshot_all_objects(&self) -> Result<Vec<ObjectSnapshotEntry>> {
         let snap = self.db.snapshot();
         let mut out = Vec::new();
         for item in snap.iterator(IteratorMode::From(PREFIX_OBJECT, Direction::Forward)) {
@@ -935,10 +1818,99 @@ impl MetaStore {
             if !k.starts_with(PREFIX_OBJECT) {
                 break;
             }
-            let (bucket, key) = parse_object_key(&k)?;
-            out.push((bucket, key, decode_object(&v)?));
+            let (bucket, key, vk) = parse_object_version_key(&k)?;
+            out.push((bucket, key, vk, decode_object(&v)?));
         }
         Ok(out)
+    }
+
+    /// 全量对象快照(字节层形态;M10 V5-3 值格式重写用):与
+    /// snapshot_all_objects 同一 MVCC 快照语义,逐条携带原始键与值版本
+    /// 字节。值损坏(双读均失败)时整体报错(维护工具fail-fast,不静默跳过)。
+    pub fn snapshot_all_objects_raw(&self) -> Result<Vec<RawObjectEntry>> {
+        let snap = self.db.snapshot();
+        let mut out = Vec::new();
+        for item in snap.iterator(IteratorMode::From(PREFIX_OBJECT, Direction::Forward)) {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(PREFIX_OBJECT) {
+                break;
+            }
+            let (bucket, key, vk) = parse_object_version_key(&k)?;
+            let value_version = *v
+                .first()
+                .ok_or_else(|| Error::Corrupt("object meta value too short".into()))?;
+            out.push(RawObjectEntry {
+                raw_key: k.to_vec(),
+                bucket,
+                key,
+                vk,
+                value_version,
+                meta: decode_object(&v)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// 值版本字节只读探测(M10 V5-3):统计 o: 前缀下 v2/v3 值数量,
+    /// 返回 (v2, v3)。只读首字节、不解码(供重写前后断言与引擎启动
+    /// 警告);首字节非 2/3 的值(无版本字节的旧布局值,ADR-9 已放弃
+    /// 前置兼容)→ Corrupt。
+    pub fn count_object_value_versions(&self) -> Result<(u64, u64)> {
+        let snap = self.db.snapshot();
+        let (mut v2, mut v3) = (0u64, 0u64);
+        for item in snap.iterator(IteratorMode::From(PREFIX_OBJECT, Direction::Forward)) {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(PREFIX_OBJECT) {
+                break;
+            }
+            match v.first() {
+                Some(&fs3_core::OBJECT_META_VERSION) => v3 += 1,
+                Some(&2) => v2 += 1,
+                other => {
+                    return Err(Error::Corrupt(format!(
+                        "object value version byte {other:?} unsupported"
+                    )))
+                }
+            }
+        }
+        Ok((v2, v3))
+    }
+
+    /// 值格式 v2→v3 重写完成标记(DESIGN-FUTURE §2.4:重写完成前禁回滚)。
+    pub fn value_rewrite_v3_done(&self) -> Result<bool> {
+        Ok(self
+            .db
+            .get(SYS_KEY_VALUE_REWRITE_V3_DONE)
+            .map_err(rocks_err)?
+            .is_some())
+    }
+
+    /// 落重写完成标记(直写 + fsync,同 seed_salt 先例:工具离线/单点
+    /// 执行,不经事务;幂等)。
+    pub fn mark_value_rewrite_v3_done(&self) -> Result<()> {
+        self.db
+            .put(SYS_KEY_VALUE_REWRITE_V3_DONE, env!("CARGO_PKG_VERSION"))
+            .map_err(rocks_err)?;
+        self.db.flush_wal(true).map_err(rocks_err)
+    }
+
+    /// 测试/演练专用:以原始字节直写对象值(构造 v2 存量值夹具,
+    /// V5-3 重写与 V6-5 升级演练用)。生产路径恒走 commit_object_put*,
+    /// 勿用 —— 本入口绕过版本字节/契约校验与统计/分配记账。
+    #[doc(hidden)]
+    pub fn put_object_value_raw(
+        &self,
+        bucket: &str,
+        key: &str,
+        vk: Option<&[u8; 16]>,
+        value: &[u8],
+    ) -> Result<()> {
+        let k = match vk {
+            Some(vk) => object_version_key(bucket, key, vk),
+            None => object_key(bucket, key),
+        };
+        self.db.put(k, value).map_err(rocks_err)?;
+        self.db.flush_wal(true).map_err(rocks_err)
     }
 
     /// 全量分片快照扫描(p: 前缀;MVCC 快照)。压缩发现 + 恢复可达性扫描用。
@@ -1127,12 +2099,38 @@ impl MetaStore {
         draft: AllocDraft,
         delta: StatsDelta,
     ) -> Result<u64> {
+        self.complete_multipart_version(bucket, key, upload_id, None, meta, part_keys, draft, delta)
+    }
+
+    /// Complete 的版本化变体(ADR-11 §3.4.5;V2):`vk = Some` 时最终对象
+    /// 落版本键(Enabled 新 vk / Suspended VK_NULL 槽),`None` 退化为
+    /// 未版本化单键(与 complete_multipart 逐字节一致);会话/分片键不变。
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_multipart_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        vk: Option<&[u8; 16]>,
+        meta: &ObjectMeta,
+        part_keys: &[Vec<u8>],
+        draft: AllocDraft,
+        delta: StatsDelta,
+    ) -> Result<u64> {
         let mut ops: Vec<Op> = Vec::with_capacity(part_keys.len() + 4);
-        ops.push(Op::ObjectPut {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            meta: meta.clone(),
-        });
+        match vk {
+            Some(vk) => ops.push(Op::ObjectPutVersion {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                vk: *vk,
+                meta: meta.clone(),
+            }),
+            None => ops.push(Op::ObjectPut {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                meta: meta.clone(),
+            }),
+        }
         ops.push(Op::MultipartUpdate {
             upload_id: upload_id.to_string(),
             completed: true,
@@ -1184,7 +2182,7 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
                 let k = bucket_key(name);
                 // 读以建立冲突集(并发修改则重试)
                 tget(tx, &k)?;
-                tinsert(tx, k, encode(meta)?)?;
+                tinsert(tx, k, meta.encode_value()?)?;
                 let lk = bucket_location_key(name);
                 tget(tx, &lk)?;
                 match location.as_deref() {
@@ -1199,6 +2197,51 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
                 }
                 tremove(tx, &k)?;
                 tremove(tx, &bucket_location_key(name))?;
+                // D9 桶级配置文档同事务清理(S1 bt:/S2 bc:/S7 bo:)
+                for conf in BucketConf::ALL {
+                    tremove(tx, &conf.key(name))?;
+                }
+            }
+            Op::BucketSetVersioning { name, state } => {
+                let k = bucket_key(name);
+                let cur = tget(tx, &k)?.ok_or_else(|| Error::NotFound(format!("bucket {name}")))?;
+                let mut meta = decode_bucket(&cur)?;
+                meta.versioning = *state;
+                tinsert(tx, k, meta.encode_value()?)?;
+            }
+            Op::BucketConfPut {
+                bucket,
+                conf,
+                value,
+            } => {
+                if tget(tx, &bucket_key(bucket))?.is_none() {
+                    return Err(Error::NotFound(format!("bucket {bucket}")));
+                }
+                let k = conf.key(bucket);
+                tget(tx, &k)?;
+                tinsert(tx, k, value.clone())?;
+            }
+            Op::BucketConfDelete { bucket, conf } => {
+                if tget(tx, &bucket_key(bucket))?.is_none() {
+                    return Err(Error::NotFound(format!("bucket {bucket}")));
+                }
+                tremove(tx, &conf.key(bucket))?;
+            }
+            Op::ObjectSetTags {
+                bucket,
+                key,
+                vk,
+                tags,
+            } => {
+                let k = match vk {
+                    Some(vk) => object_version_key(bucket, key, vk),
+                    None => object_key(bucket, key),
+                };
+                let cur = tget(tx, &k)?
+                    .ok_or_else(|| Error::NotFound(format!("object {bucket}/{key}")))?;
+                let mut meta = decode_object(&cur)?;
+                meta.tags = tags.clone();
+                tinsert(tx, k, meta.encode_value()?)?;
             }
             Op::ObjectPut { bucket, key, meta } => {
                 if tget(tx, &bucket_key(bucket))?.is_none() {
@@ -1287,6 +2330,71 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
                 }
                 tremove(tx, &k)?;
             }
+            Op::ObjectDeleteCurrent {
+                bucket,
+                key,
+                vk,
+                marker,
+            } => {
+                if tget(tx, &bucket_key(bucket))?.is_none() {
+                    return Err(Error::NotFound(format!("bucket {bucket}")));
+                }
+                // 删除标记契约(ADR-11 D3):size=0、extents/inline 为空
+                if !marker.is_delete_marker
+                    || marker.size != 0
+                    || !marker.extents.is_empty()
+                    || marker.inline.is_some()
+                {
+                    return Err(Error::InvalidArgument(format!(
+                        "delete marker meta malformed for {bucket}/{key}"
+                    )));
+                }
+                // Some(vk) = 版本键;None = 遗留未版本化单键原地覆盖(D1a-1)
+                let k = match vk {
+                    Some(vk) => object_version_key(bucket, key, vk),
+                    None => object_key(bucket, key),
+                };
+                // 读以建立冲突集(Suspended 覆盖 null 族 = 同事务读改写)
+                tget(tx, &k)?;
+                tinsert(tx, k, marker.encode_value()?)?;
+            }
+            Op::ObjectDeleteVersion { bucket, key, vk } => {
+                let k = object_version_key(bucket, key, vk);
+                if tget(tx, &k)?.is_none() {
+                    return Err(Error::NotFound(format!("object version {bucket}/{key}")));
+                }
+                tremove(tx, &k)?;
+            }
+            Op::ObjectPutVersion {
+                bucket,
+                key,
+                vk,
+                meta,
+            } => {
+                if tget(tx, &bucket_key(bucket))?.is_none() {
+                    return Err(Error::NotFound(format!("bucket {bucket}")));
+                }
+                // 版本数据条目契约:删除标记须经 ObjectDeleteCurrent 写入
+                if meta.is_delete_marker {
+                    return Err(Error::InvalidArgument(format!(
+                        "delete marker must use ObjectDeleteCurrent for {bucket}/{key}"
+                    )));
+                }
+                let k = object_version_key(bucket, key, vk);
+                // 读以建立冲突集(Suspended 覆盖 null 槽 = 同事务读改写)
+                tget(tx, &k)?;
+                tinsert(tx, k, meta.encode_value()?)?;
+            }
+            Op::ObjectMetaRewrite { key, meta } => {
+                // 读以建立冲突集并要求键存在(防误写游离键)
+                if tget(tx, key)?.is_none() {
+                    return Err(Error::NotFound(format!(
+                        "object raw key {} bytes",
+                        key.len()
+                    )));
+                }
+                tinsert(tx, key.clone(), meta.encode_value()?)?;
+            }
             Op::Alloc { draft } => {
                 if !draft.is_empty() {
                     let rec = AllocRecord {
@@ -1311,7 +2419,7 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
                 meta.stats.objects =
                     (meta.stats.objects as i128 + delta.objects as i128).max(0) as u64;
                 meta.stats.bytes = (meta.stats.bytes as i128 + delta.bytes as i128).max(0) as u64;
-                tinsert(tx, k, encode(&meta)?)?;
+                tinsert(tx, k, meta.encode_value()?)?;
             }
             Op::MultipartCreate { upload_id, session } => {
                 // 桶必须存在
@@ -1408,6 +2516,9 @@ mod tests {
             stats: BucketStats::default(),
             quota: None,
             created_with_acl: false,
+            versioning: fs3_core::VersioningState::Off,
+            default_encryption: None,
+            object_lock: false,
         }
     }
 
@@ -1422,6 +2533,23 @@ mod tests {
             inline: None,
             parts: vec![],
             resp_headers: vec![],
+            version_id: None,
+            is_delete_marker: false,
+            tags: vec![],
+            sse: None,
+            checksum: None,
+            retention: None,
+            legal_hold: false,
+        }
+    }
+
+    /// 删除标记条目(ADR-11 D3:size=0、extents/inline 空;vk 落入 version_id,
+    /// null 槽调用方传 None)。
+    fn delete_marker(vk: Option<[u8; 16]>) -> ObjectMeta {
+        ObjectMeta {
+            is_delete_marker: true,
+            version_id: vk,
+            ..object_meta(0)
         }
     }
 
@@ -1458,6 +2586,78 @@ mod tests {
             "",
             "删除桶 → location 清理"
         );
+    }
+
+    #[test]
+    fn bucket_conf_roundtrip_and_delete_cleanup() {
+        // M10 S1/S2/S7:D9 桶级配置文档(bc:/bt:/bo:)读写删 + 删桶清理
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        for conf in BucketConf::ALL {
+            assert_eq!(s.bucket_conf("b1", conf).unwrap(), None, "{conf:?} 无配置");
+            s.commit_bucket_conf_put("b1", conf, b"<doc/>").unwrap();
+            assert_eq!(
+                s.bucket_conf("b1", conf).unwrap().as_deref(),
+                Some(b"<doc/>".as_slice()),
+                "{conf:?} 写入可读"
+            );
+            // 覆盖写
+            s.commit_bucket_conf_put("b1", conf, b"<doc2/>").unwrap();
+            assert_eq!(
+                s.bucket_conf("b1", conf).unwrap().as_deref(),
+                Some(b"<doc2/>".as_slice())
+            );
+            // 不存在桶 → NotFound
+            assert!(s.commit_bucket_conf_put("ghost", conf, b"x").is_err());
+        }
+        // 删除单个配置(幂等):其余配置不动
+        s.commit_bucket_conf_delete("b1", BucketConf::Cors).unwrap();
+        assert_eq!(s.bucket_conf("b1", BucketConf::Cors).unwrap(), None);
+        assert!(s.bucket_conf("b1", BucketConf::Tagging).unwrap().is_some());
+        s.commit_bucket_conf_delete("b1", BucketConf::Cors).unwrap();
+        // 删桶 → 全部配置键清理(BucketDelete 事务臂)
+        s.commit_bucket_delete("b1").unwrap();
+        for conf in BucketConf::ALL {
+            assert_eq!(
+                s.bucket_conf("b1", conf).unwrap(),
+                None,
+                "{conf:?} 删桶后残留"
+            );
+        }
+    }
+
+    #[test]
+    fn object_set_tags_read_modify_write() {
+        // M10 S1:ObjectSetTags 单事务读改写(仅 tags 变更;缺失目标 → NotFound)
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        s.commit_object_put(
+            "b1",
+            "k",
+            &object_meta(3),
+            AllocDraft::default(),
+            StatsDelta {
+                objects: 1,
+                bytes: 3,
+            },
+        )
+        .unwrap();
+        let tags = vec![("a".to_string(), "b".to_string())];
+        s.commit_object_set_tags("b1", "k", None, tags.clone())
+            .unwrap();
+        let m = s.get_object("b1", "k").unwrap().unwrap();
+        assert_eq!(m.tags, tags);
+        assert_eq!(m.size, 3, "其余字段不动");
+        // 清空
+        s.commit_object_set_tags("b1", "k", None, vec![]).unwrap();
+        assert!(s.get_object("b1", "k").unwrap().unwrap().tags.is_empty());
+        // 缺失对象/缺失版本键 → NotFound
+        assert!(s
+            .commit_object_set_tags("b1", "ghost", None, vec![])
+            .is_err());
+        assert!(s
+            .commit_object_set_tags("b1", "k", Some([0x42u8; 16]), vec![])
+            .is_err());
     }
 
     #[test]
@@ -1517,6 +2717,66 @@ mod tests {
         let b = s.get_bucket("b1").unwrap().unwrap();
         assert_eq!(b.stats.objects, 0);
         assert_eq!(b.stats.bytes, 0);
+    }
+
+    #[test]
+    fn off_bucket_key_shape_byte_exact() {
+        // V4-2 断言性回归:Off(未版本化)桶对象提交路径落键逐字节 =
+        // `o:{bucket}\0{esc(key)}`,绝不产生 `\0{vk16}` 版本键形态
+        // (ADR-11 D1 硬承诺;v1.0.x 行为逐字节保持)。
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        let put = |key: &str, size: u64| {
+            s.commit_object_put(
+                "b1",
+                key,
+                &object_meta(size),
+                AllocDraft::default(),
+                StatsDelta {
+                    objects: 1,
+                    bytes: size as i64,
+                },
+            )
+            .unwrap();
+        };
+        put("k", 5);
+        put("dir/a\x00b", 7);
+        // 原始扫描全库 `o:` 键:逐字节比对 + 双形态解析均无 vk 后缀
+        let obj_keys: Vec<Vec<u8>> =
+            s.db.iterator(IteratorMode::From(PREFIX_OBJECT, Direction::Forward))
+                .map(|item| item.unwrap().0.to_vec())
+                .take_while(|k| k.starts_with(PREFIX_OBJECT))
+                .collect();
+        assert_eq!(
+            obj_keys,
+            vec![
+                b"o:b1\x00dir/a\xff\x00b".as_slice(), // esc(0x00) = FF 00
+                b"o:b1\x00k".as_slice(),
+            ]
+        );
+        for k in &obj_keys {
+            let (_, _, vk) = parse_object_version_key(k).unwrap();
+            assert!(vk.is_none(), "Off 桶不得产生版本键形态: {k:?}");
+        }
+        // 删除后 `o:` 键零残留(物理删除,无标记/版本键)
+        for (key, size) in [("k", 5i64), ("dir/a\x00b", 7)] {
+            s.commit_object_delete(
+                "b1",
+                key,
+                AllocDraft::default(),
+                StatsDelta {
+                    objects: -1,
+                    bytes: -size,
+                },
+            )
+            .unwrap();
+        }
+        let rest: Vec<Vec<u8>> =
+            s.db.iterator(IteratorMode::From(PREFIX_OBJECT, Direction::Forward))
+                .map(|item| item.unwrap().0.to_vec())
+                .take_while(|k| k.starts_with(PREFIX_OBJECT))
+                .collect();
+        assert!(rest.is_empty(), "删除后无 o: 键残留: {rest:?}");
     }
 
     #[test]
@@ -1722,6 +2982,163 @@ mod tests {
         ));
     }
 
+    /// v2 值格式夹具(M10 V5-3 测试用;字段与 fs3-core ObjectMetaV2
+    /// 逐一对应,postcard 字段序即编码序)。
+    #[derive(serde::Serialize)]
+    struct ObjectMetaV2Fixture {
+        size: u64,
+        etag: [u8; 16],
+        mtime: i64,
+        extents: Vec<Segment>,
+        content_type: String,
+        user_meta: Vec<(String, String)>,
+        inline: Option<Vec<u8>>,
+        parts: Vec<u64>,
+        resp_headers: Vec<(String, String)>,
+    }
+
+    /// 以 v2 版本字节编码 ObjectMeta(丢弃 v3 尾部字段)。
+    fn encode_v2_value(m: &ObjectMeta) -> Vec<u8> {
+        let f = ObjectMetaV2Fixture {
+            size: m.size,
+            etag: m.etag,
+            mtime: m.mtime,
+            extents: m.extents.clone(),
+            content_type: m.content_type.clone(),
+            user_meta: m.user_meta.clone(),
+            inline: m.inline.clone(),
+            parts: m.parts.clone(),
+            resp_headers: m.resp_headers.clone(),
+        };
+        let mut v = vec![2u8];
+        v.extend(postcard::to_allocvec(&f).unwrap());
+        v
+    }
+
+    #[test]
+    fn commit_object_meta_update_reencodes_in_place() {
+        // M10 V5-3:单事务按原始键重编码(不改统计/分配;双形态键均覆盖);
+        // 键不存在 → NotFound。
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        let m = object_meta(64);
+        s.commit_object_put(
+            "b1",
+            "k",
+            &m,
+            AllocDraft {
+                alloc: vec![(1, 1)],
+                ..Default::default()
+            },
+            StatsDelta {
+                objects: 1,
+                bytes: 64,
+            },
+        )
+        .unwrap();
+        let vk = [7u8; 16];
+        let mv = ObjectMeta {
+            version_id: Some(vk),
+            ..object_meta(32)
+        };
+        s.commit_object_put_version(
+            "b1",
+            "vk",
+            &vk,
+            &mv,
+            AllocDraft::default(),
+            StatsDelta {
+                objects: 1,
+                bytes: 32,
+            },
+        )
+        .unwrap();
+
+        // v2 存量值(单键 + 版本键各一)
+        s.put_object_value_raw("b1", "k", None, &encode_v2_value(&m))
+            .unwrap();
+        s.put_object_value_raw("b1", "vk", Some(&vk), &encode_v2_value(&mv))
+            .unwrap();
+        assert_eq!(s.count_object_value_versions().unwrap(), (2, 0));
+
+        // 重写:值内容不变、版本字节 → 3、统计/分配零触碰
+        for e in s.snapshot_all_objects_raw().unwrap() {
+            assert_eq!(e.value_version, 2);
+            s.commit_object_meta_update(&e.raw_key, &e.meta).unwrap();
+        }
+        assert_eq!(s.count_object_value_versions().unwrap(), (0, 2));
+        let expect_m = ObjectMeta::decode_value(&encode_v2_value(&m)).unwrap();
+        assert_eq!(s.get_object("b1", "k").unwrap().unwrap(), expect_m);
+        // 重写 = 双读结果的原样重编码:v2 无 version_id 字段,双读后为
+        // None,重写保持 None(commit 层不做引擎不变量归一;真实存量 v2
+        // 值只可能位于未版本化单键 —— 版本键是 v1.1 新键,写入恒 v3)。
+        let got_v = s.get_object_version("b1", "vk", &vk).unwrap().unwrap();
+        assert_eq!(
+            got_v,
+            ObjectMeta::decode_value(&encode_v2_value(&mv)).unwrap()
+        );
+        let b = s.get_bucket("b1").unwrap().unwrap();
+        assert_eq!((b.stats.objects, b.stats.bytes), (2, 96), "统计不变");
+        // 重写事务只推 s:seq,不产生新 a: 记录
+        assert_eq!(s.list_alloc_records(0).unwrap().len(), 1);
+
+        // 键不存在 → NotFound
+        assert!(matches!(
+            s.commit_object_meta_update(&object_key("b1", "ghost"), &m),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn raw_snapshot_and_value_version_probe() {
+        // M10 V5-3:snapshot_all_objects_raw 携带原始键/值版本字节;
+        // count_object_value_versions 只读首字节;完成标记读写。
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        s.commit_object_put(
+            "b1",
+            "a",
+            &object_meta(1),
+            AllocDraft::default(),
+            StatsDelta::default(),
+        )
+        .unwrap();
+        let vk = [9u8; 16];
+        s.commit_object_put_version(
+            "b1",
+            "a",
+            &vk,
+            &ObjectMeta {
+                version_id: Some(vk),
+                ..object_meta(2)
+            },
+            AllocDraft::default(),
+            StatsDelta::default(),
+        )
+        .unwrap();
+        s.put_object_value_raw("b1", "old", None, &encode_v2_value(&object_meta(3)))
+            .unwrap();
+
+        let raw = s.snapshot_all_objects_raw().unwrap();
+        assert_eq!(raw.len(), 3);
+        for e in &raw {
+            // 原始键与解析字段互洽(经 keys.rs 单入口往返)
+            let (b, k, v) = parse_object_version_key(&e.raw_key).unwrap();
+            assert_eq!((b, k, v), (e.bucket.clone(), e.key.clone(), e.vk));
+        }
+        let v2 = raw.iter().filter(|e| e.value_version == 2).count();
+        let v3 = raw.iter().filter(|e| e.value_version == 3).count();
+        assert_eq!((v2, v3), (1, 2));
+        assert_eq!(s.count_object_value_versions().unwrap(), (1, 2));
+
+        // 完成标记:未落 → false;落 → true(幂等)
+        assert!(!s.value_rewrite_v3_done().unwrap());
+        s.mark_value_rewrite_v3_done().unwrap();
+        assert!(s.value_rewrite_v3_done().unwrap());
+        s.mark_value_rewrite_v3_done().unwrap();
+        assert!(s.value_rewrite_v3_done().unwrap());
+    }
+
     #[test]
     fn migrate_txn_replaces_segments_and_detects_stale() {
         let (_d, s) = open_tmp();
@@ -1802,7 +3219,7 @@ mod tests {
         let uid = "upload-1";
         s.create_multipart(
             uid,
-            &MultipartSession::new("b1", "big", "text/x", vec![], vec![]),
+            &MultipartSession::new("b1", "big", "text/x", vec![], vec![], vec![]),
         )
         .unwrap();
         let part = PartMeta {
@@ -1820,7 +3237,7 @@ mod tests {
         s.put_part(uid, 1, &part, AllocDraft::default()).unwrap();
         let objs = s.snapshot_all_objects().unwrap();
         assert_eq!(objs.len(), 3);
-        assert!(objs.iter().all(|(b, _, _)| b == "b1"));
+        assert!(objs.iter().all(|(b, _, _, _)| b == "b1"));
         let parts = s.snapshot_all_parts().unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].0, uid);
@@ -2006,11 +3423,1144 @@ mod tests {
         let m = s.get_bucket("b1").unwrap().unwrap();
         assert!(!m.created_with_acl);
         assert_eq!(m.owner, "u");
+        // M10/ADR-11:存量值回退补默认(未版本化)
+        assert_eq!(m.versioning, fs3_core::VersioningState::Off);
+        assert_eq!(m.default_encryption, None);
+        assert!(!m.object_lock);
         // 新格式往返
         let mut m2 = m.clone();
         m2.created_with_acl = true;
         s.commit_bucket_put("b1", &m2).unwrap();
         assert!(s.get_bucket("b1").unwrap().unwrap().created_with_acl);
         assert_eq!(s.get_bucket("b1").unwrap().unwrap().owner, "u");
+        // M10 起写入恒带版本字节
+        let raw = s.db.get(bucket_key("b1")).unwrap().unwrap();
+        assert_eq!(raw[0], fs3_core::BUCKET_META_VERSION);
+    }
+
+    #[test]
+    fn bucket_v1_1_value_dual_read() {
+        // M10/ADR-11:v1.1.0 桶值(五字段含 created_with_acl,无版本字节)
+        // 双读保留该字段,v2 尾部字段补默认。
+        let (_d, s) = open_tmp();
+        #[derive(serde::Serialize)]
+        struct BucketMetaV1 {
+            created: i64,
+            owner: String,
+            stats: fs3_core::BucketStats,
+            quota: Option<u64>,
+            created_with_acl: bool,
+        }
+        let v11 = BucketMetaV1 {
+            created: 1_724_155_200,
+            owner: "u".into(),
+            stats: fs3_core::BucketStats::default(),
+            quota: Some(7),
+            created_with_acl: true,
+        };
+        s.db.put(bucket_key("b1"), postcard::to_allocvec(&v11).unwrap())
+            .unwrap();
+        let m = s.get_bucket("b1").unwrap().unwrap();
+        assert!(m.created_with_acl, "v1.1.0 尾部字段不得丢失");
+        assert_eq!(m.quota, Some(7));
+        assert_eq!(m.versioning, fs3_core::VersioningState::Off);
+        assert_eq!(m.default_encryption, None);
+        assert!(!m.object_lock);
+    }
+
+    #[test]
+    fn object_delete_current_writes_delete_marker() {
+        // ADR-11 D3/§3.4.3:删除当前版本 = 写删除标记条目(版本键),
+        // 不触碰数据段,统计零 delta(未版本化键不受影响)。
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        s.commit_object_put(
+            "b1",
+            "k",
+            &object_meta(100),
+            AllocDraft::default(),
+            StatsDelta {
+                objects: 1,
+                bytes: 100,
+            },
+        )
+        .unwrap();
+        let vk_dm = [0x11u8; 16];
+        s.commit_object_delete_current(
+            "b1",
+            "k",
+            Some(&vk_dm),
+            &delete_marker(Some(vk_dm)),
+            AllocDraft::default(),
+            StatsDelta::default(),
+        )
+        .unwrap();
+        // 标记条目落在版本键,原样可读;未版本化条目不动(引擎 V2 才分叉,
+        // 此处只验证 meta 层机制)
+        let raw =
+            s.db.get(object_version_key("b1", "k", &vk_dm))
+                .unwrap()
+                .unwrap();
+        let marker = decode_object(&raw).unwrap();
+        assert!(marker.is_delete_marker);
+        assert_eq!(marker.version_id, Some(vk_dm));
+        assert_eq!(marker.size, 0);
+        assert!(marker.extents.is_empty() && marker.inline.is_none());
+        assert!(s.get_object("b1", "k").unwrap().is_some());
+        // 零 delta:统计不变
+        let b = s.get_bucket("b1").unwrap().unwrap();
+        assert_eq!((b.stats.objects, b.stats.bytes), (1, 100));
+        // 契约校验:非删除标记/带数据 → InvalidArgument
+        let mut not_marker = delete_marker(Some([0x22; 16]));
+        not_marker.is_delete_marker = false;
+        assert!(matches!(
+            s.commit_object_delete_current(
+                "b1",
+                "k",
+                Some(&[0x22; 16]),
+                &not_marker,
+                AllocDraft::default(),
+                StatsDelta::default()
+            ),
+            Err(Error::InvalidArgument(_))
+        ));
+        let mut with_data = delete_marker(Some([0x33; 16]));
+        with_data.size = 1;
+        assert!(matches!(
+            s.commit_object_delete_current(
+                "b1",
+                "k",
+                Some(&[0x33; 16]),
+                &with_data,
+                AllocDraft::default(),
+                StatsDelta::default()
+            ),
+            Err(Error::InvalidArgument(_))
+        ));
+        // 桶不存在 → NotFound
+        assert!(matches!(
+            s.commit_object_delete_current(
+                "nope",
+                "k",
+                Some(&[0x44; 16]),
+                &delete_marker(Some([0x44; 16])),
+                AllocDraft::default(),
+                StatsDelta::default()
+            ),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn object_delete_version_removes_entry() {
+        // ADR-11 §3.4.3:物理删除指定版本 = 删版本键 + 同事务 release/扣减。
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        let vk1 = [0x22u8; 16];
+        // 预置一个版本条目 + 入账(模拟引擎版本写路径的 meta 侧形态)
+        s.db.put(
+            object_version_key("b1", "k", &vk1),
+            object_meta(100).encode_value().unwrap(),
+        )
+        .unwrap();
+        s.commit(&[Op::Stats {
+            bucket: "b1".into(),
+            delta: StatsDelta {
+                objects: 1,
+                bytes: 100,
+            },
+        }])
+        .unwrap();
+        s.commit_object_delete_version(
+            "b1",
+            "k",
+            &vk1,
+            AllocDraft {
+                ref_dec: vec![7],
+                ..Default::default()
+            },
+            StatsDelta {
+                objects: -1,
+                bytes: -100,
+            },
+        )
+        .unwrap();
+        assert!(s
+            .db
+            .get(object_version_key("b1", "k", &vk1))
+            .unwrap()
+            .is_none());
+        let b = s.get_bucket("b1").unwrap().unwrap();
+        assert_eq!((b.stats.objects, b.stats.bytes), (0, 0));
+        // 释放记录同事务生成
+        let recs = s.list_alloc_records(0).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].ref_dec, vec![7]);
+        // 版本不存在 → NotFound(幂等 204 由引擎/协议层映射)
+        assert!(matches!(
+            s.commit_object_delete_version(
+                "b1",
+                "k",
+                &[0x99; 16],
+                AllocDraft::default(),
+                StatsDelta::default()
+            ),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn versioned_stats_five_paths() {
+        // ADR-11 D5:bytes/objects = 全部非删除标记版本;删除标记不计入。
+        // 入账 5 路径(put/complete/copy/delete-version/delete-marker)逐条断言。
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        let stats = |s: &MetaStore| {
+            let b = s.get_bucket("b1").unwrap().unwrap();
+            (b.stats.objects, b.stats.bytes)
+        };
+
+        // 1) put:+1/+100
+        s.commit_object_put(
+            "b1",
+            "a",
+            &object_meta(100),
+            AllocDraft::default(),
+            StatsDelta {
+                objects: 1,
+                bytes: 100,
+            },
+        )
+        .unwrap();
+        assert_eq!(stats(&s), (1, 100));
+
+        // 2) multipart complete:+1/+200
+        let uid = "up-1";
+        s.create_multipart(
+            uid,
+            &MultipartSession::new("b1", "m", "text/x", vec![], vec![], vec![]),
+        )
+        .unwrap();
+        let part = PartMeta {
+            size: 200,
+            etag: [1u8; 16],
+            mtime: 1,
+            extents: vec![],
+            inline: Some(vec![0u8; 200]),
+        };
+        s.put_part(uid, 1, &part, AllocDraft::default()).unwrap();
+        let mut mm = object_meta(200);
+        mm.parts = vec![200];
+        s.complete_multipart(
+            "b1",
+            "m",
+            uid,
+            &mm,
+            &[part_key(uid, 1)],
+            AllocDraft::default(),
+            StatsDelta {
+                objects: 1,
+                bytes: 200,
+            },
+        )
+        .unwrap();
+        assert_eq!(stats(&s), (2, 300));
+
+        // 3) copy(与 put 同入账点 commit_object_put):+1/+50
+        s.commit_object_put(
+            "b1",
+            "c",
+            &object_meta(50),
+            AllocDraft::default(),
+            StatsDelta {
+                objects: 1,
+                bytes: 50,
+            },
+        )
+        .unwrap();
+        assert_eq!(stats(&s), (3, 350));
+
+        // 4) delete-marker:零 delta,统计不变;条目落在版本键
+        let vk_dm = [0x11u8; 16];
+        s.commit_object_delete_current(
+            "b1",
+            "a",
+            Some(&vk_dm),
+            &delete_marker(Some(vk_dm)),
+            AllocDraft::default(),
+            StatsDelta::default(),
+        )
+        .unwrap();
+        assert_eq!(stats(&s), (3, 350), "删除标记零 delta");
+
+        // 5) delete-version:按版本 size 扣减;删除标记版本删除零 delta
+        let vk1 = [0x22u8; 16];
+        s.db.put(
+            object_version_key("b1", "a", &vk1),
+            object_meta(100).encode_value().unwrap(),
+        )
+        .unwrap();
+        s.commit(&[Op::Stats {
+            bucket: "b1".into(),
+            delta: StatsDelta {
+                objects: 1,
+                bytes: 100,
+            },
+        }])
+        .unwrap();
+        assert_eq!(stats(&s), (4, 450));
+        s.commit_object_delete_version(
+            "b1",
+            "a",
+            &vk1,
+            AllocDraft::default(),
+            StatsDelta {
+                objects: -1,
+                bytes: -100,
+            },
+        )
+        .unwrap();
+        assert_eq!(stats(&s), (3, 350), "delete-version 扣减后配额占用下降");
+        s.commit_object_delete_version(
+            "b1",
+            "a",
+            &vk_dm,
+            AllocDraft::default(),
+            StatsDelta::default(),
+        )
+        .unwrap();
+        assert_eq!(stats(&s), (3, 350), "删除标记版本不计 bytes/objects");
+
+        // Suspended 覆盖 null 槽:删除标记原地覆盖旧 null 版本,
+        // 旧 null 版本扣减由调用方(引擎)计算,同事务入账
+        s.db.put(
+            object_version_key("b1", "n", &VK_NULL),
+            object_meta(80).encode_value().unwrap(),
+        )
+        .unwrap();
+        s.commit(&[Op::Stats {
+            bucket: "b1".into(),
+            delta: StatsDelta {
+                objects: 1,
+                bytes: 80,
+            },
+        }])
+        .unwrap();
+        assert_eq!(stats(&s), (4, 430));
+        s.commit_object_delete_current(
+            "b1",
+            "n",
+            Some(&VK_NULL),
+            &delete_marker(None),
+            AllocDraft {
+                ref_dec: vec![9],
+                ..Default::default()
+            },
+            StatsDelta {
+                objects: -1,
+                bytes: -80,
+            },
+        )
+        .unwrap();
+        // null 槽覆盖的段释放记录(ref_dec)与扣减同事务落盘
+        let recs = s.list_alloc_records(0).unwrap();
+        assert!(recs.iter().any(|r| r.ref_dec == vec![9]));
+        assert_eq!(
+            stats(&s),
+            (3, 350),
+            "null 槽覆盖:旧 null 版本扣减、标记零 delta"
+        );
+        // 原槽位现为删除标记条目(原地覆盖,version_id = None)
+        let raw =
+            s.db.get(object_version_key("b1", "n", &VK_NULL))
+                .unwrap()
+                .unwrap();
+        let marker = decode_object(&raw).unwrap();
+        assert!(marker.is_delete_marker);
+        assert_eq!(marker.version_id, None);
+    }
+
+    // ─────────────────── 版本化读路径(ADR-11 D1/D4;V2) ───────────────────
+
+    /// 时间戳分量 vk 构造(测试用;随机分量固定 0x07)。
+    fn vk_at(ts: u64) -> [u8; 16] {
+        // 夹具 vk 时间戳分量按 **微秒** 编码(与 new_version_vk 布局一致):
+        // ts 与 ObjectMeta.mtime(秒)同值可比(V6-1 起 D1a 裁决按 vk 秒分量)
+        let mut v = [0x07u8; 16];
+        v[..8].copy_from_slice(&(ts * 1_000_000).to_be_bytes());
+        v
+    }
+
+    fn versioned_bucket(name: &str, state: fs3_core::VersioningState) -> BucketMeta {
+        BucketMeta {
+            versioning: state,
+            ..bucket_meta(name)
+        }
+    }
+
+    #[test]
+    fn object_put_version_op_and_exact_read() {
+        // ADR-11 D1:版本化 PUT 落版本键;精确读;契约校验。
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        let vk1 = vk_at(100);
+        let mut m = object_meta(64);
+        m.version_id = Some(vk1);
+        s.commit_object_put_version(
+            "b1",
+            "k",
+            &vk1,
+            &m,
+            AllocDraft {
+                alloc: vec![(3, 1)],
+                ..Default::default()
+            },
+            StatsDelta {
+                objects: 1,
+                bytes: 64,
+            },
+        )
+        .unwrap();
+        // 版本键可读;未版本化键无条目
+        assert!(s.get_object("b1", "k").unwrap().is_none());
+        let got = s.get_object_version("b1", "k", &vk1).unwrap().unwrap();
+        assert_eq!(got.version_id, Some(vk1));
+        assert_eq!(got.size, 64);
+        // 分配记录同事务可见
+        assert!(s
+            .list_alloc_records(0)
+            .unwrap()
+            .iter()
+            .any(|r| r.alloc == vec![(3, 1)]));
+        // 桶不存在 → NotFound;删除标记须经 DeleteCurrent → InvalidArgument
+        assert!(matches!(
+            s.commit_object_put_version(
+                "nope",
+                "k",
+                &vk1,
+                &m,
+                AllocDraft::default(),
+                StatsDelta::default()
+            ),
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            s.commit_object_put_version(
+                "b1",
+                "k",
+                &vk_at(200),
+                &delete_marker(Some(vk_at(200))),
+                AllocDraft::default(),
+                StatsDelta::default()
+            ),
+            Err(Error::InvalidArgument(_))
+        ));
+        // 同 vk 覆盖(Suspended null 槽原地覆盖形态):值被替换
+        let mut m2 = object_meta(32);
+        m2.version_id = Some(vk1);
+        s.commit_object_put_version(
+            "b1",
+            "k",
+            &vk1,
+            &m2,
+            AllocDraft::default(),
+            StatsDelta {
+                objects: 0,
+                bytes: -32,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            s.get_object_version("b1", "k", &vk1).unwrap().unwrap().size,
+            32
+        );
+        let b = s.get_bucket("b1").unwrap().unwrap();
+        assert_eq!((b.stats.objects, b.stats.bytes), (1, 32));
+    }
+
+    #[test]
+    fn current_version_resolution_and_versions_listing() {
+        // ADR-11 D4:当前版本 = 最大 vk 条目(删除标记亦为当前版本);
+        // 全版本列举 vk 升序;null 槽恒最大;反扫上界键不干扰。
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put(
+            "b1",
+            &versioned_bucket("b1", fs3_core::VersioningState::Enabled),
+        )
+        .unwrap();
+        // k:两个数据版本 + 一条新删除标记(最大 vk)
+        for (t, sz) in [(100u64, 10u64), (200, 20)] {
+            let mut m = object_meta(sz);
+            m.version_id = Some(vk_at(t));
+            s.commit_object_put_version(
+                "b1",
+                "k",
+                &vk_at(t),
+                &m,
+                AllocDraft::default(),
+                StatsDelta::default(),
+            )
+            .unwrap();
+        }
+        s.commit_object_delete_current(
+            "b1",
+            "k",
+            Some(&vk_at(300)),
+            &delete_marker(Some(vk_at(300))),
+            AllocDraft::default(),
+            StatsDelta::default(),
+        )
+        .unwrap();
+        let (cur_vk, cur) = s.get_current_version("b1", "k").unwrap().unwrap();
+        assert_eq!(cur_vk, vk_at(300));
+        assert!(cur.is_delete_marker, "最大 vk 条目原样返回,调用方判定标记");
+        // 全版本列举:vk 升序(= 创建序)
+        let all = s.list_key_versions("b1", "k").unwrap();
+        assert_eq!(all.len(), 3);
+        assert!(all.windows(2).all(|w| w[0].0 < w[1].0));
+        assert_eq!(all[1].1.size, 20);
+        // 无版本 key → None
+        assert!(s.get_current_version("b1", "ghost").unwrap().is_none());
+        assert!(s.list_key_versions("b1", "ghost").unwrap().is_empty());
+        // 反扫上界碰撞:真实对象键 `o:b1\0k\x01`(恰为上界值)不得干扰解析
+        s.commit_object_put(
+            "b1",
+            "k\u{1}",
+            &object_meta(5),
+            AllocDraft::default(),
+            StatsDelta::default(),
+        )
+        .unwrap();
+        let (cur_vk2, _) = s.get_current_version("b1", "k").unwrap().unwrap();
+        assert_eq!(cur_vk2, vk_at(300), "上界键不得干扰最大 vk 反扫");
+        // null 槽恒为当前(键序最大)
+        s.commit_object_put_version(
+            "b1",
+            "n",
+            &VK_NULL,
+            &object_meta(9),
+            AllocDraft::default(),
+            StatsDelta::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            s.get_current_version("b1", "n").unwrap().unwrap().0,
+            VK_NULL
+        );
+        // 全条目枚举:双形态(3 版本 + null 槽 + 1 未版本化)
+        let entries = s.list_object_entries("b1").unwrap();
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries.iter().filter(|(_, vk, _)| vk.is_some()).count(), 4);
+        assert!(entries
+            .iter()
+            .any(|(k, vk, _)| k == "k\u{1}" && vk.is_none()));
+        // 快照扫描双形态:版本条目带 vk,恢复可达性可见(§3.4.6)
+        let snap = s.snapshot_all_objects().unwrap();
+        assert_eq!(snap.len(), 5);
+        assert_eq!(snap.iter().filter(|(_, _, vk, _)| vk.is_some()).count(), 4);
+    }
+
+    #[test]
+    fn current_version_for_off_fast_path_equivalence() {
+        // F-1:Off 桶快速路径 = 未版本化单键点读(vk 恒 VK_NULL),与全量
+        // D1a 裁决逐值等价(Off 桶绝不可能存在版本键);Enabled/Suspended
+        // 的 _for 与全量同路,行为不变。
+        let (_d, s) = open_tmp();
+        // —— Off 桶:存在键 → (VK_NULL, meta);不存在键 → None(404 源)——
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        s.commit_object_put(
+            "b1",
+            "k",
+            &object_meta(42),
+            AllocDraft::default(),
+            StatsDelta::default(),
+        )
+        .unwrap();
+        let full = s.get_current_version("b1", "k").unwrap();
+        let fast = s
+            .get_current_version_for("b1", "k", fs3_core::VersioningState::Off)
+            .unwrap();
+        assert_eq!(fast, full);
+        assert_eq!(fast.unwrap().0, VK_NULL);
+        assert!(s
+            .get_current_version_for("b1", "ghost", fs3_core::VersioningState::Off)
+            .unwrap()
+            .is_none());
+        // —— Enabled 桶:_for 与全量 D1a 同路(真实版本裁决不变)——
+        s.commit_bucket_put(
+            "b2",
+            &versioned_bucket("b2", fs3_core::VersioningState::Enabled),
+        )
+        .unwrap();
+        for (t, sz) in [(100u64, 10u64), (200, 20)] {
+            let mut m = object_meta(sz);
+            m.version_id = Some(vk_at(t));
+            s.commit_object_put_version(
+                "b2",
+                "k",
+                &vk_at(t),
+                &m,
+                AllocDraft::default(),
+                StatsDelta::default(),
+            )
+            .unwrap();
+        }
+        let full = s.get_current_version("b2", "k").unwrap();
+        assert_eq!(
+            s.get_current_version_for("b2", "k", fs3_core::VersioningState::Enabled)
+                .unwrap(),
+            full
+        );
+        assert_eq!(full.unwrap().0, vk_at(200));
+        // —— Suspended 桶:null 槽裁决同路 ——
+        s.commit_bucket_put(
+            "b3",
+            &versioned_bucket("b3", fs3_core::VersioningState::Suspended),
+        )
+        .unwrap();
+        s.commit_object_put_version(
+            "b3",
+            "k",
+            &VK_NULL,
+            &object_meta(9),
+            AllocDraft::default(),
+            StatsDelta::default(),
+        )
+        .unwrap();
+        let full = s.get_current_version("b3", "k").unwrap();
+        assert_eq!(
+            s.get_current_version_for("b3", "k", fs3_core::VersioningState::Suspended)
+                .unwrap(),
+            full
+        );
+        assert_eq!(full.unwrap().0, VK_NULL);
+    }
+
+    #[test]
+    fn list_page_versioned_current_only_filter() {
+        // ADR-11 §3.4.4:版本化桶 ListObjects 每 key 只出当前版本;当前 =
+        // 删除标记则该 key 不出现;游标/delimiter 语义不变。
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put(
+            "b1",
+            &versioned_bucket("b1", fs3_core::VersioningState::Enabled),
+        )
+        .unwrap();
+        let put_v = |s: &MetaStore, key: &str, t: u64, sz: u64| {
+            let mut m = object_meta(sz);
+            m.version_id = Some(vk_at(t));
+            s.commit_object_put_version(
+                "b1",
+                key,
+                &vk_at(t),
+                &m,
+                AllocDraft::default(),
+                StatsDelta::default(),
+            )
+            .unwrap();
+        };
+        // a:两个版本,当前 = vk(200) 数据版本
+        put_v(&s, "a", 100, 1);
+        put_v(&s, "a", 200, 2);
+        // b:当前 = 删除标记 → 隐藏
+        put_v(&s, "b", 100, 1);
+        s.commit_object_delete_current(
+            "b1",
+            "b",
+            Some(&vk_at(200)),
+            &delete_marker(Some(vk_at(200))),
+            AllocDraft::default(),
+            StatsDelta::default(),
+        )
+        .unwrap();
+        // dir/x 当前数据;dir/y 当前 = 标记(delimiter 分组仍出 dir/)
+        put_v(&s, "dir/x", 100, 3);
+        put_v(&s, "dir/y", 100, 4);
+        s.commit_object_delete_current(
+            "b1",
+            "dir/y",
+            Some(&vk_at(200)),
+            &delete_marker(Some(vk_at(200))),
+            AllocDraft::default(),
+            StatsDelta::default(),
+        )
+        .unwrap();
+
+        // 全量:仅当前数据版本;a 输出的是 vk(200) 的值
+        let p = s.list_objects_page("b1", "", None, None, 100).unwrap();
+        let keys: Vec<&str> = p.items.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["a", "dir/x"]);
+        assert_eq!(p.items[0].1.size, 2, "输出当前版本(最新)的 meta");
+        assert!(!p.truncated);
+        // delimiter:dir/ 归组(组内有 key 当前为标记不影响组的发出)
+        let p = s.list_objects_page("b1", "", Some("/"), None, 100).unwrap();
+        let keys: Vec<&str> = p.items.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["a"]);
+        assert_eq!(p.common_prefixes, ["dir/"]);
+        // 分页:max=1 逐页,游标续扫不重不漏
+        let p1 = s.list_objects_page("b1", "", None, None, 1).unwrap();
+        assert_eq!(p1.items.len(), 1);
+        assert!(p1.truncated);
+        let p2 = s
+            .list_objects_page("b1", "", None, p1.last_scanned.as_deref(), 10)
+            .unwrap();
+        let mut all: Vec<String> = p1.items.iter().map(|(k, _)| k.clone()).collect();
+        all.extend(p2.items.iter().map(|(k, _)| k.clone()));
+        assert_eq!(all, ["a", "dir/x"]);
+        assert!(!p2.truncated);
+        // list_objects 同步过滤
+        let all = s.list_objects("b1", "").unwrap();
+        let keys: Vec<&str> = all.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["a", "dir/x"]);
+        // Off 桶对照:同内容全量输出(旧路径零改动)
+        s.commit_bucket_put("b2", &bucket_meta("b2")).unwrap();
+        s.commit_object_put(
+            "b2",
+            "a",
+            &object_meta(1),
+            AllocDraft::default(),
+            StatsDelta::default(),
+        )
+        .unwrap();
+        s.commit_object_put(
+            "b2",
+            "b",
+            &object_meta(1),
+            AllocDraft::default(),
+            StatsDelta::default(),
+        )
+        .unwrap();
+        assert_eq!(s.list_objects("b2", "").unwrap().len(), 2);
+        assert_eq!(
+            s.list_objects_page("b2", "", None, None, 100)
+                .unwrap()
+                .items
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn complete_multipart_version_lands_version_key() {
+        // ADR-11 §3.4.5:Complete 落版本键(vk = Some);None 退化为未版本化
+        // 单键(与 complete_multipart 委托路径一致)。
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        let mk_part = |uid: &str| {
+            s.create_multipart(
+                uid,
+                &MultipartSession::new("b1", "m", "text/x", vec![], vec![], vec![]),
+            )
+            .unwrap();
+            let part = PartMeta {
+                size: 5,
+                etag: [1u8; 16],
+                mtime: 1,
+                extents: vec![],
+                inline: Some(vec![0u8; 5]),
+            };
+            s.put_part(uid, 1, &part, AllocDraft::default()).unwrap();
+            part
+        };
+        let mut mm = object_meta(5);
+        mm.parts = vec![5];
+        // vk = Some:版本键
+        let vk1 = vk_at(100);
+        let mut vm = mm.clone();
+        vm.version_id = Some(vk1);
+        s.complete_multipart_version(
+            "b1",
+            "m",
+            "up-v",
+            Some(&vk1),
+            &vm,
+            &[part_key("up-v", 1)],
+            AllocDraft::default(),
+            StatsDelta {
+                objects: 1,
+                bytes: 5,
+            },
+        )
+        .unwrap_err();
+        // 会话未创建 → NotFound;先建会话再 Complete
+        mk_part("up-v");
+        s.complete_multipart_version(
+            "b1",
+            "m",
+            "up-v",
+            Some(&vk1),
+            &vm,
+            &[part_key("up-v", 1)],
+            AllocDraft::default(),
+            StatsDelta {
+                objects: 1,
+                bytes: 5,
+            },
+        )
+        .unwrap();
+        assert!(s.get_object("b1", "m").unwrap().is_none());
+        assert_eq!(
+            s.get_object_version("b1", "m", &vk1).unwrap().unwrap().size,
+            5
+        );
+        assert!(s.get_multipart("up-v").unwrap().unwrap().completed);
+        assert!(s.list_parts("up-v").unwrap().is_empty());
+        // vk = None:未版本化单键(等价 complete_multipart)
+        mk_part("up-p");
+        s.complete_multipart_version(
+            "b1",
+            "p",
+            "up-p",
+            None,
+            &mm,
+            &[part_key("up-p", 1)],
+            AllocDraft::default(),
+            StatsDelta {
+                objects: 1,
+                bytes: 5,
+            },
+        )
+        .unwrap();
+        assert_eq!(s.get_object("b1", "p").unwrap().unwrap().size, 5);
+    }
+
+    // ─────────────── D1a 跨状态转换(ADR-11 D1a;V3-0) ───────────────
+
+    /// 预置遗留未版本化单键(Off 时代形态):自定 mtime。
+    fn put_legacy(s: &MetaStore, bucket: &str, key: &str, mtime: i64, size: u64) {
+        let mut m = object_meta(size);
+        m.mtime = mtime;
+        s.commit_object_put(
+            bucket,
+            key,
+            &m,
+            AllocDraft::default(),
+            StatsDelta::default(),
+        )
+        .unwrap();
+    }
+
+    /// 预置真实版本条目:vk_at(ts),mtime 独立指定。
+    fn put_real(s: &MetaStore, bucket: &str, key: &str, ts: u64, mtime: i64, size: u64) {
+        let mut m = object_meta(size);
+        m.mtime = mtime;
+        m.version_id = Some(vk_at(ts));
+        s.commit_object_put_version(
+            bucket,
+            key,
+            &vk_at(ts),
+            &m,
+            AllocDraft::default(),
+            StatsDelta::default(),
+        )
+        .unwrap();
+    }
+
+    /// 预置 null 槽条目(数据版本;is_delete_marker 由参数定)。
+    fn put_null_slot(s: &MetaStore, bucket: &str, key: &str, mtime: i64, size: u64, marker: bool) {
+        let mut m = object_meta(size);
+        m.mtime = mtime;
+        if marker {
+            m.is_delete_marker = true;
+            m.size = 0;
+            s.commit_object_delete_current(
+                bucket,
+                key,
+                Some(&VK_NULL),
+                &m,
+                AllocDraft::default(),
+                StatsDelta::default(),
+            )
+            .unwrap();
+        } else {
+            s.commit_object_put_version(
+                bucket,
+                key,
+                &VK_NULL,
+                &m,
+                AllocDraft::default(),
+                StatsDelta::default(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn d1a_current_version_legacy_vs_real() {
+        // Off→Enabled 遗留键遮蔽回归(D1a-2):遗留单键与真实版本共存时
+        // 当前 = mtime 最大;相等取真实版本;删掉真实版本后遗留单键回升。
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put(
+            "b1",
+            &versioned_bucket("b1", fs3_core::VersioningState::Enabled),
+        )
+        .unwrap();
+        put_legacy(&s, "b1", "k", 100, 10);
+        // 仅遗留单键:当前 = 遗留(VK_NULL 展示)
+        let (vk, m) = s.get_current_version("b1", "k").unwrap().unwrap();
+        assert_eq!((vk, m.size), (VK_NULL, 10));
+        // 写入真实版本(mtime 更大)→ 真实版本为当前(遗留被遮蔽)
+        put_real(&s, "b1", "k", 200, 200, 20);
+        let (vk, m) = s.get_current_version("b1", "k").unwrap().unwrap();
+        assert_eq!((vk, m.size), (vk_at(200), 20));
+        // 候选 = 遗留 vs **最大真实 vk**(D1a 候选语义;非键内最大 mtime):
+        // vk_at(300) 为最大真实 vk,与遗留同 mtime → tie 取真实版本
+        put_real(&s, "b1", "k", 300, 100, 30);
+        let (vk, m) = s.get_current_version("b1", "k").unwrap().unwrap();
+        assert_eq!((vk, m.size), (vk_at(300), 30), "tie:最大真实 vk 胜出");
+        // 真实版本全部删除 → 遗留单键回升为当前
+        s.commit_object_delete_version(
+            "b1",
+            "k",
+            &vk_at(200),
+            AllocDraft::default(),
+            StatsDelta::default(),
+        )
+        .unwrap();
+        s.commit_object_delete_version(
+            "b1",
+            "k",
+            &vk_at(300),
+            AllocDraft::default(),
+            StatsDelta::default(),
+        )
+        .unwrap();
+        let (vk, m) = s.get_current_version("b1", "k").unwrap().unwrap();
+        assert_eq!((vk, m.size), (VK_NULL, 10));
+        // tie 专项:真实 vk 秒分量 == 遗留单键 mtime(100)→ 打平取真实版本
+        // (V6-1 比较键 = vk 时间戳分量,写侧保序下打平 ⟺ 真实版本后写)
+        put_real(&s, "b1", "k", 100, 100, 40);
+        let (vk, _) = s.get_current_version("b1", "k").unwrap().unwrap();
+        assert_eq!(vk, vk_at(100), "打平取真实版本");
+    }
+
+    #[test]
+    fn d1a_current_version_null_slot_vs_real() {
+        // Suspended→Enabled null 槽遮蔽回归(D1a-2):null 槽与真实版本共存,
+        // mtime 裁决;重启用后的新真实版本(同秒)胜出。
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put(
+            "b1",
+            &versioned_bucket("b1", fs3_core::VersioningState::Enabled),
+        )
+        .unwrap();
+        put_real(&s, "b1", "k", 100, 100, 10);
+        // Suspended 时代 null 槽写入(mtime 更晚)→ null 族为当前
+        put_null_slot(&s, "b1", "k", 200, 20, false);
+        let (vk, m) = s.get_current_version("b1", "k").unwrap().unwrap();
+        assert_eq!((vk, m.size), (VK_NULL, 20));
+        // 重启用后写入(vk 秒分量更大)→ 真实版本胜出
+        put_real(&s, "b1", "k", 300, 200, 30);
+        let (vk, m) = s.get_current_version("b1", "k").unwrap().unwrap();
+        assert_eq!((vk, m.size), (vk_at(300), 30), "vk 更新:真实版本胜出");
+        // tie 专项:null 槽 mtime == 最大真实 vk 秒分量 → 打平取真实版本
+        // (写侧保序下打平 ⟺ 真实版本后写)
+        put_null_slot(&s, "b1", "k", 300, 25, false);
+        let (vk, m) = s.get_current_version("b1", "k").unwrap().unwrap();
+        assert_eq!((vk, m.size), (vk_at(300), 30), "tie:真实版本仍为当前");
+        // null 槽为删除标记:mtime 最大 → 当前 = 标记(调用方判 404)
+        put_null_slot(&s, "b1", "k", 400, 0, true);
+        let (vk, m) = s.get_current_version("b1", "k").unwrap().unwrap();
+        assert_eq!(vk, VK_NULL);
+        assert!(m.is_delete_marker);
+        // vk 防回拨比较基址(D1a-5):不含 null 槽/遗留单键
+        assert_eq!(s.max_real_vk("b1", "k").unwrap(), Some(vk_at(300)));
+        put_legacy(&s, "b1", "g", 500, 1);
+        assert_eq!(s.max_real_vk("b1", "g").unwrap(), None);
+    }
+
+    #[test]
+    fn d1a_list_objects_current_by_mtime() {
+        // 版本化桶 ListObjects/ListPage 的当前版本同走 D1a(组内 mtime 裁决,
+        // 非组尾键序):Suspended 覆盖遗留单键后,新真实版本同秒胜出。
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put(
+            "b1",
+            &versioned_bucket("b1", fs3_core::VersioningState::Enabled),
+        )
+        .unwrap();
+        put_legacy(&s, "b1", "a", 100, 10);
+        put_real(&s, "b1", "a", 200, 100, 20); // 同 mtime:真实版本为当前
+        put_real(&s, "b1", "b", 100, 100, 30);
+        put_null_slot(&s, "b1", "b", 200, 40, false); // null 槽更晚:当前
+        let all = s.list_objects("b1", "").unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].1.size, 20, "key a:同秒真实版本胜出");
+        assert_eq!(all[1].1.size, 40, "key b:null 槽 mtime 最大");
+        let page = s.list_objects_page("b1", "", None, None, 10).unwrap();
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[0].1.size, 20);
+        assert_eq!(page.items[1].1.size, 40);
+    }
+
+    #[test]
+    fn object_delete_current_legacy_inplace() {
+        // D1a-1 meta 机制:vk=None → 删除标记写未版本化单键(原地覆盖);
+        // 契约校验同样生效。
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        put_legacy(&s, "b1", "k", 100, 10);
+        s.commit_object_delete_current(
+            "b1",
+            "k",
+            None,
+            &delete_marker(None),
+            AllocDraft::default(),
+            StatsDelta {
+                objects: -1,
+                bytes: -10,
+            },
+        )
+        .unwrap();
+        let m = s.get_object("b1", "k").unwrap().unwrap();
+        assert!(m.is_delete_marker && m.version_id.is_none());
+        assert!(s.list_key_versions("b1", "k").unwrap().is_empty());
+        let b = s.get_bucket("b1").unwrap().unwrap();
+        assert_eq!((b.stats.objects, b.stats.bytes), (0, 0));
+    }
+
+    #[test]
+    fn bucket_set_versioning_txn() {
+        // V3-1:单事务读改写;location/统计等其余字段不动;桶不存在 → NotFound。
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put_with_location("b1", &bucket_meta("b1"), "eu-west-1")
+            .unwrap();
+        s.commit_bucket_set_versioning("b1", fs3_core::VersioningState::Enabled)
+            .unwrap();
+        let b = s.get_bucket("b1").unwrap().unwrap();
+        assert_eq!(b.versioning, fs3_core::VersioningState::Enabled);
+        assert_eq!(s.bucket_location("b1").unwrap(), "eu-west-1");
+        s.commit_bucket_set_versioning("b1", fs3_core::VersioningState::Suspended)
+            .unwrap();
+        assert_eq!(
+            s.get_bucket("b1").unwrap().unwrap().versioning,
+            fs3_core::VersioningState::Suspended
+        );
+        assert!(matches!(
+            s.commit_bucket_set_versioning("nope", fs3_core::VersioningState::Enabled),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn list_versions_page_full_semantics() {
+        // ADR-11 §3.4.4 + D1a-3:键升序、键内 mtime 降序;IsLatest 按 D1a;
+        // KeyMarker/VersionIdMarker 条目级续传;delimiter 归组。
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put(
+            "b1",
+            &versioned_bucket("b1", fs3_core::VersioningState::Enabled),
+        )
+        .unwrap();
+        // key "a":3 个真实版本(创建序 vk 100<200<300)+ 1 删除标记(最新)
+        for (ts, sz) in [(100u64, 1u64), (200, 2), (300, 3)] {
+            put_real(&s, "b1", "a", ts, ts as i64, sz);
+        }
+        let mut dm = delete_marker(Some(vk_at(400)));
+        dm.mtime = 400;
+        s.commit_object_delete_current(
+            "b1",
+            "a",
+            Some(&vk_at(400)),
+            &dm,
+            AllocDraft::default(),
+            StatsDelta::default(),
+        )
+        .unwrap();
+        // key "b":真实版本 + null 槽(null 槽 mtime 居中 → 按 mtime 插入序列)
+        put_real(&s, "b1", "b", 100, 100, 10);
+        put_null_slot(&s, "b1", "b", 150, 20, false);
+        put_real(&s, "b1", "b", 200, 200, 30);
+        // key "d/x"、"d/y"(delimiter 归组用)
+        put_real(&s, "b1", "d/x", 100, 100, 1);
+        put_real(&s, "b1", "d/y", 100, 100, 1);
+
+        let page = s
+            .list_versions_page("b1", "", None, None, None, 100)
+            .unwrap();
+        assert!(!page.truncated);
+        // 键内 mtime 降序:a = [标记(400), v300, v200, v100]
+        let a: Vec<&VersionListEntry> = page.entries.iter().filter(|e| e.key == "a").collect();
+        assert_eq!(a.len(), 4);
+        assert!(
+            a[0].meta.is_delete_marker && a[0].is_latest,
+            "最新 = 删除标记"
+        );
+        assert_eq!(a[1].vk, vk_at(300));
+        assert!(!a[1].is_latest);
+        assert_eq!(a[3].vk, vk_at(100));
+        // b = [v200, null(150), v100]:null 按 mtime 插入,不按键位
+        let b: Vec<&VersionListEntry> = page.entries.iter().filter(|e| e.key == "b").collect();
+        assert_eq!(b.len(), 3);
+        assert_eq!(b[0].vk, vk_at(200));
+        assert!(b[0].is_latest, "v200 mtime 最大 = 当前");
+        assert_eq!(b[1].vk, VK_NULL, "null 条目按 mtime 插入真实版本序列");
+        assert_eq!(b[2].vk, vk_at(100));
+
+        // 分页:max=3 → 截断;a 组内 VersionIdMarker 续传不重不漏
+        let p1 = s.list_versions_page("b1", "", None, None, None, 3).unwrap();
+        assert!(p1.truncated);
+        assert_eq!(p1.entries.len(), 3);
+        let (lk, lvk) = p1.last_scanned.clone().unwrap();
+        assert_eq!((lk.as_str(), lvk), ("a", Some(vk_at(200))));
+        let p2 = s
+            .list_versions_page("b1", "", None, Some("a"), lvk.as_ref(), 100)
+            .unwrap();
+        assert!(!p2.truncated);
+        let mut resumed: Vec<([u8; 16], &str)> =
+            p2.entries.iter().map(|e| (e.vk, e.key.as_str())).collect();
+        // p2 首条 = a 的 v100(接着 p1 末条 v200),随后 b 组 3 条 + d 组 2 条
+        assert_eq!(resumed.remove(0), (vk_at(100), "a"));
+        assert_eq!(resumed.len(), 5);
+        // 全量 = p1 + p2,无重叠无遗漏
+        let total: Vec<([u8; 16], &str)> = p1
+            .entries
+            .iter()
+            .chain(p2.entries.iter())
+            .map(|e| (e.vk, e.key.as_str()))
+            .collect();
+        assert_eq!(total.len(), 4 + 3 + 2);
+
+        // delimiter:d/ 组折叠为公共前缀;d 组版本条目不出现
+        let pd = s
+            .list_versions_page("b1", "", Some("/"), None, None, 100)
+            .unwrap();
+        assert_eq!(pd.common_prefixes, vec!["d/".to_string()]);
+        assert!(pd.entries.iter().all(|e| !e.key.starts_with("d/")));
+        // 公共前缀续传:key_marker = "d/" → d 组整组跳过
+        let pd2 = s
+            .list_versions_page("b1", "", Some("/"), Some("d/"), None, 100)
+            .unwrap();
+        assert!(pd2.entries.is_empty() && pd2.common_prefixes.is_empty());
+    }
+
+    #[test]
+    fn list_versions_page_unversioned_stub_compat() {
+        // 未版本化桶(Off)走同一实现:每对象一条 VersionId="null"、
+        // IsLatest=true(现状桩语义,s3-tests nuke_bucket 依赖);key_marker
+        // 分页与 max-keys 截断一致。
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        for (k, sz) in [("a", 1u64), ("b", 2), ("c", 3)] {
+            put_legacy(&s, "b1", k, 100, sz);
+        }
+        let page = s
+            .list_versions_page("b1", "", None, None, None, 100)
+            .unwrap();
+        assert_eq!(page.entries.len(), 3);
+        assert!(page
+            .entries
+            .iter()
+            .all(|e| e.vk == VK_NULL && e.is_latest && !e.meta.is_delete_marker));
+        let p1 = s.list_versions_page("b1", "", None, None, None, 2).unwrap();
+        assert!(p1.truncated && p1.entries.len() == 2);
+        let (lk, lvk) = p1.last_scanned.clone().unwrap();
+        assert_eq!((lk.as_str(), lvk), ("b", Some(VK_NULL)));
+        let p2 = s
+            .list_versions_page("b1", "", None, Some("b"), lvk.as_ref(), 100)
+            .unwrap();
+        assert!(!p2.truncated);
+        assert_eq!(p2.entries.len(), 1);
+        assert_eq!(p2.entries[0].key, "c");
     }
 }

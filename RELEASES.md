@@ -1,4 +1,50 @@
 # FastS3 发布记录
+## v1.1.0 — M10 版本控制 + 4 补全项(季度 minor 轨道)(2026-08-23)
+
+> 发布状态:与 M10 交付同步;git tag/发布流水线属执行期步骤(与 v1.0.x 同口径,
+> 尚未正式打 tag)。决策记录:ADR-11(docs/DESIGN.md §3.3,含实施期补遗
+> D1a/D7/D8/D9/D10);设计与门禁依据:DESIGN-FUTURE §3、S3-GAP §7 建议 1。
+
+### 变更(TODO M10 全项:V1~V7 + S1~S7)
+
+- **版本控制**:PutBucketVersioning/GetBucketVersioning 真实配置(Enabled→Off
+  拒绝;MfaDelete=Enabled 显式拒绝);版本化键空间 o: 键加 vk16 后缀(未版本化桶
+  零改动);删除标记 + ?versionId 寻址(404/405 + x-amz-delete-marker);
+  ListObjectVersions 全语义(分页/delimiter/encoding-type);CopyObject 源版本;
+  Complete = 新版本;跨状态转换解析 D1a(mtime 裁决 + 写侧保序)。
+- **条件写**:PUT If-Match/If-None-Match: */×LastModifiedTime/×Size(写锁内判定);
+  DELETE/DeleteObjects 条件版本删除;条件 GET 304 补 ETag/Last-Modified(V4-4)。
+- **补全项**:对象标签(头 + 对象/桶级 API + copy directive);CORS(配置 CRUD +
+  预检/实际请求注入);桶策略(Principal + 最小 Condition 键,桶 × 密钥求交);
+  POST 表单(policy 文档 + SigV4/SigV2 表单签名);ownership controls 最小集。
+- **演进底座**:ObjectMeta v3 / BucketMeta v2(双读单写,预留 v1.2/v1.3 字段);
+  rewrite-values 在线值格式重写(节流/暂停/幂等,完成前禁回滚);meta-export/import
+  v2(版本条目,v1 双读);桶级配置键前缀族(D9)。
+- **管理面**:控制台版本浏览/恢复/永久删除、标签编辑、版本化开关、CORS/策略编辑器、
+  历史版本清理;web/server M10 端点族;审计检索覆盖新操作。
+- **过程缺陷修复**:fs3-alloc dec_live 竞态、压缩 extent 打包溢出、D1a 同秒误判、
+  DeleteObjects RFC7231 日期解析。已知跟进:S8 压缩 × 流式读竞态(v1.1.x)。
+
+### 验证(门禁,实测记录见 TODO.md M10 段)
+
+- `cargo test --workspace` 全绿(388+ 用例)、clippy -D warnings、fmt;
+  覆盖率 81.82% 行(llvm-cov;≥80% 达标);cargo audit 0 漏洞。
+- s3-tests 全量 gate:**356 passed / 94 skipped / 388 excluded / 0 unexpected
+  (两轮一致)**;version/条件写/tagging/cors/policy/post/ifmodifiedsince 族出集;
+  残余排除含 6 项 RGW/目录桶口径裁决(README 逐名明示)。
+- 崩溃 500 轮版本化混载(kills=188)零撕裂/零泄漏/账目零漂移;
+  升级演练 v1.0.1→v1.1 六步全过(含禁回滚负向断言与快照回滚);
+  meta-export/import 版本条目往返一致。
+- perf(perf-M10.md):Off 吞吐回退 PUT +0.4%/GET -4.2%(<5%);F-1 单连接
+  p50 信号根因修复(Off 快速路径),复测收敛本底;版本化 p99 PUT +0.8%/GET +6.5%;
+  扩展性 1 key×1000 版本 p50 81ms、100 万 key×2 版本深页无退化。
+- 客户端矩阵:aws cli/boto3/mc/rclone 版本化往返全过;restic/duplicati 实跑通过;
+  **Hadoop S3A 环境无 java 未跑,如实标注为执行期缺口**。
+- **企业硬门槛覆盖率(使用约定 7,S3-GAP §5 Top20 已同步)**:A 档达标 7/10
+  (v1.1 清零 #4 版本控制/#5 条件写/#9 桶策略;余 #3 Object Lock → v1.3、
+  #7 checksum / #10 SSE → v1.2);B 档 #17 CORS 清零(余 Lifecycle/通知/STS 等
+  按路线);C 档维持文档化定位。
+
 ## v1.0.1 — M9 协议卫生补丁(月度 patch 轨道)(2026-08-22)
 
 > 发布状态:本条目与 M9 交付同步(v1.0.0 GA 候选口径不变,见上条执行期

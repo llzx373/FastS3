@@ -15,6 +15,12 @@
 //! > 导出文件含种子盐(密钥密文派生密钥)与密钥哈希,属敏感文件:落盘 0600,
 //! > 应随卷快照一起加密保管。
 //!
+//! 格式版本:v1 = v1.0.x(无版本化字段);v2 = M10 V5-1 起(版本条目逐版本
+//! 导出 —— `ObjectDto.version_id` 三态 None/"null"/hex 承载键形态、
+//! `is_delete_marker`、v3 尾部字段透传;`BucketDto` 增 versioning 等
+//! BucketMeta v2 字段)。导入双读:v1 JSON 经 serde 默认值兼容导入。
+//! 演进纪律(DESIGN-FUTURE §2.2):新键/值格式字段必须同步本 DTO。
+//!
 //! # meta-import
 //!
 //! 恢复到**同一布局**(extent_size/extent_count/layout_version 必须与导出一致)
@@ -32,7 +38,10 @@ use fs3_meta::{AllocDraft, MetaConfig, MetaStore, PartMeta, StatsDelta};
 use serde::{Deserialize, Serialize};
 
 pub const META_EXPORT_FORMAT: &str = "fasts3-meta-export";
-pub const META_EXPORT_VERSION: u32 = 1;
+/// 当前导出格式版本:v2 = M10 V5-1(版本条目/null 槽/桶版本化字段)。
+pub const META_EXPORT_VERSION: u32 = 2;
+/// 可导入的最低格式版本(v1 = v1.0.x 导出,无版本化字段,serde 默认双读)。
+pub const META_EXPORT_VERSION_MIN: u32 = 1;
 
 // ───────────────────────────── DTO(可移植 JSON) ─────────────────────────────
 
@@ -81,10 +90,70 @@ pub struct ObjectDto {
     /// 存量导出 JSON 无此字段 → 按空表导入)。
     #[serde(default)]
     pub resp_headers: Vec<(String, String)>,
+    /// 版本条目身份(M10 V5-1;ADR-11 D1/D1a-4,与协议层一致的展示口径;
+    /// v1 导出 JSON 无此字段 → None = 未版本化单键):
+    /// - `None`:未版本化单键(`o:{b}\0{key}`;Off 桶对象,对外无 VersionId);
+    /// - `Some("null")`:null 槽(VK_NULL 版本键;Suspended 桶条目,协议层
+    ///   渲染 VersionId = "null");
+    /// - `Some(<32 hex>)`:真实版本(Enabled;VersionId = hex(vk))。
+    ///
+    /// 键形态权威来源于此字段(恢复时决定写单键/版本键),非 ObjectMeta
+    /// 内嵌 version_id(后者为引擎写入期的派生展示态,导入时按引擎不变量
+    /// 由键形态重建:真实 vk → Some(vk),null 族/单键 → None)。
+    #[serde(default)]
+    pub version_id: Option<String>,
+    /// 删除标记(ADR-11 D3;v1 导出无此字段 → false)。
+    #[serde(default)]
+    pub is_delete_marker: bool,
+    /// 对象标签(ADR-11 D8;M10 S1 填充;v1 导出无此字段 → 空表)。
+    #[serde(default)]
+    pub tags: Vec<(String, String)>,
+    /// v1.2 填充(ADR-11 D0 一次性预留;启用时经演进纪律同步本 DTO)。
+    #[serde(default)]
+    pub sse: Option<fs3_core::SseInfo>,
+    /// v1.2 填充(同上)。
+    #[serde(default)]
+    pub checksum: Option<fs3_core::ChecksumInfo>,
+    /// v1.3 填充(同上)。
+    #[serde(default)]
+    pub retention: Option<fs3_core::Retention>,
+    /// v1.3 填充(同上)。
+    #[serde(default)]
+    pub legal_hold: bool,
+}
+
+/// 键形态 vk → 导出 DTO 的版本串(None = 单键;"null" = null 槽;hex = 真实 vk)。
+fn version_id_export(vk: Option<&[u8; 16]>) -> Option<String> {
+    match vk {
+        None => None,
+        Some(vk) if *vk == fs3_meta::keys::VK_NULL => Some("null".to_string()),
+        Some(vk) => Some(hex::encode(vk)),
+    }
+}
+
+/// 导出 DTO 版本串 → 键形态 vk(None = 单键;Some(VK_NULL) = null 槽)。
+fn version_id_parse(s: Option<&str>) -> fs3_core::Result<Option<[u8; 16]>> {
+    match s {
+        None => Ok(None),
+        Some("null") => Ok(Some(fs3_meta::keys::VK_NULL)),
+        Some(hexs) => {
+            let bytes = hex::decode(hexs)
+                .map_err(|e| fs3_core::Error::InvalidArgument(format!("version_id hex: {e}")))?;
+            let vk: [u8; 16] = bytes.try_into().map_err(|_| {
+                fs3_core::Error::InvalidArgument(format!("version_id not 16 bytes: {hexs}"))
+            })?;
+            if vk == fs3_meta::keys::VK_NULL {
+                // VK_NULL 的 hex 形态与 "null" 串同义,归一到键形态即可
+                return Ok(Some(fs3_meta::keys::VK_NULL));
+            }
+            Ok(Some(vk))
+        }
+    }
 }
 
 impl ObjectDto {
-    fn from_meta(m: &ObjectMeta) -> Self {
+    /// `vk` = 快照键形态(导出逐版本条目,含删除标记;V5-1 起不丢 vk)。
+    fn from_meta(m: &ObjectMeta, vk: Option<&[u8; 16]>) -> Self {
         ObjectDto {
             size: m.size,
             etag_hex: m.etag_hex(),
@@ -98,10 +167,19 @@ impl ObjectDto {
                 .as_ref()
                 .map(|d| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, d)),
             parts: m.parts.clone(),
+            version_id: version_id_export(vk),
+            is_delete_marker: m.is_delete_marker,
+            tags: m.tags.clone(),
+            sse: m.sse.clone(),
+            checksum: m.checksum.clone(),
+            retention: m.retention.clone(),
+            legal_hold: m.legal_hold,
         }
     }
 
-    fn to_meta(&self) -> fs3_core::Result<ObjectMeta> {
+    /// 还原为 (键形态 vk, ObjectMeta);meta.version_id 按引擎不变量从
+    /// 键形态重建(真实 vk → Some(vk);null 族/单键 → None)。
+    fn to_meta(&self) -> fs3_core::Result<(Option<[u8; 16]>, ObjectMeta)> {
         // etag_hex → [u8;16];base64 → 字节
         let etag = hex_to_etag(&self.etag_hex)?;
         let inline = match &self.inline_b64 {
@@ -111,17 +189,29 @@ impl ObjectDto {
             ),
             None => None,
         };
-        Ok(ObjectMeta {
-            size: self.size,
-            etag,
-            mtime: self.mtime,
-            extents: self.extents.iter().map(SegmentDto::to_segment).collect(),
-            content_type: self.content_type.clone(),
-            user_meta: self.user_meta.clone(),
-            resp_headers: self.resp_headers.clone(),
-            inline,
-            parts: self.parts.clone(),
-        })
+        let vk = version_id_parse(self.version_id.as_deref())?;
+        Ok((
+            vk,
+            ObjectMeta {
+                size: self.size,
+                etag,
+                mtime: self.mtime,
+                extents: self.extents.iter().map(SegmentDto::to_segment).collect(),
+                content_type: self.content_type.clone(),
+                user_meta: self.user_meta.clone(),
+                resp_headers: self.resp_headers.clone(),
+                inline,
+                parts: self.parts.clone(),
+                // M10 V5-1:键形态权威;version_id 为派生展示态(引擎不变量)
+                version_id: vk.filter(|v| *v != fs3_meta::keys::VK_NULL),
+                is_delete_marker: self.is_delete_marker,
+                tags: self.tags.clone(),
+                sse: self.sse.clone(),
+                checksum: self.checksum.clone(),
+                retention: self.retention.clone(),
+                legal_hold: self.legal_hold,
+            },
+        ))
     }
 }
 
@@ -179,6 +269,10 @@ pub struct UploadDto {
     /// 回显头(M9/C3;v1.0.0 存量导出 JSON 无此字段 → 按空表导入)。
     #[serde(default)]
     pub resp_headers: Vec<(String, String)>,
+    /// 对象标签(M10 S1;Create 时 x-amz-tagging 随会话携带;旧导出无此
+    /// 字段 → 按空表导入)。
+    #[serde(default)]
+    pub tags: Vec<(String, String)>,
     pub created: i64,
     pub completed: bool,
     pub final_etag_hex: String,
@@ -200,6 +294,7 @@ impl UploadDto {
             content_type: s.content_type.clone(),
             user_meta: s.user_meta.clone(),
             resp_headers: s.resp_headers.clone(),
+            tags: s.tags.clone(),
             created: s.created,
             completed: s.completed,
             final_etag_hex: s.final_etag.iter().map(|b| format!("{b:02x}")).collect(),
@@ -235,6 +330,29 @@ pub struct BucketDto {
     /// M9/C5:创建时是否带 ACL 头(重建语义;旧导出无此字段 → false)。
     #[serde(default)]
     pub created_with_acl: bool,
+    /// 版本化状态(M10 V5-1;ADR-11 D1;v1 导出无此字段 → Off)。
+    #[serde(default)]
+    pub versioning: fs3_core::VersioningState,
+    /// v1.2 填充:桶默认加密(ADR-11 D0;v1 导出无此字段 → None)。
+    #[serde(default)]
+    pub default_encryption: Option<fs3_core::SseAlgorithm>,
+    /// v1.3 填充:Object Lock 启用位(ADR-11 D0;v1 导出无此字段 → false)。
+    #[serde(default)]
+    pub object_lock: bool,
+    /// D9 桶级配置文档(M10 S1 桶标签 `bt:`;规范化 XML;旧导出无此字段
+    /// → None = 无配置)。ADR-11 D9 三处联动之一(另两处:fs3-meta keys.rs
+    /// 前缀表 + 删桶事务清理;check 可达性扫描只读 o:/p: 段引用键,天然安全)。
+    #[serde(default)]
+    pub tagging: Option<String>,
+    /// D9 桶级配置文档(M10 S2 CORS `bc:`;同上)。
+    #[serde(default)]
+    pub cors: Option<String>,
+    /// D9 桶级配置文档(M10 S7 OwnershipControls `bo:`;同上)。
+    #[serde(default)]
+    pub ownership_controls: Option<String>,
+    /// D9 桶级配置文档(M10 S3 桶策略 `bp:`;原始 JSON 文本;同上)。
+    #[serde(default)]
+    pub policy: Option<String>,
 }
 
 /// 导出文件顶层结构。
@@ -306,27 +424,46 @@ pub fn run_meta_export(
     let buckets: Vec<BucketDto> = store
         .list_buckets()?
         .into_iter()
-        .map(|(name, m)| BucketDto {
-            name: name.clone(),
-            created: m.created,
-            owner: m.owner,
-            objects: m.stats.objects,
-            bytes: m.stats.bytes,
-            quota: m.quota,
-            location: Some(store.bucket_location(&name).unwrap_or_default()),
-            created_with_acl: m.created_with_acl,
+        .map(|(name, m)| {
+            // D9 桶级配置文档(S1/S2/S7;无配置 → None,DTO 缺省)
+            let conf = |c: fs3_meta::BucketConf| {
+                store
+                    .bucket_conf(&name, c)
+                    .ok()
+                    .flatten()
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+            };
+            BucketDto {
+                name: name.clone(),
+                created: m.created,
+                owner: m.owner,
+                objects: m.stats.objects,
+                bytes: m.stats.bytes,
+                quota: m.quota,
+                location: Some(store.bucket_location(&name).unwrap_or_default()),
+                created_with_acl: m.created_with_acl,
+                versioning: m.versioning,
+                default_encryption: m.default_encryption,
+                object_lock: m.object_lock,
+                tagging: conf(fs3_meta::BucketConf::Tagging),
+                cors: conf(fs3_meta::BucketConf::Cors),
+                ownership_controls: conf(fs3_meta::BucketConf::Ownership),
+                policy: conf(fs3_meta::BucketConf::Policy),
+            }
         })
         .collect();
 
     let keys = store.list_keys()?;
 
+    // M10 V5-1:版本化桶逐版本条目导出(含删除标记与 null 槽),vk 不丢 ——
+    // 键形态经 ObjectDto.version_id 承载(None/"null"/hex 三态)。
     let objects: Vec<ObjectEntryDto> = store
         .snapshot_all_objects()?
         .into_iter()
-        .map(|(bucket, key, m)| ObjectEntryDto {
+        .map(|(bucket, key, vk, m)| ObjectEntryDto {
             bucket,
             key,
-            meta: ObjectDto::from_meta(&m),
+            meta: ObjectDto::from_meta(&m, vk.as_ref()),
         })
         .collect();
 
@@ -399,10 +536,16 @@ pub fn run_meta_import(
             args.input.display()
         ))
     })?;
-    if file.format != META_EXPORT_FORMAT || file.format_version != META_EXPORT_VERSION {
+    if file.format != META_EXPORT_FORMAT
+        || !(META_EXPORT_VERSION_MIN..=META_EXPORT_VERSION).contains(&file.format_version)
+    {
         return Err(fs3_core::Error::InvalidArgument(format!(
-            "unsupported export format {} v{} (expect {} v{})",
-            file.format, file.format_version, META_EXPORT_FORMAT, META_EXPORT_VERSION
+            "unsupported export format {} v{} (expect {} v{}..=v{})",
+            file.format,
+            file.format_version,
+            META_EXPORT_FORMAT,
+            META_EXPORT_VERSION_MIN,
+            META_EXPORT_VERSION
         )));
     }
 
@@ -456,12 +599,28 @@ pub fn run_meta_import(
             },
             quota: b.quota,
             created_with_acl: b.created_with_acl,
+            // M10 V5-1:BucketMeta v2 字段原样恢复(v1 导出经 serde 默认
+            // 双读为 Off/None/false)
+            versioning: b.versioning,
+            default_encryption: b.default_encryption,
+            object_lock: b.object_lock,
         };
         store.commit_bucket_put_with_location(
             &b.name,
             &meta,
             &b.location.clone().unwrap_or_default(),
         )?;
+        // D9 桶级配置文档恢复(M10 S1/S2/S3/S7;独立事务,键随桶登记)
+        for (conf, doc) in [
+            (fs3_meta::BucketConf::Tagging, &b.tagging),
+            (fs3_meta::BucketConf::Cors, &b.cors),
+            (fs3_meta::BucketConf::Ownership, &b.ownership_controls),
+            (fs3_meta::BucketConf::Policy, &b.policy),
+        ] {
+            if let Some(doc) = doc {
+                store.commit_bucket_conf_put(&b.name, conf, doc.as_bytes())?;
+            }
+        }
     }
 
     // 5) 访问密钥(secret_hash/salt/密文原样;种子盐已恢复,可解密)
@@ -471,7 +630,12 @@ pub fn run_meta_import(
 
     // 6) 对象:段校验(布局边界/对齐)+ 分配草稿 + 零统计增量
     //    (桶统计已含最终值,避免二次记账)
+    //    M10 V5-1:版本条目按原 vk 落版本键(VersionId 稳定);删除标记
+    //    原样恢复;按键形态分发 commit 路径(单键/版本键 × 数据/标记)。
     let mut objects_restored = 0usize;
+    // D5 口径重算(导入自检):全部非删除标记版本计入 objects/bytes
+    let mut stats_recalc: std::collections::HashMap<&str, (u64, u64)> =
+        std::collections::HashMap::new();
     for o in &file.objects {
         if store.get_bucket(&o.bucket)?.is_none() {
             return Err(fs3_core::Error::InvalidArgument(format!(
@@ -479,7 +643,7 @@ pub fn run_meta_import(
                 o.bucket, o.key, o.bucket
             )));
         }
-        let meta = o.meta.to_meta()?;
+        let (vk, meta) = o.meta.to_meta()?;
         if meta.size > MAX_OBJECT_SIZE {
             return Err(fs3_core::Error::InvalidArgument(format!(
                 "object {}/{} size {} exceeds max {}",
@@ -488,8 +652,48 @@ pub fn run_meta_import(
         }
         validate_segments(&meta.extents, &layout)?;
         let draft = draft_for_segments(&meta.extents);
-        store.commit_object_put(&o.bucket, &o.key, &meta, draft, StatsDelta::default())?;
+        let zero = StatsDelta::default();
+        if meta.is_delete_marker {
+            // 删除标记:经 ObjectDeleteCurrent 落键(事务臂校验 D3 契约:
+            // size=0、extents/inline 空);vk = None 为遗留单键原地覆盖形态
+            store.commit_object_delete_current(
+                &o.bucket,
+                &o.key,
+                vk.as_ref(),
+                &meta,
+                draft,
+                zero,
+            )?;
+        } else {
+            match vk {
+                Some(vk) => {
+                    store.commit_object_put_version(&o.bucket, &o.key, &vk, &meta, draft, zero)?
+                }
+                None => store.commit_object_put(&o.bucket, &o.key, &meta, draft, zero)?,
+            };
+        }
+        if !meta.is_delete_marker {
+            let e = stats_recalc.entry(o.bucket.as_str()).or_default();
+            e.0 += 1;
+            e.1 += meta.size;
+        }
         objects_restored += 1;
+    }
+    // D5 统计口径重算校验:导出文件的桶统计必须与条目重算一致(防截断/
+    // 篡改的半成品导出静默落库)
+    for b in &file.buckets {
+        let (objects, bytes) = stats_recalc
+            .get(b.name.as_str())
+            .copied()
+            .unwrap_or_default();
+        if objects != b.objects || bytes != b.bytes {
+            return Err(fs3_core::Error::InvalidArgument(format!(
+                "bucket {} stats mismatch: export says objects={} bytes={}, \
+                 recalculated from entries (ADR-11 D5) objects={} bytes={} \
+                 (export file truncated or tampered?)",
+                b.name, b.objects, b.bytes, objects, bytes
+            )));
+        }
     }
 
     // 7) multipart 会话与分片(段同样校验)
@@ -512,6 +716,7 @@ pub fn run_meta_import(
             final_etag: hex_to_etag(&u.final_etag_hex)?,
             final_size: u.final_size,
             final_mtime: u.final_mtime,
+            tags: u.tags.clone(),
         };
         store.create_multipart(&u.upload_id, &session)?;
         for p in &u.parts {
@@ -588,7 +793,10 @@ fn hex_to_etag(hex: &str) -> fs3_core::Result<[u8; 16]> {
         .map_err(|_| fs3_core::Error::InvalidArgument(format!("etag not 16 bytes: {hex}")))
 }
 
-/// 段合法性校验:编号在布局范围内、4KiB 对齐、段长 ≥ 4KiB 且不越界。
+/// 段合法性校验:编号在布局范围内、起点 4KiB 对齐、物理占用不越界。
+/// 段长 = 实际数据字节(ADR-9 §5.1:可非 4KiB 倍数,物理占用按 4KiB
+/// 对齐上取整,对齐间隙为死区)——按「4KiB 倍数且 ≥4KiB」校验会误拒
+/// 真实导出(M10 V5-1 往返测试发现的历史校验偏差)。
 fn validate_segments(segs: &[Segment], layout: &LayoutInfoDto) -> fs3_core::Result<()> {
     for s in segs {
         if s.extent_id as u64 >= layout.extent_count {
@@ -597,13 +805,15 @@ fn validate_segments(segs: &[Segment], layout: &LayoutInfoDto) -> fs3_core::Resu
                 s.extent_id, layout.extent_count
             )));
         }
-        if s.offset % 4096 != 0 || s.len % 4096 != 0 || s.len < 4096 {
+        if s.offset % 4096 != 0 || s.len == 0 {
             return Err(fs3_core::Error::InvalidArgument(format!(
-                "segment ({},{},{}) not 4KiB aligned",
+                "segment ({},{},{}) offset not 4KiB aligned or empty",
                 s.extent_id, s.offset, s.len
             )));
         }
-        if s.offset as u64 + s.len as u64 > layout.extent_size {
+        // 物理区终点 = offset + align_up(len)(对齐死区计入占用)
+        let phys_end = s.offset as u64 + fs3_core::align_up(s.len as u64, 4096);
+        if phys_end > layout.extent_size {
             return Err(fs3_core::Error::InvalidArgument(format!(
                 "segment ({},{},{}) exceeds extent_size {}",
                 s.extent_id, s.offset, s.len, layout.extent_size
@@ -694,4 +904,485 @@ fn write_private(path: &Path, bytes: &[u8]) -> fs3_core::Result<()> {
     std::io::Write::write_all(&mut f, bytes)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(())
+}
+
+// ───────────────────────────── 测试 ─────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fs3_core::VersioningState;
+    use fs3_meta::keys::VK_NULL;
+    use std::io::Cursor;
+
+    /// 同布局临时设备对(导出源 / 导入目标)。
+    fn tmp_devices() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let img1 = dir.path().join("d1.img");
+        let img2 = dir.path().join("d2.img");
+        for p in [&img1, &img2] {
+            std::fs::File::create(p)
+                .unwrap()
+                .set_len(64 * 1024 * 1024)
+                .unwrap();
+            fs3_device::init_device(p, 4 * 1024 * 1024, 0, false).unwrap();
+        }
+        (dir, img1, img2)
+    }
+
+    fn engine_cfg(device: &Path, meta_dir: &Path) -> fs3_engine::EngineConfig {
+        fs3_engine::EngineConfig {
+            device: device.to_path_buf(),
+            meta_dir: meta_dir.to_path_buf(),
+            ..Default::default()
+        }
+    }
+
+    /// 确定性伪随机数据(种子区分内容)。
+    fn rnd(len: usize, seed: u8) -> Vec<u8> {
+        (0..len as u32)
+            .map(|i| (i as u8).wrapping_mul(seed).wrapping_add(seed) % 251)
+            .collect()
+    }
+
+    fn read_version(e: &fs3_engine::Engine, bucket: &str, key: &str, vk: &[u8; 16]) -> Vec<u8> {
+        let mut out = Vec::new();
+        e.get_to_version(bucket, key, Some(vk), 0..u64::MAX, &mut out)
+            .unwrap();
+        out
+    }
+
+    /// 桶全部条目快照:(key, vk 展示串, is_delete_marker, size, etag_hex)
+    /// 按 (key, vk) 排序 —— 导出/导入两侧逐条比对的口径。
+    fn entry_dump(
+        e: &fs3_engine::Engine,
+        bucket: &str,
+    ) -> Vec<(String, String, bool, u64, String)> {
+        let mut rows: Vec<_> = e
+            .meta()
+            .list_object_entries(bucket)
+            .unwrap()
+            .into_iter()
+            .map(|(key, vk, m)| {
+                (
+                    key,
+                    version_id_export(vk.as_ref()).unwrap_or_else(|| "<none>".into()),
+                    m.is_delete_marker,
+                    m.size,
+                    m.etag_hex(),
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// M10 V5-1 往返:版本化桶(Enabled 多版本 + 删除标记 + Suspended
+    /// null 槽 + Off 时代遗留单键)export → 同布局新设备 import →
+    /// 逐版本内容/标记/统计一致。
+    #[test]
+    fn versioned_export_import_roundtrip() {
+        let (dir, img1, img2) = tmp_devices();
+        let meta1 = dir.path().join("meta1");
+        let meta2 = dir.path().join("meta2");
+
+        // —— 构造夹具(引擎写路径,真实 vk/段/内联全覆盖)——
+        // (桶, 键, vk, 内容):Some(vk) 逐版本寻址读;None = 未版本化单键
+        type Expect = Vec<(&'static str, &'static str, Option<[u8; 16]>, Vec<u8>)>;
+        let mut expect: Expect = Vec::new();
+        let (vb_stats, nb_stats, vb_dump, nb_dump);
+        {
+            let mut e = fs3_engine::Engine::open(&engine_cfg(&img1, &meta1)).unwrap();
+            e.ensure_bucket("vb").unwrap();
+            e.ensure_bucket("nb").unwrap();
+
+            // nb:未版本化回归(Off 路径零改动)
+            let nd = rnd(80_000, 1);
+            e.put("nb", "plain", &mut Cursor::new(nd.clone())).unwrap();
+            expect.push(("nb", "plain", None, nd));
+
+            // vb:Off 时代遗留单键 → Enabled 两个真实版本
+            let d0 = rnd(1_000, 2);
+            e.put("vb", "k1", &mut Cursor::new(d0.clone())).unwrap();
+            e.meta()
+                .commit_bucket_set_versioning("vb", VersioningState::Enabled)
+                .unwrap();
+            let d1 = rnd(100_000, 3); // 段形态(> 内联阈值)
+            let v1 = e
+                .put("vb", "k1", &mut Cursor::new(d1.clone()))
+                .unwrap()
+                .version_id
+                .unwrap();
+            let d2 = rnd(900, 4); // 内联形态
+            let v2 = e
+                .put("vb", "k1", &mut Cursor::new(d2.clone()))
+                .unwrap()
+                .version_id
+                .unwrap();
+            expect.push(("vb", "k1", Some(VK_NULL), d0)); // 遗留单键 = null 族寻址
+            expect.push(("vb", "k1", Some(v1), d1));
+            expect.push(("vb", "k1", Some(v2), d2));
+
+            // k2:数据版本 + 删除标记(当前)
+            let dk = rnd(60_000, 5);
+            let vk2d = e
+                .put("vb", "k2", &mut Cursor::new(dk.clone()))
+                .unwrap()
+                .version_id
+                .unwrap();
+            assert!(e.delete("vb", "k2").unwrap().unwrap().is_delete_marker);
+            expect.push(("vb", "k2", Some(vk2d), dk));
+
+            // Suspended:null 槽数据(k3)与 null 槽删除标记(k4)
+            e.meta()
+                .commit_bucket_set_versioning("vb", VersioningState::Suspended)
+                .unwrap();
+            let d3 = rnd(70_000, 6);
+            let m3 = e.put("vb", "k3", &mut Cursor::new(d3.clone())).unwrap();
+            assert_eq!(m3.version_id, None, "Suspended 写入落 null 槽");
+            expect.push(("vb", "k3", Some(VK_NULL), d3));
+            assert!(e.delete("vb", "k4").unwrap().unwrap().is_delete_marker);
+
+            vb_stats = e.meta().get_bucket("vb").unwrap().unwrap().stats;
+            nb_stats = e.meta().get_bucket("nb").unwrap().unwrap().stats;
+            assert_eq!(vb_stats.objects, 5, "D5:非删除标记版本计数(3×k1+k2+k3)");
+            vb_dump = entry_dump(&e, "vb");
+            nb_dump = entry_dump(&e, "nb");
+            e.close().unwrap();
+        }
+
+        // —— 导出 ——
+        let export = dir.path().join("export.json");
+        run_meta_export(
+            &img1,
+            &meta1,
+            &MetaExportArgs {
+                output: export.clone(),
+            },
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&export).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["format_version"], 2);
+        let objs = json["objects"].as_array().unwrap();
+        assert_eq!(objs.len(), 8, "7 个 vb 条目 + 1 个 nb 条目");
+        let nulls = objs
+            .iter()
+            .filter(|o| o["meta"]["version_id"] == "null")
+            .count();
+        assert_eq!(nulls, 2, "k3/k4 null 槽条目");
+        let markers = objs
+            .iter()
+            .filter(|o| o["meta"]["is_delete_marker"] == true)
+            .count();
+        assert_eq!(markers, 2, "k2 真实 vk 标记 + k4 null 槽标记");
+        let hexes = objs
+            .iter()
+            .filter(|o| {
+                o["meta"]["version_id"]
+                    .as_str()
+                    .map(|s| s.len() == 32 && s != "null")
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(hexes, 4, "k1 v1/v2 + k2 数据/标记各一个真实 vk");
+        // 桶按 name 序(nb < vb):nb = Off;vb = Suspended
+        assert_eq!(json["buckets"][0]["versioning"], "Off");
+        let vb_bucket = json["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["name"] == "vb")
+            .unwrap();
+        assert_eq!(vb_bucket["versioning"], "Suspended");
+
+        // —— 导入(同布局新设备;先恢复底层卷数据快照 = 设备文件整拷)——
+        std::fs::copy(&img1, &img2).unwrap();
+        run_meta_import(
+            &img2,
+            &meta2,
+            &MetaImportArgs {
+                input: export.clone(),
+                force: false,
+            },
+        )
+        .unwrap();
+
+        // —— 逐版本校验 ——
+        let e2 = fs3_engine::Engine::open(&engine_cfg(&img2, &meta2)).unwrap();
+        assert_eq!(
+            e2.meta().get_bucket("vb").unwrap().unwrap().versioning,
+            VersioningState::Suspended,
+            "桶版本化状态恢复"
+        );
+        assert_eq!(e2.meta().get_bucket("vb").unwrap().unwrap().stats, vb_stats);
+        assert_eq!(e2.meta().get_bucket("nb").unwrap().unwrap().stats, nb_stats);
+        assert_eq!(entry_dump(&e2, "vb"), vb_dump, "条目级(vk/标记/etag)一致");
+        assert_eq!(entry_dump(&e2, "nb"), nb_dump);
+        // 逐版本内容(VersionId 稳定 = vk 原样恢复)
+        for (b, k, vk, data) in &expect {
+            match vk {
+                Some(vk) => assert_eq!(&read_version(&e2, b, k, vk), data, "{b}/{k} {vk:?}"),
+                // nb/plain:未版本化单键 → 当前版本读
+                None => {
+                    let mut out = Vec::new();
+                    e2.get_to(b, k, 0..u64::MAX, &mut out).unwrap();
+                    assert_eq!(&out, data, "{b}/{k} 单键");
+                }
+            }
+        }
+        // 删除标记原样:k2 当前版本 = 标记(列表隐藏),k4 null 槽标记
+        let (_, k2_cur) = e2.meta().get_current_version("vb", "k2").unwrap().unwrap();
+        assert!(k2_cur.is_delete_marker);
+        let (_, k4_cur) = e2.meta().get_current_version("vb", "k4").unwrap().unwrap();
+        assert!(k4_cur.is_delete_marker && k4_cur.version_id.is_none());
+        // 一致性:零泄漏(版本条目段可达性)
+        let report = e2.check_report().unwrap();
+        assert!(report.leaks.is_empty(), "leaks: {:?}", report.leaks);
+        e2.abort();
+    }
+
+    /// v1 导出 JSON(无版本化字段)双读导入;过高版本拒绝。
+    #[test]
+    fn v1_export_json_compat_import() {
+        let (dir, img1, img2) = tmp_devices();
+        let meta1 = dir.path().join("meta1");
+        let meta2 = dir.path().join("meta2");
+        let data = rnd(50_000, 9);
+        {
+            let mut e = fs3_engine::Engine::open(&engine_cfg(&img1, &meta1)).unwrap();
+            e.ensure_bucket("b1").unwrap();
+            e.put("b1", "o", &mut Cursor::new(data.clone())).unwrap();
+            e.close().unwrap();
+        }
+        let export = dir.path().join("export.json");
+        run_meta_export(
+            &img1,
+            &meta1,
+            &MetaExportArgs {
+                output: export.clone(),
+            },
+        )
+        .unwrap();
+
+        // 构造 v1 形态:剥离 v2 新增字段,format_version 降 1
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&export).unwrap()).unwrap();
+        json["format_version"] = serde_json::json!(1);
+        for b in json["buckets"].as_array_mut().unwrap() {
+            for f in [
+                "versioning",
+                "default_encryption",
+                "object_lock",
+                // M10 S1/S2/S7:D9 桶级配置文档(serde default 双读)
+                "tagging",
+                "cors",
+                "ownership_controls",
+                // M10 S3:桶策略 `bp:`(同 D9 双读)
+                "policy",
+            ] {
+                b.as_object_mut().unwrap().remove(f);
+            }
+        }
+        for o in json["objects"].as_array_mut().unwrap() {
+            let m = o["meta"].as_object_mut().unwrap();
+            for f in [
+                "version_id",
+                "is_delete_marker",
+                "tags",
+                "sse",
+                "checksum",
+                "retention",
+                "legal_hold",
+            ] {
+                m.remove(f);
+            }
+        }
+        let v1 = dir.path().join("export-v1.json");
+        std::fs::write(&v1, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        // 底层卷快照(设备文件整拷)后导入
+        std::fs::copy(&img1, &img2).unwrap();
+        run_meta_import(
+            &img2,
+            &meta2,
+            &MetaImportArgs {
+                input: v1,
+                force: false,
+            },
+        )
+        .unwrap();
+        let e2 = fs3_engine::Engine::open(&engine_cfg(&img2, &meta2)).unwrap();
+        assert_eq!(
+            e2.meta().get_bucket("b1").unwrap().unwrap().versioning,
+            VersioningState::Off
+        );
+        let mut out = Vec::new();
+        e2.get_to("b1", "o", 0..u64::MAX, &mut out).unwrap();
+        assert_eq!(out, data);
+        e2.abort();
+
+        // 未来版本拒绝
+        json["format_version"] = serde_json::json!(99);
+        let v99 = dir.path().join("export-v99.json");
+        std::fs::write(&v99, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        let meta3 = dir.path().join("meta3");
+        let err = run_meta_import(
+            &img2,
+            &meta3,
+            &MetaImportArgs {
+                input: v99,
+                force: false,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported export format"),
+            "err: {err}"
+        );
+    }
+
+    /// M10 S1/S2/S3/S7:D9 桶级配置文档(bt:/bc:/bo:/bp:)导出/导入往返。
+    #[test]
+    fn bucket_conf_export_import_roundtrip() {
+        let (dir, img1, img2) = tmp_devices();
+        let meta1 = dir.path().join("meta1");
+        let meta2 = dir.path().join("meta2");
+        {
+            let mut e = fs3_engine::Engine::open(&engine_cfg(&img1, &meta1)).unwrap();
+            e.ensure_bucket("b1").unwrap();
+            let m = e.meta();
+            m.commit_bucket_conf_put(
+                "b1",
+                fs3_meta::BucketConf::Tagging,
+                b"<Tagging><TagSet/></Tagging>",
+            )
+            .unwrap();
+            m.commit_bucket_conf_put("b1", fs3_meta::BucketConf::Cors, b"<CORSConfiguration/>")
+                .unwrap();
+            m.commit_bucket_conf_put(
+                "b1",
+                fs3_meta::BucketConf::Ownership,
+                b"<OwnershipControls/>",
+            )
+            .unwrap();
+            m.commit_bucket_conf_put(
+                "b1",
+                fs3_meta::BucketConf::Policy,
+                br#"{"Version":"2012-10-17","Statement":[]}"#,
+            )
+            .unwrap();
+            e.close().unwrap();
+        }
+        let export = dir.path().join("export.json");
+        run_meta_export(
+            &img1,
+            &meta1,
+            &MetaExportArgs {
+                output: export.clone(),
+            },
+        )
+        .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&export).unwrap()).unwrap();
+        let b = &json["buckets"][0];
+        assert_eq!(b["tagging"], "<Tagging><TagSet/></Tagging>");
+        assert_eq!(b["cors"], "<CORSConfiguration/>");
+        assert_eq!(b["ownership_controls"], "<OwnershipControls/>");
+        assert_eq!(b["policy"], r#"{"Version":"2012-10-17","Statement":[]}"#);
+
+        std::fs::copy(&img1, &img2).unwrap();
+        run_meta_import(
+            &img2,
+            &meta2,
+            &MetaImportArgs {
+                input: export,
+                force: false,
+            },
+        )
+        .unwrap();
+        let e2 = fs3_engine::Engine::open(&engine_cfg(&img2, &meta2)).unwrap();
+        for (conf, expect) in [
+            (
+                fs3_meta::BucketConf::Tagging,
+                &b"<Tagging><TagSet/></Tagging>"[..],
+            ),
+            (fs3_meta::BucketConf::Cors, b"<CORSConfiguration/>"),
+            (fs3_meta::BucketConf::Ownership, b"<OwnershipControls/>"),
+            (
+                fs3_meta::BucketConf::Policy,
+                br#"{"Version":"2012-10-17","Statement":[]}"#,
+            ),
+        ] {
+            assert_eq!(
+                e2.meta().bucket_conf("b1", conf).unwrap().as_deref(),
+                Some(expect),
+                "{conf:?} 导入后丢失"
+            );
+        }
+        e2.abort();
+    }
+
+    /// D5 统计重算校验:桶统计与条目重算不一致(截断/篡改)→ 拒绝导入。
+    #[test]
+    fn import_rejects_tampered_bucket_stats() {
+        let (dir, img1, img2) = tmp_devices();
+        let meta1 = dir.path().join("meta1");
+        {
+            let mut e = fs3_engine::Engine::open(&engine_cfg(&img1, &meta1)).unwrap();
+            e.ensure_bucket("b1").unwrap();
+            e.put("b1", "o", &mut Cursor::new(rnd(10_000, 11))).unwrap();
+            e.close().unwrap();
+        }
+        let export = dir.path().join("export.json");
+        run_meta_export(
+            &img1,
+            &meta1,
+            &MetaExportArgs {
+                output: export.clone(),
+            },
+        )
+        .unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&export).unwrap()).unwrap();
+        json["buckets"][0]["objects"] = serde_json::json!(42);
+        let bad = dir.path().join("export-tampered.json");
+        std::fs::write(&bad, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        let err = run_meta_import(
+            &img2,
+            &dir.path().join("meta2"),
+            &MetaImportArgs {
+                input: bad,
+                force: false,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("stats mismatch"),
+            "expected D5 stats mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn version_id_display_parse_roundtrip() {
+        // 三态:None = 单键;"null" = null 槽;hex = 真实 vk(协议层口径)
+        assert_eq!(version_id_export(None), None);
+        assert_eq!(version_id_export(Some(&VK_NULL)).as_deref(), Some("null"));
+        let vk = [0xABu8; 16];
+        assert_eq!(
+            version_id_export(Some(&vk)).as_deref(),
+            Some(hex::encode(vk).as_str())
+        );
+        assert_eq!(version_id_parse(None).unwrap(), None);
+        assert_eq!(version_id_parse(Some("null")).unwrap(), Some(VK_NULL));
+        assert_eq!(version_id_parse(Some(&hex::encode(vk))).unwrap(), Some(vk));
+        // VK_NULL 的 hex 形态归一为 null 槽
+        assert_eq!(
+            version_id_parse(Some(&hex::encode(VK_NULL))).unwrap(),
+            Some(VK_NULL)
+        );
+        // 畸形拒绝
+        assert!(version_id_parse(Some("zz")).is_err());
+        assert!(version_id_parse(Some("abcd")).is_err());
+    }
 }

@@ -305,6 +305,97 @@ B+ 树实现在超大对象数(风险 R5)下的扩展性未经验证。本 ADR �
 - **决策:保留 md5x4 原语(供未来批处理/校验路径),热路径按结论 2 用 etag=fast;
   防止把「多缓冲」误用为单对象 ETag 加速(物理不可行)写进文档**。
 
+#### ADR-11(M10 立项决策):版本化键空间、ObjectMeta v3 与 v1.1 决策清单
+
+**背景**:M10「版本控制 + 4 补全项」(TODO M10)立项。本 ADR 按推荐方案落盘
+DESIGN-FUTURE §11 决策清单的 D0~D7,并裁决两项实施期发现的设计空档
+(D8/D9)。详细论证见 [DESIGN-FUTURE.md](./DESIGN-FUTURE.md) §3.3/§3.4。
+
+**D0(值格式总纲)**:ObjectMeta 升 v3,**一次性预留** v1.2/v1.3 字段
+(version_id/is_delete_marker/sse/checksum/retention/legal_hold/tags);
+BucketMeta 升 v2(versioning + 桶级配置占位)。v2/v3 **双读**、写入恒 v3
+(沿用 M9 resp_headers「新格式优先、旧格式回退」模式);后续里程碑只填充
+不再改结构。在线值格式重写(v2→v3 后台逐键)走升级工具,重写完成前禁回滚。
+
+**D1(版本化键空间)**:方案 A——版本化桶对象版本键 =
+`o:{bucket}\0{esc(key)}\0{vk16}`;**未版本化桶保持 `o:{bucket}\0{esc(key)}`
+单键零改动**。当前版本 = 前缀下最大 vk 且非删除标记;esc 转义保证键内无
+孤立 0x00,后缀分隔符唯一可辨。null 版本槽(Suspended)= vk 0xFF×16
+(恒为键序最大,原地覆盖)。双键形态分支集中于 keys.rs 单入口。
+
+**D2(VersionId 生成)**:vk = be64(微秒)‖be64(随机)16 字节,对外
+VersionId = hex(vk);字典序 = 时间序(分页正确),随机分量防枚举;
+时钟回拨时取 `max(now, 本 key 最大 vk 时间戳 + 1)` 防乱序。
+
+**D3(删除标记)**:ObjectMeta v3 `is_delete_marker` 布尔位;删除标记条目
+size=0、extents/inline 为空,与普通版本同键同值结构,扫描/解码零分叉。
+
+**D4(当前版本索引)**:不建 `c:` 索引;读路径前缀反向扫描(版本数通常
+1~3,平均 1~2 步)。`c:` 索引列为 v1.x 性能后手,仅当实测 ListObjects 在
+大量删除标记负载下劣化才引入(进 perf 门禁观测)。
+
+**D5(统计/配额口径)**:bytes/objects = 全部**非删除标记**版本;删除标记
+不计入;配额 = 桶内全部版本字节之和(与 AWS 计费一致),超限 403 不变。
+入账路径由 3 条扩为 5 条(put/complete/copy/delete-version/delete-marker),
+仍与版本事务同事务。
+
+**D6(条件写并入 v1.1)**:PUT 支持 If-Match(ETag/\*)/If-None-Match: \*/
+If-Match×LastModifiedTime/×Size;未版本化桶同样支持(基于当前版本
+ETag/mtime/size);版本化桶匹配当前版本;冲突 → 412 PreconditionFailed。
+DELETE/DeleteObjects 条件版本删除同批交付。与 GET 读侧条件(412 先于 304)
+语义互不干扰。
+
+**D7(MFA Delete)**:不实现;PutBucketVersioning 携带 MfaDelete 参数 →
+InvalidArgument 显式拒绝(不静默失效,红线);列入 v2.x 评估。
+(V3 实施期澄清:`MfaDelete=Disabled` 是 AWS 默认 no-op,SDK/s3-tests
+setup 例行携带,**接受**;仅 `MfaDelete=Enabled` 拒绝。Suspended 桶
+PUT/Complete/Copy 响应按 AWS 回 `x-amz-version-id: null`。)
+
+**D8(新增裁决:tags 存储)**:DESIGN-FUTURE §3.4.1 仅预留 `tags_hash`
+占位,但对象标签(S1)与版本化同里程碑交付——裁决:ObjectMeta v3 直接落
+`tags: Vec<(String,String)>` 真实字段(替代纯 hash 占位),随用随填,
+不额外迁移;桶级标签(BucketTagging)落 D9 的桶级配置键。
+
+**D9(新增裁决:桶级配置键前缀)**:桶级策略(?policy)与 CORS(?cors)
+配置文档(可达 20KB)不并入 BucketMeta 值(避免桶记录膨胀),沿用 M8
+`l:` location 键先例:新增独立键前缀(`bp:`/`bc:`),同步三处——
+keys.rs 前缀表、meta-export/import DTO、check 可达性扫描(演进纪律,
+DESIGN-FUTURE §2.2)。(S1/S2/S7 实施期落定的具体映射:`bc:` = CORS,
+`bt:` = 桶级标签(D8),`bo:` = OwnershipControls(S7);统一经 fs3-meta
+`BucketConf` 枚举存取,删桶事务臂清理,导出 DTO 挂 BucketDto;check
+可达性扫描只读 `o:`/`p:` 段引用键,对配置键天然安全。)
+
+**预研物接管**:M10 执行前工作区已存在 4 件未跟踪预研物——
+`crates/fs3d/src/rewrite.rs`(V5-3 值格式重写骨架,签名按假想 API 编写,
+须随 V1 落地重写)、`tests/backup/upgrade-values-drill.sh`(V6-5 演练
+脚本)、`tests/crash/run_crash_version.sh`(V6-2 崩溃 harness)、
+`web/server/src/m10.test.ts`(管理面契约测试,先行红)。经评审与本 ADR
+结论一致,予以接管;rewrite.rs 的节流/暂停/幂等骨架保留,API 签名重写。
+
+**D1a(V2 实施期补遗:跨状态转换的「当前版本」解析)**:V2 实施发现
+「null 槽 VK_NULL 恒为键序最大」在**跨状态转换**下遮蔽新真实版本——
+Off→Enabled 后遗留未版本化单键与新版本键共存、Suspended→Enabled 后
+null 槽恒压过新 vk,键序无法表达 AWS 的 null 版本语义(AWS 中 null 版本
+是历史版本,当前版本 = 最新写入)。裁决(不做批量迁移——桶级状态转换是
+单事务配置变更,不可携带无界数据迁移):
+
+1. Suspended 桶写入:若存在 Off 时代遗留的未版本化单键则**原地覆盖该单键**
+   (其对外 VersionId 恒为 `"null"`,与 AWS 一致),否则写 null 槽;
+   遗留单键与 null 槽因此不会共存;
+2. 当前版本解析 = 候选集{遗留/null 条目, 最大真实 vk 条目}中 **mtime 最大**
+   者,mtime 相等取真实版本(重启用后的写必然后于挂起期写);
+3. ListObjectVersions 按条目 mtime 降序输出(null 条目按 mtime 插入真实
+   版本序列,不按键位);
+4. 遗留单键与 null 槽对外 VersionId 均为 `"null"`,`?versionId=null`
+   寻址命中二者之一;
+5. vk 防回拨比较(取本 key 最大 vk 时间戳)不纳入 null 槽/遗留单键。
+
+**D10(V2 实施期补遗:压缩对版本条目的限制)**:惰性压缩发现扫描
+(`fs3-engine/src/compaction.rs`)显式跳过版本条目与删除标记——
+`Op::ObjectMigrate` 只写未版本化键,版本条目的段迁移
+(ObjectMigrateVersion)留 v1.x 跟进;当前行为 = 安全地不回收(绝不误写),
+版本化桶的打包空间回收率暂不享受压缩收益,作为已知限制文档化。
+
 #### ADR-14(M9 实现确认):multipart 复合 ETag 修复与多段 Range 契约
 
 **背景**:M9「协议卫生与正确性补丁」(TODO M9 B1/B4)修复两项「已支持功能与

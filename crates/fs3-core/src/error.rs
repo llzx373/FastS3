@@ -61,6 +61,17 @@ pub enum Error {
     /// 桶配额超限(E4;S3 层映射 QuotaExceeded)。
     #[error("bucket quota exceeded: {0}")]
     QuotaExceeded(String),
+
+    /// 版本化读取命中删除标记(ADR-11 §3.4.3;载荷 = 删除标记的 VersionId
+    /// 展示字符串:hex(vk),null 槽 = "null")。无 versionId 请求 → 协议层
+    /// 渲染 404 NoSuchKey + x-amz-delete-marker;带 versionId → 405。
+    #[error("current version is a delete marker: {0}")]
+    DeleteMarker(String),
+
+    /// 条件写冲突(ADR-11 D6:If-Match/If-None-Match/时间/大小前置不满足;
+    /// 引擎写锁内对当前版本元数据判定;S3 层映射 412 PreconditionFailed)。
+    #[error("precondition failed: {0}")]
+    PreconditionFailed(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -120,7 +120,8 @@ where
         let web_root = web_root.clone();
         let cors = cors_allow_origins.clone();
         async move {
-            // REVIEW §2.4 受控 CORS:
+            // REVIEW §2.4 受控 CORS(静态列表;M10 S2 起与桶级 CORS 规则
+            // 并集放行:静态命中先行应答/注头,未命中落 handle 内桶级评估):
             // 1) 浏览器预检 OPTIONS(带 Origin)→ 直接应答允许头(无副作用);
             // 2) 实际跨源请求(带 Origin)→ 附加 CORS 响应头;
             //    其余请求不受影响(未配置允许源时完全不干预)。
@@ -209,6 +210,67 @@ fn cors_attach_headers(headers: &mut hyper::HeaderMap, origin: &str) {
     }
 }
 
+// ── M10 S2 桶级 CORS(D9 bc: 键;与上面静态列表并集放行) ──
+
+/// 桶级规则命中的预检 200 应答(Allow-* 取自命中规则;Max-Age 仅规则
+/// 声明时携带;Allow-Headers 仅规则声明时携带)。
+fn cors_rule_preflight_response(allow: &fs3_s3::xml::CorsAllow) -> Response<RespBody> {
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header("access-control-allow-origin", &allow.allow_origin)
+        .header("vary", "Origin")
+        .header(
+            "access-control-allow-methods",
+            allow.allow_methods.join(","),
+        )
+        .header("content-length", "0");
+    if !allow.allow_headers.is_empty() {
+        builder = builder.header(
+            "access-control-allow-headers",
+            allow.allow_headers.join(","),
+        );
+    }
+    if let Some(max_age) = allow.max_age_seconds {
+        builder = builder.header("access-control-max-age", max_age.to_string());
+    }
+    builder.body(empty_body()).unwrap()
+}
+
+/// 实际请求(非预检)CORS 注头:Origin 命中桶级规则时在响应(含错误响应,
+/// s3-tests cors 族 403/404 也带弹头)注入 Allow-Origin/Allow-Methods/
+/// Expose-Headers。注:AWS 实际请求不回 Allow-Methods,此处从 RGW/
+/// s3-tests 口径(浏览器对多余头无害;族过集以此为据)。
+fn cors_attach_actual(
+    service: &S3Service,
+    host: &str,
+    path: &str,
+    method: &str,
+    acrm: Option<&str>,
+    origin: Option<&str>,
+    headers: &mut hyper::HeaderMap,
+) {
+    let Some(origin) = origin else { return };
+    // RGW/s3-tests 口径:实际请求携带 ACRM 时以其替代请求方法做规则匹配
+    let effective_method = acrm.unwrap_or(method);
+    let Some(allow) = service.cors_eval(host, path, origin, effective_method, None) else {
+        return;
+    };
+    if let Ok(v) = allow.allow_origin.parse() {
+        headers.insert("access-control-allow-origin", v);
+    }
+    if !allow.allow_methods.is_empty() {
+        if let Ok(v) = allow.allow_methods.join(",").parse() {
+            headers.insert("access-control-allow-methods", v);
+        }
+    }
+    if !allow.expose_headers.is_empty() {
+        if let Ok(v) = allow.expose_headers.join(",").parse() {
+            headers.insert("access-control-expose-headers", v);
+        }
+    }
+    headers.insert("vary", "Origin".parse().unwrap());
+}
+
 fn empty_body() -> RespBody {
     Full::new(Bytes::new())
         .map_err(|e| std::io::Error::other(e.to_string()))
@@ -268,6 +330,11 @@ fn error_response(e: &S3Error, host_id: &str, request_id: &str) -> Response<Resp
         if let Some((_, v)) = e.extra.iter().find(|(k, _)| k == "ActualObjectSize") {
             builder = builder.header("x-amz-actual-object-size", v);
         }
+    }
+    // ADR-11 §3.4.3:错误附带头(删除标记路径的 x-amz-delete-marker /
+    // x-amz-version-id 等,服务层 with_resp_header 注入)
+    for (k, v) in &e.resp_headers {
+        builder = builder.header(k.as_str(), v.as_str());
     }
     // AWS 节流语义(准入/限速):503 恒带 Retry-After
     if status == StatusCode::SERVICE_UNAVAILABLE {
@@ -386,15 +453,6 @@ async fn handle(
     if raw_path == "/health" || raw_path == "/ready" {
         return Ok(probe_response(service.as_ref(), raw_path.as_str(), &method));
     }
-    // M9/D2 配套(s3-tests raw-get 预签名族断言):未配置 CORS 时 OPTIONS
-    // 显式 400(浏览器预检无 CORS 配置 = 跨源不可用;RGW 同语义)。
-    // serve_common 的预检分支只在配置了允许源且 Origin 命中时先行应答,
-    // 到不了这里。
-    if method == "OPTIONS" {
-        let err = S3Error::new(fs3_s3::S3ErrorCode::InvalidRequest)
-            .with_message("CORS is not enabled for this bucket.");
-        return Ok(error_response(&err, &host_id, &request_id));
-    }
     // h1:Host 头;h2::authority 由 hyper 合成进 uri(uri().authority())。
     // 路由用去端口 host;h2 缺 Host 头时按原始 authority 合成签名用 host。
     let host_raw = req
@@ -417,6 +475,54 @@ async fn handle(
         _ => vec![],
     };
     let decoded_path = percent_decode(&raw_path);
+
+    // M10 S2:OPTIONS 处理(须在 S3 路由之前;免认证,AWS 预检语义)——
+    // - 预检(带 Origin + Access-Control-Request-Method):匹配桶级 CORS
+    //   规则(D9 `bc:` 键)→ 200 + Allow-*;无配置/无命中 → 403(AWS);
+    // - 非预检 OPTIONS(缺 Origin/ACRM)→ 400(M9/D2 现状口径,
+    //   s3-tests raw-get 预签名族与 cors 族依赖);
+    // serve_common 的静态允许源(server.cors_allow_origins,M9 管理面受控
+    // CORS)命中时先行应答,到不了这里——两者并集放行。
+    if method == "OPTIONS" {
+        let hdr = |name: &str| {
+            req.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        if let (Some(origin), Some(acrm)) = (hdr("origin"), hdr("access-control-request-method")) {
+            let acrh = hdr("access-control-request-headers");
+            return Ok(
+                match service.cors_eval(&host, &decoded_path, &origin, &acrm, acrh.as_deref()) {
+                    Some(allow) => cors_rule_preflight_response(&allow),
+                    None => {
+                        let err = S3Error::new(fs3_s3::S3ErrorCode::AccessDenied)
+                        .with_message("CORS preflight failed: no CORS configuration or no matching rule for this origin/method.");
+                        error_response(&err, &host_id, &request_id)
+                    }
+                },
+            );
+        }
+        let err = S3Error::new(fs3_s3::S3ErrorCode::InvalidRequest)
+            .with_message("CORS is not enabled for this bucket.");
+        return Ok(error_response(&err, &host_id, &request_id));
+    }
+
+    // M10 S2:实际请求(非预检)CORS 注头用 Origin(请求体消费前捕获;
+    // 命中桶级规则时在各 S3 返回点注入,含错误响应——s3-tests cors 族
+    // 403/404 带弹头断言)。ACRM 一并捕获:RGW/s3-tests 口径下实际请求
+    // 携带 Access-Control-Request-Method 时以其替代请求方法做规则匹配
+    // (test_cors_origin_response:PUT + ACRM=GET → 按 GET 命中注头)。
+    let origin = req
+        .headers()
+        .get("origin")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let acrm = req
+        .headers()
+        .get("access-control-request-method")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
 
     // M7 / I5 内嵌控制台(web_root):无认证头的 GET/HEAD,且首段不是既有桶
     // (S3 路径风格)时按静态资源托管(SPA 回退 index.html;目录穿越拒绝)。
@@ -550,14 +656,24 @@ async fn handle(
                     Err(S3Error::new(fs3_s3::S3ErrorCode::InternalError)
                         .with_message(e.to_string()))
                 });
-        return Ok(render_with(
-            service,
+        let mut resp = render_with(
+            service.clone(),
             result,
             &host_id,
             &request_id,
             Some(admission.clone()),
             zc_ctx.map(|c| (c, is_h2)),
-        ));
+        );
+        cors_attach_actual(
+            &service,
+            &host,
+            &decoded_path,
+            &method,
+            acrm.as_deref(),
+            origin.as_deref(),
+            resp.headers_mut(),
+        );
+        return Ok(resp);
     }
 
     // 缓冲路径
@@ -572,14 +688,24 @@ async fn handle(
     let mut s3req = s3req;
     s3req.body = body_bytes;
     let result = service.handle(&s3req);
-    Ok(render_with(
-        service,
+    let mut resp = render_with(
+        service.clone(),
         result,
         &host_id,
         &request_id,
         Some(admission),
         zc_ctx.map(|c| (c, is_h2)),
-    ))
+    );
+    cors_attach_actual(
+        &service,
+        &host,
+        &decoded_path,
+        &method,
+        acrm.as_deref(),
+        origin.as_deref(),
+        resp.headers_mut(),
+    );
+    Ok(resp)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -612,11 +738,13 @@ fn render_with(
         ResponseBody::ObjectStream {
             bucket,
             key,
+            version,
             offset,
             length,
             zc_segments,
             zc_fd,
             zc_verify,
+            versioning,
         } => {
             // 零拷贝候选(h1 + 设备支持 + 对象 extent 段 + 未开 verify_reads)
             let zc_body = zc.and_then(|(ctx, is_h2)| {
@@ -677,9 +805,16 @@ fn render_with(
                 let mut pos = 0u64;
                 let mut buf = vec![0u8; 4 * 1024 * 1024];
                 loop {
-                    let n = match svc
-                        .read_stream_chunk(&bucket, &key, offset, length, &mut pos, &mut buf)
-                    {
+                    let n = match svc.read_stream_chunk(
+                        &bucket,
+                        &key,
+                        version.as_ref(),
+                        versioning,
+                        offset,
+                        length,
+                        &mut pos,
+                        &mut buf,
+                    ) {
                         Ok(n) => n,
                         Err(e) => {
                             let _ = tx
@@ -714,10 +849,12 @@ fn render_with(
         ResponseBody::MultiRange {
             bucket,
             key,
+            version,
             ranges,
             total,
             boundary,
             part_content_type,
+            versioning,
         } => {
             let total_len: u64 = ranges
                 .iter()
@@ -752,8 +889,16 @@ fn render_with(
                     let len = e - s + 1;
                     let mut pos = 0u64;
                     loop {
-                        let n = match svc.read_stream_chunk(&bucket, &key, *s, len, &mut pos, &mut buf)
-                        {
+                        let n = match svc.read_stream_chunk(
+                            &bucket,
+                            &key,
+                            version.as_ref(),
+                            versioning,
+                            *s,
+                            len,
+                            &mut pos,
+                            &mut buf,
+                        ) {
                             Ok(n) => n,
                             Err(err) => {
                                 let _ = tx

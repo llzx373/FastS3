@@ -56,11 +56,15 @@ impl AllocRecord {
     }
 }
 
-/// 对象元数据(键 `o:{bucket}\0{key}`,值 = [版本字节 u8] + postcard(ObjectMeta))。
+/// 对象元数据(键 `o:{bucket}\0{key}`;版本化桶 `o:{bucket}\0{key}\0{vk16}`,
+/// 值 = [版本字节 u8] + postcard(ObjectMeta))。
 ///
 /// > v2 演进说明(ADR-9):`extents` 由 `ExtentRef`(整 extent 引用)改为
 /// > `Vec<Segment>`(4KiB 对齐变长段 + 段内 CRC 网格);值格式加版本字节。
 /// > 放弃旧布局前置兼容:旧值(无版本字节)直接拒绝解码。
+/// > v3 演进说明(ADR-11 D0):尾部一次性预留版本化与 v1.2/v1.3 字段
+/// > (version_id/is_delete_marker/tags/sse/checksum/retention/legal_hold),
+/// > 后续里程碑只填充不重排版;写入恒 v3,读取 v2/v3 双读。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectMeta {
     pub size: u64,
@@ -80,11 +84,76 @@ pub struct ObjectMeta {
     /// 序列化尾部追加字段(M9 双读:decode_value 新格式优先、v1.0.0 格式
     /// 回退,存量对象按空表读取;写入恒为新格式)。
     pub resp_headers: Vec<(String, String)>,
+    /// 版本 ID(ADR-11 D1:Enabled 版本 = Some(vk16);null 槽(Suspended)
+    /// 与未版本化对象 = None)。
+    pub version_id: Option<[u8; 16]>,
+    /// 删除标记(ADR-11 D3:size=0、extents/inline 为空,与普通版本同键
+    /// 同值结构,扫描/解码零分叉)。
+    pub is_delete_marker: bool,
+    /// 对象标签(ADR-11 D8:直接落真实字段,随用随填,不额外迁移)。
+    pub tags: Vec<(String, String)>,
+    /// v1.2 填充(ADR-11 D0):服务端加密信息(SSE-C/SSE-S3,§4)。
+    pub sse: Option<SseInfo>,
+    /// v1.2 填充(ADR-11 D0):checksum 家族(§4.4,明文语义)。
+    pub checksum: Option<ChecksumInfo>,
+    /// v1.3 填充(ADR-11 D0):Object Lock 保留(§5.2,按版本存)。
+    pub retention: Option<Retention>,
+    /// v1.3 填充(ADR-11 D0):法定保留(§5.2,与 retention 取更严格者)。
+    pub legal_hold: bool,
 }
 
-/// 对象元数据值格式版本(ADR-9 §13:`[version: u8 = 2] + postcard(ObjectMeta)`;
-/// 旧值无版本字节,放弃前置兼容后直接拒绝)。
-pub const OBJECT_META_VERSION: u8 = 2;
+/// 对象元数据值格式版本(ADR-11 D0:`[version: u8 = 3] + postcard(ObjectMeta)`;
+/// v2/v3 双读、写入恒 v3;无版本字节的旧值放弃前置兼容,直接拒绝)。
+pub const OBJECT_META_VERSION: u8 = 3;
+
+/// v2 值格式版本(ADR-9 §13;M10 起为双读回退格式,见 decode_value)。
+const OBJECT_META_VERSION_V2: u8 = 2;
+
+/// 服务端加密信息(v1.2 填充,ADR-11 D0;§4.3 DS1 两级密钥 KEK/DEK)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SseInfo {
+    /// KEK 代 id(轮换用;KEK 明文永不下发)。
+    pub kek_id: u32,
+    /// DEK 密文(AES-256-GCM 包裹:nonce || ct)。
+    pub wrapped_dek: Vec<u8>,
+    /// 每对象随机 nonce 基址(chunk nonce 派生,§4.2 DE1)。
+    pub nonce_base: [u8; 12],
+}
+
+/// checksum 算法(v1.2 填充,ADR-11 D0;§4.4 四族。
+/// 变体序 = postcard 编码序,只允许尾部追加)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChecksumAlgorithm {
+    Crc32c,
+    Crc32,
+    Sha1,
+    Sha256,
+    Crc64Nvme,
+}
+
+/// 对象校验和(v1.2 填充,ADR-11 D0;multipart 为复合值,§4.4)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChecksumInfo {
+    pub algorithm: ChecksumAlgorithm,
+    /// 校验和原始字节(未 base64;长度由算法定)。
+    pub value: Vec<u8>,
+}
+
+/// Object Lock 保留模式(v1.3 填充,ADR-11 D0;§5.1。
+/// 变体序 = postcard 编码序,只允许尾部追加)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RetentionMode {
+    Governance,
+    Compliance,
+}
+
+/// 对象保留(v1.3 填充,ADR-11 D0;§5.2:按版本存,覆盖写不继承)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Retention {
+    pub mode: RetentionMode,
+    /// 保留截止(unix 秒;到期判定走可信时钟,§5.3)。
+    pub retain_until: i64,
+}
 
 /// ETag 计算模式(M5「CPU 优化」etag=fast 降级开关;DESIGN §6.7)。
 ///
@@ -138,30 +207,67 @@ impl ObjectMeta {
 
     /// 解码值格式;版本字节缺失/不符 → Corrupt(旧布局无前置兼容)。
     ///
-    /// M9/C3 双读:值格式版本字节仍为 2,但序列化尾部追加了 `resp_headers`
-    /// 字段。postcard 是严格定长格式,无 `#[serde(default)]` 缺省语义——
-    /// 旧值(无该字段)用新结构解码必然报 "unexpected end";因此按
-    /// **新格式优先、旧格式回退**双读:新格式解码失败时回退 v1.0.0 值
-    /// 格式(旧结构,resp_headers = 空)并成功返回。新旧值在磁盘上共存
-    /// (新写入恒为新格式;存量对象保持可读)。回退仅发生在字段截断,
-    /// 其它损坏两种格式都解码失败 → Corrupt。
+    /// M10/ADR-11 D0 双读:版本字节 3 = 现格式;2 = v2 格式(沿用 M9/C3
+    /// 「新格式优先、旧格式回退」链:v1.1.0 含 resp_headers 的 v2 结构优先,
+    /// 失败回退 v1.0.0 无 resp_headers 结构,v3 尾部字段补默认
+    /// None/false/空)。新旧值在磁盘上共存(新写入恒为 v3;存量对象保持
+    /// 可读)。回退仅发生在字段截断,其它损坏各格式都解码失败 → Corrupt。
     pub fn decode_value(buf: &[u8]) -> Result<Self> {
         let Some(&ver) = buf.first() else {
             return Err(Error::Corrupt("object meta value too short".into()));
         };
-        if ver != OBJECT_META_VERSION {
-            return Err(Error::Corrupt(format!(
+        match ver {
+            OBJECT_META_VERSION => postcard::from_bytes(&buf[1..])
+                .map_err(|e| Error::Corrupt(format!("postcard decode object meta: {e}"))),
+            OBJECT_META_VERSION_V2 => match postcard::from_bytes::<ObjectMetaV2>(&buf[1..]) {
+                Ok(m) => Ok(m.into()),
+                Err(_) => {
+                    // 双读回退:v1.0.0 值格式(无 resp_headers 尾部字段)
+                    let legacy: LegacyObjectMeta = postcard::from_bytes(&buf[1..])
+                        .map_err(|e| Error::Corrupt(format!("postcard decode object meta: {e}")))?;
+                    Ok(legacy.into())
+                }
+            },
+            _ => Err(Error::Corrupt(format!(
                 "object meta version {ver} unsupported (expected {OBJECT_META_VERSION})"
-            )));
+            ))),
         }
-        match postcard::from_bytes(&buf[1..]) {
-            Ok(m) => Ok(m),
-            Err(_) => {
-                // 双读回退:v1.0.0 值格式(无 resp_headers 尾部字段)
-                let legacy: LegacyObjectMeta = postcard::from_bytes(&buf[1..])
-                    .map_err(|e| Error::Corrupt(format!("postcard decode object meta: {e}")))?;
-                Ok(legacy.into())
-            }
+    }
+}
+
+/// v2 值格式(v1.1.0;含 resp_headers,无 v3 尾部字段;M10 双读回退用)。
+#[derive(Serialize, Deserialize)]
+struct ObjectMetaV2 {
+    size: u64,
+    etag: [u8; 16],
+    mtime: i64,
+    extents: Vec<Segment>,
+    content_type: String,
+    user_meta: Vec<(String, String)>,
+    inline: Option<Vec<u8>>,
+    parts: Vec<u64>,
+    resp_headers: Vec<(String, String)>,
+}
+
+impl From<ObjectMetaV2> for ObjectMeta {
+    fn from(l: ObjectMetaV2) -> Self {
+        ObjectMeta {
+            size: l.size,
+            etag: l.etag,
+            mtime: l.mtime,
+            extents: l.extents,
+            content_type: l.content_type,
+            user_meta: l.user_meta,
+            inline: l.inline,
+            parts: l.parts,
+            resp_headers: l.resp_headers,
+            version_id: None,
+            is_delete_marker: false,
+            tags: Vec::new(),
+            sse: None,
+            checksum: None,
+            retention: None,
+            legal_hold: false,
         }
     }
 }
@@ -191,11 +297,19 @@ impl From<LegacyObjectMeta> for ObjectMeta {
             inline: l.inline,
             parts: l.parts,
             resp_headers: Vec::new(),
+            version_id: None,
+            is_delete_marker: false,
+            tags: Vec::new(),
+            sse: None,
+            checksum: None,
+            retention: None,
+            legal_hold: false,
         }
     }
 }
 
-/// 桶元数据(键 `b:{bucket}`)。
+/// 桶元数据(键 `b:{bucket}`;M10/ADR-11 起值 = [版本字节 u8] + postcard,
+/// 存量无版本字节值双读回退,见 decode_value)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BucketMeta {
     pub created: i64,
@@ -208,6 +322,99 @@ pub struct BucketMeta {
     /// (s3-tests recreate_overwrite_acl);未带 ACL → 幂等 200 no-op。
     /// 序列化尾部追加字段,decode_bucket 双读兼容 v1.0.0 存量桶值。
     pub created_with_acl: bool,
+    /// 版本化状态(ADR-11 D1;Off → Enabled/Suspended 合法,
+    /// Enabled → Off 禁止,AWS 语义)。
+    pub versioning: VersioningState,
+    /// v1.2 填充(ADR-11 D0):桶默认加密(§4.3 DS3;None = 不加密)。
+    pub default_encryption: Option<SseAlgorithm>,
+    /// v1.3 填充(ADR-11 D0):Object Lock 启用位(§5.1;启用后不可关闭,
+    /// 开启自动连带版本化)。
+    pub object_lock: bool,
+}
+
+/// 桶元数据值格式版本(ADR-11:`[version: u8 = 2] + postcard(BucketMeta)`;
+/// 存量 v1.x 值无版本字节,decode_value 双读回退)。
+pub const BUCKET_META_VERSION: u8 = 2;
+
+/// 版本化状态(ADR-11 D1。变体序 = postcard 编码序,只允许尾部追加)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum VersioningState {
+    #[default]
+    Off,
+    Enabled,
+    Suspended,
+}
+
+/// 桶默认加密算法(v1.2 填充,ADR-11 D0;§4.3 DS3:仅 SSE-S3 AES256,
+/// KMS 参数显式拒绝。变体序 = postcard 编码序,只允许尾部追加)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SseAlgorithm {
+    Aes256,
+}
+
+impl BucketMeta {
+    /// 编码为值格式:`[version: u8] + postcard(Self)`(M10 起写入恒 v2)。
+    pub fn encode_value(&self) -> Result<Vec<u8>> {
+        let mut v = Vec::with_capacity(64);
+        v.push(BUCKET_META_VERSION);
+        postcard::to_allocvec(self)
+            .map_err(|e| Error::Meta(format!("postcard encode bucket meta: {e}")))
+            .map(|mut p| {
+                v.append(&mut p);
+                v
+            })
+    }
+
+    /// 解码桶值(M10/ADR-11 双读):首字节 == BUCKET_META_VERSION 且新格式
+    /// 解码成功 → v2;否则按存量格式回退(v1.1.0 五字段优先、v1.0.0 四字段
+    /// 次之,均无版本字节),存量桶零迁移读取。
+    ///
+    /// 首字节消歧论证:存量值首字段 `created` 为 unix 秒,postcard 按 zigzag
+    /// varint 编码;现实时间戳(≥ 1.7e9 秒)zigzag 后逾 34 亿,首字节必带
+    /// 续位(≥ 0x80),仅 created ≤ 63(1970-01-01)才可能编码出单字节
+    /// 0x02 —— 实际不存在,故 0x02 首字节可安全判为新格式。
+    pub fn decode_value(buf: &[u8]) -> Result<Self> {
+        if buf.first() == Some(&BUCKET_META_VERSION) {
+            if let Ok(m) = postcard::from_bytes::<BucketMeta>(&buf[1..]) {
+                return Ok(m);
+            }
+            // 新格式解码失败:上述 1970 年理论歧义或损坏,继续按存量格式
+            // 尝试,均失败 → Corrupt。
+        }
+        match postcard::from_bytes::<BucketMetaV1>(buf) {
+            Ok(l) => Ok(l.into()),
+            Err(_) => {
+                let l: LegacyBucketMeta = postcard::from_bytes(buf)
+                    .map_err(|e| Error::Corrupt(format!("postcard decode bucket meta: {e}")))?;
+                Ok(l.into())
+            }
+        }
+    }
+}
+
+/// v1.1.0 桶值格式(五字段含 `created_with_acl`,无版本字节;M10 双读回退用)。
+#[derive(Serialize, Deserialize)]
+struct BucketMetaV1 {
+    created: i64,
+    owner: String,
+    stats: BucketStats,
+    quota: Option<u64>,
+    created_with_acl: bool,
+}
+
+impl From<BucketMetaV1> for BucketMeta {
+    fn from(l: BucketMetaV1) -> Self {
+        BucketMeta {
+            created: l.created,
+            owner: l.owner,
+            stats: l.stats,
+            quota: l.quota,
+            created_with_acl: l.created_with_acl,
+            versioning: VersioningState::Off,
+            default_encryption: None,
+            object_lock: false,
+        }
+    }
 }
 
 /// v1.0.0 桶值格式(无 `created_with_acl` 尾部字段;M9 双读回退用)。
@@ -227,6 +434,9 @@ impl From<LegacyBucketMeta> for BucketMeta {
             stats: l.stats,
             quota: l.quota,
             created_with_acl: false,
+            versioning: VersioningState::Off,
+            default_encryption: None,
+            object_lock: false,
         }
     }
 }
@@ -858,18 +1068,82 @@ mod tests {
             inline: None,
             parts: vec![],
             resp_headers: vec![],
+            version_id: Some([7u8; 16]),
+            is_delete_marker: false,
+            tags: vec![("t".into(), "1".into())],
+            sse: Some(SseInfo {
+                kek_id: 1,
+                wrapped_dek: vec![1, 2, 3],
+                nonce_base: [9u8; 12],
+            }),
+            checksum: Some(ChecksumInfo {
+                algorithm: ChecksumAlgorithm::Crc32c,
+                value: vec![0xde, 0xad],
+            }),
+            retention: Some(Retention {
+                mode: RetentionMode::Compliance,
+                retain_until: 1_800_000_000,
+            }),
+            legal_hold: true,
         };
         let v = m.encode_value().unwrap();
         assert_eq!(v[0], OBJECT_META_VERSION);
+        assert_eq!(v[0], 3, "M10 起写入恒 v3");
         assert_eq!(ObjectMeta::decode_value(&v).unwrap(), m);
         // 无版本字节(旧布局值)→ 拒绝
         let legacy = postcard::to_allocvec(&m).unwrap();
         assert!(ObjectMeta::decode_value(&legacy).is_err());
-        // 版本字节不符 → 拒绝
-        let mut bad = v.clone();
-        bad[0] = 1;
-        assert!(ObjectMeta::decode_value(&bad).is_err());
-        // M9/C3 双读兼容:v1.0.0 存量值(无 resp_headers 字段)按空表解码
+        // 版本字节不符 → 拒绝(2 为回退格式,不在此列)
+        for bad_ver in [0u8, 1, 4, 0xFF] {
+            let mut bad = v.clone();
+            bad[0] = bad_ver;
+            assert!(ObjectMeta::decode_value(&bad).is_err());
+        }
+        // M10 双读:v2 值(v1.1.0 格式,无 v3 尾部字段)回退补默认
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct ObjectMetaV2 {
+            size: u64,
+            etag: [u8; 16],
+            mtime: i64,
+            extents: Vec<Segment>,
+            content_type: String,
+            user_meta: Vec<(String, String)>,
+            inline: Option<Vec<u8>>,
+            parts: Vec<u64>,
+            resp_headers: Vec<(String, String)>,
+        }
+        let v2_value = {
+            let mut b = vec![2u8];
+            let m2 = ObjectMetaV2 {
+                size: m.size,
+                etag: m.etag,
+                mtime: m.mtime,
+                extents: m.extents.clone(),
+                content_type: m.content_type.clone(),
+                user_meta: m.user_meta.clone(),
+                inline: m.inline.clone(),
+                parts: m.parts.clone(),
+                resp_headers: vec![("x".into(), "y".into())],
+            };
+            b.extend_from_slice(&postcard::to_allocvec(&m2).unwrap());
+            b
+        };
+        let dec = ObjectMeta::decode_value(&v2_value).unwrap();
+        assert_eq!(dec.size, m.size);
+        assert_eq!(
+            dec.resp_headers,
+            vec![("x".to_string(), "y".to_string())],
+            "v2 值的 resp_headers 原样保留"
+        );
+        assert_eq!(dec.version_id, None);
+        assert!(!dec.is_delete_marker);
+        assert_eq!(dec.tags, Vec::<(String, String)>::new());
+        assert_eq!(dec.sse, None);
+        assert_eq!(dec.checksum, None);
+        assert_eq!(dec.retention, None);
+        assert!(!dec.legal_hold);
+        // M9/C3 双读兼容:v1.0.0 存量值(版本字节 2,无 resp_headers 字段)
+        // 按空表解码,v3 尾部字段同样补默认
         #[derive(serde::Serialize, serde::Deserialize)]
         struct LegacyObjectMeta {
             size: u64,
@@ -882,8 +1156,7 @@ mod tests {
             parts: Vec<u64>,
         }
         let legacy_v2 = {
-            let mut b = Vec::with_capacity(64);
-            b.push(OBJECT_META_VERSION);
+            let mut b = vec![2u8];
             let lm = LegacyObjectMeta {
                 size: m.size,
                 etag: m.etag,
@@ -900,6 +1173,14 @@ mod tests {
         let dec = ObjectMeta::decode_value(&legacy_v2).unwrap();
         assert_eq!(dec.resp_headers, Vec::<(String, String)>::new());
         assert_eq!(dec.size, m.size);
+        assert_eq!(dec.version_id, None);
+        assert!(!dec.is_delete_marker && !dec.legal_hold);
+        // v2 值损坏(截断)→ 两种回退格式都失败 → Corrupt
+        let truncated = &v2_value[..v2_value.len() / 2];
+        assert!(matches!(
+            ObjectMeta::decode_value(truncated),
+            Err(Error::Corrupt(_))
+        ));
     }
 
     #[test]
@@ -917,27 +1198,93 @@ mod tests {
     }
 
     #[test]
-    fn bucket_meta_legacy_value_still_decodes() {
-        // M9/C5 双读:v1.0.0 桶值(无 created_with_acl 尾部字段)直接 postcard
-        // 解码失败 → 走 fs3-meta decode_bucket 的回退。此处验证 fs3-meta
-        // 侧该模式(等效断言):新格式往返 + 旧格式解码为 false。
-        #[derive(serde::Serialize, serde::Deserialize)]
+    fn bucket_meta_value_version_roundtrip() {
+        // M10/ADR-11:BucketMeta 升 v2,值 = [2] + postcard;写入恒 v2。
+        let m = BucketMeta {
+            created: 1_724_155_200,
+            owner: "u".into(),
+            stats: BucketStats {
+                objects: 3,
+                bytes: 42,
+            },
+            quota: Some(1024),
+            created_with_acl: true,
+            versioning: VersioningState::Suspended,
+            default_encryption: Some(SseAlgorithm::Aes256),
+            object_lock: true,
+        };
+        let v = m.encode_value().unwrap();
+        assert_eq!(v[0], BUCKET_META_VERSION);
+        assert_eq!(v[0], 2);
+        assert_eq!(BucketMeta::decode_value(&v).unwrap(), m);
+        // v1.1.0 存量值(五字段,无版本字节)双读回退:v2 尾部字段补默认
+        #[derive(serde::Serialize)]
+        struct BucketMetaV1 {
+            created: i64,
+            owner: String,
+            stats: BucketStats,
+            quota: Option<u64>,
+            created_with_acl: bool,
+        }
+        let v11 = postcard::to_allocvec(&BucketMetaV1 {
+            created: m.created,
+            owner: "u".into(),
+            stats: m.stats,
+            quota: None,
+            created_with_acl: true,
+        })
+        .unwrap();
+        assert_ne!(v11[0], BUCKET_META_VERSION, "现实 created 首字节不带 0x02");
+        let dec = BucketMeta::decode_value(&v11).unwrap();
+        assert!(dec.created_with_acl);
+        assert_eq!(dec.versioning, VersioningState::Off);
+        assert_eq!(dec.default_encryption, None);
+        assert!(!dec.object_lock);
+        // v1.0.0 存量值(四字段)回退:created_with_acl = false
+        #[derive(serde::Serialize)]
         struct LegacyBucket {
             created: i64,
             owner: String,
             stats: BucketStats,
             quota: Option<u64>,
         }
-        let legacy = LegacyBucket {
-            created: 1,
+        let v10 = postcard::to_allocvec(&LegacyBucket {
+            created: m.created,
             owner: "u".into(),
-            stats: BucketStats::default(),
+            stats: m.stats,
             quota: None,
-        };
-        let enc = postcard::to_allocvec(&legacy).unwrap();
-        // 新结构直接解码旧值必失败(postcard 严格定长)
-        assert!(postcard::from_bytes::<BucketMeta>(&enc).is_err());
-        // fs3-meta 的 decode_bucket 双读由 fs3-meta 测试覆盖(bucket 值往返)。
+        })
+        .unwrap();
+        let dec = BucketMeta::decode_value(&v10).unwrap();
+        assert!(!dec.created_with_acl);
+        assert_eq!(dec.versioning, VersioningState::Off);
+        // 损坏值(空/垃圾)→ Corrupt
+        assert!(matches!(
+            BucketMeta::decode_value(&[]),
+            Err(Error::Corrupt(_))
+        ));
+        assert!(matches!(
+            BucketMeta::decode_value(&[0x02, 0xFF, 0xFF]),
+            Err(Error::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn versioning_state_serde_stable() {
+        // ADR-11 D1:变体序 = postcard varint 索引,禁止重排(磁盘格式契约)。
+        assert_eq!(postcard::to_allocvec(&VersioningState::Off).unwrap(), [0]);
+        assert_eq!(
+            postcard::to_allocvec(&VersioningState::Enabled).unwrap(),
+            [1]
+        );
+        assert_eq!(
+            postcard::to_allocvec(&VersioningState::Suspended).unwrap(),
+            [2]
+        );
+        assert_eq!(VersioningState::default(), VersioningState::Off);
+        // 回读一致性
+        let dec: VersioningState = postcard::from_bytes(&[2]).unwrap();
+        assert_eq!(dec, VersioningState::Suspended);
     }
 
     proptest::proptest! {

@@ -24,18 +24,83 @@ pub enum Operation {
     GetBucketVersioning {
         bucket: String,
     },
+    /// PUT ?versioning(ADR-11 D1;V3-1):状态机转换(Off→Enabled/Suspended,
+    /// Enabled↔Suspended;Enabled→Off 由服务层拒绝)。
+    PutBucketVersioning {
+        bucket: String,
+        status: crate::xml::VersioningStatus,
+    },
+    // —— 桶级标签 / CORS / OwnershipControls(M10 S1/S2/S7;ADR-11 D8/D9) ——
+    /// PUT ?tagging(桶级):标签集 ≤ 50(AWS 桶标签上限),XML body 已解析校验。
+    PutBucketTagging {
+        bucket: String,
+        tags: Vec<(String, String)>,
+    },
+    GetBucketTagging {
+        bucket: String,
+    },
+    DeleteBucketTagging {
+        bucket: String,
+    },
+    /// PUT ?cors:规则已解析校验(≤100 条;方法/通配符合法性见 xml)。
+    PutBucketCors {
+        bucket: String,
+        rules: Vec<crate::xml::CorsRule>,
+    },
+    GetBucketCors {
+        bucket: String,
+    },
+    DeleteBucketCors {
+        bucket: String,
+    },
+    /// PUT ?ownershipControls(M10 S7:单账号模型下配置存取 + 回显)。
+    PutBucketOwnershipControls {
+        bucket: String,
+        ownership: crate::xml::ObjectOwnership,
+    },
+    GetBucketOwnershipControls {
+        bucket: String,
+    },
+    DeleteBucketOwnershipControls {
+        bucket: String,
+    },
+    // —— 桶策略(M10 S3;ADR-11 D9 `bp:` 键) ——
+    /// PUT ?policy:JSON body 原样携带(服务层解析校验 + 原文入库,GET 逐字节
+    /// 回显——s3-tests test_set_get_del_bucket_policy 断言逐字节相等)。
+    PutBucketPolicy {
+        bucket: String,
+        body: Vec<u8>,
+    },
+    GetBucketPolicy {
+        bucket: String,
+    },
+    DeleteBucketPolicy {
+        bucket: String,
+    },
+    /// POST 表单上传(M10 S4;浏览器 POST policy)。仅 multipart/form-data
+    /// 在服务层受理;其他 Content-Type 维持原 MethodNotAllowed。
+    PostObject {
+        bucket: String,
+    },
     /// GET ?acl(对象级;M1 返回私有默认 ACL)。
     GetObjectAcl {
         bucket: String,
         key: String,
     },
-    /// 版本未启用:每对象一个 Version 条目(VersionId=null),供客户端
-    /// 枚举/清理;支持 prefix / key-marker / max-keys 分页。
+    /// ListObjectVersions(ADR-11 §3.4.4;V3-3 全语义):Version/DeleteMarker
+    /// 条目、KeyMarker/VersionIdMarker 分页、delimiter 分组。
+    /// 未版本化桶保持桩语义(每对象一条 VersionId=null IsLatest=true,
+    /// s3-tests nuke_bucket 依赖)。
     ListObjectVersions {
         bucket: String,
         prefix: String,
         key_marker: String,
+        /// version-id-marker(原始串;"null" 或 32 字符 hex,路由已校验)。
+        version_id_marker: Option<String>,
         max_keys: u32,
+        delimiter: Option<String>,
+        /// M9/C1:`encoding-type=url` 时响应键/前缀/分页游标 URL 编码。
+        encoding_type: Option<String>,
     },
     ListObjectsV1 {
         bucket: String,
@@ -129,24 +194,93 @@ pub enum Operation {
         bucket: String,
         key: String,
     },
+    /// PutObjectTagging(M10 S1):标签集 ≤ 10,XML body 已解析校验;
+    /// ?versionId 按版本寻址(ADR-11 §3.4.3 同 GetObject 口径)。
+    PutObjectTagging {
+        bucket: String,
+        key: String,
+        version_id: Option<VersionIdArg>,
+        tags: Vec<(String, String)>,
+    },
+    GetObjectTagging {
+        bucket: String,
+        key: String,
+        version_id: Option<VersionIdArg>,
+    },
+    DeleteObjectTagging {
+        bucket: String,
+        key: String,
+        version_id: Option<VersionIdArg>,
+    },
     GetObject {
         bucket: String,
         key: String,
+        /// ?versionId 寻址(ADR-11 §3.4.3;None = 当前版本)。
+        version_id: Option<VersionIdArg>,
     },
     HeadObject {
         bucket: String,
         key: String,
+        version_id: Option<VersionIdArg>,
     },
     DeleteObject {
         bucket: String,
         key: String,
+        version_id: Option<VersionIdArg>,
     },
     DeleteObjects {
         bucket: String,
         quiet: bool,
-        /// (键, 可选 VersionId)。
-        keys: Vec<(String, Option<String>)>,
+        /// 逐条删除条目(键 + 可选 VersionId + 可选条件元素)。
+        keys: Vec<crate::xml::DeleteObjectEntry>,
     },
+}
+
+/// ?versionId 参数(ADR-11 §3.4.3 对象级寻址):"null" → null 族(遗留
+/// 单键/null 槽,D1a-4);32 字符 hex → 精确 vk;其它 → 400 InvalidArgument。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionIdArg {
+    Null,
+    Vk([u8; 16]),
+}
+
+impl VersionIdArg {
+    /// 展示串(x-amz-version-id / NextVersionIdMarker 渲染口径):
+    /// Null → "null";Vk → hex。
+    pub fn display(&self) -> String {
+        match self {
+            VersionIdArg::Null => "null".to_string(),
+            VersionIdArg::Vk(vk) => hex::encode(vk),
+        }
+    }
+
+    /// 引擎寻址 vk(Null → fs3_meta::keys::VK_NULL 通道)。
+    pub fn vk(&self) -> [u8; 16] {
+        match self {
+            VersionIdArg::Null => fs3_meta::keys::VK_NULL,
+            VersionIdArg::Vk(vk) => *vk,
+        }
+    }
+}
+
+/// 解析 ?versionId / version-id-marker 原始值(None = 参数缺席)。
+fn parse_version_id_param(raw: Option<&str>) -> Result<Option<VersionIdArg>, S3Error> {
+    match raw {
+        None => Ok(None),
+        Some("null") => Ok(Some(VersionIdArg::Null)),
+        Some(s) if s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            let mut vk = [0u8; 16];
+            hex::decode_to_slice(s, &mut vk).map_err(|_| {
+                S3Error::new(S3ErrorCode::InvalidArgument)
+                    .with_message("Invalid version id specified")
+            })?;
+            Ok(Some(VersionIdArg::Vk(vk)))
+        }
+        Some(_) => {
+            Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                .with_message("Invalid version id specified"))
+        }
+    }
 }
 
 /// 路由请求到操作。
@@ -205,6 +339,16 @@ impl Router {
             let mut it = trimmed.splitn(2, '/');
             let b = it.next().unwrap_or("");
             Ok((Some(b.to_string()), it.next().unwrap_or("")))
+        }
+    }
+
+    /// 解析 host + 路径得桶名(M10 S2:CORS 预检/注头的 HTTP 层旁路评估用;
+    /// 服务级路径或解析失败 → None)。
+    pub fn bucket_name_of(&self, host: &str, path: &str) -> Option<String> {
+        match self.bucket_of(host, path) {
+            Ok((Some(vh), _)) => Some(vh),
+            Ok((None, _)) => p_bucket_of_path(path),
+            Err(_) => None,
         }
     }
 
@@ -271,30 +415,40 @@ impl Router {
                 return Ok(Operation::GetBucketLocation { bucket });
             }
             if has_q("versioning") {
-                return Ok(Operation::GetBucketVersioning { bucket });
+                // V3-1 方法盲区修复:GET/PUT 分流(此前 PUT ?versioning 被
+                // 静默路由给 GetBucketVersioning 返回 200 空配置)
+                return match method {
+                    "GET" => Ok(Operation::GetBucketVersioning { bucket }),
+                    "PUT" => Ok(Operation::PutBucketVersioning {
+                        bucket,
+                        status: crate::xml::parse_versioning_configuration(body)?,
+                    }),
+                    _ => Err(S3Error::new(S3ErrorCode::MethodNotAllowed)),
+                };
             }
             if has_q("versions") {
                 if method != "GET" {
                     return Err(S3Error::new(S3ErrorCode::MethodNotAllowed));
                 }
                 let key_marker = get_q("key-marker").unwrap_or_default();
+                let version_id_marker = get_q("version-id-marker");
                 // AWS:version-id-marker 不可脱离 key-marker 单独出现。
-                if get_q("version-id-marker").is_some() && key_marker.is_empty() {
+                if version_id_marker.is_some() && key_marker.is_empty() {
                     return Err(S3Error::new(S3ErrorCode::InvalidArgument).with_message(
                         "A version-id marker cannot be specified without a key marker.",
                     ));
                 }
-                if let Some(d) = get_q("delimiter") {
-                    if !d.is_empty() {
-                        return Err(S3Error::new(S3ErrorCode::NotImplemented)
-                            .with_message("ListObjectVersions with delimiter is not supported"));
-                    }
-                }
+                // 格式校验(路由层 400;不静默透传)
+                let version_id_marker = parse_version_id_param(version_id_marker.as_deref())?;
                 return Ok(Operation::ListObjectVersions {
                     bucket,
                     prefix: get_q("prefix").unwrap_or_default(),
                     key_marker,
+                    version_id_marker: version_id_marker.map(|v| v.display()),
                     max_keys: parse_max_keys(get_q("max-keys").as_deref())?,
+                    // V3-3:delimiter 支持(移除 501);空 delimiter 视为未提供
+                    delimiter: get_q("delimiter").filter(|d| !d.is_empty()),
+                    encoding_type: get_q("encoding-type").filter(|s| !s.is_empty()),
                 });
             }
             if has_q("list-type") && get_q("list-type").as_deref() == Some("2") {
@@ -339,13 +493,61 @@ impl Router {
                     max_uploads: parse_max_keys(get_q("max-uploads").as_deref())?,
                 });
             }
+            // M10 S1:桶级标签(D9 `bt:` 键;XML body 路由层解析校验)
+            if has_q("tagging") {
+                return match method {
+                    "PUT" => Ok(Operation::PutBucketTagging {
+                        bucket,
+                        tags: crate::xml::parse_tagging(body, crate::xml::MAX_BUCKET_TAGS)?,
+                    }),
+                    "GET" => Ok(Operation::GetBucketTagging { bucket }),
+                    "DELETE" => Ok(Operation::DeleteBucketTagging { bucket }),
+                    _ => Err(S3Error::new(S3ErrorCode::MethodNotAllowed)),
+                };
+            }
+            // M10 S2:桶级 CORS(D9 `bc:` 键;XML body 路由层解析校验)
+            if has_q("cors") {
+                return match method {
+                    "PUT" => Ok(Operation::PutBucketCors {
+                        bucket,
+                        rules: crate::xml::parse_cors_configuration(body)?,
+                    }),
+                    "GET" => Ok(Operation::GetBucketCors { bucket }),
+                    "DELETE" => Ok(Operation::DeleteBucketCors { bucket }),
+                    _ => Err(S3Error::new(S3ErrorCode::MethodNotAllowed)),
+                };
+            }
+            // M10 S7:OwnershipControls(D9 `bo:` 键;XML body 路由层解析校验)
+            if has_q("ownershipControls") {
+                return match method {
+                    "PUT" => Ok(Operation::PutBucketOwnershipControls {
+                        bucket,
+                        ownership: crate::xml::parse_ownership_controls(body)?,
+                    }),
+                    "GET" => Ok(Operation::GetBucketOwnershipControls { bucket }),
+                    "DELETE" => Ok(Operation::DeleteBucketOwnershipControls { bucket }),
+                    _ => Err(S3Error::new(S3ErrorCode::MethodNotAllowed)),
+                };
+            }
+            // M10 S3:桶策略(D9 `bp:` 键;JSON body 服务层解析校验)
+            if has_q("policy") {
+                return match method {
+                    "PUT" => Ok(Operation::PutBucketPolicy {
+                        bucket,
+                        body: body.to_vec(),
+                    }),
+                    "GET" => Ok(Operation::GetBucketPolicy { bucket }),
+                    "DELETE" => Ok(Operation::DeleteBucketPolicy { bucket }),
+                    _ => Err(S3Error::new(S3ErrorCode::MethodNotAllowed)),
+                };
+            }
             // 不支持/未实现的子资源
             for unsupported in [
                 "acl",
-                "policy",
-                "cors",
+                // GetBucketPolicyStatus 属 PublicAccessBlock 族(远期;M10 S3 不做,
+                // 显式 501 不静默落列表)
+                "policyStatus",
                 "lifecycle",
-                "tagging",
                 "website",
                 "notification",
                 "replication",
@@ -364,7 +566,6 @@ impl Router {
                 "inventory",
                 "metrics",
                 "intelligent-tiering",
-                "ownershipControls",
                 "legal-hold",
                 "retention",
             ] {
@@ -381,6 +582,9 @@ impl Router {
                 }),
                 "DELETE" => Ok(Operation::DeleteBucket { bucket }),
                 "HEAD" => Ok(Operation::HeadBucket { bucket }),
+                // M10 S4:桶级 POST(无 ?delete)→ 浏览器表单上传
+                // (multipart/form-data 判定在服务层;其他 Content-Type 维持原错误)
+                "POST" => Ok(Operation::PostObject { bucket }),
                 "GET" => Ok(Operation::ListObjectsV1 {
                     bucket,
                     prefix: get_q("prefix").unwrap_or_default(),
@@ -469,12 +673,61 @@ impl Router {
                     return Err(S3Error::new(S3ErrorCode::NotImplemented)
                         .with_message("PutObjectAcl is not implemented"));
                 }
+                if has_q("tagging") {
+                    // M10 S1:PutObjectTagging(?versionId 按版本寻址合法,
+                    // 须在下方 PUT 裸 versionId 拒绝之前判定)
+                    return Ok(Operation::PutObjectTagging {
+                        bucket,
+                        key,
+                        version_id: parse_version_id_param(get_q("versionId").as_deref())?,
+                        tags: crate::xml::parse_tagging(body, crate::xml::MAX_OBJECT_TAGS)?,
+                    });
+                }
+                if has_q("versionId") {
+                    // PUT 无版本寻址语义(AWS 同样拒绝);显式 400 不静默
+                    return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                        .with_message("versionId is not valid for PUT Object"));
+                }
                 Ok(Operation::PutObject { bucket, key })
             }
-            "GET" if has_q("acl") => Ok(Operation::GetObjectAcl { bucket, key }),
-            "GET" => Ok(Operation::GetObject { bucket, key }),
-            "HEAD" => Ok(Operation::HeadObject { bucket, key }),
-            "DELETE" => Ok(Operation::DeleteObject { bucket, key }),
+            "GET" if has_q("acl") => {
+                if has_q("versionId") {
+                    return Err(S3Error::new(S3ErrorCode::NotImplemented)
+                        .with_message("GetObjectAcl with versionId is not implemented"));
+                }
+                Ok(Operation::GetObjectAcl { bucket, key })
+            }
+            // M10 S1:GetObjectTagging/DeleteObjectTagging(此前显式 501;
+            // ?versionId 按版本寻址)
+            "GET" if has_q("tagging") => Ok(Operation::GetObjectTagging {
+                bucket,
+                key,
+                version_id: parse_version_id_param(get_q("versionId").as_deref())?,
+            }),
+            // V6-1:GetObjectAttributes 属 checksum 族(v1.2);此前静默落到
+            // GetObject 返回对象体(客户端 200 解析失败重试风暴),改显式 501
+            "GET" if has_q("attributes") => Err(S3Error::new(S3ErrorCode::NotImplemented)
+                .with_message("GetObjectAttributes is not implemented")),
+            "DELETE" if has_q("tagging") => Ok(Operation::DeleteObjectTagging {
+                bucket,
+                key,
+                version_id: parse_version_id_param(get_q("versionId").as_deref())?,
+            }),
+            "GET" => Ok(Operation::GetObject {
+                bucket,
+                key,
+                version_id: parse_version_id_param(get_q("versionId").as_deref())?,
+            }),
+            "HEAD" => Ok(Operation::HeadObject {
+                bucket,
+                key,
+                version_id: parse_version_id_param(get_q("versionId").as_deref())?,
+            }),
+            "DELETE" => Ok(Operation::DeleteObject {
+                bucket,
+                key,
+                version_id: parse_version_id_param(get_q("versionId").as_deref())?,
+            }),
             _ => Err(S3Error::new(S3ErrorCode::MethodNotAllowed)),
         }
     }
@@ -542,7 +795,8 @@ mod tests {
             op,
             Operation::GetObject {
                 bucket: "b1".into(),
-                key: "k1".into()
+                key: "k1".into(),
+                version_id: None,
             }
         );
         let op = r.route("PUT", "127.0.0.1", "/b1", &[], b"").unwrap();
@@ -601,7 +855,8 @@ mod tests {
             op,
             Operation::GetObject {
                 bucket: "b1".into(),
-                key: "k1".into()
+                key: "k1".into(),
+                version_id: None,
             }
         );
         // host 即桶名本身(s3.example.com 不在基准里时首标签解析)——基准含它
@@ -613,7 +868,8 @@ mod tests {
             op,
             Operation::GetObject {
                 bucket: "b1".into(),
-                key: "k".into()
+                key: "k".into(),
+                version_id: None,
             }
         );
     }
@@ -676,10 +932,25 @@ mod tests {
                 bucket: "b1".into()
             }
         );
-        // 未实现子资源
-        let q = vec![("policy".into(), "".into())];
+        // 未实现子资源(?policy 自 M10 S3 起已实现,改用 lifecycle 断言)
+        let q = vec![("lifecycle".into(), "".into())];
         let err = r.route("GET", "localhost", "/b1", &q, b"").unwrap_err();
         assert_eq!(err.code, S3ErrorCode::NotImplemented);
+        // M10 S3:?policy 三方法分流
+        let q = vec![("policy".into(), "".into())];
+        let op = r.route("GET", "localhost", "/b1", &q, b"").unwrap();
+        assert!(matches!(op, Operation::GetBucketPolicy { bucket } if bucket == "b1"));
+        let op = r.route("PUT", "localhost", "/b1", &q, b"{}").unwrap();
+        assert!(
+            matches!(op, Operation::PutBucketPolicy { bucket, body } if bucket == "b1" && body == b"{}")
+        );
+        let op = r.route("DELETE", "localhost", "/b1", &q, b"").unwrap();
+        assert!(matches!(op, Operation::DeleteBucketPolicy { bucket } if bucket == "b1"));
+        let err = r.route("POST", "localhost", "/b1", &q, b"").unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::MethodNotAllowed);
+        // M10 S4:桶级 POST(无子资源)→ PostObject
+        let op = r.route("POST", "localhost", "/b1", &[], b"").unwrap();
+        assert!(matches!(op, Operation::PostObject { bucket } if bucket == "b1"));
     }
 
     #[test]
@@ -830,7 +1101,8 @@ mod tests {
             cs,
             crate::xml::CopySource {
                 bucket: "b1".into(),
-                key: "k x".into()
+                key: "k x".into(),
+                version_id: None,
             }
         );
         let cs = parse_copy_source("b1/a%2Fb").unwrap();
@@ -838,7 +1110,8 @@ mod tests {
             cs,
             crate::xml::CopySource {
                 bucket: "b1".into(),
-                key: "a/b".into()
+                key: "a/b".into(),
+                version_id: None,
             }
         );
         let cs = parse_copy_source("/b1/%3FversionId").unwrap();
@@ -846,14 +1119,247 @@ mod tests {
             cs,
             crate::xml::CopySource {
                 bucket: "b1".into(),
-                key: "?versionId".into()
+                key: "?versionId".into(),
+                version_id: None,
             }
         );
-        // versionId 查询 → NotImplemented
-        let e = parse_copy_source("/b1/k?versionId=abc").unwrap_err();
-        assert_eq!(e.code, S3ErrorCode::NotImplemented);
+        // V3-2:versionId 查询解析为源版本寻址(不再 NotImplemented)
+        let cs = parse_copy_source("/b1/k?versionId=abc").unwrap();
+        assert_eq!(cs.version_id.as_deref(), Some("abc"));
+        // 未知查询参数 → InvalidArgument(显式拒绝)
+        let e = parse_copy_source("/b1/k?foo=bar").unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::InvalidArgument);
         // 缺桶 → InvalidArgument
         let e = parse_copy_source("/k").unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn versioning_and_versionid_routing() {
+        let r = router();
+        // V3-1 方法盲区:PUT ?versioning 不再落入 GetBucketVersioning
+        let body = br#"<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>"#;
+        let op = r
+            .route(
+                "PUT",
+                "localhost",
+                "/b1",
+                &[("versioning".into(), "".into())],
+                body,
+            )
+            .unwrap();
+        assert_eq!(
+            op,
+            Operation::PutBucketVersioning {
+                bucket: "b1".into(),
+                status: crate::xml::VersioningStatus::Enabled,
+            }
+        );
+        let op = r
+            .route(
+                "GET",
+                "localhost",
+                "/b1",
+                &[("versioning".into(), "".into())],
+                b"",
+            )
+            .unwrap();
+        assert_eq!(
+            op,
+            Operation::GetBucketVersioning {
+                bucket: "b1".into()
+            }
+        );
+        // DELETE ?versioning → 405
+        let e = r
+            .route(
+                "DELETE",
+                "localhost",
+                "/b1",
+                &[("versioning".into(), "".into())],
+                b"",
+            )
+            .unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::MethodNotAllowed);
+        // MfaDelete → InvalidArgument(D7)
+        let body = br#"<VersioningConfiguration><Status>Enabled</Status><MfaDelete>Enabled</MfaDelete></VersioningConfiguration>"#;
+        let e = r
+            .route(
+                "PUT",
+                "localhost",
+                "/b1",
+                &[("versioning".into(), "".into())],
+                body,
+            )
+            .unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::InvalidArgument);
+
+        // ?versionId 寻址:GET/HEAD/DELETE
+        let vid = "0123456789abcdef0123456789abcdef";
+        for m in ["GET", "HEAD", "DELETE"] {
+            let op = r
+                .route(
+                    m,
+                    "localhost",
+                    "/b1/k",
+                    &[("versionId".into(), vid.into())],
+                    b"",
+                )
+                .unwrap();
+            let expect_vk = parse_version_id_param(Some(vid)).unwrap();
+            match (&op, m) {
+                (Operation::GetObject { version_id, .. }, "GET") => {
+                    assert_eq!(*version_id, expect_vk)
+                }
+                (Operation::HeadObject { version_id, .. }, "HEAD") => {
+                    assert_eq!(*version_id, expect_vk)
+                }
+                (Operation::DeleteObject { version_id, .. }, "DELETE") => {
+                    assert_eq!(*version_id, expect_vk)
+                }
+                _ => panic!("{op:?}"),
+            }
+        }
+        // "null" → Null;非法格式 → 400
+        let op = r
+            .route(
+                "GET",
+                "localhost",
+                "/b1/k",
+                &[("versionId".into(), "null".into())],
+                b"",
+            )
+            .unwrap();
+        assert!(matches!(
+            op,
+            Operation::GetObject {
+                version_id: Some(VersionIdArg::Null),
+                ..
+            }
+        ));
+        let e = r
+            .route(
+                "GET",
+                "localhost",
+                "/b1/k",
+                &[("versionId".into(), "xyz".into())],
+                b"",
+            )
+            .unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::InvalidArgument);
+        // PUT ?versionId → 400(显式,不静默)
+        let e = r
+            .route(
+                "PUT",
+                "localhost",
+                "/b1/k",
+                &[("versionId".into(), vid.into())],
+                b"",
+            )
+            .unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::InvalidArgument);
+        // M10 S1:?tagging 三方法接线(对象级;不再 501)
+        let tbody =
+            br#"<Tagging><TagSet><Tag><Key>a</Key><Value>b</Value></Tag></TagSet></Tagging>"#;
+        let op = r
+            .route(
+                "PUT",
+                "localhost",
+                "/b1/k",
+                &[("tagging".into(), "".into())],
+                tbody,
+            )
+            .unwrap();
+        assert!(matches!(
+            op,
+            Operation::PutObjectTagging { ref tags, .. }
+                if tags.as_slice() == [("a".to_string(), "b".to_string())]
+        ));
+        for (m, expect_get) in [("GET", true), ("DELETE", false)] {
+            let op = r
+                .route(
+                    m,
+                    "localhost",
+                    "/b1/k",
+                    &[("tagging".into(), "".into())],
+                    b"",
+                )
+                .unwrap();
+            if expect_get {
+                assert!(matches!(op, Operation::GetObjectTagging { .. }), "{m}");
+            } else {
+                assert!(matches!(op, Operation::DeleteObjectTagging { .. }), "{m}");
+            }
+        }
+        // PUT ?tagging 空 body → MalformedXML;?tagging&versionId 版本寻址
+        let e = r
+            .route(
+                "PUT",
+                "localhost",
+                "/b1/k",
+                &[("tagging".into(), "".into())],
+                b"",
+            )
+            .unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::MalformedXML);
+        let op = r
+            .route(
+                "GET",
+                "localhost",
+                "/b1/k",
+                &[
+                    ("tagging".into(), "".into()),
+                    ("versionId".into(), vid.into()),
+                ],
+                b"",
+            )
+            .unwrap();
+        assert!(matches!(
+            op,
+            Operation::GetObjectTagging {
+                version_id: Some(VersionIdArg::Vk(_)),
+                ..
+            }
+        ));
+        // ?versions 全参数:delimiter/version-id-marker/encoding-type 透传
+        let op = r
+            .route(
+                "GET",
+                "localhost",
+                "/b1",
+                &[
+                    ("versions".into(), "".into()),
+                    ("delimiter".into(), "/".into()),
+                    ("key-marker".into(), "k9".into()),
+                    ("version-id-marker".into(), "null".into()),
+                    ("encoding-type".into(), "url".into()),
+                ],
+                b"",
+            )
+            .unwrap();
+        assert!(matches!(
+            op,
+            Operation::ListObjectVersions {
+                delimiter: Some(_),
+                version_id_marker: Some(_),
+                encoding_type: Some(_),
+                ..
+            }
+        ));
+        // version-id-marker 非法格式 → 400
+        let e = r
+            .route(
+                "GET",
+                "localhost",
+                "/b1",
+                &[
+                    ("versions".into(), "".into()),
+                    ("key-marker".into(), "k".into()),
+                    ("version-id-marker".into(), "bad!".into()),
+                ],
+                b"",
+            )
+            .unwrap_err();
         assert_eq!(e.code, S3ErrorCode::InvalidArgument);
     }
 
@@ -868,7 +1374,8 @@ mod tests {
             op,
             Operation::GetObject {
                 bucket: "b1".into(),
-                key: "b2/k".into()
+                key: "b2/k".into(),
+                version_id: None,
             }
         );
         // IP host 恒为路径风格
@@ -877,7 +1384,8 @@ mod tests {
             op,
             Operation::GetObject {
                 bucket: "b1".into(),
-                key: "k".into()
+                key: "k".into(),
+                version_id: None,
             }
         );
     }

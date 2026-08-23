@@ -13,6 +13,9 @@ checkpoint_interval = 30
 # etag_mode = "md5"
 # 内联小对象阈值(默认 32KiB;对象 ≤ 此值数据直接内联元数据,零设备 I/O)
 # small_object_limit = 32768
+# 后台惰性压缩(ADR-9;默认 true)。false = 不启动压缩 worker(前台 compact 仍可用);
+# 协议一致性 gate 等需确定性读环境的场景使用(tests/s3-tests/README.md「运行」节)
+# compaction_enabled = true
 
 [server]
 listen = "0.0.0.0:9000"

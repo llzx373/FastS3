@@ -19,6 +19,7 @@ mod config;
 mod doctor;
 mod loadgen;
 mod meta;
+mod rewrite;
 mod settings;
 mod signal;
 mod stress;
@@ -89,6 +90,9 @@ enum Cmd {
     MetaExport(meta::MetaExportArgs),
     /// M7/E5 元数据快照导入(先恢复底层卷数据快照;布局必须与导出一致)
     MetaImport(meta::MetaImportArgs),
+    /// M10 V5-3 值格式在线重写:ObjectMeta v2→v3 逐键重编码(停机/维护
+    /// 窗口;Tier2 节流 + --pause-file 暂停;完成前禁回滚到 v1.0.x)
+    RewriteValues(rewrite::RewriteValuesArgs),
     /// 流式 PUT:文件或 stdin(-)到对象
     Put {
         /// 桶名(自动创建)
@@ -263,6 +267,36 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 etag_mode,
             )?;
             meta::run_meta_import(&engine_cfg.device, &engine_cfg.meta_dir, &args)
+        }
+        Cmd::RewriteValues(args) => {
+            // 只触碰元数据(不读写设备数据区);--device 仍需解析以定位
+            // meta_dir 默认值(与 meta-export 同一配置路径)
+            let engine_cfg = engine_config(
+                device,
+                meta_dir,
+                sync_mode,
+                cli.group_commit_ms.or(storage.group_commit_ms),
+                cli.checkpoint_interval.or(storage.checkpoint_interval),
+                cli.no_uring,
+                etag_mode,
+            )?;
+            if args.count_only {
+                let (v2, v3) = rewrite::count_value_versions(&engine_cfg.meta_dir)?;
+                println!("rewrite-values: value-versions v2={v2} v3={v3}");
+                return Ok(());
+            }
+            let r = rewrite::run_rewrite(&engine_cfg.meta_dir, &args)?;
+            println!(
+                "rewrite-values: scanned={} rewritten={} skipped_v3={} skipped_markers={} errors={} elapsed={:.1}s",
+                r.scanned, r.rewritten, r.skipped_v3, r.skipped_marker, r.errors, r.elapsed_secs
+            );
+            if r.errors > 0 {
+                return Err(fs3_core::Error::Meta(format!(
+                    "rewrite-values: {} key(s) failed (see output above)",
+                    r.errors
+                )));
+            }
+            Ok(())
         }
         Cmd::Put { bucket, key, file } => {
             let engine_cfg = engine_config(
@@ -451,9 +485,12 @@ fn cmd_serve(
     drain_secs: u64,
 ) -> fs3_core::Result<()> {
     let mut engine_cfg = engine_cfg.clone();
-    engine_cfg.compaction.enabled = true; // 服务常驻:后台惰性压缩(ADR-9 §6)
-                                          // REVIEW §4.7:small_object_limit 经配置暴露(README/TODO 称「阈值可配置」;
-                                          // 此前 CLI 硬编码仅引擎层可配)
+    // 服务常驻:后台惰性压缩默认开启(ADR-9 §6);[storage] compaction_enabled=false
+    // 可关(M10 S5:协议 gate 需确定性环境——压缩迁移与大对象流式读的并发竞态
+    // 为已发现未关闭项,见 tests/s3-tests/README.md「运行」节)。
+    engine_cfg.compaction.enabled = cfg.storage.compaction_enabled.unwrap_or(true);
+    // REVIEW §4.7:small_object_limit 经配置暴露(README/TODO 称「阈值可配置」;
+    // 此前 CLI 硬编码仅引擎层可配)
     if let Some(sol) = cfg.storage.small_object_limit {
         engine_cfg.small_object_limit = sol;
     }

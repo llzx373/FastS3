@@ -11,6 +11,9 @@
  *   GET  /api/buckets/{name}/objects      对象浏览(数据面 ListObjectsV2)
  *   POST /api/buckets/{name}/presign      签发 PUT/GET 预签名 URL
  *   POST /api/buckets/{name}/multipart/{init|complete|abort}
+ *   M10:GET /api/buckets/{name}/versions;POST .../versions/action(restore/delete)
+ *   M10:GET/PUT /api/buckets/{name}/versioning;GET/PUT/DELETE .../cors;GET/PUT/DELETE .../policy
+ *   M10:GET /api/buckets/{name}/object-tags;POST .../object-tags/action(put)
  *   GET/POST/DELETE /api/keys[/{id}]      密钥管理(代理)
  *   PUT  /api/keys/{access}/policy        密钥策略文档(代理 admin PATCH)
  *   GET  /api/uploads;POST /api/uploads/{id}/abort
@@ -23,7 +26,7 @@
  *
  * 静态资源(控制台构建产物)由 --static 提供;数据流永不经过 Node。
  */
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
 import { createServer } from "node:http";
 import { readFileSync } from "node:fs";
 import { WebSocketServer } from "ws";
@@ -31,7 +34,7 @@ import { loadConfig, listenHostPort, type WebConfig } from "./config.js";
 import { authPlugin, issueToken, requireRole, verifyJwt, type JwtClaims } from "./auth.js";
 import { AdminClient } from "./admin-client.js";
 import { AdminWsClient } from "./admin-ws.js";
-import { S3Client } from "./s3-client.js";
+import { S3Client, S3M10Client, type BucketCorsRule, type S3Tag } from "./s3-client.js";
 import { presignUrl } from "./presign.js";
 import { buildDashboard, buildSnapshot, dashboardFromSnapshot } from "./dashboard.js";
 import { MetricsHistory } from "./metrics-history.js";
@@ -39,6 +42,8 @@ import { MetricsHistory } from "./metrics-history.js";
 export interface ServerDeps {
   admin: AdminClient;
   s3: S3Client;
+  /** M10 版本化/标签/CORS/桶策略桥接(数据面直达);缺省时对应端点不注册 */
+  s3m10?: S3M10Client;
   cfg: WebConfig;
   /** 指标历史环形缓冲(共享实例;缺省时 buildServer 自建) */
   metricsHistory?: MetricsHistory;
@@ -309,6 +314,228 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     }
   );
 
+  // ── M10:版本化/标签/CORS/桶策略(s3m10 缺省时不注册) ──
+  const m10 = deps.s3m10;
+  if (m10) {
+    const m10Error = (e: unknown, reply: FastifyReply, bucket: string) => {
+      const msg = (e as Error).message;
+      if (msg.includes("NoSuchBucket")) {
+        return reply.code(404).send({ error: { code: "no_such_bucket", message: `bucket ${bucket}` } });
+      }
+      return reply.code(502).send({ error: { code: "s3_error", message: msg } });
+    };
+
+    // 版本列表(ListObjectVersions;prefix/keyMarker/versionIdMarker/maxKeys 透传)
+    app.get<{
+      Params: { name: string };
+      Querystring: { prefix?: string; keyMarker?: string; versionIdMarker?: string; maxKeys?: string };
+    }>("/api/buckets/:name/versions", async (req, reply) => {
+      const { name } = req.params;
+      const maxKeys = Number(req.query.maxKeys ?? 1000);
+      try {
+        return await m10.listObjectVersions(
+          name,
+          req.query.prefix ?? "",
+          req.query.keyMarker || undefined,
+          req.query.versionIdMarker || undefined,
+          Number.isFinite(maxKeys) ? Math.max(1, Math.min(Math.floor(maxKeys), 1000)) : 1000
+        );
+      } catch (e) {
+        return m10Error(e, reply, name);
+      }
+    });
+
+    // 版本操作:restore(CopyObject 自复制恢复)/ delete(永久删除指定版本)
+    app.post<{ Params: { name: string }; Body: { action?: string; key?: string; versionId?: string } }>(
+      "/api/buckets/:name/versions/action",
+      { preHandler: requireRole("admin") },
+      async (req, reply) => {
+        const { name } = req.params;
+        const { action, key, versionId } = req.body ?? {};
+        if (!key) return reply.code(400).send({ error: { code: "bad_request", message: "missing key" } });
+        if (!versionId) {
+          return reply.code(400).send({ error: { code: "bad_request", message: "missing versionId" } });
+        }
+        try {
+          if (action === "restore") {
+            await m10.restoreVersion(name, key, versionId);
+            return { restored: { key, versionId } };
+          }
+          if (action === "delete") {
+            await m10.deleteObjectVersion(name, key, versionId);
+            return { deleted: { key, versionId } };
+          }
+          return reply.code(400).send({ error: { code: "bad_request", message: "bad action" } });
+        } catch (e) {
+          return m10Error(e, reply, name);
+        }
+      }
+    );
+
+    // 版本化开关(Enabled/Suspended;Enabled→Off 由数据面 409 拒绝)
+    app.get<{ Params: { name: string } }>("/api/buckets/:name/versioning", async (req, reply) => {
+      try {
+        return { Status: await m10.getBucketVersioning(req.params.name) };
+      } catch (e) {
+        return m10Error(e, reply, req.params.name);
+      }
+    });
+
+    app.put<{ Params: { name: string }; Body: { Status?: string } }>(
+      "/api/buckets/:name/versioning",
+      { preHandler: requireRole("admin") },
+      async (req, reply) => {
+        const status = req.body?.Status;
+        if (status !== "Enabled" && status !== "Suspended") {
+          return reply.code(400).send({
+            error: { code: "bad_request", message: "Status must be Enabled or Suspended" },
+          });
+        }
+        try {
+          await m10.putBucketVersioning(req.params.name, status);
+          return { Status: status };
+        } catch (e) {
+          return m10Error(e, reply, req.params.name);
+        }
+      }
+    );
+
+    // CORS 配置(未配置时 GET 返回空规则组)
+    app.get<{ Params: { name: string } }>("/api/buckets/:name/cors", async (req, reply) => {
+      try {
+        return { CORSRules: await m10.getBucketCors(req.params.name) };
+      } catch (e) {
+        return m10Error(e, reply, req.params.name);
+      }
+    });
+
+    app.put<{ Params: { name: string }; Body: { CORSRules?: unknown } }>(
+      "/api/buckets/:name/cors",
+      { preHandler: requireRole("admin") },
+      async (req, reply) => {
+        const rules = req.body?.CORSRules;
+        if (!Array.isArray(rules) || rules.length === 0) {
+          return reply.code(400).send({
+            error: { code: "bad_request", message: "CORSRules must be a non-empty array" },
+          });
+        }
+        try {
+          await m10.putBucketCors(req.params.name, rules as BucketCorsRule[]);
+          return { CORSRules: rules };
+        } catch (e) {
+          return m10Error(e, reply, req.params.name);
+        }
+      }
+    );
+
+    app.delete<{ Params: { name: string } }>(
+      "/api/buckets/:name/cors",
+      { preHandler: requireRole("admin") },
+      async (req, reply) => {
+        try {
+          await m10.deleteBucketCors(req.params.name);
+          return { deleted: req.params.name };
+        } catch (e) {
+          return m10Error(e, reply, req.params.name);
+        }
+      }
+    );
+
+    // 桶策略(未配置时 GET 返回 Policy: "")
+    app.get<{ Params: { name: string } }>("/api/buckets/:name/policy", async (req, reply) => {
+      try {
+        return { Policy: await m10.getBucketPolicy(req.params.name) };
+      } catch (e) {
+        return m10Error(e, reply, req.params.name);
+      }
+    });
+
+    app.put<{ Params: { name: string }; Body: { Policy?: unknown } }>(
+      "/api/buckets/:name/policy",
+      { preHandler: requireRole("admin") },
+      async (req, reply) => {
+        const policy = req.body?.Policy;
+        if (typeof policy !== "string" || policy.trim() === "") {
+          return reply.code(400).send({
+            error: { code: "bad_request", message: "Policy must be a non-empty JSON string" },
+          });
+        }
+        try {
+          JSON.parse(policy);
+        } catch {
+          return reply.code(400).send({ error: { code: "bad_request", message: "Policy is not valid JSON" } });
+        }
+        try {
+          await m10.putBucketPolicy(req.params.name, policy);
+          return { Policy: policy };
+        } catch (e) {
+          return m10Error(e, reply, req.params.name);
+        }
+      }
+    );
+
+    app.delete<{ Params: { name: string } }>(
+      "/api/buckets/:name/policy",
+      { preHandler: requireRole("admin") },
+      async (req, reply) => {
+        try {
+          await m10.deleteBucketPolicy(req.params.name);
+          return { deleted: req.params.name };
+        } catch (e) {
+          return m10Error(e, reply, req.params.name);
+        }
+      }
+    );
+
+    // 对象标签读取(配合控制台标签编辑器)
+    app.get<{ Params: { name: string }; Querystring: { key?: string } }>(
+      "/api/buckets/:name/object-tags",
+      async (req, reply) => {
+        const key = req.query.key;
+        if (!key) return reply.code(400).send({ error: { code: "bad_request", message: "missing key" } });
+        try {
+          return { tags: await m10.getObjectTagging(req.params.name, key) };
+        } catch (e) {
+          return m10Error(e, reply, req.params.name);
+        }
+      }
+    );
+
+    // 对象标签操作:put = 整体替换(空数组即清空)
+    app.post<{ Params: { name: string }; Body: { action?: string; key?: string; tags?: unknown } }>(
+      "/api/buckets/:name/object-tags/action",
+      { preHandler: requireRole("admin") },
+      async (req, reply) => {
+        const { name } = req.params;
+        const { action, key, tags } = req.body ?? {};
+        if (!key) return reply.code(400).send({ error: { code: "bad_request", message: "missing key" } });
+        const validTags =
+          Array.isArray(tags) &&
+          tags.every(
+            (t) =>
+              t !== null &&
+              typeof t === "object" &&
+              typeof (t as { key?: unknown }).key === "string" &&
+              typeof (t as { value?: unknown }).value === "string"
+          );
+        if (action === "put") {
+          if (!validTags) {
+            return reply.code(400).send({
+              error: { code: "bad_request", message: "tags must be an array of {key,value} strings" },
+            });
+          }
+          try {
+            await m10.putObjectTagging(name, key, tags as S3Tag[]);
+            return { key, tags };
+          } catch (e) {
+            return m10Error(e, reply, name);
+          }
+        }
+        return reply.code(400).send({ error: { code: "bad_request", message: "bad action" } });
+      }
+    );
+  }
+
   // ── 密钥管理 ──
   app.get("/api/keys", async (_req, reply) => {
     try {
@@ -516,8 +743,14 @@ export function startServer(): void {
     accessKey: cfg.s3.accessKey,
     secretKey: cfg.s3.secretKey,
   });
+  const s3m10 = new S3M10Client({
+    endpoint: cfg.s3.endpoint,
+    region: cfg.s3.region,
+    accessKey: cfg.s3.accessKey,
+    secretKey: cfg.s3.secretKey,
+  });
   const history = new MetricsHistory();
-  const app = buildServer({ admin, s3, cfg, metricsHistory: history });
+  const app = buildServer({ admin, s3, s3m10, cfg, metricsHistory: history });
 
   const { host, port } = listenHostPort(cfg.listen);
   app.listen({ host, port }).catch((e) => {

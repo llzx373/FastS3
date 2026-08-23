@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.1"
+version = "1.1.0"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.88"
@@ -42,6 +42,9 @@ quick-xml = "0.41"
 hmac = "0.12"
 parking_lot = "0.12"
 sha2 = "0.10"
+# sha1:M10 S4 POST 表单 SigV2 签名(HMAC-SHA1);已在依赖树(tokio-tungstenite
+# 经 fs3-admin 引入 0.10.7),复用锁树版本,不引入新包。
+sha1 = "0.10"
 hex = "0.4"
 base64 = "0.22"
 serde_json = "1.0"

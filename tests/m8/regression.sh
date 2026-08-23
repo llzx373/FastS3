@@ -152,6 +152,9 @@ listen = "127.0.0.1:$SPORT"
 devices = ["$IMG"]
 meta_dir = "$META"
 sync_mode = "full"
+# M10 S5:协议门禁需确定性环境——压缩迁移与大对象流式读存在已跟踪并发竞态
+# (tests/s3-tests/README.md「运行」节);gate/冒烟矩阵关闭后台压缩。
+compaction_enabled = false
 EOF
     if "$BIN" doctor --config "$CONF" --json > "$WORK/doctor.json" 2>/dev/null \
         && grep -q "kernel\|io_uring\|device" "$WORK/doctor.json"; then
@@ -165,7 +168,10 @@ EOF
     # 连接 fd 余量:客户端池 keep-alive 连接全量冲压下默认 ulimit(1024/10240)
     # 不足(M8 实测 s3-tests 全量 ~1 万连接级);serve 进程显式抬高。
     ulimit -n "${FS3_MAX_FDS:-131072}" 2>/dev/null || true
+    # M10 S5:s3-tests 门禁服务必须 --allow-anonymous(cors_origin_response/wildcard
+    # 首条断言为匿名 GET;匿名族翻转覆盖面见 tests/s3-tests/README.md「匿名读写语义」)。
     "$BIN" serve --config "$CONF" --key test:secret123 --admin-token regress-token \
+        --allow-anonymous \
         --admin-listen "127.0.0.1:19501" "${NO_URING_ARGS[@]}" > "$WORK/serve.log" 2>&1 &
     SVC_PID=$!
     for _ in $(seq 1 30); do

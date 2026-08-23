@@ -29,6 +29,27 @@ const OP_OPTIONS = [
   "CreateMultipartUpload",
   "UploadPart",
   "CompleteMultipartUpload",
+  // M10:tagging/cors/policy/ownership/versioning 子资源与 POST 表单的审计
+  // 操作名(数据面 route_op_bucket_key 口径)
+  "PostObject",
+  "PutBucketVersioning",
+  "GetBucketVersioning",
+  "ListObjectVersions",
+  "PutObjectTagging",
+  "GetObjectTagging",
+  "DeleteObjectTagging",
+  "PutBucketTagging",
+  "GetBucketTagging",
+  "DeleteBucketTagging",
+  "PutBucketCors",
+  "GetBucketCors",
+  "DeleteBucketCors",
+  "PutBucketPolicy",
+  "GetBucketPolicy",
+  "DeleteBucketPolicy",
+  "PutBucketOwnershipControls",
+  "GetBucketOwnershipControls",
+  "DeleteBucketOwnershipControls",
 ];
 
 /** 过滤行输入态(未应用;datetime-local 与数字输入原始字符串)。 */

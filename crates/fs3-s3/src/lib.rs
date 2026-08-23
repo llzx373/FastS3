@@ -7,11 +7,12 @@ pub mod auth;
 pub mod chunked;
 pub mod error;
 pub mod policy;
+pub mod post;
 pub mod ratelimit;
 pub mod router;
 pub mod service;
 pub mod xml;
 
 pub use error::{S3Error, S3ErrorCode};
-pub use router::{Operation, Router};
+pub use router::{Operation, Router, VersionIdArg};
 pub use service::{ResponseBody, S3Request, S3Service, ServiceResponse, BUFFERED_PUT_LIMIT};

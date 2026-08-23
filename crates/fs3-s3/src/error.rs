@@ -18,6 +18,9 @@ pub enum S3ErrorCode {
     EntityTooLarge,
     EntityTooSmall,
     IllegalLocationConstraintException,
+    /// 版本化状态机非法转换(ADR-11 D1:Enabled/Suspended → Off 禁止;409,
+    /// 与 AWS IllegalVersioningConfigurationException 同义)。
+    IllegalVersioningConfiguration,
     IncompleteBody,
     IncorrectNumberOfFilesInPostRequest,
     InlineDataTooLarge,
@@ -48,6 +51,8 @@ pub enum S3ErrorCode {
     InvalidURI,
     KeyTooLongError,
     MalformedACLError,
+    /// 桶策略文档非法(M10 S3;PutBucketPolicy 写入校验失败,400)。
+    MalformedPolicy,
     MalformedPOSTRequest,
     MalformedXML,
     MaxMessageLengthExceeded,
@@ -71,6 +76,8 @@ pub enum S3ErrorCode {
     NotModified,
     NoSuchWebsiteConfiguration,
     OperationAborted,
+    /// 桶无 OwnershipControls 配置(M10 S7;AWS 404)。
+    OwnershipControlsNotFoundError,
     PermanentRedirect,
     PreconditionFailed,
     Redirect,
@@ -113,6 +120,7 @@ impl S3ErrorCode {
             EntityTooLarge => "Your proposed upload exceeds the maximum allowed size.",
             EntityTooSmall => "Your proposed upload is smaller than the minimum allowed object size.",
             IllegalLocationConstraintException => "The specified location-constraint is not valid.",
+            IllegalVersioningConfiguration => "The versioning configuration specified in the request is not valid.",
             IncompleteBody => "You did not provide the number of bytes specified by the Content-Length HTTP header.",
             IncorrectNumberOfFilesInPostRequest => "POST requires exactly one file upload per request.",
             InlineDataTooLarge => "Inline data exceeds the maximum allowed size.",
@@ -142,6 +150,7 @@ impl S3ErrorCode {
             InvalidURI => "Couldn't parse the specified URI.",
             KeyTooLongError => "Your key is too long.",
             MalformedACLError => "The XML you provided was not well-formed or did not validate against our published schema.",
+            MalformedPolicy => "The specified policy is invalid.",
             MalformedPOSTRequest => "The body of your POST request is not well-formed multipart/form-data.",
             MalformedXML => "The XML you provided was not well-formed or did not validate against our published schema.",
             MaxMessageLengthExceeded => "Your request was too big.",
@@ -165,6 +174,9 @@ impl S3ErrorCode {
             NotModified => "Not Modified",
             NoSuchWebsiteConfiguration => "The specified bucket does not have a website configuration",
             OperationAborted => "A conflicting conditional operation is currently in progress against this resource. Try again.",
+            OwnershipControlsNotFoundError => {
+                "The bucket does not have ownership controls configured."
+            }
             PermanentRedirect => "The bucket you are attempting to access must be addressed using the specified endpoint. Send all future requests to this endpoint.",
             PreconditionFailed => "At least one of the pre-conditions you specified did not hold.",
             Redirect => "Temporary redirect.",
@@ -204,10 +216,18 @@ impl S3ErrorCode {
             BucketAlreadyExists | BucketAlreadyOwnedByYou | BucketNotEmpty | OperationAborted => {
                 409
             }
+            IllegalVersioningConfiguration => 409,
             InvalidRange => 416,
             PreconditionFailed => 412,
             NotModified => 304,
-            NoSuchBucket | NoSuchKey | NoSuchUpload | NoSuchVersion => 404,
+            NoSuchBucket
+            | NoSuchKey
+            | NoSuchUpload
+            | NoSuchVersion
+            | NoSuchBucketPolicy
+            | NoSuchCORSConfiguration
+            | NoSuchTagSet
+            | OwnershipControlsNotFoundError => 404,
             MethodNotAllowed => 405,
             EntityTooLarge | EntityTooSmall | InlineDataTooLarge => 400,
             InsufficientStorage => 507,
@@ -229,6 +249,9 @@ pub struct S3Error {
     pub extra: Vec<(String, String)>,
     /// 覆盖默认 Message(极少使用)。
     pub message_override: Option<String>,
+    /// 错误响应需携带的额外 HTTP 头(ADR-11 §3.4.3:删除标记路径的
+    /// x-amz-delete-marker / x-amz-version-id;HTTP 层注入)。
+    pub resp_headers: Vec<(String, String)>,
 }
 
 impl S3Error {
@@ -237,6 +260,7 @@ impl S3Error {
             code,
             extra: Vec::new(),
             message_override: None,
+            resp_headers: Vec::new(),
         }
     }
 
@@ -254,6 +278,12 @@ impl S3Error {
 
     pub fn with_message(mut self, msg: impl Into<String>) -> Self {
         self.message_override = Some(msg.into());
+        self
+    }
+
+    /// 错误响应附带 HTTP 头(版本化删除标记语义,ADR-11 §3.4.3)。
+    pub fn with_resp_header(mut self, k: &str, v: &str) -> Self {
+        self.resp_headers.push((k.to_string(), v.to_string()));
         self
     }
 

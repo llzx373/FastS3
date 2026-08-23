@@ -804,3 +804,186 @@ async fn te_chunked_put_is_accepted() {
     let (status, _, body) = c.send(req.into_bytes()).await;
     assert_eq!(status, 200, "chunked PUT must be accepted: {body:?}");
 }
+
+// ── M10 S2:桶级 CORS(D9 bc: 键)端到端:预检 200/403/400 + 实际请求注头 ──
+
+#[tokio::test]
+async fn bucket_cors_preflight_and_actual_over_http() {
+    let (_d, service) = setup();
+    let addr = spawn_server(service.clone()).await;
+    let host = format!("{addr}");
+    let mut client = RawClient::connect(addr).await;
+    let hdr_of = |headers: &[(String, String)], name: &str| {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+
+    // 建桶 + 写桶级 CORS 配置(签名 PUT ?cors)
+    let h = sigv4_headers(&host, "PUT", "/cors-bkt", &[], &[], b"");
+    let (s, _, _) = client
+        .send(render_request("PUT", "/cors-bkt", &h, b""))
+        .await;
+    assert_eq!(s, 200);
+    let cors_body = br#"<CORSConfiguration><CORSRule><AllowedMethod>GET</AllowedMethod><AllowedOrigin>*suffix</AllowedOrigin></CORSRule><CORSRule><AllowedMethod>PUT</AllowedMethod><AllowedOrigin>*</AllowedOrigin><AllowedHeader>x-amz-*</AllowedHeader><MaxAgeSeconds>60</MaxAgeSeconds></CORSRule></CORSConfiguration>"#;
+    let q = [("cors".to_string(), "".to_string())];
+    let h = sigv4_headers(&host, "PUT", "/cors-bkt", &q, &[], cors_body);
+    let (s, _, ebody) = client
+        .send(render_request("PUT", "/cors-bkt?cors", &h, cors_body))
+        .await;
+    assert_eq!(s, 200, "PutBucketCors: {}", String::from_utf8_lossy(&ebody));
+
+    // 1) 非预检 OPTIONS(无 Origin)→ 400(现状口径,s3-tests 依赖)
+    let rel = format!("OPTIONS /cors-bkt HTTP/1.1\r\nHost: {host}\r\n\r\n");
+    let (s, _, _) = client.send(rel.into_bytes()).await;
+    assert_eq!(s, 400, "non-preflight OPTIONS stays 400");
+    // 有 Origin 但缺 Access-Control-Request-Method → 同样 400(非预检)
+    let rel = format!("OPTIONS /cors-bkt HTTP/1.1\r\nHost: {host}\r\nOrigin: foo.suffix\r\n\r\n");
+    let (s, _, _) = client.send(rel.into_bytes()).await;
+    assert_eq!(s, 400);
+
+    // 2) 预检命中 → 200 + 回显 Origin + 规则方法
+    let rel = format!(
+        "OPTIONS /cors-bkt/obj HTTP/1.1\r\nHost: {host}\r\nOrigin: foo.suffix\r\nAccess-Control-Request-Method: GET\r\n\r\n"
+    );
+    let (s, headers, _) = client.send(rel.into_bytes()).await;
+    assert_eq!(s, 200, "preflight hit");
+    assert_eq!(
+        hdr_of(&headers, "access-control-allow-origin").as_deref(),
+        Some("foo.suffix")
+    );
+    assert_eq!(
+        hdr_of(&headers, "access-control-allow-methods").as_deref(),
+        Some("GET")
+    );
+    // 通配 Origin 规则 → 回显 "*";带 MaxAge/AllowHeaders
+    let rel = format!(
+        "OPTIONS /cors-bkt/obj HTTP/1.1\r\nHost: {host}\r\nOrigin: https://any.example\r\nAccess-Control-Request-Method: PUT\r\nAccess-Control-Request-Headers: x-amz-meta-h\r\n\r\n"
+    );
+    let (s, headers, _) = client.send(rel.into_bytes()).await;
+    assert_eq!(s, 200);
+    assert_eq!(
+        hdr_of(&headers, "access-control-allow-origin").as_deref(),
+        Some("*")
+    );
+    assert_eq!(
+        hdr_of(&headers, "access-control-max-age").as_deref(),
+        Some("60")
+    );
+    assert_eq!(
+        hdr_of(&headers, "access-control-allow-headers").as_deref(),
+        Some("x-amz-*")
+    );
+
+    // 3) 预检未命中(Origin 不匹配/方法不匹配/头未覆盖/无配置桶)→ 403 无弹头
+    for (origin, acrm, acrh, why) in [
+        ("foo.bar", "GET", "", "origin 不匹配"),
+        ("foo.suffix", "DELETE", "", "方法不在任何命中规则内"),
+        (
+            "https://any.example",
+            "PUT",
+            "authorization",
+            "请求头未覆盖",
+        ),
+    ] {
+        let mut rel = format!(
+            "OPTIONS /cors-bkt/obj HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\nAccess-Control-Request-Method: {acrm}\r\n"
+        );
+        if !acrh.is_empty() {
+            rel.push_str(&format!("Access-Control-Request-Headers: {acrh}\r\n"));
+        }
+        rel.push_str("\r\n");
+        let (s, headers, _) = client.send(rel.into_bytes()).await;
+        assert_eq!(s, 403, "{why}");
+        assert_eq!(
+            hdr_of(&headers, "access-control-allow-origin"),
+            None,
+            "{why}"
+        );
+    }
+    let rel = format!(
+        "OPTIONS /ghost-bucket/obj HTTP/1.1\r\nHost: {host}\r\nOrigin: foo.suffix\r\nAccess-Control-Request-Method: GET\r\n\r\n"
+    );
+    let (s, _, _) = client.send(rel.into_bytes()).await;
+    assert_eq!(s, 403, "无配置桶预检 → 403(AWS)");
+
+    // 4) 实际请求注头:签名 GET 不存在对象(404)带命中 Origin → 错误响应
+    // 也注入 CORS 头(s3-tests cors 族 404/403 带弹头断言;RGW 口径含
+    // Allow-Methods);未命中 Origin → 无弹头
+    let h = sigv4_headers(
+        &host,
+        "GET",
+        "/cors-bkt/nope",
+        &[],
+        &[("origin", "foo.suffix")],
+        b"",
+    );
+    let (s, headers, _) = client
+        .send(render_request("GET", "/cors-bkt/nope", &h, b""))
+        .await;
+    assert_eq!(s, 404);
+    assert_eq!(
+        hdr_of(&headers, "access-control-allow-origin").as_deref(),
+        Some("foo.suffix"),
+        "错误响应同样注头"
+    );
+    assert_eq!(
+        hdr_of(&headers, "access-control-allow-methods").as_deref(),
+        Some("GET")
+    );
+    let h = sigv4_headers(
+        &host,
+        "GET",
+        "/cors-bkt/nope",
+        &[],
+        &[("origin", "foo.bar")],
+        b"",
+    );
+    let (s, headers, _) = client
+        .send(render_request("GET", "/cors-bkt/nope", &h, b""))
+        .await;
+    assert_eq!(s, 404);
+    assert_eq!(hdr_of(&headers, "access-control-allow-origin"), None);
+
+    // ACRM 覆盖(RGW/s3-tests 口径,test_cors_origin_response):匿名 PUT
+    // (403)+ ACRM=GET → 按 GET 命中注头;ACRM=PUT/无 ACRM → PUT 不在
+    // *suffix 规则 → 无弹头
+    let rel = format!(
+        "PUT /cors-bkt/obj HTTP/1.1\r\nHost: {host}\r\nOrigin: foo.suffix\r\nAccess-Control-Request-Method: GET\r\nContent-Length: 0\r\n\r\n"
+    );
+    let (s, headers, _) = client.send(rel.into_bytes()).await;
+    assert_eq!(s, 403, "匿名写拒绝");
+    assert_eq!(
+        hdr_of(&headers, "access-control-allow-origin").as_deref(),
+        Some("foo.suffix"),
+        "ACRM=GET 按 GET 规则命中"
+    );
+    assert_eq!(
+        hdr_of(&headers, "access-control-allow-methods").as_deref(),
+        Some("GET")
+    );
+    let rel = format!(
+        "PUT /cors-bkt/obj HTTP/1.1\r\nHost: {host}\r\nOrigin: foo.suffix\r\nAccess-Control-Request-Method: DELETE\r\nContent-Length: 0\r\n\r\n"
+    );
+    let (s, headers, _) = client.send(rel.into_bytes()).await;
+    assert_eq!(s, 403);
+    assert_eq!(
+        hdr_of(&headers, "access-control-allow-origin"),
+        None,
+        "ACRM=DELETE 无任何规则命中"
+    );
+
+    // 5) 删除配置后 → 预检回到 403
+    let q = [("cors".to_string(), "".to_string())];
+    let h = sigv4_headers(&host, "DELETE", "/cors-bkt", &q, &[], b"");
+    let (s, _, _) = client
+        .send(render_request("DELETE", "/cors-bkt?cors", &h, b""))
+        .await;
+    assert_eq!(s, 204);
+    let rel = format!(
+        "OPTIONS /cors-bkt/obj HTTP/1.1\r\nHost: {host}\r\nOrigin: foo.suffix\r\nAccess-Control-Request-Method: GET\r\n\r\n"
+    );
+    let (s, _, _) = client.send(rel.into_bytes()).await;
+    assert_eq!(s, 403, "配置删除后预检不再放行");
+}

@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use crate::auth::{self, AuthOutcome, Authenticator, Credentials, PayloadHash};
 use crate::chunked::ChunkedSigV4Reader;
 use crate::error::{S3Error, S3ErrorCode};
-use crate::router::{Operation, Router};
+use crate::router::{Operation, Router, VersionIdArg};
 use crate::xml;
 
 /// 已解析的 HTTP 请求(由 fs3-http 构造)。
@@ -48,10 +48,13 @@ pub enum ResponseBody {
     Bytes(Vec<u8>),
     /// 对象数据流:HTTP 层按块拉取或零拷贝发送(range 已裁剪,
     /// offset/length 为实际区间;zc_segments 由服务层在同一锁内算好,
-    /// 避免 HTTP 层再次取锁)。
+    /// 避免 HTTP 层再次取锁)。`version` = ?versionId 寻址版本(ADR-11
+    /// §3.4.3;None = 当前版本),HTTP 层读取必须按同一版本取数。
     ObjectStream {
         bucket: String,
         key: String,
+        /// 寻址版本(None = 当前版本)。
+        version: Option<[u8; 16]>,
         /// 数据起始偏移(对象内)。
         offset: u64,
         /// 数据长度。
@@ -62,12 +65,17 @@ pub enum ResponseBody {
         zc_fd: Option<i32>,
         /// 读校验开关(开启时禁零拷贝)。
         zc_verify: bool,
+        /// 桶版本化状态(构造处已持有;F-1:HTTP 层逐块读取据此走 Off
+        /// 快速路径,免每块重复桶点读/版本反扫)。
+        versioning: fs3_core::VersioningState,
     },
     /// M9/B4:多段 Range → 206 multipart/byteranges。HTTP 层按段输出
     /// 边界帧 + 段数据(零拷贝禁用;Content-Length 已由服务层算好)。
     MultiRange {
         bucket: String,
         key: String,
+        /// 寻址版本(None = 当前版本)。
+        version: Option<[u8; 16]>,
         /// 归一化段列表(闭区间 [start, end])。
         ranges: Vec<(u64, u64)>,
         /// 对象总长(Content-Range 分母)。
@@ -76,6 +84,8 @@ pub enum ResponseBody {
         boundary: String,
         /// 每段头里的 Content-Type。
         part_content_type: String,
+        /// 桶版本化状态(同 ObjectStream.versioning)。
+        versioning: fs3_core::VersioningState,
     },
 }
 
@@ -118,6 +128,11 @@ pub struct S3Service {
     /// 密钥策略缓存(J4:access → Policy;None = 无策略 = 放行)。
     /// 与 meta 中 KeyRecord.policy 保持同步(启动恢复/写入时更新)。
     policies: std::sync::Mutex<std::collections::HashMap<String, Option<crate::policy::Policy>>>,
+    /// 桶策略缓存(M10 S3:bucket → Option<Policy>;None = 已确认无策略)。
+    /// 读穿透自 meta `bp:` 键(D9);PutBucketPolicy/DeleteBucketPolicy 写时
+    /// 失效,CreateBucket/DeleteBucket 同步失效(防删桶重建后陈旧策略复活)。
+    bucket_policies:
+        std::sync::Mutex<std::collections::HashMap<String, Option<crate::policy::Policy>>>,
 }
 
 fn header<'a>(req: &'a S3Request, name: &str) -> Option<&'a str> {
@@ -171,6 +186,7 @@ impl S3Service {
             last_peer: std::sync::Mutex::new(String::new()),
             limiter: Arc::new(crate::ratelimit::KeyLimiter::new()),
             policies: std::sync::Mutex::new(std::collections::HashMap::new()),
+            bucket_policies: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_clock_secs: std::sync::atomic::AtomicI64::new(unix_now() as i64),
         }
     }
@@ -389,38 +405,134 @@ impl S3Service {
             .and_then(|r| r.policy)
     }
 
-    /// J4 策略执行:已认证请求按密钥策略判定(默认拒绝)。
-    /// `action` 为审计操作名(如 PutObject);`bucket`/`key` 构成资源 ARN。
-    /// 无策略/未知密钥 → 放行(密钥有效性已由认证把关)。
+    /// 桶策略(M10 S3):读穿透缓存(meta `bp:` 键为权威;解析失败/无配置
+    /// → None——写入时已校验,解析失败仅可能源于外部篡改,按无策略处理并
+    /// 拒绝放行桶策略授权路径,不漏放)。
+    fn bucket_policy(&self, bucket: &str) -> Option<crate::policy::Policy> {
+        if let Some(hit) = self.bucket_policies.lock().unwrap().get(bucket) {
+            return hit.clone();
+        }
+        let parsed = self
+            .engine
+            .read()
+            .meta()
+            .bucket_conf(bucket, fs3_meta::BucketConf::Policy)
+            .ok()
+            .flatten()
+            .and_then(|b| String::from_utf8(b).ok())
+            .and_then(|t| crate::policy::Policy::parse(&t).ok());
+        self.bucket_policies
+            .lock()
+            .unwrap()
+            .insert(bucket.to_string(), parsed.clone());
+        parsed
+    }
+
+    /// 策略求值上下文(M10 S3 条件键):源 IP(连接对端,低精度——与审计同源)
+    /// + 列表 prefix/delimiter 查询参数。
+    fn policy_ctx(&self, req: &S3Request) -> crate::policy::EvalCtx {
+        let q = |name: &str| {
+            req.query
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.clone())
+        };
+        let peer = self.last_peer.lock().unwrap().clone();
+        let source_ip = peer.parse::<std::net::SocketAddr>().ok().map(|a| a.ip());
+        crate::policy::EvalCtx {
+            source_ip,
+            prefix: q("prefix"),
+            delimiter: q("delimiter"),
+        }
+    }
+
+    /// 匿名请求是否被桶策略显式授权(M10 S3;Principal "*" 且 Allow)。
+    fn anonymous_bucket_grant(
+        &self,
+        action: &str,
+        bucket: &str,
+        key: &str,
+        ctx: &crate::policy::EvalCtx,
+    ) -> bool {
+        if bucket.is_empty() {
+            return false;
+        }
+        let Some(p) = self.bucket_policy(bucket) else {
+            return false;
+        };
+        p.decide(action, &resource_arn(bucket, key), false, ctx) == crate::policy::Decision::Allow
+    }
+
+    /// J4+M10 S3 策略执行:密钥策略 × 桶策略双层求交(AWS 语义,单账号模型):
+    /// - 任一层显式 Deny → AccessDenied(Deny 优先,跨层生效);
+    /// - 已认证请求:两策略同属一账号,Allow 取并集——密钥无策略(隐式同账号
+    ///   全量,既有行为)或任一层 Allow → 放行;密钥有策略且两层均 NoMatch →
+    ///   拒绝(默认拒绝,J4 既有语义);
+    /// - 匿名请求:仅桶策略 Allow 放行;NoMatch 在此放行后由 require_auth 的
+    ///   全局匿名开关兜底(读)或拒绝(写);显式 Deny 在此直接拒绝。
+    ///
+    /// `action` 为审计操作名(如 PutObject;经 s3_action_name 归一为 S3 动作);
+    /// `bucket`/`key` 构成资源 ARN。无策略/未知密钥 → 放行(密钥有效性已由
+    /// 认证把关)。PostObject 不经此入口(键在表单体内,op_post_object 自判)。
     fn authorize(
         &self,
         access: Option<&str>,
         action: &str,
         bucket: &str,
         key: &str,
+        req: &S3Request,
     ) -> Result<(), S3Error> {
-        let Some(ak) = access else {
-            return Ok(());
+        use crate::policy::Decision;
+        let resource = resource_arn(bucket, key);
+        let action = s3_action_name(action, bucket, key);
+        let ctx = self.policy_ctx(req);
+        let denied = || {
+            S3Error::new(S3ErrorCode::AccessDenied).with_message(format!(
+                "access key {} is not authorized for {action} on {resource}",
+                access.unwrap_or("anonymous")
+            ))
         };
-        let policy = match self.policies.lock().unwrap().get(ak) {
-            Some(Some(p)) => p.clone(),
-            _ => return Ok(()),
+        // —— 密钥层(无策略 = NoMatch,是否放行由并集语义裁决)——
+        let mut key_has_policy = false;
+        let key_decision = match access {
+            Some(ak) => match self.policies.lock().unwrap().get(ak) {
+                Some(Some(p)) => {
+                    key_has_policy = true;
+                    p.decide(action, &resource, true, &ctx)
+                }
+                _ => Decision::NoMatch,
+            },
+            None => Decision::NoMatch,
         };
-        let resource = if bucket.is_empty() {
-            "*".to_string()
-        } else if key.is_empty() {
-            format!("arn:aws:s3:::{bucket}")
+        if key_decision == Decision::Deny {
+            return Err(denied());
+        }
+        // —— 桶层(服务级操作无桶 → NoMatch)——
+        let bucket_decision = if bucket.is_empty() {
+            Decision::NoMatch
         } else {
-            format!("arn:aws:s3:::{bucket}/{key}")
+            match self.bucket_policy(bucket) {
+                Some(p) => p.decide(action, &resource, access.is_some(), &ctx),
+                None => Decision::NoMatch,
+            }
         };
-        if policy.evaluate(action, &resource) {
-            Ok(())
-        } else {
-            Err(
-                S3Error::new(S3ErrorCode::AccessDenied).with_message(format!(
-                    "access key {ak} is not authorized for {action} on {resource}"
-                )),
-            )
+        if bucket_decision == Decision::Deny {
+            return Err(denied());
+        }
+        match access {
+            Some(_) => {
+                // 并集:无密钥策略(隐式放行)或任一层 Allow
+                if !key_has_policy
+                    || key_decision == Decision::Allow
+                    || bucket_decision == Decision::Allow
+                {
+                    Ok(())
+                } else {
+                    Err(denied())
+                }
+            }
+            // 匿名:显式 Deny 已在上方拒绝;Allow/NoMatch 交 require_auth 判定
+            None => Ok(()),
         }
     }
 
@@ -511,8 +623,12 @@ impl S3Service {
                     .with_message("Rate limit exceeded for this access key."));
             }
         }
-        // J4 密钥策略执行(Deny 优先;无匹配默认拒绝)
-        self.authorize(access.as_deref(), &name, &bucket, &key)?;
+        // J4 密钥策略 × M10 S3 桶策略双层求交(Deny 优先;同账号 Allow 并集)。
+        // PostObject 除外:键在表单体内,授权(含匿名桶策略放行)由
+        // op_post_object 解析后按真实键执行。
+        if name != "PostObject" {
+            self.authorize(access.as_deref(), &name, &bucket, &key, req)?;
+        }
         // M4 D4 掉盘只读降级:写方法在降级期拒绝(读不受影响)
         self.check_writable(req)?;
         let result = self.handle_inner(req);
@@ -699,12 +815,15 @@ impl S3Service {
 
     /// M9/A1:未实现头显式拒绝(红线 6:静默忽略客户端头 = 拒绝合入)。
     ///
-    /// - SSE 家族 / 对象标签 / Object Lock / 网站重定向 → 501 NotImplemented
+    /// - SSE 家族 / Object Lock / 网站重定向 → 501 NotImplemented
     ///   (错误码自带语义 "A header you provided implies functionality that is not implemented");
     /// - `x-amz-storage-class` 非 STANDARD → 400 InvalidStorageClass(与 AWS 同码);
     /// - ACL 家族在对象创建路径上**接受但不生效**(单账号私有默认;值合法性
     ///   单独校验,M9/C5 在 op_create_bucket/op_put_object_buffered 声明),
-    ///   不在此拒绝(兼容 s3-tests 建桶/传对象携带 ACL 的合法调用)。
+    ///   不在此拒绝(兼容 s3-tests 建桶/传对象携带 ACL 的合法调用);
+    /// - `x-amz-tagging`(M10 S1)已实现,不在此表:PutObject/CopyObject/
+    ///   CreateMultipartUpload 解析落 ObjectMeta.tags;其余写路径
+    ///   (UploadPart/CompleteMultipartUpload 等)携带 → 显式 400(见各 op)。
     fn check_unimplemented_headers(&self, req: &S3Request) -> Result<(), S3Error> {
         const UNSUPPORTED: &[&str] = &[
             "x-amz-server-side-encryption",
@@ -715,7 +834,6 @@ impl S3Service {
             "x-amz-server-side-encryption-customer-key",
             "x-amz-server-side-encryption-customer-key-md5",
             "x-amz-sse-kms-key-id",
-            "x-amz-tagging",
             "x-amz-object-lock-mode",
             "x-amz-object-lock-retain-until-date",
             "x-amz-object-lock-legal-hold",
@@ -742,6 +860,22 @@ impl S3Service {
     fn require_auth(&self, req: &S3Request) -> Result<Option<String>, S3Error> {
         let access = self.authenticate(req)?;
         if access.is_none() {
+            // M10 S3:桶策略可对匿名显式授权(Principal "*" 且 Allow;读写同口径)。
+            // 显式 Deny 已在 authorize 拒绝;NoMatch 落回既有语义(写拒绝/
+            // 读按 allow_anonymous 全局开关)。
+            {
+                let (_op, name, bucket, key) = route_op_bucket_key(req);
+                if !bucket.is_empty()
+                    && self.anonymous_bucket_grant(
+                        s3_action_name(&name, &bucket, &key),
+                        &bucket,
+                        &key,
+                        &self.policy_ctx(req),
+                    )
+                {
+                    return Ok(None);
+                }
+            }
             // REVIEW §3.5:allow_anonymous 仅开放「匿名公共读」(GET/HEAD),
             // 写操作(PUT/DELETE/POST 等)即使开启也必须携带有效签名。
             let read_only = matches!(req.method.as_str(), "GET" | "HEAD");
@@ -836,7 +970,12 @@ impl S3Service {
                 };
             }
         }
-        self.require_auth(req)?;
+        // M10 S4:PostObject 自带认证(表单签名/header 认证/匿名桶策略判定
+        // 在 op_post_object 内),跳过前置 require_auth——表单签名在请求体中,
+        // 此处的 header/query 认证必然判匿名而误拒。
+        if !matches!(op, Operation::PostObject { .. }) {
+            self.require_auth(req)?;
+        }
         // M9/A1:未实现头显式拒绝(先认证后验头,与 AWS 顺序一致)
         self.check_unimplemented_headers(req)?;
         let mut headers = self.base_headers();
@@ -851,12 +990,56 @@ impl S3Service {
             Operation::GetBucketVersioning { bucket } => {
                 Ok(self.op_get_bucket_versioning(&bucket)?)
             }
+            Operation::PutBucketVersioning { bucket, status } => {
+                Ok(self.op_put_bucket_versioning(&bucket, status)?)
+            }
+            // —— M10 S1/S2/S7:桶级标签 / CORS / OwnershipControls ——
+            Operation::PutBucketTagging { bucket, tags } => {
+                Ok(self.op_put_bucket_tagging(&bucket, &tags)?)
+            }
+            Operation::GetBucketTagging { bucket } => Ok(self.op_get_bucket_tagging(&bucket)?),
+            Operation::DeleteBucketTagging { bucket } => {
+                Ok(self.op_delete_bucket_tagging(&bucket)?)
+            }
+            Operation::PutBucketCors { bucket, rules } => {
+                Ok(self.op_put_bucket_cors(&bucket, &rules)?)
+            }
+            Operation::GetBucketCors { bucket } => Ok(self.op_get_bucket_cors(&bucket)?),
+            Operation::DeleteBucketCors { bucket } => Ok(self.op_delete_bucket_cors(&bucket)?),
+            Operation::PutBucketOwnershipControls { bucket, ownership } => {
+                Ok(self.op_put_bucket_ownership_controls(&bucket, ownership)?)
+            }
+            Operation::GetBucketOwnershipControls { bucket } => {
+                Ok(self.op_get_bucket_ownership_controls(&bucket)?)
+            }
+            Operation::DeleteBucketOwnershipControls { bucket } => {
+                Ok(self.op_delete_bucket_ownership_controls(&bucket)?)
+            }
+            // —— M10 S3:桶策略(D9 `bp:` 键) ——
+            Operation::PutBucketPolicy { bucket, body } => {
+                Ok(self.op_put_bucket_policy(&bucket, &body)?)
+            }
+            Operation::GetBucketPolicy { bucket } => Ok(self.op_get_bucket_policy(&bucket)?),
+            Operation::DeleteBucketPolicy { bucket } => Ok(self.op_delete_bucket_policy(&bucket)?),
+            // —— M10 S4:POST 表单上传 ——
+            Operation::PostObject { bucket } => self.op_post_object(req, &bucket),
             Operation::ListObjectVersions {
                 bucket,
                 prefix,
                 key_marker,
+                version_id_marker,
                 max_keys,
-            } => Ok(self.op_list_object_versions(&bucket, &prefix, &key_marker, max_keys)?),
+                delimiter,
+                encoding_type,
+            } => Ok(self.op_list_object_versions(
+                &bucket,
+                &prefix,
+                &key_marker,
+                version_id_marker.as_deref(),
+                max_keys,
+                delimiter.as_deref(),
+                encoding_type.as_deref(),
+            )?),
             Operation::ListObjectsV1 {
                 bucket,
                 prefix,
@@ -989,13 +1172,38 @@ impl S3Service {
                 Ok(self.op_put_object_buffered(req, &bucket, &key)?)
             }
             Operation::GetObjectAcl { bucket, key } => Ok(self.op_get_object_acl(&bucket, &key)?),
-            Operation::GetObject { bucket, key } => {
-                Ok(self.op_get_object(req, &bucket, &key, false)?)
-            }
-            Operation::HeadObject { bucket, key } => {
-                Ok(self.op_get_object(req, &bucket, &key, true)?)
-            }
-            Operation::DeleteObject { bucket, key } => Ok(self.op_delete_object(&bucket, &key)?),
+            // —— M10 S1:对象级标签(?versionId 按版本寻址) ——
+            Operation::PutObjectTagging {
+                bucket,
+                key,
+                version_id,
+                tags,
+            } => Ok(self.op_put_object_tagging(&bucket, &key, version_id, tags)?),
+            Operation::GetObjectTagging {
+                bucket,
+                key,
+                version_id,
+            } => Ok(self.op_get_object_tagging(&bucket, &key, version_id)?),
+            Operation::DeleteObjectTagging {
+                bucket,
+                key,
+                version_id,
+            } => Ok(self.op_delete_object_tagging(&bucket, &key, version_id)?),
+            Operation::GetObject {
+                bucket,
+                key,
+                version_id,
+            } => Ok(self.op_get_object(req, &bucket, &key, false, version_id)?),
+            Operation::HeadObject {
+                bucket,
+                key,
+                version_id,
+            } => Ok(self.op_get_object(req, &bucket, &key, true, version_id)?),
+            Operation::DeleteObject {
+                bucket,
+                key,
+                version_id,
+            } => Ok(self.op_delete_object(req, &bucket, &key, version_id)?),
             Operation::DeleteObjects {
                 bucket,
                 quiet,
@@ -1029,9 +1237,10 @@ impl S3Service {
                     .with_message("Rate limit exceeded for this access key."));
             }
         }
-        // J4 密钥策略执行(流式 PUT / UploadPart 同语义;认证失败在此体现为
-        // handle_inner 的 AccessDenied,策略判定对未认证请求直接放行)
-        if let Err(e) = self.authorize(access.as_deref(), &name, &bucket, &key) {
+        // J4 密钥策略 × M10 S3 桶策略双层求交(流式 PUT / UploadPart 同语义;
+        // 认证失败在此体现为 handle_inner 的 AccessDenied,策略判定对未认证
+        // 请求仅施加桶策略显式 Deny)
+        if let Err(e) = self.authorize(access.as_deref(), &name, &bucket, &key, req) {
             self.metrics.record_error(&e.code_name());
             self.audit_record(access.as_deref(), &name, &bucket, &key, e.status());
             return Err(e);
@@ -1126,18 +1335,30 @@ impl S3Service {
             StreamTarget::Object { bucket, .. } => bucket.as_str(),
             StreamTarget::Part { bucket, .. } => bucket.as_str(),
         };
-        {
+        let bucket_versioning = {
             let engine = self.engine.write();
-            if engine
+            engine
                 .meta()
                 .get_bucket(bucket_name)
                 .map_err(|e| map_engine_error(e, bucket_name, ""))?
-                .is_none()
-            {
-                return Err(
+                .ok_or_else(|| {
                     S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket_name)
-                );
-            }
+                })?
+                .versioning
+        };
+        // 条件写(ADR-11 D6;仅对象 PUT 语义;UploadPart 不适用,携带则
+        // 显式拒绝,不静默)
+        let precond = parse_write_precondition(req)?;
+        if precond.is_some() && matches!(target, StreamTarget::Part { .. }) {
+            return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                .with_message("conditional write headers are not valid for UploadPart"));
+        }
+        // M10 S1:x-amz-tagging 仅对象 PUT 语义(AWS);UploadPart 携带 →
+        // 显式拒绝(不静默忽略,红线)
+        let stream_tags = object_tags_header(req)?;
+        if stream_tags.is_some() && matches!(target, StreamTarget::Part { .. }) {
+            return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                .with_message("x-amz-tagging is not valid for UploadPart"));
         }
 
         // 载荷哈希处理(M9/D3:与缓冲 PUT 同一认证语义——header 认证
@@ -1167,17 +1388,28 @@ impl S3Service {
         };
 
         let mut engine = self.engine.write();
-        // 统一收口:执行写入(对象或分片),返回 (etag, 删除回滚闭包)。
+        // 统一收口:执行写入(对象或分片),返回 (etag, 对象版本视图——版本化
+        // 桶回滚/响应头用;分片为 None)。
         let write_once = |engine: &mut Engine,
                           reader: &mut dyn Read,
                           content_type: Option<&str>,
                           user_meta: Vec<(String, String)>,
                           resp_headers: Vec<(String, String)>|
-         -> Result<[u8; 16], S3Error> {
+         -> Result<([u8; 16], Option<fs3_core::ObjectMeta>), S3Error> {
             match &target {
                 StreamTarget::Object { bucket, key } => engine
-                    .put_with_meta(bucket, key, reader, content_type, user_meta, resp_headers)
-                    .map(|m| m.etag)
+                    .put_with_meta(
+                        bucket,
+                        key,
+                        reader,
+                        content_type,
+                        user_meta,
+                        resp_headers,
+                        // M10 S1:对象 PUT 落标签(Part 分支已在上游拒绝)
+                        stream_tags.clone().unwrap_or_default(),
+                        precond.as_ref(),
+                    )
+                    .map(|m| (m.etag, Some(m)))
                     .map_err(|e| map_engine_error(e, bucket, key)),
                 StreamTarget::Part {
                     bucket,
@@ -1188,21 +1420,28 @@ impl S3Service {
                     let _ = (bucket, key);
                     engine
                         .upload_part(upload_id, *part_number, reader)
-                        .map(|p| p.etag)
+                        .map(|p| (p.etag, None))
                         .map_err(|e| map_engine_error(e, bucket, key))
                 }
             }
         };
-        let rollback = |engine: &mut Engine| {
+        let rollback = |engine: &mut Engine, written: Option<&fs3_core::ObjectMeta>| {
             if let StreamTarget::Object { bucket, key } = &target {
-                let _ = engine.delete(bucket, key);
+                match written {
+                    // 版本化桶:精确删刚写入的版本/null 族条目(不能再
+                    // engine.delete——Enabled 桶会留下删除标记)
+                    Some(m) => rollback_put_version(engine, bucket, key, bucket_versioning, m),
+                    None => {
+                        let _ = engine.delete(bucket, key);
+                    }
+                }
             }
         };
-        let etag = match payload_hash {
+        let (etag, written_meta): ([u8; 16], Option<fs3_core::ObjectMeta>) = match payload_hash {
             PayloadHash::HexSha256(expected) => {
                 // 流式校验:边读边算,写后比对,不匹配删除
                 let mut hashing = HashingReader::new(reader);
-                let etag = write_once(
+                let (etag, m) = write_once(
                     &mut engine,
                     &mut hashing,
                     header(req, "content-type"),
@@ -1211,14 +1450,14 @@ impl S3Service {
                 )?;
                 let actual = hex::encode(hashing.finalize());
                 if !actual.eq_ignore_ascii_case(&expected) {
-                    rollback(&mut engine);
+                    rollback(&mut engine, m.as_ref());
                     // M9/B2:与缓冲路径同码 XAmzContentSHA256Mismatch
                     return Err(S3Error::new(S3ErrorCode::XAmzContentSHA256Mismatch)
                         .with_message(
                             "The provided 'x-amz-content-sha256' header does not match what was computed.",
                         ));
                 }
-                etag
+                (etag, m)
             }
             PayloadHash::Unsigned => write_once(
                 &mut engine,
@@ -1266,7 +1505,7 @@ impl S3Service {
                 base64::Engine::decode(&base64::engine::general_purpose::STANDARD, md5_b64)
                     .map_err(|_| S3Error::new(S3ErrorCode::InvalidDigest))?;
             if expected != etag {
-                rollback(&mut engine);
+                rollback(&mut engine, written_meta.as_ref());
                 return Err(S3Error::new(S3ErrorCode::BadDigest).with_message(
                     "The Content-MD5 you specified did not match what we received.",
                 ));
@@ -1275,6 +1514,14 @@ impl S3Service {
 
         let mut headers = self.base_headers();
         headers.push(("ETag".into(), format!("\"{}\"", hex::encode(etag))));
+        // V3-5 + V4:x-amz-version-id(Enabled = hex(vk);Suspended = "null";
+        // Off 不回)
+        if let Some(v) = written_meta
+            .as_ref()
+            .and_then(|m| write_version_id_header(bucket_versioning, m))
+        {
+            headers.push(("x-amz-version-id".into(), v));
+        }
         Ok(ServiceResponse {
             status: 200,
             headers,
@@ -1283,10 +1530,16 @@ impl S3Service {
     }
 
     /// 对象流分块读取(HTTP 层调用;每块上锁;从对象内 offset 起,至多 length 字节)。
+    /// `version` = ?versionId 寻址版本(None = 当前版本;ADR-11 §3.4.3)。
+    /// `versioning` = 响应构造处持有的桶版本化状态(F-1:Off 桶每块解析
+    /// 走单键点读快速路径,不反扫、不重复点读桶 meta)。
+    #[allow(clippy::too_many_arguments)]
     pub fn read_stream_chunk(
         &self,
         bucket: &str,
         key: &str,
+        version: Option<&[u8; 16]>,
+        versioning: fs3_core::VersioningState,
         offset: u64,
         length: u64,
         pos: &mut u64,
@@ -1299,22 +1552,29 @@ impl S3Service {
         // 读路径:读锁(读并发;write 锁会让流式 GET 互相串行)
         let engine = self.engine.read();
         engine
-            .read_at(bucket, key, offset + *pos, &mut buf[..want])
+            .read_at_version_for(
+                bucket,
+                key,
+                version,
+                offset + *pos,
+                &mut buf[..want],
+                versioning,
+            )
             .inspect(|&n| {
                 *pos += n as u64;
             })
             .map_err(|e| map_engine_error(e, bucket, key))
     }
 
-    /// 对象大小(流头部计算 Content-Length 用)。
+    /// 对象大小(流头部计算 Content-Length 用;当前版本,D1a 裁决)。
     pub fn object_size(&self, bucket: &str, key: &str) -> Result<u64, S3Error> {
         let engine = self.engine.write();
-        match engine
-            .head(bucket, key)
-            .map_err(|e| map_engine_error(e, bucket, key))?
-        {
-            Some(m) => Ok(m.size),
-            None => Err(S3Error::new(S3ErrorCode::NoSuchKey).with_extra("Key", key)),
+        match engine.head_version(bucket, key, None) {
+            Ok(m) => Ok(m.size),
+            Err(CoreError::DeleteMarker(_)) | Err(CoreError::NotFound(_)) => {
+                Err(S3Error::new(S3ErrorCode::NoSuchKey).with_extra("Key", key))
+            }
+            Err(e) => Err(map_engine_error(e, bucket, key)),
         }
     }
 
@@ -1411,11 +1671,35 @@ impl S3Service {
             stats: Default::default(),
             quota: None,
             created_with_acl: has_acl_headers(req),
+            // M10/ADR-11:新桶默认未版本化;v1.2/v1.3 桶级配置占位
+            versioning: fs3_core::VersioningState::Off,
+            default_encryption: None,
+            object_lock: false,
         };
         engine
             .meta()
             .commit_bucket_put_with_location(bucket, &meta, location.unwrap_or(""))
             .map_err(|e| map_engine_error(e, bucket, ""))?;
+        // M10 S3:桶策略缓存防御性失效(删后重建 = 全新桶,不继承旧策略)
+        self.bucket_policies.lock().unwrap().remove(bucket);
+        // M10 S7:CreateBucket 的 x-amz-object-ownership 头(AWS ObjectOwnership
+        // 参数;单账号下语义恒等,见 xml::ObjectOwnership 裁决注释)→ 落 D9
+        // `bo:` 键。非法值 → 400 显式拒绝(不静默忽略,红线)。
+        // 独立事务:与建桶事务间的崩溃窗口仅表现为配置缺失,客户端可重试补齐。
+        if let Some(raw) = header(req, "x-amz-object-ownership") {
+            let ownership = xml::ObjectOwnership::parse(raw).ok_or_else(|| {
+                S3Error::new(S3ErrorCode::InvalidArgument)
+                    .with_message(format!("Invalid x-amz-object-ownership header: {raw}"))
+            })?;
+            engine
+                .meta()
+                .commit_bucket_conf_put(
+                    bucket,
+                    fs3_meta::BucketConf::Ownership,
+                    xml::render_ownership_controls(ownership).as_bytes(),
+                )
+                .map_err(|e| map_engine_error(e, bucket, ""))?;
+        }
         Ok(ServiceResponse {
             status: 200,
             headers: vec![("Location".into(), format!("/{bucket}"))],
@@ -1443,6 +1727,8 @@ impl S3Service {
             .meta()
             .commit_bucket_delete(bucket)
             .map_err(|e| map_engine_error(e, bucket, ""))?;
+        // M10 S3:桶策略缓存失效(bp: 键已随删桶事务清理)
+        self.bucket_policies.lock().unwrap().remove(bucket);
         Ok(ServiceResponse {
             status: 204,
             headers: vec![],
@@ -1495,15 +1781,16 @@ impl S3Service {
 
     fn op_get_bucket_versioning(&self, bucket: &str) -> Result<ServiceResponse, S3Error> {
         let engine = self.engine.read();
-        if engine
+        let bkt = engine
             .meta()
             .get_bucket(bucket)
-            .map_err(|e| map_engine_error(e, bucket, ""))?
-            .is_none()
-        {
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        let Some(bkt) = bkt else {
             return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
-        }
-        let xml = xml::render_versioning_not_enabled();
+        };
+        // V3-1:Enabled/Suspended 返回真实配置;Off/未版本化桶保持空配置
+        // 200(现状兼容,s3-tests check_versioning(bucket, None) 依赖)
+        let xml = xml::render_versioning(bkt.versioning);
         Ok(ServiceResponse {
             status: 200,
             headers: vec![
@@ -1514,15 +1801,535 @@ impl S3Service {
         })
     }
 
-    /// ListObjectVersions。桶未启用版本时 AWS 仍为每个对象返回一个
-    /// `<Version>` 条目(VersionId=null,IsLatest=true),s3-tests 等
-    /// 客户端依赖它做对象枚举与清理;按 KeyMarker 分页。
-    fn op_list_object_versions(
+    /// PutBucketVersioning(ADR-11 D1;V3-1):状态机转换(Off→Enabled/
+    /// Suspended,Enabled↔Suspended;Enabled→Off 拒绝),单事务更新
+    /// BucketMeta v2 versioning(l: location 等其余字段不动)。
+    /// 权限口径与既有桶级写操作一致(handle_inner 统一认证 + 策略执行)。
+    fn op_put_bucket_versioning(
         &self,
         bucket: &str,
-        prefix: &str,
-        key_marker: &str,
-        max_keys: u32,
+        status: xml::VersioningStatus,
+    ) -> Result<ServiceResponse, S3Error> {
+        let target = match status {
+            xml::VersioningStatus::Enabled => fs3_core::VersioningState::Enabled,
+            xml::VersioningStatus::Suspended => fs3_core::VersioningState::Suspended,
+        };
+        let engine = self.engine.write();
+        let bkt = engine
+            .meta()
+            .get_bucket(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        let Some(bkt) = bkt else {
+            return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
+        };
+        validate_versioning_transition(bkt.versioning, target)?;
+        engine
+            .meta()
+            .commit_bucket_set_versioning(bucket, target)
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        Ok(ServiceResponse {
+            status: 200,
+            headers: vec![],
+            body: ResponseBody::Empty,
+        })
+    }
+
+    // ───────────────── M10 S1/S2/S7:桶级配置文档(ADR-11 D8/D9) ─────────────────
+
+    /// D9 配置文档读辅助:桶不存在 → NoSuchBucket;无配置 → None。
+    fn read_bucket_conf(
+        &self,
+        bucket: &str,
+        conf: fs3_meta::BucketConf,
+    ) -> Result<Option<Vec<u8>>, S3Error> {
+        let engine = self.engine.read();
+        if engine
+            .meta()
+            .get_bucket(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?
+            .is_none()
+        {
+            return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
+        }
+        engine
+            .meta()
+            .bucket_conf(bucket, conf)
+            .map_err(|e| map_engine_error(e, bucket, ""))
+    }
+
+    /// D9 配置文档写辅助(桶不存在 → NoSuchBucket;值 = 规范化 XML)。
+    fn write_bucket_conf(
+        &self,
+        bucket: &str,
+        conf: fs3_meta::BucketConf,
+        doc: String,
+    ) -> Result<ServiceResponse, S3Error> {
+        let engine = self.engine.write();
+        engine
+            .meta()
+            .commit_bucket_conf_put(bucket, conf, doc.as_bytes())
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        Ok(ServiceResponse {
+            status: 200,
+            headers: vec![],
+            body: ResponseBody::Empty,
+        })
+    }
+
+    /// D9 配置文档删辅助(AWS 幂等:无配置同样 204;桶不存在 → NoSuchBucket)。
+    fn delete_bucket_conf(
+        &self,
+        bucket: &str,
+        conf: fs3_meta::BucketConf,
+    ) -> Result<ServiceResponse, S3Error> {
+        let engine = self.engine.write();
+        engine
+            .meta()
+            .commit_bucket_conf_delete(bucket, conf)
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        Ok(ServiceResponse {
+            status: 204,
+            headers: vec![],
+            body: ResponseBody::Empty,
+        })
+    }
+
+    fn xml_response(xml: String) -> ServiceResponse {
+        ServiceResponse {
+            status: 200,
+            headers: vec![
+                ("Content-Type".into(), "application/xml".into()),
+                ("Content-Length".into(), xml.len().to_string()),
+            ],
+            body: ResponseBody::Bytes(xml.into_bytes()),
+        }
+    }
+
+    /// PutBucketTagging(M10 S1):桶级标签落 D9 `bt:` 键(ADR-11 D8 裁决;
+    /// 标签集 ≤50,路由层已校验;规范化 XML 入库)。
+    fn op_put_bucket_tagging(
+        &self,
+        bucket: &str,
+        tags: &[(String, String)],
+    ) -> Result<ServiceResponse, S3Error> {
+        self.write_bucket_conf(
+            bucket,
+            fs3_meta::BucketConf::Tagging,
+            xml::render_tagging(tags),
+        )
+    }
+
+    /// GetBucketTagging(M10 S1):无标签配置 → 404 NoSuchTagSet(AWS 桶级
+    /// 语义,s3-tests test_set_bucket_tagging 依赖;与对象级空 TagSet 不同)。
+    fn op_get_bucket_tagging(&self, bucket: &str) -> Result<ServiceResponse, S3Error> {
+        match self.read_bucket_conf(bucket, fs3_meta::BucketConf::Tagging)? {
+            Some(doc) => Ok(Self::xml_response(
+                String::from_utf8_lossy(&doc).into_owned(),
+            )),
+            None => Err(S3Error::new(S3ErrorCode::NoSuchTagSet)),
+        }
+    }
+
+    fn op_delete_bucket_tagging(&self, bucket: &str) -> Result<ServiceResponse, S3Error> {
+        self.delete_bucket_conf(bucket, fs3_meta::BucketConf::Tagging)
+    }
+
+    /// PutBucketCors(M10 S2):配置文档落 D9 `bc:` 键(ADR-11 D9;可达数 KB
+    /// 不并入 BucketMeta);规则路由层已解析校验,规范化 XML 入库。
+    fn op_put_bucket_cors(
+        &self,
+        bucket: &str,
+        rules: &[xml::CorsRule],
+    ) -> Result<ServiceResponse, S3Error> {
+        self.write_bucket_conf(
+            bucket,
+            fs3_meta::BucketConf::Cors,
+            xml::render_cors_configuration(rules),
+        )
+    }
+
+    /// GetBucketCors(M10 S2):无配置 → 404 NoSuchCORSConfiguration(AWS)。
+    fn op_get_bucket_cors(&self, bucket: &str) -> Result<ServiceResponse, S3Error> {
+        match self.read_bucket_conf(bucket, fs3_meta::BucketConf::Cors)? {
+            Some(doc) => Ok(Self::xml_response(
+                String::from_utf8_lossy(&doc).into_owned(),
+            )),
+            None => Err(S3Error::new(S3ErrorCode::NoSuchCORSConfiguration)),
+        }
+    }
+
+    fn op_delete_bucket_cors(&self, bucket: &str) -> Result<ServiceResponse, S3Error> {
+        self.delete_bucket_conf(bucket, fs3_meta::BucketConf::Cors)
+    }
+
+    /// PutBucketOwnershipControls(M10 S7):单账号模型下三值语义恒等(见
+    /// xml::ObjectOwnership 裁决注释),配置落 D9 `bo:` 键原样回显。
+    fn op_put_bucket_ownership_controls(
+        &self,
+        bucket: &str,
+        ownership: xml::ObjectOwnership,
+    ) -> Result<ServiceResponse, S3Error> {
+        self.write_bucket_conf(
+            bucket,
+            fs3_meta::BucketConf::Ownership,
+            xml::render_ownership_controls(ownership),
+        )
+    }
+
+    /// GetBucketOwnershipControls(M10 S7):无配置 → 404
+    /// OwnershipControlsNotFoundError(AWS,s3-tests ownership 族依赖)。
+    fn op_get_bucket_ownership_controls(&self, bucket: &str) -> Result<ServiceResponse, S3Error> {
+        match self.read_bucket_conf(bucket, fs3_meta::BucketConf::Ownership)? {
+            Some(doc) => Ok(Self::xml_response(
+                String::from_utf8_lossy(&doc).into_owned(),
+            )),
+            None => Err(S3Error::new(S3ErrorCode::OwnershipControlsNotFoundError)),
+        }
+    }
+
+    fn op_delete_bucket_ownership_controls(
+        &self,
+        bucket: &str,
+    ) -> Result<ServiceResponse, S3Error> {
+        self.delete_bucket_conf(bucket, fs3_meta::BucketConf::Ownership)
+    }
+
+    // ───────────────── M10 S3:桶策略(D9 `bp:` 键) ─────────────────
+
+    /// PutBucketPolicy(M10 S3):JSON body 解析校验(Policy::parse;失败 →
+    /// 400 MalformedPolicy,不放行不写库——红线),**原文逐字节**落 D9 `bp:`
+    /// 键(GET 逐字节回显;s3-tests test_set_get_del_bucket_policy 断言
+    /// policy_document == response['Policy'])。缓存写时更新。
+    fn op_put_bucket_policy(&self, bucket: &str, body: &[u8]) -> Result<ServiceResponse, S3Error> {
+        let text = std::str::from_utf8(body).map_err(|_| {
+            S3Error::new(S3ErrorCode::MalformedPolicy).with_message("policy is not valid UTF-8")
+        })?;
+        let parsed = crate::policy::Policy::parse(text)
+            .map_err(|e| S3Error::new(S3ErrorCode::MalformedPolicy).with_message(format!("{e}")))?;
+        {
+            let engine = self.engine.write();
+            engine
+                .meta()
+                .commit_bucket_conf_put(bucket, fs3_meta::BucketConf::Policy, body)
+                .map_err(|e| map_engine_error(e, bucket, ""))?;
+        }
+        self.bucket_policies
+            .lock()
+            .unwrap()
+            .insert(bucket.to_string(), Some(parsed));
+        Ok(ServiceResponse {
+            status: 204,
+            headers: vec![],
+            body: ResponseBody::Empty,
+        })
+    }
+
+    /// GetBucketPolicy(M10 S3):无配置 → 404 NoSuchBucketPolicy(AWS);
+    /// Content-Type application/json,body 为写入时原文。
+    fn op_get_bucket_policy(&self, bucket: &str) -> Result<ServiceResponse, S3Error> {
+        match self.read_bucket_conf(bucket, fs3_meta::BucketConf::Policy)? {
+            Some(doc) => Ok(ServiceResponse {
+                status: 200,
+                headers: vec![
+                    ("Content-Type".into(), "application/json".into()),
+                    ("Content-Length".into(), doc.len().to_string()),
+                ],
+                body: ResponseBody::Bytes(doc),
+            }),
+            None => Err(S3Error::new(S3ErrorCode::NoSuchBucketPolicy)),
+        }
+    }
+
+    /// DeleteBucketPolicy(M10 S3):无配置 → 404 NoSuchBucketPolicy(任务书
+    /// 口径;AWS 对存在的策略删除返回 204)。缓存写时失效。
+    fn op_delete_bucket_policy(&self, bucket: &str) -> Result<ServiceResponse, S3Error> {
+        if self
+            .read_bucket_conf(bucket, fs3_meta::BucketConf::Policy)?
+            .is_none()
+        {
+            return Err(S3Error::new(S3ErrorCode::NoSuchBucketPolicy));
+        }
+        let resp = self.delete_bucket_conf(bucket, fs3_meta::BucketConf::Policy)?;
+        self.bucket_policies
+            .lock()
+            .unwrap()
+            .insert(bucket.to_string(), None);
+        Ok(resp)
+    }
+
+    // ───────────────── M10 S4:POST 表单上传 ─────────────────
+
+    /// PostObject(M10 S4;AWS Browser-Based Uploads using POST 子集)。
+    ///
+    /// 流程:multipart 解析 → key/文件提取 → 表单签名(SigV4/SigV2)或
+    /// header 认证或匿名 → POST policy 条件校验(过期/逐条比对/字段覆盖,
+    /// 失败不放行)→ 密钥×桶策略双层求交(动作 s3:PutObject,匿名仅桶策略
+    /// Allow)→ 复用缓冲 PUT 口径写对象(版本化桶 = 新版本,沿用 V3)→
+    /// 按 success_action_status/redirect 成形响应。
+    fn op_post_object(&self, req: &S3Request, bucket: &str) -> Result<ServiceResponse, S3Error> {
+        // 仅 multipart/form-data 受理;其他 Content-Type 维持原 MethodNotAllowed
+        let ct = header(req, "content-type").unwrap_or("");
+        let boundary = crate::post::multipart_boundary(ct)
+            .ok_or_else(|| S3Error::new(S3ErrorCode::MethodNotAllowed))?;
+        let form =
+            crate::post::PostForm::from_parts(crate::post::parse_multipart(&req.body, &boundary)?)?;
+        // key:必备;${filename} 代入文件部分文件名
+        let raw_key = form.field("key").ok_or_else(|| {
+            S3Error::new(S3ErrorCode::UserKeyMustBeSpecified)
+                .with_message("The bucket POST must contain the specified field name: key")
+        })?;
+        let key = if raw_key.contains("${filename}") {
+            raw_key.replace("${filename}", form.file_name.as_deref().unwrap_or(""))
+        } else {
+            raw_key.to_string()
+        };
+        if key.is_empty() {
+            return Err(S3Error::new(S3ErrorCode::UserKeyMustBeSpecified));
+        }
+        // 5TiB 上限预拒绝(与缓冲 PUT 同口径)
+        if form.file.len() as u64 > fs3_core::MAX_OBJECT_SIZE {
+            return Err(S3Error::new(S3ErrorCode::EntityTooLarge)
+                .with_message("Object exceeds the 5TiB maximum object size."));
+        }
+
+        // —— 认证与 policy 文档 ——
+        let identity: Option<String> = match form.field("policy") {
+            Some(policy_b64) => {
+                // 表单签名必须存在且通过(缺签名族字段 → 400;伪造 → 403)
+                let access = crate::post::verify_form_signature(
+                    &form,
+                    policy_b64,
+                    &self.region,
+                    |a| self.auth.find_key_by_access(a).map(|c| c.secret_key),
+                    std::time::SystemTime::now(),
+                )?
+                .ok_or_else(|| {
+                    S3Error::new(S3ErrorCode::InvalidArgument)
+                        .with_message("POST policy requires a signature field")
+                })?;
+                let policy =
+                    crate::post::PostPolicy::parse(&crate::post::decode_policy_field(policy_b64)?)?;
+                policy.verify(bucket, &key, &form, unix_now() as i64)?;
+                Some(access)
+            }
+            None => {
+                // 无 policy 字段:header 认证(AWS:已认证 POST 可不携 policy)
+                // 或匿名(仅桶策略显式 Allow 放行,见下方求交)
+                let outcome = self.auth.verify_header_auth(
+                    &req.method,
+                    &req.raw_path,
+                    &req.query,
+                    &req.headers,
+                )?;
+                match outcome {
+                    crate::auth::AuthOutcome::Authenticated {
+                        access_key,
+                        payload_hash,
+                        ..
+                    } => {
+                        // header 签名声明的载荷哈希必须与实际体一致(防篡改)
+                        if let crate::auth::PayloadHash::HexSha256(expected) = &payload_hash {
+                            let actual = hex::encode(Sha256::digest(&req.body));
+                            if !actual.eq_ignore_ascii_case(expected) {
+                                return Err(S3Error::new(S3ErrorCode::XAmzContentSHA256Mismatch)
+                                    .with_message(
+                                        "The provided 'x-amz-content-sha256' header does not match what was computed.",
+                                    ));
+                            }
+                        }
+                        Some(access_key)
+                    }
+                    // 预签名 query 或无签名 → 交 authenticate 统一判定(匿名 → None)
+                    crate::auth::AuthOutcome::Anonymous => self.authenticate(req)?,
+                }
+            }
+        };
+
+        // —— 密钥策略 × 桶策略双层求交(动作 s3:PutObject)——
+        match &identity {
+            Some(ak) => self.authorize(Some(ak), "PutObject", bucket, &key, req)?,
+            None => {
+                if !self.anonymous_bucket_grant("PutObject", bucket, &key, &self.policy_ctx(req)) {
+                    return Err(S3Error::new(S3ErrorCode::AccessDenied));
+                }
+            }
+        }
+
+        // acl 字段:已知 canned 值接受但不生效(单账号私有默认,同 PUT 口径);
+        // 未知值 → 400(显式,不静默)
+        if let Some(acl) = form.field("acl") {
+            const KNOWN: &[&str] = &[
+                "private",
+                "public-read",
+                "public-read-write",
+                "authenticated-read",
+                "aws-exec-read",
+                "bucket-owner-read",
+                "bucket-owner-full-control",
+            ];
+            if !KNOWN.iter().any(|c| acl.eq_ignore_ascii_case(c)) {
+                return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                    .with_message(format!("The canned ACL you provided is not valid: {acl}")));
+            }
+        }
+        // 标签:M10 S1 落 ObjectMeta.tags。`tagging` 字段 = XML TagSet
+        // (RGW/s3-tests post_object_tags_* 口径);`x-amz-tagging` 字段 =
+        // URL-encoded(AWS 文档口径)。两者同现 → 400(不静默择一)。
+        let tags = match (form.field("tagging"), form.field("x-amz-tagging")) {
+            (Some(_), Some(_)) => {
+                return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                    .with_message("only one of tagging / x-amz-tagging may be specified"))
+            }
+            (Some(xml_text), None) => {
+                crate::xml::parse_tagging(xml_text.as_bytes(), crate::xml::MAX_OBJECT_TAGS)?
+            }
+            (None, Some(raw)) => crate::xml::parse_tagging_header(raw)?,
+            (None, None) => Vec::new(),
+        };
+        let user_meta: Vec<(String, String)> = form
+            .fields
+            .iter()
+            .filter(|(k, _)| k.starts_with("x-amz-meta-"))
+            .cloned()
+            .collect();
+        // 标准回显头字段(与 PUT 路径 resp_headers 同键名,GET/HEAD 回显)
+        let mut resp_headers = Vec::new();
+        for f in [
+            "cache-control",
+            "content-disposition",
+            "content-encoding",
+            "expires",
+        ] {
+            if let Some(v) = form.field(f) {
+                resp_headers.push((f.to_string(), v.to_string()));
+            }
+        }
+        let content_type = form.field("content-type");
+
+        // 桶必须存在(AWS:NoSuchBucket)+ 取版本化状态(响应头口径同 V3-5)
+        let bucket_versioning = {
+            let engine = self.engine.read();
+            engine
+                .meta()
+                .get_bucket(bucket)
+                .map_err(|e| map_engine_error(e, bucket, ""))?
+                .ok_or_else(|| {
+                    S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket)
+                })?
+                .versioning
+        };
+        let mut engine = self.engine.write();
+        let meta = engine
+            .put_with_meta(
+                bucket,
+                &key,
+                &mut std::io::Cursor::new(form.file.clone()),
+                content_type,
+                user_meta,
+                resp_headers,
+                tags,
+                None,
+            )
+            .map_err(|e| map_engine_error(e, bucket, &key))?;
+        let etag = meta.etag_full();
+        let mut base = vec![("ETag".into(), format!("\"{etag}\""))];
+        if let Some(v) = write_version_id_header(bucket_versioning, &meta) {
+            base.push(("x-amz-version-id".into(), v));
+        }
+
+        // —— 响应成形:redirect 优先(AWS);否则 success_action_status ——
+        let redirect = form
+            .field("success_action_redirect")
+            .or_else(|| form.field("redirect"));
+        if let Some(url) = redirect {
+            let sep = if url.contains('?') { "&" } else { "?" };
+            let location = format!(
+                "{url}{sep}bucket={}&key={}&etag=%22{}%22",
+                crate::auth::uri_encode(bucket),
+                crate::auth::uri_encode(&key),
+                crate::auth::uri_encode(&etag),
+            );
+            base.push(("Location".into(), location));
+            return Ok(ServiceResponse {
+                status: 303,
+                headers: base,
+                body: ResponseBody::Empty,
+            });
+        }
+        match form.field("success_action_status") {
+            Some("200") => Ok(ServiceResponse {
+                status: 200,
+                headers: base,
+                body: ResponseBody::Empty,
+            }),
+            Some("201") => {
+                let host = header(req, "host").unwrap_or("localhost");
+                let xml = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<PostResponse>\
+                     <Location>http://{}/{}/{}</Location><Bucket>{}</Bucket><Key>{}</Key>\
+                     <ETag>&quot;{}&quot;</ETag></PostResponse>",
+                    host,
+                    bucket,
+                    crate::error::escape_xml(&key),
+                    crate::error::escape_xml(bucket),
+                    crate::error::escape_xml(&key),
+                    etag,
+                );
+                base.push(("Content-Type".into(), "application/xml".into()));
+                base.push(("Content-Length".into(), xml.len().to_string()));
+                Ok(ServiceResponse {
+                    status: 201,
+                    headers: base,
+                    body: ResponseBody::Bytes(xml.into_bytes()),
+                })
+            }
+            // 204(默认);非法值按 204 处理(AWS:忽略非法 success_action_status)
+            _ => Ok(ServiceResponse {
+                status: 204,
+                headers: base,
+                body: ResponseBody::Empty,
+            }),
+        }
+    }
+
+    // ───────────────── M10 S1:对象级标签 ─────────────────
+
+    /// PutObjectTagging(?versionId 按版本寻址;覆盖语义):命中删除标记/缺失
+    /// 版本的错误口径与 GetObject 一致(405/404;引擎 set_object_tags)。
+    fn op_put_object_tagging(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionIdArg>,
+        tags: Vec<(String, String)>,
+    ) -> Result<ServiceResponse, S3Error> {
+        let mut engine = self.engine.write();
+        if engine
+            .meta()
+            .get_bucket(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?
+            .is_none()
+        {
+            return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
+        }
+        let vk = version_id.map(|v| v.vk());
+        engine
+            .set_object_tags(bucket, key, vk.as_ref(), tags)
+            .map_err(|e| self.tagging_op_error(e, bucket, key, version_id))?;
+        Ok(ServiceResponse {
+            status: 200,
+            headers: vec![],
+            body: ResponseBody::Empty,
+        })
+    }
+
+    /// GetObjectTagging:无标签对象 → 200 空 TagSet(AWS 对象级语义;
+    /// 桶级才是 404 NoSuchTagSet)。
+    fn op_get_object_tagging(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionIdArg>,
     ) -> Result<ServiceResponse, S3Error> {
         let engine = self.engine.read();
         if engine
@@ -1533,26 +2340,144 @@ impl S3Service {
         {
             return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
         }
-        // rocksdb 前缀扫描天然按 key 字典序。
-        let all = engine
-            .list_objects(bucket, prefix)
-            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        let vk = version_id.map(|v| v.vk());
+        let meta = engine
+            .head_version(bucket, key, vk.as_ref())
+            .map_err(|e| self.tagging_op_error(e, bucket, key, version_id))?;
+        Ok(Self::xml_response(xml::render_tagging(&meta.tags)))
+    }
+
+    /// DeleteObjectTagging(清空 tags;AWS 204)。
+    fn op_delete_object_tagging(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionIdArg>,
+    ) -> Result<ServiceResponse, S3Error> {
+        let mut engine = self.engine.write();
+        if engine
+            .meta()
+            .get_bucket(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?
+            .is_none()
+        {
+            return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
+        }
+        let vk = version_id.map(|v| v.vk());
+        engine
+            .set_object_tags(bucket, key, vk.as_ref(), Vec::new())
+            .map_err(|e| self.tagging_op_error(e, bucket, key, version_id))?;
+        Ok(ServiceResponse {
+            status: 204,
+            headers: vec![],
+            body: ResponseBody::Empty,
+        })
+    }
+
+    /// 对象标签族错误映射(与 op_get_object 同口径):删除标记 → 带
+    /// versionId 405 / 无 versionId 404;版本不存在 → NoSuchVersion;
+    /// 对象不存在 → NoSuchKey。
+    fn tagging_op_error(
+        &self,
+        e: CoreError,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionIdArg>,
+    ) -> S3Error {
+        match e {
+            CoreError::DeleteMarker(disp) => delete_marker_error(&disp, key, version_id.is_some()),
+            CoreError::NotFound(_) => match &version_id {
+                Some(v) => no_such_version_error(key, v),
+                None => S3Error::new(S3ErrorCode::NoSuchKey).with_extra("Key", key),
+            },
+            other => map_engine_error(other, bucket, key),
+        }
+    }
+
+    /// M10 S2:桶级 CORS 规则评估(HTTP 层预检/实际请求注头用;免认证——
+    /// 浏览器预检不带签名,AWS 同)。命中 → 放行参数;桶不存在/无配置/
+    /// 无命中规则 → None(HTTP 层:预检 403,实际请求不注头)。
+    /// `request_headers`:预检的 Access-Control-Request-Headers 原值;
+    /// 实际请求传 None(头校验只在预检)。
+    pub fn cors_eval(
+        &self,
+        host: &str,
+        path: &str,
+        origin: &str,
+        method: &str,
+        request_headers: Option<&str>,
+    ) -> Option<xml::CorsAllow> {
+        let bucket = self.router.bucket_name_of(host, path)?;
+        let engine = self.engine.read();
+        let doc = engine
+            .meta()
+            .bucket_conf(&bucket, fs3_meta::BucketConf::Cors)
+            .ok()??;
+        let rules = xml::parse_cors_configuration(&doc).ok()?;
+        xml::match_cors_rule(&rules, origin, method, request_headers)
+    }
+
+    /// ListObjectVersions(ADR-11 §3.4.4 + D1a-3;V3-3 全语义):
+    /// Version/DeleteMarker 两类条目、IsLatest(D1a)、KeyMarker/VersionIdMarker
+    /// 条目级分页、delimiter 分组、encoding-type=url。
+    /// 未版本化桶保持现状桩语义(每对象一条 VersionId=null IsLatest=true;
+    /// s3-tests nuke_bucket 依赖)——由 meta 层统一实现天然覆盖。
+    #[allow(clippy::too_many_arguments)]
+    fn op_list_object_versions(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        key_marker: &str,
+        version_id_marker: Option<&str>,
+        max_keys: u32,
+        delimiter: Option<&str>,
+        encoding_type: Option<&str>,
+    ) -> Result<ServiceResponse, S3Error> {
+        let engine = self.engine.read();
+        if engine
+            .meta()
+            .get_bucket(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?
+            .is_none()
+        {
+            return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
+        }
         // max-keys=0 → 空页且不截断(AWS 语义),避免空 NextKeyMarker 死循环。
         let max = max_keys.min(1000) as usize;
-        let (items, truncated) = if max == 0 {
-            (Vec::new(), false)
+        let page = if max == 0 {
+            fs3_meta::VersionListPage::default()
         } else {
-            let mut iter = all.into_iter().filter(|(k, _)| k.as_str() > key_marker);
-            let items: Vec<(String, fs3_core::ObjectMeta)> = iter.by_ref().take(max).collect();
-            (items, iter.next().is_some())
+            let vm = version_id_marker.map(parse_version_marker_vk).transpose()?;
+            let km = if key_marker.is_empty() {
+                None
+            } else {
+                Some(key_marker)
+            };
+            engine
+                .meta()
+                .list_versions_page(bucket, prefix, delimiter, km, vm.as_ref(), max)
+                .map_err(|e| map_engine_error(e, bucket, ""))?
         };
+        // 截断游标:版本条目 → (key, VersionId 展示串);公共前缀 → (前缀, 无)
+        let next = page
+            .truncated
+            .then(|| {
+                page.last_scanned
+                    .as_ref()
+                    .map(|(k, v)| (k.as_str(), v.as_ref().map(version_marker_display)))
+            })
+            .flatten();
+        let next = next.as_ref().map(|(k, v)| (*k, v.as_deref()));
         let xml = xml::render_list_object_versions(
             bucket,
             prefix,
             key_marker,
+            version_id_marker,
             max_keys.min(1000),
-            &items,
-            truncated,
+            &page,
+            next,
+            delimiter,
+            encoding_type,
             &self.owner,
         );
         Ok(ServiceResponse {
@@ -1777,24 +2702,26 @@ impl S3Service {
         };
 
         // 桶必须存在(AWS:NoSuchBucket;引擎报 NotFound 会被映射成 NoSuchKey)
-        {
+        let bucket_versioning = {
             let engine = self.engine.write();
-            if engine
+            engine
                 .meta()
                 .get_bucket(bucket)
                 .map_err(|e| map_engine_error(e, bucket, ""))?
-                .is_none()
-            {
-                return Err(
+                .ok_or_else(|| {
                     S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket)
-                );
-            }
-        }
+                })?
+                .versioning
+        };
 
         let mut engine = self.engine.write();
         // M9/A1 配套:ACL 家族头显式校验(接受但不生效,单账号私有默认语义;
         // 非法值显式报错,不静默)
         validate_canned_acl(req)?;
+        // M10 S1:x-amz-tagging 头 → ObjectMeta.tags(非法 → 400 InvalidTag)
+        let tags = object_tags_header(req)?.unwrap_or_default();
+        // 条件写(ADR-11 D6;V3-4):判定在引擎写锁内对当前版本元数据执行
+        let precond = parse_write_precondition(req)?;
         let meta = engine
             .put_with_meta(
                 bucket,
@@ -1803,16 +2730,23 @@ impl S3Service {
                 header(req, "content-type"),
                 user_meta(req),
                 resp_headers_from(req),
+                tags,
+                precond.as_ref(),
             )
             .map_err(|e| map_engine_error(e, bucket, key))?;
         if md5_ok == Some(false) {
-            let _ = engine.delete(bucket, key);
+            rollback_put_version(&mut engine, bucket, key, bucket_versioning, &meta);
             return Err(S3Error::new(S3ErrorCode::BadDigest)
                 .with_message("The Content-MD5 you specified did not match what we received."));
         }
+        let mut headers = vec![("ETag".into(), format!("\"{}\"", meta.etag_full()))];
+        // V3-5 + V4:x-amz-version-id(Enabled = hex;Suspended = "null";Off 不回)
+        if let Some(v) = write_version_id_header(bucket_versioning, &meta) {
+            headers.push(("x-amz-version-id".into(), v));
+        }
         Ok(ServiceResponse {
             status: 200,
-            headers: vec![("ETag".into(), format!("\"{}\"", meta.etag_full()))],
+            headers,
             body: ResponseBody::Empty,
         })
     }
@@ -1823,23 +2757,35 @@ impl S3Service {
         bucket: &str,
         key: &str,
         head_only: bool,
+        version_id: Option<VersionIdArg>,
     ) -> Result<ServiceResponse, S3Error> {
         let engine = self.engine.read();
-        if engine
+        let bkt = engine
             .meta()
             .get_bucket(bucket)
-            .map_err(|e| map_engine_error(e, bucket, ""))?
-            .is_none()
-        {
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        let Some(bkt) = bkt else {
             return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
-        }
-        let meta = match engine
-            .head(bucket, key)
-            .map_err(|e| map_engine_error(e, bucket, key))?
-        {
-            Some(m) => m,
-            None => return Err(S3Error::new(S3ErrorCode::NoSuchKey).with_extra("Key", key)),
         };
+        // ?versionId 寻址(ADR-11 §3.4.3):None = 当前版本(D1a 裁决);
+        // 命中删除标记 → 无 versionId 404 / 带 versionId 405(均带
+        // x-amz-delete-marker + x-amz-version-id);版本不存在 → NoSuchVersion
+        let vk = version_id.map(|v| v.vk());
+        let meta = match engine.head_version_for(bucket, key, vk.as_ref(), bkt.versioning) {
+            Ok(m) => m,
+            Err(CoreError::DeleteMarker(disp)) => {
+                return Err(delete_marker_error(&disp, key, version_id.is_some()))
+            }
+            Err(CoreError::NotFound(_)) => {
+                return Err(match &version_id {
+                    Some(v) => no_such_version_error(key, v),
+                    None => S3Error::new(S3ErrorCode::NoSuchKey).with_extra("Key", key),
+                })
+            }
+            Err(e) => return Err(map_engine_error(e, bucket, key)),
+        };
+        // 响应携带所读版本的 x-amz-version-id(版本化桶;Off 无头)
+        let resp_version_id = version_id_response_header(bkt.versioning, &meta);
 
         // 条件头:先 412 组,后 304 组(AWS 顺序)
         if let Some(etag) = header(req, "if-match") {
@@ -1858,13 +2804,13 @@ impl S3Service {
         if let Some(etag) = header(req, "if-none-match") {
             let etag = etag.trim().trim_matches('"').to_string();
             if etag == "*" || etag == meta.etag_full() {
-                return Err(S3Error::new(S3ErrorCode::NotModified));
+                return Err(not_modified_error(&meta));
             }
         }
         if let Some(since) = header(req, "if-modified-since") {
             if let Some(ts) = parse_http_date(since) {
                 if meta.mtime <= ts {
-                    return Err(S3Error::new(S3ErrorCode::NotModified));
+                    return Err(not_modified_error(&meta));
                 }
             }
         }
@@ -1897,11 +2843,18 @@ impl S3Service {
                     ("Accept-Ranges".into(), "bytes".into()),
                     ("Content-Length".into(), "0".into()),
                 ];
+                if let Some(v) = &resp_version_id {
+                    headers.push(("x-amz-version-id".into(), v.clone()));
+                }
                 for (k, v) in &meta.user_meta {
                     headers.push((k.clone(), v.clone()));
                 }
                 for (k, v) in &meta.resp_headers {
                     headers.push((k.clone(), v.clone()));
+                }
+                // M10 S1:对象带标签时回显数量(AWS:仅对象有标签时返回该头)
+                if !meta.tags.is_empty() {
+                    headers.push(("x-amz-tagging-count".into(), meta.tags.len().to_string()));
                 }
                 let total = meta.size;
                 let len = multipart_byte_length(&boundary, &meta.content_type, parts, total);
@@ -1920,10 +2873,12 @@ impl S3Service {
                         ResponseBody::MultiRange {
                             bucket: bucket.to_string(),
                             key: key.to_string(),
+                            version: vk,
                             ranges: parts.iter().map(|p| (p.start, p.end)).collect(),
                             total,
                             boundary,
                             part_content_type: meta.content_type.clone(),
+                            versioning: bkt.versioning,
                         }
                     },
                 });
@@ -1954,12 +2909,20 @@ impl S3Service {
         headers.push(("Last-Modified".into(), xml::http_date(meta.mtime)));
         headers.push(("Accept-Ranges".into(), "bytes".into()));
         headers.push(("Content-Length".into(), content_length.to_string()));
+        if let Some(v) = &resp_version_id {
+            headers.push(("x-amz-version-id".into(), v.clone()));
+        }
         for (k, v) in &meta.user_meta {
             headers.push((k.clone(), v.clone()));
         }
         // M9/C3:回显头(Content-Encoding/Cache-Control/Expires)
         for (k, v) in &meta.resp_headers {
             headers.push((k.clone(), v.clone()));
+        }
+        // M10 S1:对象带标签时回显数量(AWS:仅对象有标签时返回该头;
+        // s3-tests test_get_obj_head_tagging 依赖)
+        if !meta.tags.is_empty() {
+            headers.push(("x-amz-tagging-count".into(), meta.tags.len().to_string()));
         }
         if is_range {
             // S3 Content-Range 为闭区间:start-(end-1)/size
@@ -1977,9 +2940,16 @@ impl S3Service {
             });
         }
 
-        // 零拷贝段(同一锁内算好,避免 HTTP 层重复取锁)
+        // 零拷贝段(同一锁内算好,避免 HTTP 层重复取锁;版本寻址形态)
         let zc_segments = engine
-            .object_segments(bucket, key, start, content_length)
+            .object_segments_version_for(
+                bucket,
+                key,
+                vk.as_ref(),
+                start,
+                content_length,
+                bkt.versioning,
+            )
             .ok()
             .flatten();
         let zc_fd = engine.zc_fd();
@@ -1990,11 +2960,13 @@ impl S3Service {
             body: ResponseBody::ObjectStream {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
+                version: vk,
                 offset: start,
                 length: content_length,
                 zc_segments,
                 zc_fd,
                 zc_verify,
+                versioning: bkt.versioning,
             },
         })
     }
@@ -2010,12 +2982,13 @@ impl S3Service {
         {
             return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
         }
-        if engine
-            .head(bucket, key)
-            .map_err(|e| map_engine_error(e, bucket, key))?
-            .is_none()
-        {
-            return Err(S3Error::new(S3ErrorCode::NoSuchKey).with_extra("Key", key));
+        if let Err(e) = engine.head_version(bucket, key, None) {
+            return Err(match e {
+                CoreError::DeleteMarker(_) | CoreError::NotFound(_) => {
+                    S3Error::new(S3ErrorCode::NoSuchKey).with_extra("Key", key)
+                }
+                other => map_engine_error(other, bucket, key),
+            });
         }
         let xml = xml::render_access_control_policy(&self.owner);
         Ok(ServiceResponse {
@@ -2045,6 +3018,13 @@ impl S3Service {
         {
             return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
         }
+        // 条件写头(ADR-11 D6)在 CompleteMultipartUpload 判定(AWS 语义);
+        // Create 携带 → 显式拒绝,不静默忽略(红线)
+        if parse_write_precondition(req)?.is_some() {
+            return Err(S3Error::new(S3ErrorCode::InvalidArgument).with_message(
+                "conditional write headers are only evaluated at CompleteMultipartUpload",
+            ));
+        }
         // 惰性过期回收(每次创建顺带扫一遍,成本可忽略的规模)
         let _ = engine.sweep_expired_sessions(fs3_core::MULTIPART_TTL_SECS);
         let uid = engine
@@ -2056,6 +3036,9 @@ impl S3Service {
                 // M9/C3:Create 时携带的回显头(Content-Encoding 等)随会话
                 // 落到 Complete 后的对象上
                 resp_headers_from(req),
+                // M10 S1:x-amz-tagging 随会话落到 Complete 后的对象上
+                // (s3-tests test_set_multipart_tagging)
+                object_tags_header(req)?.unwrap_or_default(),
             )
             .map_err(|e| map_engine_error(e, bucket, key))?;
         let xml = xml::render_initiate_multipart(bucket, key, &uid);
@@ -2082,6 +3065,12 @@ impl S3Service {
         if req.body.len() as u64 > fs3_core::MAX_PART_SIZE {
             return Err(S3Error::new(S3ErrorCode::InvalidPart)
                 .with_message("Part size exceeds the 5GiB per-part limit."));
+        }
+        // M10 S1:x-amz-tagging 仅 Create 时携带(AWS);UploadPart 携带 →
+        // 显式拒绝(不静默忽略,红线)
+        if header(req, "x-amz-tagging").is_some() {
+            return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                .with_message("x-amz-tagging is not valid for UploadPart"));
         }
         let mut engine = self.engine.write();
         if engine
@@ -2110,7 +3099,7 @@ impl S3Service {
     #[allow(clippy::too_many_arguments)]
     fn op_upload_part_copy(
         &self,
-        _req: &S3Request,
+        req: &S3Request,
         bucket: &str,
         _key: &str,
         part_number: u32,
@@ -2118,6 +3107,17 @@ impl S3Service {
         copy_source: &xml::CopySource,
         copy_source_range: Option<&str>,
     ) -> Result<ServiceResponse, S3Error> {
+        // 源版本寻址(ADR-11 §3.4.5)目前仅 CopyObject 落地;UploadPartCopy
+        // 携带 versionId → 显式拒绝(不静默忽略,红线)
+        if copy_source.version_id.is_some() {
+            return Err(S3Error::new(S3ErrorCode::NotImplemented)
+                .with_message("UploadPartCopy with a source versionId is not implemented"));
+        }
+        // M10 S1:x-amz-tagging 仅 Create 时携带(AWS);显式拒绝不静默
+        if header(req, "x-amz-tagging").is_some() {
+            return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                .with_message("x-amz-tagging is not valid for UploadPartCopy"));
+        }
         let mut engine = self.engine.write();
         if engine
             .meta()
@@ -2136,13 +3136,14 @@ impl S3Service {
             return Err(S3Error::new(S3ErrorCode::NoSuchBucket)
                 .with_extra("BucketName", &copy_source.bucket));
         }
-        // 源大小(范围校验用)
-        let src_meta = engine
-            .head(&copy_source.bucket, &copy_source.key)
-            .map_err(|e| map_engine_error(e, &copy_source.bucket, &copy_source.key))?
-            .ok_or_else(|| {
-                S3Error::new(S3ErrorCode::NoSuchKey).with_extra("Key", &copy_source.key)
-            })?;
+        // 源大小(范围校验用;当前版本 D1a 裁决——删除标记当前 → NoSuchKey)
+        let src_meta = match engine.head_version(&copy_source.bucket, &copy_source.key, None) {
+            Ok(m) => m,
+            Err(CoreError::DeleteMarker(_)) | Err(CoreError::NotFound(_)) => {
+                return Err(S3Error::new(S3ErrorCode::NoSuchKey).with_extra("Key", &copy_source.key))
+            }
+            Err(e) => return Err(map_engine_error(e, &copy_source.bucket, &copy_source.key)),
+        };
         let range = match copy_source_range {
             Some(r) => parse_copy_range(r, src_meta.size)?,
             None => 0..src_meta.size,
@@ -2180,7 +3181,25 @@ impl S3Service {
             return Err(S3Error::new(S3ErrorCode::MalformedXML)
                 .with_message("The XML you provided was not well-formed or did not validate against our published schema"));
         }
+        // M10 S1:标签仅 Create 时携带(AWS);Complete 携带 → 显式拒绝不静默
+        if header(req, "x-amz-tagging").is_some() {
+            return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                .with_message("x-amz-tagging is not valid for CompleteMultipartUpload"));
+        }
         let mut engine = self.engine.write();
+        let bucket_versioning = engine
+            .meta()
+            .get_bucket(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?
+            .map(|b| b.versioning)
+            .unwrap_or_default();
+        // 条件写(ADR-11 D6;AWS 语义:Complete 携带 If-Match/If-None-Match
+        // 时对新对象的当前版本判定;引擎写锁内执行,check-then-act 原子)
+        if let Some(p) = parse_write_precondition(req)? {
+            engine
+                .check_put_precondition(bucket, key, &p)
+                .map_err(|e| map_engine_error(e, bucket, key))?;
+        }
         let meta = engine
             .complete_multipart(bucket, key, upload_id, parts)
             .map_err(|e| map_engine_error(e, bucket, key))?;
@@ -2190,13 +3209,19 @@ impl S3Service {
             key,
             &format!("\"{}\"", meta.etag_full()),
         );
+        let mut headers = vec![
+            ("Content-Type".into(), "application/xml".into()),
+            ("Content-Length".into(), xml.len().to_string()),
+            ("ETag".into(), format!("\"{}\"", meta.etag_full())),
+        ];
+        // V3-5 + V4:x-amz-version-id(Enabled = hex;Suspended = "null";
+        // Off 不回)
+        if let Some(v) = write_version_id_header(bucket_versioning, &meta) {
+            headers.push(("x-amz-version-id".into(), v));
+        }
         Ok(ServiceResponse {
             status: 200,
-            headers: vec![
-                ("Content-Type".into(), "application/xml".into()),
-                ("Content-Length".into(), xml.len().to_string()),
-                ("ETag".into(), format!("\"{}\"", meta.etag_full())),
-            ],
+            headers,
             body: ResponseBody::Bytes(xml.into_bytes()),
         })
     }
@@ -2353,20 +3378,19 @@ impl S3Service {
         part_number: u32,
     ) -> Result<ServiceResponse, S3Error> {
         let engine = self.engine.read();
-        if engine
+        let bkt = engine
             .meta()
             .get_bucket(bucket)
-            .map_err(|e| map_engine_error(e, bucket, ""))?
-            .is_none()
-        {
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        let Some(bkt) = bkt else {
             return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
-        }
-        let meta = match engine
-            .head(bucket, key)
-            .map_err(|e| map_engine_error(e, bucket, key))?
-        {
-            Some(m) => m,
-            None => return Err(S3Error::new(S3ErrorCode::NoSuchKey).with_extra("Key", key)),
+        };
+        let meta = match engine.head_version_for(bucket, key, None, bkt.versioning) {
+            Ok(m) => m,
+            Err(CoreError::DeleteMarker(_)) | Err(CoreError::NotFound(_)) => {
+                return Err(S3Error::new(S3ErrorCode::NoSuchKey).with_extra("Key", key))
+            }
+            Err(e) => return Err(map_engine_error(e, bucket, key)),
         };
         let part_count = meta.parts.len() as u32;
         let (start, length) = if meta.parts.is_empty() {
@@ -2405,7 +3429,7 @@ impl S3Service {
             });
         }
         let zc_segments = engine
-            .object_segments(bucket, key, start, length)
+            .object_segments_version_for(bucket, key, None, start, length, bkt.versioning)
             .ok()
             .flatten();
         let zc_fd = engine.zc_fd();
@@ -2416,11 +3440,13 @@ impl S3Service {
             body: ResponseBody::ObjectStream {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
+                version: None,
                 offset: start,
                 length,
                 zc_segments,
                 zc_fd,
                 zc_verify,
+                versioning: bkt.versioning,
             },
         })
     }
@@ -2448,20 +3474,44 @@ impl S3Service {
                     .with_message(format!("Unknown metadata directive: {other}")))
             }
         };
+        // M10 S1:x-amz-tagging-directive(默认 COPY = 复制源标签;REPLACE =
+        // 采用 x-amz-tagging 头新标签,头缺席则清空)。头携带但指令非
+        // REPLACE → 显式 400(不静默忽略,红线);非法指令值 → 400。
+        let tagging_directive = match header(req, "x-amz-tagging-directive") {
+            None => None,
+            Some(d) if d.eq_ignore_ascii_case("COPY") => Some("COPY"),
+            Some(d) if d.eq_ignore_ascii_case("REPLACE") => Some("REPLACE"),
+            Some(other) => {
+                return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                    .with_message(format!("Unknown tagging directive: {other}")))
+            }
+        };
+        let new_tags = object_tags_header(req)?;
+        if new_tags.is_some() && tagging_directive != Some("REPLACE") {
+            return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                .with_message("x-amz-tagging requires x-amz-tagging-directive: REPLACE"));
+        }
+        let replace_tags = if tagging_directive == Some("REPLACE") {
+            Some(new_tags.unwrap_or_default())
+        } else {
+            None
+        };
         // 复制到自身:必须 REPLACE(否则 InvalidRequest)
         if directive == "COPY" && copy_source.bucket == bucket && copy_source.key == key {
             return Err(S3Error::new(S3ErrorCode::InvalidRequest)
                 .with_message("This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes."));
         }
         let mut engine = self.engine.write();
-        if engine
+        let dst_versioning = match engine
             .meta()
             .get_bucket(bucket)
             .map_err(|e| map_engine_error(e, bucket, ""))?
-            .is_none()
         {
-            return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
-        }
+            Some(b) => b.versioning,
+            None => {
+                return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket))
+            }
+        };
         if engine
             .meta()
             .get_bucket(&copy_source.bucket)
@@ -2471,13 +3521,62 @@ impl S3Service {
             return Err(S3Error::new(S3ErrorCode::NoSuchBucket)
                 .with_extra("BucketName", &copy_source.bucket));
         }
-        let src_meta = engine
-            .head(&copy_source.bucket, &copy_source.key)
-            .map_err(|e| map_engine_error(e, &copy_source.bucket, &copy_source.key))?
-            .ok_or_else(|| {
-                S3Error::new(S3ErrorCode::NoSuchKey).with_extra("Key", &copy_source.key)
-            })?;
-        // 复制条件头(412 PreconditionFailed)
+        // 源版本寻址(ADR-11 §3.4.5;V3-2):copy-source ?versionId= 解析
+        // ("null" → null 族;32 hex → 精确版本;非法 → 400)
+        let src_varg = match copy_source.version_id.as_deref() {
+            Some("null") => Some(VersionIdArg::Null),
+            Some(s) if s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                let mut vk = [0u8; 16];
+                hex::decode_to_slice(s, &mut vk).map_err(|_| {
+                    S3Error::new(S3ErrorCode::InvalidArgument)
+                        .with_message("Invalid version id specified")
+                })?;
+                Some(VersionIdArg::Vk(vk))
+            }
+            Some(_) => {
+                return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                    .with_message("Invalid version id specified"))
+            }
+            None => None,
+        };
+        let src_vk = src_varg.map(|v| v.vk());
+        // 源读取(条件判定基准 = 所寻址版本;删除标记版本是合法复制源,
+        // §3.4.5 复制其元数据标记,由引擎 copy_object_version 落目标标记)
+        let src_meta =
+            match engine.head_version(&copy_source.bucket, &copy_source.key, src_vk.as_ref()) {
+                Ok(m) => m,
+                Err(CoreError::DeleteMarker(_)) => {
+                    // 源为删除标记:无 versionId → 视为对象不存在(AWS:当前
+                    // 版本是删除标记 = 对象已删除);带 versionId → 复制标记本身
+                    let Some(v) = src_varg else {
+                        return Err(S3Error::new(S3ErrorCode::NoSuchKey)
+                            .with_extra("Key", &copy_source.key));
+                    };
+                    // 条件头对标记条目判定(etag 全零/mtime 为标记时间;
+                    // read_delete_target 原样返回标记,null 族双形态正确寻址)
+                    match engine.read_delete_target(
+                        &copy_source.bucket,
+                        &copy_source.key,
+                        src_vk.as_ref(),
+                    ) {
+                        Ok(Some(m)) => m,
+                        Ok(None) => return Err(no_such_version_error(&copy_source.key, &v)),
+                        Err(e) => {
+                            return Err(map_engine_error(e, &copy_source.bucket, &copy_source.key))
+                        }
+                    }
+                }
+                Err(CoreError::NotFound(_)) => {
+                    return Err(match &src_varg {
+                        Some(v) => no_such_version_error(&copy_source.key, v),
+                        None => {
+                            S3Error::new(S3ErrorCode::NoSuchKey).with_extra("Key", &copy_source.key)
+                        }
+                    })
+                }
+                Err(e) => return Err(map_engine_error(e, &copy_source.bucket, &copy_source.key)),
+            };
+        // 复制条件头(412 PreconditionFailed;按所寻址版本判定,§3.4.5)
         if let Some(em) = if_match {
             if !etag_matches(&src_meta.etag_full(), em) {
                 return Err(S3Error::new(S3ErrorCode::PreconditionFailed).with_message(
@@ -2520,55 +3619,120 @@ impl S3Service {
             (None, None, None)
         };
         let meta = engine
-            .copy_object(
+            .copy_object_version_for(
                 &copy_source.bucket,
                 &copy_source.key,
+                src_vk.as_ref(),
                 bucket,
                 key,
                 ct,
                 um.as_deref(),
                 rh.as_deref(),
+                replace_tags.as_deref(),
+                dst_versioning,
             )
             .map_err(|e| map_engine_error(e, &copy_source.bucket, &copy_source.key))?;
         let xml = xml::render_copy_object(&meta.etag_full(), &xml::ts_to_rfc3339(meta.mtime));
+        let mut headers = vec![
+            ("Content-Type".into(), "application/xml".into()),
+            ("Content-Length".into(), xml.len().to_string()),
+        ];
+        // V3-5 + V4:x-amz-copy-source-version-id(源带版本寻址时回显);
+        // x-amz-version-id(目标 Enabled = hex;Suspended = "null";Off 无头)
+        if let Some(v) = &src_varg {
+            headers.push(("x-amz-copy-source-version-id".into(), v.display()));
+        }
+        if let Some(v) = write_version_id_header(dst_versioning, &meta) {
+            headers.push(("x-amz-version-id".into(), v));
+        }
         Ok(ServiceResponse {
             status: 200,
-            headers: vec![
-                ("Content-Type".into(), "application/xml".into()),
-                ("Content-Length".into(), xml.len().to_string()),
-            ],
+            headers,
             body: ResponseBody::Bytes(xml.into_bytes()),
         })
     }
 
-    fn op_delete_object(&self, bucket: &str, key: &str) -> Result<ServiceResponse, S3Error> {
+    /// DELETE Object(ADR-11 §3.4.3 + D6;V3-2/V3-4):
+    /// - 无 versionId:版本化桶 = 插删除标记(204 + x-amz-delete-marker +
+    ///   x-amz-version-id);Off 桶 = 物理删除(逐字节不变);
+    /// - 带 versionId:物理删除指定版本(幂等 204;版本不存在同样 204;
+    ///   Off 桶非 null versionId → 404 NoSuchVersion);
+    /// - 条件删除(if-match 族):对所寻址版本/当前版本判定,目标不存在 →
+    ///   放行(幂等),不匹配 → 412(引擎写锁内 check-then-act)。
+    fn op_delete_object(
+        &self,
+        req: &S3Request,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionIdArg>,
+    ) -> Result<ServiceResponse, S3Error> {
         let mut engine = self.engine.write();
         // M9/②组:桶已删除后再删键 → NoSuchBucket(AWS/RGW 语义;
         // s3-tests test_object_delete_key_bucket_gone)
-        if engine
+        let bkt = engine
             .meta()
             .get_bucket(bucket)
-            .map_err(|e| map_engine_error(e, bucket, ""))?
-            .is_none()
-        {
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        let Some(bkt) = bkt else {
             return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
+        };
+        // Off 桶带非 null versionId → 该版本必不存在 → 404 NoSuchVersion
+        // (null = 未版本化对象自身,AWS 语义,放行由引擎物理删除)
+        if bkt.versioning == fs3_core::VersioningState::Off {
+            if let Some(v @ VersionIdArg::Vk(_)) = version_id {
+                return Err(no_such_version_error(key, &v));
+            }
         }
-        // S3 语义:删除不存在的对象返回 204(幂等)
-        let _ = engine
-            .delete(bucket, key)
+        let vk = version_id.map(|v| v.vk());
+        // 条件删除(D6):目标 = 所寻址版本(无 versionId = D1a 当前版本);
+        // 不存在 → 放行(幂等 204);存在(含删除标记)→ 逐条判定
+        if let Some(p) = parse_write_precondition(req)? {
+            let target = engine
+                .read_delete_target(bucket, key, vk.as_ref())
+                .map_err(|e| map_engine_error(e, bucket, key))?;
+            p.check_delete(target.as_ref())
+                .map_err(|e| map_engine_error(e, bucket, key))?;
+        }
+        let deleted = engine
+            .delete_version_for(bucket, key, vk, bkt.versioning)
             .map_err(|e| map_engine_error(e, bucket, key))?;
+        let mut headers: Vec<(String, String)> = Vec::new();
+        match (&version_id, &deleted) {
+            // 版本定向删除:回显 VersionId;删掉的是删除标记 → 补
+            // x-amz-delete-marker(AWS 语义;幂等删除不存在版本只回显)
+            (Some(v), d) => {
+                headers.push(("x-amz-version-id".into(), v.display()));
+                if let Some(m) = d {
+                    if m.is_delete_marker {
+                        headers.push(("x-amz-delete-marker".into(), "true".into()));
+                    }
+                }
+            }
+            // 无 versionId:版本化桶新建删除标记 → 双头;Off 无头(零变化)
+            (None, Some(m)) if m.is_delete_marker => {
+                headers.push(("x-amz-delete-marker".into(), "true".into()));
+                if let Some(v) = version_id_response_header(bkt.versioning, m) {
+                    headers.push(("x-amz-version-id".into(), v));
+                }
+            }
+            _ => {}
+        }
         Ok(ServiceResponse {
             status: 204,
-            headers: vec![],
+            headers,
             body: ResponseBody::Empty,
         })
     }
 
+    /// DeleteObjects(ADR-11 §3.4.4 + D6;V3-4):条目 VersionId 扩展
+    /// ("null"/真实 hex/删除标记版本);版本化桶无 VersionId 条目 = 每 key
+    /// 插删除标记;逐条条件元素(ETag/LastModifiedTime/Size)判定,不匹配
+    /// → 该条 PreconditionFailed 错误项。
     fn op_delete_objects(
         &self,
         bucket: &str,
         quiet: bool,
-        keys: &[(String, Option<String>)],
+        keys: &[xml::DeleteObjectEntry],
     ) -> Result<ServiceResponse, S3Error> {
         // M9/D1:单请求键数上限 1000(AWS 语义;超限显式 400,防超大体 DoS)
         if keys.len() > 1000 {
@@ -2577,32 +3741,132 @@ impl S3Service {
             ));
         }
         let mut engine = self.engine.write();
-        if engine
+        let bkt = engine
             .meta()
             .get_bucket(bucket)
-            .map_err(|e| map_engine_error(e, bucket, ""))?
-            .is_none()
-        {
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        let Some(bkt) = bkt else {
             return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
-        }
-        let mut deleted: Vec<(String, bool)> = Vec::new();
+        };
+        let mut deleted: Vec<xml::DeletedEntry> = Vec::new();
         let mut errors: Vec<(String, &str, &str)> = Vec::new();
-        for (key, version) in keys {
-            // 版本未启用:仅接受 VersionId=null(缺省同义);其它版本 ID 拒绝。
-            if let Some(v) = version {
-                if v != "null" {
+        for entry in keys {
+            let key = entry.key.as_str();
+            // 条目 VersionId:"null" → null 族;32 hex → 精确版本;非法 →
+            // 该条 InvalidArgument(沿用现状口径)
+            let varg = match entry.version_id.as_deref() {
+                Some("null") => Some(VersionIdArg::Null),
+                Some(s) if s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                    let mut vk = [0u8; 16];
+                    match hex::decode_to_slice(s, &mut vk) {
+                        Ok(()) => Some(VersionIdArg::Vk(vk)),
+                        Err(_) => {
+                            errors.push((
+                                key.into(),
+                                "InvalidArgument",
+                                "Invalid version id specified",
+                            ));
+                            continue;
+                        }
+                    }
+                }
+                Some(_) => {
                     errors.push((
-                        key.clone(),
+                        key.into(),
                         "InvalidArgument",
                         "Invalid version id specified",
                     ));
                     continue;
                 }
+                None => None,
+            };
+            // Off 桶 + 非 null VersionId → 该版本必不存在(现状口径:
+            // InvalidArgument 错误项)
+            if bkt.versioning == fs3_core::VersioningState::Off
+                && matches!(varg, Some(VersionIdArg::Vk(_)))
+            {
+                errors.push((
+                    key.into(),
+                    "InvalidArgument",
+                    "Invalid version id specified",
+                ));
+                continue;
             }
-            match engine.delete(bucket, key) {
-                Ok(_) => deleted.push((key.clone(), true)),
+            // 逐条条件删除元素(D6):对所寻址目标判定;不存在 → 放行(幂等)
+            let precond = {
+                let mut p = fs3_engine::WritePrecondition::default();
+                if let Some(e) = &entry.etag {
+                    p.if_match = Some(vec![e.clone()]);
+                }
+                if let Some(lm) = &entry.last_modified {
+                    // V6-1 实测:botocore 对该 XML 元素按 RFC 7231 IMF-fixdate
+                    // 序列化("Thu, 01 Jan 2015 00:00:00 GMT"),非 ISO8601;
+                    // 双格式解析,非法才 400
+                    match parse_iso8601(lm).or_else(|| parse_http_date(lm)) {
+                        Some(ts) => p.if_match_mtime = Some(ts),
+                        None => {
+                            errors.push((
+                                key.into(),
+                                "InvalidArgument",
+                                "Invalid LastModifiedTime specified",
+                            ));
+                            continue;
+                        }
+                    }
+                }
+                p.if_match_size = entry.size;
+                if p.is_empty() {
+                    None
+                } else {
+                    Some(p)
+                }
+            };
+            let vk = varg.map(|v| v.vk());
+            if let Some(p) = &precond {
+                let target = match engine.read_delete_target(bucket, key, vk.as_ref()) {
+                    Ok(t) => t,
+                    Err(e) => return Err(map_engine_error(e, bucket, key)),
+                };
+                if let Err(e) = p.check_delete(target.as_ref()) {
+                    match e {
+                        CoreError::PreconditionFailed(_) => {
+                            errors.push((
+                                key.into(),
+                                "PreconditionFailed",
+                                "At least one of the pre-conditions you specified did not hold",
+                            ));
+                            continue;
+                        }
+                        other => return Err(map_engine_error(other, bucket, key)),
+                    }
+                }
+            }
+            match engine.delete_version_for(bucket, key, vk, bkt.versioning) {
+                Ok(d) => {
+                    let mut de = xml::DeletedEntry {
+                        key: key.to_string(),
+                        version_id: entry.version_id.clone(),
+                        delete_marker: false,
+                        delete_marker_version_id: None,
+                    };
+                    match (&varg, &d) {
+                        // 版本定向:删掉的是标记 → DeleteMarker + 回显该版本
+                        (Some(v), Some(m)) if m.is_delete_marker => {
+                            de.delete_marker = true;
+                            de.delete_marker_version_id = Some(v.display());
+                        }
+                        // 无 VersionId:版本化桶新插标记 → DeleteMarker + 新标记版本
+                        (None, Some(m)) if m.is_delete_marker => {
+                            de.delete_marker = true;
+                            de.delete_marker_version_id =
+                                version_id_response_header(bkt.versioning, m);
+                        }
+                        _ => {}
+                    }
+                    deleted.push(de);
+                }
                 Err(_) => errors.push((
-                    key.clone(),
+                    key.to_string(),
                     "InternalError",
                     "We encountered an internal error. Please try again.",
                 )),
@@ -2693,12 +3957,208 @@ fn etag_matches(actual_hex: &str, header_value: &str) -> bool {
     h == "*" || h.eq_ignore_ascii_case(actual_hex)
 }
 
+// ─────────────────── 版本化/条件写辅助(M10/ADR-11,V3) ───────────────────
+
+/// 版本化状态机(ADR-11 D1):Off→Enabled/Suspended 与 Enabled↔Suspended
+/// 合法;**Enabled/Suspended→Off 拒绝**(AWS:已版本化桶不可回退,
+/// IllegalVersioningConfiguration)。
+fn validate_versioning_transition(
+    cur: fs3_core::VersioningState,
+    target: fs3_core::VersioningState,
+) -> Result<(), S3Error> {
+    use fs3_core::VersioningState as V;
+    match (cur, target) {
+        (V::Off, V::Off) => Err(S3Error::new(S3ErrorCode::InvalidArgument)
+            .with_message("bucket has never had versioning enabled")),
+        (V::Enabled | V::Suspended, V::Off) => Err(S3Error::new(
+            S3ErrorCode::IllegalVersioningConfiguration,
+        )
+        .with_message("versioning cannot be disabled once enabled (only suspension is allowed)")),
+        _ => Ok(()),
+    }
+}
+
+/// VersionIdMarker 展示串 → vk("null" → VK_NULL;32 hex → vk;路由层已
+/// 校验格式,此处防御性 400)。
+fn parse_version_marker_vk(s: &str) -> Result<[u8; 16], S3Error> {
+    if s == "null" {
+        return Ok(fs3_meta::keys::VK_NULL);
+    }
+    if s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let mut vk = [0u8; 16];
+        hex::decode_to_slice(s, &mut vk).map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument))?;
+        return Ok(vk);
+    }
+    Err(S3Error::new(S3ErrorCode::InvalidArgument)
+        .with_message("Invalid version id marker specified"))
+}
+
+/// vk → VersionId 展示串(VK_NULL → "null";否则 hex)。
+fn version_marker_display(vk: &[u8; 16]) -> String {
+    if *vk == fs3_meta::keys::VK_NULL {
+        "null".to_string()
+    } else {
+        hex::encode(vk)
+    }
+}
+
+/// 对象版本寻址的 x-amz-version-id 口径(V3-5):
+/// meta.version_id = Some → hex;None 且桶非 Off(null 族)→ "null";
+/// Off → 无头(未版本化桶零变化)。
+fn version_id_response_header(
+    versioning: fs3_core::VersioningState,
+    meta: &fs3_core::ObjectMeta,
+) -> Option<String> {
+    match meta.version_id {
+        Some(vk) => Some(hex::encode(vk)),
+        None if versioning != fs3_core::VersioningState::Off => Some("null".to_string()),
+        None => None,
+    }
+}
+
+/// 写响应(PUT/Complete/CopyObject)的 x-amz-version-id 口径(V3-5 +
+/// V4/D7 澄清):Enabled 产生真实 vk → hex;Suspended(null 族)→ AWS
+/// 口径回 "null";Off → 无头(未版本化桶零变化)。
+/// (注:s3-tests test_versioning_bucket_*_return_version_id 断言 Suspended
+/// 无 VersionId,为 RGW 口径,与 AWS 相悖;versioning 族在排除集内,以
+/// AWS 语义为准。)
+fn write_version_id_header(
+    versioning: fs3_core::VersioningState,
+    meta: &fs3_core::ObjectMeta,
+) -> Option<String> {
+    match meta.version_id {
+        Some(vk) => Some(hex::encode(vk)),
+        None if versioning == fs3_core::VersioningState::Suspended => Some("null".to_string()),
+        None => None,
+    }
+}
+
+/// 版本化读取命中删除标记的错误渲染(ADR-11 §3.4.3):
+/// 无 versionId → 404 NoSuchKey;带 versionId → 405 MethodNotAllowed;
+/// 均携带 x-amz-delete-marker: true + x-amz-version-id(展示串)。
+fn delete_marker_error(display: &str, key: &str, version_given: bool) -> S3Error {
+    let code = if version_given {
+        S3ErrorCode::MethodNotAllowed
+    } else {
+        S3ErrorCode::NoSuchKey
+    };
+    S3Error::new(code)
+        .with_extra("Key", key)
+        .with_resp_header("x-amz-delete-marker", "true")
+        .with_resp_header("x-amz-version-id", display)
+}
+
+/// 带 versionId 寻址的 NotFound → 404 NoSuchVersion(AWS 语义)。
+fn no_such_version_error(key: &str, version_id: &VersionIdArg) -> S3Error {
+    S3Error::new(S3ErrorCode::NoSuchVersion)
+        .with_extra("Key", key)
+        .with_extra("VersionId", &version_id.display())
+}
+
+/// 304 Not Modified(AWS 口径,V4-4):响应携带对象 ETag/Last-Modified 头
+/// (s3-tests test_get_object_ifmodifiedsince_failed / ifnonematch_good 断言
+/// 304 回 etag 头;412→304 判定次序不变)。
+fn not_modified_error(meta: &fs3_core::ObjectMeta) -> S3Error {
+    S3Error::new(S3ErrorCode::NotModified)
+        .with_resp_header("ETag", &format!("\"{}\"", meta.etag_full()))
+        .with_resp_header("Last-Modified", &xml::http_date(meta.mtime))
+}
+
+/// 解析 ETag 列表条件头(逗号分隔、去引号;"*" 原样保留)。
+fn parse_etag_list(v: &str) -> Vec<String> {
+    v.split(',')
+        .map(|s| s.trim().trim_matches('"').to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 解析条件写头(ADR-11 D6;PUT/Complete/DELETE 共用):
+/// If-Match / If-None-Match(ETag 列表或 *)、
+/// x-amz-if-match-last-modified-time(HTTP date)、x-amz-if-match-size。
+/// 全缺省 → None;格式非法 → 400 InvalidArgument(显式,不静默)。
+fn parse_write_precondition(
+    req: &S3Request,
+) -> Result<Option<fs3_engine::WritePrecondition>, S3Error> {
+    let mut p = fs3_engine::WritePrecondition::default();
+    if let Some(v) = header(req, "if-match") {
+        p.if_match = Some(parse_etag_list(v));
+    }
+    if let Some(v) = header(req, "if-none-match") {
+        p.if_none_match = Some(parse_etag_list(v));
+    }
+    if let Some(v) = header(req, "x-amz-if-match-last-modified-time") {
+        p.if_match_mtime = Some(parse_http_date(v).ok_or_else(|| {
+            S3Error::new(S3ErrorCode::InvalidArgument)
+                .with_message("x-amz-if-match-last-modified-time is not a valid HTTP date")
+        })?);
+    }
+    if let Some(v) = header(req, "x-amz-if-match-size") {
+        p.if_match_size = Some(v.trim().parse::<u64>().map_err(|_| {
+            S3Error::new(S3ErrorCode::InvalidArgument)
+                .with_message("x-amz-if-match-size must be a non-negative integer")
+        })?);
+    }
+    Ok(if p.is_empty() { None } else { Some(p) })
+}
+
+/// 解析 ISO8601 时间戳(DeleteObjects 条件元素 LastModifiedTime 的兼容
+/// 格式之一;`YYYY-MM-DDTHH:MM:SS[.fff][Z|±HH:MM]`)→ unix 秒。
+/// 非法 → None(调用方 400)。注:botocore rest-xml 对该元素实测按
+/// RFC 7231 IMF-fixdate 序列化,调用点以 parse_http_date 兜底。
+fn parse_iso8601(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (date, time) = s
+        .split_once('T')
+        .or_else(|| s.split_once('t'))
+        .or_else(|| s.split_once(' '))?;
+    let dp: Vec<&str> = date.split('-').collect();
+    if dp.len() != 3 {
+        return None;
+    }
+    let year: i64 = dp[0].parse().ok()?;
+    let month: u32 = dp[1].parse().ok()?;
+    let day: u32 = dp[2].parse().ok()?;
+    // 时区后缀:Z / +HH:MM / -HH:MM(小数秒先剥离)
+    let mut time = time;
+    let mut tz_sign = 0i64; // 秒;本地时间 → UTC 的修正量
+    if let Some(t) = time.strip_suffix('Z').or_else(|| time.strip_suffix('z')) {
+        time = t;
+    } else if let Some(i) = time.rfind(['+', '-']) {
+        let off = &time[i..];
+        let (oh, om) = off[1..].split_once(':')?;
+        let secs = oh.parse::<i64>().ok()? * 3600 + om.parse::<i64>().ok()? * 60;
+        tz_sign = if off.starts_with('-') { secs } else { -secs };
+        time = &time[..i];
+    }
+    let time = time.split('.').next().unwrap_or(time);
+    let tp: Vec<&str> = time.split(':').collect();
+    if tp.len() != 3 {
+        return None;
+    }
+    let h: i64 = tp[0].parse().ok()?;
+    let mi: i64 = tp[1].parse().ok()?;
+    let sec: i64 = tp[2].parse().ok()?;
+    let days = auth::days_from_civil_pub(year, month, day);
+    Some(days * 86400 + h * 3600 + mi * 60 + sec + tz_sign)
+}
+
 fn user_meta(req: &S3Request) -> Vec<(String, String)> {
     req.headers
         .iter()
         .filter(|(k, _)| k.starts_with("x-amz-meta-"))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
+}
+
+/// M10 S1:x-amz-tagging 头解析(AWS:URL-encoded `k=v&...`;≤10 标签,
+/// key ≤128 / value ≤256 字符)。未携带 → None;非法 → 400 InvalidTag
+/// (显式报错,不静默忽略——红线)。支持路径:PutObject(缓冲/流式)、
+/// CopyObject(directive=REPLACE)、CreateMultipartUpload。
+fn object_tags_header(req: &S3Request) -> Result<Option<Vec<(String, String)>>, S3Error> {
+    match header(req, "x-amz-tagging") {
+        Some(raw) => Ok(Some(xml::parse_tagging_header(raw)?)),
+        None => Ok(None),
+    }
 }
 
 /// M9/C3+D5:从请求提取需在 GET/HEAD 回显的标准头:
@@ -2789,6 +4249,28 @@ fn validate_bucket_name(name: &str) -> Result<(), S3Error> {
         Err(S3Error::new(S3ErrorCode::InvalidBucketName)
             .with_message(format!("The specified bucket is not valid: {name}")))
     }
+}
+
+/// PUT 写后校验失败的回滚(版本化语义;V3):Enabled 物理删刚写入的版本;
+/// Suspended 删刚覆盖的 null 族条目(遗留单键/null 槽,D1a-4 通道);
+/// Off 物理删单键(旧路径逐字节不变)。
+fn rollback_put_version(
+    engine: &mut Engine,
+    bucket: &str,
+    key: &str,
+    versioning: fs3_core::VersioningState,
+    meta: &fs3_core::ObjectMeta,
+) {
+    let r = match (versioning, meta.version_id) {
+        (fs3_core::VersioningState::Enabled, Some(vk)) => {
+            engine.delete_version(bucket, key, Some(vk))
+        }
+        (fs3_core::VersioningState::Suspended, _) => {
+            engine.delete_version(bucket, key, Some(fs3_meta::keys::VK_NULL))
+        }
+        _ => engine.delete(bucket, key),
+    };
+    let _ = r;
 }
 
 /// 归一化后的 Range 段(闭区间 [start, end];由 parse_range_multi 保证有序且
@@ -2926,6 +4408,33 @@ fn parse_http_date(s: &str) -> Option<i64> {
 
 /// 轻量路由:从请求解析 (指标 op, 审计 op 名, bucket, key)。
 /// 不依赖 router(router 解析 body 较贵);用于指标/审计打点。
+/// 资源 ARN 构造(策略求值;服务级操作 → "*")。
+fn resource_arn(bucket: &str, key: &str) -> String {
+    if bucket.is_empty() {
+        "*".to_string()
+    } else if key.is_empty() {
+        format!("arn:aws:s3:::{bucket}")
+    } else {
+        format!("arn:aws:s3:::{bucket}/{key}")
+    }
+}
+
+/// 审计操作名 → S3 策略动作名(M10 S3;多数审计名即动作名,原样返回)。
+/// 特例:桶级 GET(列表)= s3:ListBucket;HeadBucket = s3:ListBucket;服务级
+/// 列桶 = s3:ListAllMyBuckets;POST 表单上传 = s3:PutObject。
+/// 已知子集口径:ListObjectVersions/ListMultipartUploads 的审计名(GetObject/
+/// Multipart)归一到 ListBucket/PutObject 族,不复核细粒度动作(单账号模型
+/// 下已认证请求经隐式并集放行,细粒度仅影响匿名授权面——匿名写本就不开)。
+fn s3_action_name<'a>(audit_name: &'a str, bucket: &str, key: &str) -> &'a str {
+    match audit_name {
+        "GetObject" if key.is_empty() && !bucket.is_empty() => "ListBucket",
+        "HeadBucket" => "ListBucket",
+        "ListBuckets" => "ListAllMyBuckets",
+        "PostObject" => "PutObject",
+        other => other,
+    }
+}
+
 fn route_op_bucket_key(req: &S3Request) -> (fs3_core::metrics::Op, String, String, String) {
     use fs3_core::metrics::Op;
     let m = req.method.as_str();
@@ -2934,8 +4443,37 @@ fn route_op_bucket_key(req: &S3Request) -> (fs3_core::metrics::Op, String, Strin
     let bucket = parts.next().unwrap_or("").to_string();
     let key = parts.next().unwrap_or("").to_string();
 
+    // M10 S1/S2/S7:tagging/cors/ownershipControls 子资源审计名(守卫臂须在
+    // 通配臂之前;指标 Op 按方法族归类——桶级配置读写归 Other,对象标签归
+    // 对象读写族)。
+    let has_q = |name: &str| req.query.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
     let (op, name) = match (m, bucket.as_str(), key.as_str()) {
         ("GET", "", _) => (Op::ListBuckets, "ListBuckets"),
+        ("PUT", _, "") if has_q("tagging") => (Op::Other, "PutBucketTagging"),
+        ("GET", _, "") if has_q("tagging") => (Op::Other, "GetBucketTagging"),
+        ("DELETE", _, "") if has_q("tagging") => (Op::Other, "DeleteBucketTagging"),
+        ("PUT", _, "") if has_q("cors") => (Op::Other, "PutBucketCors"),
+        ("GET", _, "") if has_q("cors") => (Op::Other, "GetBucketCors"),
+        ("DELETE", _, "") if has_q("cors") => (Op::Other, "DeleteBucketCors"),
+        ("PUT", _, "") if has_q("ownershipControls") => (Op::Other, "PutBucketOwnershipControls"),
+        ("GET", _, "") if has_q("ownershipControls") => (Op::Other, "GetBucketOwnershipControls"),
+        ("DELETE", _, "") if has_q("ownershipControls") => {
+            (Op::Other, "DeleteBucketOwnershipControls")
+        }
+        // M10 S3:桶策略子资源审计名(即 AWS 动作名 s3:{Get,Put,Delete}BucketPolicy)
+        ("PUT", _, "") if has_q("policy") => (Op::Other, "PutBucketPolicy"),
+        ("GET", _, "") if has_q("policy") => (Op::Other, "GetBucketPolicy"),
+        ("DELETE", _, "") if has_q("policy") => (Op::Other, "DeleteBucketPolicy"),
+        // M10 V3:版本化子资源审计名
+        ("PUT", _, "") if has_q("versioning") => (Op::Other, "PutBucketVersioning"),
+        ("GET", _, "") if has_q("versioning") => (Op::Other, "GetBucketVersioning"),
+        ("GET", _, "") if has_q("versions") => (Op::Get, "ListObjectVersions"),
+        // M10 S4:桶级 POST 表单上传(?delete 批量删除仍归 Multipart 族);
+        // 键在表单体内,审计仅到桶,策略判定在 op_post_object 内按真实键执行
+        ("POST", _, "") if !has_q("delete") => (Op::Put, "PostObject"),
+        ("PUT", _, _) if has_q("tagging") => (Op::Put, "PutObjectTagging"),
+        ("GET", _, _) if has_q("tagging") => (Op::Get, "GetObjectTagging"),
+        ("DELETE", _, _) if has_q("tagging") => (Op::Delete, "DeleteObjectTagging"),
         ("PUT", _, "") => (Op::CreateBucket, "CreateBucket"),
         ("DELETE", _, "") => (Op::DeleteBucket, "DeleteBucket"),
         ("HEAD", _, "") => (Op::Other, "HeadBucket"),
@@ -2982,6 +4520,14 @@ fn map_engine_error(e: CoreError, bucket: &str, key: &str) -> S3Error {
             S3Error::new(S3ErrorCode::NoSuchUpload).with_extra("UploadId", &m)
         }
         CoreError::QuotaExceeded(m) => S3Error::new(S3ErrorCode::QuotaExceeded).with_message(m),
+        // 条件写冲突(ADR-11 D6)→ 412
+        CoreError::PreconditionFailed(m) => {
+            S3Error::new(S3ErrorCode::PreconditionFailed).with_message(m)
+        }
+        // 删除标记命中(未走显式判定的兜底路径;§3.4.3:无 versionId = 404)
+        CoreError::DeleteMarker(_) => S3Error::new(S3ErrorCode::NoSuchKey)
+            .with_extra("Key", key)
+            .with_resp_header("x-amz-delete-marker", "true"),
         other => {
             S3Error::new(S3ErrorCode::InternalError).with_message(format!("engine error: {other}"))
         }
@@ -3126,6 +4672,53 @@ mod tests {
     }
 
     #[test]
+    fn versioning_transition_state_machine() {
+        // ADR-11 D1 状态机:Off→Enabled/Suspended 合法;Enabled↔Suspended
+        // 合法;Enabled/Suspended→Off 拒绝(IllegalVersioningConfiguration,409)
+        use fs3_core::VersioningState as V;
+        for (cur, target) in [
+            (V::Off, V::Enabled),
+            (V::Off, V::Suspended),
+            (V::Enabled, V::Suspended),
+            (V::Suspended, V::Enabled),
+            (V::Enabled, V::Enabled),
+            (V::Suspended, V::Suspended),
+        ] {
+            assert!(
+                validate_versioning_transition(cur, target).is_ok(),
+                "{cur:?}→{target:?}"
+            );
+        }
+        for (cur, target) in [(V::Enabled, V::Off), (V::Suspended, V::Off)] {
+            let e = validate_versioning_transition(cur, target).unwrap_err();
+            assert_eq!(
+                e.code,
+                S3ErrorCode::IllegalVersioningConfiguration,
+                "{cur:?}→Off"
+            );
+            assert_eq!(e.status(), 409);
+        }
+        let e = validate_versioning_transition(V::Off, V::Off).unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn iso8601_parsing() {
+        // DeleteObjects 条件元素 LastModifiedTime(botocore rest-xml 形态)
+        assert_eq!(parse_iso8601("2024-08-20T12:00:00Z"), Some(1_724_155_200));
+        assert_eq!(
+            parse_iso8601("2024-08-20T12:00:00.123456Z"),
+            Some(1_724_155_200)
+        );
+        assert_eq!(
+            parse_iso8601("2024-08-20T14:00:00+02:00"),
+            Some(1_724_155_200)
+        );
+        assert!(parse_iso8601("not a date").is_none());
+        assert!(parse_iso8601("2024-08-20").is_none());
+    }
+
+    #[test]
     fn range_header_parsing() {
         // 单段闭区间
         assert_eq!(
@@ -3260,7 +4853,8 @@ mod tests {
     #[test]
     fn unimplemented_headers_explicitly_rejected() {
         let (_d, _engine, service) = service_fixture();
-        // A1:SSE 家族 + tagging + object-lock + website 重定向 → 501 NotImplemented
+        // A1:SSE 家族 + object-lock + website 重定向 → 501 NotImplemented
+        // (M10 S1:x-amz-tagging 已实现,出表)
         for h in [
             "x-amz-server-side-encryption",
             "x-amz-server-side-encryption-aws-kms-key-id",
@@ -3270,7 +4864,6 @@ mod tests {
             "x-amz-server-side-encryption-customer-key",
             "x-amz-server-side-encryption-customer-key-md5",
             "x-amz-sse-kms-key-id",
-            "x-amz-tagging",
             "x-amz-object-lock-mode",
             "x-amz-object-lock-retain-until-date",
             "x-amz-object-lock-legal-hold",
@@ -3281,6 +4874,9 @@ mod tests {
             assert_eq!(err.code, S3ErrorCode::NotImplemented, "header {h}");
             assert_eq!(err.status(), 501, "header {h}");
         }
+        // M10 S1:x-amz-tagging 不再 501(由写路径解析落 ObjectMeta.tags)
+        let tagged = headers_req(&[("x-amz-tagging", "k=v")]);
+        assert!(service.check_unimplemented_headers(&tagged).is_ok());
         // storage-class:STANDARD 接受(显式 no-op);其它 → InvalidStorageClass
         let ok = headers_req(&[("x-amz-storage-class", "STANDARD")]);
         assert!(service.check_unimplemented_headers(&ok).is_ok());
@@ -3400,17 +4996,34 @@ mod tests {
                         stats: Default::default(),
                         quota: None,
                         created_with_acl: false,
+                        versioning: fs3_core::VersioningState::Off,
+                        default_encryption: None,
+                        object_lock: false,
                     },
                 )
                 .unwrap();
         }
         // 1000 键 → 允许;1001 键 → 400 MalformedXML
-        let keys1000: Vec<(String, Option<String>)> =
-            (0..1000).map(|i| (format!("k{i}"), None)).collect();
+        let keys1000: Vec<xml::DeleteObjectEntry> = (0..1000)
+            .map(|i| xml::DeleteObjectEntry {
+                key: format!("k{i}"),
+                version_id: None,
+                etag: None,
+                last_modified: None,
+                size: None,
+            })
+            .collect();
         let r1000 = service.op_delete_objects("b1", true, &keys1000);
         assert!(r1000.is_ok());
-        let keys1001: Vec<(String, Option<String>)> =
-            (0..1001).map(|i| (format!("k{i}"), None)).collect();
+        let keys1001: Vec<xml::DeleteObjectEntry> = (0..1001)
+            .map(|i| xml::DeleteObjectEntry {
+                key: format!("k{i}"),
+                version_id: None,
+                etag: None,
+                last_modified: None,
+                size: None,
+            })
+            .collect();
         let err = service
             .op_delete_objects("b1", true, &keys1001)
             .unwrap_err();

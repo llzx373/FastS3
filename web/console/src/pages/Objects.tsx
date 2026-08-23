@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, fmtBytes, type ListResult, type BucketInfo } from "../api";
+import { api, fmtBytes, type ListResult, type BucketInfo, type ObjectVersion, type S3Tag } from "../api";
 
 const PART_SIZE = 8 * 1024 * 1024; // 8MiB/片(>5MiB 下限)
 
@@ -308,7 +308,16 @@ export default function Objects() {
         </div>
       )}
 
-      {metaObj && <ObjectMeta bucket={metaObj.bucket} key={metaObj.key} onClose={() => setMetaObj(null)} />}
+      {metaObj && (
+        <ObjectMeta
+          bucket={metaObj.bucket}
+          key={metaObj.key}
+          size={metaObj.size}
+          etag={metaObj.etag}
+          lastModified={metaObj.lastModified}
+          onClose={() => setMetaObj(null)}
+        />
+      )}
     </div>
   );
 }
@@ -342,7 +351,7 @@ function ObjectMeta({
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
+      <div className="modal" onClick={(e) => e.stopPropagation()} style={{ width: 720 }}>
         <h3>对象详情</h3>
         <div className="form-row">
           <label>键</label>
@@ -378,12 +387,208 @@ function ObjectMeta({
             <textarea rows={3} readOnly value={presign} style={{ width: "100%" }} />
           </div>
         )}
+        {/* M10:版本列表(恢复/永久删除)与对象标签编辑 */}
+        <VersionPanel bucket={bucket} objKey={key} />
+        <TagPanel bucket={bucket} objKey={key} />
         <div className="actions">
           <button className="ghost" onClick={onClose}>
             关闭
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+/** M10:版本区——该对象的版本列表(含删除标记),支持恢复与永久删除。 */
+function VersionPanel({ bucket, objKey }: { bucket: string; objKey: string }) {
+  const [versions, setVersions] = useState<ObjectVersion[] | null>(null);
+  const [truncated, setTruncated] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      // 以完整键为 prefix 列举,再精确过滤同键条目(避免 "a" 命中 "ab")
+      const r = await api.listVersions(bucket, objKey);
+      setVersions(r.versions.filter((v) => v.key === objKey));
+      setTruncated(r.isTruncated);
+      setError(null);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }, [bucket, objKey]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const restore = async (v: ObjectVersion) => {
+    if (!confirm(`将 ${objKey} 恢复到版本 ${v.versionId.slice(0, 12)}…?(以其内容生成新的当前版本)`)) {
+      return;
+    }
+    setBusy(true);
+    try {
+      await api.versionAction(bucket, "restore", objKey, v.versionId);
+      await load();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const purge = async (v: ObjectVersion) => {
+    if (!confirm(`永久删除版本 ${v.versionId.slice(0, 12)}…?该版本数据将被物理删除,不可恢复。`)) return;
+    setBusy(true);
+    try {
+      await api.versionAction(bucket, "delete", objKey, v.versionId);
+      await load();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{ marginTop: 16 }}>
+      <div className="title">版本</div>
+      {error && <div className="alert">{error}</div>}
+      {versions === null && !error && <div className="muted">加载中…</div>}
+      {versions !== null && versions.length === 0 && <div className="muted">无版本信息(桶未启用版本化?)</div>}
+      {versions !== null && versions.length > 0 && (
+        <table>
+          <thead>
+            <tr>
+              <th>VersionId</th>
+              <th>状态</th>
+              <th>时间</th>
+              <th>大小</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {versions.map((v) => (
+              <tr key={v.versionId}>
+                <td className="mono" style={{ fontSize: 12 }} title={v.versionId}>
+                  {v.versionId.length > 16 ? `${v.versionId.slice(0, 16)}…` : v.versionId}
+                </td>
+                <td>
+                  {v.isDeleteMarker && <span className="badge">删除标记</span>}{" "}
+                  {v.isLatest && <span style={{ color: "var(--green)" }}>最新</span>}
+                </td>
+                <td className="muted">{v.lastModified ? new Date(v.lastModified).toLocaleString() : "—"}</td>
+                <td>{v.isDeleteMarker ? "—" : fmtBytes(v.size)}</td>
+                <td>
+                  {!v.isDeleteMarker && (
+                    <>
+                      <button className="ghost small" disabled={busy} onClick={() => restore(v)}>
+                        恢复
+                      </button>{" "}
+                    </>
+                  )}
+                  <button className="danger small" disabled={busy} onClick={() => purge(v)}>
+                    永久删除
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      {truncated && <div className="muted" style={{ fontSize: 12 }}>版本列表已截断(仅显示首页)</div>}
+    </div>
+  );
+}
+
+/** M10:对象标签编辑(增删改,整体替换 PUT ?tagging;保存空表 = 清空)。 */
+function TagPanel({ bucket, objKey }: { bucket: string; objKey: string }) {
+  const [tags, setTags] = useState<S3Tag[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => {
+    api
+      .getObjectTags(bucket, objKey)
+      .then((r) => setTags(r.tags))
+      .catch((e) => setError((e as Error).message));
+  }, [bucket, objKey]);
+
+  const update = (i: number, field: "key" | "value", val: string) => {
+    setTags((ts) => (ts ?? []).map((t, j) => (j === i ? { ...t, [field]: val } : t)));
+    setSaved(false);
+  };
+
+  const save = async () => {
+    if (tags === null) return;
+    if (tags.some((t) => t.key.trim() === "")) {
+      setError("标签键不能为空(删除整行可移除标签)");
+      return;
+    }
+    setSaving(true);
+    try {
+      await api.putObjectTags(bucket, objKey, tags);
+      setSaved(true);
+      setError(null);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div style={{ marginTop: 16 }}>
+      <div className="title">标签</div>
+      {error && <div className="alert">{error}</div>}
+      {tags === null && !error && <div className="muted">加载中…</div>}
+      {tags !== null && (
+        <>
+          {tags.map((t, i) => (
+            <div className="form-row" key={i} style={{ gap: 6 }}>
+              <input
+                value={t.key}
+                placeholder="键"
+                onChange={(e) => update(i, "key", e.target.value)}
+                style={{ width: 200 }}
+              />
+              <input
+                value={t.value}
+                placeholder="值"
+                onChange={(e) => update(i, "value", e.target.value)}
+                style={{ flex: 1 }}
+              />
+              <button
+                className="ghost small"
+                onClick={() => {
+                  setTags(tags.filter((_, j) => j !== i));
+                  setSaved(false);
+                }}
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+          <div className="toolbar" style={{ marginTop: 4 }}>
+            <button
+              className="ghost small"
+              onClick={() => {
+                setTags([...tags, { key: "", value: "" }]);
+                setSaved(false);
+              }}
+            >
+              + 添加标签
+            </button>
+            <div className="spacer" />
+            {saved && <span style={{ color: "var(--green)", fontSize: 12 }}>✓ 已保存</span>}
+            <button className="small" onClick={save} disabled={saving}>
+              {saving ? "保存中…" : "保存标签"}
+            </button>
+          </div>
+        </>
+      )}
     </div>
   );
 }

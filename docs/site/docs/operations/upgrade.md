@@ -63,3 +63,9 @@ aws --endpoint-url http://127.0.0.1:9000 s3api list-objects --bucket drill-demo
 - 磁盘镜像建议留 10% 余量(未来布局迁移期需要暂存空间);
 - 生产升级窗口:先备份元数据快照(meta-export,M7 提供)或底层卷快照;
 - 大版本跨跳(如 v0.8 → v0.10):按 N-1 链逐级升级,不跨级。
+- **v1.0.x → v1.1(M10/ADR-11 D0)**:元数据值格式 v2→v3 双读零迁移可读;
+  升级后在维护窗口执行 `fasts3d rewrite-values`(见
+  [CLI 参考](../reference/cli.md))把存量值重写为 v3。**重写完成(持久标记
+  `s:value_rewrite_v3_done`)前禁止回滚到 v1.0.x 二进制**(其拒绝解码 v3
+  值;引擎启动时检测到残留 v2 值会打警告日志);此期间回滚只能走
+  「meta-export 快照 + 底层卷快照」恢复路径。
