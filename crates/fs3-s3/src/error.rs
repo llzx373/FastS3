@@ -3,66 +3,102 @@
 use std::fmt::Write as _;
 
 /// S3 错误码。命名与 AWS 文档一致;渲染 XML 时 Code 与 Message 直接使用。
+///
+/// M11 H1-1 逐码审计约定:标注「预留」的变体在 v1.2 **无触发路径**(对应
+/// 特性未实现或语义上不可达,原因逐码注明),保留以维持与 AWS 错误码全集
+/// 的对照;未标注的变体均有真实触发路径(见各 op / auth / checksum / sse)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum S3ErrorCode {
     AccessDenied,
+    /// 预留:AWS 账号级故障码;单机单账号模型无该错误面。
     AccountProblem,
+    /// 预留:ACL email 授权未实现(ACL 家族接受但不生效,M9/C5 裁决)。
     AmbiguousGrantByEmailAddress,
     AuthorizationHeaderMalformed,
     BadDigest,
     BucketAlreadyExists,
+    /// 不可达:单账号模型 + M9/C5 桶重建语义(重复建桶 = 200 幂等 no-op;
+    /// 带 ACL 历史冲突 = 409 BucketAlreadyExists),不区分 owner 口径。
     BucketAlreadyOwnedByYou,
     BucketNotEmpty,
+    /// 预留:AWS 用于匿名-only 端点携带凭证的场景;本实现无该类端点。
     CredentialsNotSupported,
+    /// 预留:server access logging 未实现(501 表已显式拒绝 ?logging)。
     CrossLocationLoggingProhibited,
     EntityTooLarge,
     EntityTooSmall,
+    /// 不可达:M8 裁决 CreateBucket 接受任意 LocationConstraint 并回显
+    /// (RGW/MinIO 测试器语义;单机服务无区域表),无非法 location 面。
     IllegalLocationConstraintException,
     /// 版本化状态机非法转换(ADR-11 D1:Enabled/Suspended → Off 禁止;409,
     /// 与 AWS IllegalVersioningConfigurationException 同义)。
     IllegalVersioningConfiguration,
     IncompleteBody,
     IncorrectNumberOfFilesInPostRequest,
+    /// 不可达:inline 小对象是引擎内部存储形态(≤SMALL_OBJECT_LIMIT),
+    /// 超限自动落 extent,无对外错误面。
     InlineDataTooLarge,
     /// 磁盘满(507;DESIGN §6 故障注入"磁盘满(507 语义)")。
     InsufficientStorage,
     InternalError,
     InvalidAccessKeyId,
+    /// 预留:Anonymous role 寻址头语义(AWS 虚拟主机匿名模式);未使用。
     InvalidAddressingHeader,
     InvalidArgument,
     InvalidBucketName,
+    /// 预留:无桶级状态机拒绝面(版本化非法转换另有
+    /// IllegalVersioningConfiguration)。
     InvalidBucketState,
     InvalidDigest,
     InvalidEncryptionAlgorithmError,
+    /// 不可达:同 IllegalLocationConstraintException(location 任意接受)。
     InvalidLocationConstraint,
+    /// 预留:归档/取回(Glacier 族)对象状态语义;v1.2 无存储分层。
     InvalidObjectState,
     InvalidPart,
     InvalidPartOrder,
+    /// 预留:Requester Pays 未实现。
     InvalidPayer,
     InvalidPolicyDocument,
     InvalidRange,
     InvalidRequest,
+    /// 预留:AWS 通用参数码;本实现具体参数错误统一归 InvalidArgument。
     InvalidRequestParameter,
+    /// 预留:签名畸形归 AuthorizationHeaderMalformed、计算不符归
+    /// SignatureDoesNotMatch(AWS 文档亦以二者为主)。
     InvalidSignature,
     InvalidStorageClass,
     InvalidTag,
+    /// 预留:server access logging 未实现。
     InvalidTargetBucketForLogging,
+    /// 预留:无 session token/STS(x-amz-security-token 不签发)。
     InvalidToken,
+    /// 路径 percent-decode 后非合法 UTF-8(M11 G-1,fs3-http 入口;AWS
+    /// 对 \xAE\x8A 一类非法字节序列回 400 本码)。
     InvalidURI,
     KeyTooLongError,
+    /// 预留:XML ACL 文档未实现(ACL 家族接受但不生效,M9/C5 裁决)。
     MalformedACLError,
     /// 桶策略文档非法(M10 S3;PutBucketPolicy 写入校验失败,400)。
     MalformedPolicy,
     MalformedPOSTRequest,
     MalformedXML,
+    /// 预留:AWS SOAP/消息长度面;本实现无该入口。
     MaxMessageLengthExceeded,
     MetadataTooLarge,
     MethodNotAllowed,
+    /// 预留:SOAP 附件语义;SOAP 不实现。
     MissingAttachment,
+    /// 预留:HTTP 层受理 chunked/无 Content-Length 请求(aws-chunked 以
+    /// x-amz-decoded-content-length 为准),无此拒绝面。
     MissingContentLength,
+    /// 不可达:需 XML 体的 op 空体由各解析器归 MalformedXML(AWS 同口径)。
     MissingRequestBodyError,
+    /// 预留:SOAP 1.1 语义;SOAP 不实现。
     MissingSecurityElement,
+    /// 预留:缺必需头的各路径已有专属码(InvalidRequest 等)。
     MissingSecurityHeader,
+    /// 预留:server access logging 未实现。
     NoLoggingStatusForKey,
     NoSuchBucket,
     NoSuchBucketPolicy,
@@ -74,27 +110,43 @@ pub enum S3ErrorCode {
     NoSuchVersion,
     NotImplemented,
     NotModified,
+    /// 预留:website hosting 未实现(x-amz-website-redirect-location 在
+    /// 501 表显式拒绝)。
     NoSuchWebsiteConfiguration,
+    /// 预留:条件写判定在引擎写锁内串行(check-then-act),无并发冲突面。
     OperationAborted,
     /// 桶无 OwnershipControls 配置(M10 S7;AWS 404)。
     OwnershipControlsNotFoundError,
+    /// 桶无默认加密配置(M11 K1-2;GetBucketEncryption 的 AWS 404 码)。
+    ServerSideEncryptionConfigurationNotFoundError,
+    /// 预留:单区域单机,无端点重定向。
     PermanentRedirect,
     PreconditionFailed,
+    /// 预留:单区域单机,无端点重定向。
     Redirect,
+    /// 预留:无归档取回(Glacier 族)语义。
     RestoreAlreadyInProgress,
+    /// 预留:POST 非 multipart/form-data 归 MethodNotAllowed(op_post_object)。
     RequestIsNotMultiPartContent,
+    /// 预留:HTTP 层读超时无此映射(连接级处理,不渲染 S3 错误体)。
     RequestTimeout,
     RequestTimeTooSkewed,
+    /// 预留:BitTorrent(?torrent)不实现。
     RequestTorrentOfBucketError,
     /// 桶配额超限(E4;与 AWS QuotaExceeded 语义一致,403)。
     QuotaExceeded,
     SignatureDoesNotMatch,
     ServiceUnavailable,
     SlowDown,
+    /// 预留:单区域单机,无端点重定向。
     TemporaryRedirect,
+    /// 预留:无 session token/STS。
     TokenRefreshRequired,
+    /// 不可达:v1.2 无桶数配额(AWS 默认 100 桶/账号;单账号模型未设限)。
     TooManyBuckets,
+    /// 预留:带体 GET 等由路由/各 op 既有校验拒绝(InvalidRequest 等)。
     UnexpectedContent,
+    /// 预留:ACL email 授权未实现。
     UnresolvableGrantByEmailAddress,
     UserKeyMustBeSpecified,
     /// `x-amz-content-sha256` 声明值与实际接收载荷不符(M9/B2;替代
@@ -177,6 +229,9 @@ impl S3ErrorCode {
             OwnershipControlsNotFoundError => {
                 "The bucket does not have ownership controls configured."
             }
+            ServerSideEncryptionConfigurationNotFoundError => {
+                "The server side encryption configuration was not found"
+            }
             PermanentRedirect => "The bucket you are attempting to access must be addressed using the specified endpoint. Send all future requests to this endpoint.",
             PreconditionFailed => "At least one of the pre-conditions you specified did not hold.",
             Redirect => "Temporary redirect.",
@@ -226,8 +281,10 @@ impl S3ErrorCode {
             | NoSuchVersion
             | NoSuchBucketPolicy
             | NoSuchCORSConfiguration
+            | NoSuchLifecycleConfiguration
             | NoSuchTagSet
-            | OwnershipControlsNotFoundError => 404,
+            | OwnershipControlsNotFoundError
+            | ServerSideEncryptionConfigurationNotFoundError => 404,
             MethodNotAllowed => 405,
             EntityTooLarge | EntityTooSmall | InlineDataTooLarge => 400,
             InsufficientStorage => 507,
@@ -372,6 +429,8 @@ mod tests {
         assert_eq!(S3ErrorCode::SlowDown.status(), 503);
         assert_eq!(S3ErrorCode::InternalError.status(), 500);
         assert_eq!(S3ErrorCode::NotImplemented.status(), 501);
+        // M11 L1:占位挂接(AWS:GetBucketLifecycleConfiguration 无配置 404)
+        assert_eq!(S3ErrorCode::NoSuchLifecycleConfiguration.status(), 404);
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! 结构化响应(状态码 + 头 + XML/流)。HTTP 接入在 fs3-http。
 
 pub mod auth;
+pub mod checksum;
 pub mod chunked;
 pub mod error;
 pub mod policy;
@@ -11,6 +12,7 @@ pub mod post;
 pub mod ratelimit;
 pub mod router;
 pub mod service;
+pub mod sse;
 pub mod xml;
 
 pub use error::{S3Error, S3ErrorCode};

@@ -454,6 +454,7 @@ dependencies = [
  "fs3-meta",
  "fs3-s3",
  "futures-util",
+ "hex",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -488,8 +489,11 @@ dependencies = [
  "postcard",
  "proptest",
  "serde",
+ "sha1",
  "sha2",
  "thiserror",
+ "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -516,6 +520,7 @@ dependencies = [
  "proptest",
  "tempfile",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

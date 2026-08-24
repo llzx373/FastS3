@@ -120,6 +120,10 @@ pub struct ObjectDto {
     /// v1.3 填充(同上)。
     #[serde(default)]
     pub legal_hold: bool,
+    /// v1.2 填充(M11 C1-4,ADR-12 D-E3:multipart 各分片 checksum,索引与
+    /// parts 对齐;旧导出无此字段 → 空表)。
+    #[serde(default)]
+    pub part_checksums: Vec<Option<fs3_core::ChecksumInfo>>,
 }
 
 /// 键形态 vk → 导出 DTO 的版本串(None = 单键;"null" = null 槽;hex = 真实 vk)。
@@ -174,6 +178,7 @@ impl ObjectDto {
             checksum: m.checksum.clone(),
             retention: m.retention.clone(),
             legal_hold: m.legal_hold,
+            part_checksums: m.part_checksums.clone(),
         }
     }
 
@@ -210,6 +215,7 @@ impl ObjectDto {
                 checksum: self.checksum.clone(),
                 retention: self.retention.clone(),
                 legal_hold: self.legal_hold,
+                part_checksums: self.part_checksums.clone(),
             },
         ))
     }
@@ -223,6 +229,13 @@ pub struct PartDto {
     pub mtime: i64,
     pub extents: Vec<SegmentDto>,
     pub inline_b64: Option<String>,
+    /// 分片 checksum(M11 C1-4,ADR-12 D-E3;旧导出无此字段 → None)。
+    #[serde(default)]
+    pub checksum: Option<fs3_core::ChecksumInfo>,
+    /// 分片 SSE-C 加密产物(M11 E1-4,ADR-12 D-E4;仅 nonce/tag/key_md5
+    /// 校验子(D-E5),无密钥材料;旧导出无此字段 → None)。
+    #[serde(default)]
+    pub sse: Option<fs3_core::SseInfo>,
 }
 
 impl PartDto {
@@ -237,6 +250,8 @@ impl PartDto {
                 .inline
                 .as_ref()
                 .map(|d| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, d)),
+            checksum: p.checksum.clone(),
+            sse: p.sse.clone(),
         }
     }
 
@@ -254,11 +269,21 @@ impl PartDto {
                 ),
                 None => None,
             },
+            checksum: self.checksum.clone(),
+            sse: self.sse.clone(),
         })
     }
 }
 
 /// multipart 会话(会话字段为纯文本;final_etag 转 hex)。
+/// SSE-S3 会话密钥材料 DTO(M11 K1-1;wrapped_dek 为 KEK 包裹**密文**,
+/// 导出安全;DEK 明文零落盘零导出红线不破)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SseS3SessionDto {
+    pub kek_id: u32,
+    pub wrapped_dek_hex: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadDto {
     pub upload_id: String,
@@ -273,6 +298,20 @@ pub struct UploadDto {
     /// 字段 → 按空表导入)。
     #[serde(default)]
     pub tags: Vec<(String, String)>,
+    /// Create 时声明的 checksum 算法(M11 C1-4 门禁补强;旧导出无此字段
+    /// → 按 None 导入,会话退化为无算法:Complete 仍可走客户端复合头驱动)。
+    #[serde(default)]
+    pub checksum_alg: Option<fs3_core::ChecksumAlgorithm>,
+    /// SSE-C 会话绑定的 key-MD5(M11 E1-4;只存 MD5,客户密钥零落盘;
+    /// 旧导出无此字段 → None = 无 SSE 会话)。
+    #[serde(default)]
+    pub sse_key_md5: Option<String>,
+    /// SSE-S3 会话绑定的 DEK 包裹值(M11 K1-1;密文;旧导出无此字段 →
+    /// None = 无 SSE-S3 会话)。**注意:`s:sse_kek_seed` 永不导出(红线),
+    /// 导入侧若无同一种子,恢复的 SSE-S3 会话/对象不可解密**——meta-import
+    /// 是元数据迁移通道,不是加密数据备份通道(备份走卷快照)。
+    #[serde(default)]
+    pub sse_s3: Option<SseS3SessionDto>,
     pub created: i64,
     pub completed: bool,
     pub final_etag_hex: String,
@@ -295,6 +334,12 @@ impl UploadDto {
             user_meta: s.user_meta.clone(),
             resp_headers: s.resp_headers.clone(),
             tags: s.tags.clone(),
+            checksum_alg: s.checksum_alg,
+            sse_key_md5: s.sse_key_md5.clone(),
+            sse_s3: s.sse_s3.as_ref().map(|s3| SseS3SessionDto {
+                kek_id: s3.kek_id,
+                wrapped_dek_hex: hex::encode(&s3.wrapped_dek),
+            }),
             created: s.created,
             completed: s.completed,
             final_etag_hex: s.final_etag.iter().map(|b| format!("{b:02x}")).collect(),
@@ -353,6 +398,11 @@ pub struct BucketDto {
     /// D9 桶级配置文档(M10 S3 桶策略 `bp:`;原始 JSON 文本;同上)。
     #[serde(default)]
     pub policy: Option<String>,
+    /// 生命周期规则集(M11 L1;ADR-12 DL1 `r:` 两段式键;**规范化 XML
+    /// 字符串**,与 cors 同先例——DTO 存文档不存结构;导入时重新解析为
+    /// 规则逐条重写。旧导出无此字段 → None = 无配置)。
+    #[serde(default)]
+    pub lifecycle: Option<String>,
 }
 
 /// 导出文件顶层结构。
@@ -433,6 +483,13 @@ pub fn run_meta_export(
                     .flatten()
                     .map(|b| String::from_utf8_lossy(&b).into_owned())
             };
+            // M11 L1(ADR-12 DL1):生命周期规则集 → 规范化 XML(r: 两段式
+            // 键不走 BucketConf 单键通道;无规则 → None)
+            let lifecycle = store
+                .get_lifecycle_rules(&name)
+                .ok()
+                .filter(|rules| !rules.is_empty())
+                .map(|rules| fs3_s3::xml::render_lifecycle_configuration(&rules));
             BucketDto {
                 name: name.clone(),
                 created: m.created,
@@ -449,6 +506,7 @@ pub fn run_meta_export(
                 cors: conf(fs3_meta::BucketConf::Cors),
                 ownership_controls: conf(fs3_meta::BucketConf::Ownership),
                 policy: conf(fs3_meta::BucketConf::Policy),
+                lifecycle,
             }
         })
         .collect();
@@ -621,6 +679,18 @@ pub fn run_meta_import(
                 store.commit_bucket_conf_put(&b.name, conf, doc.as_bytes())?;
             }
         }
+        // M11 L1(ADR-12 DL1):生命周期规则集恢复——规范化 XML 重新解析
+        // (协议层同一份校验,篡改/非法文档显式拒绝,不静默落库)后整体写入
+        if let Some(doc) = &b.lifecycle {
+            let rules =
+                fs3_s3::xml::parse_lifecycle_configuration(doc.as_bytes()).map_err(|e| {
+                    fs3_core::Error::InvalidArgument(format!(
+                        "bucket {} lifecycle document invalid: {e}",
+                        b.name
+                    ))
+                })?;
+            store.put_lifecycle_rules(&b.name, &rules)?;
+        }
     }
 
     // 5) 访问密钥(secret_hash/salt/密文原样;种子盐已恢复,可解密)
@@ -717,6 +787,20 @@ pub fn run_meta_import(
             final_size: u.final_size,
             final_mtime: u.final_mtime,
             tags: u.tags.clone(),
+            checksum_alg: u.checksum_alg,
+            sse_key_md5: u.sse_key_md5.clone(),
+            sse_s3: match &u.sse_s3 {
+                Some(s3) => Some(fs3_meta::SessionSseS3 {
+                    kek_id: s3.kek_id,
+                    wrapped_dek: hex::decode(&s3.wrapped_dek_hex).map_err(|e| {
+                        fs3_core::Error::InvalidArgument(format!(
+                            "upload {} wrapped_dek_hex: {e}",
+                            u.upload_id
+                        ))
+                    })?,
+                }),
+                None => None,
+            },
         };
         store.create_multipart(&u.upload_id, &session)?;
         for p in &u.parts {
@@ -1180,6 +1264,8 @@ mod tests {
                 "ownership_controls",
                 // M10 S3:桶策略 `bp:`(同 D9 双读)
                 "policy",
+                // M11 L1:生命周期规则集 `r:`(规范化 XML;同双读)
+                "lifecycle",
             ] {
                 b.as_object_mut().unwrap().remove(f);
             }
@@ -1194,6 +1280,8 @@ mod tests {
                 "checksum",
                 "retention",
                 "legal_hold",
+                // M11 C1-4:对象级分片 checksum 表(serde default 双读)
+                "part_checksums",
             ] {
                 m.remove(f);
             }
@@ -1243,6 +1331,7 @@ mod tests {
     }
 
     /// M10 S1/S2/S3/S7:D9 桶级配置文档(bt:/bc:/bo:/bp:)导出/导入往返。
+    /// M11 L1:生命周期规则集(`r:` 两段式键;规范化 XML 字段)随桶往返。
     #[test]
     fn bucket_conf_export_import_roundtrip() {
         let (dir, img1, img2) = tmp_devices();
@@ -1272,6 +1361,12 @@ mod tests {
                 br#"{"Version":"2012-10-17","Statement":[]}"#,
             )
             .unwrap();
+            // M11 L1:生命周期规则(两规则,含 Filter Prefix+Tag 与 Abort)
+            let rules = fs3_s3::xml::parse_lifecycle_configuration(
+                br#"<LifecycleConfiguration><Rule><ID>r1</ID><Filter><And><Prefix>logs/</Prefix><Tag><Key>c</Key><Value>d</Value></Tag></And></Filter><Status>Enabled</Status><Expiration><Days>30</Days></Expiration></Rule><Rule><ID>r2</ID><Filter/><Status>Disabled</Status><AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>"#,
+            )
+            .unwrap();
+            m.put_lifecycle_rules("b1", &rules).unwrap();
             e.close().unwrap();
         }
         let export = dir.path().join("export.json");
@@ -1290,6 +1385,12 @@ mod tests {
         assert_eq!(b["cors"], "<CORSConfiguration/>");
         assert_eq!(b["ownership_controls"], "<OwnershipControls/>");
         assert_eq!(b["policy"], r#"{"Version":"2012-10-17","Statement":[]}"#);
+        // 生命周期:规范化 XML 导出(规则按 rule_id 字典序)
+        let lc = b["lifecycle"].as_str().expect("lifecycle 字段应导出");
+        assert!(
+            lc.contains("<ID>r1</ID>") && lc.contains("<ID>r2</ID>"),
+            "{lc}"
+        );
 
         std::fs::copy(&img1, &img2).unwrap();
         run_meta_import(
@@ -1320,7 +1421,78 @@ mod tests {
                 "{conf:?} 导入后丢失"
             );
         }
+        // 生命周期规则集导入后与导出前逐字段相等
+        let rules = fs3_s3::xml::parse_lifecycle_configuration(
+            br#"<LifecycleConfiguration><Rule><ID>r1</ID><Filter><And><Prefix>logs/</Prefix><Tag><Key>c</Key><Value>d</Value></Tag></And></Filter><Status>Enabled</Status><Expiration><Days>30</Days></Expiration></Rule><Rule><ID>r2</ID><Filter/><Status>Disabled</Status><AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>"#,
+        )
+        .unwrap();
+        assert_eq!(e2.meta().get_lifecycle_rules("b1").unwrap(), rules);
         e2.abort();
+    }
+
+    /// M11 K1-1 红线(ADR-12 DS1):meta-export **绝不含** `s:sse_kek_seed`
+    /// 及其派生材料——导出只覆盖桶/对象/会话/密钥类键;对象 DTO 携带的
+    /// wrapped_dek 是 KEK 包裹**密文**(导出安全),会话 DTO 同;桶默认
+    /// 加密字段随 BucketDto 导出(DS3 三处联动的 DTO 臂)。seed 不导出 ⇒
+    /// 导入侧 SSE-S3 对象不可解密是**明示语义**(meta-import 是元数据迁移
+    /// 通道,不是加密数据备份通道;备份走卷快照)。
+    #[test]
+    fn export_never_leaks_sse_kek_seed() {
+        let (dir, img1, _img2) = tmp_devices();
+        let meta1 = dir.path().join("meta1");
+        let seed_hex;
+        let kek_hex;
+        {
+            let mut e = fs3_engine::Engine::open(&engine_cfg(&img1, &meta1)).unwrap();
+            e.ensure_bucket("b1").unwrap();
+            // 桶默认加密(DTO 导出臂)+ SSE-S3 对象(wrapped_dek 密文导出)
+            e.meta()
+                .commit_bucket_set_encryption("b1", Some(fs3_core::SseAlgorithm::Aes256))
+                .unwrap();
+            let wk = e.sse_s3_mint_write_key().unwrap();
+            let wk_ref = fs3_core::SseWriteKey::SseS3(&wk);
+            e.put_with_meta(
+                "b1",
+                "s3-obj",
+                &mut Cursor::new(rnd(1_000, 12)),
+                None,
+                vec![],
+                vec![],
+                vec![],
+                None,
+                None,
+                Some(&wk_ref),
+            )
+            .unwrap();
+            // 轮换一次(s:sse_kek_gen 落盘),制造「两代状态」
+            e.sse_s3_rotate_kek().unwrap();
+            let seed = e.meta().sse_kek_seed().unwrap();
+            seed_hex = hex::encode(seed);
+            kek_hex = hex::encode(fs3_core::derive_sse_s3_kek(&seed, 1));
+            e.close().unwrap();
+        }
+        let export = dir.path().join("export.json");
+        run_meta_export(
+            &img1,
+            &meta1,
+            &MetaExportArgs {
+                output: export.clone(),
+            },
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&export).unwrap();
+        // 红线:seed/KEK 明文零导出(键名与内容双向钉住)
+        assert!(!text.contains("sse_kek_seed"), "导出含 seed 键名");
+        assert!(!text.contains(&seed_hex), "导出含 seed 内容");
+        assert!(!text.contains(&kek_hex), "导出含 KEK 内容");
+        // 桶默认加密随 DTO 导出(DS3)
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["buckets"][0]["default_encryption"], "Aes256");
+        // 对象 wrapped_dek 密文照常导出(元数据迁移语义)
+        assert_eq!(
+            json["objects"][0]["meta"]["sse"]["kind"],
+            serde_json::json!("SseS3")
+        );
     }
 
     /// D5 统计重算校验:桶统计与条目重算不一致(截断/篡改)→ 拒绝导入。

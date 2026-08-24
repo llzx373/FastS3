@@ -34,6 +34,40 @@ fn setup() -> (tempfile::TempDir, S3Service) {
 
 use std::sync::Arc;
 
+/// 关后台压缩的确定性变体(M11 SSE multipart 测试用:≥5MiB 分片 + 加密
+/// CPU 耗时放宽了「extent 刚封口、分片尚未 add_object 记账」窗口被后台
+/// 压缩迁移/释放的预存竞争面——与引擎单测同口径,关压缩保确定性;
+/// 该竞争为 SSE 无关的预存缺陷,另案跟踪)。
+fn setup_no_compact() -> (tempfile::TempDir, S3Service) {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("disk.img");
+    std::fs::File::create(&img)
+        .unwrap()
+        .set_len(128 * 1024 * 1024)
+        .unwrap();
+    fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
+    let cfg = fs3_engine::EngineConfig {
+        device: img,
+        meta_dir: dir.path().join("meta"),
+        compaction: fs3_engine::CompactionConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let engine = Arc::new(parking_lot::RwLock::new(Engine::open(&cfg).unwrap()));
+    let svc = S3Service::new(
+        engine,
+        vec![Credentials {
+            access_key: "test".into(),
+            secret_key: "secret123".into(),
+        }],
+        "us-east-1".into(),
+        false,
+    );
+    (dir, svc)
+}
+
 /// 构造已签名请求。
 fn req(method: &str, path: &str, body: Vec<u8>) -> S3Request {
     req_q(method, path, &[], body)
@@ -314,6 +348,7 @@ fn bucket_and_object_flow() {
                 big.len() as u64,
                 &mut pos,
                 &mut buf,
+                None,
             )
             .unwrap();
         if n == 0 {
@@ -1004,10 +1039,13 @@ fn auth_and_errors() {
     assert_eq!(err_code(&r), "SignatureDoesNotMatch");
 
     // 未实现子资源 → NotImplemented(?policy 自 M10 S3 起已实现:
-    // 不存在桶的 GetBucketPolicy → NoSuchBucket)
-    let r = svc.handle(&req_q("GET", "/bkt1", &[("lifecycle", "")], vec![]));
+    // 不存在桶的 GetBucketPolicy → NoSuchBucket;?lifecycle 自 M11 L1
+    // 起已实现:不存在桶 → NoSuchBucket)
+    let r = svc.handle(&req_q("GET", "/bkt1", &[("website", "")], vec![]));
     assert_eq!(err_code(&r), "NotImplemented");
     let r = svc.handle(&req_q("GET", "/bkt1", &[("policy", "")], vec![]));
+    assert_eq!(err_code(&r), "NoSuchBucket");
+    let r = svc.handle(&req_q("GET", "/bkt1", &[("lifecycle", "")], vec![]));
     assert_eq!(err_code(&r), "NoSuchBucket");
     // ListMultipartUploads 已实现(M4 修复);不存在桶 → NoSuchBucket
     let r = svc.handle(&req_q("GET", "/bkt1", &[("uploads", "")], vec![]));
@@ -1230,6 +1268,8 @@ fn assert_ok(err: &Result<ServiceResponse, fs3_s3::S3Error>) {
 }
 
 /// 读取对象响应(body 可能是 Bytes 或 ObjectStream)并逐字节比对。
+/// 读 ObjectStream 响应体并与期望字节比对(SSE 对象的请求期密钥随
+/// 响应体携带,M11 E1-3)。
 fn read_body(svc: &S3Service, r: &ServiceResponse, expect: &[u8]) {
     match &r.body {
         ResponseBody::Bytes(b) => assert_eq!(b, expect),
@@ -1240,6 +1280,7 @@ fn read_body(svc: &S3Service, r: &ServiceResponse, expect: &[u8]) {
             offset,
             length,
             versioning,
+            sse_key,
             ..
         } => {
             let mut buf = Vec::with_capacity(*length as usize);
@@ -1256,6 +1297,7 @@ fn read_body(svc: &S3Service, r: &ServiceResponse, expect: &[u8]) {
                         *length,
                         &mut pos,
                         &mut chunk,
+                        sse_key.as_ref(),
                     )
                     .expect("read stream");
                 if n == 0 {
@@ -1615,6 +1657,70 @@ fn resp_headers_roundtrip_echo() {
     let head2 = svc.handle(&req("HEAD", "/rh-bucket/obj", vec![])).unwrap();
     assert!(!head2.headers.iter().any(|(k, _)| k == "content-encoding"));
     assert!(!head2.headers.iter().any(|(k, _)| k == "cache-control"));
+}
+
+/// M11 G-1:GetObject response-* 查询参数覆盖响应头(AWS Response Header
+/// Overrides;s3-tests test_object_raw_response_headers 回归):六参数逐对
+/// 替换(含 PUT 期存储值,替换非追加),未携带参数 → 存储值回显不变。
+#[test]
+fn get_object_response_header_overrides() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/ov-bucket", vec![]))), 200);
+    let r = req_h(
+        "PUT",
+        "/ov-bucket/obj",
+        &[("cache-control", "public"), ("content-encoding", "gzip")],
+        b"data".to_vec(),
+    );
+    assert_eq!(status(&svc.handle(&r)), 200);
+
+    let get = svc
+        .handle(&req_q(
+            "GET",
+            "/ov-bucket/obj",
+            &[
+                ("response-content-type", "foo/bar"),
+                ("response-content-disposition", "bla"),
+                ("response-content-language", "esperanto"),
+                ("response-cache-control", "no-cache"),
+                ("response-content-encoding", "aaa"),
+                ("response-expires", "123"),
+            ],
+            vec![],
+        ))
+        .unwrap();
+    let h = |k: &str| {
+        get.headers
+            .iter()
+            .find(|(kk, _)| kk.eq_ignore_ascii_case(k))
+            .map(|(_, v)| v.clone())
+    };
+    assert_eq!(h("content-type").as_deref(), Some("foo/bar"));
+    assert_eq!(h("content-disposition").as_deref(), Some("bla"));
+    assert_eq!(h("content-language").as_deref(), Some("esperanto"));
+    assert_eq!(h("cache-control").as_deref(), Some("no-cache"));
+    assert_eq!(h("content-encoding").as_deref(), Some("aaa"));
+    assert_eq!(h("expires").as_deref(), Some("123"));
+    // 覆盖为替换非追加:同名头唯一
+    assert_eq!(
+        get.headers
+            .iter()
+            .filter(|(kk, _)| kk.eq_ignore_ascii_case("cache-control"))
+            .count(),
+        1
+    );
+
+    // 未携带参数:PUT 期存储值照常回显
+    let plain = svc.handle(&req("GET", "/ov-bucket/obj", vec![])).unwrap();
+    let ph = |k: &str| {
+        plain
+            .headers
+            .iter()
+            .find(|(kk, _)| kk.eq_ignore_ascii_case(k))
+            .map(|(_, v)| v.clone())
+    };
+    assert_eq!(ph("cache-control").as_deref(), Some("public"));
+    assert_eq!(ph("content-encoding").as_deref(), Some("gzip"));
 }
 
 /// M9/C2:unicode 元数据头往返(服务层;HTTP 层字节保真在 fs3-http,
@@ -2039,6 +2145,7 @@ fn versionid_addressing_and_delete_markers() {
             offset,
             length,
             versioning,
+            sse_key,
             ..
         } => {
             let mut buf = Vec::new();
@@ -2055,6 +2162,7 @@ fn versionid_addressing_and_delete_markers() {
                         *length,
                         &mut pos,
                         &mut chunk,
+                        sse_key.as_ref(),
                     )
                     .unwrap();
                 if n == 0 {
@@ -3601,6 +3709,315 @@ fn cors_eval_matching() {
         .is_none());
 }
 
+// ───────────────────── M11 L1:桶生命周期(ADR-12 DL1)─────────────────────
+
+/// PutBucketLifecycleConfiguration/GetBucketLifecycleConfiguration/
+/// DeleteBucketLifecycleConfiguration 全流程:多规则 + 各动作组合 +
+/// Filter(Prefix/Tag/And)往返;NoSuchLifecycleConfiguration;DELETE 幂等;
+/// 整体替换语义。
+#[test]
+fn bucket_lifecycle_flow() {
+    let (_d, svc) = setup();
+    svc.handle(&req("PUT", "/bkt1", vec![])).unwrap();
+    let q = &[("lifecycle", "")];
+
+    // 无配置 → 404 NoSuchLifecycleConfiguration(AWS)
+    let r = svc.handle(&req_q("GET", "/bkt1", q, vec![]));
+    assert_eq!(status(&r), 404);
+    assert_eq!(err_code(&r), "NoSuchLifecycleConfiguration");
+
+    // 多规则 PUT(Expiration Days/Date/ExpiredObjectDeleteMarker +
+    // NoncurrentVersionExpiration + AbortIncompleteMultipartUpload +
+    // Filter Prefix/Tag/And/空)→ 200
+    let body = br#"<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+      <Rule><ID>a-expire</ID><Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status>
+        <Expiration><Days>30</Days></Expiration></Rule>
+      <Rule><ID>b-date</ID><Filter><Tag><Key>class</Key><Value>cold</Value></Tag></Filter>
+        <Status>Enabled</Status><Expiration><Date>2026-06-01T00:00:00Z</Date></Expiration></Rule>
+      <Rule><ID>c-noncur</ID><Filter><And><Prefix>v/</Prefix><Tag><Key>k</Key><Value>x</Value></Tag></And></Filter>
+        <Status>Disabled</Status>
+        <NoncurrentVersionExpiration><NoncurrentDays>90</NoncurrentDays><NewerNoncurrentVersions>2</NewerNoncurrentVersions></NoncurrentVersionExpiration>
+        <AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule>
+      <Rule><ID>d-marker</ID><Filter/><Status>Enabled</Status>
+        <Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration></Rule>
+    </LifecycleConfiguration>"#
+        .to_vec();
+    let r = svc.handle(&req_q("PUT", "/bkt1", q, body));
+    assert_eq!(status(&r), 200, "{r:?}");
+
+    // GET 往返:规则全部回显(序 = rule_id 字典序),字段保真
+    let r = svc.handle(&req_q("GET", "/bkt1", q, vec![]));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let x = body_str(&r.unwrap());
+    for frag in [
+        "<ID>a-expire</ID>",
+        "<ID>b-date</ID>",
+        "<ID>c-noncur</ID>",
+        "<ID>d-marker</ID>",
+        "<Filter><Prefix>logs/</Prefix></Filter>",
+        "<Tag><Key>class</Key><Value>cold</Value></Tag>",
+        "<Date>2026-06-01T00:00:00.000Z</Date>",
+        "<And><Prefix>v/</Prefix>",
+        "<Status>Disabled</Status>",
+        "<NoncurrentDays>90</NoncurrentDays>",
+        "<NewerNoncurrentVersions>2</NewerNoncurrentVersions>",
+        "<DaysAfterInitiation>7</DaysAfterInitiation>",
+        "<ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker>",
+    ] {
+        assert!(x.contains(frag), "missing {frag} in {x}");
+    }
+    // 规则序 = rule_id 字典序(存储序,DL1 每规则一键)
+    let ia = x.find("<ID>a-expire</ID>").unwrap();
+    let ib = x.find("<ID>b-date</ID>").unwrap();
+    let ic = x.find("<ID>c-noncur</ID>").unwrap();
+    let idm = x.find("<ID>d-marker</ID>").unwrap();
+    assert!(ia < ib && ib < ic && ic < idm, "{x}");
+
+    // 整体替换:新配置仅一条 → 旧四条全灭
+    let body2 = br#"<LifecycleConfiguration><Rule><ID>only</ID><Filter/><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>"#.to_vec();
+    let r = svc.handle(&req_q("PUT", "/bkt1", q, body2));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let x = body_str(&svc.handle(&req_q("GET", "/bkt1", q, vec![])).unwrap());
+    assert!(
+        x.contains("<ID>only</ID>") && !x.contains("a-expire"),
+        "{x}"
+    );
+
+    // DELETE → 204;再 DELETE → 204(AWS 幂等);再 GET → 404
+    let r = svc.handle(&req_q("DELETE", "/bkt1", q, vec![]));
+    assert_eq!(status(&r), 204, "{r:?}");
+    let r = svc.handle(&req_q("DELETE", "/bkt1", q, vec![]));
+    assert_eq!(status(&r), 204, "Delete 幂等:无配置同样 204");
+    let r = svc.handle(&req_q("GET", "/bkt1", q, vec![]));
+    assert_eq!(err_code(&r), "NoSuchLifecycleConfiguration");
+    // 桶不存在 → NoSuchBucket(三方法同口径)
+    for m in ["GET", "PUT", "DELETE"] {
+        let body = if m == "PUT" {
+            br#"<LifecycleConfiguration><Rule><ID>r</ID><Filter/><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>"#.to_vec()
+        } else {
+            vec![]
+        };
+        let r = svc.handle(&req_q(m, "/ghost", q, body));
+        assert_eq!(err_code(&r), "NoSuchBucket", "{m}");
+    }
+}
+
+/// 非法配置显式拒绝:坏 XML / 语义违例 / Transition 族(不静默)。
+#[test]
+fn bucket_lifecycle_rejects() {
+    let (_d, svc) = setup();
+    svc.handle(&req("PUT", "/bkt1", vec![])).unwrap();
+    let q = &[("lifecycle", "")];
+    let wrap = |rule: &str| {
+        format!(r#"<LifecycleConfiguration>{rule}</LifecycleConfiguration>"#).into_bytes()
+    };
+    // 坏 XML / 缺 Status / Days+Date 同现 / 无 Filter 无 Prefix → MalformedXML
+    for (body, code) in [
+        (b"<oops".to_vec(), "MalformedXML"),
+        (
+            wrap(r#"<Rule><ID>r</ID><Filter/><Expiration><Days>1</Days></Expiration></Rule>"#),
+            "MalformedXML",
+        ),
+        (
+            wrap(
+                r#"<Rule><ID>r</ID><Filter/><Status>Enabled</Status><Expiration><Days>1</Days><Date>2026-01-01T00:00:00Z</Date></Expiration></Rule>"#,
+            ),
+            "MalformedXML",
+        ),
+        (
+            wrap(
+                r#"<Rule><ID>r</ID><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule>"#,
+            ),
+            "MalformedXML",
+        ),
+        // Days=0 → InvalidArgument(AWS 口径,M11 L5);无动作规则 → InvalidRequest
+        (
+            wrap(
+                r#"<Rule><ID>r</ID><Filter/><Status>Enabled</Status><Expiration><Days>0</Days></Expiration></Rule>"#,
+            ),
+            "InvalidArgument",
+        ),
+        (
+            wrap(r#"<Rule><ID>r</ID><Filter/><Status>Enabled</Status></Rule>"#),
+            "InvalidRequest",
+        ),
+        // Transition / NoncurrentVersionTransition → NotImplemented(显式)
+        (
+            wrap(
+                r#"<Rule><ID>r</ID><Filter/><Status>Enabled</Status><Transition><Days>30</Days><StorageClass>GLACIER</StorageClass></Transition></Rule>"#,
+            ),
+            "NotImplemented",
+        ),
+        (
+            wrap(
+                r#"<Rule><ID>r</ID><Filter/><Status>Enabled</Status><NoncurrentVersionTransition><NoncurrentDays>30</NoncurrentDays><StorageClass>GLACIER</StorageClass></NoncurrentVersionTransition></Rule>"#,
+            ),
+            "NotImplemented",
+        ),
+    ] {
+        let r = svc.handle(&req_q("PUT", "/bkt1", q, body.clone()));
+        assert_eq!(err_code(&r), code, "{}", String::from_utf8_lossy(&body));
+    }
+    // 全部被拒 → 配置不落库(GET 仍 404)
+    let r = svc.handle(&req_q("GET", "/bkt1", q, vec![]));
+    assert_eq!(err_code(&r), "NoSuchLifecycleConfiguration");
+}
+
+/// 删桶清理 + 两桶隔离(r: 键随桶删除;前缀互不串扰)。
+#[test]
+fn bucket_lifecycle_delete_cleanup_and_isolation() {
+    let (_d, svc) = setup();
+    svc.handle(&req("PUT", "/bkt1", vec![])).unwrap();
+    svc.handle(&req("PUT", "/bkt2", vec![])).unwrap();
+    let q = &[("lifecycle", "")];
+    let body = |id: &str, days: u32| {
+        format!(
+            r#"<LifecycleConfiguration><Rule><ID>{id}</ID><Filter/><Status>Enabled</Status><Expiration><Days>{days}</Days></Expiration></Rule></LifecycleConfiguration>"#
+        )
+        .into_bytes()
+    };
+    svc.handle(&req_q("PUT", "/bkt1", q, body("r-one", 30)))
+        .unwrap();
+    svc.handle(&req_q("PUT", "/bkt2", q, body("r-two", 60)))
+        .unwrap();
+    // 两桶隔离:各自的规则互不可见
+    let x1 = body_str(&svc.handle(&req_q("GET", "/bkt1", q, vec![])).unwrap());
+    let x2 = body_str(&svc.handle(&req_q("GET", "/bkt2", q, vec![])).unwrap());
+    assert!(x1.contains("r-one") && !x1.contains("r-two"), "{x1}");
+    assert!(x2.contains("r-two") && !x2.contains("r-one"), "{x2}");
+    // b1 替换不影响 b2
+    svc.handle(&req_q("PUT", "/bkt1", q, body("r-new", 1)))
+        .unwrap();
+    let x2 = body_str(&svc.handle(&req_q("GET", "/bkt2", q, vec![])).unwrap());
+    assert!(x2.contains("r-two"), "{x2}");
+    // 删 b1 → 规则随桶清理;重建同名桶 → 无残留
+    let r = svc.handle(&req("DELETE", "/bkt1", vec![]));
+    assert_eq!(status(&r), 204, "{r:?}");
+    svc.handle(&req("PUT", "/bkt1", vec![])).unwrap();
+    let r = svc.handle(&req_q("GET", "/bkt1", q, vec![]));
+    assert_eq!(
+        err_code(&r),
+        "NoSuchLifecycleConfiguration",
+        "删桶后规则必须清理"
+    );
+    let x2 = body_str(&svc.handle(&req_q("GET", "/bkt2", q, vec![])).unwrap());
+    assert!(x2.contains("r-two"), "删 b1 不得波及 b2: {x2}");
+}
+
+/// M11 L5:旧版直下 `<Prefix>` 提交形态按原样往返(AWS/RGW 按原始文档
+/// 形态存取;s3-tests test_lifecycle_get 逐字段相等断言)+ 规则 ID 缺省
+/// 自动生成(test_lifecycle_get_no_id:GET 必须带回 ID)。
+#[test]
+fn bucket_lifecycle_legacy_prefix_form_and_auto_id() {
+    let (_d, svc) = setup();
+    svc.handle(&req("PUT", "/bkt1", vec![])).unwrap();
+    let q = &[("lifecycle", "")];
+    let body = br#"<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+      <Rule><Expiration><Days>31</Days></Expiration><Prefix>test1/</Prefix><Status>Enabled</Status></Rule>
+      <Rule><Expiration><Days>120</Days></Expiration><Prefix>test2/</Prefix><Status>Enabled</Status></Rule>
+    </LifecycleConfiguration>"#
+        .to_vec();
+    let r = svc.handle(&req_q("PUT", "/bkt1", q, body));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let x = body_str(&svc.handle(&req_q("GET", "/bkt1", q, vec![])).unwrap());
+    // 旧版形态原样回渲染(不归一为 <Filter>),生成 ID 非空且互异
+    assert!(
+        x.contains("<Prefix>test1/</Prefix>") && x.contains("<Prefix>test2/</Prefix>"),
+        "{x}"
+    );
+    assert!(!x.contains("<Filter>"), "legacy 形态不得渲染 Filter: {x}");
+    let ids: Vec<&str> = x
+        .match_indices("<ID>")
+        .map(|(i, _)| &x[i + 4..x[i + 4..].find("</ID>").unwrap() + i + 4])
+        .collect();
+    assert_eq!(ids.len(), 2, "{x}");
+    assert!(ids.iter().all(|id| !id.is_empty()), "缺省 ID 自动生成: {x}");
+    assert_ne!(ids[0], ids[1], "{x}");
+    // Filter 形态提交的规则仍归一渲染为 Filter(不受 legacy 通道影响)
+    let body2 = br#"<LifecycleConfiguration><Rule><ID>f</ID><Filter><Prefix>p/</Prefix></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>"#.to_vec();
+    assert_eq!(status(&svc.handle(&req_q("PUT", "/bkt1", q, body2))), 200);
+    let x = body_str(&svc.handle(&req_q("GET", "/bkt1", q, vec![])).unwrap());
+    assert!(x.contains("<Filter><Prefix>p/</Prefix></Filter>"), "{x}");
+}
+
+/// M11 L5:x-amz-expiration 响应头(s3-tests lifecycle_expiration_header
+/// 族):PUT/GET/HEAD 命中 Enabled 过期规则(Days/Date)时回显
+/// expiry-date + rule-id(多命中取最早);tag 不命中/Disabled/纯删除标记
+/// 规则不回。
+#[test]
+fn object_lifecycle_expiration_header() {
+    let (_d, svc) = setup();
+    svc.handle(&req("PUT", "/bkt1", vec![])).unwrap();
+    let q = &[("lifecycle", "")];
+    let cfg = |tag: &str| {
+        format!(
+            r#"<LifecycleConfiguration>
+      <Rule><ID>days-rule</ID><Filter><Prefix>days1/</Prefix></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule>
+      <Rule><ID>tag-rule</ID><Filter><Tag><Key>{tag}</Key><Value>tag1</Value></Tag></Filter><Status>Enabled</Status><Expiration><Days>2</Days></Expiration></Rule>
+      <Rule><ID>dm-rule</ID><Filter><Prefix>dm/</Prefix></Filter><Status>Enabled</Status><Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration></Rule>
+      <Rule><ID>off-rule</ID><Filter><Prefix>off/</Prefix></Filter><Status>Disabled</Status><Expiration><Days>1</Days></Expiration></Rule>
+    </LifecycleConfiguration>"#
+        )
+        .into_bytes()
+    };
+    assert_eq!(
+        status(&svc.handle(&req_q("PUT", "/bkt1", q, cfg("key1")))),
+        200
+    );
+    let check = |h: Option<String>, rule_id: &str| {
+        let h = h.expect("x-amz-expiration 头存在");
+        let (d, r) = h
+            .strip_prefix("expiry-date=\"")
+            .and_then(|s| s.split_once("\", rule-id=\""))
+            .and_then(|(d, r)| r.strip_suffix('"').map(|r| (d, r)))
+            .unwrap_or_else(|| panic!("头形态: {h}"));
+        assert_eq!(r, rule_id, "{h}");
+        assert!(d.ends_with("00:00:00 GMT"), "DL4 午夜语义: {h}");
+    };
+    // PUT 命中前缀规则 → 回显(缓冲路径)
+    let r = svc
+        .handle(&req("PUT", "/bkt1/days1/foo", b"x".to_vec()))
+        .unwrap();
+    check(hdr(&r, "x-amz-expiration"), "days-rule");
+    // HEAD/GET 同口径
+    let r = svc.handle(&req("HEAD", "/bkt1/days1/foo", vec![])).unwrap();
+    check(hdr(&r, "x-amz-expiration"), "days-rule");
+    let r = svc.handle(&req("GET", "/bkt1/days1/foo", vec![])).unwrap();
+    check(hdr(&r, "x-amz-expiration"), "days-rule");
+    // 未打标对象不命中 tag 规则 → 无头;打标后 HEAD 回显 tag-rule
+    let r = svc
+        .handle(&req("PUT", "/bkt1/obj_key1", b"x".to_vec()))
+        .unwrap();
+    assert!(hdr(&r, "x-amz-expiration").is_none(), "{r:?}");
+    let tags =
+        br#"<Tagging><TagSet><Tag><Key>key1</Key><Value>tag1</Value></Tag></TagSet></Tagging>"#
+            .to_vec();
+    assert_eq!(
+        status(&svc.handle(&req_q("PUT", "/bkt1/obj_key1", &[("tagging", "")], tags))),
+        200
+    );
+    let r = svc.handle(&req("HEAD", "/bkt1/obj_key1", vec![])).unwrap();
+    check(hdr(&r, "x-amz-expiration"), "tag-rule");
+    // 规则改为不命中标签 → 头消失(test_lifecycle_expiration_header_tags_head 负向臂)
+    assert_eq!(
+        status(&svc.handle(&req_q("PUT", "/bkt1", q, cfg("key2")))),
+        200
+    );
+    let r = svc.handle(&req("HEAD", "/bkt1/obj_key1", vec![])).unwrap();
+    assert!(hdr(&r, "x-amz-expiration").is_none(), "{r:?}");
+    // 纯 ExpiredObjectDeleteMarker 规则 / Disabled 规则前缀 → 无头
+    assert_eq!(
+        status(&svc.handle(&req_q("PUT", "/bkt1", q, cfg("key1")))),
+        200
+    );
+    for k in ["dm/a", "off/a"] {
+        let r = svc
+            .handle(&req("PUT", &format!("/bkt1/{k}"), b"x".to_vec()))
+            .unwrap();
+        assert!(hdr(&r, "x-amz-expiration").is_none(), "{k}: {r:?}");
+    }
+}
+
 // ───────────────────── M10 S7:OwnershipControls ─────────────────────
 
 /// OwnershipControls 存取回显 + 404 + 删除幂等 + CreateBucket 头落配置。
@@ -3979,6 +4396,65 @@ fn post_object_sigv2_flow() {
         .iter()
         .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v == "text/plain"));
     let _ = POST_POLICY; // 文档常量锚定(防误改语义)
+}
+
+/// M11 门禁:POST 表单 x-amz-checksum-* 字段——policy 无覆盖条件仍受理
+/// (AWS 口径,s3-tests test_post_object_upload_checksum);值验算:正确 →
+/// 204 + 回显 + 落库;错误 → 400 BadDigest 且对象不落盘。
+#[test]
+fn post_object_checksum_field() {
+    let (_d, svc) = setup();
+    assert_ok(&svc.handle(&req("PUT", "/post", vec![])));
+    let payload = b"post checksum payload";
+    let good = cksum_b64(fs3_core::ChecksumAlgorithm::Sha256, payload);
+    let (policy_b64, sig) = sigv2_form("secret123", &post_policy_doc());
+    let boundary = "----fasts3test";
+    let fields = [
+        ("key", "foo-ck.txt"),
+        ("AWSAccessKeyId", "test"),
+        ("acl", "private"),
+        ("signature", sig.as_str()),
+        ("policy", policy_b64.as_str()),
+        ("Content-Type", "text/plain"),
+        ("x-amz-checksum-sha256", good.as_str()),
+    ];
+    let body = post_form_body(boundary, &fields, ("f.txt", payload));
+    let r = svc.handle(&post_req("/post", boundary, body));
+    assert_eq!(status(&r), 204, "{r:?}");
+    assert_eq!(
+        hdr(&r.unwrap(), "x-amz-checksum-sha256").as_deref(),
+        Some(good.as_str())
+    );
+    // 落库:checksum-mode 下 HEAD 回显
+    let head = svc
+        .handle(&req_h(
+            "HEAD",
+            "/post/foo-ck.txt",
+            &[("x-amz-checksum-mode", "ENABLED")],
+            vec![],
+        ))
+        .unwrap();
+    assert_eq!(
+        hdr(&head, "x-amz-checksum-sha256").as_deref(),
+        Some(good.as_str())
+    );
+    // 错误值 → 400 BadDigest,对象不落盘
+    let bad = cksum_b64(fs3_core::ChecksumAlgorithm::Sha256, b"tampered");
+    let fields = [
+        ("key", "foo-ck-bad.txt"),
+        ("AWSAccessKeyId", "test"),
+        ("acl", "private"),
+        ("signature", sig.as_str()),
+        ("policy", policy_b64.as_str()),
+        ("Content-Type", "text/plain"),
+        ("x-amz-checksum-sha256", bad.as_str()),
+    ];
+    let body = post_form_body(boundary, &fields, ("f.txt", payload));
+    let r = svc.handle(&post_req("/post", boundary, body));
+    assert_eq!(status(&r), 400, "{r:?}");
+    assert_eq!(err_code(&r), "BadDigest");
+    let r = svc.handle(&req("GET", "/post/foo-ck-bad.txt", vec![]));
+    assert_eq!(err_code(&r), "NoSuchKey", "坏 checksum POST 不得落盘");
 }
 
 /// M10 S4:SigV4 表单 POST(x-amz-* 字段族;boto3 generate_presigned_post 口径)。
@@ -4567,14 +5043,3847 @@ fn d1a_suspended_null_write_ordering() {
     read_body(&svc, &r, b"enabled-v2");
 }
 
+// ─────────────────── M11 C1-3/C1-4:GetObjectAttributes + multipart checksum ───────────────────
+
+/// 发起一次带 checksum 的 multipart 全流程辅助:Create(`with_session`
+/// 时携带 x-amz-checksum-algorithm 会话头)→ UploadPart(带
+/// x-amz-checksum-{alg} 头)→ 返回 (uid, [(part_no, etag_hex, part_ck_b64)])。
+fn mp_upload_parts(
+    svc: &S3Service,
+    bucket: &str,
+    key: &str,
+    alg: fs3_core::ChecksumAlgorithm,
+    parts: &[Vec<u8>],
+    with_session: bool,
+) -> (String, Vec<(u32, String, String)>) {
+    let hdr_name = format!("x-amz-checksum-{}", alg.header_suffix());
+    let create_headers: Vec<(String, String)> = if with_session {
+        vec![("x-amz-checksum-algorithm".into(), alg.s3_name().into())]
+    } else {
+        vec![]
+    };
+    let r = svc
+        .handle(&req_qh(
+            "POST",
+            &format!("/{bucket}/{key}"),
+            &[("uploads", "")],
+            &create_headers
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect::<Vec<_>>(),
+            vec![],
+        ))
+        .unwrap();
+    let x = body_str(&r);
+    let uid = x
+        .split("<UploadId>")
+        .nth(1)
+        .unwrap()
+        .split("</UploadId>")
+        .next()
+        .unwrap()
+        .to_string();
+    let mut out = Vec::new();
+    for (i, data) in parts.iter().enumerate() {
+        let ck = cksum_b64(alg, data);
+        let rq = req_qh(
+            "PUT",
+            &format!("/{bucket}/{key}"),
+            &[("partNumber", &(i + 1).to_string()), ("uploadId", &uid)],
+            &[(hdr_name.as_str(), &ck)],
+            data.clone(),
+        );
+        let r = svc.handle(&rq);
+        assert_eq!(status(&r), 200, "UploadPart {alg:?} #{i}: {r:?}");
+        let r = r.unwrap();
+        // UploadPart 响应回显 checksum 头(AWS 口径)
+        assert_eq!(hdr(&r, &hdr_name).as_deref(), Some(ck.as_str()));
+        let etag = hdr(&r, "etag").unwrap().trim_matches('"').to_string();
+        out.push(((i + 1) as u32, etag, ck));
+    }
+    (uid, out)
+}
+
+/// 复合头值 = base64(alg(concat(各分片 checksum 原始字节))) + -N。
+fn composite_header_value(alg: fs3_core::ChecksumAlgorithm, part_ck_b64: &[String]) -> String {
+    let mut concat = Vec::new();
+    for b64 in part_ck_b64 {
+        concat.extend_from_slice(
+            &base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).unwrap(),
+        );
+    }
+    let raw = fs3_core::checksum_one_shot(alg, &concat);
+    format!(
+        "{}-{}",
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, raw),
+        part_ck_b64.len()
+    )
+}
+
+/// Complete 请求体(可选逐分片 checksum 元素)。
+fn complete_xml(parts: &[(u32, String, String)], with_checksum: Option<&str>) -> Vec<u8> {
+    let mut xml = "<CompleteMultipartUpload>".to_string();
+    for (no, etag, ck) in parts {
+        xml.push_str(&format!(
+            "<Part><PartNumber>{no}</PartNumber><ETag>\"{etag}\"</ETag>"
+        ));
+        if let Some(elem) = with_checksum {
+            xml.push_str(&format!("<{elem}>{ck}</{elem}>"));
+        }
+        xml.push_str("</Part>");
+    }
+    xml.push_str("</CompleteMultipartUpload>");
+    xml.into_bytes()
+}
+
+/// 五族全流程:Create 会话算法 → UploadPart 带 checksum → Complete
+/// (COMPOSITE 族带 -N 复合头;FULL_OBJECT 族带裸值头)→ 200 + body
+/// 元素回显;GetObjectAttributes 五属性全取校验;HEAD 门控回显。
 #[test]
-fn get_object_attributes_explicit_501() {
-    // V6-1 卫生:GetObjectAttributes(checksum 族 v1.2)此前静默落到
-    // GetObject 返回对象体(客户端 200 解析失败重试风暴),改显式 501。
+fn multipart_checksum_five_algorithms_full_flow() {
     let (_d, svc) = setup();
-    svc.handle(&req("PUT", "/bkt1", vec![])).unwrap();
-    svc.handle(&req("PUT", "/bkt1/k", b"xx".to_vec())).unwrap();
+    assert_eq!(status(&svc.handle(&req("PUT", "/mp-ck", vec![]))), 200);
+    let cases = [
+        (fs3_core::ChecksumAlgorithm::Crc32, "crc32", "ChecksumCRC32"),
+        (
+            fs3_core::ChecksumAlgorithm::Crc32c,
+            "crc32c",
+            "ChecksumCRC32C",
+        ),
+        (fs3_core::ChecksumAlgorithm::Sha1, "sha1", "ChecksumSHA1"),
+        (
+            fs3_core::ChecksumAlgorithm::Sha256,
+            "sha256",
+            "ChecksumSHA256",
+        ),
+        (
+            fs3_core::ChecksumAlgorithm::Crc64Nvme,
+            "crc64nvme",
+            "ChecksumCRC64NVME",
+        ),
+    ];
+    for (i, (alg, suffix, elem)) in cases.iter().enumerate() {
+        let key = format!("obj{i}");
+        // 两分片:5MiB(extent)+ 小(内联)→ 混合臂
+        let data1 = vec![0x30u8 + i as u8; 5 * 1024 * 1024];
+        let data2 = format!("tail-{i}").into_bytes();
+        let (uid, parts) = mp_upload_parts(
+            &svc,
+            "mp-ck",
+            &key,
+            *alg,
+            &[data1.clone(), data2.clone()],
+            true,
+        );
+        let hdr_name = format!("x-amz-checksum-{suffix}");
+        let ctype = alg.default_checksum_type();
+        // 对象级期望值:COMPOSITE = 复合 -N;FULL_OBJECT = 全数据裸值
+        let object_value = match ctype {
+            fs3_core::ChecksumType::Composite => composite_header_value(
+                *alg,
+                &parts
+                    .iter()
+                    .map(|(_, _, ck)| ck.clone())
+                    .collect::<Vec<_>>(),
+            ),
+            fs3_core::ChecksumType::FullObject => {
+                let mut data = data1.clone();
+                data.extend_from_slice(&data2);
+                cksum_b64(*alg, &data)
+            }
+        };
+        let rq = req_qh(
+            "POST",
+            &format!("/mp-ck/{key}"),
+            &[("uploadId", &uid)],
+            &[(hdr_name.as_str(), &object_value)],
+            complete_xml(&parts, Some(elem)),
+        );
+        let r = svc.handle(&rq);
+        assert_eq!(status(&r), 200, "Complete {alg:?}: {r:?}");
+        let r = r.unwrap();
+        // Complete 响应:头部回显(兼容)+ body 元素(AWS 模型口径)
+        assert_eq!(
+            hdr(&r, &hdr_name).as_deref(),
+            Some(object_value.as_str()),
+            "{alg:?} Complete echo"
+        );
+        let x = body_str(&r);
+        assert!(
+            x.contains(&format!("<{elem}>{object_value}</{elem}>")),
+            "{alg:?} body: {x}"
+        );
+        assert!(
+            x.contains(&format!("<ChecksumType>{}</ChecksumType>", ctype.s3_name())),
+            "{alg:?} body: {x}"
+        );
+        // GetObjectAttributes 五属性全取:Checksum 对象级值、ObjectParts
+        // 逐分片 checksum、ETag(裸值)/ObjectSize/StorageClass
+        let r = svc
+            .handle(&req_qh(
+                "GET",
+                &format!("/mp-ck/{key}"),
+                &[("attributes", "")],
+                &[(
+                    "x-amz-object-attributes",
+                    "ETag,Checksum,ObjectParts,ObjectSize,StorageClass",
+                )],
+                vec![],
+            ))
+            .unwrap();
+        let x = body_str(&r);
+        assert!(
+            x.contains(&format!("<{elem}>{object_value}</{elem}>")),
+            "{alg:?}: {x}"
+        );
+        assert!(x.contains("<PartsCount>2</PartsCount>"), "{x}");
+        assert!(
+            x.contains(&format!("<{elem}>{}</{elem}>", parts[0].2)),
+            "{x}"
+        );
+        assert!(x.contains("<PartNumber>2</PartNumber>"), "{x}");
+        assert!(x.contains("<StorageClass>STANDARD</StorageClass>"), "{x}");
+        assert!(x.contains("<ObjectSize>"), "{x}");
+        assert!(!x.contains("&quot;"), "{alg:?} ETag 裸值无引号: {x}");
+        // HEAD:未开 checksum-mode 不回显;ENABLED 回显对象级值 + 类型
+        let head = svc
+            .handle(&req("HEAD", &format!("/mp-ck/{key}"), vec![]))
+            .unwrap();
+        assert_eq!(hdr(&head, &hdr_name), None, "{alg:?} 无模式不回显");
+        let head = svc
+            .handle(&req_h(
+                "HEAD",
+                &format!("/mp-ck/{key}"),
+                &[("x-amz-checksum-mode", "ENABLED")],
+                vec![],
+            ))
+            .unwrap();
+        assert_eq!(
+            hdr(&head, &hdr_name).as_deref(),
+            Some(object_value.as_str())
+        );
+        assert_eq!(
+            hdr(&head, "x-amz-checksum-type").as_deref(),
+            Some(ctype.s3_name())
+        );
+        // GET ?partNumber=2:分片级 checksum + 对象类型头(AWS 口径)
+        let r = svc
+            .handle(&req_q(
+                "GET",
+                &format!("/mp-ck/{key}"),
+                &[("partNumber", "2")],
+                vec![],
+            ))
+            .unwrap();
+        assert_eq!(
+            hdr(&r, &hdr_name).as_deref(),
+            Some(parts[1].2.as_str()),
+            "{alg:?} partNumber=2 分片 checksum"
+        );
+        assert_eq!(
+            hdr(&r, "x-amz-checksum-type").as_deref(),
+            Some(ctype.s3_name())
+        );
+    }
+}
+
+/// Create 会话算法时 Complete 无客户端 checksum 头也由服务端代算落值
+/// (AWS 口径;s3-tests _multipart_upload_checksum 形态)。
+#[test]
+fn multipart_checksum_session_auto_compute() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/mp-auto", vec![]))), 200);
+    let alg = fs3_core::ChecksumAlgorithm::Sha256;
+    let (uid, parts) = mp_upload_parts(&svc, "mp-auto", "k", alg, &[b"auto-part".to_vec()], true);
+    // Complete:无复合头、XML 无逐分片 checksum 元素 → 服务端代算复合值
+    let bare_parts: Vec<(u32, String, String)> = parts
+        .iter()
+        .map(|(no, etag, _)| (*no, etag.clone(), String::new()))
+        .collect();
+    let rq = req_qh(
+        "POST",
+        "/mp-auto/k",
+        &[("uploadId", &uid)],
+        &[],
+        complete_xml(&bare_parts, None),
+    );
+    let r = svc.handle(&rq);
+    assert_eq!(status(&r), 200, "{r:?}");
+    let composite = composite_header_value(alg, &[parts[0].2.clone()]);
+    let x = body_str(&r.unwrap());
+    assert!(
+        x.contains(&format!("<ChecksumSHA256>{composite}</ChecksumSHA256>")),
+        "{x}"
+    );
+    assert!(x.contains("<ChecksumType>COMPOSITE</ChecksumType>"), "{x}");
+    // Create 非默认类型组合 → 显式 InvalidRequest(不静默)
+    let r = svc.handle(&req_qh(
+        "POST",
+        "/mp-auto/k2",
+        &[("uploads", "")],
+        &[
+            ("x-amz-checksum-algorithm", "SHA256"),
+            ("x-amz-checksum-type", "FULL_OBJECT"),
+        ],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "InvalidRequest");
+}
+
+/// Complete 复合/逐分片校验反例:值不符 → BadDigest;分片缺 checksum 无法
+/// 复合 → InvalidRequest;坏 base64 字母表 → InvalidRequest。
+#[test]
+fn multipart_checksum_complete_rejects() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/mp-bad", vec![]))), 200);
+    let alg = fs3_core::ChecksumAlgorithm::Sha256;
+    let hdr_name = "x-amz-checksum-sha256";
+
+    // 1) 逐分片 checksum 元素值不符 → BadDigest
+    let (uid, parts) = mp_upload_parts(&svc, "mp-bad", "k1", alg, &[b"part-one".to_vec()], true);
+    let mut bad_parts = parts.clone();
+    bad_parts[0].2 = cksum_b64(alg, b"tampered");
+    let rq = req_qh(
+        "POST",
+        "/mp-bad/k1",
+        &[("uploadId", &uid)],
+        &[],
+        complete_xml(&bad_parts, Some("ChecksumSHA256")),
+    );
+    assert_eq!(err_code(&svc.handle(&rq)), "BadDigest");
+
+    // 2) 复合值不符 → BadDigest(逐分片值正确)
+    let composite_bad = format!("{}-1", cksum_b64(alg, b"wrong"));
+    let rq = req_qh(
+        "POST",
+        "/mp-bad/k1",
+        &[("uploadId", &uid)],
+        &[(hdr_name, &composite_bad)],
+        complete_xml(&parts, Some("ChecksumSHA256")),
+    );
+    assert_eq!(err_code(&svc.handle(&rq)), "BadDigest");
+
+    // 3) COMPOSITE 会话给裸值(缺 -N)→ BadDigest(形态不符;AWS 口径)
+    let plain = cksum_b64(alg, b"part-one");
+    let rq = req_qh(
+        "POST",
+        "/mp-bad/k1",
+        &[("uploadId", &uid)],
+        &[(hdr_name, &plain)],
+        complete_xml(&parts, Some("ChecksumSHA256")),
+    );
+    assert_eq!(err_code(&svc.handle(&rq)), "BadDigest");
+
+    // 4) 正例收尾(同会话可重试——验算失败不落对象)
+    let composite = composite_header_value(alg, &[parts[0].2.clone()]);
+    let rq = req_qh(
+        "POST",
+        "/mp-bad/k1",
+        &[("uploadId", &uid)],
+        &[(hdr_name, &composite)],
+        complete_xml(&parts, Some("ChecksumSHA256")),
+    );
+    assert_eq!(status(&svc.handle(&rq)), 200);
+
+    // 5) 分片未带 checksum 上传,Complete 携带复合头 → InvalidRequest
+    let (uid2, parts2) = {
+        // 不带 checksum 的分片(裸 UploadPart)
+        let r = svc
+            .handle(&req_q("POST", "/mp-bad/k2", &[("uploads", "")], vec![]))
+            .unwrap();
+        let x = body_str(&r);
+        let uid = x
+            .split("<UploadId>")
+            .nth(1)
+            .unwrap()
+            .split("</UploadId>")
+            .next()
+            .unwrap()
+            .to_string();
+        let r = svc
+            .handle(&req_q(
+                "PUT",
+                "/mp-bad/k2",
+                &[("partNumber", "1"), ("uploadId", &uid)],
+                b"no-checksum".to_vec(),
+            ))
+            .unwrap();
+        let etag = hdr(&r, "etag").unwrap().trim_matches('"').to_string();
+        (uid, vec![(1u32, etag, String::new())])
+    };
+    let rq = req_qh(
+        "POST",
+        "/mp-bad/k2",
+        &[("uploadId", &uid2)],
+        &[(hdr_name, &composite)],
+        complete_xml(&parts2, None),
+    );
+    assert_eq!(err_code(&svc.handle(&rq)), "InvalidRequest");
+
+    // 6) 逐分片校验通过但无复合头且无会话算法 → 200,对象无对象级 checksum
+    let (uid3, parts3) =
+        mp_upload_parts(&svc, "mp-bad", "k3", alg, &[b"only-parts".to_vec()], false);
+    let rq = req_qh(
+        "POST",
+        "/mp-bad/k3",
+        &[("uploadId", &uid3)],
+        &[],
+        complete_xml(&parts3, Some("ChecksumSHA256")),
+    );
+    assert_eq!(status(&svc.handle(&rq)), 200);
+    let head = svc
+        .handle(&req_h(
+            "HEAD",
+            "/mp-bad/k3",
+            &[("x-amz-checksum-mode", "ENABLED")],
+            vec![],
+        ))
+        .unwrap();
+    assert_eq!(hdr(&head, hdr_name), None, "无复合头 → 无对象级 checksum");
+    // 逐分片 checksum 仍随对象持久化(ObjectParts 可渲染)
+    let r = svc
+        .handle(&req_qh(
+            "GET",
+            "/mp-bad/k3",
+            &[("attributes", "")],
+            &[("x-amz-object-attributes", "ObjectParts,Checksum")],
+            vec![],
+        ))
+        .unwrap();
+    let x = body_str(&r);
+    assert!(x.contains("<PartsCount>1</PartsCount>"), "{x}");
+    assert!(
+        x.contains(&format!("<ChecksumSHA256>{}</ChecksumSHA256>", parts3[0].2)),
+        "{x}"
+    );
+    assert!(!x.contains("<Checksum><ChecksumSHA256>"), "{x}");
+}
+
+/// GetObjectAttributes 基础语义(改写自 V6-1 显式 501 回归):全属性/子集/
+/// 未知属性/缺头/不存在对象/versionId 寻址。
+#[test]
+fn get_object_attributes_semantics() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/bkt1", vec![]))), 200);
+    // 带 checksum 的单 PUT 对象
+    let body = b"attrs body".to_vec();
+    let ck = cksum_b64(fs3_core::ChecksumAlgorithm::Sha256, &body);
+    let r = req_h(
+        "PUT",
+        "/bkt1/k",
+        &[("x-amz-checksum-sha256", &ck)],
+        body.clone(),
+    );
+    assert_eq!(status(&svc.handle(&r)), 200);
+
+    let attrs = |v: &str| {
+        req_qh(
+            "GET",
+            "/bkt1/k",
+            &[("attributes", "")],
+            &[("x-amz-object-attributes", v)],
+            vec![],
+        )
+    };
+    // 五属性全取:ETag/ObjectSize/StorageClass/Checksum(纯 base64,单 PUT
+    // 非复合);ObjectParts 非 multipart 不输出;LastModified 在响应头
+    // (AWS 模型;body 无此元素)
+    let r = svc
+        .handle(&attrs("ETag,ObjectSize,Checksum,ObjectParts,StorageClass"))
+        .unwrap();
+    assert!(hdr(&r, "last-modified").is_some(), "Last-Modified 响应头");
+    let x = body_str(&r);
+    assert!(x.contains("<GetObjectAttributesOutput"), "{x}");
+    assert!(!x.contains("<LastModified>"), "{x}");
+    // 单 PUT:ETag 裸值无引号、无 -N 复合后缀(AWS GetObjectAttributes 口径)
+    let etag_elem = x
+        .split("<ETag>")
+        .nth(1)
+        .unwrap()
+        .split("</ETag>")
+        .next()
+        .unwrap();
+    assert!(!etag_elem.contains('-'), "单 PUT ETag 无 -N: {etag_elem}");
+    assert!(
+        !etag_elem.contains("&quot;"),
+        "ETag 裸值无引号: {etag_elem}"
+    );
+    assert!(x.contains("<ObjectSize>10</ObjectSize>"), "{x}");
+    assert!(x.contains("<StorageClass>STANDARD</StorageClass>"), "{x}");
+    assert!(
+        x.contains(&format!("<ChecksumSHA256>{ck}</ChecksumSHA256>")),
+        "{x}"
+    );
+    assert!(
+        x.contains("<ChecksumType>FULL_OBJECT</ChecksumType>"),
+        "{x}"
+    );
+    assert!(
+        !x.contains("<ObjectParts>"),
+        "非 multipart 无 ObjectParts: {x}"
+    );
+    // 子集:仅请求项输出
+    let r = svc.handle(&attrs("ObjectSize")).unwrap();
+    let x = body_str(&r);
+    assert!(x.contains("<ObjectSize>10</ObjectSize>"), "{x}");
+    assert!(
+        !x.contains("<ETag>") && !x.contains("<StorageClass>"),
+        "{x}"
+    );
+    // 未知属性名 → InvalidArgument
+    assert_eq!(err_code(&svc.handle(&attrs("Foo"))), "InvalidArgument");
+    assert_eq!(err_code(&svc.handle(&attrs("etag"))), "InvalidArgument");
+    // 缺头 → InvalidRequest
     let r = svc.handle(&req_q("GET", "/bkt1/k", &[("attributes", "")], vec![]));
-    assert_eq!(status(&r), 501, "{r:?}");
-    assert_eq!(err_code(&r), "NotImplemented");
+    assert_eq!(err_code(&r), "InvalidRequest");
+    // 不存在对象 → NoSuchKey;不存在桶 → NoSuchBucket
+    let r = svc.handle(&req_qh(
+        "GET",
+        "/bkt1/ghost",
+        &[("attributes", "")],
+        &[("x-amz-object-attributes", "ObjectSize")],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "NoSuchKey");
+    let r = svc.handle(&req_qh(
+        "GET",
+        "/ghost/k",
+        &[("attributes", "")],
+        &[("x-amz-object-attributes", "ObjectSize")],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "NoSuchBucket");
+
+    // versionId 寻址:Enabled 桶两版本,按 versionId 取旧版本属性
+    assert_ok(&put_versioning(&svc, "bkt1", "Enabled"));
+    let r = svc
+        .handle(&req("PUT", "/bkt1/v", b"v1-data".to_vec()))
+        .unwrap();
+    let vid1 = hdr(&r, "x-amz-version-id").unwrap();
+    let r = svc
+        .handle(&req("PUT", "/bkt1/v", b"v2-data-longer".to_vec()))
+        .unwrap();
+    let vid2 = hdr(&r, "x-amz-version-id").unwrap();
+    assert_ne!(vid1, vid2, "Enabled 桶每次写产生新版本");
+    let r = svc
+        .handle(&req_qh(
+            "GET",
+            "/bkt1/v",
+            &[("attributes", ""), ("versionId", &vid1)],
+            &[("x-amz-object-attributes", "ObjectSize")],
+            vec![],
+        ))
+        .unwrap();
+    let x = body_str(&r);
+    assert!(x.contains("<ObjectSize>7</ObjectSize>"), "v1 属性: {x}");
+    assert!(!x.contains("<VersionId>"), "VersionId 为响应头非 body: {x}");
+    assert_eq!(hdr(&r, "x-amz-version-id").as_deref(), Some(vid1.as_str()));
+    // 当前版本(不带 versionId)= v2
+    let r = svc
+        .handle(&req_qh(
+            "GET",
+            "/bkt1/v",
+            &[("attributes", "")],
+            &[("x-amz-object-attributes", "ObjectSize")],
+            vec![],
+        ))
+        .unwrap();
+    assert!(body_str(&r).contains("<ObjectSize>14</ObjectSize>"));
+    // 版本不存在 → NoSuchVersion
+    let r = svc.handle(&req_qh(
+        "GET",
+        "/bkt1/v",
+        &[
+            ("attributes", ""),
+            ("versionId", "ffffffffffffffffffffffffffffffff"),
+        ],
+        &[("x-amz-object-attributes", "ObjectSize")],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "NoSuchVersion");
+}
+
+/// C1-2 遗留行为钉住:CopyObject 经 src.clone() 携带源 checksum。
+#[test]
+fn copy_object_preserves_checksum() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/cp-ck", vec![]))), 200);
+    let body = b"copy source with checksum".to_vec();
+    let ck = cksum_b64(fs3_core::ChecksumAlgorithm::Crc64Nvme, &body);
+    let r = req_h(
+        "PUT",
+        "/cp-ck/src",
+        &[("x-amz-checksum-crc64nvme", &ck)],
+        body.clone(),
+    );
+    assert_eq!(status(&svc.handle(&r)), 200);
+    // CopyObject(无新 checksum 头)→ 目标继承源 checksum
+    let r = req_h(
+        "PUT",
+        "/cp-ck/dst",
+        &[("x-amz-copy-source", "/cp-ck/src")],
+        vec![],
+    );
+    assert_eq!(status(&svc.handle(&r)), 200, "CopyObject");
+    let head = svc
+        .handle(&req_h(
+            "HEAD",
+            "/cp-ck/dst",
+            &[("x-amz-checksum-mode", "ENABLED")],
+            vec![],
+        ))
+        .unwrap();
+    assert_eq!(
+        hdr(&head, "x-amz-checksum-crc64nvme").as_deref(),
+        Some(ck.as_str()),
+        "副本 HEAD 回显源 checksum(checksum-mode 门控)"
+    );
+    let r = svc
+        .handle(&req_qh(
+            "GET",
+            "/cp-ck/dst",
+            &[("attributes", "")],
+            &[("x-amz-object-attributes", "Checksum")],
+            vec![],
+        ))
+        .unwrap();
+    assert!(
+        body_str(&r).contains(&format!("<ChecksumCRC64NVME>{ck}</ChecksumCRC64NVME>")),
+        "副本 GetObjectAttributes 回显源 checksum"
+    );
+}
+
+// ─────────────────── M11 C1-2:checksum 头/trailer 验算与回显 ───────────────────
+
+fn cksum_b64(alg: fs3_core::ChecksumAlgorithm, data: &[u8]) -> String {
+    base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        fs3_core::checksum_one_shot(alg, data),
+    )
+}
+
+/// 五族 header 正例:缓冲 PUT 携带正确 x-amz-checksum-{alg} → 200,PUT
+/// 响应回显;HEAD/GET 在 x-amz-checksum-mode: ENABLED 下回显同值(元数据
+/// 落 ObjectMeta.checksum;M11 门禁:未开模式一律不回显,AWS 口径)。
+#[test]
+fn checksum_header_buffered_put_and_echo() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/ck-bucket", vec![]))), 200);
+    let cases = [
+        (fs3_core::ChecksumAlgorithm::Crc32, "x-amz-checksum-crc32"),
+        (fs3_core::ChecksumAlgorithm::Crc32c, "x-amz-checksum-crc32c"),
+        (fs3_core::ChecksumAlgorithm::Sha1, "x-amz-checksum-sha1"),
+        (fs3_core::ChecksumAlgorithm::Sha256, "x-amz-checksum-sha256"),
+        (
+            fs3_core::ChecksumAlgorithm::Crc64Nvme,
+            "x-amz-checksum-crc64nvme",
+        ),
+    ];
+    for (i, (alg, hdr_name)) in cases.iter().enumerate() {
+        let key = format!("/ck-bucket/obj{i}");
+        let body = format!("checksum body {i}").into_bytes();
+        let expect = cksum_b64(*alg, &body);
+        let r = req_h("PUT", &key, &[(hdr_name, &expect)], body.clone());
+        let resp = svc.handle(&r);
+        assert_eq!(status(&resp), 200, "{hdr_name}: {resp:?}");
+        // PUT 响应回显(AWS 口径)
+        assert_eq!(
+            hdr(&resp.unwrap(), hdr_name).as_deref(),
+            Some(expect.as_str()),
+            "{hdr_name} PUT echo"
+        );
+        // 未开 checksum-mode:HEAD/GET 均不回显(AWS 门控口径)
+        let head = svc.handle(&req("HEAD", &key, vec![])).unwrap();
+        assert_eq!(hdr(&head, hdr_name), None, "{hdr_name} 无模式不回显");
+        assert_eq!(hdr(&head, "x-amz-checksum-type"), None);
+        // HEAD 回显(mode ENABLED)+ 类型头(单 PUT 恒 FULL_OBJECT)
+        let head = svc
+            .handle(&req_h(
+                "HEAD",
+                &key,
+                &[("x-amz-checksum-mode", "ENABLED")],
+                vec![],
+            ))
+            .unwrap();
+        assert_eq!(
+            hdr(&head, hdr_name).as_deref(),
+            Some(expect.as_str()),
+            "{hdr_name} HEAD echo"
+        );
+        assert_eq!(
+            hdr(&head, "x-amz-checksum-type").as_deref(),
+            Some("FULL_OBJECT"),
+            "{hdr_name} 单 PUT 类型"
+        );
+        // GET 回显 + 内容一致
+        let get = svc
+            .handle(&req_h(
+                "GET",
+                &key,
+                &[("x-amz-checksum-mode", "ENABLED")],
+                vec![],
+            ))
+            .unwrap();
+        assert_eq!(hdr(&get, hdr_name).as_deref(), Some(expect.as_str()));
+        read_body(&svc, &get, &body);
+    }
+    // 非法模式值 → InvalidArgument(显式,不静默)
+    let r = svc.handle(&req_h(
+        "HEAD",
+        "/ck-bucket/obj0",
+        &[("x-amz-checksum-mode", "bogus")],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "InvalidArgument");
+}
+
+/// M11 门禁:部分 Range GET 不回显 checksum 头(AWS 口径;botocore 默认
+/// response_checksum_validation=when_supported 会自动携带
+/// x-amz-checksum-mode 并对回显值逐体验算——部分 Range 回显全对象值会
+/// 触发客户端 FlexibleChecksumError;s3-tests test_ranged_request_* 回归)。
+#[test]
+fn checksum_range_get_partial_omitted() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/ck-bucket", vec![]))), 200);
+    let body = b"testcontent".to_vec();
+    let ck = cksum_b64(fs3_core::ChecksumAlgorithm::Crc32, &body);
+    let r = req_h(
+        "PUT",
+        "/ck-bucket/range",
+        &[("x-amz-checksum-crc32", &ck)],
+        body.clone(),
+    );
+    assert_eq!(status(&svc.handle(&r)), 200);
+    // 部分 Range + checksum-mode ENABLED → 无 checksum 头
+    let r = svc
+        .handle(&req_h(
+            "GET",
+            "/ck-bucket/range",
+            &[("range", "bytes=4-7"), ("x-amz-checksum-mode", "ENABLED")],
+            vec![],
+        ))
+        .unwrap();
+    assert_eq!(r.status, 206);
+    assert_eq!(hdr(&r, "x-amz-checksum-crc32"), None, "部分 Range 不回显");
+    assert_eq!(hdr(&r, "x-amz-checksum-type"), None);
+    // 全覆盖 Range → 回显(整对象口径)
+    let r = svc
+        .handle(&req_h(
+            "GET",
+            "/ck-bucket/range",
+            &[("range", "bytes=0-10"), ("x-amz-checksum-mode", "ENABLED")],
+            vec![],
+        ))
+        .unwrap();
+    assert_eq!(
+        hdr(&r, "x-amz-checksum-crc32").as_deref(),
+        Some(ck.as_str())
+    );
+}
+
+/// header 反例:值不符 → BadDigest 且对象不落盘;非法值/多头/未知算法 →
+/// InvalidRequest(显式,不静默)。
+#[test]
+fn checksum_header_rejects() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/ck-bucket", vec![]))), 200);
+
+    // 值不符 → BadDigest,对象不落盘
+    let body = b"real body".to_vec();
+    let wrong = cksum_b64(fs3_core::ChecksumAlgorithm::Crc32, b"other");
+    let r = req_h(
+        "PUT",
+        "/ck-bucket/bad",
+        &[("x-amz-checksum-crc32", &wrong)],
+        body,
+    );
+    let resp = svc.handle(&r);
+    assert_eq!(err_code(&resp), "BadDigest", "{resp:?}");
+    assert_eq!(status(&resp), 400);
+    let get = svc.handle(&req("GET", "/ck-bucket/bad", vec![]));
+    assert_eq!(err_code(&get), "NoSuchKey", "坏 checksum 对象不得落盘");
+
+    // 非法 base64 → InvalidRequest
+    let r = req_h(
+        "PUT",
+        "/ck-bucket/b1",
+        &[("x-amz-checksum-crc32", "!!!bad!!!")],
+        b"x".to_vec(),
+    );
+    assert_eq!(err_code(&svc.handle(&r)), "InvalidRequest");
+    // 合法 base64 但长度/值与算法摘要不符 → BadDigest(AWS 实测口径:
+    // 可解码值统一走写后比对;'bad' 一类缺 padding 值同)
+    let short = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [1u8, 2, 3]);
+    let r = req_h(
+        "PUT",
+        "/ck-bucket/b2",
+        &[("x-amz-checksum-sha256", &short)],
+        b"x".to_vec(),
+    );
+    assert_eq!(err_code(&svc.handle(&r)), "BadDigest");
+    // 未知算法后缀 → InvalidRequest
+    let r = req_h(
+        "PUT",
+        "/ck-bucket/b3",
+        &[("x-amz-checksum-md5", &short)],
+        b"x".to_vec(),
+    );
+    assert_eq!(err_code(&svc.handle(&r)), "InvalidRequest");
+    // 多个 checksum 头 → InvalidRequest(AWS:单一 checksum 头)
+    let c32 = cksum_b64(fs3_core::ChecksumAlgorithm::Crc32, b"x");
+    let s1 = cksum_b64(fs3_core::ChecksumAlgorithm::Sha1, b"x");
+    let r = req_h(
+        "PUT",
+        "/ck-bucket/b4",
+        &[("x-amz-checksum-crc32", &c32), ("x-amz-checksum-sha1", &s1)],
+        b"x".to_vec(),
+    );
+    assert_eq!(err_code(&svc.handle(&r)), "InvalidRequest");
+    // 孤立 x-amz-sdk-checksum-algorithm(无 checksum 头/trailer 声明)
+    // → InvalidRequest(AWS 口径)
+    let r = req_h(
+        "PUT",
+        "/ck-bucket/b5",
+        &[("x-amz-sdk-checksum-algorithm", "CRC32")],
+        b"x".to_vec(),
+    );
+    assert_eq!(err_code(&svc.handle(&r)), "InvalidRequest");
+}
+
+/// 头模式流式 PUT(非 chunked,HexSha256 分支):引擎 tee 代算落值,写后
+/// 比对;不符 → 回滚 + BadDigest。
+#[test]
+fn checksum_header_streaming_put() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/ck-bucket", vec![]))), 200);
+    let body = b"streaming body with header checksum".to_vec();
+    // 正:正确值 → 200 + 回显 + GET 回显(req_h 按 body 签名载荷哈希,
+    // 流式路径从 reader 读同一字节流)
+    let good = cksum_b64(fs3_core::ChecksumAlgorithm::Sha256, &body);
+    let r = req_h(
+        "PUT",
+        "/ck-bucket/stream-ok",
+        &[("x-amz-checksum-sha256", &good)],
+        body.clone(),
+    );
+    let mut reader = std::io::Cursor::new(body.clone());
+    let resp = svc.put_object_stream(&r, &mut reader);
+    assert_eq!(status(&resp), 200, "{resp:?}");
+    assert_eq!(
+        hdr(&resp.unwrap(), "x-amz-checksum-sha256").as_deref(),
+        Some(good.as_str())
+    );
+    let get = svc
+        .handle(&req_h(
+            "GET",
+            "/ck-bucket/stream-ok",
+            &[("x-amz-checksum-mode", "ENABLED")],
+            vec![],
+        ))
+        .unwrap();
+    assert_eq!(
+        hdr(&get, "x-amz-checksum-sha256").as_deref(),
+        Some(good.as_str())
+    );
+    read_body(&svc, &get, &body);
+    // 反:错误值 → BadDigest + 对象不落盘
+    let bad = cksum_b64(fs3_core::ChecksumAlgorithm::Sha256, b"tampered");
+    let r = req_h(
+        "PUT",
+        "/ck-bucket/stream-bad",
+        &[("x-amz-checksum-sha256", &bad)],
+        body.clone(),
+    );
+    let mut reader = std::io::Cursor::new(body.clone());
+    let resp = svc.put_object_stream(&r, &mut reader);
+    assert_eq!(err_code(&resp), "BadDigest", "{resp:?}");
+    let get = svc.handle(&req("GET", "/ck-bucket/stream-bad", vec![]));
+    assert_eq!(err_code(&get), "NoSuchKey");
+}
+
+/// 构造 signed aws-chunked 流式请求体与请求(trailer 验算链路用)。
+/// 返回 (S3Request, 编码后 body);chunk 签名链种子 = 请求签名。
+#[allow(clippy::too_many_arguments)]
+fn chunked_streaming_req(
+    path: &str,
+    payload: &[u8],
+    trailer_alg: fs3_core::ChecksumAlgorithm,
+    trailer_value_b64: Option<&str>,
+    decoded_len_header: Option<u64>,
+    unsigned: bool,
+) -> (S3Request, Vec<u8>) {
+    chunked_streaming_req_ex(
+        path,
+        payload,
+        trailer_alg,
+        trailer_value_b64,
+        decoded_len_header,
+        unsigned,
+        &[],
+    )
+}
+
+/// chunked_streaming_req 的可扩展形态(M11 E1-7:SSE-C 头进签名):
+/// `extra_headers` 随请求一同签名(x-amz-* 头必须入 SignedHeaders)。
+#[allow(clippy::too_many_arguments)]
+fn chunked_streaming_req_ex(
+    path: &str,
+    payload: &[u8],
+    trailer_alg: fs3_core::ChecksumAlgorithm,
+    trailer_value_b64: Option<&str>,
+    decoded_len_header: Option<u64>,
+    unsigned: bool,
+    extra_headers: &[(&str, &str)],
+) -> (S3Request, Vec<u8>) {
+    type HmacSha256 = hmac::Hmac<Sha256>;
+    let cred = Credentials {
+        access_key: "test".into(),
+        secret_key: "secret123".into(),
+    };
+    let amz_date = auth::now_amz();
+    let date = &amz_date[0..8];
+    let payload_hash = if unsigned {
+        PayloadHash::StreamingUnsignedTrailer
+    } else {
+        PayloadHash::StreamingSignedTrailer
+    };
+    let suffix = trailer_alg.header_suffix();
+    let trailer_name = format!("x-amz-checksum-{suffix}");
+    // 编码长度先验可算(chunk 签名为定长 64 hex),content-length 先行签名
+    let chunk_line_overhead = |n: usize| {
+        if unsigned {
+            format!("{n:x}\r\n").len() + n + 2 // 无签名行 + 数据 + 数据后 CRLF
+        } else {
+            format!("{n:x};chunk-signature=").len() + 64 + 2 + n + 2
+        }
+    };
+    let mut encoded_len = chunk_line_overhead(payload.len());
+    encoded_len += if unsigned {
+        "0\r\n".len()
+    } else {
+        "0;chunk-signature=".len() + 64 + 2
+    };
+    if let Some(v) = trailer_value_b64 {
+        encoded_len += trailer_name.len() + 2 + v.len() + 2; // "name: value\r\n"
+    }
+    encoded_len += 2; // 收尾空行
+    let mut headers: Vec<(String, String)> = vec![
+        ("host".into(), "localhost:9000".into()),
+        ("x-amz-date".into(), amz_date.clone()),
+        (
+            "x-amz-content-sha256".into(),
+            match &payload_hash {
+                PayloadHash::StreamingSignedTrailer => {
+                    "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER".into()
+                }
+                PayloadHash::StreamingUnsignedTrailer => {
+                    "STREAMING-UNSIGNED-PAYLOAD-TRAILER".into()
+                }
+                _ => unreachable!(),
+            },
+        ),
+        ("content-encoding".into(), "aws-chunked".into()),
+        ("content-length".into(), encoded_len.to_string()),
+        ("x-amz-trailer".into(), trailer_name.clone()),
+        (
+            "x-amz-sdk-checksum-algorithm".into(),
+            trailer_alg.s3_name().into(),
+        ),
+    ];
+    if let Some(d) = decoded_len_header {
+        headers.push(("x-amz-decoded-content-length".into(), d.to_string()));
+    }
+    for (k, v) in extra_headers {
+        headers.push((k.to_string(), v.to_string()));
+    }
+    let auth_hdr = auth::sign_request(
+        &cred,
+        "us-east-1",
+        "PUT",
+        path,
+        &[],
+        &headers,
+        &amz_date,
+        &payload_hash,
+    )
+    .unwrap();
+    headers.push(("authorization".into(), auth_hdr.clone()));
+    // 种子签名 = Authorization 头中的 Signature 分量
+    let seed = auth_hdr
+        .split("Signature=")
+        .nth(1)
+        .expect("signature component")
+        .to_string();
+    // 逐 chunk 签名链(与 chunked.rs 测试同一构造)
+    const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let key = auth::signing_key(&cred.secret_key, date, "us-east-1");
+    let scope = format!("{date}/us-east-1/s3/aws4_request");
+    let chunk_sig = |prev: &str, data: &[u8]| {
+        let sts = format!(
+            "AWS4-HMAC-SHA256-PAYLOAD\n{amz_date}\n{scope}\n{prev}\n{EMPTY_SHA256}\n{}",
+            hex::encode(Sha256::digest(data)),
+        );
+        let mut mac = HmacSha256::new_from_slice(&key).unwrap();
+        mac.update(sts.as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    };
+    let mut body = Vec::new();
+    let mut prev = seed;
+    if !payload.is_empty() {
+        if unsigned {
+            body.extend_from_slice(format!("{:x}\r\n", payload.len()).as_bytes());
+        } else {
+            let sig = chunk_sig(&prev, payload);
+            body.extend_from_slice(
+                format!("{:x};chunk-signature={sig}\r\n", payload.len()).as_bytes(),
+            );
+            prev = sig;
+        }
+        body.extend_from_slice(payload);
+        body.extend_from_slice(b"\r\n");
+    }
+    if unsigned {
+        body.extend_from_slice(b"0\r\n");
+    } else {
+        let sig = chunk_sig(&prev, b"");
+        body.extend_from_slice(format!("0;chunk-signature={sig}\r\n").as_bytes());
+    }
+    if let Some(v) = trailer_value_b64 {
+        body.extend_from_slice(format!("{trailer_name}: {v}\r\n").as_bytes());
+    }
+    body.extend_from_slice(b"\r\n");
+    assert_eq!(body.len(), encoded_len, "编码长度先验计算必须准确");
+    (
+        S3Request {
+            method: "PUT".into(),
+            raw_path: path.into(),
+            decoded_path: path.into(),
+            host: "localhost".into(),
+            query: vec![],
+            headers,
+            body: vec![],
+        },
+        body,
+    )
+}
+
+/// trailer 验算:signed / unsigned 两种模式正反用例 + 元数据落值回显。
+#[test]
+fn checksum_trailer_signed_and_unsigned() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/ck-bucket", vec![]))), 200);
+    for unsigned in [false, true] {
+        let mode = if unsigned { "unsigned" } else { "signed" };
+        let payload = b"trailer mode payload bytes".to_vec();
+        let alg = fs3_core::ChecksumAlgorithm::Crc32c;
+        // 正:trailer 值与解码明文一致 → 200 + PUT 回显 + GET 回显 + 内容一致
+        let good = cksum_b64(alg, &payload);
+        let key = format!("/ck-bucket/trailer-{mode}-ok");
+        let (r, body) = chunked_streaming_req(
+            &key,
+            &payload,
+            alg,
+            Some(&good),
+            Some(payload.len() as u64),
+            unsigned,
+        );
+        let mut reader = std::io::Cursor::new(body);
+        let resp = svc.put_object_stream(&r, &mut reader);
+        assert_eq!(status(&resp), 200, "{mode}: {resp:?}");
+        assert_eq!(
+            hdr(&resp.unwrap(), "x-amz-checksum-crc32c").as_deref(),
+            Some(good.as_str()),
+            "{mode} PUT echo"
+        );
+        let get = svc
+            .handle(&req_h(
+                "GET",
+                &key,
+                &[("x-amz-checksum-mode", "ENABLED")],
+                vec![],
+            ))
+            .unwrap();
+        assert_eq!(
+            hdr(&get, "x-amz-checksum-crc32c").as_deref(),
+            Some(good.as_str()),
+            "{mode} GET echo"
+        );
+        read_body(&svc, &get, &payload);
+        // 反:trailer 值不符 → BadDigest,对象不落盘
+        let bad = cksum_b64(alg, b"tampered");
+        let key = format!("/ck-bucket/trailer-{mode}-bad");
+        let (r, body) = chunked_streaming_req(
+            &key,
+            &payload,
+            alg,
+            Some(&bad),
+            Some(payload.len() as u64),
+            unsigned,
+        );
+        let mut reader = std::io::Cursor::new(body);
+        let resp = svc.put_object_stream(&r, &mut reader);
+        assert_eq!(err_code(&resp), "BadDigest", "{mode}: {resp:?}");
+        let get = svc.handle(&req("GET", &key, vec![]));
+        assert_eq!(err_code(&get), "NoSuchKey", "{mode} 坏 trailer 不得落盘");
+    }
+    // 声明了 trailer 却未携带 trailer 行 → InvalidRequest
+    let payload = b"abc".to_vec();
+    let (r, body) = chunked_streaming_req(
+        "/ck-bucket/trailer-missing",
+        &payload,
+        fs3_core::ChecksumAlgorithm::Crc32,
+        None,
+        Some(3),
+        true,
+    );
+    let mut reader = std::io::Cursor::new(body);
+    let resp = svc.put_object_stream(&r, &mut reader);
+    assert_eq!(err_code(&resp), "InvalidRequest", "{resp:?}");
+}
+
+/// x-amz-decoded-content-length 与解码后实际字节数强制对照:不符 →
+/// InvalidRequest + 回滚;非法值 → InvalidRequest。
+#[test]
+fn decoded_content_length_enforced() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/ck-bucket", vec![]))), 200);
+    let payload = b"decoded length check".to_vec();
+    let alg = fs3_core::ChecksumAlgorithm::Crc32;
+    let good = cksum_b64(alg, &payload);
+    // 声明值 > 实际 → InvalidRequest,对象不落盘
+    let (r, body) = chunked_streaming_req(
+        "/ck-bucket/dcl-bad",
+        &payload,
+        alg,
+        Some(&good),
+        Some(payload.len() as u64 + 1),
+        true,
+    );
+    let mut reader = std::io::Cursor::new(body);
+    let resp = svc.put_object_stream(&r, &mut reader);
+    assert_eq!(err_code(&resp), "InvalidRequest", "{resp:?}");
+    let get = svc.handle(&req("GET", "/ck-bucket/dcl-bad", vec![]));
+    assert_eq!(err_code(&get), "NoSuchKey", "解码长度不符须回滚");
+    // 声明值正确 → 200
+    let (r, body) = chunked_streaming_req(
+        "/ck-bucket/dcl-ok",
+        &payload,
+        alg,
+        Some(&good),
+        Some(payload.len() as u64),
+        true,
+    );
+    let mut reader = std::io::Cursor::new(body);
+    let resp = svc.put_object_stream(&r, &mut reader);
+    assert_eq!(status(&resp), 200, "{resp:?}");
+    // 非数值 → InvalidRequest(解析期)
+    let (mut r, body) =
+        chunked_streaming_req("/ck-bucket/dcl-nan", &payload, alg, Some(&good), None, true);
+    r.headers
+        .retain(|(k, _)| !k.eq_ignore_ascii_case("x-amz-decoded-content-length"));
+    r.headers
+        .push(("x-amz-decoded-content-length".into(), "12x".into()));
+    let mut reader = std::io::Cursor::new(body);
+    let resp = svc.put_object_stream(&r, &mut reader);
+    assert_eq!(err_code(&resp), "InvalidRequest", "{resp:?}");
+}
+
+/// UploadPart(缓冲路径)checksum:正 → 200 + 回显;反 → BadDigest。
+#[test]
+fn upload_part_checksum_buffered() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/ck-bucket", vec![]))), 200);
+    // CreateMultipartUpload(query 形态同既有 multipart 测试)
+    let mut rq = req("POST", "/ck-bucket/mp", vec![]);
+    rq.query = vec![("uploads".into(), "".into())];
+    rq.headers = sign_headers("POST", "/ck-bucket/mp", &rq.query, b"");
+    let create = svc.handle(&rq).unwrap();
+    let upload_id = extract(&body_str(&create), "UploadId");
+    let part_body = b"part payload".to_vec();
+    // 正:正确 crc64nvme → 200 + 响应回显
+    let good = cksum_b64(fs3_core::ChecksumAlgorithm::Crc64Nvme, &part_body);
+    let r = req_qh(
+        "PUT",
+        "/ck-bucket/mp",
+        &[("partNumber", "1"), ("uploadId", &upload_id)],
+        &[("x-amz-checksum-crc64nvme", &good)],
+        part_body,
+    );
+    let resp = svc.handle(&r);
+    assert_eq!(status(&resp), 200, "{resp:?}");
+    assert_eq!(
+        hdr(&resp.unwrap(), "x-amz-checksum-crc64nvme").as_deref(),
+        Some(good.as_str())
+    );
+    // 反:值不符 → BadDigest
+    let bad = cksum_b64(fs3_core::ChecksumAlgorithm::Crc64Nvme, b"other");
+    let r = req_qh(
+        "PUT",
+        "/ck-bucket/mp",
+        &[("partNumber", "2"), ("uploadId", &upload_id)],
+        &[("x-amz-checksum-crc64nvme", &bad)],
+        b"part payload".to_vec(),
+    );
+    let resp = svc.handle(&r);
+    assert_eq!(err_code(&resp), "BadDigest", "{resp:?}");
+}
+
+/// 未提供 checksum 的旧对象零变化:PUT/HEAD/GET 均无 x-amz-checksum-* 头,
+/// 覆盖写无 checksum 头会清除既有 checksum(AWS 语义:新 PUT 全量替换元数据)。
+#[test]
+fn no_checksum_request_zero_change() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/ck-bucket", vec![]))), 200);
+    // 普通 PUT:无任何 checksum 头
+    let r = req("PUT", "/ck-bucket/plain", b"plain body".to_vec());
+    let resp = svc.handle(&r).unwrap();
+    assert!(!resp
+        .headers
+        .iter()
+        .any(|(k, _)| k.starts_with("x-amz-checksum-")));
+    let head = svc
+        .handle(&req("HEAD", "/ck-bucket/plain", vec![]))
+        .unwrap();
+    assert!(!head
+        .headers
+        .iter()
+        .any(|(k, _)| k.starts_with("x-amz-checksum-")));
+    // 带 checksum 写入后,无 checksum 覆盖写 → 回显清除
+    let body = b"with checksum".to_vec();
+    let good = cksum_b64(fs3_core::ChecksumAlgorithm::Sha1, &body);
+    let r = req_h(
+        "PUT",
+        "/ck-bucket/plain",
+        &[("x-amz-checksum-sha1", &good)],
+        body,
+    );
+    assert_eq!(status(&svc.handle(&r)), 200);
+    let head = svc
+        .handle(&req_h(
+            "HEAD",
+            "/ck-bucket/plain",
+            &[("x-amz-checksum-mode", "ENABLED")],
+            vec![],
+        ))
+        .unwrap();
+    assert!(head.headers.iter().any(|(k, _)| k == "x-amz-checksum-sha1"));
+    let r = req("PUT", "/ck-bucket/plain", b"no checksum now".to_vec());
+    assert_eq!(status(&svc.handle(&r)), 200);
+    let head = svc
+        .handle(&req("HEAD", "/ck-bucket/plain", vec![]))
+        .unwrap();
+    assert!(
+        !head
+            .headers
+            .iter()
+            .any(|(k, _)| k.starts_with("x-amz-checksum-")),
+        "无 checksum 覆盖写后不得残留回显"
+    );
+}
+
+// ─────────────────────────── M11 E1:SSE-C 单对象端到端 ───────────────────────────
+
+/// SSE-C 测试密钥(32B)与三头构造(base64 key + 其 MD5)。
+fn ssec_key() -> [u8; 32] {
+    [0x5Au8; 32]
+}
+
+fn ssec_headers(key: &[u8; 32]) -> [(String, String); 3] {
+    use base64::Engine as _;
+    let b64 = &base64::engine::general_purpose::STANDARD;
+    let md5 = md5::Md5::digest(key);
+    [
+        (
+            "x-amz-server-side-encryption-customer-algorithm".into(),
+            "AES256".into(),
+        ),
+        (
+            "x-amz-server-side-encryption-customer-key".into(),
+            b64.encode(key),
+        ),
+        (
+            "x-amz-server-side-encryption-customer-key-md5".into(),
+            b64.encode(md5),
+        ),
+    ]
+}
+
+fn ssec_refs(h: &[(String, String); 3]) -> Vec<(&str, &str)> {
+    h.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+}
+
+/// 带 query + 额外签名头的请求(SSE-C 头进 SignedHeaders,DE4)。
+fn ssec_req_q(
+    method: &str,
+    path: &str,
+    query: &[(&str, &str)],
+    extra: &[(&str, &str)],
+    body: Vec<u8>,
+) -> S3Request {
+    let amz_date = auth::now_amz();
+    let hash = hex::encode(Sha256::digest(&body));
+    let query: Vec<(String, String)> = query
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let mut headers: Vec<(String, String)> = vec![
+        ("host".into(), "localhost:9000".into()),
+        ("x-amz-date".into(), amz_date.clone()),
+        ("x-amz-content-sha256".into(), hash.clone()),
+    ];
+    for (k, v) in extra {
+        headers.push((k.to_string(), v.to_string()));
+    }
+    let cred = Credentials {
+        access_key: "test".into(),
+        secret_key: "secret123".into(),
+    };
+    let auth_hdr = auth::sign_request(
+        &cred,
+        "us-east-1",
+        method,
+        path,
+        &query,
+        &headers,
+        &amz_date,
+        &PayloadHash::HexSha256(hash),
+    )
+    .unwrap();
+    headers.push(("authorization".into(), auth_hdr));
+    S3Request {
+        method: method.into(),
+        raw_path: path.into(),
+        decoded_path: path.into(),
+        host: "localhost".into(),
+        query,
+        headers,
+        body,
+    }
+}
+
+const SSE_ALG_HDR: &str = "x-amz-server-side-encryption-customer-algorithm";
+const SSE_MD5_HDR: &str = "x-amz-server-side-encryption-customer-key-md5";
+
+/// E1-2/E1-7/E1-3:缓冲 PUT(内联臂)→ GET/HEAD 往返;回显头;ETag ≠
+/// 明文 MD5(密文侧语义,DE2)。
+#[test]
+fn sse_c_buffered_put_get_head_roundtrip() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/enc", vec![]))), 200);
+    let key = ssec_key();
+    let sh = ssec_headers(&key);
+    let sr = ssec_refs(&sh);
+    let plain = b"sse-c buffered inline object".to_vec();
+
+    // PUT:200 + 回显 algorithm + key-MD5(回显请求值)
+    let r = svc.handle(&req_h("PUT", "/enc/small", &sr, plain.clone()));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let resp = r.unwrap();
+    assert_eq!(hdr(&resp, SSE_ALG_HDR).as_deref(), Some("AES256"));
+    assert_eq!(
+        hdr(&resp, SSE_MD5_HDR).as_deref(),
+        Some(sh[2].1.as_str()),
+        "key-MD5 回显请求值"
+    );
+    let etag = hdr(&resp, "etag").unwrap();
+    let plain_md5 = hex::encode(md5::Md5::digest(&plain));
+    assert_ne!(etag, format!("\"{plain_md5}\""), "ETag = 密文 MD5(DE2)");
+
+    // GET 带头:200 + 明文往返 + 回显
+    let get = svc.handle(&req_h("GET", "/enc/small", &sr, vec![]));
+    assert_eq!(status(&get), 200, "{get:?}");
+    let get = get.unwrap();
+    assert_eq!(hdr(&get, SSE_ALG_HDR).as_deref(), Some("AES256"));
+    assert_eq!(hdr(&get, SSE_MD5_HDR).as_deref(), Some(sh[2].1.as_str()));
+    assert_eq!(
+        hdr(&get, "content-length").as_deref(),
+        Some(plain.len().to_string().as_str()),
+        "Content-Length = 明文长度(DE1 密文等长)"
+    );
+    read_body(&svc, &get, &plain);
+
+    // HEAD 带头:回显同 GET(无数据面)
+    let head = svc.handle(&req_h("HEAD", "/enc/small", &sr, vec![]));
+    assert_eq!(status(&head), 200, "{head:?}");
+    let head = head.unwrap();
+    assert_eq!(hdr(&head, SSE_ALG_HDR).as_deref(), Some("AES256"));
+    assert_eq!(hdr(&head, SSE_MD5_HDR).as_deref(), Some(sh[2].1.as_str()));
+}
+
+/// E1-7/E1-3:extent 臂(>32KiB,跨 64KiB chunk 边界 + 尾 partial)缓冲
+/// PUT → GET / Range GET 解密往返。
+#[test]
+fn sse_c_extent_and_range_roundtrip() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/enc", vec![]))), 200);
+    let key = ssec_key();
+    let sh = ssec_headers(&key);
+    let sr = ssec_refs(&sh);
+    // 200_000B = 3 满 chunk + 3_392B 尾块(extent 臂)
+    let plain: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let r = svc.handle(&req_h("PUT", "/enc/big", &sr, plain.clone()));
+    assert_eq!(status(&r), 200, "{r:?}");
+
+    // 整对象 GET
+    let get = svc.handle(&req_h("GET", "/enc/big", &sr, vec![])).unwrap();
+    read_body(&svc, &get, &plain);
+    // Range GET:跨 chunk 边界首尾 partial(60_000..140_000)
+    let rget = svc
+        .handle(&ssec_req_q(
+            "GET",
+            "/enc/big",
+            &[],
+            &[
+                (SSE_ALG_HDR, "AES256"),
+                ("x-amz-server-side-encryption-customer-key", &sh[1].1),
+                (SSE_MD5_HDR, &sh[2].1),
+                ("range", "bytes=60000-139999"),
+            ],
+            vec![],
+        ))
+        .unwrap();
+    assert_eq!(rget.status, 206);
+    assert_eq!(
+        hdr(&rget, "content-range").as_deref(),
+        Some("bytes 60000-139999/200000")
+    );
+    assert_eq!(hdr(&rget, SSE_ALG_HDR).as_deref(), Some("AES256"));
+    read_body(&svc, &rget, &plain[60_000..140_000]);
+}
+
+/// E1-7:流式 PUT HexSha256 分支 + SSE-C;chunked trailer + checksum +
+/// SSE-C 组合(明文 checksum 验算在前,加密在后,顺序不可颠倒)。
+#[test]
+fn sse_c_streaming_put_branches() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/enc", vec![]))), 200);
+    let key = ssec_key();
+    let sh = ssec_headers(&key);
+    let sr = ssec_refs(&sh);
+
+    // —— HexSha256 分支(非 chunked 流式)——
+    let plain: Vec<u8> = (0..150_000u32).map(|i| (i % 241) as u8).collect();
+    let r = req_h("PUT", "/enc/stream", &sr, plain.clone());
+    let mut reader = std::io::Cursor::new(plain.clone());
+    let resp = svc.put_object_stream(&r, &mut reader);
+    assert_eq!(status(&resp), 200, "{resp:?}");
+    let resp = resp.unwrap();
+    assert_eq!(hdr(&resp, SSE_ALG_HDR).as_deref(), Some("AES256"));
+    let get = svc
+        .handle(&req_h("GET", "/enc/stream", &sr, vec![]))
+        .unwrap();
+    read_body(&svc, &get, &plain);
+
+    // —— aws-chunked signed trailer + checksum + SSE-C 组合 ——
+    let payload: Vec<u8> = (0..90_000u32).map(|i| (i % 233) as u8).collect();
+    let alg = fs3_core::ChecksumAlgorithm::Crc32c;
+    let good = cksum_b64(alg, &payload);
+    let (r, body) = chunked_streaming_req_ex(
+        "/enc/chunked",
+        &payload,
+        alg,
+        Some(&good),
+        Some(payload.len() as u64),
+        false,
+        &sr,
+    );
+    let mut reader = std::io::Cursor::new(body);
+    let resp = svc.put_object_stream(&r, &mut reader);
+    assert_eq!(status(&resp), 200, "chunked+sse: {resp:?}");
+    let resp = resp.unwrap();
+    assert_eq!(
+        hdr(&resp, "x-amz-checksum-crc32c").as_deref(),
+        Some(good.as_str()),
+        "明文 checksum 验算(trailer)后回显"
+    );
+    assert_eq!(hdr(&resp, SSE_ALG_HDR).as_deref(), Some("AES256"));
+    // GET 往返 + checksum 回显(明文语义值)
+    let get = svc
+        .handle(&ssec_req_q(
+            "GET",
+            "/enc/chunked",
+            &[],
+            &[
+                (SSE_ALG_HDR, "AES256"),
+                ("x-amz-server-side-encryption-customer-key", &sh[1].1),
+                (SSE_MD5_HDR, &sh[2].1),
+                ("x-amz-checksum-mode", "ENABLED"),
+            ],
+            vec![],
+        ))
+        .unwrap();
+    assert_eq!(
+        hdr(&get, "x-amz-checksum-crc32c").as_deref(),
+        Some(good.as_str()),
+        "checksum 为明文语义(先于加密)"
+    );
+    read_body(&svc, &get, &payload);
+}
+
+/// E1-2/E1-3 + D-E5:错误路径——缺头 400 / 错 key 400(校验子比对)/
+/// 坏算法 400 / 缺一头 400 / 坏 key-MD5 InvalidDigest;未加密对象带
+/// SSE-C 头按 AWS 忽略。
+#[test]
+fn sse_c_error_paths() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/enc", vec![]))), 200);
+    let key = ssec_key();
+    let sh = ssec_headers(&key);
+    let sr = ssec_refs(&sh);
+    let plain = b"encrypted data".to_vec();
+    assert_eq!(
+        status(&svc.handle(&req_h("PUT", "/enc/obj", &sr, plain.clone()))),
+        200
+    );
+
+    // 加密对象 GET/HEAD 缺三头 → 400 InvalidRequest(AWS 口径)
+    let r = svc.handle(&req("GET", "/enc/obj", vec![]));
+    assert_eq!(err_code(&r), "InvalidRequest");
+    let r = svc.handle(&req("HEAD", "/enc/obj", vec![]));
+    assert_eq!(err_code(&r), "InvalidRequest");
+    // 缺一头(仅 algorithm + key)→ 400 InvalidRequest
+    let r = svc.handle(&req_h(
+        "GET",
+        "/enc/obj",
+        &[
+            (SSE_ALG_HDR, "AES256"),
+            ("x-amz-server-side-encryption-customer-key", &sh[1].1),
+        ],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "InvalidRequest");
+    // 坏算法 → 400 InvalidEncryptionAlgorithmError
+    let r = svc.handle(&req_h(
+        "GET",
+        "/enc/obj",
+        &[
+            (SSE_ALG_HDR, "AES128"),
+            ("x-amz-server-side-encryption-customer-key", &sh[1].1),
+            (SSE_MD5_HDR, &sh[2].1),
+        ],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "InvalidEncryptionAlgorithmError");
+    // key-MD5 与 key 不符 → InvalidDigest(AWS 实测口径)
+    use base64::Engine as _;
+    let wrong_md5 = base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(b"other"));
+    let r = svc.handle(&req_h(
+        "GET",
+        "/enc/obj",
+        &[
+            (SSE_ALG_HDR, "AES256"),
+            ("x-amz-server-side-encryption-customer-key", &sh[1].1),
+            (SSE_MD5_HDR, &wrong_md5),
+        ],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "InvalidDigest");
+    // 错 key(自一致 MD5)→ D-E5 校验子比对在响应构造前即 400
+    // InvalidRequest(AWS 口径:服务端存校验材料,错 key 是请求错误;
+    // 不再有 E1-3 时代的 chunk0 早探 500)
+    let bad_key = [0xA5u8; 32];
+    let bh = ssec_headers(&bad_key);
+    let br = ssec_refs(&bh);
+    let get = svc.handle(&req_h("GET", "/enc/obj", &br, vec![]));
+    let e = get.unwrap_err();
+    assert_eq!(e.status(), 400, "错 key → 校验子比对 → 400: {e:?}");
+    assert_eq!(e.code, fs3_s3::S3ErrorCode::InvalidRequest, "{e:?}");
+    // partNumber 读路径同口径:错 key → 400
+    let get = svc.handle(&req_qh(
+        "GET",
+        "/enc/obj",
+        &[("partNumber", "1")],
+        &br,
+        vec![],
+    ));
+    let e = get.unwrap_err();
+    assert_eq!(e.status(), 400, "partNumber 错 key → 400: {e:?}");
+    assert_eq!(e.code, fs3_s3::S3ErrorCode::InvalidRequest, "{e:?}");
+    // HEAD 错 key → 400(D-E5:校验子落元数据,不读数据也能发现;
+    // E1-3 时代 HEAD 无校验材料只能 200 的差异消除)
+    let head = svc.handle(&req_h("HEAD", "/enc/obj", &br, vec![]));
+    let e = head.unwrap_err();
+    assert_eq!(e.status(), 400, "HEAD 错 key → 400: {e:?}");
+    assert_eq!(e.code, fs3_s3::S3ErrorCode::InvalidRequest, "{e:?}");
+
+    // GetObjectAttributes 同属对象读族:加密对象缺三头 → 400;带合法
+    // 三头 → 200 + 回显;错 key → 400(同 HEAD,校验子比对)
+    let attrs = |extra: &[(&str, &str)]| {
+        req_qh(
+            "GET",
+            "/enc/obj",
+            &[("attributes", "")],
+            {
+                let mut v = vec![("x-amz-object-attributes", "ETag,ObjectSize")];
+                v.extend_from_slice(extra);
+                v
+            }
+            .as_slice(),
+            vec![],
+        )
+    };
+    let r = svc.handle(&attrs(&[]));
+    assert_eq!(err_code(&r), "InvalidRequest", "attributes 缺三头: {r:?}");
+    let r = svc.handle(&attrs(&sr)).unwrap();
+    assert_eq!(hdr(&r, SSE_ALG_HDR).as_deref(), Some("AES256"));
+    assert_eq!(hdr(&r, SSE_MD5_HDR).as_deref(), Some(sh[2].1.as_str()));
+    let r = svc.handle(&attrs(&br));
+    assert_eq!(
+        err_code(&r),
+        "InvalidRequest",
+        "attributes 错 key → 400: {r:?}"
+    );
+
+    // 未加密对象带 SSE-C 头 → AWS 语义忽略(正常返回,内容一致)
+    assert_eq!(
+        status(&svc.handle(&req("PUT", "/enc/plain", plain.clone()))),
+        200
+    );
+    let get = svc.handle(&req_h("GET", "/enc/plain", &sr, vec![]));
+    assert_eq!(status(&get), 200, "未加密对象带头忽略: {get:?}");
+    let get = get.unwrap();
+    assert!(
+        hdr(&get, SSE_ALG_HDR).is_none(),
+        "未加密对象不回显 SSE-C 头"
+    );
+    read_body(&svc, &get, &plain);
+}
+
+/// E1-4/E1-5 落地后的剩余门控:Abort/ListParts/ListMultipartUploads 携带
+/// SSE-C 三头 → 显式 501(不静默);POST 表单 SSE-C 字段 → 400(DE4,AWS 同)。
+#[test]
+fn sse_c_remaining_gates() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/enc", vec![]))), 200);
+    let key = ssec_key();
+    let sh = ssec_headers(&key);
+    let sr = ssec_refs(&sh);
+
+    // AbortMultipartUpload + SSE-C → 501
+    let r = svc.handle(&ssec_req_q(
+        "DELETE",
+        "/enc/mp",
+        &[("uploadId", "u1")],
+        &sr,
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "NotImplemented", "{r:?}");
+    // ListParts + SSE-C → 501
+    let r = svc.handle(&ssec_req_q(
+        "GET",
+        "/enc/mp",
+        &[("uploadId", "u1")],
+        &sr,
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "NotImplemented", "{r:?}");
+    // ListMultipartUploads + SSE-C → 501
+    let r = svc.handle(&ssec_req_q("GET", "/enc", &[("uploads", "")], &sr, vec![]));
+    assert_eq!(err_code(&r), "NotImplemented", "{r:?}");
+    // POST 表单携带 SSE-C 字段 → 400 InvalidRequest(DE4;AWS 不支持)
+    let boundary = "----ssectest";
+    let body = post_form_body(
+        boundary,
+        &[
+            ("key", "post-obj"),
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+        ],
+        ("f.txt", b"data"),
+    );
+    let r = req_h("POST", "/enc", &[], body).with_multipart_ct(boundary);
+    let r = svc.handle(&r);
+    assert_eq!(err_code(&r), "InvalidRequest", "{r:?}");
+}
+
+// ─────────────────────────── M11 E1-4:multipart SSE-C 端到端 ───────────────────────────
+
+/// Create(会话绑定 key-MD5,回显)→ UploadPart(缓冲 5MiB + 流式 5MiB +
+/// 缓冲内联小片,各带三头;part ETag = 密文 MD5 ⇒ ≠ 明文 MD5 且同内容两
+/// part 异值;D-E6 重传同 part ETag 稳定)→ Complete(回显;复合 ETag =
+/// md5(二进制拼接)-N)→ GET 带密钥往返明文;缺头/错 MD5/明文会话带头的
+/// 显式错误矩阵。
+#[test]
+fn sse_c_multipart_e2e() {
+    let (_d, svc) = setup_no_compact();
+    assert_eq!(status(&svc.handle(&req("PUT", "/enc", vec![]))), 200);
+    let key = ssec_key();
+    let sh = ssec_headers(&key);
+    let sr = ssec_refs(&sh);
+
+    // —— CreateMultipartUpload + SSE-C:200 + 回显 algorithm/key-MD5 ——
+    let r = svc.handle(&ssec_req_q(
+        "POST",
+        "/enc/mp",
+        &[("uploads", "")],
+        &sr,
+        vec![],
+    ));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let resp = r.unwrap();
+    assert_eq!(hdr(&resp, SSE_ALG_HDR).as_deref(), Some("AES256"));
+    assert_eq!(
+        hdr(&resp, SSE_MD5_HDR).as_deref(),
+        Some(sh[2].1.as_str()),
+        "Create 回显 key-MD5"
+    );
+    let xml = match resp.body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!(),
+    };
+    let uid = xml
+        .split("<UploadId>")
+        .nth(1)
+        .unwrap()
+        .split("</UploadId>")
+        .next()
+        .unwrap()
+        .to_string();
+
+    // —— UploadPart(缓冲,5MiB)+ SSE-C:回显;ETag = 密文 MD5 ——
+    let p1 = vec![0x41u8; 5 * 1024 * 1024];
+    let r = svc.handle(&ssec_req_q(
+        "PUT",
+        "/enc/mp",
+        &[("partNumber", "1"), ("uploadId", &uid)],
+        &sr,
+        p1.clone(),
+    ));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let resp = r.unwrap();
+    assert_eq!(hdr(&resp, SSE_ALG_HDR).as_deref(), Some("AES256"));
+    let etag1 = hdr(&resp, "etag").unwrap();
+    let plain_md5 = format!("\"{}\"", hex::encode(md5::Md5::digest(&p1)));
+    assert_ne!(etag1, plain_md5, "part ETag = 密文 MD5(DE2)");
+
+    // —— UploadPart(流式,同内容)+ SSE-C:part 号不同 ⇒ 派生 nonce 不同
+    // ⇒ 同明文不同密文 ETag(D-E6 确定性派生按 part_number 区分)——
+    let r = ssec_req_q(
+        "PUT",
+        "/enc/mp",
+        &[("partNumber", "2"), ("uploadId", &uid)],
+        &sr,
+        p1.clone(),
+    );
+    let mut reader = std::io::Cursor::new(p1.clone());
+    let r = svc.put_object_stream(&r, &mut reader);
+    assert_eq!(status(&r), 200, "流式 part: {r:?}");
+    let resp = r.unwrap();
+    assert_eq!(hdr(&resp, SSE_ALG_HDR).as_deref(), Some("AES256"));
+    let etag2 = hdr(&resp, "etag").unwrap();
+    assert_ne!(
+        etag1, etag2,
+        "不同 part 号 ⇒ 派生 nonce_base 不同 ⇒ 同明文不同密文 ETag"
+    );
+
+    // —— D-E6:同 part 同内容重传 ⇒ 确定性 nonce ⇒ 密文/ETag 逐字节稳定
+    // (重传幂等;s3-tests test_multipart_sse_c_get_part resend 语义)——
+    let r = svc.handle(&ssec_req_q(
+        "PUT",
+        "/enc/mp",
+        &[("partNumber", "2"), ("uploadId", &uid)],
+        &sr,
+        p1.clone(),
+    ));
+    assert_eq!(status(&r), 200, "重传 part2: {r:?}");
+    let etag2r = hdr(&r.unwrap(), "etag").unwrap();
+    assert_eq!(etag2, etag2r, "D-E6:重传同 part ETag 稳定(重传幂等)");
+
+    // —— UploadPart(内联小片,末片)——
+    let p3 = b"tail-inline-part".to_vec();
+    let r = svc.handle(&ssec_req_q(
+        "PUT",
+        "/enc/mp",
+        &[("partNumber", "3"), ("uploadId", &uid)],
+        &sr,
+        p3.clone(),
+    ));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let etag3 = hdr(&r.unwrap(), "etag").unwrap();
+
+    // —— 会话一致性错误矩阵(AWS:part 头必须与会话一致)——
+    // SSE 会话 UploadPart 缺三头 → InvalidRequest
+    let r = svc.handle(&req_q(
+        "PUT",
+        "/enc/mp",
+        &[("partNumber", "4"), ("uploadId", &uid)],
+        b"x".to_vec(),
+    ));
+    assert_eq!(err_code(&r), "InvalidRequest", "{r:?}");
+    // key-MD5 与会话不符(另一把合法自一致的 key)→ InvalidRequest
+    let other = ssec_headers(&[0xA5u8; 32]);
+    let or = ssec_refs(&other);
+    let r = svc.handle(&ssec_req_q(
+        "PUT",
+        "/enc/mp",
+        &[("partNumber", "4"), ("uploadId", &uid)],
+        &or,
+        b"x".to_vec(),
+    ));
+    assert_eq!(err_code(&r), "InvalidRequest", "{r:?}");
+    // Complete 缺三头 → InvalidRequest(重加密必需密钥本体)
+    let body = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag1}</ETag></Part></CompleteMultipartUpload>"
+    )
+    .into_bytes();
+    let r = svc.handle(&req_q("POST", "/enc/mp", &[("uploadId", &uid)], body));
+    assert_eq!(err_code(&r), "InvalidRequest", "{r:?}");
+
+    // —— Complete + SSE-C:回显;复合 ETag = md5(各 part ETag 二进制拼接)-3 ——
+    let body = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag1}</ETag></Part>\
+         <Part><PartNumber>2</PartNumber><ETag>{etag2}</ETag></Part>\
+         <Part><PartNumber>3</PartNumber><ETag>{etag3}</ETag></Part></CompleteMultipartUpload>"
+    )
+    .into_bytes();
+    let r = svc.handle(&ssec_req_q(
+        "POST",
+        "/enc/mp",
+        &[("uploadId", &uid)],
+        &sr,
+        body,
+    ));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let resp = r.unwrap();
+    assert_eq!(hdr(&resp, SSE_ALG_HDR).as_deref(), Some("AES256"));
+    assert_eq!(hdr(&resp, SSE_MD5_HDR).as_deref(), Some(sh[2].1.as_str()));
+    let full = hdr(&resp, "etag").unwrap();
+    let mut concat = Vec::new();
+    for e in [&etag1, &etag2, &etag3] {
+        concat.extend_from_slice(&hex::decode(e.trim_matches('"')).unwrap());
+    }
+    let expect = format!("\"{}-3\"", hex::encode(md5::Md5::digest(&concat)));
+    assert_eq!(full, expect, "复合 ETag 维持 md5-N(DE2)");
+
+    // —— GET 带密钥往返 = 三片明文拼接;缺头 → 400 ——
+    let mut plain = p1.clone();
+    plain.extend_from_slice(&p1);
+    plain.extend_from_slice(&p3);
+    let get = svc.handle(&req_h("GET", "/enc/mp", &sr, vec![]));
+    assert_eq!(status(&get), 200, "{get:?}");
+    let get = get.unwrap();
+    assert_eq!(hdr(&get, SSE_ALG_HDR).as_deref(), Some("AES256"));
+    assert_eq!(hdr(&get, "etag").as_deref(), Some(full.as_str()));
+    read_body(&svc, &get, &plain);
+    let r = svc.handle(&req("GET", "/enc/mp", vec![]));
+    assert_eq!(err_code(&r), "InvalidRequest", "加密对象缺头 → 400");
+
+    // —— 明文会话 + part 带 SSE-C 头 → InvalidRequest(不静默加密)——
+    let r = svc.handle(&req_q("POST", "/enc/plain-mp", &[("uploads", "")], vec![]));
+    let xml = match r.unwrap().body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!(),
+    };
+    let uid2 = xml
+        .split("<UploadId>")
+        .nth(1)
+        .unwrap()
+        .split("</UploadId>")
+        .next()
+        .unwrap()
+        .to_string();
+    let r = svc.handle(&ssec_req_q(
+        "PUT",
+        "/enc/plain-mp",
+        &[("partNumber", "1"), ("uploadId", &uid2)],
+        &sr,
+        b"x".to_vec(),
+    ));
+    assert_eq!(err_code(&r), "InvalidRequest", "{r:?}");
+}
+
+// ─────────────────────────── M11 E1-5:copy 加密语义端到端(DE3) ───────────────────────────
+
+/// copy-source 侧三头构造(E1-5)。
+fn ssec_cs_headers(key: &[u8; 32]) -> [(String, String); 3] {
+    use base64::Engine as _;
+    let b64 = &base64::engine::general_purpose::STANDARD;
+    let md5 = md5::Md5::digest(key);
+    [
+        (
+            "x-amz-copy-source-server-side-encryption-customer-algorithm".into(),
+            "AES256".into(),
+        ),
+        (
+            "x-amz-copy-source-server-side-encryption-customer-key".into(),
+            b64.encode(key),
+        ),
+        (
+            "x-amz-copy-source-server-side-encryption-customer-key-md5".into(),
+            b64.encode(md5),
+        ),
+    ]
+}
+
+/// CopyObject 四象限:明文→加密(数据路径,ETag 变)/加密→同密钥(COW,
+/// ETag 不变)/加密→异密钥(重加密,新密钥可读旧密钥 400)/加密→未指定
+/// (InvalidRequest);缺 copy-source 头 → InvalidRequest;坏 copy-source
+/// 算法 → InvalidEncryptionAlgorithmError;目标回显 algorithm+key-MD5。
+#[test]
+fn sse_c_copy_object_matrix() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/enc", vec![]))), 200);
+    let ka = ssec_key();
+    let kb = [0xA5u8; 32];
+    let ha = ssec_headers(&ka);
+    let ra = ssec_refs(&ha);
+    let hb = ssec_headers(&kb);
+    let csa = ssec_cs_headers(&ka);
+    let csb = ssec_cs_headers(&kb);
+    let plain: Vec<u8> = (0..150_000u32).map(|i| (i % 239) as u8).collect();
+    assert_eq!(
+        status(&svc.handle(&req("PUT", "/enc/plain", plain.clone()))),
+        200
+    );
+    assert_eq!(
+        status(&svc.handle(&req_h("PUT", "/enc/enc", &ra, plain.clone()))),
+        200
+    );
+    let src_etag = hdr(
+        &svc.handle(&req_h("HEAD", "/enc/enc", &ra, vec![])).unwrap(),
+        "etag",
+    )
+    .unwrap();
+
+    // —— 象限 1:明文源 + 目标 SSE-C → 数据路径加密写 ——
+    let mut h1 = ssec_refs(&ha);
+    h1.push(("x-amz-copy-source", "/enc/plain"));
+    let r = svc.handle(&ssec_req_q("PUT", "/enc/q1", &[], &h1, vec![]));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let resp = r.unwrap();
+    assert_eq!(
+        hdr(&resp, SSE_ALG_HDR).as_deref(),
+        Some("AES256"),
+        "目标加密回显"
+    );
+    assert_eq!(hdr(&resp, SSE_MD5_HDR).as_deref(), Some(ha[2].1.as_str()));
+    let get = svc.handle(&req_h("GET", "/enc/q1", &ra, vec![])).unwrap();
+    read_body(&svc, &get, &plain);
+    let r = svc.handle(&req("GET", "/enc/q1", vec![]));
+    assert_eq!(err_code(&r), "InvalidRequest", "密文目标缺头 → 400");
+
+    // —— 象限 2:加密源 + copy-source/目标同密钥 → COW 直灌(ETag 不变)——
+    let mut h2 = ssec_refs(&ha);
+    h2.extend(csa.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    h2.push(("x-amz-copy-source", "/enc/enc"));
+    let r = svc.handle(&ssec_req_q("PUT", "/enc/q2", &[], &h2, vec![]));
+    assert_eq!(status(&r), 200, "{r:?}");
+    r.unwrap();
+    let dst_etag = hdr(
+        &svc.handle(&req_h("HEAD", "/enc/q2", &ra, vec![])).unwrap(),
+        "etag",
+    )
+    .unwrap();
+    assert_eq!(dst_etag, src_etag, "同密钥 COW:ETag 不变(零数据搬运)");
+    let get = svc.handle(&req_h("GET", "/enc/q2", &ra, vec![])).unwrap();
+    read_body(&svc, &get, &plain);
+
+    // —— 象限 3:加密源 + 异密钥 → 解密重加密(新密钥往返;旧密钥 400)——
+    let mut h3 = ssec_refs(&hb);
+    h3.extend(csa.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    h3.push(("x-amz-copy-source", "/enc/enc"));
+    let r = svc.handle(&ssec_req_q("PUT", "/enc/q3", &[], &h3, vec![]));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let resp = r.unwrap();
+    assert_eq!(hdr(&resp, SSE_MD5_HDR).as_deref(), Some(hb[2].1.as_str()));
+    let rb = ssec_refs(&hb);
+    let get = svc.handle(&req_h("GET", "/enc/q3", &rb, vec![])).unwrap();
+    read_body(&svc, &get, &plain);
+    // 旧密钥读新对象:D-E5 校验子比对 → 400 InvalidRequest(AWS 口径;
+    // E1-3 时代的 chunk0 早探 500 已被校验子取代,见 op_get_object 注释)
+    let get = svc.handle(&req_h("GET", "/enc/q3", &ra, vec![]));
+    let e = get.unwrap_err();
+    assert_eq!(e.status(), 400, "旧密钥读重加密对象 → 400: {e:?}");
+    assert_eq!(e.code, fs3_s3::S3ErrorCode::InvalidRequest, "{e:?}");
+
+    // —— 象限 4:加密源 + 目标未指定加密 → InvalidRequest(DE3,保留口径)——
+    let r = svc.handle(&ssec_req_q(
+        "PUT",
+        "/enc/q4",
+        &[],
+        &[("x-amz-copy-source", "/enc/enc")],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "InvalidRequest", "{r:?}");
+    // 加密源 + 目标 SSE-C 但缺 copy-source 三头 → InvalidRequest
+    let mut h5 = ssec_refs(&hb);
+    h5.push(("x-amz-copy-source", "/enc/enc"));
+    let r = svc.handle(&ssec_req_q("PUT", "/enc/q5", &[], &h5, vec![]));
+    assert_eq!(err_code(&r), "InvalidRequest", "{r:?}");
+    // copy-source 侧坏算法 → InvalidEncryptionAlgorithmError(同目标侧口径)
+    let bad = [
+        (
+            "x-amz-copy-source-server-side-encryption-customer-algorithm",
+            "AES128",
+        ),
+        (csa[1].0.as_str(), csa[1].1.as_str()),
+        (csa[2].0.as_str(), csa[2].1.as_str()),
+    ];
+    let mut h6 = ssec_refs(&ha);
+    h6.extend(bad);
+    h6.push(("x-amz-copy-source", "/enc/enc"));
+    let r = svc.handle(&ssec_req_q("PUT", "/enc/q6", &[], &h6, vec![]));
+    assert_eq!(err_code(&r), "InvalidEncryptionAlgorithmError", "{r:?}");
+    // 错源密钥(copy-source 给 kb,对象实为 ka)+ 目标异密钥(ka) →
+    // H1-1 校验子早判 → 400 InvalidRequest(与读路径同码同消息;E1-5 初版
+    // 落数据路径 GCM 失败 → 500 的口径已对齐 D-E5)
+    let mut h7 = ssec_refs(&ha);
+    h7.extend(csb.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    h7.push(("x-amz-copy-source", "/enc/enc"));
+    let r = svc.handle(&ssec_req_q("PUT", "/enc/q7", &[], &h7, vec![]));
+    let e = r.unwrap_err();
+    assert_eq!(e.status(), 400, "错源密钥 → 400: {e:?}");
+    assert_eq!(e.code, fs3_s3::S3ErrorCode::InvalidRequest, "{e:?}");
+}
+
+/// UploadPartCopy 矩阵:SSE 会话灌明文源(加密 part)/同密钥灌加密源;
+/// 加密源 + 明文会话 → InvalidRequest;缺 copy-source 头 → InvalidRequest;
+/// 会话缺目标头 → InvalidRequest;Complete 后整对象读回。
+#[test]
+fn sse_c_upload_part_copy_e2e() {
+    let (_d, svc) = setup_no_compact();
+    assert_eq!(status(&svc.handle(&req("PUT", "/enc", vec![]))), 200);
+    let ka = ssec_key();
+    let ha = ssec_headers(&ka);
+    let ra = ssec_refs(&ha);
+    let csa = ssec_cs_headers(&ka);
+    let src_data: Vec<u8> = (0..5 * 1024 * 1024 + 200_000u32)
+        .map(|i| (i % 241) as u8)
+        .collect();
+    assert_eq!(
+        status(&svc.handle(&req("PUT", "/enc/plain", src_data.clone()))),
+        200
+    );
+    assert_eq!(
+        status(&svc.handle(&req_h("PUT", "/enc/enc", &ra, src_data.clone()))),
+        200
+    );
+    // 辅助:建 SSE 会话,取 uploadId
+    let create_sse = |key: &str| -> String {
+        let r = svc.handle(&ssec_req_q(
+            "POST",
+            &format!("/enc/{key}"),
+            &[("uploads", "")],
+            &ra,
+            vec![],
+        ));
+        assert_eq!(status(&r), 200, "{r:?}");
+        let xml = match r.unwrap().body {
+            ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+            _ => panic!(),
+        };
+        xml.split("<UploadId>")
+            .nth(1)
+            .unwrap()
+            .split("</UploadId>")
+            .next()
+            .unwrap()
+            .to_string()
+    };
+
+    // —— SSE 会话:明文源 range 灌入(目标加密)+ 同密钥灌加密源 ——
+    let uid = create_sse("upc");
+    let mut h1 = ssec_refs(&ha);
+    h1.push(("x-amz-copy-source", "/enc/plain"));
+    h1.push(("x-amz-copy-source-range", "bytes=60000-5442879"));
+    let r = svc.handle(&ssec_req_q(
+        "PUT",
+        "/enc/upc",
+        &[("partNumber", "1"), ("uploadId", &uid)],
+        &h1,
+        vec![],
+    ));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let resp = r.unwrap();
+    assert_eq!(
+        hdr(&resp, SSE_ALG_HDR).as_deref(),
+        Some("AES256"),
+        "目标回显"
+    );
+    let xml = match resp.body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!(),
+    };
+    let etag1 = xml
+        .split("<ETag>")
+        .nth(1)
+        .unwrap()
+        .split("</ETag>")
+        .next()
+        .unwrap()
+        .to_string();
+    let mut h2 = ssec_refs(&ha);
+    h2.extend(csa.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    h2.push(("x-amz-copy-source", "/enc/enc"));
+    h2.push(("x-amz-copy-source-range", "bytes=0-99"));
+    let r = svc.handle(&ssec_req_q(
+        "PUT",
+        "/enc/upc",
+        &[("partNumber", "2"), ("uploadId", &uid)],
+        &h2,
+        vec![],
+    ));
+    assert_eq!(status(&r), 200, "同密钥灌加密源: {r:?}");
+    let xml = match r.unwrap().body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!(),
+    };
+    let etag2 = xml
+        .split("<ETag>")
+        .nth(1)
+        .unwrap()
+        .split("</ETag>")
+        .next()
+        .unwrap()
+        .to_string();
+    // Complete + 整对象带密钥读回 = 两段明文拼接
+    let body = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag1}</ETag></Part>\
+         <Part><PartNumber>2</PartNumber><ETag>{etag2}</ETag></Part></CompleteMultipartUpload>"
+    )
+    .into_bytes();
+    let r = svc.handle(&ssec_req_q(
+        "POST",
+        "/enc/upc",
+        &[("uploadId", &uid)],
+        &ra,
+        body,
+    ));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let mut plain = src_data[60_000..].to_vec();
+    plain.extend_from_slice(&src_data[..100]);
+    let get = svc.handle(&req_h("GET", "/enc/upc", &ra, vec![])).unwrap();
+    read_body(&svc, &get, &plain);
+
+    // —— 错误矩阵 ——
+    // 加密源 + 明文会话(目标未加密)→ InvalidRequest(DE3)
+    let r = svc.handle(&req_q("POST", "/enc/upc-e1", &[("uploads", "")], vec![]));
+    let xml = match r.unwrap().body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!(),
+    };
+    let uid2 = xml
+        .split("<UploadId>")
+        .nth(1)
+        .unwrap()
+        .split("</UploadId>")
+        .next()
+        .unwrap()
+        .to_string();
+    let r = svc.handle(&ssec_req_q(
+        "PUT",
+        "/enc/upc-e1",
+        &[("partNumber", "1"), ("uploadId", &uid2)],
+        &[("x-amz-copy-source", "/enc/enc")],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "InvalidRequest", "{r:?}");
+    // 加密源 + SSE 会话但缺 copy-source 三头 → InvalidRequest
+    let uid3 = create_sse("upc-e2");
+    let mut h3 = ssec_refs(&ha);
+    h3.push(("x-amz-copy-source", "/enc/enc"));
+    let r = svc.handle(&ssec_req_q(
+        "PUT",
+        "/enc/upc-e2",
+        &[("partNumber", "1"), ("uploadId", &uid3)],
+        &h3,
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "InvalidRequest", "{r:?}");
+    // SSE 会话缺目标三头(明文源)→ InvalidRequest(会话一致性)
+    let r = svc.handle(&ssec_req_q(
+        "PUT",
+        "/enc/upc-e2",
+        &[("partNumber", "1"), ("uploadId", &uid3)],
+        &[("x-amz-copy-source", "/enc/plain")],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "InvalidRequest", "{r:?}");
+    // 错 copy-source 密钥(源侧给 kb,对象实为 ka;目标侧 ka 与会话一致)
+    // → H1-1 校验子早判 → 400 InvalidRequest(与 CopyObject/读路径同码同
+    // 消息;E1-5 初版落引擎 GCM 失败 → 500 的口径已对齐 D-E5)
+    let kb = [0xA5u8; 32];
+    let csb = ssec_cs_headers(&kb);
+    let uid4 = create_sse("upc-e3");
+    let mut h4 = ssec_refs(&ha);
+    h4.extend(csb.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    h4.push(("x-amz-copy-source", "/enc/enc"));
+    let r = svc.handle(&ssec_req_q(
+        "PUT",
+        "/enc/upc-e3",
+        &[("partNumber", "1"), ("uploadId", &uid4)],
+        &h4,
+        vec![],
+    ));
+    let e = r.unwrap_err();
+    assert_eq!(e.status(), 400, "错 copy-source 密钥 → 400: {e:?}");
+    assert_eq!(e.code, fs3_s3::S3ErrorCode::InvalidRequest, "{e:?}");
+}
+
+// ─────────────────────────── M11 E1-6:预签名 + SSE-C(DE4) ───────────────────────────
+
+/// 构造预签名请求(query 认证;`signed` = 进 SignedHeaders 的额外头,
+/// `send` = 实际发送的头——两者可不一致以构造反例)。payload 恒
+/// UNSIGNED-PAYLOAD(预签名惯例)。
+fn presigned_req(
+    method: &str,
+    path: &str,
+    signed: &[(&str, &str)],
+    send: &[(&str, &str)],
+    body: Vec<u8>,
+) -> S3Request {
+    let cred = Credentials {
+        access_key: "test".into(),
+        secret_key: "secret123".into(),
+    };
+    let amz_date = auth::now_amz();
+    let date = &amz_date[0..8];
+    // SignedHeaders = host + signed(按小写名排序, SigV4 规范)
+    let mut signed_all: Vec<(String, String)> = vec![("host".into(), "localhost:9000".into())];
+    for (k, v) in signed {
+        signed_all.push((k.to_string(), v.to_string()));
+    }
+    let mut names: Vec<String> = signed_all.iter().map(|(k, _)| k.to_lowercase()).collect();
+    names.sort();
+    let signed_list = names.join(";");
+    let mut query: Vec<(String, String)> = vec![
+        ("X-Amz-Algorithm".into(), auth::ALGORITHM.into()),
+        (
+            "X-Amz-Credential".into(),
+            format!("test/{date}/us-east-1/s3/aws4_request"),
+        ),
+        ("X-Amz-Date".into(), amz_date.clone()),
+        ("X-Amz-Expires".into(), "3600".into()),
+        ("X-Amz-SignedHeaders".into(), signed_list.clone()),
+    ];
+    let q = auth::canonical_query(&query, &["X-Amz-Signature"]);
+    let mut lines: Vec<(String, String)> = signed_all
+        .iter()
+        .map(|(k, v)| (k.to_lowercase(), v.trim().to_string()))
+        .collect();
+    lines.sort();
+    let c_headers: String = lines.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
+    let creq = format!("{method}\n{path}\n{q}\n{c_headers}\n{signed_list}\nUNSIGNED-PAYLOAD");
+    let sts = auth::string_to_sign(&amz_date, date, "us-east-1", &creq);
+    let skey = auth::signing_key(&cred.secret_key, date, "us-east-1");
+    type HmacSha256 = hmac::Hmac<Sha256>;
+    let mut mac = <HmacSha256 as hmac::Mac>::new_from_slice(&skey).unwrap();
+    mac.update(sts.as_bytes());
+    let sig = hex::encode(mac.finalize().into_bytes());
+    query.push(("X-Amz-Signature".into(), sig));
+    let mut headers: Vec<(String, String)> = vec![("host".into(), "localhost:9000".into())];
+    for (k, v) in send {
+        headers.push((k.to_string(), v.to_string()));
+    }
+    S3Request {
+        method: method.into(),
+        raw_path: path.into(),
+        decoded_path: path.into(),
+        host: "localhost".into(),
+        query,
+        headers,
+        body,
+    }
+}
+
+/// E1-6(DE4):预签名 PUT/GET 带 SSE-C 三头(SignedHeaders 含三头)→
+/// 往返成功(回显 + 明文一致);签名缺头/头值被改 → SignatureDoesNotMatch。
+#[test]
+fn sse_c_presigned_roundtrip() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/enc", vec![]))), 200);
+    let key = ssec_key();
+    let sh = ssec_headers(&key);
+    let sr = ssec_refs(&sh);
+
+    // —— 预签名 PUT(SSE-C 三头进 SignedHeaders)→ 200 + 回显 ——
+    let plain = b"presigned sse-c object".to_vec();
+    let r = presigned_req("PUT", "/enc/ps", &sr, &sr, plain.clone());
+    let r = svc.handle(&r);
+    assert_eq!(status(&r), 200, "预签名 PUT: {r:?}");
+    let resp = r.unwrap();
+    assert_eq!(hdr(&resp, SSE_ALG_HDR).as_deref(), Some("AES256"));
+    assert_eq!(hdr(&resp, SSE_MD5_HDR).as_deref(), Some(sh[2].1.as_str()));
+    // 落盘为加密对象:无头 GET → 400(间接证明加密生效)
+    let r = svc.handle(&req("GET", "/enc/ps", vec![]));
+    assert_eq!(err_code(&r), "InvalidRequest");
+
+    // —— 预签名 GET(SSE-C 三头进 SignedHeaders)→ 200 + 明文往返 ——
+    let r = presigned_req("GET", "/enc/ps", &sr, &sr, vec![]);
+    let r = svc.handle(&r);
+    assert_eq!(status(&r), 200, "预签名 GET: {r:?}");
+    let resp = r.unwrap();
+    assert_eq!(hdr(&resp, SSE_ALG_HDR).as_deref(), Some("AES256"));
+    read_body(&svc, &resp, &plain);
+
+    // —— 反例 1:签名缺头(SignedHeaders 声明含 key 头,请求未携带)→
+    // SignatureDoesNotMatch ——
+    let send_missing: Vec<(&str, &str)> = sr
+        .iter()
+        .filter(|(k, _)| *k != "x-amz-server-side-encryption-customer-key")
+        .copied()
+        .collect();
+    let r = presigned_req("GET", "/enc/ps", &sr, &send_missing, vec![]);
+    let r = svc.handle(&r);
+    assert_eq!(err_code(&r), "SignatureDoesNotMatch", "{r:?}");
+
+    // —— 反例 2:头值被改(签名按正确值,请求携带篡改值)→
+    // SignatureDoesNotMatch ——
+    let bad_key = ssec_headers(&[0xA5u8; 32]);
+    let tampered: Vec<(&str, &str)> = sr
+        .iter()
+        .map(|(k, v)| {
+            if *k == "x-amz-server-side-encryption-customer-key" {
+                (*k, bad_key[1].1.as_str())
+            } else {
+                (*k, *v)
+            }
+        })
+        .collect();
+    let r = presigned_req("GET", "/enc/ps", &sr, &tampered, vec![]);
+    let r = svc.handle(&r);
+    assert_eq!(err_code(&r), "SignatureDoesNotMatch", "{r:?}");
+}
+
+// ─────────────────────────── M11 K:SSE-S3 + 桶默认加密(ADR-12 DS1~DS4)───────────────────────────
+
+const SSE_S3_HDR: &str = "x-amz-server-side-encryption";
+
+/// SSE-S3 头请求(签名;值进 SignedHeaders,DE4 同口径)。
+fn s3_req(
+    method: &str,
+    path: &str,
+    query: &[(&str, &str)],
+    sse_s3: bool,
+    body: Vec<u8>,
+) -> S3Request {
+    let extra: Vec<(&str, &str)> = if sse_s3 {
+        vec![(SSE_S3_HDR, "AES256")]
+    } else {
+        vec![]
+    };
+    ssec_req_q(method, path, query, &extra, body)
+}
+
+/// PutBucketEncryption 规范 XML(仅 AES256 单 Rule)。
+fn enc_xml() -> Vec<u8> {
+    b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>".to_vec()
+}
+
+/// K1-2:?encryption 三 API 正反——Put(AES256 → 200)/Get(回显 XML)/
+/// Delete(204 幂等);无配置 Get → 404 ServerSideEncryptionConfiguration-
+/// NotFoundError;无配置 Delete → 204(AWS 幂等口径);桶不存在 → 404。
+#[test]
+fn bucket_encryption_apis() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/enc", vec![]))), 200);
+    let q = &[("encryption", "")];
+
+    // 无配置 Get → 404 AWS 码
+    let r = svc.handle(&req_q("GET", "/enc", q, vec![]));
+    assert_eq!(status(&r), 404, "{r:?}");
+    assert_eq!(
+        err_code(&r),
+        "ServerSideEncryptionConfigurationNotFoundError"
+    );
+    // 无配置 Delete → 204 幂等(AWS 口径)
+    let r = svc.handle(&req_q("DELETE", "/enc", q, vec![]));
+    assert_eq!(status(&r), 204, "{r:?}");
+    // Put AES256 → 200
+    let r = svc.handle(&req_q("PUT", "/enc", q, enc_xml()));
+    assert_eq!(status(&r), 200, "{r:?}");
+    // Get → 200 + 规范化 XML(含 AES256 单 Rule)
+    let r = svc.handle(&req_q("GET", "/enc", q, vec![]));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let xml = body_str(&r.unwrap());
+    assert!(xml.contains("<SSEAlgorithm>AES256</SSEAlgorithm>"), "{xml}");
+    assert!(
+        xml.contains("<ApplyServerSideEncryptionByDefault>"),
+        "{xml}"
+    );
+    // Delete → 204;再 Get → 404
+    let r = svc.handle(&req_q("DELETE", "/enc", q, vec![]));
+    assert_eq!(status(&r), 204, "{r:?}");
+    let r = svc.handle(&req_q("GET", "/enc", q, vec![]));
+    assert_eq!(
+        err_code(&r),
+        "ServerSideEncryptionConfigurationNotFoundError"
+    );
+    // 桶不存在 → NoSuchBucket
+    let r = svc.handle(&req_q("PUT", "/ghost", q, enc_xml()));
+    assert_eq!(err_code(&r), "NoSuchBucket", "{r:?}");
+    let r = svc.handle(&req_q("GET", "/ghost", q, vec![]));
+    assert_eq!(err_code(&r), "NoSuchBucket", "{r:?}");
+    // 坏 XML → MalformedXML;零/多 Rule → MalformedXML
+    let r = svc.handle(&req_q("PUT", "/enc", q, b"<oops/>".to_vec()));
+    assert_eq!(err_code(&r), "MalformedXML", "{r:?}");
+    let two =
+        b"<ServerSideEncryptionConfiguration><Rule/><Rule/></ServerSideEncryptionConfiguration>"
+            .to_vec();
+    let r = svc.handle(&req_q("PUT", "/enc", q, two));
+    assert_eq!(err_code(&r), "MalformedXML", "{r:?}");
+}
+
+/// K1-4:SSE-KMS 显式拒绝矩阵(钉住,不静默)——aws:kms 算法值全入口
+/// 400 InvalidEncryptionAlgorithmError;KMS 参数头族 501 NotImplemented;
+/// PutBucketEncryption 的 KMSKeyID/BucketKeyEnabled 元素 400
+/// InvalidArgument;非受理 op 携带 SSE-S3 头 400 InvalidArgument(AWS 口径)。
+#[test]
+fn sse_kms_explicit_rejection_matrix() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/enc", vec![]))), 200);
+    let q = &[("encryption", "")];
+
+    // —— 对象头 aws:kms(PUT/CreateMultipart/CopyObject)→ 400 ——
+    for r in [
+        ssec_req_q(
+            "PUT",
+            "/enc/k",
+            &[],
+            &[(SSE_S3_HDR, "aws:kms")],
+            b"x".to_vec(),
+        ),
+        ssec_req_q(
+            "POST",
+            "/enc/k",
+            &[("uploads", "")],
+            &[(SSE_S3_HDR, "aws:kms")],
+            vec![],
+        ),
+        ssec_req_q(
+            "PUT",
+            "/enc/d",
+            &[],
+            &[("x-amz-copy-source", "/enc/k"), (SSE_S3_HDR, "aws:kms")],
+            vec![],
+        ),
+    ] {
+        let r = svc.handle(&r);
+        assert_eq!(err_code(&r), "InvalidEncryptionAlgorithmError", "{r:?}");
+        assert_eq!(status(&r), 400);
+    }
+    // 垃圾算法值同码(显式,不静默)
+    let r = svc.handle(&ssec_req_q(
+        "PUT",
+        "/enc/k",
+        &[],
+        &[(SSE_S3_HDR, "AES128")],
+        b"x".to_vec(),
+    ));
+    assert_eq!(err_code(&r), "InvalidEncryptionAlgorithmError", "{r:?}");
+
+    // —— KMS 参数头族 → 501(头表保留,K1-4 显式拒绝路径)——
+    for h in [
+        "x-amz-server-side-encryption-aws-kms-key-id",
+        "x-amz-server-side-encryption-context",
+        "x-amz-server-side-encryption-bucket-key-enabled",
+    ] {
+        let r = svc.handle(&ssec_req_q(
+            "PUT",
+            "/enc/k",
+            &[],
+            &[(h, "v")],
+            b"x".to_vec(),
+        ));
+        assert_eq!(err_code(&r), "NotImplemented", "header {h}: {r:?}");
+        assert_eq!(status(&r), 501);
+    }
+
+    // —— PutBucketEncryption 的 KMS 元素 → 400 InvalidArgument ——
+    let kms_alg = b"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>".to_vec();
+    let r = svc.handle(&req_q("PUT", "/enc", q, kms_alg));
+    assert_eq!(err_code(&r), "InvalidEncryptionAlgorithmError", "{r:?}");
+    let kms_key = b"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm><KMSKeyID>arn:aws:kms:x</KMSKeyID></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>".to_vec();
+    let r = svc.handle(&req_q("PUT", "/enc", q, kms_key));
+    assert_eq!(err_code(&r), "InvalidEncryptionAlgorithmError", "{r:?}");
+    // KMSKeyID 与合法 AES256 同现也显式拒绝(不静默丢弃 KMS 参数)
+    let kms_key2 = b"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm><KMSKeyID>arn:x</KMSKeyID></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>".to_vec();
+    let r = svc.handle(&req_q("PUT", "/enc", q, kms_key2));
+    assert_eq!(err_code(&r), "InvalidArgument", "{r:?}");
+    let bke = b"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm><BucketKeyEnabled>true</BucketKeyEnabled></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>".to_vec();
+    let r = svc.handle(&req_q("PUT", "/enc", q, bke));
+    assert_eq!(err_code(&r), "InvalidArgument", "{r:?}");
+
+    // —— 非受理 op 携带 SSE-S3 头 → 400(GET/UploadPart/DeleteObject)——
+    let r = svc.handle(&s3_req("GET", "/enc/k", &[], true, vec![]));
+    assert_eq!(err_code(&r), "InvalidArgument", "{r:?}");
+    let r = svc.handle(&s3_req(
+        "PUT",
+        "/enc/k",
+        &[("partNumber", "1"), ("uploadId", "x")],
+        true,
+        b"x".to_vec(),
+    ));
+    assert_eq!(err_code(&r), "InvalidArgument", "{r:?}");
+    let r = svc.handle(&s3_req("DELETE", "/enc/k", &[], true, vec![]));
+    assert_eq!(err_code(&r), "InvalidArgument", "{r:?}");
+}
+
+/// K1-2/K1-3:显式 AES256 头 PUT(桶无默认依然加密,对象级指定优先)+
+/// GET/HEAD 恒回显 AES256(零客户头);SSE-C × SSE-S3 头互斥 400;
+/// SSE-S3 对象携带 SSE-C 头读 → 400。
+#[test]
+fn sse_s3_header_put_get_echo() {
+    let (_d, svc) = setup_no_compact();
+    assert_eq!(status(&svc.handle(&req("PUT", "/enc", vec![]))), 200);
+    let plain: Vec<u8> = (0..150_000u32).map(|i| (i % 251) as u8).collect(); // extent 臂
+
+    // 显式头 PUT(桶无默认):200 + 回显 AES256
+    let r = svc.handle(&s3_req("PUT", "/enc/big", &[], true, plain.clone()));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let resp = r.unwrap();
+    assert_eq!(hdr(&resp, SSE_S3_HDR).as_deref(), Some("AES256"));
+    let etag = hdr(&resp, "etag").unwrap();
+    assert_ne!(
+        etag,
+        format!("\"{}\"", hex::encode(md5::Md5::digest(&plain))),
+        "ETag = 密文 MD5(DE2)"
+    );
+
+    // GET 零头:200 + 明文往返 + 恒回显 AES256
+    let get = svc.handle(&req("GET", "/enc/big", vec![]));
+    assert_eq!(status(&get), 200, "{get:?}");
+    let get = get.unwrap();
+    assert_eq!(hdr(&get, SSE_S3_HDR).as_deref(), Some("AES256"));
+    assert!(hdr(&get, "x-amz-server-side-encryption-customer-algorithm").is_none());
+    read_body(&svc, &get, &plain);
+    // HEAD 零头:回显同 GET
+    let head = svc.handle(&req("HEAD", "/enc/big", vec![]));
+    assert_eq!(status(&head), 200, "{head:?}");
+    assert_eq!(hdr(&head.unwrap(), SSE_S3_HDR).as_deref(), Some("AES256"));
+    // Range GET 零头:跨 chunk 解密一致 + 回显
+    let rget = svc.handle(&req_h(
+        "GET",
+        "/enc/big",
+        &[("range", "bytes=60000-139999")],
+        vec![],
+    ));
+    assert_eq!(status(&rget), 206, "{rget:?}");
+    let rget = rget.unwrap();
+    assert_eq!(hdr(&rget, SSE_S3_HDR).as_deref(), Some("AES256"));
+    read_body(&svc, &rget, &plain[60_000..140_000]);
+
+    // SSE-S3 对象携带 SSE-C 头读 → 显式 400(不静默混用)
+    let key = ssec_key();
+    let sh = ssec_headers(&key);
+    let r = svc.handle(&ssec_req_q("GET", "/enc/big", &[], &ssec_refs(&sh), vec![]));
+    assert_eq!(err_code(&r), "InvalidRequest", "{r:?}");
+
+    // SSE-C × SSE-S3 头同现 → 显式互斥 400(AWS:InvalidArgument)
+    let mut both = ssec_refs(&sh);
+    both.push((SSE_S3_HDR, "AES256"));
+    let r = svc.handle(&ssec_req_q("PUT", "/enc/mix", &[], &both, b"x".to_vec()));
+    assert_eq!(err_code(&r), "InvalidArgument", "{r:?}");
+
+    // 内联臂(小对象)同口径往返
+    let small = b"sse-s3 inline object".to_vec();
+    let r = svc.handle(&s3_req("PUT", "/enc/small", &[], true, small.clone()));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let get = svc.handle(&req("GET", "/enc/small", vec![])).unwrap();
+    read_body(&svc, &get, &small);
+}
+
+/// K1-3:桶默认加密——无头 PUT 自动 SSE-S3;SSE-C 头覆盖默认(AWS:请求头
+/// 覆盖);显式 AES256 头覆盖默认同效;DeleteBucketEncryption 后无头 PUT
+/// 回落明文。
+#[test]
+fn sse_s3_bucket_default() {
+    let (_d, svc) = setup_no_compact();
+    assert_eq!(status(&svc.handle(&req("PUT", "/enc", vec![]))), 200);
+    let q = &[("encryption", "")];
+    assert_eq!(
+        status(&svc.handle(&req_q("PUT", "/enc", q, enc_xml()))),
+        200
+    );
+
+    // 无头 PUT → 自动 SSE-S3(回显 + 落盘加密 + 零头读回)
+    let plain = rnd_bytes(80_000, 3);
+    let r = svc.handle(&req("PUT", "/enc/auto", plain.clone()));
+    assert_eq!(status(&r), 200, "{r:?}");
+    assert_eq!(hdr(&r.unwrap(), SSE_S3_HDR).as_deref(), Some("AES256"));
+    let get = svc.handle(&req("GET", "/enc/auto", vec![])).unwrap();
+    assert_eq!(hdr(&get, SSE_S3_HDR).as_deref(), Some("AES256"));
+    read_body(&svc, &get, &plain);
+
+    // SSE-C 头优先于桶默认(对象按 SSE-C 落:无头读 → 400;带三头读 → 明文)
+    let key = ssec_key();
+    let sh = ssec_headers(&key);
+    let sr = ssec_refs(&sh);
+    let cplain = b"sse-c overrides bucket default".to_vec();
+    let r = svc.handle(&ssec_req_q("PUT", "/enc/c-obj", &[], &sr, cplain.clone()));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let resp = r.unwrap();
+    assert_eq!(hdr(&resp, SSE_ALG_HDR).as_deref(), Some("AES256"));
+    assert!(
+        hdr(&resp, SSE_S3_HDR).is_none(),
+        "SSE-C 优先,不回显 SSE-S3 头"
+    );
+    let r = svc.handle(&req("GET", "/enc/c-obj", vec![]));
+    assert_eq!(err_code(&r), "InvalidRequest", "SSE-C 对象无头读 400");
+    let get = svc
+        .handle(&ssec_req_q("GET", "/enc/c-obj", &[], &sr, vec![]))
+        .unwrap();
+    read_body(&svc, &get, &cplain);
+
+    // DeleteBucketEncryption → 无头 PUT 回落明文(无回显头)
+    assert_eq!(
+        status(&svc.handle(&req_q("DELETE", "/enc", q, vec![]))),
+        204
+    );
+    let r = svc.handle(&req("PUT", "/enc/plain", b"p".to_vec()));
+    assert_eq!(status(&r), 200, "{r:?}");
+    assert!(hdr(&r.unwrap(), SSE_S3_HDR).is_none());
+}
+
+/// K1-3(DS3 同 DE3 口径):copy 象限——SSE-S3 源 + 目标未指定加密 →
+/// InvalidRequest;目标桶默认在场 → 无头 copy 按默认加密(AWS 口径);
+/// SSE-S3↔SSE-C 换密钥 = 解密重加密;同 SSE-S3 = COW(SseInfo 继承)。
+#[test]
+fn sse_s3_copy_matrix() {
+    let (_d, svc) = setup_no_compact();
+    assert_eq!(status(&svc.handle(&req("PUT", "/src", vec![]))), 200);
+    assert_eq!(status(&svc.handle(&req("PUT", "/plain-dst", vec![]))), 200);
+    assert_eq!(status(&svc.handle(&req("PUT", "/enc-dst", vec![]))), 200);
+    let q = &[("encryption", "")];
+    assert_eq!(
+        status(&svc.handle(&req_q("PUT", "/enc-dst", q, enc_xml()))),
+        200
+    );
+
+    // 源:SSE-S3 对象(显式头)
+    let plain = rnd_bytes(100_000, 7);
+    let r = svc.handle(&s3_req("PUT", "/src/s3", &[], true, plain.clone()));
+    assert_eq!(status(&r), 200, "{r:?}");
+    // 源:SSE-C 对象
+    let key = ssec_key();
+    let sh = ssec_headers(&key);
+    let sr = ssec_refs(&sh);
+    let cplain = rnd_bytes(60_000, 8);
+    assert_eq!(
+        status(&svc.handle(&ssec_req_q("PUT", "/src/c", &[], &sr, cplain.clone()))),
+        200
+    );
+
+    // 象限 1:SSE-S3 源 + 目标桶无默认 + 无头 → InvalidRequest(DS3)
+    let r = svc.handle(&ssec_req_q(
+        "PUT",
+        "/plain-dst/k",
+        &[],
+        &[("x-amz-copy-source", "/src/s3")],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "InvalidRequest", "{r:?}");
+
+    // 象限 2:SSE-S3 源 + 目标桶默认在场 + 无头 → 按默认加密(AWS 口径;
+    // 同代 COW:ETag 不变)
+    let src_head = svc.handle(&req("HEAD", "/src/s3", vec![])).unwrap();
+    let src_etag = hdr(&src_head, "etag").unwrap();
+    let r = svc.handle(&ssec_req_q(
+        "PUT",
+        "/enc-dst/k",
+        &[],
+        &[("x-amz-copy-source", "/src/s3")],
+        vec![],
+    ));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let resp = r.unwrap();
+    assert_eq!(hdr(&resp, SSE_S3_HDR).as_deref(), Some("AES256"));
+    let dhead = svc.handle(&req("HEAD", "/enc-dst/k", vec![])).unwrap();
+    assert_eq!(hdr(&dhead, SSE_S3_HDR).as_deref(), Some("AES256"));
+    assert_eq!(hdr(&dhead, "etag"), Some(src_etag), "同代 COW:密文不动");
+    let get = svc.handle(&req("GET", "/enc-dst/k", vec![])).unwrap();
+    read_body(&svc, &get, &plain);
+
+    // 象限 3:SSE-S3 源 + 显式 SSE-C 目标 → 解密重加密(换密钥)
+    let mut q3 = ssec_refs(&sh);
+    q3.insert(0, ("x-amz-copy-source", "/src/s3"));
+    let r = svc.handle(&ssec_req_q("PUT", "/plain-dst/c-out", &[], &q3, vec![]));
+    assert_eq!(status(&r), 200, "{r:?}");
+    assert_eq!(hdr(&r.unwrap(), SSE_ALG_HDR).as_deref(), Some("AES256"));
+    let get = svc
+        .handle(&ssec_req_q("GET", "/plain-dst/c-out", &[], &sr, vec![]))
+        .unwrap();
+    read_body(&svc, &get, &plain);
+
+    // 象限 4:SSE-C 源 + 显式 SSE-S3 目标头 → 解密重加密(需 copy-source 三头)
+    let mut cs = ssec_headers(&key); // 复用同 key 作源侧
+    for h in cs.iter_mut() {
+        h.0 = h.0.replace(
+            "x-amz-server-side-encryption",
+            "x-amz-copy-source-server-side-encryption",
+        );
+    }
+    let mut both = ssec_refs(&cs);
+    both.push((SSE_S3_HDR, "AES256"));
+    both.insert(0, ("x-amz-copy-source", "/src/c"));
+    let r = svc.handle(&ssec_req_q("PUT", "/plain-dst/s3-out", &[], &both, vec![]));
+    assert_eq!(status(&r), 200, "{r:?}");
+    assert_eq!(hdr(&r.unwrap(), SSE_S3_HDR).as_deref(), Some("AES256"));
+    let get = svc
+        .handle(&req("GET", "/plain-dst/s3-out", vec![]))
+        .unwrap();
+    read_body(&svc, &get, &cplain);
+
+    // 象限 5:SSE-C 源 + 目标桶默认在场 + 无目标头 → 按默认 SSE-S3 重加密
+    // (桶默认 = 目标已指定加密;copy-source 三头仍必需)
+    let mut q5 = ssec_refs(&cs);
+    q5.insert(0, ("x-amz-copy-source", "/src/c"));
+    let r = svc.handle(&ssec_req_q("PUT", "/enc-dst/c-to-s3", &[], &q5, vec![]));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let get = svc.handle(&req("GET", "/enc-dst/c-to-s3", vec![])).unwrap();
+    read_body(&svc, &get, &cplain);
+
+    // 象限 6:SSE-S3 源 + copy-source SSE-C 头 → 显式 400(混用拒绝)
+    let r = svc.handle(&ssec_req_q(
+        "PUT",
+        "/enc-dst/mix",
+        &[],
+        &{
+            let mut v = ssec_refs(&cs);
+            v.insert(0, ("x-amz-copy-source", "/src/s3"));
+            v
+        },
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "InvalidRequest", "{r:?}");
+}
+
+/// K1-1/K1-2 multipart SSE-S3 端到端:Create 显式头(回显)→ part 零头
+/// (回显;重传幂等)→ Complete 零头(回显;D-E4 重加密臂)→ GET 零头
+/// 明文往返;桶默认 Create 同效;SSE-S3 会话带 SSE-C 头 → 400。
+#[test]
+fn sse_s3_multipart_e2e() {
+    let (_d, svc) = setup_no_compact();
+    assert_eq!(status(&svc.handle(&req("PUT", "/enc", vec![]))), 200);
+
+    // —— Create + AES256 头:200 + 回显 ——
+    let r = svc.handle(&s3_req("POST", "/enc/mp", &[("uploads", "")], true, vec![]));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let resp = r.unwrap();
+    assert_eq!(hdr(&resp, SSE_S3_HDR).as_deref(), Some("AES256"));
+    let xml = body_str(&resp);
+    let uid = xml
+        .split("<UploadId>")
+        .nth(1)
+        .unwrap()
+        .split("</UploadId>")
+        .next()
+        .unwrap()
+        .to_string();
+
+    // —— UploadPart 零头(缓冲 5MiB + 流式重传 + 内联尾片):回显 ——
+    let p1 = rnd_bytes(5 * 1024 * 1024, 41);
+    let r = svc.handle(&s3_req(
+        "PUT",
+        "/enc/mp",
+        &[("partNumber", "1"), ("uploadId", &uid)],
+        false,
+        p1.clone(),
+    ));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let resp = r.unwrap();
+    assert_eq!(
+        hdr(&resp, SSE_S3_HDR).as_deref(),
+        Some("AES256"),
+        "加密会话 part 回显"
+    );
+    let etag1 = hdr(&resp, "etag").unwrap();
+    assert_ne!(
+        etag1,
+        format!("\"{}\"", hex::encode(md5::Md5::digest(&p1))),
+        "part ETag = 密文 MD5(DE2)"
+    );
+    // 流式 part2 + 同内容重传 ⇒ ETag 稳定(会话级 DEK + D-E6 确定性 nonce)
+    let r = s3_req(
+        "PUT",
+        "/enc/mp",
+        &[("partNumber", "2"), ("uploadId", &uid)],
+        false,
+        p1.clone(),
+    );
+    let r = svc.put_object_stream(&r, &mut std::io::Cursor::new(p1.clone()));
+    assert_eq!(status(&r), 200, "流式 part: {r:?}");
+    let etag2 = hdr(&r.unwrap(), "etag").unwrap();
+    let r = svc.handle(&s3_req(
+        "PUT",
+        "/enc/mp",
+        &[("partNumber", "2"), ("uploadId", &uid)],
+        false,
+        p1.clone(),
+    ));
+    assert_eq!(status(&r), 200, "重传 part2: {r:?}");
+    let etag2r = hdr(&r.unwrap(), "etag").unwrap();
+    assert_eq!(etag2, etag2r, "会话级 DEK + D-E6:重传幂等(ETag 稳定)");
+    let p3 = b"s3 tail inline part".to_vec();
+    let r = svc.handle(&s3_req(
+        "PUT",
+        "/enc/mp",
+        &[("partNumber", "3"), ("uploadId", &uid)],
+        false,
+        p3.clone(),
+    ));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let etag3 = hdr(&r.unwrap(), "etag").unwrap();
+
+    // —— SSE-S3 会话携带 SSE-C 头 → 显式 400(混用拒绝)——
+    let key = ssec_key();
+    let sh = ssec_headers(&key);
+    let r = svc.handle(&ssec_req_q(
+        "PUT",
+        "/enc/mp",
+        &[("partNumber", "4"), ("uploadId", &uid)],
+        &ssec_refs(&sh),
+        b"x".to_vec(),
+    ));
+    assert_eq!(err_code(&r), "InvalidRequest", "{r:?}");
+
+    // —— Complete 零头:回显;复合 ETag -3 ——
+    let body = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag1}</ETag></Part>\
+         <Part><PartNumber>2</PartNumber><ETag>{etag2}</ETag></Part>\
+         <Part><PartNumber>3</PartNumber><ETag>{etag3}</ETag></Part></CompleteMultipartUpload>"
+    )
+    .into_bytes();
+    let r = svc.handle(&s3_req(
+        "POST",
+        "/enc/mp",
+        &[("uploadId", &uid)],
+        false,
+        body,
+    ));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let resp = r.unwrap();
+    assert_eq!(hdr(&resp, SSE_S3_HDR).as_deref(), Some("AES256"));
+    let etag = hdr(&resp, "etag").unwrap();
+    assert!(etag.ends_with("-3\""), "复合 ETag: {etag}");
+
+    // —— GET/HEAD 零头:明文往返 + 恒回显 ——
+    let mut expect = p1.clone();
+    expect.extend_from_slice(&p1);
+    expect.extend_from_slice(&p3);
+    let get = svc.handle(&req("GET", "/enc/mp", vec![]));
+    assert_eq!(status(&get), 200, "{get:?}");
+    let get = get.unwrap();
+    assert_eq!(hdr(&get, SSE_S3_HDR).as_deref(), Some("AES256"));
+    read_body(&svc, &get, &expect);
+
+    // —— 桶默认 Create(无头)→ 会话自动 SSE-S3 ——
+    assert_eq!(
+        status(&svc.handle(&req_q("PUT", "/enc", &[("encryption", "")], enc_xml()))),
+        200
+    );
+    let r = svc.handle(&s3_req(
+        "POST",
+        "/enc/mp2",
+        &[("uploads", "")],
+        false,
+        vec![],
+    ));
+    assert_eq!(status(&r), 200, "{r:?}");
+    assert_eq!(
+        hdr(&r.unwrap(), SSE_S3_HDR).as_deref(),
+        Some("AES256"),
+        "桶默认 ⇒ Create 回显(无头自动加密)"
+    );
+}
+
+/// 确定性伪随机(集成测试局部;与引擎 rnd 同形)。
+fn rnd_bytes(len: usize, seed: u8) -> Vec<u8> {
+    (0..len as u32)
+        .map(|i| (i as u8).wrapping_mul(seed).wrapping_add(seed) % 251)
+        .collect()
+}
+
+// ─────────────────────────── M11 C1-5:SSE × checksum 并存组合矩阵 ───────────────────────────
+//
+// ADR-12 DE2 顺序:明文 → checksum 验算 → 加密 → 密文 CRC32C → ETag=密文 MD5;
+// checksum 恒明文语义(AWS),SSE 是服务端行为。已有钉住:aws-chunked trailer
+// × SSE-C × crc32c(sse_c_streaming_put_branches);etag=fast × SSE-C × 明文
+// checksum 引擎级(fs3-engine sse_c_etag_fast_and_plaintext_checksum)。
+// 本区补齐服务层组合矩阵:SSE-C/SSE-S3 × 五族 × {缓冲 PUT / 流式 PUT /
+// aws-chunked trailer / multipart(复合 + FULL_OBJECT)/ CopyObject /
+// 桶默认加密}。
+
+/// 五族 checksum 算法全表(C1-5 组合矩阵用)。
+fn five_algs() -> [fs3_core::ChecksumAlgorithm; 5] {
+    [
+        fs3_core::ChecksumAlgorithm::Crc32,
+        fs3_core::ChecksumAlgorithm::Crc32c,
+        fs3_core::ChecksumAlgorithm::Sha1,
+        fs3_core::ChecksumAlgorithm::Sha256,
+        fs3_core::ChecksumAlgorithm::Crc64Nvme,
+    ]
+}
+
+/// C1-5:SSE-C × 五族 checksum × 缓冲 PUT(内联/extent 两臂交替)——PUT 回显
+/// checksum + SSE-C 双族头;GET/HEAD 开 checksum-mode 回显明文值 +
+/// FULL_OBJECT 类型;GetObjectAttributes Checksum 一致;明文往返;值不符 →
+/// BadDigest 且不落盘(回滚)。
+#[test]
+fn sse_c_checksum_buffered_put_matrix() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/enc", vec![]))), 200);
+    let key = ssec_key();
+    let sh = ssec_headers(&key);
+    for (i, alg) in five_algs().into_iter().enumerate() {
+        let hdr_name = format!("x-amz-checksum-{}", alg.header_suffix());
+        // 偶数位内联臂(≤32KiB),奇数位 extent 臂
+        let plain = if i % 2 == 0 {
+            format!("sse-c checksum inline body {i}").into_bytes()
+        } else {
+            rnd_bytes(100_000, 17 + i as u8)
+        };
+        let ck = cksum_b64(alg, &plain);
+        let mut h = ssec_refs(&sh);
+        h.push((hdr_name.as_str(), ck.as_str()));
+        let path = format!("/enc/ck{i}");
+        let r = svc.handle(&req_h("PUT", &path, &h, plain.clone()));
+        assert_eq!(status(&r), 200, "{alg:?}: {r:?}");
+        let resp = r.unwrap();
+        assert_eq!(
+            hdr(&resp, &hdr_name).as_deref(),
+            Some(ck.as_str()),
+            "{alg:?} PUT 回显"
+        );
+        assert_eq!(hdr(&resp, SSE_ALG_HDR).as_deref(), Some("AES256"));
+        assert_eq!(hdr(&resp, SSE_MD5_HDR).as_deref(), Some(sh[2].1.as_str()));
+        // ETag = 密文摘要(DE2):≠ 明文 MD5
+        let etag = hdr(&resp, "etag").unwrap();
+        assert_ne!(
+            etag,
+            format!("\"{}\"", hex::encode(md5::Md5::digest(&plain))),
+            "{alg:?} ETag = 密文 MD5(DE2)"
+        );
+        // GET(SSE-C + checksum-mode ENABLED):明文 checksum 回显 + 明文往返
+        let mut g = ssec_refs(&sh);
+        g.push(("x-amz-checksum-mode", "ENABLED"));
+        let get = svc.handle(&req_h("GET", &path, &g, vec![]));
+        assert_eq!(status(&get), 200, "{alg:?} GET: {get:?}");
+        let get = get.unwrap();
+        assert_eq!(
+            hdr(&get, &hdr_name).as_deref(),
+            Some(ck.as_str()),
+            "{alg:?} GET 回显明文 checksum"
+        );
+        assert_eq!(
+            hdr(&get, "x-amz-checksum-type").as_deref(),
+            Some("FULL_OBJECT"),
+            "{alg:?} 单 PUT 类型"
+        );
+        assert_eq!(hdr(&get, SSE_ALG_HDR).as_deref(), Some("AES256"));
+        read_body(&svc, &get, &plain);
+        // HEAD 同口径回显
+        let head = svc.handle(&req_h("HEAD", &path, &g, vec![]));
+        assert_eq!(status(&head), 200, "{alg:?} HEAD: {head:?}");
+        let head = head.unwrap();
+        assert_eq!(
+            hdr(&head, &hdr_name).as_deref(),
+            Some(ck.as_str()),
+            "{alg:?} HEAD 回显"
+        );
+        // GetObjectAttributes(SSE-C 头):Checksum 与 PUT 一致(明文语义)
+        let mut a = ssec_refs(&sh);
+        a.push(("x-amz-object-attributes", "Checksum"));
+        let r = svc.handle(&req_qh("GET", &path, &[("attributes", "")], &a, vec![]));
+        assert_eq!(status(&r), 200, "{alg:?} attrs: {r:?}");
+        let x = body_str(&r.unwrap());
+        let elem = format!("Checksum{}", alg.s3_name());
+        assert!(
+            x.contains(&format!("<{elem}>{ck}</{elem}>")),
+            "{alg:?} attrs: {x}"
+        );
+        assert!(
+            x.contains("<ChecksumType>FULL_OBJECT</ChecksumType>"),
+            "{alg:?}: {x}"
+        );
+    }
+    // 负例:值不符 → BadDigest,对象不落盘(带密钥 GET → NoSuchKey)
+    let plain = b"sse-c bad checksum".to_vec();
+    let wrong = cksum_b64(fs3_core::ChecksumAlgorithm::Sha256, b"tampered");
+    let mut h = ssec_refs(&sh);
+    h.push(("x-amz-checksum-sha256", wrong.as_str()));
+    let r = svc.handle(&req_h("PUT", "/enc/ck-bad", &h, plain));
+    assert_eq!(err_code(&r), "BadDigest", "{r:?}");
+    let get = svc.handle(&req_h("GET", "/enc/ck-bad", &ssec_refs(&sh), vec![]));
+    assert_eq!(err_code(&get), "NoSuchKey", "坏 checksum 不得落盘: {get:?}");
+}
+
+/// C1-5:SSE-C × 五族 checksum × 流式 PUT(HexSha256 分支,extent 臂)——
+/// 引擎 tee 明文代算(先于加密)→ 写后比对回显;不符 → 回滚 + BadDigest。
+#[test]
+fn sse_c_checksum_streaming_put_matrix() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/enc", vec![]))), 200);
+    let key = ssec_key();
+    let sh = ssec_headers(&key);
+    for (i, alg) in five_algs().into_iter().enumerate() {
+        let hdr_name = format!("x-amz-checksum-{}", alg.header_suffix());
+        let plain = rnd_bytes(150_000, 31 + i as u8);
+        let ck = cksum_b64(alg, &plain);
+        let mut h = ssec_refs(&sh);
+        h.push((hdr_name.as_str(), ck.as_str()));
+        let path = format!("/enc/st{i}");
+        let r = req_h("PUT", &path, &h, plain.clone());
+        let resp = svc.put_object_stream(&r, &mut std::io::Cursor::new(plain.clone()));
+        assert_eq!(status(&resp), 200, "{alg:?}: {resp:?}");
+        let resp = resp.unwrap();
+        assert_eq!(
+            hdr(&resp, &hdr_name).as_deref(),
+            Some(ck.as_str()),
+            "{alg:?} PUT 回显"
+        );
+        assert_eq!(hdr(&resp, SSE_ALG_HDR).as_deref(), Some("AES256"));
+        let mut g = ssec_refs(&sh);
+        g.push(("x-amz-checksum-mode", "ENABLED"));
+        let get = svc.handle(&req_h("GET", &path, &g, vec![])).unwrap();
+        assert_eq!(
+            hdr(&get, &hdr_name).as_deref(),
+            Some(ck.as_str()),
+            "{alg:?} GET 回显明文 checksum"
+        );
+        read_body(&svc, &get, &plain);
+    }
+    // 负例:流式值不符 → 回滚 + BadDigest(不落盘)
+    let plain = rnd_bytes(80_000, 41);
+    let wrong = cksum_b64(fs3_core::ChecksumAlgorithm::Crc32c, b"tampered");
+    let mut h = ssec_refs(&sh);
+    h.push(("x-amz-checksum-crc32c", wrong.as_str()));
+    let r = req_h("PUT", "/enc/st-bad", &h, plain.clone());
+    let resp = svc.put_object_stream(&r, &mut std::io::Cursor::new(plain));
+    assert_eq!(err_code(&resp), "BadDigest", "{resp:?}");
+    let get = svc.handle(&req_h("GET", "/enc/st-bad", &ssec_refs(&sh), vec![]));
+    assert_eq!(err_code(&get), "NoSuchKey", "坏 checksum 回滚: {get:?}");
+}
+
+/// C1-5:aws-chunked signed trailer × SSE-C 补齐其余四族(crc32c 已由
+/// sse_c_streaming_put_branches 钉住)——trailer 在解码明文流上验算(外层
+/// reader,先于引擎加密);坏 trailer → BadDigest 且不落盘。
+#[test]
+fn sse_c_checksum_trailer_matrix() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/enc", vec![]))), 200);
+    let key = ssec_key();
+    let sh = ssec_headers(&key);
+    let sr = ssec_refs(&sh);
+    for (i, alg) in [
+        fs3_core::ChecksumAlgorithm::Crc32,
+        fs3_core::ChecksumAlgorithm::Sha1,
+        fs3_core::ChecksumAlgorithm::Sha256,
+        fs3_core::ChecksumAlgorithm::Crc64Nvme,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let hdr_name = format!("x-amz-checksum-{}", alg.header_suffix());
+        let payload = rnd_bytes(70_000, 51 + i as u8);
+        let ck = cksum_b64(alg, &payload);
+        let path = format!("/enc/tr{i}");
+        let (r, body) = chunked_streaming_req_ex(
+            &path,
+            &payload,
+            alg,
+            Some(&ck),
+            Some(payload.len() as u64),
+            false,
+            &sr,
+        );
+        let resp = svc.put_object_stream(&r, &mut std::io::Cursor::new(body));
+        assert_eq!(status(&resp), 200, "{alg:?}: {resp:?}");
+        let resp = resp.unwrap();
+        assert_eq!(
+            hdr(&resp, &hdr_name).as_deref(),
+            Some(ck.as_str()),
+            "{alg:?} PUT 回显"
+        );
+        assert_eq!(hdr(&resp, SSE_ALG_HDR).as_deref(), Some("AES256"));
+        let mut g = ssec_refs(&sh);
+        g.push(("x-amz-checksum-mode", "ENABLED"));
+        let get = svc.handle(&req_h("GET", &path, &g, vec![])).unwrap();
+        assert_eq!(
+            hdr(&get, &hdr_name).as_deref(),
+            Some(ck.as_str()),
+            "{alg:?} GET 回显明文值"
+        );
+        read_body(&svc, &get, &payload);
+    }
+    // 负例:trailer 值不符 → BadDigest,对象不落盘
+    let payload = rnd_bytes(40_000, 61);
+    let bad = cksum_b64(fs3_core::ChecksumAlgorithm::Crc32, b"tampered");
+    let (r, body) = chunked_streaming_req_ex(
+        "/enc/tr-bad",
+        &payload,
+        fs3_core::ChecksumAlgorithm::Crc32,
+        Some(&bad),
+        Some(payload.len() as u64),
+        false,
+        &sr,
+    );
+    let resp = svc.put_object_stream(&r, &mut std::io::Cursor::new(body));
+    assert_eq!(err_code(&resp), "BadDigest", "{resp:?}");
+    let get = svc.handle(&req_h("GET", "/enc/tr-bad", &sr, vec![]));
+    assert_eq!(err_code(&get), "NoSuchKey", "坏 trailer 不得落盘: {get:?}");
+}
+
+/// C1-5:SSE-C × 五族 checksum × multipart——每 part 带 checksum 头(extent
+/// 与内联两臂;UploadPart 缓冲臂明文直算先于加密),Complete 复合头驱动
+/// (COMPOSITE 族 -N / FULL_OBJECT 族裸值;加密会话 FULL_OBJECT 由引擎按
+/// 解密后明文重算,本用例值不符即暴露顺序颠倒)→ 200 + body/头回显;
+/// GET/attrs 一致;复合值不符 → BadDigest。
+#[test]
+fn sse_c_checksum_multipart_matrix() {
+    let (_d, svc) = setup_no_compact();
+    assert_eq!(status(&svc.handle(&req("PUT", "/enc", vec![]))), 200);
+    let key = ssec_key();
+    let sh = ssec_headers(&key);
+    let sr = ssec_refs(&sh);
+    for (i, alg) in five_algs().into_iter().enumerate() {
+        let hdr_name = format!("x-amz-checksum-{}", alg.header_suffix());
+        let elem = format!("Checksum{}", alg.s3_name());
+        let path = format!("/enc/mp{i}");
+        // Create(SSE-C;不带会话算法,对象级值由 Complete 复合头驱动)
+        let r = svc.handle(&ssec_req_q("POST", &path, &[("uploads", "")], &sr, vec![]));
+        assert_eq!(status(&r), 200, "{alg:?} Create: {r:?}");
+        let uid = extract(&body_str(&r.unwrap()), "UploadId");
+        // part1 extent 臂(5MiB+128KiB),part2 内联臂
+        let p1 = rnd_bytes(5 * 1024 * 1024 + 128 * 1024, 71 + i as u8);
+        let p2 = rnd_bytes(1_000, 91 + i as u8);
+        let mut parts: Vec<(u32, String, String)> = Vec::new();
+        for (no, data) in [(1u32, &p1), (2u32, &p2)] {
+            let ck = cksum_b64(alg, data);
+            let mut h = ssec_refs(&sh);
+            h.push((hdr_name.as_str(), ck.as_str()));
+            let r = svc.handle(&ssec_req_q(
+                "PUT",
+                &path,
+                &[("partNumber", &no.to_string()), ("uploadId", &uid)],
+                &h,
+                data.clone(),
+            ));
+            assert_eq!(status(&r), 200, "{alg:?} part{no}: {r:?}");
+            let resp = r.unwrap();
+            assert_eq!(
+                hdr(&resp, &hdr_name).as_deref(),
+                Some(ck.as_str()),
+                "{alg:?} part{no} 回显"
+            );
+            assert_eq!(hdr(&resp, SSE_ALG_HDR).as_deref(), Some("AES256"));
+            let etag = hdr(&resp, "etag").unwrap().trim_matches('"').to_string();
+            parts.push((no, etag, ck));
+        }
+        // 对象级期望值:COMPOSITE 族 = base64(alg(concat(分片摘要)))-N;
+        // FULL_OBJECT 族 = base64(alg(拼接明文))
+        let ctype = alg.default_checksum_type();
+        let expect = match ctype {
+            fs3_core::ChecksumType::Composite => composite_header_value(
+                alg,
+                &parts.iter().map(|(_, _, c)| c.clone()).collect::<Vec<_>>(),
+            ),
+            fs3_core::ChecksumType::FullObject => {
+                let mut all = p1.clone();
+                all.extend_from_slice(&p2);
+                cksum_b64(alg, &all)
+            }
+        };
+        // Complete(复合头 + SSE-C)
+        let mut h = ssec_refs(&sh);
+        h.push((hdr_name.as_str(), expect.as_str()));
+        let r = svc.handle(&ssec_req_q(
+            "POST",
+            &path,
+            &[("uploadId", &uid)],
+            &h,
+            complete_xml(&parts, None),
+        ));
+        assert_eq!(status(&r), 200, "{alg:?} Complete: {r:?}");
+        let resp = r.unwrap();
+        assert_eq!(
+            hdr(&resp, &hdr_name).as_deref(),
+            Some(expect.as_str()),
+            "{alg:?} Complete 头回显"
+        );
+        assert_eq!(hdr(&resp, SSE_ALG_HDR).as_deref(), Some("AES256"));
+        let x = body_str(&resp);
+        assert!(
+            x.contains(&format!("<{elem}>{expect}</{elem}>")),
+            "{alg:?} Complete body: {x}"
+        );
+        assert!(
+            x.contains(&format!("<ChecksumType>{}</ChecksumType>", ctype.s3_name())),
+            "{alg:?}: {x}"
+        );
+        // GET:明文往返 + 对象级回显
+        let mut g = ssec_refs(&sh);
+        g.push(("x-amz-checksum-mode", "ENABLED"));
+        let get = svc.handle(&req_h("GET", &path, &g, vec![]));
+        assert_eq!(status(&get), 200, "{alg:?} GET: {get:?}");
+        let get = get.unwrap();
+        assert_eq!(
+            hdr(&get, &hdr_name).as_deref(),
+            Some(expect.as_str()),
+            "{alg:?} GET 回显"
+        );
+        assert_eq!(
+            hdr(&get, "x-amz-checksum-type").as_deref(),
+            Some(ctype.s3_name())
+        );
+        let mut plain = p1.clone();
+        plain.extend_from_slice(&p2);
+        read_body(&svc, &get, &plain);
+        // GetObjectAttributes:Checksum 对象级 + ObjectParts 逐分片值
+        let mut a = ssec_refs(&sh);
+        a.push(("x-amz-object-attributes", "Checksum,ObjectParts"));
+        let r = svc.handle(&req_qh("GET", &path, &[("attributes", "")], &a, vec![]));
+        assert_eq!(status(&r), 200, "{alg:?} attrs: {r:?}");
+        let x = body_str(&r.unwrap());
+        assert!(
+            x.contains(&format!("<{elem}>{expect}</{elem}>")),
+            "{alg:?} attrs: {x}"
+        );
+        for (_, _, ck) in &parts {
+            assert!(
+                x.contains(&format!("<{elem}>{ck}</{elem}>")),
+                "{alg:?} attrs 分片值: {x}"
+            );
+        }
+    }
+    // 负例 1:加密会话 UploadPart 值不符 → BadDigest(缓冲臂明文直算,不落分片)
+    let r = svc.handle(&ssec_req_q(
+        "POST",
+        "/enc/mp-neg",
+        &[("uploads", "")],
+        &sr,
+        vec![],
+    ));
+    let uid = extract(&body_str(&r.unwrap()), "UploadId");
+    let pdata = b"neg part payload".to_vec();
+    let wrong = cksum_b64(fs3_core::ChecksumAlgorithm::Sha256, b"tampered");
+    let mut h = ssec_refs(&sh);
+    h.push(("x-amz-checksum-sha256", wrong.as_str()));
+    let r = svc.handle(&ssec_req_q(
+        "PUT",
+        "/enc/mp-neg",
+        &[("partNumber", "1"), ("uploadId", &uid)],
+        &h,
+        pdata.clone(),
+    ));
+    assert_eq!(err_code(&r), "BadDigest", "加密会话 part 验算: {r:?}");
+    // 负例 2:Complete 复合值不符 → BadDigest(加密会话 FULL_OBJECT 口径)
+    let good = cksum_b64(fs3_core::ChecksumAlgorithm::Sha256, &pdata);
+    let mut h = ssec_refs(&sh);
+    h.push(("x-amz-checksum-sha256", good.as_str()));
+    let r = svc.handle(&ssec_req_q(
+        "PUT",
+        "/enc/mp-neg",
+        &[("partNumber", "1"), ("uploadId", &uid)],
+        &h,
+        pdata.clone(),
+    ));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let p_etag = hdr(&r.unwrap(), "etag")
+        .unwrap()
+        .trim_matches('"')
+        .to_string();
+    let bad_composite = format!(
+        "{}-1",
+        cksum_b64(fs3_core::ChecksumAlgorithm::Sha256, b"wrong")
+    );
+    let mut h = ssec_refs(&sh);
+    h.push(("x-amz-checksum-sha256", bad_composite.as_str()));
+    let r = svc.handle(&ssec_req_q(
+        "POST",
+        "/enc/mp-neg",
+        &[("uploadId", &uid)],
+        &h,
+        complete_xml(&[(1, p_etag, good)], None),
+    ));
+    assert_eq!(err_code(&r), "BadDigest", "加密会话 Complete 验算: {r:?}");
+    let get = svc.handle(&req_h("GET", "/enc/mp-neg", &sr, vec![]));
+    assert_eq!(err_code(&get), "NoSuchKey", "Complete 失败不落盘: {get:?}");
+}
+
+/// C1-5:SSE-C × checksum × CopyObject——加密源(带 checksum)复制到加密
+/// 目标:同密钥 COW(五族,ETag 不变)与异密钥重加密(数据路径,ETag 变)
+/// 两臂,目标 checksum 原样继承(明文语义,加密不改变明文),GET/HEAD/
+/// attrs 回显一致。
+#[test]
+fn sse_c_checksum_copy_matrix() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/enc", vec![]))), 200);
+    let ka = ssec_key();
+    let kb = [0xA5u8; 32];
+    let ha = ssec_headers(&ka);
+    let ra = ssec_refs(&ha);
+    let hb = ssec_headers(&kb);
+    let csa = ssec_cs_headers(&ka);
+
+    // —— 同密钥 COW 臂 × 五族(内联小对象)——
+    for (i, alg) in five_algs().into_iter().enumerate() {
+        let hdr_name = format!("x-amz-checksum-{}", alg.header_suffix());
+        let plain = format!("copy cow checksum body {i}").into_bytes();
+        let ck = cksum_b64(alg, &plain);
+        let src = format!("/enc/cs{i}");
+        let mut h = ssec_refs(&ha);
+        h.push((hdr_name.as_str(), ck.as_str()));
+        let r = svc.handle(&req_h("PUT", &src, &h, plain.clone()));
+        assert_eq!(status(&r), 200, "{alg:?} 源 PUT: {r:?}");
+        let src_etag = hdr(&r.unwrap(), "etag").unwrap();
+        // 同密钥 COW(copy-source 侧三头 + 目标三头同密钥)
+        let mut c = ssec_refs(&ha);
+        c.extend(csa.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        c.push(("x-amz-copy-source", src.as_str()));
+        let dst = format!("/enc/cd{i}");
+        let r = svc.handle(&ssec_req_q("PUT", &dst, &[], &c, vec![]));
+        assert_eq!(status(&r), 200, "{alg:?} copy: {r:?}");
+        // 目标 HEAD(SSE-C + checksum-mode):checksum 继承 + ETag 不变(COW)
+        let mut g = ssec_refs(&ha);
+        g.push(("x-amz-checksum-mode", "ENABLED"));
+        let head = svc.handle(&req_h("HEAD", &dst, &g, vec![]));
+        assert_eq!(status(&head), 200, "{alg:?} HEAD: {head:?}");
+        let head = head.unwrap();
+        assert_eq!(
+            hdr(&head, &hdr_name).as_deref(),
+            Some(ck.as_str()),
+            "{alg:?} COW 目标继承明文 checksum"
+        );
+        assert_eq!(
+            hdr(&head, "etag").as_deref(),
+            Some(src_etag.as_str()),
+            "{alg:?} COW ETag 不变"
+        );
+        let get = svc.handle(&req_h("GET", &dst, &g, vec![])).unwrap();
+        read_body(&svc, &get, &plain);
+    }
+
+    // —— 异密钥重加密臂(extent 数据路径)——
+    let alg = fs3_core::ChecksumAlgorithm::Sha256;
+    let plain = rnd_bytes(120_000, 5);
+    let ck = cksum_b64(alg, &plain);
+    let mut h = ssec_refs(&ha);
+    h.push(("x-amz-checksum-sha256", ck.as_str()));
+    let r = svc.handle(&req_h("PUT", "/enc/re-src", &h, plain.clone()));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let src_etag = hdr(&r.unwrap(), "etag").unwrap();
+    let mut c = ssec_refs(&hb);
+    c.extend(csa.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    c.push(("x-amz-copy-source", "/enc/re-src"));
+    let r = svc.handle(&ssec_req_q("PUT", "/enc/re-dst", &[], &c, vec![]));
+    assert_eq!(status(&r), 200, "异密钥重加密: {r:?}");
+    // CopyObject 的 ETag 在响应 XML body(AWS 模型;非响应头)
+    let dst_etag = extract(&body_str(&r.unwrap()), "ETag");
+    assert_ne!(dst_etag, src_etag, "重加密 ⇒ 新密文 ⇒ ETag 变(DE2)");
+    // 新密钥 GET:明文往返 + checksum 继承(加密不改变明文)
+    let mut g = ssec_refs(&hb);
+    g.push(("x-amz-checksum-mode", "ENABLED"));
+    let get = svc.handle(&req_h("GET", "/enc/re-dst", &g, vec![]));
+    assert_eq!(status(&get), 200, "{get:?}");
+    let get = get.unwrap();
+    assert_eq!(
+        hdr(&get, "x-amz-checksum-sha256").as_deref(),
+        Some(ck.as_str()),
+        "重加密目标继承明文 checksum"
+    );
+    read_body(&svc, &get, &plain);
+    // attrs 一致(新密钥)
+    let mut a = ssec_refs(&hb);
+    a.push(("x-amz-object-attributes", "Checksum"));
+    let r = svc.handle(&req_qh(
+        "GET",
+        "/enc/re-dst",
+        &[("attributes", "")],
+        &a,
+        vec![],
+    ));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let x = body_str(&r.unwrap());
+    assert!(
+        x.contains(&format!("<ChecksumSHA256>{ck}</ChecksumSHA256>")),
+        "attrs: {x}"
+    );
+    // 旧密钥读重加密目标 → 400(D-E5 校验子)
+    let r = svc.handle(&req_h("GET", "/enc/re-dst", &ra, vec![]));
+    assert_eq!(err_code(&r), "InvalidRequest", "{r:?}");
+}
+
+/// C1-5:SSE-S3 × 五族 checksum × 单对象 PUT(显式 AES256 头;内联/extent
+/// 两臂交替)——PUT 回显 checksum + AES256;GET/HEAD 零客户头开
+/// checksum-mode 回显明文值;attrs 一致;值不符 → BadDigest 且不落盘。
+#[test]
+fn sse_s3_checksum_put_matrix() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/enc", vec![]))), 200);
+    for (i, alg) in five_algs().into_iter().enumerate() {
+        let hdr_name = format!("x-amz-checksum-{}", alg.header_suffix());
+        let plain = if i % 2 == 0 {
+            format!("sse-s3 checksum inline body {i}").into_bytes()
+        } else {
+            rnd_bytes(100_000, 111 + i as u8)
+        };
+        let ck = cksum_b64(alg, &plain);
+        let path = format!("/enc/s3ck{i}");
+        let r = svc.handle(&ssec_req_q(
+            "PUT",
+            &path,
+            &[],
+            &[(SSE_S3_HDR, "AES256"), (hdr_name.as_str(), ck.as_str())],
+            plain.clone(),
+        ));
+        assert_eq!(status(&r), 200, "{alg:?}: {r:?}");
+        let resp = r.unwrap();
+        assert_eq!(
+            hdr(&resp, &hdr_name).as_deref(),
+            Some(ck.as_str()),
+            "{alg:?} PUT 回显"
+        );
+        assert_eq!(hdr(&resp, SSE_S3_HDR).as_deref(), Some("AES256"));
+        let etag = hdr(&resp, "etag").unwrap();
+        assert_ne!(
+            etag,
+            format!("\"{}\"", hex::encode(md5::Md5::digest(&plain))),
+            "{alg:?} ETag = 密文 MD5(DE2)"
+        );
+        // GET/HEAD 零客户头 + checksum-mode ENABLED:回显明文 checksum
+        let get = svc.handle(&req_h(
+            "GET",
+            &path,
+            &[("x-amz-checksum-mode", "ENABLED")],
+            vec![],
+        ));
+        assert_eq!(status(&get), 200, "{alg:?} GET: {get:?}");
+        let get = get.unwrap();
+        assert_eq!(
+            hdr(&get, &hdr_name).as_deref(),
+            Some(ck.as_str()),
+            "{alg:?} GET 回显明文 checksum"
+        );
+        assert_eq!(hdr(&get, SSE_S3_HDR).as_deref(), Some("AES256"));
+        read_body(&svc, &get, &plain);
+        let head = svc
+            .handle(&req_h(
+                "HEAD",
+                &path,
+                &[("x-amz-checksum-mode", "ENABLED")],
+                vec![],
+            ))
+            .unwrap();
+        assert_eq!(
+            hdr(&head, &hdr_name).as_deref(),
+            Some(ck.as_str()),
+            "{alg:?} HEAD 回显"
+        );
+        // attrs(AWS 模型无 SSE-S3 回显头;Checksum 元素一致)
+        let r = svc.handle(&req_qh(
+            "GET",
+            &path,
+            &[("attributes", "")],
+            &[("x-amz-object-attributes", "Checksum")],
+            vec![],
+        ));
+        assert_eq!(status(&r), 200, "{alg:?} attrs: {r:?}");
+        let x = body_str(&r.unwrap());
+        let elem = format!("Checksum{}", alg.s3_name());
+        assert!(
+            x.contains(&format!("<{elem}>{ck}</{elem}>")),
+            "{alg:?} attrs: {x}"
+        );
+    }
+    // 负例:值不符 → BadDigest,对象不落盘
+    let wrong = cksum_b64(fs3_core::ChecksumAlgorithm::Crc32, b"tampered");
+    let r = svc.handle(&ssec_req_q(
+        "PUT",
+        "/enc/s3ck-bad",
+        &[],
+        &[
+            (SSE_S3_HDR, "AES256"),
+            ("x-amz-checksum-crc32", wrong.as_str()),
+        ],
+        b"sse-s3 bad checksum".to_vec(),
+    ));
+    assert_eq!(err_code(&r), "BadDigest", "{r:?}");
+    let get = svc.handle(&req("GET", "/enc/s3ck-bad", vec![]));
+    assert_eq!(err_code(&get), "NoSuchKey", "坏 checksum 不得落盘: {get:?}");
+}
+
+/// C1-5:SSE-S3 × 五族 checksum × multipart——Create 携带 AES256 + 会话
+/// checksum 算法(双会话头组合),part 带 checksum 头(零 SSE 头),Complete
+/// 复合头验算(FULL_OBJECT 由引擎按解密后明文重算)→ 回显;GET/attrs 一致。
+#[test]
+fn sse_s3_checksum_multipart_matrix() {
+    let (_d, svc) = setup_no_compact();
+    assert_eq!(status(&svc.handle(&req("PUT", "/enc", vec![]))), 200);
+    for (i, alg) in five_algs().into_iter().enumerate() {
+        let hdr_name = format!("x-amz-checksum-{}", alg.header_suffix());
+        let elem = format!("Checksum{}", alg.s3_name());
+        let path = format!("/enc/s3mp{i}");
+        // Create:AES256 + 会话 checksum 算法(回显双族)
+        let r = svc.handle(&ssec_req_q(
+            "POST",
+            &path,
+            &[("uploads", "")],
+            &[
+                (SSE_S3_HDR, "AES256"),
+                ("x-amz-checksum-algorithm", alg.s3_name()),
+            ],
+            vec![],
+        ));
+        assert_eq!(status(&r), 200, "{alg:?} Create: {r:?}");
+        let resp = r.unwrap();
+        assert_eq!(hdr(&resp, SSE_S3_HDR).as_deref(), Some("AES256"));
+        assert_eq!(
+            hdr(&resp, "x-amz-checksum-algorithm").as_deref(),
+            Some(alg.s3_name()),
+            "{alg:?} Create 回显会话算法"
+        );
+        let uid = extract(&body_str(&resp), "UploadId");
+        let p1 = rnd_bytes(5 * 1024 * 1024 + 64 * 1024, 131 + i as u8);
+        let p2 = rnd_bytes(1_200, 151 + i as u8);
+        let mut parts: Vec<(u32, String, String)> = Vec::new();
+        for (no, data) in [(1u32, &p1), (2u32, &p2)] {
+            let ck = cksum_b64(alg, data);
+            let r = svc.handle(&ssec_req_q(
+                "PUT",
+                &path,
+                &[("partNumber", &no.to_string()), ("uploadId", &uid)],
+                &[(hdr_name.as_str(), ck.as_str())],
+                data.clone(),
+            ));
+            assert_eq!(status(&r), 200, "{alg:?} part{no}: {r:?}");
+            let resp = r.unwrap();
+            assert_eq!(
+                hdr(&resp, &hdr_name).as_deref(),
+                Some(ck.as_str()),
+                "{alg:?} part{no} 回显"
+            );
+            assert_eq!(
+                hdr(&resp, SSE_S3_HDR).as_deref(),
+                Some("AES256"),
+                "{alg:?} part{no} 会话回显"
+            );
+            let etag = hdr(&resp, "etag").unwrap().trim_matches('"').to_string();
+            parts.push((no, etag, ck));
+        }
+        let ctype = alg.default_checksum_type();
+        let expect = match ctype {
+            fs3_core::ChecksumType::Composite => composite_header_value(
+                alg,
+                &parts.iter().map(|(_, _, c)| c.clone()).collect::<Vec<_>>(),
+            ),
+            fs3_core::ChecksumType::FullObject => {
+                let mut all = p1.clone();
+                all.extend_from_slice(&p2);
+                cksum_b64(alg, &all)
+            }
+        };
+        // Complete(复合头;零 SSE 头,会话自持)
+        let r = svc.handle(&ssec_req_q(
+            "POST",
+            &path,
+            &[("uploadId", &uid)],
+            &[(hdr_name.as_str(), expect.as_str())],
+            complete_xml(&parts, None),
+        ));
+        assert_eq!(status(&r), 200, "{alg:?} Complete: {r:?}");
+        let resp = r.unwrap();
+        assert_eq!(
+            hdr(&resp, &hdr_name).as_deref(),
+            Some(expect.as_str()),
+            "{alg:?} Complete 头回显"
+        );
+        assert_eq!(hdr(&resp, SSE_S3_HDR).as_deref(), Some("AES256"));
+        let x = body_str(&resp);
+        assert!(
+            x.contains(&format!("<{elem}>{expect}</{elem}>")),
+            "{alg:?} Complete body: {x}"
+        );
+        // GET 零头:明文往返 + 回显
+        let get = svc.handle(&req_h(
+            "GET",
+            &path,
+            &[("x-amz-checksum-mode", "ENABLED")],
+            vec![],
+        ));
+        assert_eq!(status(&get), 200, "{alg:?} GET: {get:?}");
+        let get = get.unwrap();
+        assert_eq!(
+            hdr(&get, &hdr_name).as_deref(),
+            Some(expect.as_str()),
+            "{alg:?} GET 回显"
+        );
+        let mut plain = p1.clone();
+        plain.extend_from_slice(&p2);
+        read_body(&svc, &get, &plain);
+        // attrs:Checksum 对象级 + ObjectParts 逐分片
+        let r = svc.handle(&req_qh(
+            "GET",
+            &path,
+            &[("attributes", "")],
+            &[("x-amz-object-attributes", "Checksum,ObjectParts")],
+            vec![],
+        ));
+        assert_eq!(status(&r), 200, "{alg:?} attrs: {r:?}");
+        let x = body_str(&r.unwrap());
+        assert!(
+            x.contains(&format!("<{elem}>{expect}</{elem}>")),
+            "{alg:?} attrs: {x}"
+        );
+        for (_, _, ck) in &parts {
+            assert!(
+                x.contains(&format!("<{elem}>{ck}</{elem}>")),
+                "{alg:?} attrs 分片值: {x}"
+            );
+        }
+    }
+}
+
+/// C1-5:SSE-S3 × 桶默认加密 × 五族 checksum——无 SSE 头 PUT 自动加密 +
+/// checksum 验算落值(回显双族);GET/HEAD 零头回显明文 checksum;值不符 →
+/// BadDigest 且不落盘。
+#[test]
+fn sse_s3_bucket_default_checksum_matrix() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/enc", vec![]))), 200);
+    assert_eq!(
+        status(&svc.handle(&req_q("PUT", "/enc", &[("encryption", "")], enc_xml()))),
+        200
+    );
+    for (i, alg) in five_algs().into_iter().enumerate() {
+        let hdr_name = format!("x-amz-checksum-{}", alg.header_suffix());
+        let plain = if i == 0 {
+            rnd_bytes(90_000, 171) // 一条 extent 臂
+        } else {
+            format!("bucket default checksum body {i}").into_bytes()
+        };
+        let ck = cksum_b64(alg, &plain);
+        let path = format!("/enc/auto{i}");
+        // 仅 checksum 头(无 SSE 头)→ 桶默认自动 SSE-S3
+        let r = svc.handle(&req_h(
+            "PUT",
+            &path,
+            &[(hdr_name.as_str(), ck.as_str())],
+            plain.clone(),
+        ));
+        assert_eq!(status(&r), 200, "{alg:?}: {r:?}");
+        let resp = r.unwrap();
+        assert_eq!(
+            hdr(&resp, SSE_S3_HDR).as_deref(),
+            Some("AES256"),
+            "{alg:?} 桶默认自动加密回显"
+        );
+        assert_eq!(
+            hdr(&resp, &hdr_name).as_deref(),
+            Some(ck.as_str()),
+            "{alg:?} PUT 回显"
+        );
+        let get = svc.handle(&req_h(
+            "GET",
+            &path,
+            &[("x-amz-checksum-mode", "ENABLED")],
+            vec![],
+        ));
+        assert_eq!(status(&get), 200, "{alg:?} GET: {get:?}");
+        let get = get.unwrap();
+        assert_eq!(hdr(&get, SSE_S3_HDR).as_deref(), Some("AES256"));
+        assert_eq!(
+            hdr(&get, &hdr_name).as_deref(),
+            Some(ck.as_str()),
+            "{alg:?} GET 回显明文 checksum"
+        );
+        read_body(&svc, &get, &plain);
+    }
+    // 负例:桶默认加密下值不符 → BadDigest,对象不落盘
+    let wrong = cksum_b64(fs3_core::ChecksumAlgorithm::Sha1, b"tampered");
+    let r = svc.handle(&req_h(
+        "PUT",
+        "/enc/auto-bad",
+        &[("x-amz-checksum-sha1", wrong.as_str())],
+        b"auto bad".to_vec(),
+    ));
+    assert_eq!(err_code(&r), "BadDigest", "{r:?}");
+    let get = svc.handle(&req("GET", "/enc/auto-bad", vec![]));
+    assert_eq!(err_code(&get), "NoSuchKey", "坏 checksum 不得落盘: {get:?}");
+}
+
+// ─────────────────────────── M11 H1-1:错误码触发路径补全 ───────────────────────────
+
+/// H1-1:InvalidStorageClass 三写入口(PutObject/CopyObject/
+/// CreateMultipartUpload)——x-amz-storage-class 非 STANDARD → 400
+/// InvalidStorageClass(与 AWS 同码;check_unimplemented_headers 统一判定);
+/// STANDARD(大小写不敏感)放行对照;错误 XML Code 元素断言。
+#[test]
+fn h1_1_invalid_storage_class_all_entries() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/scl", vec![]))), 200);
+    assert_eq!(
+        status(&svc.handle(&req("PUT", "/scl/src", b"x".to_vec()))),
+        200
+    );
+    for class in ["GLACIER", "STANDARD_IA", "DEEP_ARCHIVE"] {
+        // PutObject
+        let r = svc.handle(&req_h(
+            "PUT",
+            "/scl/o",
+            &[("x-amz-storage-class", class)],
+            b"x".to_vec(),
+        ));
+        let e = r.unwrap_err();
+        assert_eq!(e.status(), 400, "PUT {class}: {e:?}");
+        let xml = e.render_xml("r", "h");
+        assert!(
+            xml.contains("<Code>InvalidStorageClass</Code>"),
+            "PUT {class}: {xml}"
+        );
+        // CopyObject(目标侧头即判,无需源存在性参与)
+        let r = svc.handle(&req_h(
+            "PUT",
+            "/scl/dst",
+            &[
+                ("x-amz-copy-source", "/scl/src"),
+                ("x-amz-storage-class", class),
+            ],
+            vec![],
+        ));
+        assert_eq!(
+            err_code(&r),
+            "InvalidStorageClass",
+            "CopyObject {class}: {r:?}"
+        );
+        // CreateMultipartUpload
+        let r = svc.handle(&req_qh(
+            "POST",
+            "/scl/mp",
+            &[("uploads", "")],
+            &[("x-amz-storage-class", class)],
+            vec![],
+        ));
+        assert_eq!(
+            err_code(&r),
+            "InvalidStorageClass",
+            "CreateMultipart {class}: {r:?}"
+        );
+    }
+    // 对照:STANDARD(大小写不敏感)放行
+    let r = svc.handle(&req_h(
+        "PUT",
+        "/scl/ok",
+        &[("x-amz-storage-class", "STANDARD")],
+        b"x".to_vec(),
+    ));
+    assert_eq!(status(&r), 200, "STANDARD 放行: {r:?}");
+    let r = svc.handle(&req_h(
+        "PUT",
+        "/scl/ok2",
+        &[("x-amz-storage-class", "Standard")],
+        b"x".to_vec(),
+    ));
+    assert_eq!(status(&r), 200, "大小写不敏感放行: {r:?}");
+}
+
+/// H1-1:KeyTooLongError 触发路径——键 UTF-8 字节长 >1024 → 400
+/// KeyTooLongError(PUT/GET/CreateMultipart 路径键 + CopyObject 的
+/// copy-source 键);恰好 1024 字节放行对照(AWS 上限口径)。
+#[test]
+fn h1_1_key_too_long() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/kln", vec![]))), 200);
+    let long_key = "k".repeat(1025);
+    let max_key = "m".repeat(1024);
+    // PUT 超长键 → 400 KeyTooLongError(XML Code 断言)
+    let r = svc.handle(&req("PUT", &format!("/kln/{long_key}"), b"x".to_vec()));
+    let e = r.unwrap_err();
+    assert_eq!(e.status(), 400, "PUT 超长键: {e:?}");
+    let xml = e.render_xml("r", "h");
+    assert!(xml.contains("<Code>KeyTooLongError</Code>"), "{xml}");
+    // GET 超长键 → 400(键本身非法,一切带键 op 统一判定)
+    let r = svc.handle(&req("GET", &format!("/kln/{long_key}"), vec![]));
+    assert_eq!(err_code(&r), "KeyTooLongError", "GET 超长键: {r:?}");
+    // CreateMultipartUpload 超长键 → 400
+    let r = svc.handle(&req_q(
+        "POST",
+        &format!("/kln/{long_key}"),
+        &[("uploads", "")],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "KeyTooLongError", "Create 超长键: {r:?}");
+    // CopyObject 的 copy-source 超长键 → 400(目标键合法)
+    let r = svc.handle(&req_h(
+        "PUT",
+        "/kln/dst",
+        &[("x-amz-copy-source", &format!("/kln/{long_key}"))],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "KeyTooLongError", "copy-source 超长键: {r:?}");
+    // 对照:恰好 1024 字节 = AWS 上限内,放行
+    let r = svc.handle(&req("PUT", &format!("/kln/{max_key}"), b"x".to_vec()));
+    assert_eq!(status(&r), 200, "1024 字节键放行: {r:?}");
+}
+
+/// H1-1:MetadataTooLarge 触发路径——x-amz-meta-* 键名+值字节和 >2KiB →
+/// 400 MetadataTooLarge(PutObject/CreateMultipartUpload/CopyObject-
+/// REPLACE/PostObject 同口径);≤2KiB 放行对照;非受理 op(GET)与
+/// CopyObject-COPY 指令不判(元数据不被消费,AWS 同语义)。
+#[test]
+fn h1_1_metadata_too_large() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/mda", vec![]))), 200);
+    assert_eq!(
+        status(&svc.handle(&req("PUT", "/mda/src", b"x".to_vec()))),
+        200
+    );
+    // "x-amz-meta-pad" 14 字节:值 2035 → 总 2049 >2048(拒);2034 → 2048(收)
+    let over = "v".repeat(2035);
+    let at_max = "v".repeat(2034);
+    // PutObject 超限 → 400 MetadataTooLarge(XML Code 断言)
+    let r = svc.handle(&req_h(
+        "PUT",
+        "/mda/o",
+        &[("x-amz-meta-pad", &over)],
+        b"x".to_vec(),
+    ));
+    let e = r.unwrap_err();
+    assert_eq!(e.status(), 400, "PUT 超限元数据: {e:?}");
+    let xml = e.render_xml("r", "h");
+    assert!(xml.contains("<Code>MetadataTooLarge</Code>"), "{xml}");
+    // 对照:恰好 2KiB 放行
+    let r = svc.handle(&req_h(
+        "PUT",
+        "/mda/ok",
+        &[("x-amz-meta-pad", &at_max)],
+        b"x".to_vec(),
+    ));
+    assert_eq!(status(&r), 200, "2KiB 边界放行: {r:?}");
+    // CreateMultipartUpload 超限 → 400
+    let r = svc.handle(&req_qh(
+        "POST",
+        "/mda/mp",
+        &[("uploads", "")],
+        &[("x-amz-meta-pad", &over)],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "MetadataTooLarge", "Create 超限: {r:?}");
+    // CopyObject REPLACE(受理新元数据)超限 → 400
+    let r = svc.handle(&req_h(
+        "PUT",
+        "/mda/dst",
+        &[
+            ("x-amz-copy-source", "/mda/src"),
+            ("x-amz-metadata-directive", "REPLACE"),
+            ("x-amz-meta-pad", &over),
+        ],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "MetadataTooLarge", "Copy REPLACE 超限: {r:?}");
+    // CopyObject COPY 指令(元数据不被消费)→ 不判,复制照常 200
+    let r = svc.handle(&req_h(
+        "PUT",
+        "/mda/dst2",
+        &[("x-amz-copy-source", "/mda/src"), ("x-amz-meta-pad", &over)],
+        vec![],
+    ));
+    assert_eq!(status(&r), 200, "COPY 指令不消费元数据: {r:?}");
+    // GET(非受理 op)携带超限元数据头 → 不判,按既有语义处理
+    let r = svc.handle(&req_h(
+        "GET",
+        "/mda/src",
+        &[("x-amz-meta-pad", &over)],
+        vec![],
+    ));
+    assert_eq!(status(&r), 200, "GET 不判元数据尺寸: {r:?}");
 }

@@ -72,6 +72,16 @@ pub enum Error {
     /// 引擎写锁内对当前版本元数据判定;S3 层映射 412 PreconditionFailed)。
     #[error("precondition failed: {0}")]
     PreconditionFailed(String),
+
+    /// checksum 值不符(M11 C1-4,ADR-12:UploadPart/Complete 的分片或复合
+    /// checksum 与客户端声明值不匹配;S3 层映射 400 BadDigest)。
+    #[error("checksum mismatch: {0}")]
+    BadDigest(String),
+
+    /// 请求语义非法(M11 C1-4,ADR-12:复合 checksum 无法合成——分片缺
+    /// checksum 或算法不一致;S3 层映射 400 InvalidRequest)。
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

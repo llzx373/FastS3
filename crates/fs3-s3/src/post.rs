@@ -430,7 +430,9 @@ impl PostPolicy {
         }
     }
 
-    /// 免条件覆盖的字段(认证与忽略族)。
+    /// 免条件覆盖的字段(认证与忽略族;`x-amz-checksum-*` 照 AWS 口径
+    /// 豁免——s3-tests test_post_object_upload_checksum:policy 无条件
+    /// 覆盖的 checksum 字段仍被受理,值由服务端验算)。
     fn exempt(name: &str) -> bool {
         const EXEMPT: &[&str] = &[
             "file",
@@ -444,7 +446,9 @@ impl PostPolicy {
             "x-amz-security-token",
             "submit",
         ];
-        EXEMPT.contains(&name) || name.starts_with("x-ignore-")
+        EXEMPT.contains(&name)
+            || name.starts_with("x-ignore-")
+            || name.starts_with("x-amz-checksum-")
     }
 }
 

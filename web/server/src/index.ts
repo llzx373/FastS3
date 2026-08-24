@@ -14,6 +14,7 @@
  *   M10:GET /api/buckets/{name}/versions;POST .../versions/action(restore/delete)
  *   M10:GET/PUT /api/buckets/{name}/versioning;GET/PUT/DELETE .../cors;GET/PUT/DELETE .../policy
  *   M10:GET /api/buckets/{name}/object-tags;POST .../object-tags/action(put)
+ *   M11:GET/PUT/DELETE /api/buckets/{name}/lifecycle;GET/PUT/DELETE .../encryption(仅 AES256)
  *   GET/POST/DELETE /api/keys[/{id}]      密钥管理(代理)
  *   PUT  /api/keys/{access}/policy        密钥策略文档(代理 admin PATCH)
  *   GET  /api/uploads;POST /api/uploads/{id}/abort
@@ -34,7 +35,7 @@ import { loadConfig, listenHostPort, type WebConfig } from "./config.js";
 import { authPlugin, issueToken, requireRole, verifyJwt, type JwtClaims } from "./auth.js";
 import { AdminClient } from "./admin-client.js";
 import { AdminWsClient } from "./admin-ws.js";
-import { S3Client, S3M10Client, type BucketCorsRule, type S3Tag } from "./s3-client.js";
+import { S3Client, S3M10Client, type BucketCorsRule, type LifecycleRule, type S3Tag } from "./s3-client.js";
 import { presignUrl } from "./presign.js";
 import { buildDashboard, buildSnapshot, dashboardFromSnapshot } from "./dashboard.js";
 import { MetricsHistory } from "./metrics-history.js";
@@ -480,6 +481,101 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       async (req, reply) => {
         try {
           await m10.deleteBucketPolicy(req.params.name);
+          return { deleted: req.params.name };
+        } catch (e) {
+          return m10Error(e, reply, req.params.name);
+        }
+      }
+    );
+
+    // M11:生命周期规则(未配置时 GET 返回空规则组;空规则集由前端走 DELETE)
+    app.get<{ Params: { name: string } }>("/api/buckets/:name/lifecycle", async (req, reply) => {
+      try {
+        return { Rules: await m10.getBucketLifecycle(req.params.name) };
+      } catch (e) {
+        return m10Error(e, reply, req.params.name);
+      }
+    });
+
+    app.put<{ Params: { name: string }; Body: { Rules?: unknown } }>(
+      "/api/buckets/:name/lifecycle",
+      { preHandler: requireRole("admin") },
+      async (req, reply) => {
+        const rules = req.body?.Rules;
+        if (!Array.isArray(rules) || rules.length === 0) {
+          return reply.code(400).send({
+            error: { code: "bad_request", message: "Rules must be a non-empty array" },
+          });
+        }
+        const valid = rules.every(
+          (r) =>
+            r !== null &&
+            typeof r === "object" &&
+            typeof (r as { ID?: unknown }).ID === "string" &&
+            (r as { ID: string }).ID.trim() !== "" &&
+            ((r as { Status?: unknown }).Status === "Enabled" ||
+              (r as { Status?: unknown }).Status === "Disabled")
+        );
+        if (!valid) {
+          return reply.code(400).send({
+            error: { code: "bad_request", message: "each rule needs a non-empty ID and Status Enabled|Disabled" },
+          });
+        }
+        try {
+          await m10.putBucketLifecycle(req.params.name, rules as LifecycleRule[]);
+          return { Rules: rules };
+        } catch (e) {
+          return m10Error(e, reply, req.params.name);
+        }
+      }
+    );
+
+    app.delete<{ Params: { name: string } }>(
+      "/api/buckets/:name/lifecycle",
+      { preHandler: requireRole("admin") },
+      async (req, reply) => {
+        try {
+          await m10.deleteBucketLifecycle(req.params.name);
+          return { deleted: req.params.name };
+        } catch (e) {
+          return m10Error(e, reply, req.params.name);
+        }
+      }
+    );
+
+    // M11:桶默认加密(仅 SSE-S3 AES256,不含 KMS;未配置时 GET 返回 SSEAlgorithm: "")
+    app.get<{ Params: { name: string } }>("/api/buckets/:name/encryption", async (req, reply) => {
+      try {
+        return { SSEAlgorithm: await m10.getBucketEncryption(req.params.name) };
+      } catch (e) {
+        return m10Error(e, reply, req.params.name);
+      }
+    });
+
+    app.put<{ Params: { name: string }; Body: { SSEAlgorithm?: unknown } }>(
+      "/api/buckets/:name/encryption",
+      { preHandler: requireRole("admin") },
+      async (req, reply) => {
+        if (req.body?.SSEAlgorithm !== "AES256") {
+          return reply.code(400).send({
+            error: { code: "bad_request", message: "SSEAlgorithm must be AES256 (SSE-S3; KMS not supported)" },
+          });
+        }
+        try {
+          await m10.putBucketEncryption(req.params.name, "AES256");
+          return { SSEAlgorithm: "AES256" };
+        } catch (e) {
+          return m10Error(e, reply, req.params.name);
+        }
+      }
+    );
+
+    app.delete<{ Params: { name: string } }>(
+      "/api/buckets/:name/encryption",
+      { preHandler: requireRole("admin") },
+      async (req, reply) => {
+        try {
+          await m10.deleteBucketEncryption(req.params.name);
           return { deleted: req.params.name };
         } catch (e) {
           return m10Error(e, reply, req.params.name);

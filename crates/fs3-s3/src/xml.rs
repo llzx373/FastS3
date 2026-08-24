@@ -286,16 +286,42 @@ pub fn parse_delete_objects_full(body: &[u8]) -> Result<DeleteObjectsRequest, St
     Ok(DeleteObjectsRequest { quiet, keys })
 }
 
-/// 解析 CompleteMultipartUpload 请求体 → [(PartNumber, ETag hex 去引号)]。
-pub fn parse_complete_multipart(body: &[u8]) -> Result<Vec<(u32, String)>, String> {
+/// 解析 CompleteMultipartUpload 请求体 → 分片声明列表(PartNumber、ETag
+/// hex 去引号、可选逐分片 checksum——M11 C1-4:`<ChecksumCRC32>` 等五族
+/// 元素,base64 解码 + 长度校验;单分片多个 checksum 元素/非法值 →
+/// malformed,与 schema 校验失败同口径)。
+pub fn parse_complete_multipart(body: &[u8]) -> Result<Vec<fs3_core::CompletePart>, String> {
     let mut reader = quick_xml::Reader::from_reader(body);
     reader.config_mut().trim_text(true);
     let mut buf = Vec::new();
-    let mut parts: Vec<(u32, String)> = Vec::new();
+    let mut parts: Vec<fs3_core::CompletePart> = Vec::new();
     let mut in_part = false;
     let mut saw_complete = false;
     let mut cur_no: Option<u32> = None;
     let mut cur_etag: Option<String> = None;
+    let mut cur_checksum: Option<fs3_core::ChecksumInfo> = None;
+    // 逐分片 checksum 元素(<ChecksumCRC32> 等)→ (算法, base64 原文)
+    let parse_checksum =
+        |name: &[u8], text: &str, cur: &mut Option<fs3_core::ChecksumInfo>| -> Result<(), String> {
+            let alg = name
+                .strip_prefix(b"Checksum")
+                .and_then(|s| std::str::from_utf8(s).ok())
+                .and_then(fs3_core::ChecksumAlgorithm::from_s3_name)
+                .ok_or_else(|| format!("malformed XML: unknown checksum element {name:?}"))?;
+            if cur.is_some() {
+                return Err("malformed XML: multiple checksum elements in one Part".into());
+            }
+            let raw =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, text.trim())
+                    .ok()
+                    .filter(|r| r.len() == alg.digest_len())
+                    .ok_or_else(|| format!("malformed XML: bad {} value", alg.s3_name()))?;
+            *cur = Some(fs3_core::ChecksumInfo {
+                algorithm: alg,
+                value: raw,
+            });
+            Ok(())
+        };
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(quick_xml::events::Event::Start(e)) => {
@@ -306,6 +332,7 @@ pub fn parse_complete_multipart(body: &[u8]) -> Result<Vec<(u32, String)>, Strin
                         in_part = true;
                         cur_no = None;
                         cur_etag = None;
+                        cur_checksum = None;
                     }
                     b"PartNumber" if in_part => {
                         let raw = reader
@@ -329,6 +356,13 @@ pub fn parse_complete_multipart(body: &[u8]) -> Result<Vec<(u32, String)>, Strin
                                 .to_string(),
                         );
                     }
+                    _ if in_part && name.starts_with(b"Checksum") => {
+                        let raw = reader
+                            .read_text(e.name())
+                            .map_err(|err| format!("malformed XML: {err}"))?;
+                        let txt = unescape_text(raw.as_ref())?;
+                        parse_checksum(&name, &txt, &mut cur_checksum)?;
+                    }
                     _ => {}
                 }
             }
@@ -340,6 +374,10 @@ pub fn parse_complete_multipart(body: &[u8]) -> Result<Vec<(u32, String)>, Strin
                     }
                     b"PartNumber" if in_part => cur_no = Some(0),
                     b"ETag" if in_part => cur_etag = Some(String::new()),
+                    _ if in_part && name.starts_with(b"Checksum") => {
+                        // 空元素 = 空值(base64 解码为空,长度校验必败 → malformed)
+                        parse_checksum(&name, "", &mut cur_checksum)?;
+                    }
                     _ => {}
                 }
             }
@@ -353,7 +391,11 @@ pub fn parse_complete_multipart(body: &[u8]) -> Result<Vec<(u32, String)>, Strin
                     let etag = cur_etag
                         .take()
                         .ok_or_else(|| "malformed XML: Part missing ETag".to_string())?;
-                    parts.push((no, etag));
+                    parts.push(fs3_core::CompletePart {
+                        part_number: no,
+                        etag_hex: etag,
+                        checksum: cur_checksum.take(),
+                    });
                 }
             }
             Ok(quick_xml::events::Event::Eof) => break,
@@ -432,21 +474,174 @@ pub fn render_initiate_multipart(bucket: &str, key: &str, upload_id: &str) -> St
     )
 }
 
-/// CompleteMultipartUpload 响应。
-pub fn render_complete_multipart(location: &str, bucket: &str, key: &str, etag: &str) -> String {
-    format!(
+/// CompleteMultipartUpload 响应。`checksum`(M11 C1-4 门禁补强)=
+/// (元素名, 渲染值, 类型):对象带 checksum 时在 body 输出
+/// `<Checksum{ALG}>` 与 `<ChecksumType>` 元素(AWS 模型:Complete 的
+/// checksum 在响应 body,非响应头)。
+pub fn render_complete_multipart(
+    location: &str,
+    bucket: &str,
+    key: &str,
+    etag: &str,
+    checksum: Option<(&str, &str, &str)>,
+) -> String {
+    let mut xml = format!(
         concat!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
             "<CompleteMultipartUploadResult xmlns=\"{}\"\n  ><Location>{}</Location>",
-            "<Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag>",
-            "</CompleteMultipartUploadResult>"
+            "<Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag>"
         ),
         XMLNS,
         escape_xml(location),
         escape_xml(bucket),
         escape_xml(key),
         escape_xml(etag)
-    )
+    );
+    if let Some((elem, value, ctype)) = checksum {
+        let _ = write!(
+            xml,
+            "<{elem}>{}</{elem}><ChecksumType>{ctype}</ChecksumType>",
+            escape_xml(value)
+        );
+    }
+    xml.push_str("</CompleteMultipartUploadResult>");
+    xml
+}
+
+// ─────────────────── M11 C1-3:GetObjectAttributes(ADR-12 D-E2)───────────────────
+
+/// x-amz-object-attributes 请求头解析结果(五种请求属性;AWS 枚举值
+/// 大小写敏感)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ObjectAttributesRequest {
+    pub etag: bool,
+    pub checksum: bool,
+    pub object_parts: bool,
+    pub object_size: bool,
+    pub storage_class: bool,
+}
+
+/// 解析 x-amz-object-attributes 头(逗号分隔属性名列表)。
+/// 缺头/空表 → InvalidRequest(AWS:该头为必需);未知属性名 →
+/// InvalidArgument(AWS 对非法属性名的 400 口径)。
+pub fn parse_object_attributes(raw: Option<&str>) -> Result<ObjectAttributesRequest, S3Error> {
+    let mut out = ObjectAttributesRequest::default();
+    if let Some(v) = raw {
+        for name in v.split(',').map(str::trim) {
+            if name.is_empty() {
+                continue;
+            }
+            match name {
+                "ETag" => out.etag = true,
+                "Checksum" => out.checksum = true,
+                "ObjectParts" => out.object_parts = true,
+                "ObjectSize" => out.object_size = true,
+                "StorageClass" => out.storage_class = true,
+                other => {
+                    return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                        .with_message(format!("Invalid attribute {other} specified")));
+                }
+            }
+        }
+    }
+    if out == ObjectAttributesRequest::default() {
+        return Err(S3Error::new(S3ErrorCode::InvalidRequest).with_message(
+            "The x-amz-object-attributes header is required and must name at least one attribute",
+        ));
+    }
+    Ok(out)
+}
+
+/// ObjectParts 分页参数(`x-amz-max-parts` / `x-amz-part-number-marker`
+/// 请求头解析结果;默认值照 AWS:1000 / 0)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectPartsPage {
+    pub max_parts: u32,
+    pub marker: u32,
+}
+
+impl Default for ObjectPartsPage {
+    fn default() -> Self {
+        ObjectPartsPage {
+            max_parts: 1000,
+            marker: 0,
+        }
+    }
+}
+
+/// GetObjectAttributes 响应(M11 C1-3 + 门禁补强):body 仅含模型
+/// 定义的 body 成员(ETag/Checksum/ObjectParts/ObjectSize/StorageClass;
+/// ETag 不带引号——AWS 该元素为裸值,与 PUT 响应头口径不同);
+/// LastModified/VersionId/DeleteMarker 在 AWS 模型中是**响应头**,
+/// 由 service 层注入,不在此渲染。
+/// ObjectParts 仅 multipart 对象输出(非 multipart 无此元素,AWS 同);
+/// 结构照 botocore 模型:总数元素名 `PartsCount`(模型 locationName;
+/// TotalPartsCount 是 SDK 字段名不是线格式)、`Part` 扁平列表(无
+/// `Parts` 包裹层)、分页四元(PartNumberMarker/NextPartNumberMarker
+/// (仅截断时)/MaxParts/IsTruncated);分片 checksum 来自 ObjectMeta
+/// v4 `part_checksums`(Complete 时随对象持久化)。
+pub fn render_get_object_attributes(
+    meta: &ObjectMeta,
+    attrs: &ObjectAttributesRequest,
+    page: ObjectPartsPage,
+) -> String {
+    let mut xml = String::with_capacity(512);
+    let _ = write!(
+        xml,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<GetObjectAttributesOutput xmlns=\"{XMLNS}\">"
+    );
+    if attrs.etag {
+        let _ = write!(xml, "<ETag>{}</ETag>", meta.etag_full());
+    }
+    if attrs.checksum {
+        if let (Some(info), Some(ctype)) = (&meta.checksum, meta.checksum_type()) {
+            let name = info.algorithm.s3_name();
+            let value = crate::checksum::object_checksum_value(meta)
+                .map(|(_, v)| v)
+                .unwrap_or_default();
+            let _ = write!(
+                xml,
+                "<Checksum><Checksum{name}>{}</Checksum{name}><ChecksumType>{}</ChecksumType></Checksum>",
+                escape_xml(&value),
+                ctype.s3_name()
+            );
+        }
+    }
+    if attrs.object_parts && !meta.parts.is_empty() {
+        let total = meta.parts.len();
+        // marker 之后起取 max_parts 片(part_number = 索引 + 1)
+        let start = (page.marker as usize).min(total);
+        let end = (start + page.max_parts as usize).min(total);
+        let truncated = end < total;
+        let _ = write!(xml, "<ObjectParts>");
+        let _ = write!(xml, "<PartsCount>{total}</PartsCount>");
+        let _ = write!(xml, "<PartNumberMarker>{}</PartNumberMarker>", page.marker);
+        if truncated {
+            let _ = write!(xml, "<NextPartNumberMarker>{end}</NextPartNumberMarker>");
+        }
+        let _ = write!(xml, "<MaxParts>{}</MaxParts>", page.max_parts);
+        let _ = write!(xml, "<IsTruncated>{truncated}</IsTruncated>");
+        for i in start..end {
+            let _ = write!(xml, "<Part><PartNumber>{}</PartNumber>", i + 1);
+            let _ = write!(xml, "<Size>{}</Size>", meta.parts[i]);
+            if let Some(Some(info)) = meta.part_checksums.get(i) {
+                let name = info.algorithm.s3_name();
+                let b64 =
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &info.value);
+                let _ = write!(xml, "<Checksum{name}>{b64}</Checksum{name}>");
+            }
+            let _ = write!(xml, "</Part>");
+        }
+        let _ = write!(xml, "</ObjectParts>");
+    }
+    if attrs.object_size {
+        let _ = write!(xml, "<ObjectSize>{}</ObjectSize>", meta.size);
+    }
+    if attrs.storage_class {
+        let _ = write!(xml, "<StorageClass>STANDARD</StorageClass>");
+    }
+    let _ = write!(xml, "</GetObjectAttributesOutput>");
+    xml
 }
 
 /// CopyObject 响应。
@@ -627,6 +822,47 @@ fn unescape_text(raw: &[u8]) -> Result<String, String> {
     quick_xml::escape::unescape(s)
         .map(|c| c.into_owned())
         .map_err(|e| format!("malformed XML escape: {e}"))
+}
+
+/// 解析 ISO8601 时间戳(`YYYY-MM-DDTHH:MM:SS[.fff][Z|±HH:MM]`)→ unix 秒。
+/// 非法 → None(调用方 400)。DeleteObjects 条件元素 LastModifiedTime 与
+/// 生命周期 Expiration Date(M11 L1)共用;botocore rest-xml 对前者实测按
+/// RFC 7231 IMF-fixdate 序列化,该调用点以 parse_http_date 兜底。
+pub fn parse_iso8601(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (date, time) = s
+        .split_once('T')
+        .or_else(|| s.split_once('t'))
+        .or_else(|| s.split_once(' '))?;
+    let dp: Vec<&str> = date.split('-').collect();
+    if dp.len() != 3 {
+        return None;
+    }
+    let year: i64 = dp[0].parse().ok()?;
+    let month: u32 = dp[1].parse().ok()?;
+    let day: u32 = dp[2].parse().ok()?;
+    // 时区后缀:Z / +HH:MM / -HH:MM(小数秒先剥离)
+    let mut time = time;
+    let mut tz_sign = 0i64; // 秒;本地时间 → UTC 的修正量
+    if let Some(t) = time.strip_suffix('Z').or_else(|| time.strip_suffix('z')) {
+        time = t;
+    } else if let Some(i) = time.rfind(['+', '-']) {
+        let off = &time[i..];
+        let (oh, om) = off[1..].split_once(':')?;
+        let secs = oh.parse::<i64>().ok()? * 3600 + om.parse::<i64>().ok()? * 60;
+        tz_sign = if off.starts_with('-') { secs } else { -secs };
+        time = &time[..i];
+    }
+    let time = time.split('.').next().unwrap_or(time);
+    let tp: Vec<&str> = time.split(':').collect();
+    if tp.len() != 3 {
+        return None;
+    }
+    let h: i64 = tp[0].parse().ok()?;
+    let mi: i64 = tp[1].parse().ok()?;
+    let sec: i64 = tp[2].parse().ok()?;
+    let days = crate::auth::days_from_civil_pub(year, month, day);
+    Some(days * 86400 + h * 3600 + mi * 60 + sec + tz_sign)
 }
 
 // ─────────────────────────── 响应生成 ───────────────────────────
@@ -1476,6 +1712,110 @@ pub fn parse_cors_configuration(body: &[u8]) -> Result<Vec<CorsRule>, S3Error> {
     Ok(rules)
 }
 
+/// PutBucketEncryption 请求体解析(M11 K1-2,ADR-12 DS2/DS4):
+/// `<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault>
+/// <SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule>
+/// </ServerSideEncryptionConfiguration>`。
+///
+/// 显式拒绝口径(不静默):
+/// - `SSEAlgorithm` ≠ `AES256`(含 `aws:kms`)→ InvalidEncryptionAlgorithmError
+///   (与对象头/ SSE-C 算法值同口径,AWS 标准码);
+/// - `KMSKeyID` / `BucketKeyEnabled` 元素(SSE-KMS 类参数,DS4 不做)→
+///   InvalidArgument 显式拒绝;
+/// - 零/多 Rule、缺 SSEAlgorithm、结构损坏 → MalformedXML。
+pub fn parse_bucket_encryption(body: &[u8]) -> Result<fs3_core::SseAlgorithm, S3Error> {
+    let malformed = |m: String| S3Error::new(S3ErrorCode::MalformedXML).with_message(m);
+    if body.iter().all(|&b| b.is_ascii_whitespace()) {
+        return Err(malformed(
+            "ServerSideEncryptionConfiguration body is empty".into(),
+        ));
+    }
+    let mut reader = quick_xml::Reader::from_reader(body);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut saw_root = false;
+    let mut rules = 0usize;
+    let mut algorithm: Option<fs3_core::SseAlgorithm> = None;
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(quick_xml::events::Event::Start(e)) => {
+                let name = e.name().as_ref().to_vec();
+                let text = |r: &mut quick_xml::Reader<&[u8]>| -> Result<String, S3Error> {
+                    let raw = r
+                        .read_text(e.name())
+                        .map_err(|err| malformed(format!("malformed XML: {err}")))?;
+                    unescape_text(raw.as_ref()).map_err(malformed)
+                };
+                match name.as_slice() {
+                    b"ServerSideEncryptionConfiguration" => saw_root = true,
+                    b"Rule" => rules += 1,
+                    b"SSEAlgorithm" => {
+                        let v = text(&mut reader)?;
+                        // DS2/DS4:仅 AES256;aws:kms 与其余值显式拒绝
+                        algorithm = Some(if v == "AES256" {
+                            fs3_core::SseAlgorithm::Aes256
+                        } else {
+                            return Err(S3Error::new(S3ErrorCode::InvalidEncryptionAlgorithmError));
+                        });
+                    }
+                    b"KMSKeyID" => {
+                        // DS4:SSE-KMS 不做,元素在场即显式拒绝(不静默丢弃)
+                        let _ = text(&mut reader)?;
+                        return Err(S3Error::new(S3ErrorCode::InvalidArgument).with_message(
+                            "SSE-KMS (KMSKeyID) is not supported; only AES256 (SSE-S3) is supported.",
+                        ));
+                    }
+                    b"BucketKeyEnabled" => {
+                        let _ = text(&mut reader)?;
+                        return Err(S3Error::new(S3ErrorCode::InvalidArgument).with_message(
+                            "BucketKeyEnabled is an SSE-KMS parameter and is not supported.",
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            Ok(quick_xml::events::Event::Empty(e)) => {
+                match e.name().as_ref() {
+                    b"ServerSideEncryptionConfiguration" => saw_root = true,
+                    // 空元素形态的 KMS 参数同样显式拒绝
+                    b"KMSKeyID" | b"BucketKeyEnabled" => {
+                        return Err(S3Error::new(S3ErrorCode::InvalidArgument).with_message(
+                            "SSE-KMS parameters are not supported; only AES256 (SSE-S3) is supported.",
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Err(e) => return Err(malformed(format!("malformed XML: {e}"))),
+            _ => {}
+        }
+        buf.clear();
+    }
+    if !saw_root {
+        return Err(malformed(
+            "malformed XML: missing <ServerSideEncryptionConfiguration>".into(),
+        ));
+    }
+    if rules != 1 {
+        return Err(malformed(
+            "ServerSideEncryptionConfiguration requires exactly one Rule".into(),
+        ));
+    }
+    algorithm.ok_or_else(|| malformed("Rule requires SSEAlgorithm".into()))
+}
+
+/// GetBucketEncryption 响应(规范化渲染;仅 AES256 单 Rule,与
+/// PutBucketEncryption 受理形态互逆)。
+pub fn render_bucket_encryption(alg: fs3_core::SseAlgorithm) -> String {
+    let name = match alg {
+        fs3_core::SseAlgorithm::Aes256 => "AES256",
+    };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ServerSideEncryptionConfiguration xmlns=\"{XMLNS}\"><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>{name}</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>"
+    )
+}
+
 /// GetBucketCors 响应(规范化渲染;PutBucketCors 入库值同此形态)。
 pub fn render_cors_configuration(rules: &[CorsRule]) -> String {
     let mut xml = format!(
@@ -1576,6 +1916,679 @@ pub fn match_cors_rule(
     None
 }
 
+// ───────────────────── 生命周期配置(M11 L1;ADR-12 DL1;DESIGN-FUTURE §4.1.1) ─────────────────────
+
+/// 生命周期规则数上限(AWS:PutBucketLifecycleConfiguration ≤ 1000 条)。
+pub const MAX_LIFECYCLE_RULES: usize = 1000;
+/// 规则 ID 长度上限(AWS:≤ 255 Unicode 字符)。
+pub const MAX_LIFECYCLE_RULE_ID_CHARS: usize = 255;
+
+/// 解析 LifecycleConfiguration 请求体(PutBucketLifecycleConfiguration;
+/// 新旧参数同线格式同语义,旧名 PutBucketLifecycle 的 `<Prefix>` 直下形态
+/// 归一到 Filter)。
+///
+/// v1.2 显式子集(§4.1.1):
+/// - Transition / NoncurrentVersionTransition 元素 → **NotImplemented**
+///   (AWS 合法元素,但无存储类分层转换无目标;显式拒绝,不静默丢弃);
+/// - ObjectSizeGreaterThan / ObjectSizeLessThan 过滤器 → NotImplemented(同上);
+/// - ID 必需(AWS 可选;DL1 键按 `r:{bucket}\0{rule_id}` 寻址,收紧为必需)。
+///
+/// 错误口径(AWS 同属 400 族,按结构/语义归类):
+/// - 结构/schema 违例 → MalformedXML:XML 损坏、缺 LifecycleConfiguration/
+///   Rule/Status、Status 非法值、缺 Filter 且无直下 Prefix(AWS 实测同码,
+///   aws-sdk-go-v2#1944)、Filter 多直下子元素(AWS 至多一,ceph/s3-tests
+///   #638)、And 条件 < 2(terraform-provider-aws#23882)、Days/Date 非数/
+///   非法 ISO8601、Expiration 三成员零选或多选(schema 互斥)、必备子
+///   元素缺失;
+/// - 语义违例 → InvalidRequest:Days/DaysAfterInitiation/NoncurrentDays/
+///   NewerNoncurrentVersions 为 0(AWS 要求正整数)、规则无任何动作、
+///   规则 ID 空/超长/重复、规则数超限。
+pub fn parse_lifecycle_configuration(body: &[u8]) -> Result<Vec<fs3_core::LifecycleRule>, S3Error> {
+    use fs3_core::{
+        AbortIncompleteMultipartUpload, LifecycleExpiration, LifecycleFilter, LifecycleRule,
+        LifecycleStatus, NoncurrentVersionExpiration,
+    };
+    let malformed = |m: String| S3Error::new(S3ErrorCode::MalformedXML).with_message(m);
+    let invalid = |m: &str| S3Error::new(S3ErrorCode::InvalidRequest).with_message(m.to_string());
+    let not_impl = |m: &str| S3Error::new(S3ErrorCode::NotImplemented).with_message(m.to_string());
+    if body.iter().all(|&b| b.is_ascii_whitespace()) {
+        return Err(malformed("LifecycleConfiguration body is empty".into()));
+    }
+    // 规则解析中间形态(exp/noncur/abort 的 Option 标记 = 元素在场;
+    // 子字段零值判定在 </Rule> 校验)。
+    #[derive(Default)]
+    struct RuleAcc {
+        id: Option<String>,
+        status: Option<String>,
+        legacy_prefix: Option<String>,
+        saw_filter: bool,
+        filter_children: u8,
+        filter_prefix: Option<String>,
+        filter_tags: Vec<(String, String)>,
+        saw_and: bool,
+        and_conditions: u8,
+        expiration: Option<LifecycleExpiration>,
+        exp_fields: u8,
+        noncurrent: Option<NoncurrentVersionExpiration>,
+        abort: Option<AbortIncompleteMultipartUpload>,
+    }
+    let mut reader = quick_xml::Reader::from_reader(body);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut saw_root = false;
+    let mut rules: Vec<LifecycleRule> = Vec::new();
+    let mut cur: Option<RuleAcc> = None;
+    // 容器栈(LifecycleConfiguration/Rule/Filter/And/Expiration/
+    // NoncurrentVersionExpiration/AbortIncompleteMultipartUpload/Tag);
+    // 叶子元素经 read_text 消费,不入栈。
+    let mut stack: Vec<Vec<u8>> = Vec::new();
+    let mut cur_tag_key: Option<String> = None;
+    let mut cur_tag_val: Option<String> = None;
+    fn stack_top(stack: &[Vec<u8>]) -> Option<&[u8]> {
+        stack.last().map(|v| v.as_slice())
+    }
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(quick_xml::events::Event::Start(e)) => {
+                let name = e.name().as_ref().to_vec();
+                let text = |r: &mut quick_xml::Reader<&[u8]>| -> Result<String, S3Error> {
+                    let raw = r
+                        .read_text(e.name())
+                        .map_err(|err| malformed(format!("malformed XML: {err}")))?;
+                    unescape_text(raw.as_ref()).map_err(malformed)
+                };
+                let ctx = stack_top(&stack);
+                match name.as_slice() {
+                    b"LifecycleConfiguration" => saw_root = true,
+                    b"Rule" => {
+                        if cur.is_some() {
+                            return Err(malformed("nested <Rule> element".into()));
+                        }
+                        cur = Some(RuleAcc::default());
+                        stack.push(name.clone());
+                    }
+                    b"Filter" => {
+                        if ctx == Some(b"Rule") {
+                            if let Some(r) = cur.as_mut() {
+                                r.saw_filter = true;
+                            }
+                        }
+                        stack.push(name.clone());
+                    }
+                    b"And" => {
+                        if ctx == Some(b"Filter") {
+                            if let Some(r) = cur.as_mut() {
+                                r.saw_and = true;
+                                r.filter_children += 1;
+                            }
+                        }
+                        stack.push(name.clone());
+                    }
+                    b"Expiration"
+                    | b"NoncurrentVersionExpiration"
+                    | b"AbortIncompleteMultipartUpload"
+                    | b"Tag" => {
+                        // 动作容器仅在 Rule 直下受理(错位嵌套宽容忽略,不
+                        // 计入字段);Tag 在 Filter 直下计一个 Filter 子元素
+                        match name.as_slice() {
+                            b"Expiration" if ctx == Some(b"Rule") => {
+                                if let Some(r) = cur.as_mut() {
+                                    r.expiration = Some(LifecycleExpiration::default());
+                                }
+                            }
+                            b"NoncurrentVersionExpiration" if ctx == Some(b"Rule") => {
+                                if let Some(r) = cur.as_mut() {
+                                    r.noncurrent = Some(NoncurrentVersionExpiration::default());
+                                }
+                            }
+                            b"AbortIncompleteMultipartUpload" if ctx == Some(b"Rule") => {
+                                if let Some(r) = cur.as_mut() {
+                                    r.abort = Some(AbortIncompleteMultipartUpload {
+                                        days_after_initiation: 0,
+                                    });
+                                }
+                            }
+                            b"Tag" => {
+                                if ctx == Some(b"Filter") {
+                                    if let Some(r) = cur.as_mut() {
+                                        r.filter_children += 1;
+                                    }
+                                }
+                                cur_tag_key = None;
+                                cur_tag_val = None;
+                            }
+                            _ => {}
+                        }
+                        stack.push(name.clone());
+                    }
+                    // 显式拒绝族(不静默):Transition 无存储类目标;
+                    // ObjectSize* 过滤器出 v1.2 子集
+                    b"Transition" | b"NoncurrentVersionTransition" => {
+                        return Err(not_impl(
+                            "Transition actions are not supported (no storage classes); \
+                             lifecycle transitions are explicitly rejected, not silently dropped",
+                        ));
+                    }
+                    b"ObjectSizeGreaterThan" | b"ObjectSizeLessThan" => {
+                        return Err(not_impl(
+                            "ObjectSize filters are not supported in lifecycle rules",
+                        ));
+                    }
+                    // —— 叶子元素 ——
+                    b"ID" => {
+                        let v = text(&mut reader)?;
+                        if let Some(r) = cur.as_mut() {
+                            r.id = Some(v);
+                        }
+                    }
+                    b"Status" => {
+                        let v = text(&mut reader)?;
+                        if ctx == Some(b"Rule") {
+                            if let Some(r) = cur.as_mut() {
+                                r.status = Some(v);
+                            }
+                        }
+                    }
+                    b"Prefix" => {
+                        let v = text(&mut reader)?;
+                        if let Some(r) = cur.as_mut() {
+                            match ctx {
+                                Some(b"Filter") => {
+                                    r.filter_children += 1;
+                                    r.filter_prefix = Some(v);
+                                }
+                                Some(b"And") => {
+                                    r.and_conditions += 1;
+                                    r.filter_prefix = Some(v);
+                                }
+                                Some(b"Rule") => r.legacy_prefix = Some(v),
+                                _ => {}
+                            }
+                        }
+                    }
+                    b"Key" if ctx == Some(b"Tag") => {
+                        cur_tag_key = Some(text(&mut reader)?);
+                    }
+                    b"Value" if ctx == Some(b"Tag") => {
+                        cur_tag_val = Some(text(&mut reader)?);
+                    }
+                    b"Days" if ctx == Some(b"Expiration") => {
+                        let v = text(&mut reader)?;
+                        let d = v
+                            .parse::<u32>()
+                            .map_err(|_| malformed("Expiration Days must be an integer".into()))?;
+                        if let Some(r) = cur.as_mut() {
+                            if let Some(e) = r.expiration.as_mut() {
+                                r.exp_fields += 1;
+                                e.days = Some(d);
+                            }
+                        }
+                    }
+                    b"Date" if ctx == Some(b"Expiration") => {
+                        let v = text(&mut reader)?;
+                        let ts = parse_iso8601(&v).ok_or_else(|| {
+                            malformed(format!(
+                                "Expiration Date is not a valid ISO8601 timestamp: {v}"
+                            ))
+                        })?;
+                        if let Some(r) = cur.as_mut() {
+                            if let Some(e) = r.expiration.as_mut() {
+                                r.exp_fields += 1;
+                                e.date = Some(ts);
+                            }
+                        }
+                    }
+                    b"ExpiredObjectDeleteMarker" if ctx == Some(b"Expiration") => {
+                        let v = text(&mut reader)?;
+                        let on = match v.as_str() {
+                            "true" => true,
+                            "false" => false,
+                            _ => {
+                                return Err(malformed(
+                                    "ExpiredObjectDeleteMarker must be true or false".into(),
+                                ))
+                            }
+                        };
+                        if let Some(r) = cur.as_mut() {
+                            if let Some(e) = r.expiration.as_mut() {
+                                // false = 未设置(AWS 布尔语义),不占互斥名额
+                                if on {
+                                    r.exp_fields += 1;
+                                }
+                                e.expired_object_delete_marker = on;
+                            }
+                        }
+                    }
+                    b"NoncurrentDays" if ctx == Some(b"NoncurrentVersionExpiration") => {
+                        let v = text(&mut reader)?;
+                        let d = v
+                            .parse::<u32>()
+                            .map_err(|_| malformed("NoncurrentDays must be an integer".into()))?;
+                        if let Some(r) = cur.as_mut() {
+                            if let Some(n) = r.noncurrent.as_mut() {
+                                n.noncurrent_days = Some(d);
+                            }
+                        }
+                    }
+                    b"NewerNoncurrentVersions" if ctx == Some(b"NoncurrentVersionExpiration") => {
+                        let v = text(&mut reader)?;
+                        let d = v.parse::<u32>().map_err(|_| {
+                            malformed("NewerNoncurrentVersions must be an integer".into())
+                        })?;
+                        if let Some(r) = cur.as_mut() {
+                            if let Some(n) = r.noncurrent.as_mut() {
+                                n.newer_noncurrent_versions = Some(d);
+                            }
+                        }
+                    }
+                    b"DaysAfterInitiation" if ctx == Some(b"AbortIncompleteMultipartUpload") => {
+                        let v = text(&mut reader)?;
+                        let d = v.parse::<u32>().map_err(|_| {
+                            malformed("DaysAfterInitiation must be an integer".into())
+                        })?;
+                        if let Some(r) = cur.as_mut() {
+                            if let Some(a) = r.abort.as_mut() {
+                                a.days_after_initiation = d;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(quick_xml::events::Event::Empty(e)) => {
+                let name = e.name().as_ref().to_vec();
+                let ctx = stack_top(&stack);
+                match name.as_slice() {
+                    b"LifecycleConfiguration" => saw_root = true,
+                    b"Filter" => {
+                        if ctx == Some(b"Rule") {
+                            if let Some(r) = cur.as_mut() {
+                                r.saw_filter = true;
+                            }
+                        }
+                    }
+                    b"And" => {
+                        // 空 And(零条件)计入,校验段统一拒绝
+                        if ctx == Some(b"Filter") {
+                            if let Some(r) = cur.as_mut() {
+                                r.saw_and = true;
+                                r.filter_children += 1;
+                            }
+                        }
+                    }
+                    // 空动作元素同样标记在场(零字段 → 校验段拒绝)
+                    b"Expiration" if ctx == Some(b"Rule") => {
+                        if let Some(r) = cur.as_mut() {
+                            r.expiration = Some(LifecycleExpiration::default());
+                        }
+                    }
+                    b"NoncurrentVersionExpiration" if ctx == Some(b"Rule") => {
+                        if let Some(r) = cur.as_mut() {
+                            r.noncurrent = Some(NoncurrentVersionExpiration::default());
+                        }
+                    }
+                    b"AbortIncompleteMultipartUpload" if ctx == Some(b"Rule") => {
+                        if let Some(r) = cur.as_mut() {
+                            r.abort = Some(AbortIncompleteMultipartUpload {
+                                days_after_initiation: 0,
+                            });
+                        }
+                    }
+                    b"Prefix" => {
+                        if let Some(r) = cur.as_mut() {
+                            match ctx {
+                                Some(b"Filter") => {
+                                    r.filter_children += 1;
+                                    r.filter_prefix = Some(String::new());
+                                }
+                                Some(b"And") => {
+                                    r.and_conditions += 1;
+                                    r.filter_prefix = Some(String::new());
+                                }
+                                Some(b"Rule") => r.legacy_prefix = Some(String::new()),
+                                _ => {}
+                            }
+                        }
+                    }
+                    b"Tag" if ctx == Some(b"Filter") || ctx == Some(b"And") => {
+                        return Err(malformed("Tag requires Key and Value elements".into()));
+                    }
+                    // 空元素形态的显式拒绝族同样拦截
+                    b"Transition" | b"NoncurrentVersionTransition" => {
+                        return Err(not_impl(
+                            "Transition actions are not supported (no storage classes); \
+                             lifecycle transitions are explicitly rejected, not silently dropped",
+                        ));
+                    }
+                    b"ObjectSizeGreaterThan" | b"ObjectSizeLessThan" => {
+                        return Err(not_impl(
+                            "ObjectSize filters are not supported in lifecycle rules",
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            Ok(quick_xml::events::Event::End(e)) => {
+                let name = e.name().as_ref().to_vec();
+                match name.as_slice() {
+                    b"Tag" => {
+                        let k = cur_tag_key
+                            .take()
+                            .ok_or_else(|| malformed("Tag missing <Key>".into()))?;
+                        let v = cur_tag_val
+                            .take()
+                            .ok_or_else(|| malformed("Tag missing <Value>".into()))?;
+                        if stack_top(&stack) == Some(b"Tag") {
+                            stack.pop();
+                        }
+                        // 仅 Filter/And 直下的 Tag 计入过滤器(错位嵌套忽略);
+                        // And 内 Tag 另计 And 条件(And 至少两条件)
+                        if let Some(r) = cur.as_mut() {
+                            match stack_top(&stack) {
+                                Some(b"Filter") => r.filter_tags.push((k, v)),
+                                Some(b"And") => {
+                                    r.and_conditions += 1;
+                                    r.filter_tags.push((k, v));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    b"Filter"
+                    | b"And"
+                    | b"Expiration"
+                    | b"NoncurrentVersionExpiration"
+                    | b"AbortIncompleteMultipartUpload" => {
+                        if stack_top(&stack) == Some(name.as_ref()) {
+                            stack.pop();
+                        }
+                    }
+                    b"Rule" => {
+                        if stack_top(&stack) != Some(b"Rule") {
+                            return Err(malformed(
+                                "malformed XML: unclosed element inside <Rule>".into(),
+                            ));
+                        }
+                        stack.pop();
+                        let r = cur
+                            .take()
+                            .ok_or_else(|| malformed("unexpected </Rule>".into()))?;
+                        rules.push(validate_lifecycle_rule(r)?);
+                    }
+                    _ => {}
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Err(e) => return Err(malformed(format!("malformed XML: {e}"))),
+            _ => {}
+        }
+        buf.clear();
+    }
+    if !saw_root {
+        return Err(malformed(
+            "malformed XML: missing <LifecycleConfiguration>".into(),
+        ));
+    }
+    if rules.is_empty() {
+        return Err(malformed(
+            "LifecycleConfiguration requires at least one Rule".into(),
+        ));
+    }
+    if rules.len() > MAX_LIFECYCLE_RULES {
+        return Err(invalid("Lifecycle configuration allows at most 1000 rules"));
+    }
+    // 规则 ID 桶内唯一(AWS 语义——InvalidArgument;键寻址前提)
+    for (i, r) in rules.iter().enumerate() {
+        if rules[..i].iter().any(|o| o.id == r.id) {
+            return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                .with_message("Rule IDs must be unique within a lifecycle configuration"));
+        }
+    }
+    return Ok(rules);
+
+    /// 单规则校验 + 装配(parse_lifecycle_configuration 内部辅助)。
+    fn validate_lifecycle_rule(acc: RuleAcc) -> Result<LifecycleRule, S3Error> {
+        let malformed = |m: String| S3Error::new(S3ErrorCode::MalformedXML).with_message(m);
+        let invalid =
+            |m: &str| S3Error::new(S3ErrorCode::InvalidRequest).with_message(m.to_string());
+        let invalid_arg =
+            |m: &str| S3Error::new(S3ErrorCode::InvalidArgument).with_message(m.to_string());
+        // ID:AWS 可选——缺省时自动生成随机 ID(M11 L5;DL1 键按 rule_id
+        // 寻址不变,生成值即键);显式给出时校验非空/长度
+        let id = match acc.id {
+            Some(id) => id,
+            None => {
+                let mut b = [0u8; 12];
+                fs3_core::random_bytes(&mut b).map_err(|e| {
+                    S3Error::new(S3ErrorCode::InternalError)
+                        .with_message(format!("rule ID generation failed: {e}"))
+                })?;
+                let mut s = String::with_capacity(24);
+                for x in b {
+                    let _ = write!(s, "{x:02x}");
+                }
+                s
+            }
+        };
+        if id.is_empty() {
+            return Err(invalid_arg("Rule ID must not be empty"));
+        }
+        if id.chars().count() > MAX_LIFECYCLE_RULE_ID_CHARS {
+            return Err(invalid_arg("Rule ID must be at most 255 characters"));
+        }
+        // Status:必填 + 枚举值(schema 违例)
+        let status = match acc.status.as_deref() {
+            Some("Enabled") => LifecycleStatus::Enabled,
+            Some("Disabled") => LifecycleStatus::Disabled,
+            Some(_) => {
+                return Err(malformed(
+                    "Status must be either Enabled or Disabled".into(),
+                ))
+            }
+            None => return Err(malformed("Rule requires a Status element".into())),
+        };
+        // Filter:无 Filter 且无直下 Prefix → MalformedXML(AWS 实测同码);
+        // 两者同现 → 冲突;多直下子元素/And 单条件 → schema 违例
+        if acc.saw_filter && acc.legacy_prefix.is_some() {
+            return Err(malformed(
+                "Rule cannot specify both Prefix and Filter".into(),
+            ));
+        }
+        if acc.filter_children > 1 {
+            return Err(malformed(
+                "Filter can have at most one of Prefix, Tag, or And".into(),
+            ));
+        }
+        if !acc.saw_filter && acc.legacy_prefix.is_none() {
+            return Err(malformed(
+                "Rule requires a Filter (or legacy Prefix) element".into(),
+            ));
+        }
+        if acc.saw_and && acc.and_conditions < 2 {
+            return Err(malformed(
+                "And requires at least two conditions (Prefix and/or Tags)".into(),
+            ));
+        }
+        validate_tags(&acc.filter_tags, MAX_OBJECT_TAGS)?;
+        let legacy_prefix = acc.legacy_prefix.is_some();
+        let filter = if acc.saw_filter {
+            LifecycleFilter {
+                prefix: acc.filter_prefix.unwrap_or_default(),
+                tags: acc.filter_tags,
+            }
+        } else {
+            LifecycleFilter {
+                prefix: acc.legacy_prefix.unwrap_or_default(),
+                tags: Vec::new(),
+            }
+        };
+        // Expiration:元素在场时 Days/Date/ExpiredObjectDeleteMarker 恰选其一
+        let expiration =
+            match acc.expiration {
+                None => None,
+                Some(e) if acc.exp_fields == 1 => {
+                    if e.days == Some(0) {
+                        return Err(invalid_arg(
+                            "'Days' for Expiration action must be a positive integer",
+                        ));
+                    }
+                    Some(e)
+                }
+                Some(_) => return Err(malformed(
+                    "Expiration requires exactly one of Days, Date, or ExpiredObjectDeleteMarker"
+                        .into(),
+                )),
+            };
+        // NoncurrentVersionExpiration:两字段至少其一;取值正整数
+        let noncurrent_expiration = match acc.noncurrent {
+            None => None,
+            Some(n) => {
+                if n.noncurrent_days.is_none() && n.newer_noncurrent_versions.is_none() {
+                    return Err(malformed(
+                        "NoncurrentVersionExpiration requires NoncurrentDays and/or \
+                         NewerNoncurrentVersions"
+                            .into(),
+                    ));
+                }
+                if n.noncurrent_days == Some(0) || n.newer_noncurrent_versions == Some(0) {
+                    return Err(invalid_arg(
+                        "NoncurrentDays and NewerNoncurrentVersions must be positive integers",
+                    ));
+                }
+                Some(n)
+            }
+        };
+        // AbortIncompleteMultipartUpload:DaysAfterInitiation 必填正整数
+        let abort_incomplete_multipart = match acc.abort {
+            None => None,
+            Some(a) => {
+                if a.days_after_initiation == 0 {
+                    return Err(invalid_arg(
+                        "'Days' for AbortIncompleteMultipartUpload action must be a positive integer",
+                    ));
+                }
+                Some(a)
+            }
+        };
+        // 至少一个动作(语义;无动作规则无意义)
+        if expiration.is_none()
+            && noncurrent_expiration.is_none()
+            && abort_incomplete_multipart.is_none()
+        {
+            return Err(invalid(
+                "Rule must include at least one lifecycle action (Expiration, \
+                 NoncurrentVersionExpiration, or AbortIncompleteMultipartUpload)",
+            ));
+        }
+        Ok(LifecycleRule {
+            id,
+            status,
+            filter,
+            expiration,
+            noncurrent_expiration,
+            abort_incomplete_multipart,
+            legacy_prefix,
+        })
+    }
+}
+
+/// GetBucketLifecycleConfiguration 响应(规范化渲染;规则序 = 存储序,
+/// 即 rule_id 字典序,见 fs3-meta get_lifecycle_rules)。AWS 旧版直下
+/// `<Prefix>` 形态按 `legacy_prefix` 标记原样回渲染(提交形态往返,
+/// M11 L5);`<Filter>` 形态恒归一渲染为 Filter。
+pub fn render_lifecycle_configuration(rules: &[fs3_core::LifecycleRule]) -> String {
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<LifecycleConfiguration xmlns=\"{XMLNS}\">"
+    );
+    for r in rules {
+        xml.push_str("<Rule>");
+        let _ = write!(xml, "<ID>{}</ID>", escape_xml(&r.id));
+        // 提交形态往返(M11 L5):旧版 Rule 直下 <Prefix> 形态提交的规则
+        // 原样回渲染(AWS/RGW 按原始文档形态往返;s3-tests test_lifecycle_get
+        // 逐字段相等断言);<Filter> 形态恒归一渲染为 Filter
+        if r.legacy_prefix {
+            let _ = write!(xml, "<Prefix>{}</Prefix>", escape_xml(&r.filter.prefix));
+        } else {
+            // Filter:无条件 → <Filter/>;单条件直下;复合条件 → <And>
+            match (r.filter.prefix.is_empty(), r.filter.tags.len()) {
+                (true, 0) => xml.push_str("<Filter/>"),
+                (false, 0) => {
+                    let _ = write!(
+                        xml,
+                        "<Filter><Prefix>{}</Prefix></Filter>",
+                        escape_xml(&r.filter.prefix)
+                    );
+                }
+                (true, 1) => {
+                    let (k, v) = &r.filter.tags[0];
+                    let _ = write!(
+                        xml,
+                        "<Filter><Tag><Key>{}</Key><Value>{}</Value></Tag></Filter>",
+                        escape_xml(k),
+                        escape_xml(v)
+                    );
+                }
+                _ => {
+                    xml.push_str("<Filter><And>");
+                    if !r.filter.prefix.is_empty() {
+                        let _ = write!(xml, "<Prefix>{}</Prefix>", escape_xml(&r.filter.prefix));
+                    }
+                    for (k, v) in &r.filter.tags {
+                        let _ = write!(
+                            xml,
+                            "<Tag><Key>{}</Key><Value>{}</Value></Tag>",
+                            escape_xml(k),
+                            escape_xml(v)
+                        );
+                    }
+                    xml.push_str("</And></Filter>");
+                }
+            }
+        }
+        let status = match r.status {
+            fs3_core::LifecycleStatus::Enabled => "Enabled",
+            fs3_core::LifecycleStatus::Disabled => "Disabled",
+        };
+        let _ = write!(xml, "<Status>{status}</Status>");
+        if let Some(e) = &r.expiration {
+            xml.push_str("<Expiration>");
+            if let Some(d) = e.days {
+                let _ = write!(xml, "<Days>{d}</Days>");
+            }
+            if let Some(ts) = e.date {
+                let _ = write!(xml, "<Date>{}</Date>", ts_to_rfc3339(ts));
+            }
+            if e.expired_object_delete_marker {
+                xml.push_str("<ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker>");
+            }
+            xml.push_str("</Expiration>");
+        }
+        if let Some(n) = &r.noncurrent_expiration {
+            xml.push_str("<NoncurrentVersionExpiration>");
+            if let Some(d) = n.noncurrent_days {
+                let _ = write!(xml, "<NoncurrentDays>{d}</NoncurrentDays>");
+            }
+            if let Some(d) = n.newer_noncurrent_versions {
+                let _ = write!(
+                    xml,
+                    "<NewerNoncurrentVersions>{d}</NewerNoncurrentVersions>"
+                );
+            }
+            xml.push_str("</NoncurrentVersionExpiration>");
+        }
+        if let Some(a) = &r.abort_incomplete_multipart {
+            let _ = write!(
+                xml,
+                "<AbortIncompleteMultipartUpload><DaysAfterInitiation>{}</DaysAfterInitiation></AbortIncompleteMultipartUpload>",
+                a.days_after_initiation
+            );
+        }
+        xml.push_str("</Rule>");
+    }
+    xml.push_str("</LifecycleConfiguration>");
+    xml
+}
+
 // ───────────────────── Ownership Controls(M10 S7) ─────────────────────
 
 /// ObjectOwnership 取值(AWS 三值)。M10 S7 裁决:FastS3 单账号私有默认
@@ -1669,6 +2682,163 @@ pub fn render_ownership_controls(oo: ObjectOwnership) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_complete_multipart_with_part_checksums() {
+        // M11 C1-4:逐分片 checksum 元素解析(base64 → ChecksumInfo)
+        let ck = fs3_core::checksum_one_shot(fs3_core::ChecksumAlgorithm::Sha256, b"data");
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ck);
+        let body = format!(
+            "<CompleteMultipartUpload>\
+             <Part><PartNumber>1</PartNumber><ETag>\"aa\"</ETag><ChecksumSHA256>{b64}</ChecksumSHA256></Part>\
+             <Part><ETag>\"bb\"</ETag><PartNumber>2</PartNumber></Part>\
+             </CompleteMultipartUpload>"
+        );
+        let parts = parse_complete_multipart(body.as_bytes()).unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].part_number, 1);
+        assert_eq!(parts[0].etag_hex, "aa");
+        assert_eq!(
+            parts[0].checksum,
+            Some(fs3_core::ChecksumInfo {
+                algorithm: fs3_core::ChecksumAlgorithm::Sha256,
+                value: ck,
+            })
+        );
+        assert_eq!(parts[1].checksum, None, "未携带元素 → None");
+        // 单分片多个 checksum 元素 → malformed
+        let bad = format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag>\
+             <ChecksumSHA256>{b64}</ChecksumSHA256><ChecksumCRC32>AAAA</ChecksumCRC32></Part></CompleteMultipartUpload>"
+        );
+        assert!(parse_complete_multipart(bad.as_bytes()).is_err());
+        // 非法 base64 / 长度不符 → malformed
+        let bad = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag>\
+                   <ChecksumSHA256>!!!</ChecksumSHA256></Part></CompleteMultipartUpload>";
+        assert!(parse_complete_multipart(bad.as_bytes()).is_err());
+        let bad = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag>\
+                   <ChecksumSHA256>AQID</ChecksumSHA256></Part></CompleteMultipartUpload>";
+        assert!(parse_complete_multipart(bad.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn object_attributes_parse_and_render() {
+        // 解析:全五属性 / 大小写敏感 / 未知属性 / 缺头
+        let a =
+            parse_object_attributes(Some("ETag, Checksum ,ObjectSize,ObjectParts,StorageClass"))
+                .unwrap();
+        assert!(a.etag && a.checksum && a.object_size && a.object_parts && a.storage_class);
+        let a = parse_object_attributes(Some("ObjectSize")).unwrap();
+        assert!(a.object_size && !a.etag && !a.checksum);
+        assert!(parse_object_attributes(None).is_err());
+        assert!(parse_object_attributes(Some("")).is_err());
+        let e = parse_object_attributes(Some("etag")).unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::InvalidArgument, "大小写敏感");
+        let e = parse_object_attributes(Some("ETag,Foo")).unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::InvalidArgument);
+        let e = parse_object_attributes(Some("Bucket")).unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::InvalidArgument);
+
+        // 渲染:multipart 复合对象(2 分片,逐分片 checksum;SHA256 默认
+        // COMPOSITE → 对象级渲染 -N)
+        let info = fs3_core::ChecksumInfo {
+            algorithm: fs3_core::ChecksumAlgorithm::Sha256,
+            value: vec![1u8; 32],
+        };
+        let meta = ObjectMeta {
+            size: 15,
+            etag: [0xabu8; 16],
+            mtime: 1_724_147_200,
+            extents: vec![],
+            content_type: "text/plain".into(),
+            user_meta: vec![],
+            inline: None,
+            parts: vec![10, 5],
+            resp_headers: vec![],
+            version_id: None,
+            is_delete_marker: false,
+            tags: vec![],
+            sse: None,
+            checksum: Some(info.clone()),
+            retention: None,
+            legal_hold: false,
+            part_checksums: vec![Some(info.clone()), Some(info.clone())],
+        };
+        let xml = render_get_object_attributes(&meta, &a_all(), ObjectPartsPage::default());
+        // LastModified/VersionId 为响应头(AWS 模型),不在 body
+        assert!(!xml.contains("<LastModified>"));
+        assert!(!xml.contains("<VersionId>"));
+        // ETag 裸值不带引号(AWS GetObjectAttributes 口径)
+        assert!(xml.contains("<ETag>abababababababababababababababab-2</ETag>"));
+        // 复合值带 -N + ChecksumType
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [1u8; 32]);
+        assert!(
+            xml.contains(&format!("<ChecksumSHA256>{b64}-2</ChecksumSHA256>")),
+            "{xml}"
+        );
+        assert!(
+            xml.contains("<ChecksumType>COMPOSITE</ChecksumType>"),
+            "{xml}"
+        );
+        // ObjectParts:PartsCount(模型 locationName)+ 扁平 Part 列表 +
+        // 分页四元(未截断无 NextPartNumberMarker)
+        assert!(xml.contains("<PartsCount>2</PartsCount>"));
+        assert!(!xml.contains("<TotalPartsCount>"));
+        assert!(!xml.contains("<Parts>"), "Part 扁平无包裹层: {xml}");
+        assert!(xml.contains("<PartNumberMarker>0</PartNumberMarker>"));
+        assert!(xml.contains("<MaxParts>1000</MaxParts>"));
+        assert!(xml.contains("<IsTruncated>false</IsTruncated>"));
+        assert!(!xml.contains("<NextPartNumberMarker>"));
+        assert!(xml.contains(&format!(
+            "<Part><PartNumber>1</PartNumber><Size>10</Size><ChecksumSHA256>{b64}</ChecksumSHA256></Part>"
+        )));
+        assert!(xml.contains("<PartNumber>2</PartNumber><Size>5</Size>"));
+        assert!(xml.contains("<ObjectSize>15</ObjectSize>"));
+        assert!(xml.contains("<StorageClass>STANDARD</StorageClass>"));
+        // 分页:marker=0,max=1 → 仅第 1 片,截断,NextPartNumberMarker=1
+        let xml = render_get_object_attributes(
+            &meta,
+            &a_all(),
+            ObjectPartsPage {
+                max_parts: 1,
+                marker: 0,
+            },
+        );
+        assert!(xml.contains("<PartsCount>2</PartsCount>"), "{xml}");
+        assert!(
+            xml.contains("<PartNumberMarker>0</PartNumberMarker>"),
+            "{xml}"
+        );
+        assert!(
+            xml.contains("<NextPartNumberMarker>1</NextPartNumberMarker>"),
+            "{xml}"
+        );
+        assert!(xml.contains("<MaxParts>1</MaxParts>"), "{xml}");
+        assert!(xml.contains("<IsTruncated>true</IsTruncated>"), "{xml}");
+        assert!(xml.contains("<PartNumber>1</PartNumber>"), "{xml}");
+        assert!(!xml.contains("<PartNumber>2</PartNumber>"), "{xml}");
+        // 子集:只要 ObjectSize → 无其它元素
+        let sub = parse_object_attributes(Some("ObjectSize")).unwrap();
+        let xml = render_get_object_attributes(&meta, &sub, ObjectPartsPage::default());
+        assert!(xml.contains("<ObjectSize>15</ObjectSize>"));
+        assert!(!xml.contains("<ETag>"));
+        assert!(!xml.contains("<ObjectParts>"));
+        // 单 PUT 对象(无 parts):Checksum 纯 base64 + FULL_OBJECT、无 ObjectParts
+        let mut single = meta.clone();
+        single.parts = vec![];
+        single.part_checksums = vec![];
+        let xml = render_get_object_attributes(&single, &a_all(), ObjectPartsPage::default());
+        assert!(xml.contains(&format!("<ChecksumSHA256>{b64}</ChecksumSHA256>")));
+        assert!(
+            xml.contains("<ChecksumType>FULL_OBJECT</ChecksumType>"),
+            "{xml}"
+        );
+        assert!(!xml.contains("<ObjectParts>"));
+    }
+
+    fn a_all() -> ObjectAttributesRequest {
+        parse_object_attributes(Some("ETag,Checksum,ObjectParts,ObjectSize,StorageClass")).unwrap()
+    }
 
     #[test]
     fn parse_create_bucket_config() {
@@ -1810,6 +2980,7 @@ mod tests {
             checksum: None,
             retention: None,
             legal_hold: false,
+            part_checksums: vec![],
         };
         // fetch-owner=true → Contents 带 Owner
         let xml = render_list_objects_v2(
@@ -1912,6 +3083,7 @@ mod tests {
             checksum: None,
             retention: None,
             legal_hold: false,
+            part_checksums: vec![],
         };
         let xml = render_list_objects_v2(
             "o",
@@ -1962,6 +3134,7 @@ mod tests {
                     checksum: None,
                     retention: None,
                     legal_hold: false,
+                    part_checksums: vec![],
                 },
             )],
             &[],
@@ -2007,6 +3180,7 @@ mod tests {
                 checksum: None,
                 retention: None,
                 legal_hold: false,
+                part_checksums: vec![],
             },
         };
         let page_of =
@@ -2422,6 +3596,250 @@ mod tests {
                 parse_ownership_controls(bad).unwrap_err().code,
                 S3ErrorCode::MalformedXML,
                 "{bad:?}"
+            );
+        }
+    }
+
+    // ───────────────────── M11 L1:生命周期配置(ADR-12 DL1)─────────────────────
+
+    /// 解析↔渲染往返:各动作组合 / Filter 形态(Prefix、Tag、And、空、
+    /// 旧版直下 Prefix 形态标记往返)。
+    #[test]
+    fn lifecycle_configuration_roundtrip() {
+        use fs3_core::{LifecycleRule, LifecycleStatus as S};
+        let body = concat!(
+            r#"<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
+            "<Rule><ID>expire-logs</ID><Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status>",
+            "<Expiration><Days>30</Days></Expiration></Rule>",
+            "<Rule><ID>tag-rule</ID><Status>Disabled</Status>",
+            "<Filter><Tag><Key>class</Key><Value>archive</Value></Tag></Filter>",
+            "<Expiration><Date>2026-01-01T00:00:00Z</Date></Expiration></Rule>",
+            "<Rule><ID>and-rule</ID><Filter><And><Prefix>doc/</Prefix>",
+            "<Tag><Key>a</Key><Value>1</Value></Tag><Tag><Key>b</Key><Value>2</Value></Tag>",
+            "</And></Filter><Status>Enabled</Status>",
+            "<NoncurrentVersionExpiration><NoncurrentDays>90</NoncurrentDays>",
+            "<NewerNoncurrentVersions>3</NewerNoncurrentVersions></NoncurrentVersionExpiration>",
+            "<AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation>",
+            "</AbortIncompleteMultipartUpload></Rule>",
+            "<Rule><ID>marker</ID><Filter/><Status>Enabled</Status>",
+            "<Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration></Rule>",
+            "<Rule><ID>legacy</ID><Prefix>old/</Prefix><Status>Enabled</Status>",
+            "<Expiration><Days>1</Days></Expiration></Rule>",
+            "</LifecycleConfiguration>"
+        );
+        let rules = parse_lifecycle_configuration(body.as_bytes()).unwrap();
+        assert_eq!(rules.len(), 5);
+        assert_eq!(rules[0].id, "expire-logs");
+        assert_eq!(rules[0].status, S::Enabled);
+        assert_eq!(rules[0].filter.prefix, "logs/");
+        assert_eq!(rules[0].expiration.as_ref().unwrap().days, Some(30));
+        assert_eq!(rules[1].status, S::Disabled);
+        assert_eq!(
+            rules[1].filter.tags,
+            vec![("class".to_string(), "archive".to_string())]
+        );
+        assert_eq!(
+            rules[1].expiration.as_ref().unwrap().date,
+            Some(parse_iso8601("2026-01-01T00:00:00Z").unwrap())
+        );
+        let and = &rules[2];
+        assert_eq!(and.filter.prefix, "doc/");
+        assert_eq!(and.filter.tags.len(), 2);
+        let nc = and.noncurrent_expiration.as_ref().unwrap();
+        assert_eq!(nc.noncurrent_days, Some(90));
+        assert_eq!(nc.newer_noncurrent_versions, Some(3));
+        assert_eq!(
+            and.abort_incomplete_multipart
+                .unwrap()
+                .days_after_initiation,
+            7
+        );
+        assert!(
+            rules[3]
+                .expiration
+                .as_ref()
+                .unwrap()
+                .expired_object_delete_marker
+        );
+        assert_eq!(rules[3].filter.prefix, "");
+        // 旧版直下 Prefix 归一到 Filter 结构,原始形态记入 legacy_prefix
+        // (M11 L5:GET 按提交形态回渲染;s3-tests test_lifecycle_get 逐字段
+        // 相等断言依赖)
+        assert_eq!(rules[4].filter.prefix, "old/");
+        assert!(rules[4].filter.tags.is_empty());
+        assert!(rules[4].legacy_prefix);
+        assert!(!rules[0].legacy_prefix);
+        // 渲染 → 再解析:结构等价(Date 渲染为 AWS RFC3339 毫秒形态)
+        let rendered = render_lifecycle_configuration(&rules);
+        let rules2 = parse_lifecycle_configuration(rendered.as_bytes()).unwrap();
+        assert_eq!(rules, rules2, "{rendered}");
+        assert!(
+            rendered.contains("<Date>2026-01-01T00:00:00.000Z</Date>"),
+            "{rendered}"
+        );
+        // 空 Filter 渲染形态 + And 渲染形态
+        assert!(
+            rendered.contains("<Rule><ID>marker</ID><Filter/>"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("<And><Prefix>doc/</Prefix>"),
+            "{rendered}"
+        );
+        // 旧版直下 Prefix 按原形态回渲染(不归一为 Filter)
+        assert!(
+            rendered.contains("<Rule><ID>legacy</ID><Prefix>old/</Prefix>"),
+            "{rendered}"
+        );
+        // Disabled 规则同样存取(执行器跳过,存储不剔除)
+        let dis: Vec<&LifecycleRule> = rules.iter().filter(|r| r.status == S::Disabled).collect();
+        assert_eq!(dis.len(), 1);
+    }
+
+    /// 规则 ID 缺省:AWS 口径自动生成(M11 L5;s3-tests
+    /// test_lifecycle_get_no_id 依赖——GET 必须带回 ID)。
+    #[test]
+    fn lifecycle_rule_id_auto_generated() {
+        let body = concat!(
+            r#"<LifecycleConfiguration>"#,
+            "<Rule><Prefix>a/</Prefix><Status>Enabled</Status><Expiration><Days>31</Days></Expiration></Rule>",
+            "<Rule><Prefix>b/</Prefix><Status>Enabled</Status><Expiration><Days>120</Days></Expiration></Rule>",
+            "</LifecycleConfiguration>"
+        );
+        let rules = parse_lifecycle_configuration(body.as_bytes()).unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_ne!(rules[0].id, rules[1].id, "生成 ID 互不相同");
+        for r in &rules {
+            assert_eq!(r.id.len(), 24, "生成 ID = 12 字节 hex: {}", r.id);
+            assert!(r.id.bytes().all(|b| b.is_ascii_hexdigit()));
+            assert!(r.legacy_prefix);
+        }
+        // 渲染带生成 ID;再解析保真(往返幂等)
+        let rendered = render_lifecycle_configuration(&rules);
+        let rules2 = parse_lifecycle_configuration(rendered.as_bytes()).unwrap();
+        assert_eq!(rules, rules2, "{rendered}");
+    }
+
+    /// 非法输入矩阵:错误码口径(结构 → MalformedXML;语义 → InvalidRequest;
+    /// 不支持元素 → NotImplemented)。
+    #[test]
+    fn lifecycle_configuration_rejects() {
+        let wrap = |rule: &str| {
+            format!(r#"<LifecycleConfiguration>{rule}</LifecycleConfiguration>"#).into_bytes()
+        };
+        let rule_ok = r#"<Rule><ID>r</ID><Filter/><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule>"#;
+        let structural: Vec<Vec<u8>> = vec![
+            // 空 body / 缺根 / 零规则 / 坏 XML
+            b"".to_vec(),
+            b"<Foo/>".to_vec(),
+            b"<LifecycleConfiguration></LifecycleConfiguration>".to_vec(),
+            b"<LifecycleConfiguration><Rule>".to_vec(),
+        ];
+        let cases: Vec<(Vec<u8>, S3ErrorCode)> = structural
+            .into_iter()
+            .map(|b| (b, S3ErrorCode::MalformedXML))
+            .chain([
+                // 缺 Status / Status 非法值
+                (
+                    wrap(r#"<Rule><ID>r</ID><Filter/><Expiration><Days>1</Days></Expiration></Rule>"#),
+                    S3ErrorCode::MalformedXML,
+                ),
+                (
+                    wrap(r#"<Rule><ID>r</ID><Filter/><Status>On</Status><Expiration><Days>1</Days></Expiration></Rule>"#),
+                    S3ErrorCode::MalformedXML,
+                ),
+                // 缺 Filter 且无直下 Prefix(AWS 实测 MalformedXML)
+                (
+                    wrap(r#"<Rule><ID>r</ID><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule>"#),
+                    S3ErrorCode::MalformedXML,
+                ),
+                // Filter 多直下子元素 / And 单条件 / Filter+Prefix 同现
+                (
+                    wrap(r#"<Rule><ID>r</ID><Status>Enabled</Status><Filter><Prefix>a</Prefix><Tag><Key>k</Key><Value>v</Value></Tag></Filter><Expiration><Days>1</Days></Expiration></Rule>"#),
+                    S3ErrorCode::MalformedXML,
+                ),
+                (
+                    wrap(r#"<Rule><ID>r</ID><Status>Enabled</Status><Filter><And><Prefix>a</Prefix></And></Filter><Expiration><Days>1</Days></Expiration></Rule>"#),
+                    S3ErrorCode::MalformedXML,
+                ),
+                (
+                    wrap(r#"<Rule><ID>r</ID><Status>Enabled</Status><Prefix>a</Prefix><Filter/><Expiration><Days>1</Days></Expiration></Rule>"#),
+                    S3ErrorCode::MalformedXML,
+                ),
+                // Expiration 多选/零选(schema 互斥)
+                (
+                    wrap(r#"<Rule><ID>r</ID><Filter/><Status>Enabled</Status><Expiration><Days>1</Days><Date>2026-01-01T00:00:00Z</Date></Expiration></Rule>"#),
+                    S3ErrorCode::MalformedXML,
+                ),
+                (
+                    wrap(r#"<Rule><ID>r</ID><Filter/><Status>Enabled</Status><Expiration/></Rule>"#),
+                    S3ErrorCode::MalformedXML,
+                ),
+                // Days 非数 / Date 非法 / 布尔非法 / Tag 缺 Value
+                (
+                    wrap(r#"<Rule><ID>r</ID><Filter/><Status>Enabled</Status><Expiration><Days>abc</Days></Expiration></Rule>"#),
+                    S3ErrorCode::MalformedXML,
+                ),
+                (
+                    wrap(r#"<Rule><ID>r</ID><Filter/><Status>Enabled</Status><Expiration><Date>not-a-date</Date></Expiration></Rule>"#),
+                    S3ErrorCode::MalformedXML,
+                ),
+                (
+                    wrap(r#"<Rule><ID>r</ID><Filter/><Status>Enabled</Status><Expiration><ExpiredObjectDeleteMarker>yes</ExpiredObjectDeleteMarker></Expiration></Rule>"#),
+                    S3ErrorCode::MalformedXML,
+                ),
+                (
+                    wrap(r#"<Rule><ID>r</ID><Status>Enabled</Status><Filter><Tag><Key>k</Key></Tag></Filter><Expiration><Days>1</Days></Expiration></Rule>"#),
+                    S3ErrorCode::MalformedXML,
+                ),
+                // 语义违例:无动作 → InvalidRequest;正整数违例(Days=0 /
+                // NoncurrentDays=0 / DaysAfterInitiation=0)与 ID 超长 →
+                // InvalidArgument(AWS 口径,M11 L5)
+                (
+                    wrap(r#"<Rule><ID>r</ID><Filter/><Status>Enabled</Status><Expiration><Days>0</Days></Expiration></Rule>"#),
+                    S3ErrorCode::InvalidArgument,
+                ),
+                (
+                    wrap(r#"<Rule><ID>r</ID><Filter/><Status>Enabled</Status></Rule>"#),
+                    S3ErrorCode::InvalidRequest,
+                ),
+                (
+                    wrap(r#"<Rule><ID>r</ID><Filter/><Status>Enabled</Status><NoncurrentVersionExpiration><NoncurrentDays>0</NoncurrentDays></NoncurrentVersionExpiration></Rule>"#),
+                    S3ErrorCode::InvalidArgument,
+                ),
+                (
+                    wrap(r#"<Rule><ID>r</ID><Filter/><Status>Enabled</Status><AbortIncompleteMultipartUpload><DaysAfterInitiation>0</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule>"#),
+                    S3ErrorCode::InvalidArgument,
+                ),
+                (
+                    wrap(&format!(
+                        r#"<Rule><ID>{}</ID><Filter/><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule>"#,
+                        "x".repeat(256)
+                    )),
+                    S3ErrorCode::InvalidArgument,
+                ),
+                // Transition 族 / ObjectSize* 过滤器 → NotImplemented(显式,不静默)
+                (
+                    wrap(r#"<Rule><ID>r</ID><Filter/><Status>Enabled</Status><Transition><Days>30</Days><StorageClass>GLACIER</StorageClass></Transition></Rule>"#),
+                    S3ErrorCode::NotImplemented,
+                ),
+                (
+                    wrap(r#"<Rule><ID>r</ID><Status>Enabled</Status><Filter><ObjectSizeGreaterThan>100</ObjectSizeGreaterThan></Filter><Expiration><Days>1</Days></Expiration></Rule>"#),
+                    S3ErrorCode::NotImplemented,
+                ),
+                // 重复 ID → InvalidArgument(AWS 口径,M11 L5)
+                (
+                    wrap(&format!("{rule_ok}{rule_ok}")),
+                    S3ErrorCode::InvalidArgument,
+                ),
+            ])
+            .collect();
+        for (body, code) in cases {
+            assert_eq!(
+                parse_lifecycle_configuration(&body).unwrap_err().code,
+                code,
+                "{}",
+                String::from_utf8_lossy(&body)
             );
         }
     }

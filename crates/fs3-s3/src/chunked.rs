@@ -18,6 +18,7 @@ use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
 use crate::error::{S3Error, S3ErrorCode};
+use fs3_core::{ChecksumAlgorithm, ChecksumHasher, ChecksumInfo};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -49,6 +50,13 @@ pub struct ChunkedSigV4Reader<'a> {
     /// unsigned 模式(HTTPS 下 aws cli 的 STREAMING-UNSIGNED-PAYLOAD-TRAILER):
     /// chunk 行无 signature,逐 chunk 校验跳过。
     unsigned: bool,
+    /// trailer checksum 声明算法(M11 C1-2;来自 x-amz-sdk-checksum-algorithm /
+    /// x-amz-trailer 声明,协议层解析后传入;None = 无 trailer 验算,现状)。
+    trailer_alg: Option<ChecksumAlgorithm>,
+    /// 解码明文流的实时 checksum(trailer_alg 声明时随 read 更新)。
+    hasher: Option<ChecksumHasher>,
+    /// trailer 验算通过的 checksum(协议层响应回显用)。
+    verified: Option<ChecksumInfo>,
 }
 
 impl<'a> ChunkedSigV4Reader<'a> {
@@ -96,12 +104,35 @@ impl<'a> ChunkedSigV4Reader<'a> {
             total_decoded: 0,
             error: None,
             unsigned,
+            trailer_alg: None,
+            hasher: None,
+            verified: None,
         }
+    }
+
+    /// 声明 trailer checksum 算法(M11 C1-2):最终 0-chunk 后的
+    /// `x-amz-checksum-{alg}` trailer 行与解码明文流的实时 checksum 比对,
+    /// 不符/缺失/非法 → 置 S3 错误并使 read 报错(引擎按流中断回滚)。
+    pub fn with_checksum_trailer(mut self, alg: Option<ChecksumAlgorithm>) -> Self {
+        self.trailer_alg = alg;
+        self.hasher = alg.map(ChecksumHasher::new);
+        self
     }
 
     /// 已解码总字节数(与 x-amz-decoded-content-length 对照)。
     pub fn total_decoded(&self) -> u64 {
         self.total_decoded
+    }
+
+    /// 取走读侧已置的 S3 错误(验签 / trailer checksum 不符;协议层据此
+    /// 返回对应错误码,替代 io 错误的 InternalError 兜底映射)。
+    pub fn take_error(&mut self) -> Option<S3Error> {
+        self.error.take()
+    }
+
+    /// trailer 验算通过的 checksum(未声明 / 未提供 = None)。
+    pub fn verified_checksum(&self) -> Option<&ChecksumInfo> {
+        self.verified.as_ref()
     }
 
     fn read_byte(&mut self) -> std::io::Result<Option<u8>> {
@@ -249,12 +280,64 @@ impl<'a> ChunkedSigV4Reader<'a> {
     /// 消费最终 0-chunk 之后的 trailer 段直到空行("\r\n\r\n" 第二段)。
     /// 无 trailer 时(普通 aws-chunked)0-chunk 行后直接是空行,此处等价消费
     /// 原「收尾 CRLF」。
+    ///
+    /// M11 C1-2(ADR-12 checksum 范围:trailer 验算):声明了 trailer
+    /// checksum 算法时,解析 trailer 行取出 `x-amz-checksum-{alg}` 的
+    /// base64 值,与解码明文流的实时 checksum 比对;算法/值不符、声明了
+    /// 却缺失、值非法 → 置 S3 错误并 read 报错(仿 :235 验签失败先例)。
     fn consume_trailers_until_blank(&mut self) -> std::io::Result<()> {
+        let mut trailer_cksum: Option<(ChecksumAlgorithm, Vec<u8>)> = None;
         loop {
             let line = self.read_line()?;
             match line {
-                Some(l) if l.is_empty() => return Ok(()),
-                Some(_) => continue, // trailer 行(x-amz-checksum-*),忽略
+                Some(l) if l.is_empty() => break,
+                Some(l) => {
+                    let line = String::from_utf8_lossy(&l).into_owned();
+                    let Some((name, value)) = line.split_once(':') else {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "malformed trailer line",
+                        ));
+                    };
+                    let name = name.trim().to_ascii_lowercase();
+                    let Some(suffix) = name.strip_prefix("x-amz-checksum-") else {
+                        continue; // 非 checksum trailer 行:不属本特性,忽略
+                    };
+                    if trailer_cksum.is_some() {
+                        return Err(self.fail_trailer(
+                            S3Error::new(S3ErrorCode::InvalidRequest).with_message(
+                                "Expecting a single x-amz-checksum- header. Multiple checksum types are not allowed.",
+                            ),
+                            "multiple checksum trailers",
+                        ));
+                    }
+                    let alg = match ChecksumAlgorithm::from_header_suffix(suffix) {
+                        Some(a) => a,
+                        None => {
+                            return Err(self.fail_trailer(
+                                S3Error::new(S3ErrorCode::InvalidRequest).with_message(format!(
+                                    "The checksum algorithm '{suffix}' is not supported."
+                                )),
+                                "unsupported checksum trailer algorithm",
+                            ))
+                        }
+                    };
+                    let raw = match base64::Engine::decode(
+                        &base64::engine::general_purpose::STANDARD,
+                        value.trim(),
+                    ) {
+                        Ok(v) if v.len() == alg.digest_len() => v,
+                        _ => {
+                            return Err(self.fail_trailer(
+                                S3Error::new(S3ErrorCode::InvalidRequest).with_message(format!(
+                                    "Value for x-amz-checksum-{suffix} header is invalid."
+                                )),
+                                "invalid checksum trailer value",
+                            ))
+                        }
+                    };
+                    trailer_cksum = Some((alg, raw));
+                }
                 None => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
@@ -263,6 +346,56 @@ impl<'a> ChunkedSigV4Reader<'a> {
                 }
             }
         }
+        match (self.trailer_alg, trailer_cksum) {
+            (Some(declared), Some((alg, value))) => {
+                // AWS:trailer 值算法与 x-amz-sdk-checksum-algorithm 声明不符 → BadDigest
+                if alg != declared {
+                    return Err(self.fail_trailer(
+                        S3Error::new(S3ErrorCode::BadDigest).with_message(
+                            "The checksum algorithm does not match x-amz-sdk-checksum-algorithm.",
+                        ),
+                        "checksum trailer algorithm mismatch",
+                    ));
+                }
+                let computed = self.hasher.take().map(|h| h.finish()).unwrap_or_default();
+                if computed != value {
+                    return Err(self.fail_trailer(
+                        S3Error::new(S3ErrorCode::BadDigest).with_message(format!(
+                            "The {} you specified did not match what we received.",
+                            alg.s3_name()
+                        )),
+                        "checksum trailer mismatch",
+                    ));
+                }
+                self.verified = Some(ChecksumInfo {
+                    algorithm: alg,
+                    value,
+                });
+                Ok(())
+            }
+            // 声明了 trailer checksum 却未收到对应 trailer 行(显式,不静默)
+            (Some(_), None) => Err(self.fail_trailer(
+                S3Error::new(S3ErrorCode::InvalidRequest).with_message(
+                    "x-amz-sdk-checksum-algorithm specified, but no corresponding x-amz-checksum trailer was received.",
+                ),
+                "declared checksum trailer missing",
+            )),
+            // 未声明却收到 checksum trailer 行(无法预声明算法实时验算,显式拒绝)
+            (None, Some(_)) => Err(self.fail_trailer(
+                S3Error::new(S3ErrorCode::InvalidRequest).with_message(
+                    "checksum trailer received without x-amz-sdk-checksum-algorithm or x-amz-trailer declaration.",
+                ),
+                "undeclared checksum trailer",
+            )),
+            (None, None) => Ok(()),
+        }
+    }
+
+    /// trailer 验算失败统一出口:置 S3 错误(协议层 `take_error` 取用),
+    /// read 侧 io 报错(引擎按流中断中止,不提交元数据)。
+    fn fail_trailer(&mut self, e: S3Error, io_msg: &'static str) -> std::io::Error {
+        self.error = Some(e);
+        std::io::Error::new(std::io::ErrorKind::InvalidData, io_msg)
     }
 }
 
@@ -284,6 +417,10 @@ impl Read for ChunkedSigV4Reader<'_> {
                     let avail = self.remaining - self.data_pos;
                     let n = avail.min(buf.len());
                     buf[..n].copy_from_slice(&self.data_buf[self.data_pos..self.data_pos + n]);
+                    // M11 C1-2:trailer checksum 声明时,实时累计解码明文
+                    if let Some(h) = &mut self.hasher {
+                        h.update(&buf[..n]);
+                    }
                     self.data_pos += n;
                     if self.data_pos == self.remaining {
                         self.state = State::Header;
@@ -305,6 +442,19 @@ mod tests {
     /// 构造一个合法的 aws-chunked 请求体(与 minio-go 签名逻辑一致)。
     fn build_chunked_body(
         chunks: &[&[u8]],
+        date: &str,
+        region: &str,
+        amz_date: &str,
+        seed: &str,
+    ) -> Vec<u8> {
+        build_chunked_body_trailers(chunks, &[], date, region, amz_date, seed)
+    }
+
+    /// 带 trailer 段的 aws-chunked 请求体(M11 C1-2):trailer 行在最终
+    /// 0-chunk 行之后、收尾空行之前(trailer 不进 chunk 签名链)。
+    fn build_chunked_body_trailers(
+        chunks: &[&[u8]],
+        trailers: &[(&str, &str)],
         date: &str,
         region: &str,
         amz_date: &str,
@@ -340,7 +490,11 @@ mod tests {
         }
         // 最终 0-chunk
         let sig = chunk_sig(&key, amz_date, &scope, &prev, b"");
-        out.extend_from_slice(format!("0;chunk-signature={sig}\r\n\r\n").as_bytes());
+        out.extend_from_slice(format!("0;chunk-signature={sig}\r\n").as_bytes());
+        for (k, v) in trailers {
+            out.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
+        }
+        out.extend_from_slice(b"\r\n");
         out
     }
 
@@ -381,5 +535,183 @@ mod tests {
             ChunkedSigV4Reader::new(&mut cursor, SECRET, date, "us-east-1", seed, amz_date);
         let mut decoded = Vec::new();
         assert!(reader.read_to_end(&mut decoded).is_err());
+    }
+
+    // ── M11 C1-2:trailer checksum 验算(signed + unsigned) ──
+
+    fn b64(v: &[u8]) -> String {
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, v)
+    }
+
+    #[test]
+    fn signed_trailer_checksum_ok() {
+        let date = "20240820";
+        let amz_date = "20240820T120000Z";
+        let seed = "abc123def456abc123def456abc123def456abc123def456abc123def456abcd";
+        let payload: &[u8] = b"trailer checksum payload";
+        let cksum = fs3_core::checksum_one_shot(ChecksumAlgorithm::Crc32c, payload);
+        let body = build_chunked_body_trailers(
+            &[payload],
+            &[("x-amz-checksum-crc32c", &b64(&cksum))],
+            date,
+            "us-east-1",
+            amz_date,
+            seed,
+        );
+        let mut cursor = std::io::Cursor::new(body);
+        let mut reader =
+            ChunkedSigV4Reader::new(&mut cursor, SECRET, date, "us-east-1", seed, amz_date)
+                .with_checksum_trailer(Some(ChecksumAlgorithm::Crc32c));
+        let mut decoded = Vec::new();
+        reader.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, payload);
+        assert_eq!(
+            reader.verified_checksum(),
+            Some(&ChecksumInfo {
+                algorithm: ChecksumAlgorithm::Crc32c,
+                value: cksum,
+            })
+        );
+        assert!(reader.take_error().is_none());
+    }
+
+    #[test]
+    fn signed_trailer_checksum_mismatch() {
+        let date = "20240820";
+        let amz_date = "20240820T120000Z";
+        let seed = "abc123def456abc123def456abc123def456abc123def456abc123def456abcd";
+        // 正确长度但内容错误的 CRC32C
+        let bad = b64(&[0xde, 0xad, 0xbe, 0xef]);
+        let body = build_chunked_body_trailers(
+            &[b"payload"],
+            &[("x-amz-checksum-crc32c", &bad)],
+            date,
+            "us-east-1",
+            amz_date,
+            seed,
+        );
+        let mut cursor = std::io::Cursor::new(body);
+        let mut reader =
+            ChunkedSigV4Reader::new(&mut cursor, SECRET, date, "us-east-1", seed, amz_date)
+                .with_checksum_trailer(Some(ChecksumAlgorithm::Crc32c));
+        let mut decoded = Vec::new();
+        assert!(reader.read_to_end(&mut decoded).is_err());
+        let err = reader.take_error().expect("stored S3 error");
+        assert_eq!(err.code, S3ErrorCode::BadDigest);
+    }
+
+    #[test]
+    fn unsigned_trailer_checksum_ok_and_mismatch() {
+        let amz_date = "20240820T120000Z";
+        // unsigned 线体:chunk 行无签名,0-chunk 行同样无签名
+        let payload: &[u8] = b"unsigned trailer payload";
+        let cksum = fs3_core::checksum_one_shot(ChecksumAlgorithm::Sha256, payload);
+        let mk = |trailer: Option<(&str, &str)>| {
+            let mut out = Vec::new();
+            out.extend_from_slice(format!("{:x}\r\n", payload.len()).as_bytes());
+            out.extend_from_slice(payload);
+            out.extend_from_slice(b"\r\n0\r\n");
+            if let Some((k, v)) = trailer {
+                out.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
+            }
+            out.extend_from_slice(b"\r\n");
+            out
+        };
+        // 正:值匹配
+        let body = mk(Some(("x-amz-checksum-sha256", &b64(&cksum))));
+        let mut cursor = std::io::Cursor::new(body);
+        let mut reader = ChunkedSigV4Reader::new_unsigned(&mut cursor, amz_date)
+            .with_checksum_trailer(Some(ChecksumAlgorithm::Sha256));
+        let mut decoded = Vec::new();
+        reader.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, payload);
+        assert_eq!(reader.verified_checksum().map(|c| &c.value), Some(&cksum));
+        // 反:值不符 → BadDigest
+        let mut wrong = cksum.clone();
+        wrong[0] ^= 0xFF;
+        let body = mk(Some(("x-amz-checksum-sha256", &b64(&wrong))));
+        let mut cursor = std::io::Cursor::new(body);
+        let mut reader = ChunkedSigV4Reader::new_unsigned(&mut cursor, amz_date)
+            .with_checksum_trailer(Some(ChecksumAlgorithm::Sha256));
+        let mut decoded = Vec::new();
+        assert!(reader.read_to_end(&mut decoded).is_err());
+        assert_eq!(reader.take_error().unwrap().code, S3ErrorCode::BadDigest);
+        // 反:声明了却未收到 trailer 行 → InvalidRequest
+        let body = mk(None);
+        let mut cursor = std::io::Cursor::new(body);
+        let mut reader = ChunkedSigV4Reader::new_unsigned(&mut cursor, amz_date)
+            .with_checksum_trailer(Some(ChecksumAlgorithm::Sha256));
+        let mut decoded = Vec::new();
+        assert!(reader.read_to_end(&mut decoded).is_err());
+        assert_eq!(
+            reader.take_error().unwrap().code,
+            S3ErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn trailer_rejects_invalid_value_and_undeclared() {
+        let amz_date = "20240820T120000Z";
+        let payload: &[u8] = b"p";
+        let mk = |trailers: &[(&str, &str)]| {
+            let mut out = Vec::new();
+            out.extend_from_slice(format!("{:x}\r\n", payload.len()).as_bytes());
+            out.extend_from_slice(payload);
+            out.extend_from_slice(b"\r\n0\r\n");
+            for (k, v) in trailers {
+                out.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
+            }
+            out.extend_from_slice(b"\r\n");
+            out
+        };
+        // 非法 base64 → InvalidRequest
+        let body = mk(&[("x-amz-checksum-crc32", "!!!not-base64!!!")]);
+        let mut cursor = std::io::Cursor::new(body);
+        let mut reader = ChunkedSigV4Reader::new_unsigned(&mut cursor, amz_date)
+            .with_checksum_trailer(Some(ChecksumAlgorithm::Crc32));
+        let mut decoded = Vec::new();
+        assert!(reader.read_to_end(&mut decoded).is_err());
+        assert_eq!(
+            reader.take_error().unwrap().code,
+            S3ErrorCode::InvalidRequest
+        );
+        // 长度不符(合法 base64 但非 4 字节)→ InvalidRequest
+        let body = mk(&[("x-amz-checksum-crc32", &b64(&[1, 2, 3]))]);
+        let mut cursor = std::io::Cursor::new(body);
+        let mut reader = ChunkedSigV4Reader::new_unsigned(&mut cursor, amz_date)
+            .with_checksum_trailer(Some(ChecksumAlgorithm::Crc32));
+        let mut decoded = Vec::new();
+        assert!(reader.read_to_end(&mut decoded).is_err());
+        assert_eq!(
+            reader.take_error().unwrap().code,
+            S3ErrorCode::InvalidRequest
+        );
+        // 未声明算法却收到 checksum trailer → InvalidRequest
+        let cksum = fs3_core::checksum_one_shot(ChecksumAlgorithm::Crc32, payload);
+        let body = mk(&[("x-amz-checksum-crc32", &b64(&cksum))]);
+        let mut cursor = std::io::Cursor::new(body);
+        let mut reader = ChunkedSigV4Reader::new_unsigned(&mut cursor, amz_date);
+        let mut decoded = Vec::new();
+        assert!(reader.read_to_end(&mut decoded).is_err());
+        assert_eq!(
+            reader.take_error().unwrap().code,
+            S3ErrorCode::InvalidRequest
+        );
+        // 声明算法与 trailer 行算法不符 → BadDigest
+        let body = mk(&[("x-amz-checksum-sha1", &b64(&[0u8; 20]))]);
+        let mut cursor = std::io::Cursor::new(body);
+        let mut reader = ChunkedSigV4Reader::new_unsigned(&mut cursor, amz_date)
+            .with_checksum_trailer(Some(ChecksumAlgorithm::Crc32));
+        let mut decoded = Vec::new();
+        assert!(reader.read_to_end(&mut decoded).is_err());
+        assert_eq!(reader.take_error().unwrap().code, S3ErrorCode::BadDigest);
+        // 无声明无 trailer:现状零变化
+        let body = mk(&[]);
+        let mut cursor = std::io::Cursor::new(body);
+        let mut reader = ChunkedSigV4Reader::new_unsigned(&mut cursor, amz_date);
+        let mut decoded = Vec::new();
+        reader.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, payload);
+        assert!(reader.verified_checksum().is_none());
     }
 }

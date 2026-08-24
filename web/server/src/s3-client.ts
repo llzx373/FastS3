@@ -10,6 +10,10 @@
  * DeleteObjectVersion / Get|PutBucketVersioning / Get|Put|DeleteBucketCors /
  * Get|Put|DeleteBucketPolicy / Get|Put|DeleteBucketTagging /
  * Get|PutObjectTagging)——全部为小 XML/JSON 文档或空体请求,无字节流经过 Node。
+ *
+ * M11:S3M10Client 再加生命周期/桶默认加密
+ * (Get|Put|DeleteBucketLifecycleConfiguration / Get|Put|DeleteBucketEncryption,
+ * 仅 SSE-S3 AES256)——同为小 XML 文档请求。
  */
 import { createHmac, createHash } from "node:crypto";
 import http from "node:http";
@@ -430,6 +434,136 @@ function renderCorsXml(rules: BucketCorsRule[]): string {
   return `<CORSConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">${inner}</CORSConfiguration>`;
 }
 
+// ─────────────────────────── M11:生命周期 / 桶加密 ───────────────────────────
+
+/**
+ * 桶级生命周期规则(AWS Lifecycle Rule 子集,与数据面渲染口径一致)。
+ * Expiration 三字段互斥(数据面校验:Days/Date/ExpiredObjectDeleteMarker 恰选其一);
+ * Filter 单 Tag 起步——数据面支持 And 复合(多 Tag),解析仅取首个 Tag
+ * (控制台表单口径;多 Tag 规则经控制台保存会收敛为单 Tag)。
+ */
+export interface LifecycleRule {
+  ID: string;
+  Status: "Enabled" | "Disabled";
+  /** 缺省 = 全部对象(渲染 <Filter/>) */
+  Filter?: { Prefix?: string; Tag?: { Key: string; Value: string } };
+  /** Days/Date(ISO8601)/ExpiredObjectDeleteMarker 互斥,恰选其一 */
+  Expiration?: { Days?: number; Date?: string; ExpiredObjectDeleteMarker?: boolean };
+  NoncurrentVersionExpiration?: { NoncurrentDays?: number };
+  AbortIncompleteMultipartUpload?: { DaysAfterInitiation?: number };
+}
+
+/** 解析 LifecycleConfiguration(数据面 render_lifecycle_configuration 的逆)。 */
+export function parseLifecycleXml(xml: string): LifecycleRule[] {
+  const rules: LifecycleRule[] = [];
+  const pick = (tag: string, from: string): string => {
+    const r = new RegExp(`<${tag}>([^<]*)<\\/${tag}>`).exec(from);
+    return r ? unescapeXml(r[1]) : "";
+  };
+  const ruleRe = /<Rule>([\s\S]*?)<\/Rule>/g;
+  let m: RegExpExecArray | null;
+  while ((m = ruleRe.exec(xml)) !== null) {
+    const block = m[1];
+    const rule: LifecycleRule = {
+      ID: pick("ID", block),
+      Status: pick("Status", block) === "Disabled" ? "Disabled" : "Enabled",
+    };
+    // Filter:<Filter/> 空 / 直下 Prefix|Tag / <And> 复合(取首个 Tag)
+    const fm = /<Filter\s*\/>|<Filter>([\s\S]*?)<\/Filter>/.exec(block);
+    const fb = fm ? (fm[1] ?? "") : null;
+    if (fb) {
+      const filter: NonNullable<LifecycleRule["Filter"]> = {};
+      const prefix = pick("Prefix", fb);
+      if (prefix) filter.Prefix = prefix;
+      const tm = /<Tag>\s*<Key>([^<]*)<\/Key>\s*<Value>([^<]*)<\/Value>\s*<\/Tag>/.exec(fb);
+      if (tm) filter.Tag = { Key: unescapeXml(tm[1]), Value: unescapeXml(tm[2]) };
+      if (filter.Prefix !== undefined || filter.Tag !== undefined) rule.Filter = filter;
+    }
+    const em = /<Expiration>([\s\S]*?)<\/Expiration>/.exec(block);
+    if (em) {
+      const exp: NonNullable<LifecycleRule["Expiration"]> = {};
+      const days = /<Days>(\d+)<\/Days>/.exec(em[1]);
+      if (days) exp.Days = Number(days[1]);
+      const date = pick("Date", em[1]);
+      if (date) exp.Date = date;
+      if (/<ExpiredObjectDeleteMarker>true<\/ExpiredObjectDeleteMarker>/.test(em[1])) {
+        exp.ExpiredObjectDeleteMarker = true;
+      }
+      rule.Expiration = exp;
+    }
+    const nm = /<NoncurrentVersionExpiration>([\s\S]*?)<\/NoncurrentVersionExpiration>/.exec(block);
+    if (nm) {
+      const nd = /<NoncurrentDays>(\d+)<\/NoncurrentDays>/.exec(nm[1]);
+      if (nd) rule.NoncurrentVersionExpiration = { NoncurrentDays: Number(nd[1]) };
+    }
+    const am = /<AbortIncompleteMultipartUpload>([\s\S]*?)<\/AbortIncompleteMultipartUpload>/.exec(block);
+    if (am) {
+      const dd = /<DaysAfterInitiation>(\d+)<\/DaysAfterInitiation>/.exec(am[1]);
+      if (dd) rule.AbortIncompleteMultipartUpload = { DaysAfterInitiation: Number(dd[1]) };
+    }
+    rules.push(rule);
+  }
+  return rules;
+}
+
+/**
+ * 渲染 LifecycleConfiguration 请求体(与数据面渲染口径同形:元素序
+ * ID/Filter/Status/动作;规则语义——ID 唯一、动作非空、Expiration 三选一——
+ * 由数据面路由层校验;Transition 不支持,数据面 501)。
+ */
+export function renderLifecycleXml(rules: LifecycleRule[]): string {
+  const inner = rules
+    .map((r) => {
+      let s = `<Rule><ID>${escapeXml(r.ID)}</ID>`;
+      // Filter:无条件 → <Filter/>;单条件直下;Prefix+Tag 复合 → <And>(≥2 条件)
+      const prefix = r.Filter?.Prefix ?? "";
+      const tag = r.Filter?.Tag;
+      if (!prefix && !tag) {
+        s += "<Filter/>";
+      } else if (prefix && !tag) {
+        s += `<Filter><Prefix>${escapeXml(prefix)}</Prefix></Filter>`;
+      } else if (!prefix && tag) {
+        s += `<Filter><Tag><Key>${escapeXml(tag.Key)}</Key><Value>${escapeXml(tag.Value)}</Value></Tag></Filter>`;
+      } else if (prefix && tag) {
+        s +=
+          `<Filter><And><Prefix>${escapeXml(prefix)}</Prefix>` +
+          `<Tag><Key>${escapeXml(tag.Key)}</Key><Value>${escapeXml(tag.Value)}</Value></Tag></And></Filter>`;
+      }
+      s += `<Status>${r.Status}</Status>`;
+      if (r.Expiration) {
+        s += "<Expiration>";
+        if (r.Expiration.Days !== undefined) s += `<Days>${r.Expiration.Days}</Days>`;
+        if (r.Expiration.Date) s += `<Date>${escapeXml(r.Expiration.Date)}</Date>`;
+        if (r.Expiration.ExpiredObjectDeleteMarker) {
+          s += "<ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker>";
+        }
+        s += "</Expiration>";
+      }
+      if (r.NoncurrentVersionExpiration?.NoncurrentDays !== undefined) {
+        s +=
+          `<NoncurrentVersionExpiration><NoncurrentDays>${r.NoncurrentVersionExpiration.NoncurrentDays}` +
+          "</NoncurrentDays></NoncurrentVersionExpiration>";
+      }
+      if (r.AbortIncompleteMultipartUpload?.DaysAfterInitiation !== undefined) {
+        s +=
+          `<AbortIncompleteMultipartUpload><DaysAfterInitiation>${r.AbortIncompleteMultipartUpload.DaysAfterInitiation}` +
+          "</DaysAfterInitiation></AbortIncompleteMultipartUpload>";
+      }
+      return s + "</Rule>";
+    })
+    .join("");
+  return `<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">${inner}</LifecycleConfiguration>`;
+}
+
+/** 渲染 ServerSideEncryptionConfiguration 请求体(仅 AES256 单 Rule)。 */
+function renderEncryptionXml(algorithm: string): string {
+  return (
+    `<ServerSideEncryptionConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">` +
+    `<Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>${escapeXml(algorithm)}</SSEAlgorithm>` +
+    `</ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>`
+  );
+}
+
 /**
  * M10 管理面子集(数据面直达):版本化/标签/CORS/桶策略。
  * 全部为小文档请求;恢复历史版本用 CopyObject 源带 versionId 自复制
@@ -590,5 +724,56 @@ export class S3M10Client {
     await this.call("PUT", `/${bucket}/${this.encodeKey(key)}?tagging`, Buffer.from(renderTaggingXml(tags)), {
       "content-type": "application/xml",
     });
+  }
+
+  // ── M11:生命周期 / 桶默认加密 ──
+
+  /** GetBucketLifecycleConfiguration;未配置(NoSuchLifecycleConfiguration 404)→ [](管理面友好口径)。 */
+  async getBucketLifecycle(bucket: string): Promise<LifecycleRule[]> {
+    const signed = signRequest(this.cfg, "GET", `/${bucket}?lifecycle`, Buffer.alloc(0), {});
+    const res = await doRequest(this.cfg, signed);
+    if (res.status === 404 && res.body.includes("NoSuchLifecycleConfiguration")) return [];
+    if (res.status !== 200) {
+      throw new Error(
+        `GetBucketLifecycleConfiguration ${bucket}: HTTP ${res.status} ${res.body.toString().slice(0, 300)}`
+      );
+    }
+    return parseLifecycleXml(res.body.toString("utf8"));
+  }
+
+  /** PutBucketLifecycleConfiguration(规则语义由数据面校验:ID 唯一、动作非空、Expiration 三选一等)。 */
+  async putBucketLifecycle(bucket: string, rules: LifecycleRule[]): Promise<void> {
+    await this.call("PUT", `/${bucket}?lifecycle`, Buffer.from(renderLifecycleXml(rules)), {
+      "content-type": "application/xml",
+    });
+  }
+
+  /** DeleteBucketLifecycle(204)。 */
+  async deleteBucketLifecycle(bucket: string): Promise<void> {
+    await this.call("DELETE", `/${bucket}?lifecycle`);
+  }
+
+  /** GetBucketEncryption:SSEAlgorithm;未配置(ServerSideEncryptionConfigurationNotFoundError 404)→ ""。 */
+  async getBucketEncryption(bucket: string): Promise<string> {
+    const signed = signRequest(this.cfg, "GET", `/${bucket}?encryption`, Buffer.alloc(0), {});
+    const res = await doRequest(this.cfg, signed);
+    if (res.status === 404 && res.body.includes("ServerSideEncryptionConfigurationNotFoundError")) return "";
+    if (res.status !== 200) {
+      throw new Error(`GetBucketEncryption ${bucket}: HTTP ${res.status} ${res.body.toString().slice(0, 300)}`);
+    }
+    const m = /<SSEAlgorithm>([^<]*)<\/SSEAlgorithm>/.exec(res.body.toString("utf8"));
+    return m ? m[1] : "";
+  }
+
+  /** PutBucketEncryption(仅 SSE-S3 AES256;aws:kms 由数据面 InvalidEncryptionAlgorithmError 拒绝)。 */
+  async putBucketEncryption(bucket: string, algorithm: "AES256"): Promise<void> {
+    await this.call("PUT", `/${bucket}?encryption`, Buffer.from(renderEncryptionXml(algorithm)), {
+      "content-type": "application/xml",
+    });
+  }
+
+  /** DeleteBucketEncryption(204;无配置亦幂等)。 */
+  async deleteBucketEncryption(bucket: string): Promise<void> {
+    await this.call("DELETE", `/${bucket}?encryption`);
   }
 }

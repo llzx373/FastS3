@@ -16,6 +16,15 @@ checkpoint_interval = 30
 # 后台惰性压缩(ADR-9;默认 true)。false = 不启动压缩 worker(前台 compact 仍可用);
 # 协议一致性 gate 等需确定性读环境的场景使用(tests/s3-tests/README.md「运行」节)
 # compaction_enabled = true
+# 生命周期执行器(M11;默认 true)。周期扫描有生命周期规则的桶执行过期删除/
+# 会话中止;无规则桶零动作(现状不变)
+# lifecycle_enabled = true
+# 生命周期执行周期秒数(默认 86400 = 24h,ADR-12 DL3 全量扫描;小周期供测试/演练)
+# lifecycle_interval_secs = 86400
+# 执行器指标(M11 L3-2):worker 启用时 /v1/admin/metrics 渲染
+# fasts3_lifecycle_{cycles,deleted_objects,deleted_bytes,aborted_uploads,
+# skipped_locked}_total 与 fasts3_lifecycle_last_cycle_timestamp;
+# 告警规则见 deploy/grafana/alerts.yml(停滞 > 2 周期 → warning;删除突增 → info)
 
 [server]
 listen = "0.0.0.0:9000"
@@ -52,3 +61,13 @@ token = "change-me"
 [limits]
 # 每密钥每秒请求上限(0 = 关闭;超限 503 SlowDown + Retry-After)
 key_rps = 0
+
+[audit]
+# 审计持久化(M11 L3-1;ADR-12 DL5;默认 true):push 同步落 `s:audit` 环形
+# (同步小写,组提交 fsync 口径与全库一致),serve 启动回放重建内存检索面
+# (/v1/admin/audit 零变化);false = 纯内存现状(重启即清空)。
+# 生命周期删除 who=system:lifecycle 重启后仍可检索。
+# persist = true
+# 磁盘条数上限(默认 100000;超上限批量截断删最旧;与内存环形容量 4096
+# 相互独立——内存环形仍是检索面,持久化是冷备 + 重启连续性)
+# max_entries = 100000

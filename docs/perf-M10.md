@@ -155,6 +155,13 @@ python3 tests/bench/list_versions_bench.py http://127.0.0.1:19200 b 1000000 2
   判据用吞吐 + §3.3 细采样)。
 - §3.3 的 p50 +7% 信号在 WSL 定时器/调度噪声量级边缘,已用对照组定量,
   仍建议 NVMe runner 复核后再做最终裁决。
+- **M11 E1(SSE-C)读路径失零拷贝**(ADR-12 DE1 裁决,本报告追加声明):
+  SSE 加密对象的 GET 必须过 CPU 逐 64KiB chunk 解密验 GCM tag,
+  `object_segments_meta` 对 `meta.sse.is_some()` 恒返回 None——
+  **sendfile/splice 零拷贝对该类对象整体禁用**,强制走缓冲解密路径
+  (大对象读带宽上限 = AES-GCM 解密速率,每核 ~3-5GB/s AES-NI);
+  解密字节量经 `fasts3_sse_decrypt_bytes_total`(admin /metrics)计量。
+  未加密对象零拷贝路径零变化。
 
 ## 7. F-1 处置(2026-08-23 追加;§3.3 p50 +7% 信号闭环)
 

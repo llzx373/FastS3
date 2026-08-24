@@ -23,6 +23,11 @@ use crate::keys::*;
 
 pub mod keys;
 
+/// M11 L3-1(ADR-12 DL5):`s:audit` 审计持久化环形。
+pub mod audit;
+
+pub use audit::AuditStore;
+
 /// 元数据同步模式(DESIGN §4.4 / E2)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SyncMode {
@@ -74,6 +79,38 @@ pub struct StatsDelta {
     pub bytes: i64,
 }
 
+/// SSE-S3 KEK 代状态(M11 K1-1,ADR-12 DS1;键 `s:sse_kek_gen`,值 =
+/// postcard 本结构)。**无密钥材料**:gen 是代数编号,KEK 本体由
+/// `s:sse_kek_seed` 按代确定性派生,永不落盘/下发。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SseKekGenState {
+    /// 当前 KEK 代(从 1 起;当前代 = 最大代,新对象/新会话签发用)。
+    pub gen: u32,
+    /// 末次轮换 unix 秒(admin 状态端点展示;初始代 = 0 = 未轮换过)。
+    pub last_rotated_at: i64,
+    /// 重包裹已收敛到的代数(后台 rewrap 完成标记;`gen >
+    /// rewrap_done_gen` = 存在待重包裹对象——重启后经本字段判定续跑,
+    /// 重跑幂等:已重包裹条目 kek_id == gen 自然跳过)。
+    pub rewrap_done_gen: u32,
+}
+
+/// SSE-S3 会话密钥材料(M11 K1-1,ADR-12 DS1;随 MultipartSession 尾部
+/// 追加落盘):Create 携带 SSE-S3 意愿(显式 AES256 头或桶默认)时签发
+/// 会话级 DEK,**只存 KEK 包裹值,DEK 明文零落盘**(UploadPart/
+/// UploadPartCopy/Complete 按 kek_id 派生 KEK 现解现用,内存用完即擦)。
+/// 会话级单 DEK(裁决写死,备选 = 每 part 随机 DEK):part nonce_base 照
+/// D-E6 由会话 DEK 确定性派生,同 part 重传 ⇒ 同密文同 ETag,重传幂等
+/// 与 SSE-C 同口径;每 part 随机 DEK 则重传 ETag 漂移 → Complete
+/// InvalidPart,是正确性回退,否决。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSseS3 {
+    /// 签发时的 KEK 代(轮换后旧代仍可由 seed 确定性派生,可读性不受影响;
+    /// Complete 落对象时按当时当前代重签对象级 DEK)。
+    pub kek_id: u32,
+    /// AES-256-GCM(KEK, 会话 DEK)包裹值(nonce‖ct‖tag 60B)。
+    pub wrapped_dek: Vec<u8>,
+}
+
 /// 分片上传会话(DESIGN §4.7;键 `u:{uploadId}`,桶索引 `m:{bucket}\0{uploadId}`)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MultipartSession {
@@ -96,6 +133,23 @@ pub struct MultipartSession {
     /// Create 时 x-amz-tagging 头携带的对象标签(M10 S1;Complete 时落到
     /// 对象。序列化尾部追加字段,decode_session 三读回退,存量会话按空表)。
     pub tags: Vec<(String, String)>,
+    /// Create 时 x-amz-checksum-algorithm 声明的算法(M11 C1-4 门禁补强;
+    /// Complete 按会话算法代算对象级 checksum——客户端未送复合头也落值,
+    /// AWS 口径。类型恒为算法默认类型:非默认组合在协议层 Create 显式
+    /// 拒绝,故无需落 ChecksumType。序列化尾部追加字段,decode_session
+    /// 四读回退,存量会话按 None)。
+    pub checksum_alg: Option<fs3_core::ChecksumAlgorithm>,
+    /// SSE-C 会话绑定(M11 E1-4,ADR-12 DE2):Create 携带 SSE-C 三头时落
+    /// key-MD5(base64 请求原文,UploadPart/UploadPartCopy/Complete 一致性
+    /// 校验与响应回显用)。**红线:只存 key-MD5,客户密钥本体零落盘**
+    /// (DE1;密钥每次请求自带)。序列化尾部追加字段,decode_session 五读
+    /// 回退,存量会话按 None(无 SSE)。
+    pub sse_key_md5: Option<String>,
+    /// SSE-S3 会话绑定(M11 K1-1,ADR-12 DS1):Create 的 SSE-S3 意愿
+    /// (显式 AES256 头或桶默认)落本字段;与 sse_key_md5 互斥(Create 处
+    /// 二选一,协议层判定)。序列化尾部追加字段,decode_session 六读回退,
+    /// 存量会话按 None。
+    pub sse_s3: Option<SessionSseS3>,
 }
 
 /// 当前 Unix 秒(会话时间戳用)。
@@ -107,6 +161,7 @@ fn now_ts() -> i64 {
 }
 
 impl MultipartSession {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         bucket: &str,
         key: &str,
@@ -114,6 +169,9 @@ impl MultipartSession {
         user_meta: Vec<(String, String)>,
         resp_headers: Vec<(String, String)>,
         tags: Vec<(String, String)>,
+        checksum_alg: Option<fs3_core::ChecksumAlgorithm>,
+        sse_key_md5: Option<String>,
+        sse_s3: Option<SessionSseS3>,
     ) -> Self {
         MultipartSession {
             bucket: bucket.to_string(),
@@ -127,12 +185,20 @@ impl MultipartSession {
             final_size: 0,
             final_mtime: 0,
             tags,
+            checksum_alg,
+            sse_key_md5,
+            sse_s3,
         }
     }
 }
 
 /// 分片元数据(键 `p:{uploadId}\0{part_no be32}`;数据在 extents 或 inline)。
 /// ADR-9:v2 起 `extents` 为段列表(Vec<Segment>)。
+/// ADR-12 D-E3(M11 C1-4):尾部追加 `checksum` 字段;decode_part 双读
+/// (旧值缺省 None),照 ObjectMeta v2→v3 / MultipartSession 先例,零迁移。
+/// M11 E1-4(ADR-12 D-E4):尾部再追加 `sse` 字段(SSE-C 分片独立加密的
+/// nonce_base + chunk_tags;Complete 重加密后对象级 SseInfo 落 ObjectMeta,
+/// 分片记录随即删除);decode_part 三读回退,存量分片按 None(未加密)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartMeta {
     pub size: u64,
@@ -140,6 +206,14 @@ pub struct PartMeta {
     pub mtime: i64,
     pub extents: Vec<Segment>,
     pub inline: Option<Vec<u8>>,
+    /// 分片 checksum(UploadPart 客户端提供算法时引擎边写边算落值;
+    /// None = 未提供)。Complete 逐分片比对与复合值重算的输入。
+    pub checksum: Option<fs3_core::ChecksumInfo>,
+    /// 分片 SSE-C 加密产物(M11 E1-4;DE2:每 part 独立加密,part 内
+    /// 64KiB 网格,inline 密文同口径;nonce_base 由 D-E6 确定性派生,
+    /// None = 未加密分片)。客户密钥零落盘——此处只有 nonce/tag/key_md5
+    /// 校验子(D-E5),无密钥材料。
+    pub sse: Option<fs3_core::SseInfo>,
 }
 
 impl PartMeta {
@@ -230,6 +304,14 @@ pub enum Op {
         name: String,
         state: fs3_core::VersioningState,
     },
+    /// 桶默认加密单事务读改写(M11 K1-2/K1-3,ADR-12 DS2/DS3;
+    /// Put/DeleteBucketEncryption 落地):只改写 BucketMeta.default_encryption
+    /// (D0 预留字段填充,不改结构),其余字段原样保留;桶不存在 →
+    /// NotFound。Delete 幂等(None → None 同样 Ok)。
+    BucketSetEncryption {
+        name: String,
+        default: Option<fs3_core::SseAlgorithm>,
+    },
     /// D9 桶级配置文档写入(M10 S1/S2/S7;值 = 规范化 XML;覆盖语义)。
     /// 桶不存在 → NotFound(与 BucketSetVersioning 同事务内校验)。
     BucketConfPut {
@@ -242,6 +324,18 @@ pub enum Op {
     BucketConfDelete {
         bucket: String,
         conf: BucketConf,
+    },
+    /// 生命周期规则单事务整体替换(M11 L1;ADR-12 DL1:读旧写新——
+    /// 事务内扫描 `r:{bucket}\0` 旧规则键全删,再逐条写入新规则;规则集
+    /// 为空 = 纯清除)。桶不存在 → NotFound。
+    LifecycleRulesReplace {
+        bucket: String,
+        rules: Vec<fs3_core::LifecycleRule>,
+    },
+    /// 生命周期规则整桶清除(幂等:无规则同样 Ok,DeleteBucketLifecycle-
+    /// Configuration 的 AWS 204 幂等语义)。桶不存在 → NotFound。
+    LifecycleRulesDelete {
+        bucket: String,
     },
     /// 对象标签单事务读改写(M10 S1;PutObjectTagging/DeleteObjectTagging
     /// 落地):`vk = None` → 未版本化单键 `o:{b}\0{k}`;`Some(vk)` → 版本键
@@ -465,10 +559,48 @@ fn decode<T: serde::de::DeserializeOwned>(v: &[u8]) -> Result<T> {
     postcard::from_bytes(v).map_err(|e| Error::Corrupt(format!("postcard decode: {e}")))
 }
 
+/// M11/L5 双读:LifecycleRule 值格式尾部追加 `legacy_prefix` 字段;新格式
+/// 优先,失败回退 L1 初版格式(legacy_prefix=false——存量规则均为 Filter
+/// 归一渲染形态)。照 decode_session 先例,零迁移。
+fn decode_lifecycle_rule(v: &[u8]) -> Result<fs3_core::LifecycleRule> {
+    /// L1 初版规则格式(无 legacy_prefix;L5 回退用)。
+    #[derive(serde::Deserialize)]
+    struct RuleV12 {
+        id: String,
+        status: fs3_core::LifecycleStatus,
+        filter: fs3_core::LifecycleFilter,
+        expiration: Option<fs3_core::LifecycleExpiration>,
+        noncurrent_expiration: Option<fs3_core::NoncurrentVersionExpiration>,
+        abort_incomplete_multipart: Option<fs3_core::AbortIncompleteMultipartUpload>,
+    }
+    match postcard::from_bytes::<fs3_core::LifecycleRule>(v) {
+        Ok(r) => Ok(r),
+        Err(_) => {
+            let old: RuleV12 = postcard::from_bytes(v)
+                .map_err(|e| Error::Corrupt(format!("postcard decode lifecycle rule: {e}")))?;
+            Ok(fs3_core::LifecycleRule {
+                id: old.id,
+                status: old.status,
+                filter: old.filter,
+                expiration: old.expiration,
+                noncurrent_expiration: old.noncurrent_expiration,
+                abort_incomplete_multipart: old.abort_incomplete_multipart,
+                legacy_prefix: false,
+            })
+        }
+    }
+}
+
 /// M9/C3 双读:MultipartSession 值格式尾部追加 `resp_headers` 字段;
 /// 新格式优先,失败回退 v1.0.0 格式(空表),存量会话保持可读。
 /// M10/S1:尾部再追加 `tags` 字段,回退链扩为三层(含 resp_headers 无
 /// tags 的 v1.1.0 格式 → tags 空表)。
+/// M11/C1-4 门禁补强:尾部再追加 `checksum_alg` 字段,回退链扩为四层
+/// (含 tags 无 checksum_alg 的 M11 初版格式 → checksum_alg None)。
+/// M11/E1-4:尾部再追加 `sse_key_md5` 字段,回退链扩为五层(含
+/// checksum_alg 无 sse_key_md5 的格式 → sse_key_md5 None = 无 SSE 会话)。
+/// M11/K1-1:尾部再追加 `sse_s3` 字段,回退链扩为六层(含 sse_key_md5 无
+/// sse_s3 的格式 → sse_s3 None = 无 SSE-S3 会话)。
 fn decode_session(v: &[u8]) -> Result<MultipartSession> {
     #[derive(serde::Serialize, serde::Deserialize)]
     struct LegacySession {
@@ -496,37 +628,230 @@ fn decode_session(v: &[u8]) -> Result<MultipartSession> {
         final_size: u64,
         final_mtime: i64,
     }
+    /// M11 初版会话格式(含 tags,无 checksum_alg;门禁补强回退用)。
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct SessionV12 {
+        bucket: String,
+        key: String,
+        content_type: String,
+        user_meta: Vec<(String, String)>,
+        resp_headers: Vec<(String, String)>,
+        created: i64,
+        completed: bool,
+        final_etag: [u8; 16],
+        final_size: u64,
+        final_mtime: i64,
+        tags: Vec<(String, String)>,
+    }
+    /// M11 E1-4 前会话格式(含 tags + checksum_alg,无 sse_key_md5;
+    /// E1-4 回退用)。
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct SessionV12b {
+        bucket: String,
+        key: String,
+        content_type: String,
+        user_meta: Vec<(String, String)>,
+        resp_headers: Vec<(String, String)>,
+        created: i64,
+        completed: bool,
+        final_etag: [u8; 16],
+        final_size: u64,
+        final_mtime: i64,
+        tags: Vec<(String, String)>,
+        checksum_alg: Option<fs3_core::ChecksumAlgorithm>,
+    }
+    /// M11 K1-1 前会话格式(含 sse_key_md5,无 sse_s3;K1-1 回退用)。
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct SessionV12c {
+        bucket: String,
+        key: String,
+        content_type: String,
+        user_meta: Vec<(String, String)>,
+        resp_headers: Vec<(String, String)>,
+        created: i64,
+        completed: bool,
+        final_etag: [u8; 16],
+        final_size: u64,
+        final_mtime: i64,
+        tags: Vec<(String, String)>,
+        checksum_alg: Option<fs3_core::ChecksumAlgorithm>,
+        sse_key_md5: Option<String>,
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn into_session(
+        bucket: String,
+        key: String,
+        content_type: String,
+        user_meta: Vec<(String, String)>,
+        resp_headers: Vec<(String, String)>,
+        created: i64,
+        completed: bool,
+        final_etag: [u8; 16],
+        final_size: u64,
+        final_mtime: i64,
+        tags: Vec<(String, String)>,
+        checksum_alg: Option<fs3_core::ChecksumAlgorithm>,
+        sse_key_md5: Option<String>,
+    ) -> MultipartSession {
+        MultipartSession {
+            bucket,
+            key,
+            content_type,
+            user_meta,
+            resp_headers,
+            created,
+            completed,
+            final_etag,
+            final_size,
+            final_mtime,
+            tags,
+            checksum_alg,
+            sse_key_md5,
+            sse_s3: None,
+        }
+    }
     match postcard::from_bytes::<MultipartSession>(v) {
         Ok(s) => Ok(s),
-        Err(_) => match postcard::from_bytes::<SessionV11>(v) {
-            Ok(s) => Ok(MultipartSession {
-                bucket: s.bucket,
-                key: s.key,
-                content_type: s.content_type,
-                user_meta: s.user_meta,
-                resp_headers: s.resp_headers,
-                created: s.created,
-                completed: s.completed,
-                final_etag: s.final_etag,
-                final_size: s.final_size,
-                final_mtime: s.final_mtime,
-                tags: Vec::new(),
+        Err(_) => match postcard::from_bytes::<SessionV12c>(v) {
+            Ok(s) => Ok(into_session(
+                s.bucket,
+                s.key,
+                s.content_type,
+                s.user_meta,
+                s.resp_headers,
+                s.created,
+                s.completed,
+                s.final_etag,
+                s.final_size,
+                s.final_mtime,
+                s.tags,
+                s.checksum_alg,
+                s.sse_key_md5,
+            )),
+            Err(_) => match postcard::from_bytes::<SessionV12b>(v) {
+                Ok(s) => Ok(into_session(
+                    s.bucket,
+                    s.key,
+                    s.content_type,
+                    s.user_meta,
+                    s.resp_headers,
+                    s.created,
+                    s.completed,
+                    s.final_etag,
+                    s.final_size,
+                    s.final_mtime,
+                    s.tags,
+                    s.checksum_alg,
+                    None,
+                )),
+                Err(_) => match postcard::from_bytes::<SessionV12>(v) {
+                    Ok(s) => Ok(into_session(
+                        s.bucket,
+                        s.key,
+                        s.content_type,
+                        s.user_meta,
+                        s.resp_headers,
+                        s.created,
+                        s.completed,
+                        s.final_etag,
+                        s.final_size,
+                        s.final_mtime,
+                        s.tags,
+                        None,
+                        None,
+                    )),
+                    Err(_) => match postcard::from_bytes::<SessionV11>(v) {
+                        Ok(s) => Ok(into_session(
+                            s.bucket,
+                            s.key,
+                            s.content_type,
+                            s.user_meta,
+                            s.resp_headers,
+                            s.created,
+                            s.completed,
+                            s.final_etag,
+                            s.final_size,
+                            s.final_mtime,
+                            Vec::new(),
+                            None,
+                            None,
+                        )),
+                        Err(_) => {
+                            let legacy: LegacySession = postcard::from_bytes(v).map_err(|e| {
+                                Error::Corrupt(format!("postcard decode session: {e}"))
+                            })?;
+                            Ok(into_session(
+                                legacy.bucket,
+                                legacy.key,
+                                legacy.content_type,
+                                legacy.user_meta,
+                                Vec::new(),
+                                legacy.created,
+                                legacy.completed,
+                                legacy.final_etag,
+                                legacy.final_size,
+                                legacy.final_mtime,
+                                Vec::new(),
+                                None,
+                                None,
+                            ))
+                        }
+                    },
+                },
+            },
+        },
+    }
+}
+
+/// M11 C1-4 双读(ADR-12 D-E3):PartMeta 值尾部追加 `checksum` 字段;
+/// 新格式优先,失败回退无 checksum 旧格式(补 None),存量分片零迁移
+/// 读取(回退仅发生在尾部字段缺失——旧值解码新结构恒因字节不足失败,
+/// 不会误判;照 decode_session / ObjectMeta v2→v3 先例)。
+/// M11 E1-4(ADR-12 D-E4):尾部再追加 `sse` 字段,回退链扩为三层(含
+/// checksum 无 sse 的格式 → sse None = 未加密分片)。
+fn decode_part(v: &[u8]) -> Result<PartMeta> {
+    /// 旧格式(v1.1.0;无 checksum/sse 尾部字段;双读回退用)。
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct LegacyPartMeta {
+        size: u64,
+        etag: [u8; 16],
+        mtime: i64,
+        extents: Vec<Segment>,
+        inline: Option<Vec<u8>>,
+    }
+    /// M11 E1-4 前分片格式(含 checksum,无 sse;E1-4 回退用)。
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct PartMetaV12 {
+        size: u64,
+        etag: [u8; 16],
+        mtime: i64,
+        extents: Vec<Segment>,
+        inline: Option<Vec<u8>>,
+        checksum: Option<fs3_core::ChecksumInfo>,
+    }
+    match postcard::from_bytes::<PartMeta>(v) {
+        Ok(p) => Ok(p),
+        Err(_) => match postcard::from_bytes::<PartMetaV12>(v) {
+            Ok(p) => Ok(PartMeta {
+                size: p.size,
+                etag: p.etag,
+                mtime: p.mtime,
+                extents: p.extents,
+                inline: p.inline,
+                checksum: p.checksum,
+                sse: None,
             }),
             Err(_) => {
-                let legacy: LegacySession = postcard::from_bytes(v)
-                    .map_err(|e| Error::Corrupt(format!("postcard decode session: {e}")))?;
-                Ok(MultipartSession {
-                    bucket: legacy.bucket,
-                    key: legacy.key,
-                    content_type: legacy.content_type,
-                    user_meta: legacy.user_meta,
-                    resp_headers: Vec::new(),
-                    created: legacy.created,
-                    completed: legacy.completed,
-                    final_etag: legacy.final_etag,
-                    final_size: legacy.final_size,
-                    final_mtime: legacy.final_mtime,
-                    tags: Vec::new(),
+                let l: LegacyPartMeta = postcard::from_bytes(v)
+                    .map_err(|e| Error::Corrupt(format!("postcard decode part meta: {e}")))?;
+                Ok(PartMeta {
+                    size: l.size,
+                    etag: l.etag,
+                    mtime: l.mtime,
+                    extents: l.extents,
+                    inline: l.inline,
+                    checksum: None,
+                    sse: None,
                 })
             }
         },
@@ -611,7 +936,7 @@ pub struct RawObjectEntry {
     pub key: String,
     /// None = 未版本化单键;Some = 版本条目(含 VK_NULL 槽与删除标记)。
     pub vk: Option<[u8; 16]>,
-    /// 值首字节(ADR-9 §13 版本字节;现存合法值 = 2/3)。
+    /// 值首字节(ADR-9 §13 版本字节;现存合法值 = 2/3/4)。
     pub value_version: u8,
     pub meta: ObjectMeta,
 }
@@ -875,6 +1200,51 @@ impl MetaStore {
             out.push((key, vk, decode_object(&v)?));
         }
         Ok(out)
+    }
+
+    /// 桶对象条目分页扫描(M11 L2-2 生命周期执行器底座;ADR-12 DL3 全量
+    /// 扫描的分块形态,避免 list_object_entries 整桶物化):双形态条目键序
+    /// 升序(同 key 组内:遗留单键 → 真实 vk 升序 → null 槽)。
+    ///
+    /// `cursor` = 上一页最后返回的条目(严格大于续扫;None = 桶首)。
+    /// 游标条目被并发删除时从其后最近条目续扫,不重复不遗漏。返回
+    /// (entries, done):done = 桶内已无更多条目。`limit` 下限钳为 1。
+    pub fn scan_object_entries_page(
+        &self,
+        bucket: &str,
+        cursor: Option<&(String, Option<[u8; 16]>)>,
+        limit: usize,
+    ) -> Result<(Vec<ObjectEntry>, bool)> {
+        let limit = limit.max(1);
+        let base = object_prefix(bucket);
+        let start = match cursor {
+            Some((key, Some(vk))) => object_version_key(bucket, key, vk),
+            Some((key, None)) => object_key(bucket, key),
+            None => base.clone(),
+        };
+        let mut out = Vec::new();
+        let mut done = true;
+        for item in self
+            .db
+            .iterator(IteratorMode::From(start.as_slice(), Direction::Forward))
+        {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(&base) {
+                break;
+            }
+            // 游标语义 = 严格大于:首条命中若即游标条目本身则跳过
+            if cursor.is_some() && out.is_empty() && k.as_ref() == start.as_slice() {
+                continue;
+            }
+            if out.len() >= limit {
+                done = false;
+                break;
+            }
+            let (b, key, vk) = parse_object_version_key(&k)?;
+            debug_assert_eq!(b, bucket);
+            out.push((key, vk, decode_object(&v)?));
+        }
+        Ok((out, done))
     }
 
     pub fn list_buckets(&self) -> Result<Vec<(String, BucketMeta)>> {
@@ -1481,6 +1851,72 @@ impl MetaStore {
         Ok(salt.to_vec())
     }
 
+    // —— SSE-S3 KEK 体系(M11 K1-1,ADR-12 DS1) ——
+
+    /// 读 KEK 种子(不存在 → 生成 64 字节随机并持久化,返回;幂等,
+    /// 与 key_seed_salt 相互独立)。**红线:seed 及其派生 KEK/DEK 明文
+    /// 零导出、零日志、永不下发**;本访问器是唯一出口,返回值不出引擎域。
+    pub fn sse_kek_seed(&self) -> Result<[u8; 64]> {
+        if let Some(v) = self.db.get(SYS_SSE_KEK_SEED).map_err(rocks_err)? {
+            return v.as_slice().try_into().map_err(|_| {
+                Error::Corrupt(format!("sse kek seed must be 64 bytes, got {}", v.len()))
+            });
+        }
+        let mut seed = [0u8; 64];
+        fs3_core::random_bytes(&mut seed)?;
+        // 直写 + fsync(照 seed_salt 先例;调用点均持引擎写锁/单点,幂等)
+        self.db.put(SYS_SSE_KEK_SEED, seed).map_err(rocks_err)?;
+        self.db.flush_wal(true).map_err(rocks_err)?;
+        Ok(seed)
+    }
+
+    /// 当前 KEK 代状态(键缺席 = 初始代 1,惰性不落盘;rewrap_done_gen
+    /// 缺席时 = gen,即「无需重包裹」)。
+    pub fn sse_kek_gen_state(&self) -> Result<SseKekGenState> {
+        match self.db.get(SYS_SSE_KEK_GEN).map_err(rocks_err)? {
+            Some(v) => decode(&v),
+            None => Ok(SseKekGenState {
+                gen: 1,
+                last_rotated_at: 0,
+                rewrap_done_gen: 1,
+            }),
+        }
+    }
+
+    /// 写 KEK 代状态(直写 + fsync,同 seed_salt 先例;调用方持引擎写锁)。
+    fn put_sse_kek_gen_state(&self, st: &SseKekGenState) -> Result<()> {
+        self.db
+            .put(SYS_SSE_KEK_GEN, encode(st)?)
+            .map_err(rocks_err)?;
+        self.db.flush_wal(true).map_err(rocks_err)
+    }
+
+    /// KEK 轮换(DS1):gen+1 落盘(last_rotated_at = 当前秒;
+    /// rewrap_done_gen 不动 —— 与 gen 拉开差距即「重包裹待办」标记,
+    /// 后台重包裹完成后由 mark_sse_rewrap_done 收敛)。返回新状态。
+    pub fn rotate_sse_kek(&self) -> Result<SseKekGenState> {
+        let cur = self.sse_kek_gen_state()?;
+        let next = SseKekGenState {
+            gen: cur
+                .gen
+                .checked_add(1)
+                .ok_or_else(|| Error::InvalidArgument("sse kek generation overflow".into()))?,
+            last_rotated_at: now_ts(),
+            rewrap_done_gen: cur.rewrap_done_gen,
+        };
+        self.put_sse_kek_gen_state(&next)?;
+        Ok(next)
+    }
+
+    /// 重包裹完成收敛(rewrap_done_gen = gen;幂等)。
+    pub fn mark_sse_rewrap_done(&self, gen: u32) -> Result<()> {
+        let cur = self.sse_kek_gen_state()?;
+        self.put_sse_kek_gen_state(&SseKekGenState {
+            rewrap_done_gen: gen,
+            ..cur
+        })
+    }
+
     /// 桶版本化状态更新(单事务读改写;l: location 等其余字段不动;
     /// V3 PutBucketVersioning 落地路径)。
     pub fn commit_bucket_set_versioning(
@@ -1491,6 +1927,19 @@ impl MetaStore {
         self.commit(&[Op::BucketSetVersioning {
             name: name.to_string(),
             state,
+        }])
+    }
+
+    /// 桶默认加密更新(M11 K1-2;单事务读改写,其余字段不动;
+    /// Put/DeleteBucketEncryption 落地路径)。
+    pub fn commit_bucket_set_encryption(
+        &self,
+        name: &str,
+        default: Option<fs3_core::SseAlgorithm>,
+    ) -> Result<u64> {
+        self.commit(&[Op::BucketSetEncryption {
+            name: name.to_string(),
+            default,
         }])
     }
 
@@ -1520,6 +1969,39 @@ impl MetaStore {
         self.commit(&[Op::BucketConfDelete {
             bucket: bucket.to_string(),
             conf,
+        }])
+    }
+
+    // —— 生命周期规则(M11 L1;ADR-12 DL1 `r:` 键) ——
+
+    /// 读桶生命周期规则集(按 `r:{bucket}\0` 前缀扫描;规则序 = rule_id
+    /// 字典序——每规则一键的存储形态不保留提交序,执行器 L2-2 对顺序
+    /// 不敏感;无规则/桶不存在 → 空表,桶存在性判定归协议层)。
+    pub fn get_lifecycle_rules(&self, bucket: &str) -> Result<Vec<fs3_core::LifecycleRule>> {
+        let mut rules = Vec::new();
+        for item in scan_prefix(&self.db, &lifecycle_rules_prefix(bucket)) {
+            let (_k, v) = item?;
+            rules.push(decode_lifecycle_rule(&v)?);
+        }
+        Ok(rules)
+    }
+
+    /// 生命周期规则整体替换(单事务读旧写新;桶不存在 → NotFound)。
+    pub fn put_lifecycle_rules(
+        &self,
+        bucket: &str,
+        rules: &[fs3_core::LifecycleRule],
+    ) -> Result<u64> {
+        self.commit(&[Op::LifecycleRulesReplace {
+            bucket: bucket.to_string(),
+            rules: rules.to_vec(),
+        }])
+    }
+
+    /// 生命周期规则整桶清除(幂等:无规则同样 Ok;桶不存在 → NotFound)。
+    pub fn delete_lifecycle_rules(&self, bucket: &str) -> Result<u64> {
+        self.commit(&[Op::LifecycleRulesDelete {
+            bucket: bucket.to_string(),
         }])
     }
 
@@ -1851,20 +2333,23 @@ impl MetaStore {
         Ok(out)
     }
 
-    /// 值版本字节只读探测(M10 V5-3):统计 o: 前缀下 v2/v3 值数量,
-    /// 返回 (v2, v3)。只读首字节、不解码(供重写前后断言与引擎启动
-    /// 警告);首字节非 2/3 的值(无版本字节的旧布局值,ADR-9 已放弃
-    /// 前置兼容)→ Corrupt。
+    /// 值版本字节只读探测(M10 V5-3):统计 o: 前缀下 v2 与当前可读格式
+    /// (v3/v4)值数量,返回 (v2, current)。只读首字节、不解码(供重写
+    /// 前后断言与引擎启动警告);首字节非 2/3/4 的值(无版本字节的旧布局
+    /// 值,ADR-9 已放弃前置兼容)→ Corrupt。
     pub fn count_object_value_versions(&self) -> Result<(u64, u64)> {
         let snap = self.db.snapshot();
-        let (mut v2, mut v3) = (0u64, 0u64);
+        let (mut v2, mut cur) = (0u64, 0u64);
         for item in snap.iterator(IteratorMode::From(PREFIX_OBJECT, Direction::Forward)) {
             let (k, v) = item.map_err(rocks_err)?;
             if !k.starts_with(PREFIX_OBJECT) {
                 break;
             }
             match v.first() {
-                Some(&fs3_core::OBJECT_META_VERSION) => v3 += 1,
+                Some(&fs3_core::OBJECT_META_VERSION) => cur += 1,
+                // v3 存量值双读可读(无需重写即合法;重写工具会顺手归一到
+                // 当前版本),与当前版本同桶计数
+                Some(&fs3_core::OBJECT_META_VERSION_V3) => cur += 1,
                 Some(&2) => v2 += 1,
                 other => {
                     return Err(Error::Corrupt(format!(
@@ -1873,7 +2358,7 @@ impl MetaStore {
                 }
             }
         }
-        Ok((v2, v3))
+        Ok((v2, cur))
     }
 
     /// 值格式 v2→v3 重写完成标记(DESIGN-FUTURE §2.4:重写完成前禁回滚)。
@@ -1936,7 +2421,7 @@ impl MetaStore {
                 return Err(Error::Corrupt("part key malformed".into()));
             }
             let part_no = u32::from_be_bytes(no.try_into().unwrap());
-            out.push((uid, part_no, decode(&v)?));
+            out.push((uid, part_no, decode_part(&v)?));
         }
         Ok(out)
     }
@@ -1994,7 +2479,8 @@ impl MetaStore {
             .get(part_key(upload_id, part_no))
             .map_err(rocks_err)?
         {
-            Some(v) => Ok(Some(decode(&v)?)),
+            // M11 C1-4 双读(存量分片值无 checksum 尾部字段)
+            Some(v) => Ok(Some(decode_part(&v)?)),
             None => Ok(None),
         }
     }
@@ -2006,7 +2492,7 @@ impl MetaStore {
         for item in scan_prefix(&self.db, &prefix) {
             let (k, v) = item?;
             let part_no = parse_part_key(&k)?;
-            out.push((part_no, decode(&v)?));
+            out.push((part_no, decode_part(&v)?));
         }
         Ok(out)
     }
@@ -2022,7 +2508,7 @@ impl MetaStore {
                     .to_vec(),
             )
             .map_err(|_| Error::Corrupt("upload id not utf8".into()))?;
-            out.push((uid, decode(&v)?));
+            out.push((uid, decode_session(&v)?));
         }
         Ok(out)
     }
@@ -2165,6 +2651,26 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
     fn tremove(tx: &Transaction<OptimisticTransactionDB>, key: &[u8]) -> Result<()> {
         tx.delete(key).map_err(rocks_err)
     }
+    /// 事务内枚举桶生命周期规则键(M11 L1;`r:{bucket}\0` 前缀)。
+    /// 冲突集纪律:r: 键域的全部写路径(本函数调用方各事务臂)都先
+    /// tget(b:{bucket}) 锚定桶记录,乐观冲突经桶键检出重试;迭代器读
+    /// 本身不入乐观事务冲突集,不得脱离桶键锚点使用。
+    fn tscan_lifecycle_rule_keys(
+        tx: &Transaction<OptimisticTransactionDB>,
+        bucket: &str,
+    ) -> Result<Vec<Vec<u8>>> {
+        let prefix = lifecycle_rules_prefix(bucket);
+        let mut keys = Vec::new();
+        let mut it = tx.iterator(IteratorMode::From(&prefix, Direction::Forward));
+        for item in &mut it {
+            let (k, _v) = item.map_err(rocks_err)?;
+            if !k.starts_with(&prefix) {
+                break;
+            }
+            keys.push(k.to_vec());
+        }
+        Ok(keys)
+    }
 
     // 单点序列化:读 s:seq → 写 s:seq+1;并发事务在提交时冲突并重试
     let cur = tget(tx, SYS_SEQ)?
@@ -2201,12 +2707,24 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
                 for conf in BucketConf::ALL {
                     tremove(tx, &conf.key(name))?;
                 }
+                // M11 L1(ADR-12 DL1):生命周期规则两段式键,前缀扫描清理
+                // (三处联动之二;BucketConf::ALL 仅覆盖单段式配置键)
+                for rk in tscan_lifecycle_rule_keys(tx, name)? {
+                    tremove(tx, &rk)?;
+                }
             }
             Op::BucketSetVersioning { name, state } => {
                 let k = bucket_key(name);
                 let cur = tget(tx, &k)?.ok_or_else(|| Error::NotFound(format!("bucket {name}")))?;
                 let mut meta = decode_bucket(&cur)?;
                 meta.versioning = *state;
+                tinsert(tx, k, meta.encode_value()?)?;
+            }
+            Op::BucketSetEncryption { name, default } => {
+                let k = bucket_key(name);
+                let cur = tget(tx, &k)?.ok_or_else(|| Error::NotFound(format!("bucket {name}")))?;
+                let mut meta = decode_bucket(&cur)?;
+                meta.default_encryption = *default;
                 tinsert(tx, k, meta.encode_value()?)?;
             }
             Op::BucketConfPut {
@@ -2226,6 +2744,32 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
                     return Err(Error::NotFound(format!("bucket {bucket}")));
                 }
                 tremove(tx, &conf.key(bucket))?;
+            }
+            Op::LifecycleRulesReplace { bucket, rules } => {
+                if tget(tx, &bucket_key(bucket))?.is_none() {
+                    return Err(Error::NotFound(format!("bucket {bucket}")));
+                }
+                // DL1 单事务整体替换:旧规则键(前缀枚举)全删 → 新规则逐条写
+                for old in tscan_lifecycle_rule_keys(tx, bucket)? {
+                    tremove(tx, &old)?;
+                }
+                for r in rules {
+                    tinsert(
+                        tx,
+                        lifecycle_rule_key(bucket, &r.id),
+                        encode(r).map_err(|e| {
+                            Error::Meta(format!("lifecycle rule {} encode: {e}", r.id))
+                        })?,
+                    )?;
+                }
+            }
+            Op::LifecycleRulesDelete { bucket } => {
+                if tget(tx, &bucket_key(bucket))?.is_none() {
+                    return Err(Error::NotFound(format!("bucket {bucket}")));
+                }
+                for old in tscan_lifecycle_rule_keys(tx, bucket)? {
+                    tremove(tx, &old)?;
+                }
             }
             Op::ObjectSetTags {
                 bucket,
@@ -2299,7 +2843,7 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
                         "part {part_no} of upload {upload_id} deleted during compaction"
                     ))
                 })?;
-                let mut meta: PartMeta = decode(&cur)?;
+                let mut meta: PartMeta = decode_part(&cur)?;
                 if old_segments.len() != new_segments.len() {
                     return Err(Error::ObjectChanged(format!(
                         "part {part_no} of upload {upload_id} segment mapping mismatch"
@@ -2540,6 +3084,7 @@ mod tests {
             checksum: None,
             retention: None,
             legal_hold: false,
+            part_checksums: Vec::new(),
         }
     }
 
@@ -2624,6 +3169,152 @@ mod tests {
                 "{conf:?} 删桶后残留"
             );
         }
+    }
+
+    /// M11 L1(ADR-12 DL1):生命周期规则三原语——整体替换语义、删桶
+    /// 事务清理、两桶前缀隔离。
+    #[test]
+    fn lifecycle_rules_replace_delete_and_bucket_cleanup() {
+        use fs3_core::{
+            AbortIncompleteMultipartUpload, LifecycleExpiration, LifecycleFilter, LifecycleRule,
+            LifecycleStatus,
+        };
+        let rule = |id: &str, days: u32| LifecycleRule {
+            id: id.into(),
+            status: LifecycleStatus::Enabled,
+            filter: LifecycleFilter::default(),
+            expiration: Some(LifecycleExpiration {
+                days: Some(days),
+                date: None,
+                expired_object_delete_marker: false,
+            }),
+            noncurrent_expiration: None,
+            abort_incomplete_multipart: None,
+            legacy_prefix: false,
+        };
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        s.commit_bucket_put("b2", &bucket_meta("b2")).unwrap();
+        // 无规则 → 空表;不存在桶写入 → NotFound
+        assert_eq!(s.get_lifecycle_rules("b1").unwrap(), vec![]);
+        assert!(s.put_lifecycle_rules("ghost", &[rule("r1", 30)]).is_err());
+        assert!(s.delete_lifecycle_rules("ghost").is_err());
+        // 写入两条(b1),b2 一条:前缀隔离
+        s.put_lifecycle_rules("b1", &[rule("r1", 30), rule("r2", 60)])
+            .unwrap();
+        s.put_lifecycle_rules(
+            "b2",
+            &[LifecycleRule {
+                id: "x".into(),
+                abort_incomplete_multipart: Some(AbortIncompleteMultipartUpload {
+                    days_after_initiation: 7,
+                }),
+                expiration: None,
+                ..rule("x", 0)
+            }],
+        )
+        .unwrap();
+        let got = s.get_lifecycle_rules("b1").unwrap();
+        assert_eq!(got, vec![rule("r1", 30), rule("r2", 60)]);
+        assert_eq!(s.get_lifecycle_rules("b2").unwrap().len(), 1);
+        assert_eq!(
+            s.get_lifecycle_rules("b2").unwrap()[0]
+                .abort_incomplete_multipart
+                .unwrap()
+                .days_after_initiation,
+            7
+        );
+        // 整体替换:r1 删除、r2 改写、r3 新增,单事务完成
+        s.put_lifecycle_rules("b1", &[rule("r2", 90), rule("r3", 1)])
+            .unwrap();
+        assert_eq!(
+            s.get_lifecycle_rules("b1").unwrap(),
+            vec![rule("r2", 90), rule("r3", 1)],
+            "替换后不得残留 r1"
+        );
+        // b2 不受 b1 替换影响
+        assert_eq!(s.get_lifecycle_rules("b2").unwrap().len(), 1);
+        // delete 幂等;不影响 b2
+        s.delete_lifecycle_rules("b1").unwrap();
+        assert_eq!(s.get_lifecycle_rules("b1").unwrap(), vec![]);
+        s.delete_lifecycle_rules("b1").unwrap();
+        assert_eq!(s.get_lifecycle_rules("b2").unwrap().len(), 1);
+        // 删桶 → r: 键同事务清理;再建同名桶无残留
+        s.put_lifecycle_rules("b1", &[rule("r1", 30)]).unwrap();
+        s.commit_bucket_delete("b1").unwrap();
+        assert_eq!(s.get_lifecycle_rules("b1").unwrap(), vec![]);
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        assert_eq!(
+            s.get_lifecycle_rules("b1").unwrap(),
+            vec![],
+            "删桶后规则必须随桶清理"
+        );
+        assert_eq!(s.get_lifecycle_rules("b2").unwrap().len(), 1);
+    }
+
+    /// M11 L5:LifecycleRule 尾部追加 `legacy_prefix`——新格式往返 +
+    /// L1 初版格式字节直写回退(false,存量规则零迁移可读)。
+    #[test]
+    fn lifecycle_rule_legacy_prefix_dual_read() {
+        use fs3_core::{
+            AbortIncompleteMultipartUpload, LifecycleExpiration, LifecycleFilter, LifecycleRule,
+            LifecycleStatus, NoncurrentVersionExpiration,
+        };
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        let rule = LifecycleRule {
+            id: "r1".into(),
+            status: LifecycleStatus::Enabled,
+            filter: LifecycleFilter {
+                prefix: "old/".into(),
+                tags: vec![],
+            },
+            expiration: Some(LifecycleExpiration {
+                days: Some(30),
+                date: None,
+                expired_object_delete_marker: false,
+            }),
+            noncurrent_expiration: None,
+            abort_incomplete_multipart: None,
+            legacy_prefix: true,
+        };
+        s.put_lifecycle_rules("b1", std::slice::from_ref(&rule))
+            .unwrap();
+        assert_eq!(
+            s.get_lifecycle_rules("b1").unwrap(),
+            vec![rule],
+            "新格式往返(legacy_prefix 原样)"
+        );
+        // L1 初版格式字节(无 legacy_prefix 尾部)直写 → 回退 false
+        #[derive(serde::Serialize)]
+        struct RuleV12 {
+            id: String,
+            status: LifecycleStatus,
+            filter: LifecycleFilter,
+            expiration: Option<LifecycleExpiration>,
+            noncurrent_expiration: Option<NoncurrentVersionExpiration>,
+            abort_incomplete_multipart: Option<AbortIncompleteMultipartUpload>,
+        }
+        let old = RuleV12 {
+            id: "r2".into(),
+            status: LifecycleStatus::Enabled,
+            filter: LifecycleFilter::default(),
+            expiration: Some(LifecycleExpiration {
+                days: Some(7),
+                date: None,
+                expired_object_delete_marker: false,
+            }),
+            noncurrent_expiration: None,
+            abort_incomplete_multipart: None,
+        };
+        let bytes = postcard::to_allocvec(&old).unwrap();
+        s.db.put(lifecycle_rule_key("b1", "r2"), &bytes)
+            .map_err(rocks_err)
+            .unwrap();
+        let got = s.get_lifecycle_rules("b1").unwrap();
+        let r2 = got.iter().find(|r| r.id == "r2").unwrap();
+        assert!(!r2.legacy_prefix, "初版格式值回退 legacy_prefix=false");
+        assert_eq!(r2.expiration.as_ref().unwrap().days, Some(7));
     }
 
     #[test]
@@ -3127,8 +3818,11 @@ mod tests {
             assert_eq!((b, k, v), (e.bucket.clone(), e.key.clone(), e.vk));
         }
         let v2 = raw.iter().filter(|e| e.value_version == 2).count();
-        let v3 = raw.iter().filter(|e| e.value_version == 3).count();
-        assert_eq!((v2, v3), (1, 2));
+        let cur = raw
+            .iter()
+            .filter(|e| e.value_version == fs3_core::OBJECT_META_VERSION)
+            .count();
+        assert_eq!((v2, cur), (1, 2));
         assert_eq!(s.count_object_value_versions().unwrap(), (1, 2));
 
         // 完成标记:未落 → false;落 → true(幂等)
@@ -3219,7 +3913,17 @@ mod tests {
         let uid = "upload-1";
         s.create_multipart(
             uid,
-            &MultipartSession::new("b1", "big", "text/x", vec![], vec![], vec![]),
+            &MultipartSession::new(
+                "b1",
+                "big",
+                "text/x",
+                vec![],
+                vec![],
+                vec![],
+                None,
+                None,
+                None,
+            ),
         )
         .unwrap();
         let part = PartMeta {
@@ -3233,6 +3937,8 @@ mod tests {
                 crcs: vec![],
             }],
             inline: None,
+            checksum: None,
+            sse: None,
         };
         s.put_part(uid, 1, &part, AllocDraft::default()).unwrap();
         let objs = s.snapshot_all_objects().unwrap();
@@ -3243,6 +3949,319 @@ mod tests {
         assert_eq!(parts[0].0, uid);
         assert_eq!(parts[0].1, 1);
         assert_eq!(parts[0].2.extents, part.extents);
+    }
+
+    #[test]
+    fn part_meta_checksum_dual_read() {
+        // M11 C1-4(ADR-12 D-E3):PartMeta 尾部追加 checksum;新格式往返 +
+        // 旧格式字节(无 checksum 字段)双读缺省 None。
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        let uid = "up-ck";
+        s.create_multipart(
+            uid,
+            &MultipartSession::new(
+                "b1",
+                "m",
+                "text/x",
+                vec![],
+                vec![],
+                vec![],
+                None,
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        let ck = fs3_core::ChecksumInfo {
+            algorithm: fs3_core::ChecksumAlgorithm::Crc32c,
+            value: vec![0xde, 0xad, 0xbe, 0xef],
+        };
+        let part = PartMeta {
+            size: 5,
+            etag: [7u8; 16],
+            mtime: 1,
+            extents: vec![],
+            inline: Some(vec![1u8; 5]),
+            checksum: Some(ck.clone()),
+            sse: None,
+        };
+        s.put_part(uid, 1, &part, AllocDraft::default()).unwrap();
+        // 新格式往返(checksum 原样)
+        let got = s.get_part(uid, 1).unwrap().unwrap();
+        assert_eq!(got, part);
+        assert_eq!(s.list_parts(uid).unwrap()[0].1.checksum, Some(ck));
+
+        // 旧格式字节(无 checksum 尾部字段)直写 → 双读补 None
+        #[derive(serde::Serialize)]
+        struct LegacyPartMeta {
+            size: u64,
+            etag: [u8; 16],
+            mtime: i64,
+            extents: Vec<Segment>,
+            inline: Option<Vec<u8>>,
+        }
+        let legacy = LegacyPartMeta {
+            size: 9,
+            etag: [2u8; 16],
+            mtime: 3,
+            extents: vec![],
+            inline: Some(vec![0u8; 9]),
+        };
+        let bytes = postcard::to_allocvec(&legacy).unwrap();
+        s.db.put(part_key(uid, 2), &bytes)
+            .map_err(rocks_err)
+            .unwrap();
+        let got = s.get_part(uid, 2).unwrap().unwrap();
+        assert_eq!(got.size, 9);
+        assert_eq!(got.checksum, None, "旧格式值双读缺省 None");
+        // 截断损坏值 → Corrupt(两种格式都失败),不静默
+        assert!(matches!(
+            decode_part(&bytes[..bytes.len() - 2]),
+            Err(Error::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn part_meta_sse_dual_read() {
+        // M11 E1-4(ADR-12 D-E4):PartMeta 尾部再追加 sse;新格式往返 +
+        // 中间格式字节(含 checksum 无 sse)三读缺省 None。
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        let uid = "up-sse";
+        s.create_multipart(
+            uid,
+            &MultipartSession::new(
+                "b1",
+                "m",
+                "text/x",
+                vec![],
+                vec![],
+                vec![],
+                None,
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        let sse = fs3_core::SseInfo::sse_c([0xAB; 12], vec![[0x11; 16], [0x22; 16]], [0x5C; 16]);
+        let part = PartMeta {
+            size: 5,
+            etag: [7u8; 16],
+            mtime: 1,
+            extents: vec![],
+            inline: Some(vec![1u8; 5]),
+            checksum: None,
+            sse: Some(sse.clone()),
+        };
+        s.put_part(uid, 1, &part, AllocDraft::default()).unwrap();
+        // 新格式往返(sse 原样)
+        let got = s.get_part(uid, 1).unwrap().unwrap();
+        assert_eq!(got, part);
+        assert_eq!(got.sse, Some(sse));
+
+        // 中间格式字节(checksum 层,无 sse 尾部)直写 → 三读补 None
+        #[derive(serde::Serialize)]
+        struct PartMetaV12 {
+            size: u64,
+            etag: [u8; 16],
+            mtime: i64,
+            extents: Vec<Segment>,
+            inline: Option<Vec<u8>>,
+            checksum: Option<fs3_core::ChecksumInfo>,
+        }
+        let mid = PartMetaV12 {
+            size: 7,
+            etag: [3u8; 16],
+            mtime: 2,
+            extents: vec![],
+            inline: Some(vec![0u8; 7]),
+            checksum: None,
+        };
+        let bytes = postcard::to_allocvec(&mid).unwrap();
+        s.db.put(part_key(uid, 2), &bytes)
+            .map_err(rocks_err)
+            .unwrap();
+        let got = s.get_part(uid, 2).unwrap().unwrap();
+        assert_eq!(got.size, 7);
+        assert_eq!(got.sse, None, "中间格式值三读缺省 None");
+    }
+
+    #[test]
+    fn session_sse_key_md5_dual_read() {
+        // M11 E1-4:MultipartSession 尾部再追加 sse_key_md5;新格式往返 +
+        // 中间格式字节(含 checksum_alg 无 sse_key_md5)五读缺省 None;
+        // 会话只存 key-MD5(客户密钥本体零落盘,DE1 红线)。
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        let sess = MultipartSession::new(
+            "b1",
+            "m",
+            "text/x",
+            vec![],
+            vec![],
+            vec![],
+            None,
+            Some("1B2M2Y8AsgTpgAmY7PhCfg==".to_string()),
+            None,
+        );
+        s.create_multipart("up-1", &sess).unwrap();
+        let got = s.get_multipart("up-1").unwrap().unwrap();
+        assert_eq!(got, sess, "新格式往返(sse_key_md5 原样)");
+
+        // 中间格式字节(checksum_alg 层,无 sse_key_md5 尾部)直写 → 五读补 None
+        #[derive(serde::Serialize)]
+        struct SessionV12b {
+            bucket: String,
+            key: String,
+            content_type: String,
+            user_meta: Vec<(String, String)>,
+            resp_headers: Vec<(String, String)>,
+            created: i64,
+            completed: bool,
+            final_etag: [u8; 16],
+            final_size: u64,
+            final_mtime: i64,
+            tags: Vec<(String, String)>,
+            checksum_alg: Option<fs3_core::ChecksumAlgorithm>,
+        }
+        let mid = SessionV12b {
+            bucket: "b1".into(),
+            key: "m".into(),
+            content_type: "text/x".into(),
+            user_meta: vec![],
+            resp_headers: vec![],
+            created: 1,
+            completed: false,
+            final_etag: [0u8; 16],
+            final_size: 0,
+            final_mtime: 0,
+            tags: vec![],
+            checksum_alg: None,
+        };
+        let bytes = postcard::to_allocvec(&mid).unwrap();
+        s.db.put(session_key("up-2"), &bytes)
+            .map_err(rocks_err)
+            .unwrap();
+        let got = s.get_multipart("up-2").unwrap().unwrap();
+        assert_eq!(got.sse_key_md5, None, "中间格式值五读缺省 None");
+
+        // M11 K1-1:sse_s3 尾部字段——新格式往返 + V12c 中间格式(含
+        // sse_key_md5 无 sse_s3)六读缺省 None
+        let sess_s3 = MultipartSession {
+            sse_s3: Some(SessionSseS3 {
+                kek_id: 2,
+                wrapped_dek: vec![0xAB; 60],
+            }),
+            ..sess.clone()
+        };
+        s.create_multipart("up-3", &sess_s3).unwrap();
+        let got = s.get_multipart("up-3").unwrap().unwrap();
+        assert_eq!(got, sess_s3, "新格式往返(sse_s3 原样)");
+        #[derive(serde::Serialize)]
+        struct SessionV12c {
+            bucket: String,
+            key: String,
+            content_type: String,
+            user_meta: Vec<(String, String)>,
+            resp_headers: Vec<(String, String)>,
+            created: i64,
+            completed: bool,
+            final_etag: [u8; 16],
+            final_size: u64,
+            final_mtime: i64,
+            tags: Vec<(String, String)>,
+            checksum_alg: Option<fs3_core::ChecksumAlgorithm>,
+            sse_key_md5: Option<String>,
+        }
+        let midc = SessionV12c {
+            bucket: "b1".into(),
+            key: "m".into(),
+            content_type: "text/x".into(),
+            user_meta: vec![],
+            resp_headers: vec![],
+            created: 1,
+            completed: false,
+            final_etag: [0u8; 16],
+            final_size: 0,
+            final_mtime: 0,
+            tags: vec![],
+            checksum_alg: None,
+            sse_key_md5: Some("1B2M2Y8AsgTpgAmY7PhCfg==".into()),
+        };
+        let bytes = postcard::to_allocvec(&midc).unwrap();
+        s.db.put(session_key("up-4"), &bytes)
+            .map_err(rocks_err)
+            .unwrap();
+        let got = s.get_multipart("up-4").unwrap().unwrap();
+        assert_eq!(
+            got.sse_key_md5.as_deref(),
+            Some("1B2M2Y8AsgTpgAmY7PhCfg=="),
+            "V12c 层 sse_key_md5 保留"
+        );
+        assert_eq!(got.sse_s3, None, "V12c 中间格式值六读缺省 None");
+
+        // M11 L5:list_all_sessions 同走 decode_session 回退链(生命周期
+        // 执行器会话阶段路径)——混合格式存量会话全可读;修复前该路径误用
+        // 裸 decode,任一旧格式会话值即令执行器周期永久卡死
+        let all = s.list_all_sessions().unwrap();
+        assert_eq!(all.len(), 4, "混合格式会话全部可列出: {all:?}");
+    }
+
+    /// M11 K1-1(ADR-12 DS1):KEK 种子幂等生成/持久化;代状态惰性默认 +
+    /// 轮换 + 重包裹收敛标记;BucketSetEncryption 读改写。
+    #[test]
+    fn sse_kek_state_and_bucket_encryption() {
+        let (_d, s) = open_tmp();
+        // 种子:首次生成 64B,二次读同值(幂等持久化)
+        let seed = s.sse_kek_seed().unwrap();
+        assert_eq!(seed.len(), 64);
+        assert_eq!(s.sse_kek_seed().unwrap(), seed, "幂等(不重新生成)");
+        // 与访问密钥种子盐相互独立(DS1 红线)
+        assert_ne!(seed[..], s.seed_salt().unwrap()[..]);
+        // 代状态:缺席 = 初始代 1(惰性不落盘)
+        let st = s.sse_kek_gen_state().unwrap();
+        assert_eq!(
+            st,
+            SseKekGenState {
+                gen: 1,
+                last_rotated_at: 0,
+                rewrap_done_gen: 1
+            }
+        );
+        // 轮换:gen+1,rewrap_done_gen 不动 → 待办标记拉开
+        let st = s.rotate_sse_kek().unwrap();
+        assert_eq!(st.gen, 2);
+        assert!(st.last_rotated_at > 0);
+        assert_eq!(st.rewrap_done_gen, 1);
+        // 重包裹收敛:done = gen → 无待办
+        s.mark_sse_rewrap_done(2).unwrap();
+        let st = s.sse_kek_gen_state().unwrap();
+        assert_eq!(st.rewrap_done_gen, 2);
+        // 持久化:重开同库状态仍在
+        drop(s);
+        let s2 = MetaStore::open(_d.path(), &MetaConfig::default()).unwrap();
+        assert_eq!(s2.sse_kek_gen_state().unwrap().gen, 2);
+        assert_eq!(s2.sse_kek_seed().unwrap(), seed);
+
+        // 桶默认加密读改写(其余字段不动;桶不在 → NotFound)
+        s2.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        assert_eq!(
+            s2.get_bucket("b1").unwrap().unwrap().default_encryption,
+            None
+        );
+        s2.commit_bucket_set_encryption("b1", Some(fs3_core::SseAlgorithm::Aes256))
+            .unwrap();
+        let m = s2.get_bucket("b1").unwrap().unwrap();
+        assert_eq!(m.default_encryption, Some(fs3_core::SseAlgorithm::Aes256));
+        assert_eq!(m.owner, bucket_meta("b1").owner, "其余字段原样");
+        // Delete 幂等(None → None 同样 Ok)
+        s2.commit_bucket_set_encryption("b1", None).unwrap();
+        assert_eq!(
+            s2.get_bucket("b1").unwrap().unwrap().default_encryption,
+            None
+        );
+        assert!(s2.commit_bucket_set_encryption("ghost", None).is_err());
     }
 
     #[test]
@@ -3638,7 +4657,17 @@ mod tests {
         let uid = "up-1";
         s.create_multipart(
             uid,
-            &MultipartSession::new("b1", "m", "text/x", vec![], vec![], vec![]),
+            &MultipartSession::new(
+                "b1",
+                "m",
+                "text/x",
+                vec![],
+                vec![],
+                vec![],
+                None,
+                None,
+                None,
+            ),
         )
         .unwrap();
         let part = PartMeta {
@@ -3647,6 +4676,8 @@ mod tests {
             mtime: 1,
             extents: vec![],
             inline: Some(vec![0u8; 200]),
+            checksum: None,
+            sse: None,
         };
         s.put_part(uid, 1, &part, AllocDraft::default()).unwrap();
         let mut mm = object_meta(200);
@@ -3960,6 +4991,97 @@ mod tests {
         assert_eq!(snap.iter().filter(|(_, _, vk, _)| vk.is_some()).count(), 4);
     }
 
+    /// M11 L2-2:分页条目扫描——游标严格大于续扫、双形态、跨页不重复不
+    /// 遗漏;游标条目被并发删除时从其后最近条目续扫。
+    #[test]
+    fn scan_object_entries_page_cursor() {
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put(
+            "b1",
+            &versioned_bucket("b1", fs3_core::VersioningState::Enabled),
+        )
+        .unwrap();
+        // k1:遗留单键;k2:两版本 + null 槽;k3:单版本(页边界跨组)
+        s.commit_object_put(
+            "b1",
+            "k1",
+            &object_meta(1),
+            AllocDraft::default(),
+            StatsDelta::default(),
+        )
+        .unwrap();
+        for t in [100u64, 200] {
+            let mut m = object_meta(t);
+            m.version_id = Some(vk_at(t));
+            s.commit_object_put_version(
+                "b1",
+                "k2",
+                &vk_at(t),
+                &m,
+                AllocDraft::default(),
+                StatsDelta::default(),
+            )
+            .unwrap();
+        }
+        s.commit_object_put_version(
+            "b1",
+            "k2",
+            &VK_NULL,
+            &object_meta(9),
+            AllocDraft::default(),
+            StatsDelta::default(),
+        )
+        .unwrap();
+        let mut m3 = object_meta(3);
+        m3.version_id = Some(vk_at(300));
+        s.commit_object_put_version(
+            "b1",
+            "k3",
+            &vk_at(300),
+            &m3,
+            AllocDraft::default(),
+            StatsDelta::default(),
+        )
+        .unwrap();
+        let all = s.list_object_entries("b1").unwrap();
+        assert_eq!(all.len(), 5);
+        // limit=2 逐页扫:拼接结果必须与全量枚举逐条一致
+        let mut cursor: Option<(String, Option<[u8; 16]>)> = None;
+        let mut paged: Vec<ObjectEntry> = Vec::new();
+        loop {
+            let (page, done) = s
+                .scan_object_entries_page("b1", cursor.as_ref(), 2)
+                .unwrap();
+            assert!(page.len() <= 2);
+            cursor = page.last().map(|(k, vk, _)| (k.clone(), *vk));
+            paged.extend(page);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(paged.len(), all.len());
+        for (a, b) in paged.iter().zip(all.iter()) {
+            assert_eq!((&a.0, a.1), (&b.0, b.1));
+        }
+        // 游标条目并发删除:从其后最近条目续扫(删除 k2 中间版本,
+        // 以它为游标续扫不得重复/遗漏)
+        s.commit_object_delete_version(
+            "b1",
+            "k2",
+            &vk_at(200),
+            AllocDraft::default(),
+            StatsDelta::default(),
+        )
+        .unwrap();
+        let (page, done) = s
+            .scan_object_entries_page("b1", Some(&("k2".to_string(), Some(vk_at(200)))), 8)
+            .unwrap();
+        assert!(done);
+        let keys: Vec<(&str, Option<[u8; 16]>)> =
+            page.iter().map(|(k, vk, _)| (k.as_str(), *vk)).collect();
+        assert_eq!(keys, vec![("k2", Some(VK_NULL)), ("k3", Some(vk_at(300)))]);
+    }
+
     #[test]
     fn current_version_for_off_fast_path_equivalence() {
         // F-1:Off 桶快速路径 = 未版本化单键点读(vk 恒 VK_NULL),与全量
@@ -4149,7 +5271,17 @@ mod tests {
         let mk_part = |uid: &str| {
             s.create_multipart(
                 uid,
-                &MultipartSession::new("b1", "m", "text/x", vec![], vec![], vec![]),
+                &MultipartSession::new(
+                    "b1",
+                    "m",
+                    "text/x",
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                    None,
+                    None,
+                ),
             )
             .unwrap();
             let part = PartMeta {
@@ -4158,6 +5290,8 @@ mod tests {
                 mtime: 1,
                 extents: vec![],
                 inline: Some(vec![0u8; 5]),
+                checksum: None,
+                sse: None,
             };
             s.put_part(uid, 1, &part, AllocDraft::default()).unwrap();
             part

@@ -453,6 +453,224 @@ AWS 有差异」的正确性契约,均属兼容行为变更,按 ADR 纪律落盘
   (与 ADR-9 旧布局不前置兼容同例;升级通道由 N-1 自动回滚框架约束)。
 - `x-amz-id-2` 注入每请求 trace id(`{request-id}/{host-id}`,替代恒值
   "fasts3";TODO M9 D4),错误 XML HostId 与响应头同源。
+
+#### ADR-12(M11 立项决策):生命周期 / SSE-C / SSE-S3 / checksum
+
+**背景**:M11「生命周期与加密」(v1.2.0;TODO M11)立项。本 ADR 按推荐
+方案落盘 DESIGN-FUTURE §11 决策清单的 DE1~DE4/DS1~DS4/DL1~DL5 及
+checksum 范围决策,详细论证见 [DESIGN-FUTURE.md](./DESIGN-FUTURE.md)
+§4.1~§4.4。
+
+**DE1(SSE-C 加密模式)**:方案 c——**分块 AES-256-GCM**。chunk = 64KiB
+(复用段 CRC 网格的 64KiB 分块粒度);`data_key = HKDF-SHA256(customer_key,
+info="fasts3-sse-c-v1")`(hmac/sha2 现成原语);chunk nonce 派生自
+`HMAC(key, object_id‖chunk_no)`,攻击者重排/截断 chunk 即认证失败;每
+chunk 16B GCM tag 存元数据(数据区长度不变,**密文等长**,响应
+Content-Length = 明文长度);元数据另存每对象随机 nonce_base + chunk 数。
+读路径解密必须过 CPU,**失去零拷贝**(sendfile/splice 不可用,走缓冲
+路径,文档化 + 按字节计解密指标)。客户密钥零落盘、不进审计/日志,
+HKDF 派生后 zeroize 擦除原始 key。
+
+**DE2(ETag/CRC 计算顺序)**:密文侧。写路径 = 明文 → checksum 验算
+(§4.4 明文语义)→ 分块加密 → 密文 CRC32C(现有 chunk 级 CRC 照常算
+密文)→ ETag = 密文 MD5;读路径 = 读密文 → 解密 → 送客户端(CRC 校验
+仍在密文上,verify_reads 语义不变)。multipart:每 part 独立加密(独立
+nonce_base),part ETag = 密文 MD5,复合 ETag 维持 `md5-N`。etag=fast
+组合:`etag_mode=crc32c` 时 SSE 对象 ETag = 密文 CRC32C(一致性规则
+写文档)。
+
+**DE3(SSE-C 复制语义)**:CopyObject/UploadPartCopy 源 SSE-C 且目标未
+指定加密 → **显式 InvalidRequest**(防静默解密落盘);源/目标密钥不同
+(或源 SSE-C、目标 SSE-S3)→ 解密重加密(缓冲路径,数据搬运);同密钥
+同算法(或源未加密)→ 现状 COW 直灌,零数据搬运。内联对象的内联
+数据 = 密文(≤32KiB 全量加密,读时解密)。
+
+**DE4(预签名与表单)**:预签名 GET/PUT 的 SSE-C 三头
+(`x-amz-server-side-encryption-customer-{algorithm,key,key-MD5}`)进
+SignedHeaders(现状预签名校验已含 SignedHeaders 比对,天然支持);
+POST 表单不支持 SSE-C(AWS 同;POST 表单本身 v1.2 不做,S3-GAP)。
+
+**DS1(SSE-S3 密钥架构)**:KEK/DEK 两级。KEK 派生自独立持久化种子
+`s:sse_kek_seed` 64B(**不与 `s:key_seed_salt` 访问密钥种子混用**),每
+KEK 代带 id 支持轮换;每对象随机 256bit DEK;`ObjectMeta.sse` 存
+`{kek_id, wrapped_dek(AES-256-GCM 包裹), nonce_base}`。轮换 = 新 KEK
+代 + 后台重包裹 DEK(复用 DESIGN-FUTURE §2.4 值格式重写框架,重写
+完成前禁回滚)。admin API 只暴露 KEK 代数与轮换时间,**永不下发明文**。
+
+**DS2(桶级加密配置 API)**:Put/Get/DeleteBucketEncryption(?encryption);
+仅支持 AES256,其余算法(含 KMS 类参数)→ InvalidArgument 显式拒绝;
+对象头 `x-amz-server-side-encryption: AES256` 处理与响应回显。
+
+**DS3(桶默认加密)**:BucketMeta v2 `default_encryption` 填值(ADR-11 D0
+预留字段已存在,只填充不改结构);未带加密头的 PUT 按桶默认自动加密
+(对象元数据记录算法);复制语义同 DE3(SSE-S3 源复制到无加密目标需显式
+头,否则 InvalidRequest)。DESIGN-FUTURE §2.2 预留的可选 `e:` 桶加密配置
+前缀裁决为**不需要**(桶默认加密落 BucketMeta v2 值,无独立键)。
+
+**DS4(SSE-KMS)**:不做(单机无 KMS 托管);`aws:kms` 算法值及
+`x-amz-server-side-encryption-aws-kms-key-id` 等 KMS 参数 → 显式拒绝
+(不静默);企业 KMS 集成列 v2.x 评估。
+
+**DL1(生命周期规则存储)**:独立前缀 `r:{bucket}\0{rule_id}`,每条规则
+一键,值 = postcard 序列化规则结构(filter/action/status);规则变更 =
+单事务整体替换(读旧写新);keys.rs 前缀表、meta-export/import DTO、
+check 可达性扫描三处同步登记(演进纪律同 ADR-11 D9)。
+
+**DL2(执行器架构)**:提取通用 `BackgroundWorker` 抽象(节流/暂停/批
+额度/锁域纪律),Tier2 压缩 worker 重构为该抽象的实例之一,生命周期
+执行器为另一实例;实例共享调度器,**全局同一令牌桶**(防后台任务叠加
+侵蚀前台)。
+
+**DL3(mtime 二级索引)**:v1.2 **不建**索引;每执行周期(默认 24h,可配)
+全量扫描桶前缀一遍(6000 万对象规模 = 小时级单次,可接受);分钟级过期
+精度列为 v1.x 增强,索引形态预留 `x:{bucket}\0{be64(mtime)}\0{esc(key)}`
+(写路径同事务维护)。
+
+**DL4(时间取整语义)**:对齐 AWS 午夜语义——对象年龄满 Days 整天后,
+自次日 00:00 UTC 起可删;±1s 边界用例进时间语义测试(TODO L5-2)。
+
+**DL5(审计持久化)**:v1.2 一并交付——`s:audit` 前缀持久化环形缓冲
+(大小上限 + 周期截断),替代现状纯内存 4096 条环形;生命周期删除审计
+who = `system:lifecycle`;删除计数/字节进 Prometheus 指标。
+
+**checksum 范围决策**:五族全做——CRC32/CRC32C(后者已有 SIMD)、
+SHA1/SHA256(sha2 crate 已在依赖树)、CRC64NVME(同步做,成本低);
+`x-amz-checksum-{alg}` header 与 trailer 双路验算(trailer 扩展现状
+chunked 解码器,由「消费忽略」改为实际验算);
+`x-amz-decoded-content-length` 与实际解码长度强制对照;multipart 每 part
+计算并校验,Complete 时 CompositeChecksum(-N 形式)服务端验算复合值;
+与 SSE 并存时 checksum 恒在明文侧计算(写路径 明文 → checksum → 加密,
+同 DE2)。
+
+**实施期预裁决(调研发现的三项设计空档,照 ADR-11 D1a/D10 补遗先例
+落盘)**:
+
+**D-E1(GCM tag 键位与 SSE 判别)**:`SseInfo` 结构体尾部追加
+`chunk_tags: Vec<[u8;16]>` 与 SSE 类型判别字段(SSE-C / SSE-S3 枚举)。
+依据:ObjectMeta v3 的 `sse` 字段自 v1.1 起全部写点恒为 `None`,从未有
+`Some` 落盘,直接修改 SseInfo **不触发值格式 v4**;postcard 尾部追加
+保持双读兼容(存量值该字段恒为 None,Option 判别字节不变)。
+
+**D-E2(GetObjectAttributes 层级)**:澄清为**对象级** `GET ?attributes`;
+DESIGN-FUTURE §4.4 行文「桶级 GET ?attributes」为笔误,AWS
+GetObjectAttributes 语义为对象级操作(对象键寻址)。
+
+**D-E3(PartMeta checksum)**:`PartMeta` 值尾部追加 checksum 字段
+(multipart 分片校验与 CompositeChecksum 所需);双读模式照 ObjectMeta
+v2→v3 先例——旧值解码该字段缺省 `None`,新写入恒带,零迁移。
+
+**D-E3a(ObjectMeta v4 与复合值 -N 口径;C1-3/C1-4 实施期补录)**:
+Complete 后 `p:` 分片记录即删除,而 GetObjectAttributes `ObjectParts`
+需逐分片 checksum——故 `ObjectMeta` 值格式 v3→**v4**,尾部追加
+`part_checksums`(索引与 `parts` 对齐;v2/v3/v4 三读,写入恒 v4,
+机制同 D0)。复合 checksum 的 `-N` 分片数**不落盘**:复合值出现的
+对象恒为 multipart,N 由 `ObjectMeta.parts.len()` 派生(与 `etag_full`
+的 `-N` 同一既有不变量),`ChecksumInfo` 结构不变(避免嵌套结构体
+重排版破坏 v3/v4 解码链)。对象级 `checksum` 仅在 Complete 复合头
+验算通过时落值(复合原始字节);逐分片声明比对不符 → BadDigest,
+分片缺 checksum/算法不一致无法复合 → InvalidRequest。
+
+**D-E4(multipart SSE-C 合并裁决与分片/会话持久化;E1-4 实施期补录)**:
+每 part 独立加密(独立 nonce_base,part 内 64KiB 网格;DE2)的产物落
+`PartMeta` 尾部追加的 `sse` 字段(双读照 D-E3 先例;只含 nonce/tag,
+**客户密钥零落盘**——会话 `MultipartSession` 尾部追加的
+`sse_key_md5` 仅存 key-MD5,供 UploadPart/UploadPartCopy/Complete 逐值
+一致性比对与响应回显,缺一/不符 → InvalidRequest,AWS 口径)。Complete
+合并两案裁决为**「逐 part 解密 → 重加密为单一 nonce_base 的对象全局
+64KiB 网格」**(数据路径,复用 ExtentWriter SSE 上下文),否决「各
+part 网格按序拼接 + 读路径按 part 边界分段解密」:后者需 part 级
+SseInfo 列表落 ObjectMeta(v5 bump)且读路径永久按 part 边界分叉,
+而重加密案对象级 SseInfo 与单对象 PUT 同形态——读路径零分叉、
+ObjectMeta 停留 v4、CopyObject/UploadPartCopy 源解密直接复用对象网格。
+代价:Complete 一次解密+重加密数据搬运(仅 SSE-C 会话);复合 ETag
+维持 md5(各 part 密文 MD5)-N 不变;checksum 恒在明文侧(分片值上传
+期按明文算,FullObject 对象级值 Complete 时解密后按明文重算)。密钥
+本体每次请求自带(会话零落盘),故 SSE-C 会话的 Complete 必须携带
+SSE-C 三头(重加密必需),缺 → InvalidRequest。
+
+**D-E5(SSE-C 密钥校验子与错 key 400;SSE-C 定向验证补录)**:`SseInfo`
+尾部追加 `key_md5: [u8;16]`——SSE-C = 客户密钥 MD5(即请求头
+`x-amz-server-side-encryption-customer-key-md5` 解码值;SSE-S3 约定全零,
+Phase K 填充时写死)。依据:AWS/RGW 均凭服务端留存的密钥校验材料把
+错 key 判为 400 `InvalidRequest`(请求错误),此前我们不存校验材料,
+只能等流内 GCM 认证失败 → 500/断连(s3-tests
+`test_encryption_sse_c_other_key` 等定向暴露)。读路径(GET/HEAD/
+GetObjectAttributes/GetObjectPart)三头解析后先比对校验子,不符即 400;
+HEAD/attributes 不读数据同能发现错 key(校验子落元数据,此前「HEAD
+无法发现错 key」与 AWS 的差异消除)。ObjectMeta v4 未发布,直接改
+结构不触发 v5(同 D-E1 窗口);E1-3 的 chunk0 早探随之退役(key 正确
+而数据被篡改的残余面由流内验 tag 兜底,断连语义不变)。红线不破:
+密钥本体零落盘,MD5 单向且该值本就随请求明文传输。
+
+**D-E6(multipart 分片 nonce 确定性派生与重传幂等;SSE-C 定向验证
+补录)**:part nonce_base 由「每 part 随机」改为**确定性派生**:
+`HMAC-SHA256(data_key, "fasts3-sse-c-part" ‖ upload_id ‖ be32(part_number))`
+取前 12B(UploadPart/UploadPartCopy 同一规则;Complete 重加密的对象级
+nonce_base 仍每次随机,不受影响)。依据:s3-tests
+`test_multipart_sse_c_get_part` 重传同分片(resend_parts)期望 ETag
+稳定——随机 nonce 使重传密文变 → ETag 变 → Complete InvalidPart。
+upload_id 全局唯一 ⇒ 跨上传/跨 part 不复用;同 part 同内容重传 ⇒ 同
+nonce 同明文 ⇒ 密文逐字节相同(零新信息泄漏)⇒ ETag 稳定(幂等)。
+安全取舍(写死):同 part 以**不同**内容重传时 nonce 复用加密不同
+明文,GCM 下泄漏两明文异或并削弱该 part 认证——接受,因 ① AWS 同
+语义(重传 = 覆盖,不拒绝);② 正常客户端重传源于超时/断连,内容
+相同,不同内容重传同 part 号极罕见;③ 随机 nonce 替代案直接破坏
+重传幂等(ETag 漂移 → Complete InvalidPart),是正确性回退而非安全
+增强。
+---
+
+**D-K1(Phase K 实施期补录;SSE-S3 落地裁决)**:照 D1a/D10 补遗先例,
+落盘 Phase K 实施期裁决——
+
+- **K1-1 键位与公式(写死)**:KEK 种子 = `s:sse_kek_seed`(64B 随机,
+  首次需要时生成,与 `s:key_seed_salt` 独立);代状态 =
+  `s:sse_kek_gen`(postcard `SseKekGenState{gen, last_rotated_at,
+  rewrap_done_gen}`;gen 从 1 起,键缺席 = 初始代 1 惰性不落盘;
+  `gen > rewrap_done_gen` ⇒ 重包裹待办,重启后据此续跑)。KEK 派生 =
+  `HKDF-SHA256(seed, salt=None, info="fasts3-sse-s3-kek-v1" ‖ be32(gen),
+  32)`;全部历史代由 seed 确定性派生 ⇒ **旧代对象在重包裹完成前恒
+  可读**,重包裹是卫生收敛而非可读性前提(无值格式变更,不触发 §2.4
+  禁回滚)。wrapped_dek = `AES-256-GCM(KEK, DEK)` 随机 12B nonce,
+  落盘形态 nonce‖ct‖tag = 60B,AAD = `"fasts3-sse-s3-dek"`(域分隔)。
+  写路径参数泛化为 `SseWriteKey::{SseC, SseS3}`(put_with_meta/
+  ExtentWriter 等写侧;读侧参数保持 `Option<&SseCKey>` 客户密钥语义,
+  SSE-S3 由引擎按 kek_id 自持解包)。
+- **轮换与重包裹**:admin `POST /v1/admin/sse/rotate`(gen+1 持久化 +
+  起后台重包裹线程,幂等)与 `GET /v1/admin/sse/status`(当前代/末次
+  轮换时间/重包裹进度);**零明文**(seed/KEK/DEK 不出任何 API/日志/
+  导出——meta-export DTO 只导桶/对象/会话/密钥类键,钉测
+  `export_never_leaks_sse_kek_seed`)。重包裹 = 扫描全部 `o:` 条目,
+  kind=SseS3 且 kek_id<当前代 → 旧代解包、新代重包裹、
+  `commit_object_meta_update` 单事务回写(复用 V5-3 通道,不改统计/
+  分配);节流照 rewrite-values Tier2 口径(500/s),在线形态以幂等
+  重跑 + drain 替代 pause-file;锁域照压缩 worker(只持 MetaStore,
+  不取引擎大锁)。分片(`p:`)不重包裹:会话短命,Complete 落对象时
+  按当时当前代新签对象级 DEK。
+- **multipart SSE-S3(裁决写死)**:会话级单 DEK(Create 签发,会话只
+  存 wrapped_dek);part nonce_base 照 D-E6 以会话 DEK 确定性派生 ⇒
+  重传幂等与 SSE-C 同口径(备选「每 part 随机 DEK」令重传 ETag 漂移
+  → Complete InvalidPart,否决);Complete 复用 D-E4 重加密臂(part 解
+  密用会话 DEK,对象写用新签发对象 DEK,两臂分离),对象级 SseInfo
+  与单对象 PUT 同形态。
+- **copy 象限(K1-3)**:SSE-S3→SSE-S3 = COW 直灌;异代(轮换后)=
+  COW + **元数据级重包裹**(仅 wrapped_dek/kek_id 两字段,数据零搬运;
+  DEK 同源是 COW 的密码学前提,mint 的随机 DEK 在该臂弃用);SSE-C↔
+  SSE-S3 跨算法 = 换密钥 → 解密重加密数据路径;源加密 + 目标未指定
+  加密 → InvalidRequest(DE3/DS3 同口径),**目标桶默认在场 = 目标已
+  指定加密**(AWS 口径:copy 未带头按目标桶默认加密)。
+- **协议面口径**:SSE-C 三头 > 显式 `x-amz-server-side-encryption:
+  AES256` > 桶默认(请求头覆盖默认,AWS 语义;两族头同现 →
+  InvalidRequest 显式互斥);SSE-S3 头受理 op = PutObject/
+  CreateMultipartUpload/CopyObject,其余 op 携带 → 501(同 SSE-C 门控
+  先例);GET/HEAD/GetObjectPart 对 SSE-S3 对象恒回显 AES256、零客户
+  头(携带 SSE-C 头读 SSE-S3 对象 → 显式 400);GetObjectAttributes
+  响应模型无 SSE-S3 头(AWS 模型),不回显;POST 表单不支持 SSE 字段
+  (显式 400;桶默认对 POST 生效);DeleteBucketEncryption 无配置 →
+  204 幂等(AWS 口径);GetBucketEncryption 无配置 → 404
+  ServerSideEncryptionConfigurationNotFoundError(AWS 码,新错误码)。
+  SSE-KMS(DS4):`aws:kms` 值全入口 → InvalidEncryptionAlgorithmError,
+  KMS 参数头族保留 501,PutBucketEncryption 的 KMSKeyID/BucketKeyEnabled
+  元素 → InvalidArgument,测试矩阵钉住不静默。
 ---
 
 ## 4. 存储引擎设计(Rust)

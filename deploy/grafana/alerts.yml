@@ -82,3 +82,29 @@ groups:
         annotations:
           summary: "io_uring 在途接近 ring 深度上限"
           description: "ring depth 默认 1024;持续打满说明背压/限速在工作(见 503 SlowDown 与 admission 指标)"
+
+      # 生命周期执行器停滞(M11 L3-2):超过 2 个周期未跑完一轮。
+      # 阈值 = 2 × lifecycle_interval_secs(默认 86400 ⇒ 172800s;配置过
+      # 小周期时按部署调整)。指标缺席 = worker 未启用(lifecycle_enabled
+      # = false / 只读引擎),不告警;> 0 条件排除启动后首轮未跑的窗口。
+      - alert: FastS3LifecycleStalled
+        expr: |
+          (time() - fasts3_lifecycle_last_cycle_timestamp > 172800)
+          and (fasts3_lifecycle_last_cycle_timestamp > 0)
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "生命周期执行器超过 2 个周期未运行"
+          description: "fasts3_lifecycle_last_cycle_timestamp 停滞;检查 fs3-lifecycle worker 线程日志(规则桶过期删除/会话中止暂停中)"
+
+      # 生命周期删除突增(信息级):规则误配(如 prefix 过宽)的第一信号
+      - alert: FastS3LifecycleDeletedSpike
+        expr: |
+          increase(fasts3_lifecycle_deleted_objects_total[1h]) > 10000
+        for: 0m
+        labels:
+          severity: info
+        annotations:
+          summary: "生命周期 1h 删除对象数突增(>10000)"
+          description: "信息级:核对近期生命周期规则变更是否符合预期;阈值按部署规模调整"

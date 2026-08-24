@@ -466,6 +466,19 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
     }
 }
 
+/// 生命周期执行器的引擎访问口(M11 L2-2;`fs3_engine::lifecycle::EngineAccess`
+/// 的服务层实现:删除逐 key 写锁短临界区,等价一次前台 DELETE 锁口径)。
+struct SharedEngine(Arc<parking_lot::RwLock<Engine>>);
+
+impl fs3_engine::lifecycle::EngineAccess for SharedEngine {
+    fn write<R>(
+        &mut self,
+        f: &mut dyn FnMut(&mut Engine) -> fs3_core::Result<R>,
+    ) -> fs3_core::Result<R> {
+        f(&mut self.0.write())
+    }
+}
+
 /// 启动 S3 服务:引擎 + S3Service + hyper 多 worker 监听 + 可选 admin API。
 /// M6 / K4 优雅停机:SIGTERM/SIGINT → 停止接受连接 → 排空(≤ drain)→
 /// 引擎收尾(最终检查点 + 元数据关闭)→ 退出(升级流程的前置条件)。
@@ -495,6 +508,24 @@ fn cmd_serve(
         engine_cfg.small_object_limit = sol;
     }
     let engine = Arc::new(parking_lot::RwLock::new(Engine::open(&engine_cfg)?));
+    // M11 K1-1(ADR-12 DS1):SSE-S3 重包裹待办续跑——重启后 gen >
+    // rewrap_done_gen ⇒ 上轮重包裹未完成,自动起后台线程收敛(幂等;
+    // 只读引擎无 SSE-S3 写,待办不处理)
+    {
+        let e = engine.read();
+        match e.sse_s3_kek_state() {
+            Ok(st) if st.gen > st.rewrap_done_gen && !engine_cfg.read_only => {
+                tracing::info!(
+                    "sse-s3 rewrap pending (gen {} > done {}); resuming background rewrap",
+                    st.gen,
+                    st.rewrap_done_gen
+                );
+                e.spawn_sse_s3_rewrap();
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("sse-s3 kek state probe failed: {e}"),
+        }
+    }
 
     // 密钥:CLI --key access:secret 优先,否则配置文件
     let mut keys: Vec<fs3_s3::auth::Credentials> = Vec::new();
@@ -531,14 +562,55 @@ fn cmd_serve(
         .unwrap_or_else(|| "us-east-1".into());
     let allow_anonymous = cli_allow_anonymous || cfg.auth.allow_anonymous;
     let metrics = Arc::new(fs3_core::metrics::Metrics::new());
-    let audit = Arc::new(fs3_core::audit::AuditRing::default());
+    // M11 L3-1(ADR-12 DL5):审计可选持久化环形(默认开;[audit] persist=false
+    // 或只读引擎时回退纯内存现状)。口径写死:内存环形仍是检索面
+    // (/v1/admin/audit 零变化),`s:audit` 持久化是冷备 + 重启连续性;磁盘
+    // 条数可大于内存容量,回放只取最新 DEFAULT_CAP 条。
+    let audit = {
+        let persist_on = cfg.audit.persist.unwrap_or(true) && !engine_cfg.read_only;
+        if !persist_on {
+            Arc::new(fs3_core::audit::AuditRing::default())
+        } else {
+            let max_entries = cfg.audit.max_entries.unwrap_or(100_000);
+            let meta = engine.read().meta_arc();
+            match fs3_meta::AuditStore::open(meta, max_entries) {
+                Ok(store) => {
+                    let store = Arc::new(store);
+                    let replayed = match store.tail(fs3_core::audit::DEFAULT_CAP) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            // 回放失败不阻断启动:空环形起步,持久化照常追加
+                            tracing::warn!("audit replay failed: {e}; starting with empty ring");
+                            Vec::new()
+                        }
+                    };
+                    if !replayed.is_empty() {
+                        tracing::info!("audit ring replayed {} persisted entries", replayed.len());
+                    }
+                    Arc::new(fs3_core::audit::AuditRing::with_persist(
+                        fs3_core::audit::DEFAULT_CAP,
+                        store,
+                        replayed,
+                    ))
+                }
+                Err(e) => {
+                    // 降级:持久化打开失败不阻断 serve(内存环形照常)
+                    tracing::warn!(
+                        "audit persist open failed: {e}; falling back to memory-only ring"
+                    );
+                    Arc::new(fs3_core::audit::AuditRing::default())
+                }
+            }
+        }
+    };
     let service = Arc::new(fs3_s3::S3Service::with_observability(
         engine.clone(),
         keys,
         region,
         allow_anonymous,
         metrics,
-        audit,
+        // M11 L2-2:生命周期执行器共用同一 AuditRing(who=system:lifecycle)
+        audit.clone(),
     ));
     // 从 meta 恢复运行时密钥(M3 密钥 CRUD;配置密钥优先,同 access 不覆盖)
     match service.restore_keys_from_meta() {
@@ -549,6 +621,41 @@ fn cmd_serve(
         }
         Err(e) => tracing::warn!("restore runtime keys failed: {e}"),
     }
+
+    // M11 L2-2(ADR-12 DL2/DL3/DL4):生命周期执行器——BackgroundWorker 实例,
+    // 与压缩 worker 共享同一全局令牌桶;周期默认 24h([storage] lifecycle_*
+    // 可配,小周期供测试)。引擎删除原语需 &mut Engine,故由服务层装配:
+    // 扫描直读 MetaStore(不经引擎锁),删除逐 key 写锁短临界区(等价一次
+    // 前台 DELETE 锁口径)。审计 who=system:lifecycle 显式推入同一 AuditRing
+    // (L3-1:持久化开启时经 AuditRing 同步落 s:audit);无规则桶零动作,
+    // 现状不变。L3-2:worker 先行创建、spawn 延后到 admin 装配之后——
+    // stats Arc 注入 admin /v1/admin/metrics 渲染 fasts3_lifecycle_* 指标。
+    let lifecycle_worker = if !engine_cfg.read_only && cfg.storage.lifecycle_enabled.unwrap_or(true)
+    {
+        let period = Duration::from_secs(
+            cfg.storage
+                .lifecycle_interval_secs
+                .unwrap_or(fs3_engine::lifecycle::DEFAULT_PERIOD_SECS)
+                .max(1),
+        );
+        let (meta, throttle) = {
+            let e = engine.read();
+            (e.meta_arc(), e.throttle())
+        };
+        // 首发延迟随周期收窄:小周期(测试/演练,如 crash 注入每轮秒级重启)
+        // 若仍等 60s 首发则删除永不发生;生产默认 24h 周期首发延迟不变(60s)。
+        let worker = fs3_engine::lifecycle::LifecycleWorker::new(
+            SharedEngine(engine.clone()),
+            meta,
+            Some(audit.clone()),
+            period,
+        )
+        .with_first_run_delay(period.min(Duration::from_secs(60)));
+        Some((worker, throttle))
+    } else {
+        None
+    };
+    let lifecycle_stats = lifecycle_worker.as_ref().map(|(w, _)| w.stats());
 
     // 管理 API(H1;可选)
     let admin_listen = cli_admin_listen.or_else(|| cfg.admin.listen.clone());
@@ -584,7 +691,8 @@ fn cmd_serve(
             f
         });
         let admin = fs3_admin::AdminServer::new(engine.clone(), service.clone(), admin_cfg)
-            .with_reload(reload);
+            .with_reload(reload)
+            .with_lifecycle_stats(lifecycle_stats);
         // M6 / J5:设置页供应器(admin GET/PATCH /v1/admin/config)
         let provider = Arc::new(settings::SettingsProvider::new(
             config_path.clone(),
@@ -601,6 +709,16 @@ fn cmd_serve(
             })
             .map_err(fs3_core::Error::Io)?;
     }
+
+    // 生命周期 worker 启动(创建见 admin 装配前;解耦仅为注入 stats Arc)
+    let mut lifecycle_worker = lifecycle_worker.map(|(worker, throttle)| {
+        fs3_engine::worker::WorkerHandle::spawn(
+            "fs3-lifecycle",
+            worker,
+            throttle,
+            Duration::from_secs(1),
+        )
+    });
 
     let addr: std::net::SocketAddr = listen
         .or_else(|| cfg.server.listen.clone())
@@ -675,7 +793,11 @@ fn cmd_serve(
         Some(shutdown),
         Duration::from_secs(drain_secs),
     );
-    // serve 返回 → 所有 worker 已排空退出;引擎收尾(最终检查点 + meta 关闭)
+    // serve 返回 → 所有 worker 已排空退出;先停生命周期 worker(避免与引擎
+    // 收尾抢写锁),再引擎收尾(最终检查点 + meta 关闭)
+    if let Some(mut h) = lifecycle_worker.take() {
+        h.stop();
+    }
     tracing::info!("http workers drained; finalizing engine (checkpoint + meta close)");
     let mut eng = engine.write();
     eng.close()?;

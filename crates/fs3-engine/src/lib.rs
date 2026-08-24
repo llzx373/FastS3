@@ -14,6 +14,8 @@
 
 pub mod compaction;
 pub mod io;
+pub mod lifecycle;
+pub mod worker;
 
 #[cfg(test)]
 mod tests;
@@ -26,9 +28,10 @@ use std::sync::{Arc, Mutex};
 use fs3_alloc::{Allocator, Checkpointer, Staged};
 use fs3_core::crc32c::crc32c;
 use fs3_core::{
-    align_up, new_version_vk, random_bytes, BucketMeta, BucketStats, Error, ExtentHeader,
-    ObjectMeta, Result, Segment, VersioningState, CHECKPOINT_ALLOC_DELTA, EXTENT_FLAG_PACKED,
-    EXTENT_HEADER_SIZE, SECTOR_SIZE, SEGMENT_CRC_GRID,
+    align_up, new_version_vk, random_bytes, BucketMeta, BucketStats, ChecksumAlgorithm,
+    ChecksumHasher, ChecksumInfo, ChecksumType, CompletePart, CompositeChecksum, Error,
+    ExtentHeader, ObjectMeta, Result, Segment, VersioningState, CHECKPOINT_ALLOC_DELTA,
+    EXTENT_FLAG_PACKED, EXTENT_HEADER_SIZE, SECTOR_SIZE, SEGMENT_CRC_GRID,
 };
 use fs3_device::{open_device, BlockDevice};
 use fs3_meta::keys::{part_key, VK_NULL};
@@ -37,8 +40,9 @@ use fs3_meta::{
 };
 use md5::Digest;
 
-use crate::compaction::{Compactor, CompactorHandle};
+use crate::compaction::Compactor;
 use crate::io::{fsync, open_io_engine, read_exact, read_exact_batch, write_all, IoEngine};
+use crate::worker::{Throttle, WorkerHandle};
 
 pub use crate::compaction::{CompactionConfig, CompactionReport};
 
@@ -153,10 +157,21 @@ pub struct Engine {
     _checkpoint_thread: Option<std::thread::JoinHandle<()>>,
     /// Tier 2 压缩核心(前台 compact_once 与后台 worker 共用)。
     compactor: Option<Arc<Compactor>>,
-    _compactor_thread: Option<CompactorHandle>,
+    /// 后台 worker 句柄(ADR-12 DL2 通用抽象;压缩为首个实例)。
+    _compactor_thread: Option<WorkerHandle>,
+    /// 后台任务全局共享令牌桶(ADR-12 DL2:压缩与生命周期执行器
+    /// (L2-2)同源申领,防后台任务叠加侵蚀前台;rate 口径 =
+    /// compaction.rate_limit_bytes_per_sec)。
+    throttle: Arc<Throttle>,
     closed: bool,
     /// 设备降级标记(M4 D4:掉盘/IO 故障 → 只读降级 + 告警;粘性,重启清除)。
     degraded: Arc<std::sync::atomic::AtomicBool>,
+    /// SSE-C 解密字节数(M11 E1-3,DE1:读路径解密过 CPU,按字节计指标;
+    /// admin /metrics 渲染 fasts3_sse_decrypt_bytes_total)。
+    sse_decrypt_bytes: std::sync::atomic::AtomicU64,
+    /// SSE-S3 重包裹进度(M11 K1-1;admin rotate/status 与工作线程共享;
+    /// 内存态——重启后经 meta 的 rewrap_done_gen 持久标记判定待办)。
+    sse_s3_rewrap: Arc<std::sync::Mutex<SseS3RewrapProgress>>,
 }
 
 impl Engine {
@@ -259,7 +274,10 @@ impl Engine {
         });
 
         // 7. Tier 2 压缩核心 + 后台 worker(ADR-9 §6;`enabled` 只门控 worker,
-        // 前台 compact_once 始终可用)
+        // 前台 compact_once 始终可用)。ADR-12 DL2:调度走通用 BackgroundWorker
+        // 抽象(worker.rs),节流 = 全局共享令牌桶——生命周期执行器(L2-2)
+        // 注册时克隆同一 throttle,防后台任务叠加侵蚀前台。
+        let throttle = Throttle::new(cfg.compaction.rate_limit_bytes_per_sec);
         let (compactor, compactor_thread) = if cfg.read_only {
             (None, None)
         } else {
@@ -272,7 +290,12 @@ impl Engine {
                 cfg.compaction.clone(),
             ));
             let h = if cfg.compaction.enabled {
-                Some(CompactorHandle::spawn(c.clone(), &cfg.compaction))
+                Some(WorkerHandle::spawn(
+                    "fs3-compactor",
+                    c.clone(),
+                    throttle.clone(),
+                    std::time::Duration::from_millis(cfg.compaction.poll_interval_ms),
+                ))
             } else {
                 None
             };
@@ -302,8 +325,11 @@ impl Engine {
             _checkpoint_thread: Some(thread),
             compactor,
             _compactor_thread: compactor_thread,
+            throttle,
             closed: false,
             degraded: degraded.clone(),
+            sse_decrypt_bytes: std::sync::atomic::AtomicU64::new(0),
+            sse_s3_rewrap: Arc::new(std::sync::Mutex::new(SseS3RewrapProgress::default())),
         })
     }
 
@@ -313,6 +339,18 @@ impl Engine {
 
     pub fn meta(&self) -> &MetaStore {
         &self.meta
+    }
+
+    /// MetaStore 共享句柄(M11 L2-2 生命周期执行器等后台 worker 直读扫描
+    /// 用——rocksdb 迭代器不经引擎锁;与引擎同一份 Arc)。
+    pub fn meta_arc(&self) -> Arc<MetaStore> {
+        self.meta.clone()
+    }
+
+    /// 后台任务全局共享令牌桶(ADR-12 DL2;服务层装配生命周期 worker 时
+    /// 克隆同一 Arc 注册,防后台任务叠加侵蚀前台)。
+    pub fn throttle(&self) -> Arc<Throttle> {
+        self.throttle.clone()
     }
 
     pub fn allocator(&self) -> &Allocator {
@@ -326,6 +364,7 @@ impl Engine {
     // ─────────────────────────── 压缩(Tier 2) ───────────────────────────
 
     /// 前台执行一轮压缩(测试 / check --compact);返回本轮报告。
+    /// 与后台 worker 共用同一全局令牌桶(ADR-12 DL2)。
     pub fn compact_once(&self) -> Result<CompactionReport> {
         if self.read_only {
             return Err(Error::Unsupported(
@@ -333,7 +372,7 @@ impl Engine {
             ));
         }
         match &self.compactor {
-            Some(c) => c.compact_batch(),
+            Some(c) => c.compact_batch(&self.throttle),
             None => Ok(CompactionReport::default()),
         }
     }
@@ -708,7 +747,7 @@ impl Engine {
         }
     }
 
-    /// 流式 PUT(便捷入口:默认无自定义头、无条件前置)。
+    /// 流式 PUT(便捷入口:默认无自定义头、无条件前置、不加密)。
     pub fn put(&mut self, bucket: &str, key: &str, reader: &mut dyn Read) -> Result<ObjectMeta> {
         self.put_with_meta(
             bucket,
@@ -718,6 +757,8 @@ impl Engine {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            None,
+            None,
             None,
         )
     }
@@ -778,6 +819,17 @@ impl Engine {
     /// Error::PreconditionFailed / NotFound,不落任何数据。
     /// 返回 meta.version_id:Enabled = Some(vk)(协议层填 x-amz-version-id);
     /// Suspended/Off = None(null 族由协议层按桶状态渲染 "null")。
+    /// checksum(M11 C1-2):`checksum_alg` 非空(客户端提供了
+    /// `x-amz-checksum-*` 头或 trailer 声明)时,引擎边写边算明文校验和并
+    /// 落 `ObjectMeta.checksum`;`None` 时不算不记(零开销透传)。值验算
+    /// 在协议层(不符回滚),引擎只负责计算与落值。
+    /// SSE(M11 E1-7 SSE-C;K1-1 泛化,ADR-12 DE1/DE2/DS1):`sse_key`
+    /// 非空时按 64KiB 网格分块加密——顺序 = 明文 → checksum tee(明文
+    /// 语义)→ 加密 → 密文 CRC/MD5(ETag = 密文摘要);内联臂整体加密后
+    /// 密文存 `inline`(同一 64KiB 网格口径:内联 ≤ 32KiB 恒单 chunk)。
+    /// 密钥经 [`fs3_core::SseWriteKey`] 并集表达:SSE-C 客户密钥仅请求期
+    /// 借用零落盘;SSE-S3 DEK 明文仅内存持有,落盘只有 wrapped_dek。
+    /// nonce_base 每对象随机生成,tag 落 `ObjectMeta.sse`。
     #[allow(clippy::too_many_arguments)]
     pub fn put_with_meta(
         &mut self,
@@ -789,6 +841,8 @@ impl Engine {
         resp_headers: Vec<(String, String)>,
         tags: Vec<(String, String)>,
         precond: Option<&WritePrecondition>,
+        checksum_alg: Option<ChecksumAlgorithm>,
+        sse_key: Option<&fs3_core::SseWriteKey>,
     ) -> Result<ObjectMeta> {
         let Some(bkt) = self.meta.get_bucket(bucket)? else {
             return Err(Error::NotFound(format!("bucket {bucket}")));
@@ -806,6 +860,11 @@ impl Engine {
         }
         let (target, old) = self.plan_object_write(bucket, key, bkt.versioning)?;
 
+        // M11 C1-2:声明 checksum 算法时套 tee 边读边算(未声明 = 纯透传);
+        // EOF 共享出口供 extent 臂(put_stream)在提交前取回落值
+        let checksum_out = std::cell::RefCell::new(None);
+        let mut tee = ChecksumTeeReader::new(reader, checksum_alg).with_eof_out(&checksum_out);
+
         // 1) 读前缀(≤ small_object_limit+1 字节)判定内联
         let limit = self.small_object_limit;
         let mut prefix: Vec<u8> = Vec::with_capacity(limit + 1);
@@ -814,7 +873,7 @@ impl Engine {
             if prefix.len() > limit {
                 break;
             }
-            let n = reader.read(&mut buf)?;
+            let n = tee.read(&mut buf)?;
             if n == 0 {
                 break;
             }
@@ -827,7 +886,27 @@ impl Engine {
         if prefix.len() <= limit {
             // —— 内联路径(E3):零设备 I/O,一条 rocksdb 事务 ——
             let size = prefix.len() as u64;
-            let etag = self.compute_etag(&prefix);
+            // M11 E1-7:SSE 内联臂——整体加密后密文存 inline(同一
+            // 64KiB 网格:内联 ≤ limit 恒单 chunk,空对象零 chunk);
+            // ETag = 密文摘要(DE2),nonce_base 每对象随机,tag 与类型
+            // 静态字段(K1-1 分派)落 meta
+            let (inline_data, sse) = match sse_key {
+                Some(k) => {
+                    let mut nonce_base = [0u8; 12];
+                    fs3_core::random_bytes(&mut nonce_base)?;
+                    let mut cipher = fs3_core::ChunkedGcm::new(k.data_key(), nonce_base);
+                    let mut ct = Vec::with_capacity(prefix.len());
+                    let mut tags = Vec::new();
+                    for (no, chunk) in prefix.chunks(fs3_core::SSE_CHUNK_SIZE).enumerate() {
+                        let (c, tag) = cipher.encrypt_chunk(no as u64, chunk);
+                        ct.extend_from_slice(&c);
+                        tags.push(tag);
+                    }
+                    (ct, Some(k.build_sse_info(nonce_base, tags)))
+                }
+                None => (prefix, None),
+            };
+            let etag = self.compute_etag(&inline_data);
             let mtime = self.write_mtime(&target, bucket, key)?;
             let meta = ObjectMeta {
                 size,
@@ -838,16 +917,17 @@ impl Engine {
                     .unwrap_or("application/octet-stream")
                     .to_string(),
                 user_meta,
-                inline: Some(prefix),
+                inline: Some(inline_data),
                 parts: vec![],
                 resp_headers,
                 version_id: target.meta_version_id(),
                 is_delete_marker: false,
                 tags,
-                sse: None,
-                checksum: None,
+                sse,
+                checksum: tee.finish(),
                 retention: None,
                 legal_hold: false,
+                part_checksums: Vec::new(),
             };
             let mut draft = Staged::default();
             if !old.segments.is_empty() {
@@ -883,7 +963,7 @@ impl Engine {
         let mut prefixed = PrefixedReader {
             prefix,
             pos: 0,
-            inner: reader,
+            inner: &mut tee,
         };
         let result = self.put_stream(PutCtx {
             bucket,
@@ -895,9 +975,18 @@ impl Engine {
             user_meta,
             resp_headers,
             tags,
+            sse_key,
+            checksum_out: &checksum_out,
         });
         match result {
             Ok(meta) => {
+                // M11 C1-2:checksum 已随 put_stream 提交前落值(EOF 共享
+                // 出口;不再事后补丁——此前落盘值恒 None)
+                debug_assert_eq!(
+                    meta.checksum.is_some(),
+                    checksum_alg.is_some(),
+                    "extent 臂提交值与声明算法一致"
+                );
                 self.maybe_checkpoint()?;
                 Ok(meta)
             }
@@ -924,18 +1013,23 @@ impl Engine {
             user_meta,
             resp_headers,
             tags,
+            sse_key,
+            checksum_out,
         } = ctx;
         let old_size = old.size;
         let old_segments = old.segments;
         let mut draft = Staged::default();
-        let (segments, size, etag) = match self.stream_to_extents(reader, &mut draft) {
-            Ok(v) => v,
-            Err(e) => {
-                // 流中断(客户端断连):回滚已暂存分配 + 开放 extent 水位
-                self.abort_draft(&draft);
-                return Err(e);
-            }
-        };
+        let (segments, size, etag, sse) =
+            match self.stream_to_extents(reader, &mut draft, sse_key, None) {
+                Ok(v) => v,
+                Err(e) => {
+                    // 流中断(客户端断连):回滚已暂存分配 + 开放 extent 水位
+                    self.abort_draft(&draft);
+                    return Err(e);
+                }
+            };
+        // M11 C1-2:tee 已读尽(EOF 落值),提交前取回 checksum(未声明 = None)
+        let checksum = checksum_out.borrow_mut().take();
 
         let mtime = self.write_mtime(&target, bucket, key)?;
         let meta = ObjectMeta {
@@ -953,10 +1047,11 @@ impl Engine {
             version_id: target.meta_version_id(),
             is_delete_marker: false,
             tags,
-            sse: None,
-            checksum: None,
+            sse,
+            checksum,
             retention: None,
             legal_hold: false,
+            part_checksums: Vec::new(),
         };
 
         // 覆盖语义(ADR-9 §5.4):新段记账必须在旧段释放**之前**——开放 extent
@@ -988,14 +1083,21 @@ impl Engine {
     }
 
     /// 数据流 → 段流水线(64KiB chunk 攒批 → O_DIRECT 写;CRC 入段表)。
-    /// 返回 (segments, size, md5)。分配/写错误自动回滚已暂存分配(调用方
+    /// 返回 (segments, size, etag, sse)。分配/写错误自动回滚已暂存分配(调用方
     /// 负责 rollback);不提交任何元数据(由调用方决定提交形式:对象/分片)。
+    /// SSE(M11 E1-7;K1-1 泛化):`sse_key` 非空时 ExtentWriter 按 64KiB
+    /// 网格分块加密(密文等长,CRC/MD5 落密文,DE2),sse 产物随返回落
+    /// 元数据。`sse_nonce_base`(D-E6):分片路径传确定性派生值(重传
+    /// 幂等),对象路径传 None(每对象随机)。
     fn stream_to_extents(
         &mut self,
         reader: &mut dyn Read,
         draft: &mut Staged,
-    ) -> Result<(Vec<Segment>, u64, [u8; 16])> {
-        let mut writer = ExtentWriter::new(self.chunk_size, self.etag_mode)?;
+        sse_key: Option<&fs3_core::SseWriteKey>,
+        sse_nonce_base: Option<[u8; 12]>,
+    ) -> Result<StreamWriteOutcome> {
+        let mut writer =
+            ExtentWriter::new(self.chunk_size, self.etag_mode, sse_key, sse_nonce_base)?;
         let mut inbuf = fs3_device::AlignedBuffer::new(self.chunk_size)?;
         loop {
             let n = read_up_to(reader, inbuf.as_mut_slice())?;
@@ -1004,7 +1106,7 @@ impl Engine {
             }
             writer.feed(self, draft, &inbuf.as_slice()[..n])?;
         }
-        writer.finish(self)
+        writer.finish(self, draft)
     }
 
     // ──────── 开放 extent 管理(ADR-9 §5.1/§5.2/§5.4) ────────
@@ -1244,6 +1346,8 @@ impl Engine {
 
     /// get_to 的版本寻址形态(ADR-11 §3.4.3;V3 协议层 ?versionId 用):
     /// None = 当前版本;Some(vk) = 精确版本;命中删除标记 → DeleteMarker。
+    /// 无 SSE-C 密钥入口:SSE 对象显式报错(不返回密文;fs3d CLI/导出
+    /// 等内部调用方遇加密对象得到显式错误而非静默密文)。
     pub fn get_to_version(
         &self,
         bucket: &str,
@@ -1253,11 +1357,68 @@ impl Engine {
         out: &mut dyn Write,
     ) -> Result<u64> {
         let meta = self.resolve_object(bucket, key, version, None)?;
-        self.get_to_meta(&meta, range, out)
+        self.get_to_meta(&meta, range, out, None)
     }
 
     /// 读已解析对象版本的内容到 out(支持 Range;verify_reads 逐段校验)。
+    /// SSE-C(M11 E1-3):`sse_key` 非空时逐 chunk 解密;为 None 遇 SSE
+    /// 对象 → 显式报错(密钥必需,不返回密文)。
     fn get_to_meta(
+        &self,
+        meta: &ObjectMeta,
+        range: std::ops::Range<u64>,
+        out: &mut dyn Write,
+        sse_key: Option<&fs3_core::SseCKey>,
+    ) -> Result<u64> {
+        let start = range.start.min(meta.size);
+        let end = range.end.min(meta.size);
+        if start >= end {
+            return Ok(0);
+        }
+
+        // M11 E1-3:SSE 对象按 64KiB chunk 网格读密文(经既有段路径,
+        // verify_reads 的 CRC 校验仍在密文上,DE2 语义不变)→ 验 tag 解密
+        // → 写明文窗口(首尾 partial 裁剪在解密后);K1-1:密钥来源按 kind
+        // 分派(SSE-C 请求期客户密钥 / SSE-S3 服务端解包 DEK)
+        if let Some(sse) = &meta.sse {
+            let data_key = self.sse_read_data_key(sse, sse_key)?;
+            let grid = fs3_core::SSE_CHUNK_SIZE as u64;
+            let cipher = fs3_core::ChunkedGcm::new(data_key, sse.nonce_base);
+            let mut written = 0u64;
+            let mut pos = start;
+            while pos < end {
+                let cno = pos / grid;
+                let cs = cno * grid;
+                let ce = (cs + grid).min(meta.size);
+                let mut ct: Vec<u8> = Vec::with_capacity((ce - cs) as usize);
+                self.get_raw_to_meta(meta, cs..ce, &mut ct)?;
+                let tag = sse.chunk_tags.get(cno as usize).ok_or_else(|| {
+                    Error::Corrupt(format!(
+                        "sse chunk_tags too short ({} entries, need chunk {cno})",
+                        sse.chunk_tags.len()
+                    ))
+                })?;
+                let pt = cipher.decrypt_chunk(cno, &ct, tag).map_err(|_| {
+                    Error::Corrupt(format!(
+                        "sse-c chunk {cno} authentication failed (corrupt data or wrong customer key)"
+                    ))
+                })?;
+                self.sse_decrypt_bytes
+                    .fetch_add(pt.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                let s = (pos - cs) as usize;
+                let e = s + (end.min(ce) - pos) as usize;
+                out.write_all(&pt[s..e])?;
+                written += (e - s) as u64;
+                pos += (e - s) as u64;
+            }
+            return Ok(written);
+        }
+        self.get_raw_to_meta(meta, start..end, out)
+    }
+
+    /// 未加密对象整体读主体(get_to_meta 的非 SSE 臂;SSE 臂逐 chunk
+    /// 复用本函数读密文窗口,verify_reads 密文 CRC 校验随之生效)。
+    fn get_raw_to_meta(
         &self,
         meta: &ObjectMeta,
         range: std::ops::Range<u64>,
@@ -1442,6 +1603,8 @@ impl Engine {
     /// 内联对象直接拷贝;extent 对象按段定位后以 4KiB 对齐块读取裁剪。
     /// 供 HTTP 层边读边发(每 chunk 上锁,见 fs3-s3/fs3-http)。
     /// verify_reads 校验走 get_to(整段路径)。
+    /// SSE-C 对象必须经 `read_at_version_for`(带密钥)读取;本入口无
+    /// 密钥,遇 SSE 对象显式报错(不返回密文)。
     pub fn read_at(&self, bucket: &str, key: &str, offset: u64, buf: &mut [u8]) -> Result<usize> {
         self.read_at_version(bucket, key, None, offset, buf)
     }
@@ -1456,12 +1619,15 @@ impl Engine {
         buf: &mut [u8],
     ) -> Result<usize> {
         let meta = self.resolve_object(bucket, key, version, None)?;
-        self.read_at_meta(&meta, offset, buf)
+        self.read_at_meta(&meta, offset, buf, None)
     }
 
     /// read_at_version 的桶状态感知形态(F-1;流式 GET 数据面,每块一次
     /// 解析——Off 桶走单键点读,状态由响应构造处随响应体传入,零新增
     /// 点读)。
+    /// SSE-C(M11 E1-3):`sse_key` = 请求期客户密钥(仅 SSE 对象需要;
+    /// 未加密对象传 None——协议层按 AWS 语义忽略 SSE-C 头)。
+    #[allow(clippy::too_many_arguments)]
     pub fn read_at_version_for(
         &self,
         bucket: &str,
@@ -1470,13 +1636,41 @@ impl Engine {
         offset: u64,
         buf: &mut [u8],
         versioning: VersioningState,
+        sse_key: Option<&fs3_core::SseCKey>,
     ) -> Result<usize> {
         let meta = self.resolve_object(bucket, key, version, Some(versioning))?;
-        self.read_at_meta(&meta, offset, buf)
+        self.read_at_meta(&meta, offset, buf, sse_key)
     }
 
     /// 已解析对象版本的顺序读原语(read_at 主体)。
-    fn read_at_meta(&self, meta: &ObjectMeta, offset: u64, buf: &mut [u8]) -> Result<usize> {
+    fn read_at_meta(
+        &self,
+        meta: &ObjectMeta,
+        offset: u64,
+        buf: &mut [u8],
+        sse_key: Option<&fs3_core::SseCKey>,
+    ) -> Result<usize> {
+        if offset >= meta.size || buf.is_empty() {
+            return Ok(0);
+        }
+        let want = ((meta.size - offset) as usize).min(buf.len());
+
+        match &meta.sse {
+            None => self.read_raw_at_meta(meta, offset, &mut buf[..want]),
+            // M11 E1-3:读出密文后按 64KiB chunk 网格解密验 tag
+            Some(sse) => self.read_sse_at_meta(meta, sse, sse_key, offset, &mut buf[..want]),
+        }
+    }
+
+    /// 未加密对象的顺序读主体(内联拷贝 / extent 批量读;SSE 臂亦复用
+    /// 本函数读密文——密文等长,偏移语义一致)。
+    ///
+    /// 跨段填满窗口(M11 E1-4 修复):此前只读 `offset` 所在的首个命中段
+    /// 即返回(调用方循环推进),SSE 臂的 64KiB 网格对齐窗口可横跨段边界
+    /// (段 = extent 容量切割,与 SSE 网格不对齐),单段短读会被
+    /// read_sse_at_meta 判为数据损坏——>4MiB 对象的 SSE 读必现;改为按
+    /// 段序填满整个请求窗口(非 SSE 调用方本就按短读循环,行为兼容)。
+    fn read_raw_at_meta(&self, meta: &ObjectMeta, offset: u64, buf: &mut [u8]) -> Result<usize> {
         if offset >= meta.size || buf.is_empty() {
             return Ok(0);
         }
@@ -1488,19 +1682,20 @@ impl Engine {
             return Ok(want);
         }
 
-        // extent 路径:定位 offset 所在段(对象内偏移连续)
+        // extent 路径:按段序从 offset 起填满窗口(对象内偏移连续)
         let mut obj_pos = 0u64;
         let mut done = 0usize;
         for seg in &meta.extents {
             let seg_begin = obj_pos;
             let seg_end = obj_pos + seg.len as u64;
             obj_pos = seg_end;
-            if offset >= seg_end || offset < seg_begin {
+            let cur = offset + done as u64;
+            if cur >= seg_end || cur < seg_begin {
                 continue;
             }
-            let in_seg = offset - seg_begin;
-            let avail = (seg_end - offset) as usize;
-            let take = want.min(avail);
+            let in_seg = cur - seg_begin;
+            let avail = (seg_end - cur) as usize;
+            let take = (want - done).min(avail);
             let dev_base =
                 self.extent_data_offset(seg.extent_id as u64) + seg.offset as u64 + in_seg;
             // 批量读(调用栈优化:一次 submit,无每块堆分配)
@@ -1510,9 +1705,184 @@ impl Engine {
                 Ok(())
             })?;
             debug_assert_eq!(n, take, "read_at must fill the requested window");
-            break;
+            if done >= want {
+                break;
+            }
         }
         Ok(done)
+    }
+
+    /// SSE 对象解密读(M11 E1-3 SSE-C;K1-1 泛化 SSE-S3,ADR-12 DE1/DE2/DS1):
+    ///
+    /// - 读窗口向外对齐到 64KiB chunk 网格(GCM 认证粒度 = 整 chunk;
+    ///   Range/流式读只解密命中 chunk,首尾 partial 裁剪在解密后);
+    /// - 逐 chunk 验 tag 解密:篡改/重排/密钥不符 → `Error::Corrupt`
+    ///   (数据不可读语义;协议层 500,不泄漏密钥/明文信息);
+    /// - 密钥来源按 kind 分派([`Self::sse_read_data_key`]):SSE-C = 请求期
+    ///   客户密钥(缺 → InvalidRequest 兜底,防内部调用方静默拿到密文);
+    ///   SSE-S3 = 服务端按 kek_id 解包 DEK(无客户头语义);
+    /// - 每 chunk 明文长度计入 `sse_decrypt_bytes`(DE1 按字节解密指标)。
+    fn read_sse_at_meta(
+        &self,
+        meta: &ObjectMeta,
+        sse: &fs3_core::SseInfo,
+        sse_key: Option<&fs3_core::SseCKey>,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<usize> {
+        let data_key = self.sse_read_data_key(sse, sse_key)?;
+        let want = buf.len() as u64;
+        let grid = fs3_core::SSE_CHUNK_SIZE as u64;
+        let cipher = fs3_core::ChunkedGcm::new(data_key, sse.nonce_base);
+        // 网格对齐的密文窗口(内联对象 read_raw 走 inline 切片,同法)
+        let win_start = offset / grid * grid;
+        let win_end = (offset + want)
+            .div_ceil(grid)
+            .saturating_mul(grid)
+            .min(meta.size);
+        let mut ct = vec![0u8; (win_end - win_start) as usize];
+        let n = self.read_raw_at_meta(meta, win_start, &mut ct)?;
+        if n != ct.len() {
+            return Err(Error::Corrupt(format!(
+                "sse-c ciphertext window short read ({n} != {})",
+                ct.len()
+            )));
+        }
+        let mut done = 0usize;
+        let mut pos = offset;
+        let end = offset + want;
+        while pos < end {
+            let cno = pos / grid;
+            let cs = cno * grid;
+            let ce = (cs + grid).min(meta.size);
+            let tag = sse.chunk_tags.get(cno as usize).ok_or_else(|| {
+                Error::Corrupt(format!(
+                    "sse chunk_tags too short ({} entries, need chunk {cno})",
+                    sse.chunk_tags.len()
+                ))
+            })?;
+            let pt = cipher
+                .decrypt_chunk(
+                    cno,
+                    &ct[(cs - win_start) as usize..(ce - win_start) as usize],
+                    tag,
+                )
+                .map_err(|_| {
+                    Error::Corrupt(format!(
+                        "sse-c chunk {cno} authentication failed (corrupt data or wrong customer key)"
+                    ))
+                })?;
+            self.sse_decrypt_bytes
+                .fetch_add(pt.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            let s = (pos - cs) as usize;
+            let e = s + (end.min(ce) - pos) as usize;
+            buf[done..done + (e - s)].copy_from_slice(&pt[s..e]);
+            done += e - s;
+            pos += (e - s) as u64;
+        }
+        Ok(done)
+    }
+
+    // ─────────────────────────── SSE-S3 KEK 体系(M11 K1-1,ADR-12 DS1) ───────────────────────────
+
+    /// SSE-S3 写密钥签发:seed(首次需要时经 meta 惰性生成)→ 当前代
+    /// KEK → 随机 256bit DEK → AES-256-GCM 包裹。返回的 DEK 明文仅随
+    /// [`fs3_core::SseS3WriteKey`] 内存持有(Drop zeroize);seed 局部副本
+    /// 用完即擦(红线:seed/KEK/DEK 零落盘、零日志、零导出)。
+    pub fn sse_s3_mint_write_key(&self) -> Result<fs3_core::SseS3WriteKey> {
+        use zeroize::Zeroize;
+        let mut seed = self.meta.sse_kek_seed()?;
+        let gen = self.meta.sse_kek_gen_state()?.gen;
+        let key = fs3_core::mint_sse_s3_write_key(&seed, gen)
+            .map_err(|e| Error::Meta(format!("sse-s3 mint write key: {e}")))?;
+        seed.zeroize();
+        Ok(key)
+    }
+
+    /// 按代解包 DEK(读路径/Complete/重包裹共用):seed 缺失或解包失败
+    /// → Corrupt(数据不可读语义;错误信息只含代数,不含密钥材料)。
+    fn sse_s3_unwrap(&self, kek_id: u32, wrapped: &[u8]) -> Result<[u8; 32]> {
+        use zeroize::Zeroize;
+        let mut seed = self.meta.sse_kek_seed()?;
+        let dek = fs3_core::unwrap_sse_s3_dek(&seed, kek_id, wrapped);
+        seed.zeroize();
+        dek.map_err(|_| {
+            Error::Corrupt(format!(
+                "sse-s3 DEK unwrap failed (kek gen {kek_id}); object data unreadable"
+            ))
+        })
+    }
+
+    /// SSE 读密钥分派(K1-1):SSE-C = 请求期客户密钥(缺 →
+    /// InvalidRequest 兜底,防御纵深:防内部调用方静默拿到密文);
+    /// SSE-S3 = 按 `SseInfo.kek_id` 解包 DEK(服务端自持,无客户头语义)。
+    /// 输出经 ChunkedGcm by-value 消化(Drop 擦除)。
+    fn sse_read_data_key(
+        &self,
+        sse: &fs3_core::SseInfo,
+        sse_key: Option<&fs3_core::SseCKey>,
+    ) -> Result<[u8; 32]> {
+        match sse.kind {
+            fs3_core::SseKind::SseC => Ok(sse_key
+                .ok_or_else(|| {
+                    Error::InvalidRequest(
+                        "object is SSE-C encrypted; the customer key is required to read it".into(),
+                    )
+                })?
+                .data_key()),
+            fs3_core::SseKind::SseS3 => self.sse_s3_unwrap(sse.kek_id, &sse.wrapped_dek),
+        }
+    }
+
+    /// KEK 代状态(admin 状态端点数据源;只含代数/时间戳,零密钥材料)。
+    pub fn sse_s3_kek_state(&self) -> Result<fs3_meta::SseKekGenState> {
+        self.meta.sse_kek_gen_state()
+    }
+
+    /// KEK 轮换(admin POST /v1/admin/sse/rotate 落地):gen+1 持久化;
+    /// 后台重包裹经 [`Self::spawn_sse_s3_rewrap`] 起线程驱动。
+    pub fn sse_s3_rotate_kek(&self) -> Result<fs3_meta::SseKekGenState> {
+        self.meta.rotate_sse_kek()
+    }
+
+    /// 重包裹进度句柄(admin 状态端点/工作线程共享;内存态,重启后经
+    /// `rewrap_done_gen` 持久标记判定待办)。
+    pub fn sse_s3_rewrap_progress(&self) -> Arc<std::sync::Mutex<SseS3RewrapProgress>> {
+        self.sse_s3_rewrap.clone()
+    }
+
+    /// 起后台重包裹线程(幂等:已在跑 → false,不起新线程;线程分离
+    /// 不 join——单条回写事务原子,进程退出中断的扫尾经幂等重跑收敛)。
+    pub fn spawn_sse_s3_rewrap(&self) -> bool {
+        {
+            let mut p = self.sse_s3_rewrap.lock().unwrap();
+            if p.running {
+                return false;
+            }
+            *p = SseS3RewrapProgress {
+                running: true,
+                started_at: now_ts(),
+                ..Default::default()
+            };
+        }
+        let meta = self.meta.clone();
+        let progress = self.sse_s3_rewrap.clone();
+        let r = std::thread::Builder::new()
+            .name("fs3-sse-rewrap".into())
+            .spawn(move || {
+                let r = run_sse_s3_rewrap(&meta, &progress);
+                let mut p = progress.lock().unwrap();
+                p.running = false;
+                p.finished_at = Some(now_ts());
+                if let Err(e) = r {
+                    p.last_error = Some(e.to_string());
+                }
+            });
+        if r.is_err() {
+            self.sse_s3_rewrap.lock().unwrap().running = false;
+            return false;
+        }
+        true
     }
 
     // ─────────────────────────── DELETE ───────────────────────────
@@ -1770,6 +2140,17 @@ impl Engine {
     // ─────────────────────────── multipart(F5) ───────────────────────────
 
     /// 创建分片上传会话;返回 128 位随机 uploadId(hex)。
+    /// `checksum_alg`(M11 C1-4 门禁):Create 携带
+    /// `x-amz-checksum-algorithm` 时随会话落盘,Complete 按会话算法代算
+    /// 对象级 checksum(类型 = 算法默认;非默认组合由协议层显式拒绝)。
+    /// `sse_key_md5`(M11 E1-4,ADR-12 DE2):Create 携带 SSE-C 三头时落
+    /// key-MD5(base64 原文)绑定会话——**只存 MD5,客户密钥零落盘**;
+    /// 后续 UploadPart/UploadPartCopy/Complete 必须自带三头且 MD5 一致
+    /// (协议层校验,引擎侧按 is_some 一致性兜底)。
+    /// `sse_s3`(M11 K1-1,ADR-12 DS1):Create 的 SSE-S3 意愿(显式
+    /// AES256 头或桶默认)落会话级 DEK 包裹值;与 sse_key_md5 互斥
+    /// (协议层二选一,此处断言兜底)。
+    #[allow(clippy::too_many_arguments)]
     pub fn create_multipart(
         &mut self,
         bucket: &str,
@@ -1778,10 +2159,17 @@ impl Engine {
         user_meta: Vec<(String, String)>,
         resp_headers: Vec<(String, String)>,
         tags: Vec<(String, String)>,
+        checksum_alg: Option<ChecksumAlgorithm>,
+        sse_key_md5: Option<String>,
+        sse_s3: Option<fs3_meta::SessionSseS3>,
     ) -> Result<String> {
         if self.meta.get_bucket(bucket)?.is_none() {
             return Err(Error::NotFound(format!("bucket {bucket}")));
         }
+        debug_assert!(
+            !(sse_key_md5.is_some() && sse_s3.is_some()),
+            "SSE-C 与 SSE-S3 会话互斥(协议层二选一)"
+        );
         let mut raw = [0u8; 16];
         random_bytes(&mut raw)?;
         let upload_id = hex::encode(raw);
@@ -1792,28 +2180,98 @@ impl Engine {
             user_meta,
             resp_headers,
             tags,
+            checksum_alg,
+            sse_key_md5,
+            sse_s3,
         );
         self.meta.create_multipart(&upload_id, &session)?;
         Ok(upload_id)
     }
 
+    /// SSE-S3 会话写密钥现解(M11 K1-1,ADR-12 DS1):unwrap 会话级 DEK
+    /// 包裹值,构造请求期持有的写密钥(kek_id/wrapped_dek 随会话原样;
+    /// DEK 明文随返回值 Drop zeroize,零落盘)。明文会话 → None。
+    fn session_s3_write_key(
+        &self,
+        session: &MultipartSession,
+    ) -> Result<Option<fs3_core::SseS3WriteKey>> {
+        match &session.sse_s3 {
+            Some(s3) => {
+                let dek = self.sse_s3_unwrap(s3.kek_id, &s3.wrapped_dek)?;
+                Ok(Some(fs3_core::SseS3WriteKey::new(
+                    dek,
+                    s3.kek_id,
+                    s3.wrapped_dek.clone(),
+                )))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// 上传分片:数据写段(小分片内联),元数据挂 `p:` 会话下。
     /// 时序保证同 PUT:数据先落盘、分片记录后提交;失败回滚已暂存分配。
+    /// checksum(M11 C1-4,ADR-12 D-E3):`checksum_alg` 非空(客户端提供了
+    /// `x-amz-checksum-*` 头或 trailer 声明)时边写边算明文校验和并落
+    /// `PartMeta.checksum`(Complete 逐分片比对与复合值重算的输入);
+    /// `None` 时不算不记。值验算在协议层(不符拒绝),引擎只算并落值。
+    /// SSE(M11 E1-4 SSE-C;K1-1 SSE-S3,ADR-12 DE2/DS1):加密会话的
+    /// 本 part 独立加密(part 内 64KiB 网格;内联臂整体加密同 PUT 先例),
+    /// part ETag = 密文 MD5(ExtentWriter 既有行为),产物落 `PartMeta.sse`。
+    /// SSE-C 会话 = `sse_key` 请求密钥;SSE-S3 会话 = 引擎现解会话 DEK
+    /// (无客户头语义)。
+    /// nonce_base 由 `fs3_core::derive_part_nonce_base` 按
+    /// (data_key, upload_id, part_number) **确定性派生**(D-E6:同 part
+    /// 重传 ⇒ 同 nonce 同密文同 ETag,重传幂等;安全取舍见该函数文档)。
+    /// SSE-S3 会话级单 DEK ⇒ 同 part 重传同密文,幂等同口径(D-E6 的
+    /// 确定性前提对 SSE-S3 同样成立:nonce 复用面只剩同 part 重传,且
+    /// 会话 DEK 随机唯一,跨会话不复用)。
+    /// 会话级一致性(写死口径,AWS:part 头必须与会话一致):会话声明
+    /// SSE-C 而本请求缺密钥,或反之 → InvalidRequest;SSE-S3 会话携带
+    /// SSE-C 密钥 → InvalidRequest(混用显式拒绝);key-MD5 与会话记录
+    /// 的逐值比对在协议层(引擎拿不到 key 原文)。
     pub fn upload_part(
         &mut self,
         upload_id: &str,
         part_no: u32,
         reader: &mut dyn Read,
+        checksum_alg: Option<ChecksumAlgorithm>,
+        sse_key: Option<&fs3_core::SseCKey>,
     ) -> Result<PartMeta> {
-        if self.meta.get_multipart(upload_id)?.is_none() {
+        let Some(session) = self.meta.get_multipart(upload_id)? else {
             return Err(Error::NoSuchUpload(upload_id.to_string()));
+        };
+        // E1-4 会话一致性(防御纵深;协议层已先行按 key-MD5 比对)
+        if session.sse_key_md5.is_some() != sse_key.is_some() {
+            return Err(Error::InvalidRequest(
+                "upload part SSE-C headers must match the encryption headers of the multipart upload session".into(),
+            ));
         }
+        // K1-1:SSE-S3 会话不收客户密钥(SSE-C/SSE-S3 混用显式拒绝)
+        if session.sse_s3.is_some() && sse_key.is_some() {
+            return Err(Error::InvalidRequest(
+                "upload part SSE-C headers must not be present on an SSE-S3 multipart upload session".into(),
+            ));
+        }
+        // K1-1:有效写密钥(SSE-C 请求密钥 / SSE-S3 会话 DEK 现解)
+        let s3_key = self.session_s3_write_key(&session)?;
+        let write_key = match (sse_key, &s3_key) {
+            (Some(c), None) => Some(fs3_core::SseWriteKey::SseC(c)),
+            (None, Some(s)) => Some(fs3_core::SseWriteKey::SseS3(s)),
+            (None, None) => None,
+            (Some(_), Some(_)) => unreachable!("SSE-C/SSE-S3 会话互斥已在上方判定"),
+        };
+        // D-E6:分片 nonce_base 确定性派生(仅加密会话;明文分片为 None)
+        let part_nonce_base = write_key
+            .as_ref()
+            .map(|k| fs3_core::derive_part_nonce_base(&k.data_key(), upload_id, part_no));
+        // M11 C1-4:声明算法时套 tee 边读边算(同 put_with_meta 先例)
+        let mut tee = ChecksumTeeReader::new(reader, checksum_alg);
         // 与 PUT 一致:读前缀判定内联
         let limit = self.small_object_limit;
         let mut prefix: Vec<u8> = Vec::with_capacity(limit + 1);
         let mut buf = [0u8; 8192];
         loop {
-            let n = reader.read(&mut buf)?;
+            let n = tee.read(&mut buf)?;
             if n == 0 {
                 break;
             }
@@ -1824,28 +2282,57 @@ impl Engine {
         }
         let mtime = now_ts();
         let part = if prefix.len() <= limit {
-            let etag = self.compute_etag(&prefix);
+            // E1-4 内联臂:整体加密后密文存 inline(part 内 64KiB 网格,
+            // 内联恒单 chunk;同 put_with_meta 内联臂先例),ETag = 密文摘要;
+            // nonce_base = D-E6 确定性派生(重传幂等);K1-1:有效写密钥
+            // (SSE-C 请求密钥 / SSE-S3 会话 DEK),SseInfo 静态字段随类型分派
+            let (inline_data, sse) = match &write_key {
+                Some(k) => {
+                    let nonce_base = part_nonce_base.expect("sse part has derived nonce_base");
+                    let mut cipher = fs3_core::ChunkedGcm::new(k.data_key(), nonce_base);
+                    let mut ct = Vec::with_capacity(prefix.len());
+                    let mut tags = Vec::new();
+                    for (no, chunk) in prefix.chunks(fs3_core::SSE_CHUNK_SIZE).enumerate() {
+                        let (c, tag) = cipher.encrypt_chunk(no as u64, chunk);
+                        ct.extend_from_slice(&c);
+                        tags.push(tag);
+                    }
+                    (ct, Some(k.build_sse_info(nonce_base, tags)))
+                }
+                None => (prefix, None),
+            };
+            let etag = self.compute_etag(&inline_data);
             PartMeta {
-                size: prefix.len() as u64,
+                size: inline_data.len() as u64,
                 etag,
                 mtime,
                 extents: Vec::new(),
-                inline: Some(prefix),
+                inline: Some(inline_data),
+                checksum: tee.finish(),
+                sse,
             }
         } else {
             let mut prefixed = PrefixedReader {
                 prefix,
                 pos: 0,
-                inner: reader,
+                inner: &mut tee,
             };
             let mut draft = Staged::default();
-            let (extents, size, etag) = match self.stream_to_extents(&mut prefixed, &mut draft) {
+            // M11 E1-4:分片 SSE——stream_to_extents 按 part 内 64KiB
+            // 网格分块加密(D-E6 确定性 nonce_base),sse 产物落 PartMeta
+            let (extents, size, etag, sse) = match self.stream_to_extents(
+                &mut prefixed,
+                &mut draft,
+                write_key.as_ref(),
+                part_nonce_base,
+            ) {
                 Ok(v) => v,
                 Err(e) => {
                     self.abort_draft(&draft);
                     return Err(e);
                 }
             };
+            debug_assert_eq!(sse.is_some(), write_key.is_some());
             self.alloc.add_object(&mut draft, &extents);
             let part = PartMeta {
                 size,
@@ -1853,6 +2340,8 @@ impl Engine {
                 mtime,
                 extents,
                 inline: None,
+                checksum: tee.finish(),
+                sse,
             };
             // 分片重传会清 completed 标记(reactivate;resend_first_finishes_last)
             let seq = self
@@ -1901,7 +2390,15 @@ impl Engine {
     }
 
     /// 分片复制(UploadPartCopy):源对象 range 直灌分片流水线(边读边写,
-    /// 无整段内存缓冲);返回分片元数据(ETag = 复制字节的 MD5)。
+    /// 无整段内存缓冲);返回分片元数据(ETag = 分片字节的 MD5;SSE 时
+    /// = 密文 MD5,DE2)。
+    /// SSE(M11 E1-5 SSE-C;K1-1 SSE-S3,ADR-12 DE3/DS1):`src_sse_key` =
+    /// copy-source 侧 SSE-C 客户密钥(源 SSE-C 时必需;源 SSE-S3 由服务端
+    /// 自持解包,无需该头);`dst_sse_key` = 目标侧 SSE-C 客户密钥(目标
+    /// 侧 = 会话语义,一致性判定同 upload_part;SSE-S3 会话 = 引擎现解
+    /// 会话 DEK,无客户头)。源加密而目标(会话)未加密 → InvalidRequest
+    /// (防静默解密落盘)。
+    #[allow(clippy::too_many_arguments)]
     pub fn upload_part_copy(
         &mut self,
         upload_id: &str,
@@ -1909,14 +2406,43 @@ impl Engine {
         src_bucket: &str,
         src_key: &str,
         range: std::ops::Range<u64>,
+        src_sse_key: Option<&fs3_core::SseCKey>,
+        dst_sse_key: Option<&fs3_core::SseCKey>,
     ) -> Result<PartMeta> {
-        if self.meta.get_multipart(upload_id)?.is_none() {
+        let Some(session) = self.meta.get_multipart(upload_id)? else {
             return Err(Error::NoSuchUpload(upload_id.to_string()));
+        };
+        // E1-5 目标侧 = 会话语义(防御纵深;key-MD5 逐值比对在协议层)
+        if session.sse_key_md5.is_some() != dst_sse_key.is_some() {
+            return Err(Error::InvalidRequest(
+                "upload part SSE-C headers must match the encryption headers of the multipart upload session".into(),
+            ));
+        }
+        // K1-1:SSE-S3 会话不收客户密钥(混用显式拒绝)
+        if session.sse_s3.is_some() && dst_sse_key.is_some() {
+            return Err(Error::InvalidRequest(
+                "upload part SSE-C headers must not be present on an SSE-S3 multipart upload session".into(),
+            ));
         }
         let src = self
             .meta
             .get_object(src_bucket, src_key)?
             .ok_or_else(|| Error::NotFound(format!("object {src_bucket}/{src_key}")))?;
+        // DE3/DS3:源加密 + 目标(会话)未加密 → 显式拒绝(防静默解密落盘)
+        let dst_encrypted = dst_sse_key.is_some() || session.sse_s3.is_some();
+        if src.sse.is_some() && !dst_encrypted {
+            return Err(Error::InvalidRequest(
+                "copy source is SSE-C encrypted; the destination of the copy must specify SSE-C encryption".into(),
+            ));
+        }
+        // 源 SSE-C 必须有 copy-source 侧密钥(读明文必需;源 SSE-S3 由
+        // 服务端 KEK 体系自持解包,无客户头语义)
+        if matches!(&src.sse, Some(s) if s.kind == fs3_core::SseKind::SseC) && src_sse_key.is_none()
+        {
+            return Err(Error::InvalidRequest(
+                "copy source is SSE-C encrypted; copy-source customer key is required".into(),
+            ));
+        }
         let start = range.start.min(src.size);
         let end = range.end.min(src.size);
         if start >= end {
@@ -1925,57 +2451,30 @@ impl Engine {
         let len = end - start;
         let mut draft = Staged::default();
         let result = (|| -> Result<PartMeta> {
-            let mut writer = ExtentWriter::new(self.chunk_size, self.etag_mode)?;
-            // 内联源:直接灌入
-            if let Some(inline) = &src.inline {
-                let data = &inline[start as usize..end as usize];
-                writer.feed(self, &mut draft, data)?;
-            } else {
-                // extent 源:逐段读取(4KiB 对齐裁剪)直灌
-                let mut obj_pos = 0u64;
-                let mut remain = len;
-                for seg in &src.extents {
-                    if remain == 0 {
-                        break;
-                    }
-                    let seg_begin = obj_pos;
-                    let seg_end = obj_pos + seg.len as u64;
-                    obj_pos = seg_end;
-                    let s = seg_begin.max(start);
-                    let e = seg_end.min(end);
-                    if s >= e {
-                        continue;
-                    }
-                    let payload_off = s - seg_begin;
-                    let dev_off = self.extent_data_offset(seg.extent_id as u64)
-                        + seg.offset as u64
-                        + payload_off;
-                    let mut done = 0usize;
-                    let seg_len = (e - s) as usize;
-                    while done < seg_len {
-                        let cur_off = dev_off + done as u64;
-                        let block_off = cur_off - (cur_off % SECTOR_SIZE);
-                        let skip = (cur_off - block_off) as usize;
-                        let want = (seg_len - done + skip).min(self.chunk_size);
-                        let block_len = align_up(want as u64, SECTOR_SIZE) as usize;
-                        let mut rbuf = fs3_device::AlignedBuffer::new(block_len)?;
-                        read_exact(
-                            &mut **self.io.lock().unwrap(),
-                            self.device.raw_fd(),
-                            rbuf.as_mut_slice(),
-                            block_off,
-                        )?;
-                        let usable =
-                            &rbuf.as_slice()[skip..skip + (want - skip).min(seg_len - done)];
-                        writer.feed(self, &mut draft, usable)?;
-                        done += usable.len();
-                        remain -= usable.len() as u64;
-                    }
-                }
-                debug_assert_eq!(remain, 0);
-            }
-            let (extents, size, etag) = writer.finish(self)?;
+            // E1-5:源按 range 读(源加密则 read_sse 逐窗解密,密钥按 kind
+            // 分派)→ 目标加密上下文(SSE-C 请求密钥 / SSE-S3 会话 DEK;
+            // None = 明文直通)直灌 ExtentWriter;分片 nonce_base = D-E6
+            // 确定性派生(与 upload_part 同一规则,同 part 重传 ⇒ ETag 稳定)
+            let s3_key = self.session_s3_write_key(&session)?;
+            let write_key = match (dst_sse_key, &s3_key) {
+                (Some(c), None) => Some(fs3_core::SseWriteKey::SseC(c)),
+                (None, Some(s)) => Some(fs3_core::SseWriteKey::SseS3(s)),
+                (None, None) => None,
+                (Some(_), Some(_)) => unreachable!("SSE-C/SSE-S3 会话互斥已在上方判定"),
+            };
+            let part_nonce_base = write_key
+                .as_ref()
+                .map(|k| fs3_core::derive_part_nonce_base(&k.data_key(), upload_id, part_no));
+            let mut writer = ExtentWriter::new(
+                self.chunk_size,
+                self.etag_mode,
+                write_key.as_ref(),
+                part_nonce_base,
+            )?;
+            self.feed_object_plain(&mut writer, &mut draft, &src, start..end, src_sse_key)?;
+            let (extents, size, etag, sse) = writer.finish(self, &mut draft)?;
             debug_assert_eq!(size, len);
+            debug_assert_eq!(sse.is_some(), write_key.is_some());
             self.alloc.add_object(&mut draft, &extents);
             let part = PartMeta {
                 size,
@@ -1983,6 +2482,9 @@ impl Engine {
                 mtime: now_ts(),
                 extents,
                 inline: None,
+                // UploadPartCopy 无请求体、无 checksum 头语义(AWS),不落值
+                checksum: None,
+                sse,
             };
             self.meta
                 .put_part(upload_id, part_no, &part, to_alloc_draft(&draft))?;
@@ -2009,33 +2511,85 @@ impl Engine {
     /// 完成上传:校验分片(存在 + ETag + 顺序 + 大小)→ 零数据搬运组合
     /// (段列表按序拼接;全内联则拼数据;混合走数据路径)。
     /// 返回最终对象元数据;二次 Complete 幂等返回(completed 快照)。
+    ///
+    /// checksum(M11 C1-4,ADR-12):`client_parts` 逐分片可选携带客户端
+    /// 声明的 checksum(Complete XML 元素)——非空项与落盘
+    /// `PartMeta.checksum` 逐一比对,不符(含落盘缺失/算法不符)→
+    /// BadDigest;`composite` 非空(客户端 `x-amz-checksum-{alg}` 复合头)
+    /// 时用落盘分片 checksum 重算复合值比对——分片缺 checksum 或算法
+    /// 不一致无法复合 → InvalidRequest;重算值/N 不符 → BadDigest;通过
+    /// 后复合值落 `ObjectMeta.checksum`(`-N` 渲染由 parts 派生,见
+    /// ChecksumInfo 注释)。逐分片 checksum 无论复合头是否在场,均落
+    /// `ObjectMeta.part_checksums`(GetObjectAttributes ObjectParts 用)。
+    ///
+    /// SSE(M11 E1-4 SSE-C;K1-1 SSE-S3,ADR-12 DE2/DS1 + D-E4 裁决):
+    /// `sse_key` = Complete 请求自带的 SSE-C 客户密钥(会话只存 key-MD5,
+    /// 重加密必须密钥本体;协议层已按 MD5 逐值比对,此处 is_some 一致性
+    /// 兜底);SSE-S3 会话无客户头——part 解密用会话 DEK 现解、对象写用
+    /// 新签发对象级 DEK(当前代包裹)。**D-E4 合并裁决:加密会话
+    /// Complete 一律走「逐 part 解密 → 重加密为单一 nonce_base 的对象
+    /// 全局 64KiB 网格」数据路径**,对象级 SseInfo 与单对象 PUT 同形态——
+    /// 读路径(read_sse_at_meta/get_to_meta/object_segments 禁零拷贝)零
+    /// 分叉,ObjectMeta 停留 v4(备选「拼接 part 网格」需 part 级 SseInfo
+    /// 列表落 ObjectMeta = v5 bump,且读路径永久按 part 边界分段解密,
+    /// 分叉面大,否决)。代价:Complete 一次解密+重加密数据搬运(仅加密
+    /// 会话,文档化)。复合 ETag 维持 md5(各 part 密文 MD5)-N 不变
+    /// (DE2);checksum 恒在明文侧(分片 checksum 在上传期按明文算,对象级
+    /// 重算走 read_part_plain_to 解密后的明文流)。
     pub fn complete_multipart(
         &mut self,
         bucket: &str,
         key: &str,
         upload_id: &str,
-        client_parts: &[(u32, String)],
+        client_parts: &[CompletePart],
+        composite: Option<&CompositeChecksum>,
+        sse_key: Option<&fs3_core::SseCKey>,
     ) -> Result<ObjectMeta> {
         let session = self
             .meta
             .get_multipart(upload_id)?
             .ok_or_else(|| Error::NoSuchUpload(upload_id.to_string()))?;
+        // E1-4 会话一致性(防御纵深):SSE-C 会话的 Complete 必须自带客户
+        // 密钥(重加密必需;会话只存 key-MD5),反之明文会话拒收密钥
+        if session.sse_key_md5.is_some() != sse_key.is_some() {
+            return Err(Error::InvalidRequest(
+                "complete SSE-C headers must match the encryption headers of the multipart upload session".into(),
+            ));
+        }
+        // K1-1:SSE-S3 会话不收客户密钥(SSE-C/SSE-S3 混用显式拒绝);
+        // SSE-S3 会话 Complete 无需任何 SSE 头(服务端 KEK 体系自持)
+        if session.sse_s3.is_some() && sse_key.is_some() {
+            return Err(Error::InvalidRequest(
+                "complete SSE-C headers must not be present on an SSE-S3 multipart upload session"
+                    .into(),
+            ));
+        }
+        // K1-1:part 解密密钥统一视图——SSE-C 会话 = 请求客户密钥;
+        // SSE-S3 会话 = 会话级 DEK 现解(内存持有,臂末擦除)
+        let s3_part_key = self.session_s3_write_key(&session)?;
+        let part_data_key: Option<[u8; 32]> = match (sse_key, &s3_part_key) {
+            (Some(c), None) => Some(c.data_key()),
+            (None, Some(s)) => Some(s.data_key()),
+            (None, None) => None,
+            (Some(_), Some(_)) => unreachable!("SSE-C/SSE-S3 会话互斥已在上方判定"),
+        };
         if client_parts.is_empty() {
             return Err(Error::InvalidArgument("empty parts list".into()));
         }
         // REVIEW §3.10:AWS 要求客户端列表按 partNumber 严格递增;
         // 乱序列表必须 400 InvalidPartOrder(此前 BTreeMap 自动排序被静默接受)。
         let mut prev = 0u32;
-        for (no, _) in client_parts {
-            if *no == 0 || *no > fs3_core::MAX_PARTS {
+        for p in client_parts {
+            let no = p.part_number;
+            if no == 0 || no > fs3_core::MAX_PARTS {
                 return Err(Error::InvalidPart(format!("part number {no} out of range")));
             }
-            if *no <= prev {
+            if no <= prev {
                 return Err(Error::InvalidPartOrder(format!(
                     "part number {no} is not strictly increasing (previous {prev})"
                 )));
             }
-            prev = *no;
+            prev = no;
         }
         // 幂等:已 completed 且无分片记录 → 重放当前对象(版本化桶经当前
         // 版本解析;当前为删除标记/已删除 → NoSuchUpload,与旧路径一致)
@@ -2055,21 +2609,20 @@ impl Engine {
         // 并只取**请求列表**对应的分片(未列出者不参与组合——AWS 语义)。
         let mut total: u64 = 0;
         let mut combined: Vec<(u32, PartMeta)> = Vec::with_capacity(client_parts.len());
-        for (no, etag_hex) in client_parts {
-            if *no == 0 || *no > fs3_core::MAX_PARTS {
-                return Err(Error::InvalidPart(format!("part number {no} out of range")));
-            }
+        for cp in client_parts {
+            let no = cp.part_number;
             let stored_meta = by_no
-                .get(no)
+                .get(&no)
                 .ok_or_else(|| Error::InvalidPart(format!("part {no} not found")))?;
-            if !stored_meta.etag_hex().eq_ignore_ascii_case(etag_hex) {
+            if !stored_meta.etag_hex().eq_ignore_ascii_case(&cp.etag_hex) {
                 return Err(Error::InvalidPart(format!(
-                    "part {no} etag mismatch (stored {}, given {etag_hex})",
-                    stored_meta.etag_hex()
+                    "part {no} etag mismatch (stored {}, given {})",
+                    stored_meta.etag_hex(),
+                    cp.etag_hex
                 )));
             }
             total += stored_meta.size;
-            combined.push((*no, stored_meta.clone()));
+            combined.push((no, stored_meta.clone()));
         }
         if total > fs3_core::MAX_OBJECT_SIZE {
             return Err(Error::InvalidArgument("object exceeds 5TiB limit".into()));
@@ -2086,6 +2639,109 @@ impl Engine {
                 )));
             }
         }
+
+        // ── M11 C1-4(ADR-12):分片 checksum 逐一分片比对 + 对象级重算 ──
+        // 逐分片:客户端声明值与落盘 PartMeta.checksum 比对;不符(含落盘
+        // 缺失/算法不一致)→ BadDigest(AWS:checksum 不匹配 400 BadDigest)。
+        for (cp, (no, stored)) in client_parts.iter().zip(&combined) {
+            if let Some(declared) = &cp.checksum {
+                if stored.checksum.as_ref() != Some(declared) {
+                    return Err(Error::BadDigest(format!(
+                        "part {no} {} checksum mismatch",
+                        declared.algorithm.s3_name()
+                    )));
+                }
+            }
+        }
+        // 对象级 checksum:会话算法优先(M11 门禁补强;AWS:Create 声明
+        // 算法时 Complete 由服务端代算,客户端复合头仅作验算),无会话算法
+        // 时维持客户端复合头驱动。类型恒 = 算法默认类型(非默认组合已在
+        // Create 显式拒绝);会话算法与复合头算法相左 → InvalidRequest。
+        if let (Some(sess_alg), Some(comp)) = (session.checksum_alg, composite) {
+            if sess_alg != comp.algorithm {
+                return Err(Error::InvalidRequest(format!(
+                    "complete checksum algorithm {} does not match the upload session algorithm {}",
+                    comp.algorithm.s3_name(),
+                    sess_alg.s3_name()
+                )));
+            }
+        }
+        let effective_alg = session.checksum_alg.or(composite.map(|c| c.algorithm));
+        let mut object_checksum: Option<ChecksumInfo> = None;
+        if let Some(alg) = effective_alg {
+            let ctype = alg.default_checksum_type();
+            let expected: Vec<u8> = match ctype {
+                ChecksumType::Composite => {
+                    // 复合值:alg(concat(各分片 checksum 原始字节));全部
+                    // 分片须有同算法落盘 checksum,否则无法复合 →
+                    // InvalidRequest(AWS 口径)
+                    let mut hasher = ChecksumHasher::new(alg);
+                    for (no, p) in &combined {
+                        match &p.checksum {
+                            Some(stored) if stored.algorithm == alg => {
+                                hasher.update(&stored.value);
+                            }
+                            Some(_) => {
+                                return Err(Error::InvalidRequest(format!(
+                                    "part {no} was uploaded with a different checksum algorithm; cannot compute the {} composite checksum",
+                                    alg.s3_name()
+                                )));
+                            }
+                            None => {
+                                return Err(Error::InvalidRequest(format!(
+                                    "part {no} was uploaded without a checksum; cannot compute the {} composite checksum",
+                                    alg.s3_name()
+                                )));
+                            }
+                        }
+                    }
+                    hasher.finish()
+                }
+                ChecksumType::FullObject => {
+                    // 全对象值:alg(拼接字节流);重读分片数据流式重算(与
+                    // Complete 数据路径同段,不引入新的一致性面)。
+                    // M11 E1-4/K1-1:SSE 分片解密后按**明文**重算(checksum
+                    // 恒在明文侧,ADR-12 checksum 决策/DE2);解密密钥 =
+                    // SSE-C 请求密钥 / SSE-S3 会话 DEK(part_data_key)
+                    let mut hasher = ChecksumHasher::new(alg);
+                    for (_, p) in &combined {
+                        self.read_part_plain_to(
+                            p,
+                            &mut HasherSink(&mut hasher),
+                            part_data_key.as_ref(),
+                        )?;
+                    }
+                    hasher.finish()
+                }
+            };
+            if let Some(comp) = composite {
+                // 客户端声明值验算:形态(COMPOSITE 须 -N 且 N = 分片数;
+                // FULL_OBJECT 须裸 base64)或值不符 → BadDigest(AWS 口径)
+                let form_ok = match ctype {
+                    ChecksumType::Composite => comp.parts == Some(combined.len() as u32),
+                    ChecksumType::FullObject => comp.parts.is_none(),
+                };
+                if !form_ok || comp.value != expected {
+                    return Err(Error::BadDigest(format!(
+                        "The {} you specified did not match what we received.",
+                        alg.s3_name()
+                    )));
+                }
+            }
+            object_checksum = Some(ChecksumInfo {
+                algorithm: alg,
+                value: expected,
+            });
+        }
+        // 逐分片 checksum 随对象持久化(索引与 parts 对齐;全部分片无
+        // checksum → 空表)。Complete 后 p: 分片记录即删除,对象级副本是
+        // GetObjectAttributes ObjectParts 的唯一来源(v4 尾部字段)。
+        let part_checksums: Vec<Option<ChecksumInfo>> =
+            if combined.iter().any(|(_, p)| p.checksum.is_some()) {
+                combined.iter().map(|(_, p)| p.checksum.clone()).collect()
+            } else {
+                Vec::new()
+            };
 
         // 组合策略(全内联 / 全 extent / 混合,均只取请求子集)
         let all_inline = combined.iter().all(|(_, p)| p.inline.is_some());
@@ -2120,7 +2776,119 @@ impl Engine {
 
         let mut draft = Staged::default();
         let result = (|| -> Result<ObjectMeta> {
-            let meta = if all_inline && total_size <= self.small_object_limit as u64 {
+            // M11 E1-4/K1-1 防御:加密会话 ⇒ 全部分片必须带加密产物
+            // (upload_part/upload_part_copy 已保证一致;此处兜底防元数据
+            // 异常时静默把未加密分片拼进加密对象)
+            let session_encrypted = sse_key.is_some() || session.sse_s3.is_some();
+            if session_encrypted {
+                for (no, p) in &combined {
+                    if p.sse.is_none() {
+                        return Err(Error::InvalidRequest(format!(
+                            "part {no} of an SSE upload is missing encryption metadata"
+                        )));
+                    }
+                }
+            }
+            // K1-1:对象级写密钥——SSE-C 会话 = 请求密钥(D-E4 同一密钥
+            // 解密+重加密);SSE-S3 会话 = **新签发对象级 DEK**(当前代包裹;
+            // part 解密用会话 DEK——part_data_key,两臂分离)
+            let s3_obj_key = match &session.sse_s3 {
+                Some(_) => Some(self.sse_s3_mint_write_key()?),
+                None => None,
+            };
+            let obj_write_key = match (sse_key, &s3_obj_key) {
+                (Some(c), None) => Some(fs3_core::SseWriteKey::SseC(c)),
+                (None, Some(s)) => Some(fs3_core::SseWriteKey::SseS3(s)),
+                (None, None) => None,
+                (Some(_), Some(_)) => unreachable!("SSE-C/SSE-S3 会话互斥已在上方判定"),
+            };
+            let meta = if let Some(wkey) = &obj_write_key {
+                let part_dk = part_data_key
+                    .as_ref()
+                    .expect("encrypted session has part data key");
+                // M11 E1-4(ADR-12 D-E4 裁决,见函数文档;K1-1 扩展 SSE-S3):
+                // 加密会话一律数据路径——逐 part 解密(part 内网格)→ 重加密
+                // 为单一 nonce_base 的对象全局 64KiB 网格,对象级 SseInfo 与
+                // 单对象 PUT 同形态(读路径零分叉,ObjectMeta 停留 v4)。
+                // 复合 ETag(md5(各 part 密文 MD5)-N)已在上方算出,不变。
+                if total_size <= self.small_object_limit as u64 {
+                    // 小对象内联:拼明文后整体加密(同一 64KiB 网格口径,
+                    // 内联恒单 chunk,同 put_with_meta 内联臂)
+                    let mut pt = Vec::with_capacity(total_size as usize);
+                    for (_, p) in &combined {
+                        let part_sse = p.sse.as_ref().expect("sse parts checked above");
+                        pt.extend_from_slice(&self.decrypt_part(p, part_sse, part_dk)?);
+                    }
+                    debug_assert_eq!(pt.len() as u64, total_size);
+                    let mut nonce_base = [0u8; 12];
+                    random_bytes(&mut nonce_base)?;
+                    let mut cipher = fs3_core::ChunkedGcm::new(wkey.data_key(), nonce_base);
+                    let mut ct = Vec::with_capacity(pt.len());
+                    let mut tags = Vec::new();
+                    for (no, chunk) in pt.chunks(fs3_core::SSE_CHUNK_SIZE).enumerate() {
+                        let (c, tag) = cipher.encrypt_chunk(no as u64, chunk);
+                        ct.extend_from_slice(&c);
+                        tags.push(tag);
+                    }
+                    ObjectMeta {
+                        size: total_size,
+                        etag,
+                        mtime,
+                        extents: Vec::new(),
+                        content_type: session.content_type.clone(),
+                        user_meta: session.user_meta.clone(),
+                        inline: Some(ct),
+                        parts: part_sizes,
+                        resp_headers: session.resp_headers.clone(),
+                        version_id: target.meta_version_id(),
+                        is_delete_marker: false,
+                        tags: session.tags.clone(),
+                        sse: Some(wkey.build_sse_info(nonce_base, tags)),
+                        checksum: object_checksum.clone(),
+                        retention: None,
+                        legal_hold: false,
+                        part_checksums: part_checksums.clone(),
+                    }
+                } else {
+                    // extent:逐 part 解密直灌 SSE 写上下文(单一对象网格;
+                    // 对象级 nonce_base 仍每 Complete 随机,D-E6 只约束分片)
+                    let mut writer =
+                        ExtentWriter::new(self.chunk_size, self.etag_mode, Some(wkey), None)?;
+                    for (_, p) in &combined {
+                        let part_sse = p.sse.as_ref().expect("sse parts checked above");
+                        let pt = self.decrypt_part(p, part_sse, part_dk)?;
+                        writer.feed(self, &mut draft, &pt)?;
+                    }
+                    let (extents, size, _, sse) = writer.finish(self, &mut draft)?;
+                    debug_assert_eq!(size, total_size);
+                    // 新段记账 + 分片旧段释放(同事务;仅请求子集)
+                    let mut part_segments: Vec<Segment> = Vec::new();
+                    for (_, p) in &combined {
+                        part_segments.extend(p.extents.iter().cloned());
+                    }
+                    self.alloc.add_object(&mut draft, &extents);
+                    self.alloc.release_object(&mut draft, &part_segments);
+                    ObjectMeta {
+                        size: total_size,
+                        etag,
+                        mtime,
+                        extents,
+                        content_type: session.content_type.clone(),
+                        user_meta: session.user_meta.clone(),
+                        inline: None,
+                        parts: part_sizes,
+                        resp_headers: session.resp_headers.clone(),
+                        version_id: target.meta_version_id(),
+                        is_delete_marker: false,
+                        tags: session.tags.clone(),
+                        sse,
+                        checksum: object_checksum.clone(),
+                        retention: None,
+                        legal_hold: false,
+                        part_checksums: part_checksums.clone(),
+                    }
+                }
+            } else if all_inline && total_size <= self.small_object_limit as u64 {
                 // 全内联:拼接数据,零设备 I/O(仅请求子集,REVIEW §4.12)
                 let mut data = Vec::with_capacity(total_size as usize);
                 for (_, p) in &combined {
@@ -2142,9 +2910,10 @@ impl Engine {
                     is_delete_marker: false,
                     tags: session.tags.clone(),
                     sse: None,
-                    checksum: None,
+                    checksum: object_checksum.clone(),
                     retention: None,
                     legal_hold: false,
+                    part_checksums: part_checksums.clone(),
                 }
             } else if all_extent {
                 // 零数据搬运:段列表按序拼接(所有权从分片转移给对象;
@@ -2167,9 +2936,10 @@ impl Engine {
                     is_delete_marker: false,
                     tags: session.tags.clone(),
                     sse: None,
-                    checksum: None,
+                    checksum: object_checksum.clone(),
                     retention: None,
                     legal_hold: false,
+                    part_checksums: part_checksums.clone(),
                 }
             } else {
                 // 混合(小分片 + 大分片):数据路径组合(仅请求子集,REVIEW §4.12)
@@ -2177,8 +2947,14 @@ impl Engine {
                 for (_, p) in &combined {
                     self.read_part_to(p, &mut sink)?;
                 }
-                let (extents, size, _) =
-                    self.stream_to_extents(&mut std::io::Cursor::new(sink), &mut draft)?;
+                // 明文会话恒不加密(SSE-C 会话在上方 D-E4 臂先行接管)
+                let (extents, size, _, sse) = self.stream_to_extents(
+                    &mut std::io::Cursor::new(sink),
+                    &mut draft,
+                    None,
+                    None,
+                )?;
+                debug_assert!(sse.is_none(), "plaintext session assembly never encrypts");
                 debug_assert_eq!(size, total_size);
                 // 分片旧段释放(同事务;ADR-9 §5.4 覆盖语义;仅请求子集)
                 let mut part_segments: Vec<Segment> = Vec::new();
@@ -2201,9 +2977,10 @@ impl Engine {
                     is_delete_marker: false,
                     tags: session.tags.clone(),
                     sse: None,
-                    checksum: None,
+                    checksum: object_checksum.clone(),
                     retention: None,
                     legal_hold: false,
+                    part_checksums: part_checksums.clone(),
                 }
             };
 
@@ -2317,15 +3094,23 @@ impl Engine {
     }
 
     /// 过期会话回收(默认 7 天;启动与周期任务调用)。
+    ///
+    /// M11 L2-2 让位口径(终稿):桶已配置生命周期规则(`r:` 键非空,含全
+    /// Disabled)→ 该桶会话中止由规则驱动(AbortIncompleteMultipartUpload,
+    /// 生命周期执行器),本硬编码 TTL 清扫跳过之——**规则存在即替代默认**
+    /// (AWS 语义:无匹配规则 = 不自动中止);无规则桶保持现状 7 天清扫。
     pub fn sweep_expired_sessions(&mut self, ttl_secs: i64) -> Result<usize> {
         let now = now_ts();
-        let expired: Vec<String> = self
-            .meta
-            .list_all_sessions()?
-            .into_iter()
-            .filter(|(_, s)| now - s.created >= ttl_secs)
-            .map(|(uid, _)| uid)
-            .collect();
+        let mut expired: Vec<String> = Vec::new();
+        for (uid, s) in self.meta.list_all_sessions()? {
+            if now - s.created < ttl_secs {
+                continue;
+            }
+            if !self.meta.get_lifecycle_rules(&s.bucket)?.is_empty() {
+                continue;
+            }
+            expired.push(uid);
+        }
         let mut n = 0usize;
         for uid in expired {
             if self.abort_multipart(&uid).is_ok() {
@@ -2369,6 +3154,98 @@ impl Engine {
         Ok(())
     }
 
+    /// SSE 分片整体解密(M11 E1-4 SSE-C;K1-1 泛化):读密文(等长)后按
+    /// part 内 64KiB 网格逐 chunk 验 tag 解密;错密钥/篡改 → Corrupt
+    /// (同读路径口径,不泄漏密钥信息)。`data_key` = 分片数据密钥
+    /// (SSE-C = 请求客户密钥派生;SSE-S3 = 会话 DEK)。Complete 重加密臂
+    /// 与 FullObject checksum 重算共用。
+    /// 峰值内存 = 单分片密文+明文(分片 ≤ 5GiB;Complete 数据路径既有
+    /// 整对象缓冲先例,此处以分片为粒度)。
+    fn decrypt_part(
+        &mut self,
+        part: &PartMeta,
+        sse: &fs3_core::SseInfo,
+        data_key: &[u8; 32],
+    ) -> Result<Vec<u8>> {
+        let mut ct = Vec::with_capacity(part.size as usize);
+        self.read_part_to(part, &mut ct)?;
+        let cipher = fs3_core::ChunkedGcm::new(*data_key, sse.nonce_base);
+        let mut pt = Vec::with_capacity(ct.len());
+        for (no, chunk) in ct.chunks(fs3_core::SSE_CHUNK_SIZE).enumerate() {
+            let tag = sse.chunk_tags.get(no).ok_or_else(|| {
+                Error::Corrupt(format!(
+                    "sse part chunk_tags too short ({} entries, need chunk {no})",
+                    sse.chunk_tags.len()
+                ))
+            })?;
+            let c = cipher.decrypt_chunk(no as u64, chunk, tag).map_err(|_| {
+                Error::Corrupt(format!(
+                    "sse-c part chunk {no} authentication failed (corrupt data or wrong customer key)"
+                ))
+            })?;
+            self.sse_decrypt_bytes
+                .fetch_add(c.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            pt.extend_from_slice(&c);
+        }
+        Ok(pt)
+    }
+
+    /// 分片明文读出(M11 E1-4;K1-1 泛化):未加密分片 = read_part_to
+    /// 原样;加密分片经 decrypt_part 解密(`part_data_key` = SSE-C 请求
+    /// 密钥派生 / SSE-S3 会话 DEK;缺 → InvalidRequest 兜底,协议层已先行
+    /// 校验;错密钥 → Corrupt)。
+    fn read_part_plain_to(
+        &mut self,
+        part: &PartMeta,
+        out: &mut dyn Write,
+        part_data_key: Option<&[u8; 32]>,
+    ) -> Result<()> {
+        let Some(sse) = &part.sse else {
+            return self.read_part_to(part, out);
+        };
+        let dk = part_data_key.ok_or_else(|| {
+            Error::InvalidRequest(
+                "part is SSE encrypted; the data key is required to read it".into(),
+            )
+        })?;
+        let pt = self.decrypt_part(part, sse, dk)?;
+        out.write_all(&pt)?;
+        Ok(())
+    }
+
+    /// 对象区间明文直灌 ExtentWriter(M11 E1-5 数据路径共用:
+    /// UploadPartCopy / CopyObject 重加密臂)。源 SSE-C 加密时按对象全局
+    /// 64KiB 网格逐窗验 tag 解密(read_sse_at_meta;错密钥 → Corrupt,
+    /// 缺密钥 → InvalidRequest),未加密直读;窗口化读-灌交替,无整段
+    /// 内存缓冲。内联/extent 源统一(read_raw_at_meta 两臂自理)。
+    fn feed_object_plain(
+        &mut self,
+        writer: &mut ExtentWriter,
+        draft: &mut Staged,
+        meta: &ObjectMeta,
+        range: std::ops::Range<u64>,
+        src_sse_key: Option<&fs3_core::SseCKey>,
+    ) -> Result<()> {
+        let mut buf = vec![0u8; self.chunk_size];
+        let mut pos = range.start;
+        while pos < range.end {
+            let want = ((range.end - pos) as usize).min(buf.len());
+            let n = match &meta.sse {
+                Some(sse) => {
+                    self.read_sse_at_meta(meta, sse, src_sse_key, pos, &mut buf[..want])?
+                }
+                None => self.read_raw_at_meta(meta, pos, &mut buf[..want])?,
+            };
+            if n == 0 {
+                break;
+            }
+            writer.feed(self, draft, &buf[..n])?;
+            pos += n as u64;
+        }
+        debug_assert_eq!(pos, range.end, "feed_object_plain 窗口必须灌满区间");
+        Ok(())
+    }
+
     // ─────────────────────────── CopyObject(F6,COW) ───────────────────────────
 
     /// 服务端复制:同设备 = 元数据操作(段级共享,零数据 I/O;ADR-9 §5.5)。
@@ -2408,6 +3285,9 @@ impl Engine {
     /// - 段共享:非内联源 share_object 零数据 I/O 不变;版本化目标跳过旧
     ///   目标释放(同 put;Suspended null 槽覆盖仍走既有 release);
     /// - 复制删除标记到未版本化桶 → InvalidArgument(标记无处安放)。
+    ///
+    /// 本便捷入口无 SSE-C 密钥(明文 COW);加密复制语义(DE3)走
+    /// `copy_object_version_for` 的 sse 尾参。
     #[allow(clippy::too_many_arguments)]
     pub fn copy_object_version(
         &mut self,
@@ -2437,12 +3317,43 @@ impl Engine {
             replace_resp_headers,
             replace_tags,
             dst_versioning,
+            None,
+            None,
         )
     }
 
     /// copy_object_version 的桶状态感知形态(F-1 配套,V2 +1 次目标桶点读
     /// 合并):调用方(协议层)已持有目标桶版本化状态(存在性已判)时直接
     /// 传入,引擎侧不再重复点读;语义与 copy_object_version 逐字节一致。
+    ///
+    /// SSE 复制加密语义矩阵(M11 E1-5 SSE-C;K1-1 扩展 SSE-S3,ADR-12
+    /// DE3/DS1/DS3):
+    /// - 源加密 + 目标未指定加密(`sse_dst_key` = None)→ **InvalidRequest**
+    ///   (防静默解密落盘;协议层先判,此处兜底);
+    /// - 源 SSE-C + 目标 SSE-C:同密钥(data_key 相等——HKDF 确定性派生,
+    ///   引擎侧可比;协议层另有 key-MD5 逐值口径)→ **COW 直灌**
+    ///   (SseInfo 原样继承,零数据搬运);密钥不同 → **解密重加密**
+    ///   (数据路径);
+    /// - 源 SSE-S3 + 目标 SSE-S3:**COW 直灌**(段共享/内联拷贝;
+    ///   chunk_tags/nonce_base/密文只读共享,安全)。kek_id 与目标代不同
+    ///   (轮换后)→ **元数据级重包裹**:源 DEK 旧代解包、目标代重包裹,
+    ///   仅改写 wrapped_dek/kek_id 两字段,数据零搬运(裁决写死——DEK
+    ///   同源是 COW 的密码学前提,故不复用 mint 的随机 DEK);
+    /// - 源/目标跨算法(SSE-C↔SSE-S3)= 换密钥 → **解密重加密**
+    ///   (数据路径);
+    /// - 源未加密 + 目标加密 → 数据路径加密写(读源明文 → ExtentWriter
+    ///   SSE 上下文;ETag 落密文摘要,DE2);
+    /// - 源/目标均未加密 → 现状 COW。
+    ///
+    /// 源 SSE-C 时 `sse_src_key`(copy-source 侧客户密钥)必须提供(重
+    /// 加密与同密钥判定必需;协议层已先行解析门控,此处兜底);源 SSE-S3
+    /// 由服务端 KEK 体系自持解包(无客户头);源未加密时 copy-source 侧
+    /// 密钥按 AWS 语义忽略(同 GET 明文裁决)。删除标记无载荷,跳过加密
+    /// 矩阵(标记原样复制)。
+    /// 数据路径产物:extent 臂经 feed_object_plain 窗口化直灌(无整段
+    /// 内存缓冲);≤ small_object_limit 走内联臂整体加密(恒单 chunk)。
+    /// checksum/parts/part_checksums 原样继承——checksum 恒明文语义,
+    /// 加密不改变明文。
     #[allow(clippy::too_many_arguments)]
     pub fn copy_object_version_for(
         &mut self,
@@ -2456,6 +3367,8 @@ impl Engine {
         replace_resp_headers: Option<&[(String, String)]>,
         replace_tags: Option<&[(String, String)]>,
         dst_versioning: VersioningState,
+        sse_src_key: Option<&fs3_core::SseCKey>,
+        sse_dst_key: Option<&fs3_core::SseWriteKey>,
     ) -> Result<ObjectMeta> {
         let src = self.resolve_object_entry(src_bucket, src_key, src_version, None)?;
         let (target, old) = self.plan_object_write(dst_bucket, dst_key, dst_versioning)?;
@@ -2482,10 +3395,132 @@ impl Engine {
                 "copy source {src_bucket}/{src_key} is a delete marker"
             )));
         }
+        // M11 E1-5/K1-1(DE3/DS1,矩阵见函数文档):true = 解密/加密数据
+        // 路径;false = COW 直灌(段共享/内联拷贝,SseInfo 随 meta 克隆
+        // 继承;SSE-S3 异代另做元数据级重包裹,见下)。
+        let data_path = if src.is_delete_marker {
+            false
+        } else {
+            match (&src.sse, sse_dst_key) {
+                (None, None) => false,
+                (None, Some(_)) => true,
+                (Some(_), None) => {
+                    return Err(Error::InvalidRequest(
+                        "copy source is SSE-C encrypted; the destination of the copy must specify SSE-C encryption".into(),
+                    ))
+                }
+                (Some(ssrc), Some(dk)) => match (ssrc.kind, dk) {
+                    (fs3_core::SseKind::SseC, fs3_core::SseWriteKey::SseC(ck)) => {
+                        let sk = sse_src_key.ok_or_else(|| {
+                            Error::InvalidRequest(
+                                "copy source is SSE-C encrypted; copy-source customer key is required"
+                                    .into(),
+                            )
+                        })?;
+                        sk.data_key() != ck.data_key()
+                    }
+                    // SSE-S3 → SSE-S3:COW(密文/网格只读共享);异代差异由
+                    // 下方元数据级重包裹收敛,不走数据路径
+                    (fs3_core::SseKind::SseS3, fs3_core::SseWriteKey::SseS3(_)) => false,
+                    // 跨算法 = 换密钥 → 解密重加密
+                    (fs3_core::SseKind::SseC, fs3_core::SseWriteKey::SseS3(_)) => {
+                        if sse_src_key.is_none() {
+                            return Err(Error::InvalidRequest(
+                                "copy source is SSE-C encrypted; copy-source customer key is required"
+                                    .into(),
+                            ));
+                        }
+                        true
+                    }
+                    (fs3_core::SseKind::SseS3, fs3_core::SseWriteKey::SseC(_)) => true,
+                },
+            }
+        };
         let mut draft = Staged::default();
-        // 源为内联 → 数据拷贝进新内联;否则共享段列表(稀疏共享表)
-        if src.inline.is_none() {
-            self.alloc.share_object(&mut draft, &meta.extents);
+        if data_path {
+            // 数据路径:读源明文(源加密则逐窗验 tag 解密,密钥按 kind
+            // 分派)→ 目标加密写;失败回滚已暂存分配(同 put 先例)
+            let r = (|| -> Result<()> {
+                let k = sse_dst_key.expect("data path implies destination sse key");
+                if src.size <= self.small_object_limit as u64 {
+                    // 小对象内联臂:读全文明文后整体加密(同一 64KiB 网格,
+                    // 内联恒单 chunk;等长,inline 容量语义不变)
+                    let mut pt = Vec::with_capacity(src.size as usize);
+                    self.get_to_meta(&src, 0..u64::MAX, &mut pt, sse_src_key)?;
+                    debug_assert_eq!(pt.len() as u64, src.size);
+                    let mut nonce_base = [0u8; 12];
+                    random_bytes(&mut nonce_base)?;
+                    let mut cipher = fs3_core::ChunkedGcm::new(k.data_key(), nonce_base);
+                    let mut ct = Vec::with_capacity(pt.len());
+                    let mut tags = Vec::new();
+                    for (no, chunk) in pt.chunks(fs3_core::SSE_CHUNK_SIZE).enumerate() {
+                        let (c, tag) = cipher.encrypt_chunk(no as u64, chunk);
+                        ct.extend_from_slice(&c);
+                        tags.push(tag);
+                    }
+                    meta.etag = self.compute_etag(&ct);
+                    meta.extents = Vec::new();
+                    meta.inline = Some(ct);
+                    meta.sse = Some(k.build_sse_info(nonce_base, tags));
+                } else {
+                    // extent 臂:源明文窗口化直灌 SSE 写上下文(对象级
+                    // nonce_base 随机,None = 由 writer 自行生成)
+                    let mut writer =
+                        ExtentWriter::new(self.chunk_size, self.etag_mode, Some(k), None)?;
+                    self.feed_object_plain(
+                        &mut writer,
+                        &mut draft,
+                        &src,
+                        0..src.size,
+                        sse_src_key,
+                    )?;
+                    let (extents, size, etag, sse) = writer.finish(self, &mut draft)?;
+                    debug_assert_eq!(size, src.size);
+                    self.alloc.add_object(&mut draft, &extents);
+                    meta.etag = etag;
+                    meta.extents = extents;
+                    meta.inline = None;
+                    meta.sse = sse;
+                }
+                Ok(())
+            })();
+            if let Err(e) = r {
+                self.abort_draft(&draft);
+                return Err(e);
+            }
+        } else {
+            // COW:源为内联 → 数据拷贝进新内联;否则共享段列表(稀疏共享表)
+            if src.inline.is_none() {
+                self.alloc.share_object(&mut draft, &meta.extents);
+            }
+            // K1-1(DS1):SSE-S3 异代 COW 的元数据级重包裹——源 DEK 旧代
+            // 解包、目标代重包裹,仅改写 wrapped_dek/kek_id(DEK 同源是
+            // COW 的密码学前提;mint 的随机 DEK 在本臂弃用,随持有结构
+            // Drop 擦除)。同代 COW = SseInfo 逐字节继承(零触碰)。
+            if let (Some(ssrc), Some(fs3_core::SseWriteKey::SseS3(w))) = (&src.sse, sse_dst_key) {
+                if ssrc.kek_id != w.kek_id() {
+                    let mut seed = self.meta.sse_kek_seed()?;
+                    let wrapped = fs3_core::rewrap_sse_s3_dek(
+                        &seed,
+                        ssrc.kek_id,
+                        w.kek_id(),
+                        &ssrc.wrapped_dek,
+                    )
+                    .map_err(|_| {
+                        Error::Corrupt(format!(
+                            "sse-s3 copy rewrap failed (kek gen {} → {})",
+                            ssrc.kek_id,
+                            w.kek_id()
+                        ))
+                    })?;
+                    zeroize::Zeroize::zeroize(&mut seed);
+                    meta.sse = Some(fs3_core::SseInfo {
+                        kek_id: w.kek_id(),
+                        wrapped_dek: wrapped,
+                        ..ssrc.clone()
+                    });
+                }
+            }
         }
         if !old.segments.is_empty() {
             self.alloc.release_object(&mut draft, &old.segments);
@@ -2674,6 +3709,12 @@ impl Engine {
         offset: u64,
         length: u64,
     ) -> Result<Option<Vec<DevSegment>>> {
+        // M11 E1-3(DE1):SSE 对象读路径必须过 CPU 解密,**禁零拷贝**
+        // (sendfile/splice 只能发密文)——返回 None 强制走缓冲解密路径
+        // (文档化见 docs/perf-M10.md §6;按字节计 fasts3_sse_decrypt_bytes_total)
+        if meta.sse.is_some() {
+            return Ok(None);
+        }
         if meta.inline.is_some() || meta.extents.is_empty() {
             return Ok(Some(Vec::new()));
         }
@@ -2718,6 +3759,12 @@ impl Engine {
     /// 读校验开关(开启时禁零拷贝)。
     pub fn verify_reads_enabled(&self) -> bool {
         self.verify_reads
+    }
+
+    /// SSE-C 累计解密字节数(M11 E1-3 指标;admin /metrics 渲染)。
+    pub fn sse_decrypt_bytes(&self) -> u64 {
+        self.sse_decrypt_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 零拷贝 fd(sendfile/splice;None = 不可用)。
@@ -3018,6 +4065,12 @@ struct PutCtx<'a> {
     resp_headers: Vec<(String, String)>,
     /// 对象标签(M10 S1;x-amz-tagging 头落 ObjectMeta.tags)。
     tags: Vec<(String, String)>,
+    /// SSE 写密钥(M11 E1-7 SSE-C;K1-1 泛化 SSE-S3;None = 未加密)。
+    /// 请求期借用,不落盘(SSE-S3 落盘的只有 wrapped_dek 密文)。
+    sse_key: Option<&'a fs3_core::SseWriteKey<'a>>,
+    /// checksum EOF 共享出口(M11 C1-2 extent 臂):tee 读尽后结果在此,
+    /// 提交前取回落 ObjectMeta.checksum(修复落盘恒 None 的时序缺口)。
+    checksum_out: &'a std::cell::RefCell<Option<ChecksumInfo>>,
 }
 
 /// 版本化写入目标(ADR-11 §3.4.2;put/copy/complete 共用分叉)。
@@ -3105,6 +4158,7 @@ fn delete_marker_meta(vid: Option<[u8; 16]>) -> ObjectMeta {
         checksum: None,
         retention: None,
         legal_hold: false,
+        part_checksums: Vec::new(),
     }
 }
 
@@ -3127,11 +4181,243 @@ impl Read for PrefixedReader<'_> {
     }
 }
 
+/// checksum 透传 reader(M11 C1-2):声明算法时边读边算明文校验和,流消费
+/// 完后 `finish` 取 [`ChecksumInfo`] 落 `ObjectMeta.checksum`;未声明
+/// (`None`)时纯透传零计算。值比对在协议层,本层只算不判。
+///
+/// EOF 落值出口(extent 臂提交时序修复):extent 路径的元数据提交发生在
+/// `put_stream` 内部,而 tee 要在流读尽(EOF)后才能出值——`eof_out`
+/// 非空时 tee 在首次 EOF 把结果写入该共享单元格,`put_stream` 提交前
+/// 取回落值(此前 commit 后只对返回副本补丁赋值,落盘值恒 None,
+/// extent 臂大对象的 GET/HEAD checksum 回显丢失)。
+struct ChecksumTeeReader<'a> {
+    inner: &'a mut dyn Read,
+    alg: Option<ChecksumAlgorithm>,
+    hasher: Option<ChecksumHasher>,
+    /// EOF 已 finalize 的结果(幂等;`finish` 优先取之)。
+    done: Option<ChecksumInfo>,
+    /// extent 臂共享出口(见结构体文档;None = 不启用)。
+    eof_out: Option<&'a std::cell::RefCell<Option<ChecksumInfo>>>,
+}
+
+impl<'a> ChecksumTeeReader<'a> {
+    fn new(inner: &'a mut dyn Read, alg: Option<ChecksumAlgorithm>) -> Self {
+        ChecksumTeeReader {
+            inner,
+            alg,
+            hasher: alg.map(ChecksumHasher::new),
+            done: None,
+            eof_out: None,
+        }
+    }
+
+    /// 挂接 EOF 共享出口(extent 臂;put_stream 提交前取值)。
+    fn with_eof_out(mut self, cell: &'a std::cell::RefCell<Option<ChecksumInfo>>) -> Self {
+        self.eof_out = Some(cell);
+        self
+    }
+
+    /// 流消费完后取结果(未声明算法 = None)。
+    fn finish(self) -> Option<ChecksumInfo> {
+        if let Some(info) = self.done {
+            return Some(info);
+        }
+        Some(ChecksumInfo {
+            algorithm: self.alg?,
+            value: self.hasher?.finish(),
+        })
+    }
+}
+
+impl Read for ChecksumTeeReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n == 0 {
+            // EOF:finalize 一次(幂等),共享出口与 done 双写
+            if self.done.is_none() {
+                if let Some(h) = self.hasher.take() {
+                    let info = ChecksumInfo {
+                        algorithm: self.alg.expect("hasher implies alg"),
+                        value: h.finish(),
+                    };
+                    if let Some(cell) = self.eof_out {
+                        cell.replace(Some(info.clone()));
+                    }
+                    self.done = Some(info);
+                }
+            }
+            return Ok(0);
+        }
+        if let Some(h) = &mut self.hasher {
+            h.update(&buf[..n]);
+        }
+        Ok(n)
+    }
+}
+
+/// checksum 流式 sink(M11 C1-4 门禁):把 `Write` 流直接喂给
+/// [`ChecksumHasher`],FULL_OBJECT 全对象校验和在 Complete 重读分片
+/// 数据时流式重算,避免整对象缓冲。
+struct HasherSink<'a>(&'a mut ChecksumHasher);
+
+impl Write for HasherSink<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// 零拷贝读段(设备偏移 + 长度;B3/D2)。
 #[derive(Debug, Clone, Copy)]
 pub struct DevSegment {
     pub dev_offset: u64,
     pub len: u64,
+}
+
+/// 段流水线产物(stream_to_extents / ExtentWriter::finish 返回):
+/// (段列表, 对象大小, ETag, SSE 产物)。
+type StreamWriteOutcome = (Vec<Segment>, u64, [u8; 16], Option<fs3_core::SseInfo>);
+
+/// SSE-S3 重包裹进度(M11 K1-1,ADR-12 DS1;admin GET /v1/admin/sse/status
+/// 渲染源)。内存态;持久判定标记 = meta 的 `rewrap_done_gen`(重启后
+/// `gen > rewrap_done_gen` ⇒ 有待办,重跑幂等收敛)。
+#[derive(Debug, Clone, Default)]
+pub struct SseS3RewrapProgress {
+    pub running: bool,
+    /// 本轮目标代(进度展示的锚点;多代连跑时随 pass 更新)。
+    pub target_gen: u32,
+    pub scanned: u64,
+    pub rewrapped: u64,
+    pub errors: u64,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    /// 只含代数/错误类别,绝不含密钥材料(红线)。
+    pub last_error: Option<String>,
+}
+
+/// 后台重包裹(DS1;[`Engine::spawn_sse_s3_rewrap`] 线程主体,测试直调):
+/// 循环 pass——扫全部 o: 条目(含版本条目),kind=SseS3 且 kek_id <
+/// 当前代 → 旧代解包、当前代重包裹、单事务回写(复用 V5-3
+/// `commit_object_meta_update`:不改统计/分配;SSE-S3 对象恒为 Phase K
+/// 二进制写入的当前版本值,回写无格式漂移),零错误 → 落
+/// `rewrap_done_gen` 收敛;gen 再进位(运行中又轮换)则续跑新 pass。
+///
+/// 纪律(写死):
+/// - 锁域照压缩 worker(ADR-9 §6.3):只持 MetaStore,不取引擎大锁;
+/// - 幂等可续跑:已当前代条目跳过;中断后重跑收敛;
+/// - 节流:照 rewrite-values 的 Tier2 平均速率口径(500 写/s);在线形态
+///   无 pause-file——常驻进程以幂等重跑 + drain 替代维护窗口语义;
+/// - 可读性不变量:全部历史代 KEK 由 seed 确定性派生,重包裹完成前旧
+///   代对象恒可读——重包裹是卫生收敛而非可读性前提,无值格式变更,故
+///   不触发 §2.4「重写完成前禁回滚」;
+/// - 分片(p:)不重包裹:会话短命(7 天 TTL),Complete 落对象时按当时
+///   当前代新签对象级 DEK,旧代分片随会话消亡;分片解密按其 kek_id
+///   派生 KEK,可读性不受轮换影响;
+/// - 红线:seed/KEK/DEK 明文不出本函数(组合原语内部擦除;进度/日志
+///   只含代数与计数)。
+pub fn run_sse_s3_rewrap(
+    meta: &MetaStore,
+    progress: &std::sync::Mutex<SseS3RewrapProgress>,
+) -> Result<()> {
+    use zeroize::Zeroize;
+    /// Tier2 节流口径(照 rewrite-values 默认:每秒最多 500 次重写)。
+    const REWRAP_RATE_PER_SEC: u64 = 500;
+    let mut seed = meta.sse_kek_seed()?;
+    let result = (|| -> Result<()> {
+        loop {
+            let st = meta.sse_kek_gen_state()?;
+            if st.rewrap_done_gen >= st.gen {
+                return Ok(());
+            }
+            progress.lock().unwrap().target_gen = st.gen;
+            let start = std::time::Instant::now();
+            let mut done_in_pass = 0u64;
+            let mut errors_in_pass = 0u64;
+            for e in &meta.snapshot_all_objects_raw()? {
+                progress.lock().unwrap().scanned += 1;
+                let Some(sse) = &e.meta.sse else { continue };
+                if sse.kind != fs3_core::SseKind::SseS3 || sse.kek_id >= st.gen {
+                    continue;
+                }
+                // 平均速率闸门(重写计次,跳过不计;照 rewrite.rs 口径)
+                if done_in_pass > 0 {
+                    let target = done_in_pass as f64 / REWRAP_RATE_PER_SEC as f64;
+                    let lag = target - start.elapsed().as_secs_f64();
+                    if lag > 0.0 {
+                        std::thread::sleep(std::time::Duration::from_secs_f64(lag.min(1.0)));
+                    }
+                }
+                let step = || -> Result<()> {
+                    let wrapped =
+                        fs3_core::rewrap_sse_s3_dek(&seed, sse.kek_id, st.gen, &sse.wrapped_dek)
+                            .map_err(|_| {
+                                Error::Corrupt(format!(
+                                    "sse-s3 rewrap unwrap failed (kek gen {} → {})",
+                                    sse.kek_id, st.gen
+                                ))
+                            })?;
+                    let mut m = e.meta.clone();
+                    m.sse = Some(fs3_core::SseInfo {
+                        kek_id: st.gen,
+                        wrapped_dek: wrapped,
+                        ..sse.clone()
+                    });
+                    meta.commit_object_meta_update(&e.raw_key, &m)?;
+                    Ok(())
+                };
+                match step() {
+                    Ok(()) => {
+                        done_in_pass += 1;
+                        progress.lock().unwrap().rewrapped += 1;
+                    }
+                    Err(err) => {
+                        // 单条失败不中止整轮(记数 + last_error;重跑收敛),
+                        // 但**不落 done 标记**(待办保留)
+                        errors_in_pass += 1;
+                        let mut p = progress.lock().unwrap();
+                        p.errors += 1;
+                        p.last_error = Some(format!("{err}"));
+                    }
+                }
+            }
+            if errors_in_pass > 0 {
+                return Ok(());
+            }
+            meta.mark_sse_rewrap_done(st.gen)?;
+        }
+    })();
+    seed.zeroize();
+    result
+}
+
+/// SSE 写侧状态(M11 E1-7 SSE-C;K1-1 泛化 SSE-S3,ADR-12 DE1/DE2/DS1):
+/// 请求期持有,随 ExtentWriter 生命周期结束而 Drop(ChunkedGcm Drop
+/// zeroize data_key;nonce_base 与 SseInfo 静态字段落 `SseInfo`,tag 随写
+/// 随收)。
+///
+/// 插入点(任务口径「明文 → checksum → 加密 → 密文 CRC → 密文 MD5」):
+/// checksum tee 在 reader 侧(更外层,不动);本状态在 **feed 入口**按对象
+/// 字节流 64KiB 网格凑块加密,密文再流入既有 acc/flush_acc 流水线——段
+/// CRC 网格/全对象 crc_acc/MD5 全部自然落在密文上(DE2 密文侧语义自动
+/// 成立)。不能在 flush_acc 按攒批缓冲加密:flush 边界受 extent 容量
+/// (4MiB-4KiB,非 64KiB 倍数)切割,与对象 64KiB 网格不对齐。
+struct SseWriteState {
+    cipher: fs3_core::ChunkedGcm,
+    /// 明文凑块暂存(≤ 64KiB;满一块加密一块,尾块在 finish 加密)。
+    staging: Vec<u8>,
+    /// 已加密 chunk 的 GCM tag(索引 = chunk_no;落 SseInfo.chunk_tags)。
+    chunk_tags: Vec<[u8; 16]>,
+    /// 落盘 SseInfo 静态字段(K1-1:SSE-C = kind SseC/kek_id 0/wrapped 空/
+    /// key_md5 = 客户密钥 MD5 校验子;SSE-S3 = kind SseS3/kek_id 当前代/
+    /// wrapped_dek 包裹值/key_md5 全零)。
+    kind: fs3_core::SseKind,
+    kek_id: u32,
+    wrapped_dek: Vec<u8>,
+    key_md5: [u8; 16],
 }
 
 /// 进行中的对象写状态(ADR-9 §5.1):每对象一个 writer,共享引擎的开放
@@ -3159,10 +4445,56 @@ struct ExtentWriter {
     seg_written: u32,
     segments: Vec<Segment>,
     size: u64,
+    /// SSE-C 写侧状态(M11 E1-7;None = 未加密,零开销透传)。
+    sse: Option<SseWriteState>,
 }
 
 impl ExtentWriter {
-    fn new(chunk_size: usize, etag_mode: fs3_core::EtagMode) -> Result<Self> {
+    /// `sse_nonce_base`(D-E6):Some = 调用方指定的 nonce_base(multipart
+    /// 分片的确定性派生值,`fs3_core::derive_part_nonce_base`;重传幂等);
+    /// None = 每对象随机(单对象 PUT/Complete 重加密/CopyObject 写臂)。
+    /// sse_key 为 None 时该参数必须为 None(明文写零开销透传)。
+    /// `sse_key`(M11 K1-1 泛化):SSE-C 客户密钥 / SSE-S3 写密钥,经
+    /// [`fs3_core::SseWriteKey`] 并集表达;data_key/校验子/落盘静态字段
+    /// 由该枚举按类型分派,网格与流水线两臂同构。
+    fn new(
+        chunk_size: usize,
+        etag_mode: fs3_core::EtagMode,
+        sse_key: Option<&fs3_core::SseWriteKey>,
+        sse_nonce_base: Option<[u8; 12]>,
+    ) -> Result<Self> {
+        // M11 E1-7:SSE 上下文(data_key 请求期派生,随 writer Drop 擦除,
+        // 零落盘;nonce_base 默认每对象随机,分片路径由调用方确定性派生)
+        let sse = match sse_key {
+            Some(k) => {
+                let nonce_base = match sse_nonce_base {
+                    Some(nb) => nb,
+                    None => {
+                        let mut nb = [0u8; 12];
+                        fs3_core::random_bytes(&mut nb)?;
+                        nb
+                    }
+                };
+                let (kind, kek_id, wrapped_dek) = match k {
+                    fs3_core::SseWriteKey::SseC(_) => (fs3_core::SseKind::SseC, 0, Vec::new()),
+                    fs3_core::SseWriteKey::SseS3(w) => (
+                        fs3_core::SseKind::SseS3,
+                        w.kek_id(),
+                        w.wrapped_dek().to_vec(),
+                    ),
+                };
+                Some(SseWriteState {
+                    cipher: fs3_core::ChunkedGcm::new(k.data_key(), nonce_base),
+                    staging: Vec::with_capacity(fs3_core::SSE_CHUNK_SIZE),
+                    chunk_tags: Vec::new(),
+                    kind,
+                    kek_id,
+                    wrapped_dek,
+                    key_md5: k.key_md5(),
+                })
+            }
+            None => None,
+        };
         Ok(ExtentWriter {
             chunk_size,
             capacity: 0, // feed 首轮经 ensure_extent 设置
@@ -3181,6 +4513,7 @@ impl ExtentWriter {
             seg_written: 0,
             segments: Vec::new(),
             size: 0,
+            sse,
         })
     }
 
@@ -3194,7 +4527,49 @@ impl ExtentWriter {
         self.seg_written = 0;
     }
 
+    /// 写入口(明文;size 按明文记账——密文等长,段/水位语义不变)。
+    /// SSE-C:按对象 64KiB 网格凑块加密,密文走 feed_bytes;未加密直通。
     fn feed(&mut self, engine: &mut Engine, draft: &mut Staged, data: &[u8]) -> Result<()> {
+        self.size += data.len() as u64;
+        if self.size > fs3_core::MAX_OBJECT_SIZE {
+            return Err(Error::InvalidArgument("object exceeds 5TiB limit".into()));
+        }
+        if self.sse.is_none() {
+            return self.feed_bytes(engine, draft, data);
+        }
+        // M11 E1-7:凑满 64KiB 加密一个 chunk(chunk_no = 网格序号,
+        // 与读路径/Range 解密同一网格)
+        let mut off = 0usize;
+        while off < data.len() {
+            let take = {
+                let st = self.sse.as_mut().expect("sse state");
+                let take = (fs3_core::SSE_CHUNK_SIZE - st.staging.len()).min(data.len() - off);
+                st.staging.extend_from_slice(&data[off..off + take]);
+                take
+            };
+            off += take;
+            if self.sse.as_ref().expect("sse state").staging.len() == fs3_core::SSE_CHUNK_SIZE {
+                let ct = self.encrypt_staged_chunk();
+                self.feed_bytes(engine, draft, &ct)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 加密暂存区中的整块明文(64KiB)或尾块(finish 调用),追加 tag,
+    /// 返回密文(等长)。调用契约:staging 非空。
+    fn encrypt_staged_chunk(&mut self) -> Vec<u8> {
+        let st = self.sse.as_mut().expect("sse state");
+        let pt = std::mem::take(&mut st.staging);
+        debug_assert!(!pt.is_empty(), "encrypt_staged_chunk requires data");
+        let (ct, tag) = st.cipher.encrypt_chunk(st.chunk_tags.len() as u64, &pt);
+        st.chunk_tags.push(tag);
+        ct
+    }
+
+    /// 数据落 extent 流水线(攒批 → flush_acc;SSE 臂输入为密文,
+    /// 段 CRC/全对象 crc_acc/MD5 均落密文,DE2)。
+    fn feed_bytes(&mut self, engine: &mut Engine, draft: &mut Staged, data: &[u8]) -> Result<()> {
         if self.capacity == 0 {
             self.capacity = engine.sb.extent_capacity();
         }
@@ -3240,16 +4615,19 @@ impl ExtentWriter {
             self.fill += take;
             off += take;
         }
-        self.size += n as u64;
-        if self.size > fs3_core::MAX_OBJECT_SIZE {
-            return Err(Error::InvalidArgument("object exceeds 5TiB limit".into()));
-        }
         Ok(())
     }
 
     /// 流结束:flush 剩余 chunk,结束当前段(extent 保持开放跨对象存活;
-    /// 恰好写满则走 end_segment 封口判定);返回 (segments, size, md5)。
-    fn finish(mut self, engine: &mut Engine) -> Result<(Vec<Segment>, u64, [u8; 16])> {
+    /// 恰好写满则走 end_segment 封口判定);返回 (segments, size, etag,
+    /// sse)(sse = SSE-C 写侧产物 nonce_base + chunk_tags,未加密 = None)。
+    fn finish(mut self, engine: &mut Engine, draft: &mut Staged) -> Result<StreamWriteOutcome> {
+        // M11 E1-7:尾块(不足 64KiB)同样有 tag(D-E1 网格口径);尾块密文
+        // 可能恰好写满/新开 extent,必须走真实 draft(分配记账不丢)
+        if self.sse.as_ref().is_some_and(|st| !st.staging.is_empty()) {
+            let ct = self.encrypt_staged_chunk();
+            self.feed_bytes(engine, draft, &ct)?;
+        }
         if self.fill > 0 {
             engine.flush_acc(&mut self)?;
         }
@@ -3293,7 +4671,18 @@ impl ExtentWriter {
                 e
             }
         };
-        Ok((self.segments, self.size, etag))
+        // M11 E1-7:SSE 产物落元数据(ETag 已为密文摘要,DE2;nonce_base
+        // + chunk_tags + 类型静态字段——K1-1:kind/kek_id/wrapped_dek 随
+        // SseWriteKey 分派,key_md5 为 D-E5 校验子)
+        let sse = self.sse.map(|st| fs3_core::SseInfo {
+            kind: st.kind,
+            kek_id: st.kek_id,
+            wrapped_dek: st.wrapped_dek,
+            nonce_base: st.cipher.nonce_base(),
+            chunk_tags: st.chunk_tags,
+            key_md5: st.key_md5,
+        });
+        Ok((self.segments, self.size, etag, sse))
     }
 }
 
@@ -3464,7 +4853,11 @@ fn resume_open_extent(
     }
     let mut resumed: Option<(u64, u32)> = None;
     for &id in &candidates {
-        let me = max_end.get(&id).copied().unwrap_or(0);
+        // 物理水位 = 逻辑段端点的 4KiB 对齐上界:段长记实际字节而 flush_acc
+        // 按 align_up(尾块) 推进 watermark(尾垫补零),恢复必须重建同一物理
+        // 水位——否则崩溃后首个追加落在非 4KiB 对齐偏移,O_DIRECT 在
+        // ext4/xfs 上 EINVAL 触发只读降级(tmpfs 不强制对齐,曾长期掩盖)。
+        let me = align_up(max_end.get(&id).copied().unwrap_or(0) as u64, SECTOR_SIZE) as u32;
         if me as u64 >= capacity {
             // 写满未封口:补写头(独占:重算 CRC;打包:空表)
             seal_at_recovery(alloc, dev, sb, id)?;
@@ -3473,7 +4866,7 @@ fn resume_open_extent(
         }
     }
     for &id in &candidates {
-        let me = max_end.get(&id).copied().unwrap_or(0);
+        let me = align_up(max_end.get(&id).copied().unwrap_or(0) as u64, SECTOR_SIZE) as u32;
         if (me as u64) < capacity && resumed != Some((id, me)) {
             seal_at_recovery(alloc, dev, sb, id)?;
         }

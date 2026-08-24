@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, fmtBytes, fmtTime, type BucketInfo, type BucketCorsRule } from "../api";
+import { api, fmtBytes, fmtTime, type BucketInfo, type BucketCorsRule, type LifecycleRule } from "../api";
 import { validatePolicy } from "./Keys";
 
 export default function Buckets() {
@@ -149,16 +149,18 @@ export default function Buckets() {
   );
 }
 
-type SettingsTab = "quota" | "versioning" | "cors" | "policy";
+type SettingsTab = "quota" | "versioning" | "cors" | "policy" | "lifecycle" | "encryption";
 
 const TAB_LABELS: { id: SettingsTab; label: string }[] = [
   { id: "quota", label: "配额" },
   { id: "versioning", label: "版本化" },
   { id: "cors", label: "CORS" },
   { id: "policy", label: "桶策略" },
+  { id: "lifecycle", label: "生命周期" },
+  { id: "encryption", label: "加密" },
 ];
 
-/** M10:桶设置弹窗(配额 / 版本化 / CORS / 桶策略 四个 Tab)。 */
+/** M10:桶设置弹窗(配额 / 版本化 / CORS / 桶策略;M11 加生命周期 / 加密 两个 Tab)。 */
 function BucketSettings({
   bucket,
   onClose,
@@ -188,6 +190,8 @@ function BucketSettings({
         {tab === "versioning" && <VersioningPane bucket={bucket} />}
         {tab === "cors" && <CorsPane bucket={bucket} />}
         {tab === "policy" && <PolicyPane bucket={bucket} />}
+        {tab === "lifecycle" && <LifecyclePane bucket={bucket} />}
+        {tab === "encryption" && <EncryptionPane bucket={bucket} />}
         <div className="actions">
           <button className="ghost" onClick={onClose}>
             关闭
@@ -540,6 +544,425 @@ function PolicyPane({ bucket }: { bucket: BucketInfo }) {
         <button onClick={save} disabled={saving}>
           {saving ? "保存中…" : "保存"}
         </button>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────── M11:生命周期 / 桶默认加密 ───────────────────────────
+
+/** 规则过滤条件摘要(表格列)。 */
+function lifecycleFilterSummary(r: LifecycleRule): string {
+  const parts: string[] = [];
+  if (r.Filter?.Prefix) parts.push(`前缀 ${r.Filter.Prefix}`);
+  if (r.Filter?.Tag) parts.push(`标签 ${r.Filter.Tag.Key}=${r.Filter.Tag.Value}`);
+  return parts.length ? parts.join(" + ") : "全部对象";
+}
+
+/** 规则动作摘要(表格列)。 */
+function lifecycleActionSummary(r: LifecycleRule): string {
+  const parts: string[] = [];
+  if (r.Expiration?.Days !== undefined) parts.push(`${r.Expiration.Days} 天后过期`);
+  if (r.Expiration?.Date) parts.push(`${r.Expiration.Date.slice(0, 10)} 过期`);
+  if (r.Expiration?.ExpiredObjectDeleteMarker) parts.push("清理过期删除标记");
+  if (r.NoncurrentVersionExpiration?.NoncurrentDays !== undefined) {
+    parts.push(`非当前版本 ${r.NoncurrentVersionExpiration.NoncurrentDays} 天后过期`);
+  }
+  if (r.AbortIncompleteMultipartUpload?.DaysAfterInitiation !== undefined) {
+    parts.push(`未完成分片 ${r.AbortIncompleteMultipartUpload.DaysAfterInitiation} 天后中止`);
+  }
+  return parts.join(";");
+}
+
+/** 过期方式(数据面口径:Days/Date/ExpiredObjectDeleteMarker 三者互斥,恰选其一)。 */
+type ExpirationMode = "none" | "days" | "date" | "marker";
+
+/** M11:生命周期规则编辑(保存 = 整体 PUT 规则集;删空 = DELETE 配置)。 */
+function LifecyclePane({ bucket }: { bucket: BucketInfo }) {
+  const [rules, setRules] = useState<LifecycleRule[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  // 表单态:null = 列表视图;{ index: null } = 新建;{ index: n } = 编辑第 n 条
+  const [editing, setEditing] = useState<{ index: number | null } | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const r = await api.getLifecycle(bucket.name);
+      setRules(r.Rules);
+      setError(null);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }, [bucket.name]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  // 整体持久化:空规则集 → DELETE,否则 PUT(数据面要求至少一条规则)
+  const persist = async (next: LifecycleRule[]) => {
+    setSaving(true);
+    try {
+      if (next.length === 0) {
+        await api.deleteLifecycle(bucket.name);
+      } else {
+        await api.putLifecycle(bucket.name, next);
+      }
+      setSaved(true);
+      setEditing(null);
+      await load();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const saveRule = async (rule: LifecycleRule) => {
+    const base = rules ?? [];
+    const idx = editing?.index ?? null;
+    if (idx === null && base.some((r) => r.ID === rule.ID)) {
+      setError(`规则 ID「${rule.ID}」已存在`);
+      return;
+    }
+    const next = idx === null ? [...base, rule] : base.map((r, i) => (i === idx ? rule : r));
+    await persist(next);
+  };
+
+  const removeRule = async (i: number) => {
+    if (!rules) return;
+    if (!confirm(`删除规则 ${rules[i].ID}?${rules.length === 1 ? "(最后一条,删除后清空生命周期配置)" : ""}`)) {
+      return;
+    }
+    await persist(rules.filter((_, j) => j !== i));
+  };
+
+  if (editing) {
+    const initial = editing.index === null ? null : (rules?.[editing.index] ?? null);
+    return (
+      <LifecycleRuleForm
+        initial={initial}
+        saving={saving}
+        error={error}
+        onSave={saveRule}
+        onCancel={() => setEditing(null)}
+      />
+    );
+  }
+
+  return (
+    <div>
+      {error && <div className="alert">{error}</div>}
+      <p className="muted" style={{ fontSize: 12, marginTop: 0 }}>
+        过期/清理规则按桶整体保存;删除全部规则即清除配置。不支持存储层转移(Transition)。
+      </p>
+      <div className="toolbar">
+        <button onClick={() => setEditing({ index: null })}>新建规则</button>
+        {saving && <span className="spin" />}
+        {saved && <span style={{ color: "var(--green)", fontSize: 12 }}>✓ 已保存</span>}
+      </div>
+      {rules === null ? (
+        <div className="muted">加载中…</div>
+      ) : (
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>状态</th>
+              <th>过滤</th>
+              <th>动作</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rules.map((r, i) => (
+              <tr key={r.ID}>
+                <td>{r.ID}</td>
+                <td>{r.Status === "Enabled" ? "启用" : "禁用"}</td>
+                <td className="muted">{lifecycleFilterSummary(r)}</td>
+                <td className="muted">{lifecycleActionSummary(r)}</td>
+                <td>
+                  <button className="ghost small" onClick={() => setEditing({ index: i })}>
+                    编辑
+                  </button>{" "}
+                  <button className="danger small" onClick={() => removeRule(i)} disabled={saving}>
+                    删除
+                  </button>
+                </td>
+              </tr>
+            ))}
+            {rules.length === 0 && (
+              <tr>
+                <td colSpan={5} className="muted">
+                  暂无规则
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+/** M11:单条生命周期规则表单(新建/编辑共用)。 */
+function LifecycleRuleForm({
+  initial,
+  saving,
+  error,
+  onSave,
+  onCancel,
+}: {
+  initial: LifecycleRule | null;
+  saving: boolean;
+  error: string | null;
+  onSave: (rule: LifecycleRule) => Promise<void>;
+  onCancel: () => void;
+}) {
+  const [ruleId, setRuleId] = useState(initial?.ID ?? "");
+  const [enabled, setEnabled] = useState(initial ? initial.Status === "Enabled" : true);
+  const [prefix, setPrefix] = useState(initial?.Filter?.Prefix ?? "");
+  const [tagKey, setTagKey] = useState(initial?.Filter?.Tag?.Key ?? "");
+  const [tagValue, setTagValue] = useState(initial?.Filter?.Tag?.Value ?? "");
+  const [expMode, setExpMode] = useState<ExpirationMode>(() => {
+    const e = initial?.Expiration;
+    if (!e) return "none";
+    if (e.Days !== undefined) return "days";
+    if (e.Date) return "date";
+    return "marker";
+  });
+  const [expDays, setExpDays] = useState(
+    initial?.Expiration?.Days !== undefined ? String(initial.Expiration.Days) : ""
+  );
+  const [expDate, setExpDate] = useState(initial?.Expiration?.Date ? initial.Expiration.Date.slice(0, 10) : "");
+  const [noncurrentDays, setNoncurrentDays] = useState(
+    initial?.NoncurrentVersionExpiration?.NoncurrentDays !== undefined
+      ? String(initial.NoncurrentVersionExpiration.NoncurrentDays)
+      : ""
+  );
+  const [abortDays, setAbortDays] = useState(
+    initial?.AbortIncompleteMultipartUpload?.DaysAfterInitiation !== undefined
+      ? String(initial.AbortIncompleteMultipartUpload.DaysAfterInitiation)
+      : ""
+  );
+  const [formError, setFormError] = useState<string | null>(null);
+
+  const positiveInt = (v: string): number | null => {
+    const n = Number(v);
+    return Number.isInteger(n) && n > 0 ? n : null;
+  };
+
+  const submit = async () => {
+    const id = ruleId.trim();
+    if (!id) {
+      setFormError("规则 ID 不能为空");
+      return;
+    }
+    if ((tagKey && !tagValue) || (!tagKey && tagValue)) {
+      setFormError("标签的键与值须同时填写(或都不填)");
+      return;
+    }
+    const rule: LifecycleRule = { ID: id, Status: enabled ? "Enabled" : "Disabled" };
+    if (prefix || tagKey) {
+      rule.Filter = {
+        ...(prefix ? { Prefix: prefix } : {}),
+        ...(tagKey ? { Tag: { Key: tagKey, Value: tagValue } } : {}),
+      };
+    }
+    if (expMode === "days") {
+      const d = positiveInt(expDays);
+      if (d === null) {
+        setFormError("过期天数须为正整数");
+        return;
+      }
+      rule.Expiration = { Days: d };
+    } else if (expMode === "date") {
+      if (!expDate) {
+        setFormError("请选择过期日期");
+        return;
+      }
+      rule.Expiration = { Date: `${expDate}T00:00:00Z` };
+    } else if (expMode === "marker") {
+      rule.Expiration = { ExpiredObjectDeleteMarker: true };
+    }
+    if (noncurrentDays.trim() !== "") {
+      const d = positiveInt(noncurrentDays);
+      if (d === null) {
+        setFormError("非当前版本过期天数须为正整数");
+        return;
+      }
+      rule.NoncurrentVersionExpiration = { NoncurrentDays: d };
+    }
+    if (abortDays.trim() !== "") {
+      const d = positiveInt(abortDays);
+      if (d === null) {
+        setFormError("分片中止天数须为正整数");
+        return;
+      }
+      rule.AbortIncompleteMultipartUpload = { DaysAfterInitiation: d };
+    }
+    if (!rule.Expiration && !rule.NoncurrentVersionExpiration && !rule.AbortIncompleteMultipartUpload) {
+      setFormError("至少配置一个动作(过期 / 非当前版本过期 / 分片中止)");
+      return;
+    }
+    setFormError(null);
+    await onSave(rule);
+  };
+
+  const EXP_MODES: { id: ExpirationMode; label: string }[] = [
+    { id: "none", label: "不启用" },
+    { id: "days", label: "按天数过期" },
+    { id: "date", label: "按日期过期" },
+    { id: "marker", label: "清理过期删除标记" },
+  ];
+
+  return (
+    <div>
+      {(formError ?? error) && <div className="alert">{formError ?? error}</div>}
+      <div className="form-row">
+        <label>规则 ID</label>
+        <input value={ruleId} onChange={(e) => setRuleId(e.target.value)} autoFocus />
+      </div>
+      <div className="form-row">
+        <label style={{ display: "flex", alignItems: "center", gap: 6, margin: 0 }}>
+          <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />
+          启用该规则
+        </label>
+      </div>
+      <div className="form-row">
+        <label>前缀过滤(留空 = 全部对象)</label>
+        <input value={prefix} onChange={(e) => setPrefix(e.target.value)} placeholder="如 logs/" />
+      </div>
+      <div className="form-row">
+        <label>标签过滤(可选,键与值)</label>
+        <div style={{ display: "flex", gap: 8 }}>
+          <input value={tagKey} onChange={(e) => setTagKey(e.target.value)} placeholder="键" />
+          <input value={tagValue} onChange={(e) => setTagValue(e.target.value)} placeholder="值" />
+        </div>
+      </div>
+      <div className="form-row">
+        <label>过期动作(三者互斥)</label>
+        <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
+          {EXP_MODES.map((m) => (
+            <label key={m.id} style={{ margin: 0, display: "flex", alignItems: "center", gap: 4 }}>
+              <input
+                type="radio"
+                name="lc-exp-mode"
+                checked={expMode === m.id}
+                onChange={() => setExpMode(m.id)}
+              />
+              {m.label}
+            </label>
+          ))}
+        </div>
+      </div>
+      {expMode === "days" && (
+        <div className="form-row">
+          <label>过期天数</label>
+          <input type="number" min={1} value={expDays} onChange={(e) => setExpDays(e.target.value)} />
+        </div>
+      )}
+      {expMode === "date" && (
+        <div className="form-row">
+          <label>过期日期(UTC 零点)</label>
+          <input type="date" value={expDate} onChange={(e) => setExpDate(e.target.value)} />
+        </div>
+      )}
+      <div className="form-row">
+        <label>非当前版本过期天数(可选;需桶已启用版本化)</label>
+        <input type="number" min={1} value={noncurrentDays} onChange={(e) => setNoncurrentDays(e.target.value)} />
+      </div>
+      <div className="form-row">
+        <label>未完成分片中止天数(可选)</label>
+        <input type="number" min={1} value={abortDays} onChange={(e) => setAbortDays(e.target.value)} />
+      </div>
+      <div className="actions" style={{ marginTop: 0 }}>
+        <button className="ghost" onClick={onCancel}>
+          取消
+        </button>
+        <button onClick={submit} disabled={saving}>
+          {saving ? "保存中…" : "保存规则"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** M11:桶默认加密(仅 SSE-S3 AES256,不含 KMS;无 ↔ AES256 即 DELETE/PUT)。 */
+function EncryptionPane({ bucket }: { bucket: BucketInfo }) {
+  const [current, setCurrent] = useState<string | null>(null);
+  const [target, setTarget] = useState<"" | "AES256">("");
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const r = await api.getEncryption(bucket.name);
+      setCurrent(r.SSEAlgorithm);
+      setTarget(r.SSEAlgorithm === "AES256" ? "AES256" : "");
+      setError(null);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }, [bucket.name]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      if (target === "AES256") {
+        await api.putEncryption(bucket.name);
+      } else {
+        await api.deleteEncryption(bucket.name);
+      }
+      setSaved(true);
+      await load();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const currentLabel = current === null ? "加载中…" : current === "" ? "无默认加密" : current;
+  return (
+    <div>
+      {error && <div className="alert">{error}</div>}
+      <p className="muted" style={{ fontSize: 12, marginTop: 0 }}>
+        桶默认加密(SSE-S3):新写入未显式指定加密的对象自动以 AES256 加密;不含 KMS(aws:kms 不受理)。
+      </p>
+      <div className="form-row">
+        <label>当前配置</label>
+        <input value={currentLabel} readOnly />
+      </div>
+      <div className="form-row">
+        <label>设置为</label>
+        <div style={{ display: "flex", gap: 14 }}>
+          <label style={{ margin: 0, display: "flex", alignItems: "center", gap: 4 }}>
+            <input type="radio" name="enc-mode" checked={target === ""} onChange={() => setTarget("")} />
+            无默认加密
+          </label>
+          <label style={{ margin: 0, display: "flex", alignItems: "center", gap: 4 }}>
+            <input
+              type="radio"
+              name="enc-mode"
+              checked={target === "AES256"}
+              onChange={() => setTarget("AES256")}
+            />
+            AES256(SSE-S3)
+          </label>
+        </div>
+      </div>
+      <div className="toolbar">
+        <button onClick={save} disabled={saving || current === null || target === (current === "AES256" ? "AES256" : "")}>
+          {saving ? "保存中…" : "保存"}
+        </button>
+        {saved && <span style={{ color: "var(--green)", fontSize: 12 }}>✓ 已保存</span>}
       </div>
     </div>
   );

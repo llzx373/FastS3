@@ -60,6 +60,7 @@ pub enum ResponseBody {
         /// 数据长度。
         length: u64,
         /// 零拷贝数据段(设备偏移+长度;None = 不可用,走块读取)。
+        /// SSE 对象恒 None(M11 E1-3/DE1:解密过 CPU,禁零拷贝)。
         zc_segments: Option<Vec<fs3_engine::DevSegment>>,
         /// 零拷贝 fd(无 O_DIRECT)。
         zc_fd: Option<i32>,
@@ -68,6 +69,10 @@ pub enum ResponseBody {
         /// 桶版本化状态(构造处已持有;F-1:HTTP 层逐块读取据此走 Off
         /// 快速路径,免每块重复桶点读/版本反扫)。
         versioning: fs3_core::VersioningState,
+        /// SSE-C 客户密钥(M11 E1-3;仅 SSE-C 对象非 None,请求期持有,
+        /// HTTP 层逐块读取时回传 read_stream_chunk 用于解密;SSE-S3 对象
+        /// 恒 None——服务端 KEK 体系自持解包,无客户密钥语义,K1-1)。
+        sse_key: Option<fs3_core::SseCKey>,
     },
     /// M9/B4:多段 Range → 206 multipart/byteranges。HTTP 层按段输出
     /// 边界帧 + 段数据(零拷贝禁用;Content-Length 已由服务层算好)。
@@ -86,6 +91,8 @@ pub enum ResponseBody {
         part_content_type: String,
         /// 桶版本化状态(同 ObjectStream.versioning)。
         versioning: fs3_core::VersioningState,
+        /// SSE-C 客户密钥(同 ObjectStream.sse_key)。
+        sse_key: Option<fs3_core::SseCKey>,
     },
 }
 
@@ -815,8 +822,17 @@ impl S3Service {
 
     /// M9/A1:未实现头显式拒绝(红线 6:静默忽略客户端头 = 拒绝合入)。
     ///
-    /// - SSE 家族 / Object Lock / 网站重定向 → 501 NotImplemented
-    ///   (错误码自带语义 "A header you provided implies functionality that is not implemented");
+    /// - SSE-KMS 家族 / Object Lock / 网站重定向 → 501 NotImplemented
+    ///   (错误码自带语义 "A header you provided implies functionality that is not implemented";
+    ///   M11 K1-4:`aws:kms` 算法值另有 InvalidEncryptionAlgorithmError 显式
+    ///   拒绝,见 sse.rs;KMS 参数头族保留本表);
+    /// - SSE-C 三头(customer-algorithm/-key/-key-MD5)自 M11 E1-2 起**出表
+    ///   实现**:单对象 PUT/GET/HEAD(见 sse.rs);E1-4 multipart 与 E1-5
+    ///   copy 目标侧同受理;Abort/ListParts 等其余操作携带时由
+    ///   handle_inner 的 op 门控显式 501;
+    /// - SSE-S3 头(x-amz-server-side-encryption)自 M11 K1-2 起**出表实现**:
+    ///   PutObject/CreateMultipartUpload/CopyObject 受理(仅 AES256);
+    ///   其余 op 携带 → handle_inner 门控显式 501;
     /// - `x-amz-storage-class` 非 STANDARD → 400 InvalidStorageClass(与 AWS 同码);
     /// - ACL 家族在对象创建路径上**接受但不生效**(单账号私有默认;值合法性
     ///   单独校验,M9/C5 在 op_create_bucket/op_put_object_buffered 声明),
@@ -826,13 +842,9 @@ impl S3Service {
     ///   (UploadPart/CompleteMultipartUpload 等)携带 → 显式 400(见各 op)。
     fn check_unimplemented_headers(&self, req: &S3Request) -> Result<(), S3Error> {
         const UNSUPPORTED: &[&str] = &[
-            "x-amz-server-side-encryption",
             "x-amz-server-side-encryption-aws-kms-key-id",
             "x-amz-server-side-encryption-context",
             "x-amz-server-side-encryption-bucket-key-enabled",
-            "x-amz-server-side-encryption-customer-algorithm",
-            "x-amz-server-side-encryption-customer-key",
-            "x-amz-server-side-encryption-customer-key-md5",
             "x-amz-sse-kms-key-id",
             "x-amz-object-lock-mode",
             "x-amz-object-lock-retain-until-date",
@@ -978,6 +990,49 @@ impl S3Service {
         }
         // M9/A1:未实现头显式拒绝(先认证后验头,与 AWS 顺序一致)
         self.check_unimplemented_headers(req)?;
+        // M11 H1-1:键长/用户元数据尺寸上限(AWS 口径;同上行顺序先例,
+        // 先认证后验尺寸)
+        check_request_size_limits(req, &op)?;
+        // M11 E1-2/E1-4/E1-5:SSE-C 三头受理范围——单对象 PutObject/
+        // GetObject/HeadObject/GetObjectPart/HeadObjectPart/
+        // GetObjectAttributes + multipart 创建/传片/完成 + copy 两 op
+        // (目标侧);Abort/ListParts/ListMultipartUploads 等其余操作携带 →
+        // 显式 501(不静默忽略,红线;copy 源侧头族另有
+        // parse_copy_source_customer_headers,不走此门控)
+        if !matches!(
+            op,
+            Operation::PutObject { .. }
+                | Operation::GetObject { .. }
+                | Operation::HeadObject { .. }
+                | Operation::GetObjectPart { .. }
+                | Operation::HeadObjectPart { .. }
+                | Operation::GetObjectAttributes { .. }
+                | Operation::CreateMultipartUpload { .. }
+                | Operation::UploadPart { .. }
+                | Operation::CompleteMultipartUpload { .. }
+                | Operation::CopyObject { .. }
+                | Operation::UploadPartCopy { .. }
+        ) && crate::sse::has_customer_headers(req)
+        {
+            return Err(S3Error::new(S3ErrorCode::NotImplemented)
+                .with_message("SSE-C is not supported for this operation."));
+        }
+        // M11 K1-2/K1-4:SSE-S3 头(x-amz-server-side-encryption)受理范围——
+        // PutObject/CreateMultipartUpload/CopyObject(仅 AES256;UploadPart
+        // 等 part 请求的 SSE-S3 意愿由会话承载,不逐请求带头);其余 op
+        // 携带 → 显式 400 InvalidArgument(不静默忽略,同 SSE-C 门控先例;
+        // AWS 对非受理 op 携带该头回 400——s3-tests
+        // test_sse_s3_default_method_head 断言 HEAD 携带 → 400)
+        if !matches!(
+            op,
+            Operation::PutObject { .. }
+                | Operation::CreateMultipartUpload { .. }
+                | Operation::CopyObject { .. }
+        ) && crate::sse::has_sse_s3_header(req)
+        {
+            return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                .with_message("SSE-S3 header is not accepted for this operation."));
+        }
         let mut headers = self.base_headers();
         let resp = match op {
             Operation::ListBuckets => Ok(self.op_list_buckets(req)),
@@ -1021,6 +1076,26 @@ impl S3Service {
             }
             Operation::GetBucketPolicy { bucket } => Ok(self.op_get_bucket_policy(&bucket)?),
             Operation::DeleteBucketPolicy { bucket } => Ok(self.op_delete_bucket_policy(&bucket)?),
+            // —— M11 K1-2:桶默认加密(ADR-12 DS2/DS3;BucketMeta v2 字段) ——
+            Operation::PutBucketEncryption { bucket, algorithm } => {
+                Ok(self.op_put_bucket_encryption(&bucket, algorithm)?)
+            }
+            Operation::GetBucketEncryption { bucket } => {
+                Ok(self.op_get_bucket_encryption(&bucket)?)
+            }
+            Operation::DeleteBucketEncryption { bucket } => {
+                Ok(self.op_delete_bucket_encryption(&bucket)?)
+            }
+            // —— M11 L1:桶生命周期(ADR-12 DL1;`r:` 键) ——
+            Operation::PutBucketLifecycleConfiguration { bucket, rules } => {
+                Ok(self.op_put_bucket_lifecycle(&bucket, &rules)?)
+            }
+            Operation::GetBucketLifecycleConfiguration { bucket } => {
+                Ok(self.op_get_bucket_lifecycle(&bucket)?)
+            }
+            Operation::DeleteBucketLifecycleConfiguration { bucket } => {
+                Ok(self.op_delete_bucket_lifecycle(&bucket)?)
+            }
             // —— M10 S4:POST 表单上传 ——
             Operation::PostObject { bucket } => self.op_post_object(req, &bucket),
             Operation::ListObjectVersions {
@@ -1194,6 +1269,11 @@ impl S3Service {
                 key,
                 version_id,
             } => Ok(self.op_get_object(req, &bucket, &key, false, version_id)?),
+            Operation::GetObjectAttributes {
+                bucket,
+                key,
+                version_id,
+            } => Ok(self.op_get_object_attributes(req, &bucket, &key, version_id)?),
             Operation::HeadObject {
                 bucket,
                 key,
@@ -1311,6 +1391,13 @@ impl S3Service {
         let _access = self.require_auth(req)?;
         // M9/A1:未实现头显式拒绝(流式 PUT/UploadPart 与缓冲路径同语义)
         self.check_unimplemented_headers(req)?;
+        // M11 H1-1:键长/用户元数据尺寸上限(与缓冲路径同口径;UploadPart
+        // 不受理 x-amz-meta-*,仅判键长)
+        let (_, _, _, stream_key) = route_op_bucket_key(req);
+        check_object_key_length(&stream_key)?;
+        if matches!(&target, StreamTarget::Object { .. }) {
+            check_user_meta_size(&user_meta(req))?;
+        }
 
         // REVIEW §3.10:流式路径按 Content-Length 提前拒绝超限请求
         // (单片 >5GiB → InvalidPart;整对象 >5TiB → EntityTooLarge,免写半程回滚)。
@@ -1335,7 +1422,7 @@ impl S3Service {
             StreamTarget::Object { bucket, .. } => bucket.as_str(),
             StreamTarget::Part { bucket, .. } => bucket.as_str(),
         };
-        let bucket_versioning = {
+        let bkt = {
             let engine = self.engine.write();
             engine
                 .meta()
@@ -1344,8 +1431,8 @@ impl S3Service {
                 .ok_or_else(|| {
                     S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket_name)
                 })?
-                .versioning
         };
+        let bucket_versioning = bkt.versioning;
         // 条件写(ADR-11 D6;仅对象 PUT 语义;UploadPart 不适用,携带则
         // 显式拒绝,不静默)
         let precond = parse_write_precondition(req)?;
@@ -1360,6 +1447,29 @@ impl S3Service {
             return Err(S3Error::new(S3ErrorCode::InvalidArgument)
                 .with_message("x-amz-tagging is not valid for UploadPart"));
         }
+        // M11 C1-2:checksum 头/trailer 声明统一解析(非法值显式拒绝;
+        // 校验时机照 Content-MD5 先例:写前解析、写后比对)
+        let cksum = crate::checksum::parse_request_checksum(req)?;
+        // M11 E1-2/E1-4:SSE-C 三头解析(写前校验)。Part 目标的会话级
+        // 一致性(key-MD5 与 Create 绑定值逐值比对)在取引擎锁后判定
+        // (需要读会话;见下方 engine 锁内检查)
+        let ssec = crate::sse::parse_customer_headers(req)?;
+        // M11 K1-2/K1-3:SSE-S3 意愿——Object 目标 = 显式 AES256 头 > 桶
+        // 默认(SSE-C 优先,同现显式拒绝);Part 目标 = 会话承载(Create 已
+        // 定),带头 → 显式拒绝(不静默忽略,红线)
+        let use_s3 = match &target {
+            StreamTarget::Object { .. } => {
+                crate::sse::sse_s3_write_intent(req, ssec.as_ref(), bkt.default_encryption)?
+            }
+            StreamTarget::Part { .. } => {
+                if crate::sse::has_sse_s3_header(req) {
+                    return Err(S3Error::new(S3ErrorCode::InvalidArgument).with_message(
+                        "x-amz-server-side-encryption is only valid on CreateMultipartUpload; the upload session carries the encryption setting.",
+                    ));
+                }
+                false
+            }
+        };
 
         // 载荷哈希处理(M9/D3:与缓冲 PUT 同一认证语义——header 认证
         // 失败/缺席时回退预签名 query 认证,保证匿名+预签名流式 PUT 与
@@ -1388,29 +1498,85 @@ impl S3Service {
         };
 
         let mut engine = self.engine.write();
+        // M11 E1-4:Part 目标 SSE-C 会话一致性——key-MD5 与 Create 绑定值
+        // 逐值比对(AWS:part 头必须与会话一致);会话不存在时跳过,由引擎
+        // 报 NoSuchUpload(错误优先级同 AWS)
+        // K1-2:SSE-S3 会话标记(响应回显用;part 请求零头,引擎内部以
+        // 会话 DEK 加密)
+        let mut sess_sse_s3 = false;
+        if let StreamTarget::Part {
+            bucket, upload_id, ..
+        } = &target
+        {
+            let sess = engine
+                .meta()
+                .get_multipart(upload_id)
+                .map_err(|e| map_engine_error(e, bucket, ""))?;
+            if let Some(sess) = &sess {
+                crate::sse::check_session_sse(sess.sse_key_md5.as_deref(), ssec.as_ref())?;
+                sess_sse_s3 = sess.sse_s3.is_some();
+            }
+        }
         // 统一收口:执行写入(对象或分片),返回 (etag, 对象版本视图——版本化
-        // 桶回滚/响应头用;分片为 None)。
+        // 桶回滚/响应头用;分片为 None, 分片落盘 checksum——对象目标为
+        // None,值在 ObjectMeta.checksum)。
+        #[allow(clippy::type_complexity)]
         let write_once = |engine: &mut Engine,
                           reader: &mut dyn Read,
                           content_type: Option<&str>,
                           user_meta: Vec<(String, String)>,
                           resp_headers: Vec<(String, String)>|
-         -> Result<([u8; 16], Option<fs3_core::ObjectMeta>), S3Error> {
+         -> Result<
+            (
+                [u8; 16],
+                Option<fs3_core::ObjectMeta>,
+                Option<fs3_core::ChecksumInfo>,
+            ),
+            S3Error,
+        > {
             match &target {
-                StreamTarget::Object { bucket, key } => engine
-                    .put_with_meta(
-                        bucket,
-                        key,
-                        reader,
-                        content_type,
-                        user_meta,
-                        resp_headers,
-                        // M10 S1:对象 PUT 落标签(Part 分支已在上游拒绝)
-                        stream_tags.clone().unwrap_or_default(),
-                        precond.as_ref(),
-                    )
-                    .map(|m| (m.etag, Some(m)))
-                    .map_err(|e| map_engine_error(e, bucket, key)),
+                StreamTarget::Object { bucket, key } => {
+                    // M11 K1-1:SSE-S3 写密钥签发(当前代 KEK 包裹的随机
+                    // DEK,明文仅内存持有)
+                    let s3_key = if use_s3 {
+                        Some(
+                            engine
+                                .sse_s3_mint_write_key()
+                                .map_err(|e| map_engine_error(e, bucket, key))?,
+                        )
+                    } else {
+                        None
+                    };
+                    let write_key = match (&ssec, &s3_key) {
+                        (Some(s), None) => Some(fs3_core::SseWriteKey::SseC(&s.key)),
+                        (None, Some(w)) => Some(fs3_core::SseWriteKey::SseS3(w)),
+                        (None, None) => None,
+                        (Some(_), Some(_)) => {
+                            unreachable!("SSE-C/SSE-S3 互斥已在意愿裁决判定")
+                        }
+                    };
+                    engine
+                        .put_with_meta(
+                            bucket,
+                            key,
+                            reader,
+                            content_type,
+                            user_meta,
+                            resp_headers,
+                            // M10 S1:对象 PUT 落标签(Part 分支已在上游拒绝)
+                            stream_tags.clone().unwrap_or_default(),
+                            precond.as_ref(),
+                            // M11 C1-2:客户端声明的 checksum 算法透传(引擎边写
+                            // 边算落 ObjectMeta.checksum;未声明 = None 不算不记)
+                            cksum.algorithm(),
+                            // M11 E1-7/K1-1:SSE 写密钥透传(顺序:明文 checksum
+                            // 验算 → 加密;chunked trailer 明文验算在更外层
+                            // reader,先于加密,不可颠倒)
+                            write_key.as_ref(),
+                        )
+                        .map(|m| (m.etag, Some(m), None))
+                        .map_err(|e| map_engine_error(e, bucket, key))
+                }
                 StreamTarget::Part {
                     bucket,
                     key,
@@ -1419,8 +1585,18 @@ impl S3Service {
                 } => {
                     let _ = (bucket, key);
                     engine
-                        .upload_part(upload_id, *part_number, reader)
-                        .map(|p| (p.etag, None))
+                        // M11 C1-4:声明算法透传(引擎 tee 边写边算落
+                        // PartMeta.checksum;未声明 = None)
+                        // M11 E1-4:SSE-C 密钥透传(part 独立加密,DE2;
+                        // 会话一致性已在引擎锁内校验)
+                        .upload_part(
+                            upload_id,
+                            *part_number,
+                            reader,
+                            cksum.algorithm(),
+                            ssec.as_ref().map(|s| &s.key),
+                        )
+                        .map(|p| (p.etag, None, p.checksum))
                         .map_err(|e| map_engine_error(e, bucket, key))
                 }
             }
@@ -1437,11 +1613,31 @@ impl S3Service {
                 }
             }
         };
-        let (etag, written_meta): ([u8; 16], Option<fs3_core::ObjectMeta>) = match payload_hash {
+        // M11 C1-2:trailer checksum 声明仅 aws-chunked 载荷有效(其余载荷
+        // 形态无 trailer 段,显式拒绝不静默)
+        let is_chunked = matches!(
+            payload_hash,
+            PayloadHash::Streaming
+                | PayloadHash::StreamingSignedTrailer
+                | PayloadHash::StreamingUnsignedTrailer
+        );
+        if cksum.trailer_alg.is_some() && !is_chunked {
+            return Err(S3Error::new(S3ErrorCode::InvalidRequest)
+                .with_message("checksum trailer declared but the request is not aws-chunked"));
+        }
+        // M11 C1-2/C1-4:头模式 checksum 的流式验算——Object/Part 目标均由
+        // 引擎 tee 代算(分别落 ObjectMeta/PartMeta checksum),写后与声明值
+        // 比对(不符回滚 + BadDigest,同 Content-MD5 先例)。
+        let mut chunked_opt: Option<ChunkedSigV4Reader> = None;
+        let (etag, written_meta, part_checksum): (
+            [u8; 16],
+            Option<fs3_core::ObjectMeta>,
+            Option<fs3_core::ChecksumInfo>,
+        ) = match payload_hash {
             PayloadHash::HexSha256(expected) => {
                 // 流式校验:边读边算,写后比对,不匹配删除
                 let mut hashing = HashingReader::new(reader);
-                let (etag, m) = write_once(
+                let (etag, m, pc) = write_once(
                     &mut engine,
                     &mut hashing,
                     header(req, "content-type"),
@@ -1457,7 +1653,7 @@ impl S3Service {
                             "The provided 'x-amz-content-sha256' header does not match what was computed.",
                         ));
                 }
-                (etag, m)
+                (etag, m, pc)
             }
             PayloadHash::Unsigned => write_once(
                 &mut engine,
@@ -1467,7 +1663,8 @@ impl S3Service {
                 resp_headers_from(req),
             )?,
             PayloadHash::Streaming | PayloadHash::StreamingSignedTrailer => {
-                // aws-chunked(signed):逐 chunk 校验签名后解码为原始流;尾部 trailer 消费
+                // aws-chunked(signed):逐 chunk 校验签名后解码为原始流;
+                // 尾部 trailer 由解码器解析并验算 checksum(M11 C1-2)
                 let date = &amz_date[0..8];
                 let cred = self.auth.find_key_by_amz(req)?;
                 let mut chunked = ChunkedSigV4Reader::new(
@@ -1477,27 +1674,69 @@ impl S3Service {
                     &self.region,
                     seed_sig.as_deref().unwrap_or_default(),
                     &amz_date,
-                );
-                write_once(
+                )
+                .with_checksum_trailer(cksum.trailer_alg);
+                let res = write_once(
                     &mut engine,
                     &mut chunked,
                     header(req, "content-type"),
                     user_meta(req),
                     resp_headers_from(req),
-                )?
+                );
+                match res {
+                    Ok(v) => {
+                        chunked_opt = Some(chunked);
+                        v
+                    }
+                    // 读侧已置 S3 错误(chunk 验签 / trailer checksum 不符)
+                    // → 直接透出,替代 io 错误的 InternalError 兜底映射
+                    Err(e) => return Err(chunked.take_error().unwrap_or(e)),
+                }
             }
             PayloadHash::StreamingUnsignedTrailer => {
-                // HTTPS 下 aws cli 默认:无签名 chunk + trailer
-                let mut chunked = ChunkedSigV4Reader::new_unsigned(reader, &amz_date);
-                write_once(
+                // HTTPS 下 aws cli 默认:无签名 chunk + trailer(验算同上)
+                let mut chunked = ChunkedSigV4Reader::new_unsigned(reader, &amz_date)
+                    .with_checksum_trailer(cksum.trailer_alg);
+                let res = write_once(
                     &mut engine,
                     &mut chunked,
                     header(req, "content-type"),
                     user_meta(req),
                     resp_headers_from(req),
-                )?
+                );
+                match res {
+                    Ok(v) => {
+                        chunked_opt = Some(chunked);
+                        v
+                    }
+                    Err(e) => return Err(chunked.take_error().unwrap_or(e)),
+                }
             }
         };
+
+        // M11 C1-2:aws-chunked 解码字节数与 x-amz-decoded-content-length
+        // 强制对照(不符回滚,显式错误)
+        if let (Some(chunked), Some(dcl)) = (&chunked_opt, cksum.decoded_len) {
+            if chunked.total_decoded() != dcl {
+                rollback(&mut engine, written_meta.as_ref());
+                return Err(S3Error::new(S3ErrorCode::InvalidRequest).with_message(
+                    "The x-amz-decoded-content-length does not match the actual decoded payload length.",
+                ));
+            }
+        }
+        // M11 C1-2/C1-4:头模式 checksum 写后比对(不符回滚 + BadDigest,同
+        // Content-MD5 先例);Object 目标取 ObjectMeta.checksum,Part 目标取
+        // PartMeta.checksum(均引擎 tee 代算落盘值)
+        if let Some(declared) = &cksum.value {
+            let actual = match &written_meta {
+                Some(m) => m.checksum.clone(),
+                None => part_checksum,
+            };
+            if actual.as_ref() != Some(declared) {
+                rollback(&mut engine, written_meta.as_ref());
+                return Err(crate::checksum::bad_digest(declared.algorithm));
+            }
+        }
 
         // Content-MD5 校验(存在时):base64(md5) 对比 ETag
         if let Some(md5_b64) = header(req, "content-md5") {
@@ -1514,6 +1753,26 @@ impl S3Service {
 
         let mut headers = self.base_headers();
         headers.push(("ETag".into(), format!("\"{}\"", hex::encode(etag))));
+        // M11 C1-2:客户端提供了 checksum(头或验算通过的 trailer)时回显
+        // 对应响应头(AWS PutObject/UploadPart 口径)
+        let resp_cksum = match (&cksum.value, &chunked_opt) {
+            (Some(v), _) => Some(v.clone()),
+            (None, Some(c)) => c.verified_checksum().cloned(),
+            (None, None) => None,
+        };
+        if let Some(info) = &resp_cksum {
+            headers.push(crate::checksum::response_header(info));
+        }
+        // M11 E1-2/E1-4:SSE-C 回显(algorithm + key-MD5 回显请求值;
+        // Object/Part 目标同口径,Part 已在上方完成会话一致性校验)
+        if let Some(s) = &ssec {
+            headers.extend(crate::sse::response_headers(s));
+        }
+        // M11 K1-2:SSE-S3 回显(Object = 显式头/桶默认生效;Part = 会话
+        // 为 SSE-S3 时回显,AWS 口径)
+        if use_s3 || sess_sse_s3 {
+            headers.push(crate::sse::sse_s3_response_header());
+        }
         // V3-5 + V4:x-amz-version-id(Enabled = hex(vk);Suspended = "null";
         // Off 不回)
         if let Some(v) = written_meta
@@ -1521,6 +1780,13 @@ impl S3Service {
             .and_then(|m| write_version_id_header(bucket_versioning, m))
         {
             headers.push(("x-amz-version-id".into(), v));
+        }
+        // M11 L5:x-amz-expiration(命中 Enabled 过期规则时回显;仅 Object
+        // 目标有 written_meta,UploadPart 天然跳过)
+        if let (Some(m), StreamTarget::Object { bucket, key }) = (&written_meta, &target) {
+            if let Some(h) = lifecycle_expiration_header(&engine, bucket, key, m) {
+                headers.push(h);
+            }
         }
         Ok(ServiceResponse {
             status: 200,
@@ -1533,6 +1799,8 @@ impl S3Service {
     /// `version` = ?versionId 寻址版本(None = 当前版本;ADR-11 §3.4.3)。
     /// `versioning` = 响应构造处持有的桶版本化状态(F-1:Off 桶每块解析
     /// 走单键点读快速路径,不反扫、不重复点读桶 meta)。
+    /// `sse_key` = SSE-C 请求期客户密钥(M11 E1-3;仅 SSE 对象需要,
+    /// 由响应构造处随 ResponseBody 传入)。
     #[allow(clippy::too_many_arguments)]
     pub fn read_stream_chunk(
         &self,
@@ -1544,6 +1812,7 @@ impl S3Service {
         length: u64,
         pos: &mut u64,
         buf: &mut [u8],
+        sse_key: Option<&fs3_core::SseCKey>,
     ) -> Result<usize, S3Error> {
         if *pos >= length {
             return Ok(0);
@@ -1559,6 +1828,7 @@ impl S3Service {
                 offset + *pos,
                 &mut buf[..want],
                 versioning,
+                sse_key,
             )
             .inspect(|&n| {
                 *pos += n as u64;
@@ -2057,6 +2327,130 @@ impl S3Service {
         Ok(resp)
     }
 
+    // ───────────────── M11 K1-2:桶默认加密(ADR-12 DS2/DS3;BucketMeta v2 字段) ─────────────────
+
+    /// PutBucketEncryption:仅 AES256(路由层已解析校验;KMS 类参数已显式
+    /// 拒绝);落 BucketMeta.default_encryption(DS3:填 D0 预留字段,无独立
+    /// 键)。AWS 返回 200(空 body)。
+    fn op_put_bucket_encryption(
+        &self,
+        bucket: &str,
+        algorithm: fs3_core::SseAlgorithm,
+    ) -> Result<ServiceResponse, S3Error> {
+        let engine = self.engine.write();
+        engine
+            .meta()
+            .commit_bucket_set_encryption(bucket, Some(algorithm))
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        Ok(ServiceResponse {
+            status: 200,
+            headers: vec![],
+            body: ResponseBody::Empty,
+        })
+    }
+
+    /// GetBucketEncryption:无配置 → 404
+    /// ServerSideEncryptionConfigurationNotFoundError(AWS 码);有配置 →
+    /// 规范化 XML(仅 AES256 单 Rule,与受理形态互逆)。
+    fn op_get_bucket_encryption(&self, bucket: &str) -> Result<ServiceResponse, S3Error> {
+        let engine = self.engine.read();
+        let bkt = engine
+            .meta()
+            .get_bucket(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?
+            .ok_or_else(|| {
+                S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket)
+            })?;
+        match bkt.default_encryption {
+            Some(alg) => Ok(Self::xml_response(xml::render_bucket_encryption(alg))),
+            None => Err(
+                S3Error::new(S3ErrorCode::ServerSideEncryptionConfigurationNotFoundError)
+                    .with_extra("BucketName", bucket),
+            ),
+        }
+    }
+
+    /// DeleteBucketEncryption:AWS 幂等口径——无配置同样 204(核实:AWS
+    /// 对无加密配置桶的 Delete 返回 204 No Content,与 DeleteBucketTagging
+    /// 幂等同例;不返 ServerSideEncryptionConfigurationNotFoundError)。
+    fn op_delete_bucket_encryption(&self, bucket: &str) -> Result<ServiceResponse, S3Error> {
+        let engine = self.engine.write();
+        engine
+            .meta()
+            .commit_bucket_set_encryption(bucket, None)
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        Ok(ServiceResponse {
+            status: 204,
+            headers: vec![],
+            body: ResponseBody::Empty,
+        })
+    }
+
+    // ───────────────── M11 L1:桶生命周期(ADR-12 DL1;`r:{bucket}\0{rule_id}` 键) ─────────────────
+
+    /// PutBucketLifecycleConfiguration:规则集路由层已解析校验(v1.2 子集;
+    /// Transition 族/ObjectSize* 已显式拒绝),单事务整体替换落 `r:` 键
+    /// (DL1 读旧写新)。AWS 返回 200(空 body)。
+    fn op_put_bucket_lifecycle(
+        &self,
+        bucket: &str,
+        rules: &[fs3_core::LifecycleRule],
+    ) -> Result<ServiceResponse, S3Error> {
+        let engine = self.engine.write();
+        engine
+            .meta()
+            .put_lifecycle_rules(bucket, rules)
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        Ok(ServiceResponse {
+            status: 200,
+            headers: vec![],
+            body: ResponseBody::Empty,
+        })
+    }
+
+    /// GetBucketLifecycleConfiguration:无配置 → 404 NoSuchLifecycle-
+    /// Configuration(AWS 码;error.rs 占位挂接);桶不存在 → NoSuchBucket。
+    /// 响应 = 规范化 XML(规则序 = rule_id 字典序;旧版直下 Prefix 归一为
+    /// Filter 形态)。
+    fn op_get_bucket_lifecycle(&self, bucket: &str) -> Result<ServiceResponse, S3Error> {
+        let engine = self.engine.read();
+        if engine
+            .meta()
+            .get_bucket(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?
+            .is_none()
+        {
+            return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
+        }
+        let rules = engine
+            .meta()
+            .get_lifecycle_rules(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        if rules.is_empty() {
+            return Err(S3Error::new(S3ErrorCode::NoSuchLifecycleConfiguration)
+                .with_extra("BucketName", bucket));
+        }
+        Ok(Self::xml_response(xml::render_lifecycle_configuration(
+            &rules,
+        )))
+    }
+
+    /// DeleteBucketLifecycleConfiguration:AWS 幂等口径——无配置同样 204
+    /// (与 DeleteBucketTagging/DeleteBucketEncryption 同例);桶不存在 →
+    /// NoSuchBucket。
+    fn op_delete_bucket_lifecycle(&self, bucket: &str) -> Result<ServiceResponse, S3Error> {
+        let engine = self.engine.write();
+        engine
+            .meta()
+            .delete_lifecycle_rules(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        Ok(ServiceResponse {
+            status: 204,
+            headers: vec![],
+            body: ResponseBody::Empty,
+        })
+    }
+
     // ───────────────── M10 S4:POST 表单上传 ─────────────────
 
     /// PostObject(M10 S4;AWS Browser-Based Uploads using POST 子集)。
@@ -2086,6 +2480,8 @@ impl S3Service {
         if key.is_empty() {
             return Err(S3Error::new(S3ErrorCode::UserKeyMustBeSpecified));
         }
+        // M11 H1-1:表单键长上限(与 PUT 路径同口径,AWS ≤1024 字节)
+        check_object_key_length(&key)?;
         // 5TiB 上限预拒绝(与缓冲 PUT 同口径)
         if form.file.len() as u64 > fs3_core::MAX_OBJECT_SIZE {
             return Err(S3Error::new(S3ErrorCode::EntityTooLarge)
@@ -2192,6 +2588,8 @@ impl S3Service {
             .filter(|(k, _)| k.starts_with("x-amz-meta-"))
             .cloned()
             .collect();
+        // M11 H1-1:表单用户元数据总量上限(与 PUT 路径同口径,AWS ≤2KiB)
+        check_user_meta_size(&user_meta)?;
         // 标准回显头字段(与 PUT 路径 resp_headers 同键名,GET/HEAD 回显)
         let mut resp_headers = Vec::new();
         for f in [
@@ -2205,20 +2603,84 @@ impl S3Service {
             }
         }
         let content_type = form.field("content-type");
+        // M11 门禁:POST 表单 checksum 字段(x-amz-checksum-{alg},至多
+        // 一个;policy 覆盖豁免见 post.rs)。解析与验算口径同 PUT:非法
+        // 字母表 → InvalidRequest;可解码值写后比对,不符 → BadDigest
+        let mut post_cksum: Option<fs3_core::ChecksumInfo> = None;
+        for (name, value) in &form.fields {
+            let Some(suffix) = name.strip_prefix("x-amz-checksum-") else {
+                continue;
+            };
+            let alg = fs3_core::ChecksumAlgorithm::from_header_suffix(suffix).ok_or_else(|| {
+                S3Error::new(S3ErrorCode::InvalidRequest).with_message(format!(
+                    "The checksum algorithm '{suffix}' is not supported."
+                ))
+            })?;
+            if post_cksum.is_some() {
+                return Err(S3Error::new(S3ErrorCode::InvalidRequest).with_message(
+                    "Expecting a single x-amz-checksum- field. Multiple checksum types are not allowed.",
+                ));
+            }
+            let raw = crate::checksum::decode_b64_lenient(value).ok_or_else(|| {
+                S3Error::new(S3ErrorCode::InvalidRequest).with_message(format!(
+                    "Value for x-amz-checksum-{suffix} field is invalid."
+                ))
+            })?;
+            post_cksum = Some(fs3_core::ChecksumInfo {
+                algorithm: alg,
+                value: raw,
+            });
+        }
+
+        // M11/ADR-12 DE4:POST 表单不支持 SSE-C(AWS 同);表单携带
+        // SSE-C 字段 → 显式 400(不静默忽略,红线)。K1-2:SSE-S3 表单字段
+        // 同样显式拒绝(表单 policy 条件模型未覆盖该字段,不收不静默;
+        // 桶默认加密仍对 POST 生效,见下)
+        if form
+            .fields
+            .iter()
+            .any(|(k, _)| k.starts_with("x-amz-server-side-encryption-customer-"))
+        {
+            return Err(S3Error::new(S3ErrorCode::InvalidRequest).with_message(
+                "POST browser-based uploads do not support SSE-C (x-amz-server-side-encryption-customer-* fields).",
+            ));
+        }
+        if form
+            .fields
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("x-amz-server-side-encryption"))
+        {
+            return Err(S3Error::new(S3ErrorCode::InvalidRequest).with_message(
+                "POST browser-based uploads do not support the x-amz-server-side-encryption field; bucket default encryption applies automatically.",
+            ));
+        }
 
         // 桶必须存在(AWS:NoSuchBucket)+ 取版本化状态(响应头口径同 V3-5)
-        let bucket_versioning = {
+        // K1-3:桶默认加密(AES256)对 POST 同样生效(AWS:默认加密覆盖全部
+        // 写入口;表单无 SSE 字段可覆盖默认)
+        let (bucket_versioning, bucket_default_encryption) = {
             let engine = self.engine.read();
-            engine
+            let bkt = engine
                 .meta()
                 .get_bucket(bucket)
                 .map_err(|e| map_engine_error(e, bucket, ""))?
                 .ok_or_else(|| {
                     S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket)
-                })?
-                .versioning
+                })?;
+            (bkt.versioning, bkt.default_encryption)
         };
         let mut engine = self.engine.write();
+        // M11 K1-1:桶默认 → SSE-S3 写密钥签发(当前代包裹;明文零落盘)
+        let s3_key = if bucket_default_encryption.is_some() {
+            Some(
+                engine
+                    .sse_s3_mint_write_key()
+                    .map_err(|e| map_engine_error(e, bucket, &key))?,
+            )
+        } else {
+            None
+        };
+        let post_wk = s3_key.as_ref().map(fs3_core::SseWriteKey::SseS3);
         let meta = engine
             .put_with_meta(
                 bucket,
@@ -2229,10 +2691,31 @@ impl S3Service {
                 resp_headers,
                 tags,
                 None,
+                // M11 门禁:POST checksum 字段声明的算法透传(引擎边写边算
+                // 落 ObjectMeta.checksum;未声明 = None 不算不记)
+                post_cksum.as_ref().map(|c| c.algorithm),
+                // ADR-12 DE4:POST 表单不支持 SSE-C(字段已在上方显式拒绝;
+                // SSE-C 恒 None);K1-3:桶默认 SSE-S3 生效
+                post_wk.as_ref(),
             )
             .map_err(|e| map_engine_error(e, bucket, &key))?;
+        // M11 门禁:checksum 写后比对(不符回滚 + BadDigest,同 PUT 口径)
+        if let Some(declared) = &post_cksum {
+            if meta.checksum.as_ref() != Some(declared) {
+                rollback_put_version(&mut engine, bucket, &key, bucket_versioning, &meta);
+                return Err(crate::checksum::bad_digest(declared.algorithm));
+            }
+        }
         let etag = meta.etag_full();
         let mut base = vec![("ETag".into(), format!("\"{etag}\""))];
+        // M11 K1-2:桶默认 SSE-S3 生效回显(AWS:POST 响应同口径)
+        if s3_key.is_some() {
+            base.push(crate::sse::sse_s3_response_header());
+        }
+        // M11 门禁:客户端提供了 checksum 字段时回显对应响应头(AWS 口径)
+        if let Some(declared) = &post_cksum {
+            base.push(crate::checksum::response_header(declared));
+        }
         if let Some(v) = write_version_id_header(bucket_versioning, &meta) {
             base.push(("x-amz-version-id".into(), v));
         }
@@ -2700,9 +3183,20 @@ impl S3Service {
             }
             None => None,
         };
+        // M11 C1-2:x-amz-checksum-* 头解析(校验时机照 Content-MD5 先例:
+        // 写前解析,非法值显式拒绝;写后比对,不符回滚 + BadDigest)
+        let cksum = crate::checksum::parse_request_checksum(req)?;
+        // trailer checksum 声明仅 aws-chunked 流式路径有效(缓冲路径无
+        // trailer 段,显式拒绝不静默)
+        if cksum.trailer_alg.is_some() {
+            return Err(S3Error::new(S3ErrorCode::InvalidRequest)
+                .with_message("checksum trailer declared but the request is not aws-chunked"));
+        }
+        // M11 E1-2:SSE-C 三头解析(写前校验;密钥仅请求期内存持有)
+        let ssec = crate::sse::parse_customer_headers(req)?;
 
         // 桶必须存在(AWS:NoSuchBucket;引擎报 NotFound 会被映射成 NoSuchKey)
-        let bucket_versioning = {
+        let bkt = {
             let engine = self.engine.write();
             engine
                 .meta()
@@ -2711,8 +3205,12 @@ impl S3Service {
                 .ok_or_else(|| {
                     S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket)
                 })?
-                .versioning
         };
+        let bucket_versioning = bkt.versioning;
+        // M11 K1-2/K1-3(DS2/DS3):SSE-S3 意愿 = 显式 AES256 头 > 桶默认
+        // (SSE-C 头优先;两者同现显式拒绝;x-amz-server-side-encryption 非
+        // AES256 值已在本调用内显式拒绝,K1-4)
+        let use_s3 = crate::sse::sse_s3_write_intent(req, ssec.as_ref(), bkt.default_encryption)?;
 
         let mut engine = self.engine.write();
         // M9/A1 配套:ACL 家族头显式校验(接受但不生效,单账号私有默认语义;
@@ -2722,6 +3220,23 @@ impl S3Service {
         let tags = object_tags_header(req)?.unwrap_or_default();
         // 条件写(ADR-11 D6;V3-4):判定在引擎写锁内对当前版本元数据执行
         let precond = parse_write_precondition(req)?;
+        // M11 K1-1:SSE-S3 写密钥签发(当前代 KEK 包裹的随机 DEK;
+        // DEK 明文仅内存持有,响应构造结束随持有结构 Drop 擦除)
+        let s3_key = if use_s3 {
+            Some(
+                engine
+                    .sse_s3_mint_write_key()
+                    .map_err(|e| map_engine_error(e, bucket, key))?,
+            )
+        } else {
+            None
+        };
+        let write_key = match (&ssec, &s3_key) {
+            (Some(s), None) => Some(fs3_core::SseWriteKey::SseC(&s.key)),
+            (None, Some(w)) => Some(fs3_core::SseWriteKey::SseS3(w)),
+            (None, None) => None,
+            (Some(_), Some(_)) => unreachable!("SSE-C/SSE-S3 互斥已在意愿裁决判定"),
+        };
         let meta = engine
             .put_with_meta(
                 bucket,
@@ -2732,6 +3247,12 @@ impl S3Service {
                 resp_headers_from(req),
                 tags,
                 precond.as_ref(),
+                // M11 C1-2:客户端声明的 checksum 算法透传(引擎边写边算落
+                // ObjectMeta.checksum;未声明 = None 不算不记)
+                cksum.algorithm(),
+                // M11 E1-7/K1-1:SSE 写密钥透传(明文 checksum → 加密 →
+                // 密文 CRC/MD5,顺序见引擎 put_with_meta 注释)
+                write_key.as_ref(),
             )
             .map_err(|e| map_engine_error(e, bucket, key))?;
         if md5_ok == Some(false) {
@@ -2739,10 +3260,34 @@ impl S3Service {
             return Err(S3Error::new(S3ErrorCode::BadDigest)
                 .with_message("The Content-MD5 you specified did not match what we received."));
         }
+        // M11 C1-2:checksum 写后比对(引擎代算值 vs 客户端声明值)
+        if let Some(declared) = &cksum.value {
+            if meta.checksum.as_ref() != Some(declared) {
+                rollback_put_version(&mut engine, bucket, key, bucket_versioning, &meta);
+                return Err(crate::checksum::bad_digest(declared.algorithm));
+            }
+        }
         let mut headers = vec![("ETag".into(), format!("\"{}\"", meta.etag_full()))];
+        // M11 C1-2:客户端提供了 checksum 时回显对应响应头(AWS 口径)
+        if let Some(info) = &cksum.value {
+            headers.push(crate::checksum::response_header(info));
+        }
+        // M11 E1-2:SSE-C 回显(algorithm + key-MD5 回显请求值)
+        if let Some(s) = &ssec {
+            headers.extend(crate::sse::response_headers(s));
+        }
+        // M11 K1-2:SSE-S3 回显(显式头或桶默认生效,恒 AES256)
+        if use_s3 {
+            headers.push(crate::sse::sse_s3_response_header());
+        }
         // V3-5 + V4:x-amz-version-id(Enabled = hex;Suspended = "null";Off 不回)
         if let Some(v) = write_version_id_header(bucket_versioning, &meta) {
             headers.push(("x-amz-version-id".into(), v));
+        }
+        // M11 L5:x-amz-expiration(命中 Enabled 过期规则时回显最早到期
+        // 时刻与规则 ID,AWS 口径;午夜语义与执行器同 DL4)
+        if let Some(h) = lifecycle_expiration_header(&engine, bucket, key, &meta) {
+            headers.push(h);
         }
         Ok(ServiceResponse {
             status: 200,
@@ -2787,6 +3332,37 @@ impl S3Service {
         // 响应携带所读版本的 x-amz-version-id(版本化桶;Off 无头)
         let resp_version_id = version_id_response_header(bkt.versioning, &meta);
 
+        // M11 E1-2/E1-3 + D-E5(SSE-C)/ K1-2(SSE-S3):按 SseInfo.kind 分派——
+        // · SSE-C 对象缺三头 → 400 InvalidRequest(AWS 口径:"The object was
+        //   stored using a form of Server Side Encryption...");带三头 → E1-2
+        //   校验 + D-E5 校验子比对(错 key 400;HEAD 不读数据同能发现);
+        // · SSE-S3 对象零客户头(服务端 KEK 体系自持解密);携带 SSE-C 头 →
+        //   显式 InvalidRequest(不静默拿客户密钥解 SSE-S3 对象,红线);
+        // · 未加密对象带三头 → 按 AWS 语义忽略(§4.2.1 明文裁决;正常返回)
+        let ssec = match &meta.sse {
+            Some(sse) if sse.kind == fs3_core::SseKind::SseS3 => {
+                if crate::sse::has_customer_headers(req) {
+                    return Err(S3Error::new(S3ErrorCode::InvalidRequest).with_message(
+                        "The object is SSE-S3 encrypted; SSE-C customer headers are not applicable.",
+                    ));
+                }
+                None
+            }
+            Some(sse) => {
+                let h = crate::sse::parse_customer_headers(req)?.ok_or_else(|| {
+                    S3Error::new(S3ErrorCode::InvalidRequest).with_message(
+                        "The object was stored using a form of Server Side Encryption. The correct parameters must be provided to retrieve the object.",
+                    )
+                })?;
+                // M11 D-E5:错 key 早判 = 校验子比对(替代 E1-3 的 chunk0 解密
+                // 早探——比对已在响应构造前排除错 key;key 正确而数据被篡改的
+                // 残余面由流内 GCM 验 tag 兜底,断连语义与后续 chunk 失败一致)
+                crate::sse::check_object_key_md5(sse, &h)?;
+                Some(h)
+            }
+            None => None,
+        };
+
         // 条件头:先 412 组,后 304 组(AWS 顺序)
         if let Some(etag) = header(req, "if-match") {
             let etag = etag.trim().trim_matches('"').to_string();
@@ -2829,6 +3405,19 @@ impl S3Service {
             }
             range_parts = Some(parts);
         }
+        // M11 门禁:x-amz-checksum-mode 门控(AWS:仅 ENABLED 时 GET/HEAD
+        // 回显对象级 checksum 与 checksum-type;不带头一律不回显);且仅当
+        // 响应覆盖整对象时回显(AWS:部分 Range GET 不返回 checksum 头——
+        // botocore 默认 response_checksum_validation=when_supported 会自动
+        // 携带 checksum-mode 并对回显值逐体验算,部分 Range 回显全对象值
+        // 会导致客户端 FlexibleChecksumError)
+        let echo_checksum = crate::checksum::checksum_mode_enabled(req)?
+            && match &range_parts {
+                None => true,
+                Some(parts) => {
+                    parts.len() == 1 && parts[0].start == 0 && parts[0].end + 1 == meta.size
+                }
+            };
         match &range_parts {
             Some(parts) if parts.len() > 1 => {
                 // —— 多段:multipart/byteranges 206 ——
@@ -2856,6 +3445,28 @@ impl S3Service {
                 if !meta.tags.is_empty() {
                     headers.push(("x-amz-tagging-count".into(), meta.tags.len().to_string()));
                 }
+                // M11 L5:x-amz-expiration(命中 Enabled 过期规则时回显)
+                if let Some(h) = lifecycle_expiration_header(&engine, bucket, key, &meta) {
+                    headers.push(h);
+                }
+                // M11 C1-2/C1-4:多段 Range 恒不回显(echo_checksum 在该
+                // 分支恒 false;保留判断作形态说明)
+                if echo_checksum {
+                    if let Some(h) = crate::checksum::object_response_header(&meta) {
+                        headers.push(h);
+                    }
+                    if let Some(h) = crate::checksum::checksum_type_header(&meta) {
+                        headers.push(h);
+                    }
+                }
+                // M11 E1-2:SSE-C 回显(algorithm + key-MD5 回显请求值)
+                if let Some(s) = &ssec {
+                    headers.extend(crate::sse::response_headers(s));
+                }
+                // M11 K1-2:SSE-S3 对象恒回显 AES256(无客户头要求)
+                if matches!(&meta.sse, Some(s) if s.kind == fs3_core::SseKind::SseS3) {
+                    headers.push(crate::sse::sse_s3_response_header());
+                }
                 let total = meta.size;
                 let len = multipart_byte_length(&boundary, &meta.content_type, parts, total);
                 for (k, v) in headers.iter_mut() {
@@ -2879,6 +3490,7 @@ impl S3Service {
                             boundary,
                             part_content_type: meta.content_type.clone(),
                             versioning: bkt.versioning,
+                            sse_key: ssec.map(|s| s.key),
                         }
                     },
                 });
@@ -2924,6 +3536,29 @@ impl S3Service {
         if !meta.tags.is_empty() {
             headers.push(("x-amz-tagging-count".into(), meta.tags.len().to_string()));
         }
+        // M11 L5:x-amz-expiration(命中 Enabled 过期规则时回显最早到期
+        // 时刻与规则 ID;s3-tests lifecycle_expiration_header 族依赖)
+        if let Some(h) = lifecycle_expiration_header(&engine, bucket, key, &meta) {
+            headers.push(h);
+        }
+        // M11 C1-2/C1-4:对象带 checksum 且客户端开启
+        // x-amz-checksum-mode 时回显(AWS 门控 + 整对象口径,见上)
+        if echo_checksum {
+            if let Some(h) = crate::checksum::object_response_header(&meta) {
+                headers.push(h);
+            }
+            if let Some(h) = crate::checksum::checksum_type_header(&meta) {
+                headers.push(h);
+            }
+        }
+        // M11 E1-2:SSE-C 回显(algorithm + key-MD5 回显请求值)
+        if let Some(s) = &ssec {
+            headers.extend(crate::sse::response_headers(s));
+        }
+        // M11 K1-2:SSE-S3 对象恒回显 AES256(无客户头要求)
+        if matches!(&meta.sse, Some(s) if s.kind == fs3_core::SseKind::SseS3) {
+            headers.push(crate::sse::sse_s3_response_header());
+        }
         if is_range {
             // S3 Content-Range 为闭区间:start-(end-1)/size
             headers.push((
@@ -2931,6 +3566,11 @@ impl S3Service {
                 format!("bytes {start}-{}/{}", end - 1, meta.size),
             ));
         }
+        // M11 G-1:GetObject response-* 查询参数响应头覆盖(AWS Response
+        // Header Overrides;s3-tests test_object_raw_response_headers 逐值
+        // 断言)。多段 206 路径不覆盖(multipart/byteranges 为 envelope
+        // Content-Type,上游无该组合断言)。
+        apply_response_header_overrides(req, &mut headers);
 
         if head_only {
             return Ok(ServiceResponse {
@@ -2941,6 +3581,8 @@ impl S3Service {
         }
 
         // 零拷贝段(同一锁内算好,避免 HTTP 层重复取锁;版本寻址形态)
+        // M11 E1-3:SSE 对象 object_segments_version_for 恒 None(禁零
+        // 拷贝,解密走下方 ObjectStream 缓冲路径)
         let zc_segments = engine
             .object_segments_version_for(
                 bucket,
@@ -2967,7 +3609,113 @@ impl S3Service {
                 zc_fd,
                 zc_verify,
                 versioning: bkt.versioning,
+                sse_key: ssec.map(|s| s.key),
             },
+        })
+    }
+
+    /// GetObjectAttributes(M11 C1-3,ADR-12 D-E2):对象级 GET ?attributes。
+    /// 版本寻址/删除标记/未版本化边界照 op_get_object 分支;不评估条件头
+    /// 与 Range(AWS 该操作无此语义)。
+    fn op_get_object_attributes(
+        &self,
+        req: &S3Request,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionIdArg>,
+    ) -> Result<ServiceResponse, S3Error> {
+        // 请求属性列表头(缺头/空表 → InvalidRequest;未知属性 →
+        // InvalidArgument;先于对象解析,与 AWS 参数校验优先一致)
+        let attrs = xml::parse_object_attributes(header(req, "x-amz-object-attributes"))?;
+        // ObjectParts 分页头(AWS 模型:x-amz-max-parts /
+        // x-amz-part-number-marker 为请求头;非数值显式 InvalidArgument)
+        let page = xml::ObjectPartsPage {
+            max_parts: match header(req, "x-amz-max-parts") {
+                Some(v) => v.trim().parse::<u32>().map_err(|_| {
+                    S3Error::new(S3ErrorCode::InvalidArgument)
+                        .with_message("Value for x-amz-max-parts header is invalid.")
+                })?,
+                None => 1000,
+            },
+            marker: match header(req, "x-amz-part-number-marker") {
+                Some(v) => v.trim().parse::<u32>().map_err(|_| {
+                    S3Error::new(S3ErrorCode::InvalidArgument)
+                        .with_message("Value for x-amz-part-number-marker header is invalid.")
+                })?,
+                None => 0,
+            },
+        };
+        let engine = self.engine.read();
+        let bkt = engine
+            .meta()
+            .get_bucket(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        let Some(bkt) = bkt else {
+            return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
+        };
+        // ?versionId 寻址(同 op_get_object 口径):命中删除标记 → 无
+        // versionId 404 / 带 versionId 405;版本不存在 → NoSuchVersion
+        let vk = version_id.map(|v| v.vk());
+        let meta = match engine.head_version_for(bucket, key, vk.as_ref(), bkt.versioning) {
+            Ok(m) => m,
+            Err(CoreError::DeleteMarker(disp)) => {
+                return Err(delete_marker_error(&disp, key, version_id.is_some()))
+            }
+            Err(CoreError::NotFound(_)) => {
+                return Err(match &version_id {
+                    Some(v) => no_such_version_error(key, v),
+                    None => S3Error::new(S3ErrorCode::NoSuchKey).with_extra("Key", key),
+                })
+            }
+            Err(e) => return Err(map_engine_error(e, bucket, key)),
+        };
+        let resp_version_id = version_id_response_header(bkt.versioning, &meta);
+        // M11 E1-2/E1-3 + D-E5(SSE-C)/ K1-2(SSE-S3):与 op_get_object
+        // 同口径按 kind 分派——SSE-C 对象缺三头 → 400(AWS:attributes 属
+        // 对象读操作族,test_get_sse_c_encrypted_object_attributes);错 key →
+        // D-E5 校验子比对 400;SSE-S3 对象零客户头(带 SSE-C 头显式拒绝);
+        // AWS 模型中 attributes 响应无 SSE-S3 头,故 SSE-S3 不回显(与
+        // GET/HEAD 恒回显的口径差异写死——AWS GetObjectAttributes 响应
+        // 模型无 x-amz-server-side-encryption 字段)。
+        let ssec = match &meta.sse {
+            Some(sse) if sse.kind == fs3_core::SseKind::SseS3 => {
+                if crate::sse::has_customer_headers(req) {
+                    return Err(S3Error::new(S3ErrorCode::InvalidRequest).with_message(
+                        "The object is SSE-S3 encrypted; SSE-C customer headers are not applicable.",
+                    ));
+                }
+                None
+            }
+            Some(sse) => {
+                let h = crate::sse::parse_customer_headers(req)?.ok_or_else(|| {
+                    S3Error::new(S3ErrorCode::InvalidRequest).with_message(
+                        "The object was stored using a form of Server Side Encryption. The correct parameters must be provided to retrieve the object.",
+                    )
+                })?;
+                crate::sse::check_object_key_md5(sse, &h)?;
+                Some(h)
+            }
+            None => None,
+        };
+        let body = xml::render_get_object_attributes(&meta, &attrs, page);
+        // Last-Modified / x-amz-version-id 在 AWS 模型中为响应头(非 body)
+        let mut headers = vec![
+            ("Content-Type".into(), "application/xml".into()),
+            ("Content-Length".into(), body.len().to_string()),
+            ("Last-Modified".into(), xml::http_date(meta.mtime)),
+        ];
+        // 响应头照 AWS:版本化桶回显 x-amz-version-id(Off 无头)
+        if let Some(v) = resp_version_id {
+            headers.push(("x-amz-version-id".into(), v));
+        }
+        // M11 E1-2:SSE-C 回显(algorithm + key-MD5 回显请求值)
+        if let Some(s) = &ssec {
+            headers.extend(crate::sse::response_headers(s));
+        }
+        Ok(ServiceResponse {
+            status: 200,
+            headers,
+            body: ResponseBody::Bytes(body.into_bytes()),
         })
     }
 
@@ -3010,14 +3758,13 @@ impl S3Service {
         key: &str,
     ) -> Result<ServiceResponse, S3Error> {
         let mut engine = self.engine.write();
-        if engine
+        let bkt = engine
             .meta()
             .get_bucket(bucket)
             .map_err(|e| map_engine_error(e, bucket, ""))?
-            .is_none()
-        {
-            return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
-        }
+            .ok_or_else(|| {
+                S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket)
+            })?;
         // 条件写头(ADR-11 D6)在 CompleteMultipartUpload 判定(AWS 语义);
         // Create 携带 → 显式拒绝,不静默忽略(红线)
         if parse_write_precondition(req)?.is_some() {
@@ -3025,6 +3772,28 @@ impl S3Service {
                 "conditional write headers are only evaluated at CompleteMultipartUpload",
             ));
         }
+        // M11 C1-4 门禁:checksum 会话头(x-amz-checksum-algorithm [+
+        // x-amz-checksum-type]);非默认类型组合显式 400(不静默)
+        let (checksum_alg, checksum_type) = crate::checksum::parse_create_checksum(req)?;
+        // M11 E1-4:SSE-C 三头解析(写前校验);密钥绑定会话——会话只落
+        // key-MD5(客户密钥零落盘,DE1 红线),后续 part 请求逐值比对
+        let ssec = crate::sse::parse_customer_headers(req)?;
+        // M11 K1-2/K1-3(DS2/DS3):SSE-S3 意愿 = 显式 AES256 头 > 桶默认
+        // (SSE-C 优先,同现显式互斥 400)
+        let use_s3 = crate::sse::sse_s3_write_intent(req, ssec.as_ref(), bkt.default_encryption)?;
+        // M11 K1-1:签发会话级 DEK(当前代 KEK 包裹;只存包裹值,DEK 明文
+        // 零落盘——part 请求时按 kek_id 派生 KEK 现解现用)
+        let sess_s3 = if use_s3 {
+            let wk = engine
+                .sse_s3_mint_write_key()
+                .map_err(|e| map_engine_error(e, bucket, key))?;
+            Some(fs3_meta::SessionSseS3 {
+                kek_id: wk.kek_id(),
+                wrapped_dek: wk.wrapped_dek().to_vec(),
+            })
+        } else {
+            None
+        };
         // 惰性过期回收(每次创建顺带扫一遍,成本可忽略的规模)
         let _ = engine.sweep_expired_sessions(fs3_core::MULTIPART_TTL_SECS);
         let uid = engine
@@ -3039,15 +3808,35 @@ impl S3Service {
                 // M10 S1:x-amz-tagging 随会话落到 Complete 后的对象上
                 // (s3-tests test_set_multipart_tagging)
                 object_tags_header(req)?.unwrap_or_default(),
+                checksum_alg,
+                // M11 E1-4:key-MD5(base64 原文)绑定会话
+                ssec.as_ref().map(|s| s.key_md5_b64.clone()),
+                // M11 K1-1:SSE-S3 会话 DEK 包裹值绑定会话
+                sess_s3,
             )
             .map_err(|e| map_engine_error(e, bucket, key))?;
         let xml = xml::render_initiate_multipart(bucket, key, &uid);
+        let mut headers = vec![
+            ("Content-Type".into(), "application/xml".into()),
+            ("Content-Length".into(), xml.len().to_string()),
+        ];
+        // 会话 checksum 回显(AWS:Create 响应头携带算法与生效类型)
+        if let Some(alg) = checksum_alg {
+            headers.push(("x-amz-checksum-algorithm".into(), alg.s3_name().into()));
+            let effective = checksum_type.unwrap_or_else(|| alg.default_checksum_type());
+            headers.push(("x-amz-checksum-type".into(), effective.s3_name().into()));
+        }
+        // M11 E1-4:SSE-C 回显(algorithm + key-MD5 回显请求值,AWS 口径)
+        if let Some(s) = &ssec {
+            headers.extend(crate::sse::response_headers(s));
+        }
+        // M11 K1-2:SSE-S3 会话回显(显式头/桶默认生效,恒 AES256)
+        if use_s3 {
+            headers.push(crate::sse::sse_s3_response_header());
+        }
         Ok(ServiceResponse {
             status: 200,
-            headers: vec![
-                ("Content-Type".into(), "application/xml".into()),
-                ("Content-Length".into(), xml.len().to_string()),
-            ],
+            headers,
             body: ResponseBody::Bytes(xml.into_bytes()),
         })
     }
@@ -3072,6 +3861,20 @@ impl S3Service {
             return Err(S3Error::new(S3ErrorCode::InvalidArgument)
                 .with_message("x-amz-tagging is not valid for UploadPart"));
         }
+        // M11 C1-2:checksum 头解析 + 缓冲体直接验算(不符显式 BadDigest,
+        // 不落分片);trailer 声明仅 aws-chunked 流式路径有效
+        let cksum = crate::checksum::parse_request_checksum(req)?;
+        if cksum.trailer_alg.is_some() {
+            return Err(S3Error::new(S3ErrorCode::InvalidRequest)
+                .with_message("checksum trailer declared but the request is not aws-chunked"));
+        }
+        if let Some(info) = &cksum.value {
+            if fs3_core::checksum_one_shot(info.algorithm, &req.body) != info.value {
+                return Err(crate::checksum::bad_digest(info.algorithm));
+            }
+        }
+        // M11 E1-4:SSE-C 三头解析(写前校验;密钥仅请求期内存持有)
+        let ssec = crate::sse::parse_customer_headers(req)?;
         let mut engine = self.engine.write();
         if engine
             .meta()
@@ -3081,16 +3884,47 @@ impl S3Service {
         {
             return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
         }
+        // M11 E1-4:会话一致性——key-MD5 与 Create 绑定值逐值比对(AWS:
+        // part 头必须与会话一致);会话不存在时跳过,由引擎报 NoSuchUpload
+        // K1-2:SSE-S3 会话标记(响应回显用;part 请求零头,引擎内部以
+        // 会话 DEK 加密)
+        let mut sess_sse_s3 = false;
+        let sess = engine
+            .meta()
+            .get_multipart(upload_id)
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        if let Some(sess) = &sess {
+            crate::sse::check_session_sse(sess.sse_key_md5.as_deref(), ssec.as_ref())?;
+            sess_sse_s3 = sess.sse_s3.is_some();
+        }
         let part = engine
             .upload_part(
                 upload_id,
                 part_number,
                 &mut std::io::Cursor::new(req.body.clone()),
+                // M11 C1-4:声明算法透传(引擎 tee 落 PartMeta.checksum;
+                // 上方已验算,值一致)
+                cksum.algorithm(),
+                // M11 E1-4:SSE-C 密钥透传(part 独立加密,DE2)
+                ssec.as_ref().map(|s| &s.key),
             )
             .map_err(|e| map_engine_error(e, bucket, key))?;
+        let mut headers = vec![("ETag".into(), format!("\"{}\"", part.etag_hex()))];
+        // M11 C1-2:客户端提供了 checksum 时回显对应响应头(AWS 口径)
+        if let Some(info) = &cksum.value {
+            headers.push(crate::checksum::response_header(info));
+        }
+        // M11 E1-4:SSE-C 回显(algorithm + key-MD5 回显请求值)
+        if let Some(s) = &ssec {
+            headers.extend(crate::sse::response_headers(s));
+        }
+        // M11 K1-2:SSE-S3 会话回显(AWS:加密会话的 UploadPart 响应回显)
+        if sess_sse_s3 {
+            headers.push(crate::sse::sse_s3_response_header());
+        }
         Ok(ServiceResponse {
             status: 200,
-            headers: vec![("ETag".into(), format!("\"{}\"", part.etag_hex()))],
+            headers,
             body: ResponseBody::Empty,
         })
     }
@@ -3118,6 +3952,10 @@ impl S3Service {
             return Err(S3Error::new(S3ErrorCode::InvalidArgument)
                 .with_message("x-amz-tagging is not valid for UploadPartCopy"));
         }
+        // M11 E1-5(ADR-12 DE3):copy-source 侧与目标侧 SSE-C 三头解析
+        // (写前校验,非法值显式错误;密钥仅请求期内存持有)
+        let cs_ssec = crate::sse::parse_copy_source_customer_headers(req)?;
+        let dst_ssec = crate::sse::parse_customer_headers(req)?;
         let mut engine = self.engine.write();
         if engine
             .meta()
@@ -3144,6 +3982,51 @@ impl S3Service {
             }
             Err(e) => return Err(map_engine_error(e, &copy_source.bucket, &copy_source.key)),
         };
+        // M11 E1-5:目标侧 = 会话语义(UploadPartCopy 的分片归属会话;
+        // key-MD5 与 Create 绑定值逐值比对);会话不存在时跳过,由引擎报
+        // NoSuchUpload
+        let mut sess_sse_s3 = false;
+        let sess = engine
+            .meta()
+            .get_multipart(upload_id)
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        if let Some(sess) = &sess {
+            crate::sse::check_session_sse(sess.sse_key_md5.as_deref(), dst_ssec.as_ref())?;
+            sess_sse_s3 = sess.sse_s3.is_some();
+        }
+        // DE3/DS3 显式错误(不静默):源加密而目标(会话)未加密 →
+        // InvalidRequest(防静默解密落盘);源 SSE-C 而 copy-source 侧未给
+        // 密钥 → InvalidRequest(源 SSE-S3 由服务端自持解包,无客户头语义;
+        // 对 SSE-S3 源携带 SSE-C 头 → 显式拒绝混用)。引擎侧另有兜底
+        let dst_encrypted = dst_ssec.is_some() || sess_sse_s3;
+        if src_meta.sse.is_some() && !dst_encrypted {
+            return Err(S3Error::new(S3ErrorCode::InvalidRequest).with_message(
+                "The copy source is SSE-C encrypted; the destination of the copy must specify SSE-C encryption.",
+            ));
+        }
+        if matches!(&src_meta.sse, Some(s) if s.kind == fs3_core::SseKind::SseC)
+            && cs_ssec.is_none()
+        {
+            return Err(S3Error::new(S3ErrorCode::InvalidRequest).with_message(
+                "The copy source is SSE-C encrypted; x-amz-copy-source-server-side-encryption-customer-* headers are required.",
+            ));
+        }
+        if matches!(&src_meta.sse, Some(s) if s.kind == fs3_core::SseKind::SseS3)
+            && cs_ssec.is_some()
+        {
+            return Err(S3Error::new(S3ErrorCode::InvalidRequest).with_message(
+                "The copy source is SSE-S3 encrypted; copy-source SSE-C headers are not applicable.",
+            ));
+        }
+        // M11 H1-1(D-E5 对齐到 copy 源侧):copy-source 错 key 早判——请求
+        // key-MD5 与源对象落盘 `SseInfo.key_md5` 校验子比对,不符 → 400
+        // InvalidRequest(与 GET/HEAD 读路径同码同消息;此前由引擎数据路径
+        // GCM 认证失败兜成 500)。上方语义判定已保证:源 SSE-C ⇒ cs_ssec
+        // 在场;check_object_key_md5 按 kind 仅对 SseC 生效(SSE-S3 源
+        // 服务端自持解包,无客户校验子)。
+        if let (Some(sse), Some(h)) = (&src_meta.sse, &cs_ssec) {
+            crate::sse::check_object_key_md5(sse, h)?;
+        }
         let range = match copy_source_range {
             Some(r) => parse_copy_range(r, src_meta.size)?,
             None => 0..src_meta.size,
@@ -3155,15 +4038,26 @@ impl S3Service {
                 &copy_source.bucket,
                 &copy_source.key,
                 range,
+                cs_ssec.as_ref().map(|s| &s.key),
+                dst_ssec.as_ref().map(|s| &s.key),
             )
             .map_err(|e| map_engine_error(e, &copy_source.bucket, &copy_source.key))?;
         let xml = xml::render_copy_part(&part.etag_hex(), &xml::ts_to_rfc3339(part.mtime));
+        let mut headers = vec![
+            ("Content-Type".into(), "application/xml".into()),
+            ("Content-Length".into(), xml.len().to_string()),
+        ];
+        // M11 E1-5:目标加密时回显 algorithm + key-MD5(AWS 口径)
+        if let Some(s) = &dst_ssec {
+            headers.extend(crate::sse::response_headers(s));
+        }
+        // M11 K1-2:SSE-S3 会话回显(目标侧 = 会话语义)
+        if sess_sse_s3 {
+            headers.push(crate::sse::sse_s3_response_header());
+        }
         Ok(ServiceResponse {
             status: 200,
-            headers: vec![
-                ("Content-Type".into(), "application/xml".into()),
-                ("Content-Length".into(), xml.len().to_string()),
-            ],
+            headers,
             body: ResponseBody::Bytes(xml.into_bytes()),
         })
     }
@@ -3174,7 +4068,7 @@ impl S3Service {
         bucket: &str,
         key: &str,
         upload_id: &str,
-        parts: &[(u32, String)],
+        parts: &[fs3_core::CompletePart],
     ) -> Result<ServiceResponse, S3Error> {
         if parts.is_empty() {
             // AWS:空分片列表 → MalformedXML(400)
@@ -3186,6 +4080,12 @@ impl S3Service {
             return Err(S3Error::new(S3ErrorCode::InvalidArgument)
                 .with_message("x-amz-tagging is not valid for CompleteMultipartUpload"));
         }
+        // M11 C1-4:复合 checksum 头(x-amz-checksum-{alg} = base64 + -N;
+        // 非法值显式 InvalidRequest);逐分片 checksum 在 XML 解析期已校验
+        let composite = crate::checksum::parse_composite_checksum_header(req)?;
+        // M11 E1-4:SSE-C 三头解析(Complete 重加密需要密钥本体——会话只
+        // 存 key-MD5,DE1 红线;密钥仅请求期内存持有)
+        let ssec = crate::sse::parse_customer_headers(req)?;
         let mut engine = self.engine.write();
         let bucket_versioning = engine
             .meta()
@@ -3193,6 +4093,19 @@ impl S3Service {
             .map_err(|e| map_engine_error(e, bucket, ""))?
             .map(|b| b.versioning)
             .unwrap_or_default();
+        // M11 E1-4:会话一致性——key-MD5 与 Create 绑定值逐值比对(AWS:
+        // part 请求头必须与会话一致);会话不存在时跳过,由引擎报
+        // NoSuchUpload。K1-2:SSE-S3 会话标记(响应回显;Complete 零头,
+        // 引擎内部以会话 DEK 解密、新签发对象级 DEK 重加密)
+        let mut sess_sse_s3 = false;
+        let sess = engine
+            .meta()
+            .get_multipart(upload_id)
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        if let Some(sess) = &sess {
+            crate::sse::check_session_sse(sess.sse_key_md5.as_deref(), ssec.as_ref())?;
+            sess_sse_s3 = sess.sse_s3.is_some();
+        }
         // 条件写(ADR-11 D6;AWS 语义:Complete 携带 If-Match/If-None-Match
         // 时对新对象的当前版本判定;引擎写锁内执行,check-then-act 原子)
         if let Some(p) = parse_write_precondition(req)? {
@@ -3201,19 +4114,51 @@ impl S3Service {
                 .map_err(|e| map_engine_error(e, bucket, key))?;
         }
         let meta = engine
-            .complete_multipart(bucket, key, upload_id, parts)
+            .complete_multipart(
+                bucket,
+                key,
+                upload_id,
+                parts,
+                composite.as_ref(),
+                // M11 E1-4:Complete 重加密密钥(D-E4 裁决,见引擎注释)
+                ssec.as_ref().map(|s| &s.key),
+            )
             .map_err(|e| map_engine_error(e, bucket, key))?;
+        // M11 C1-4 门禁:对象带 checksum 时 body 输出 <Checksum{ALG}> 与
+        // <ChecksumType> 元素(AWS 模型:Complete 的 checksum 在响应
+        // body);头部回显保留兼容旧客户端
+        let checksum_body = crate::checksum::object_checksum_value(&meta).map(|(alg, value)| {
+            let elem = format!("Checksum{}", alg.s3_name());
+            let ctype = meta.checksum_type().unwrap().s3_name();
+            (elem, value, ctype)
+        });
         let xml = xml::render_complete_multipart(
             &format!("http://{}/{}/{}", req.host, bucket, key),
             bucket,
             key,
             &format!("\"{}\"", meta.etag_full()),
+            checksum_body
+                .as_ref()
+                .map(|(e, v, c)| (e.as_str(), v.as_str(), *c)),
         );
         let mut headers = vec![
             ("Content-Type".into(), "application/xml".into()),
             ("Content-Length".into(), xml.len().to_string()),
             ("ETag".into(), format!("\"{}\"", meta.etag_full())),
         ];
+        // M11 C1-4:checksum 落值时回显响应头(兼容旧客户端;botocore
+        // 模型读 body 元素,见上)
+        if let Some(h) = crate::checksum::object_response_header(&meta) {
+            headers.push(h);
+        }
+        // M11 E1-4:SSE-C 回显(algorithm + key-MD5 回显请求值,AWS 口径)
+        if let Some(s) = &ssec {
+            headers.extend(crate::sse::response_headers(s));
+        }
+        // M11 K1-2:SSE-S3 会话回显(AWS:Complete 响应回显会话加密算法)
+        if sess_sse_s3 {
+            headers.push(crate::sse::sse_s3_response_header());
+        }
         // V3-5 + V4:x-amz-version-id(Enabled = hex;Suspended = "null";
         // Off 不回)
         if let Some(v) = write_version_id_header(bucket_versioning, &meta) {
@@ -3392,6 +4337,9 @@ impl S3Service {
             }
             Err(e) => return Err(map_engine_error(e, bucket, key)),
         };
+        // partNumber 可满足性先判(AWS 顺序:test_multipart_sse_c_get_part
+        // 对加密对象不带头发越界 partNumber 期望 InvalidPart 而非 SSE 缺头
+        // 的 InvalidRequest——请求形态错误先于加密门控)
         let part_count = meta.parts.len() as u32;
         let (start, length) = if meta.parts.is_empty() {
             // 非 multipart 对象:PartNumber=1 返回整个对象,>1 → InvalidPart
@@ -3407,6 +4355,29 @@ impl S3Service {
             let before: u64 = meta.parts[..part_number as usize - 1].iter().sum();
             (before, meta.parts[part_number as usize - 1])
         };
+        // M11 E1-2/E1-3 + D-E5(SSE-C)/ K1-2(SSE-S3):与 op_get_object
+        // 同口径按 kind 分派(partNumber GET/HEAD 属同一读路径:SSE-C 对象
+        // 缺头 400、错 key 400;SSE-S3 对象零客户头、恒回显 AES256)
+        let ssec = match &meta.sse {
+            Some(sse) if sse.kind == fs3_core::SseKind::SseS3 => {
+                if crate::sse::has_customer_headers(req) {
+                    return Err(S3Error::new(S3ErrorCode::InvalidRequest).with_message(
+                        "The object is SSE-S3 encrypted; SSE-C customer headers are not applicable.",
+                    ));
+                }
+                None
+            }
+            Some(sse) => {
+                let h = crate::sse::parse_customer_headers(req)?.ok_or_else(|| {
+                    S3Error::new(S3ErrorCode::InvalidRequest).with_message(
+                        "The object was stored using a form of Server Side Encryption. The correct parameters must be provided to retrieve the object.",
+                    )
+                })?;
+                crate::sse::check_object_key_md5(sse, &h)?;
+                Some(h)
+            }
+            None => None,
+        };
         let head_only = req.method == "HEAD";
         let mut headers = self.base_headers();
         headers.push(("ETag".into(), format!("\"{}\"", meta.etag_full())));
@@ -3414,6 +4385,31 @@ impl S3Service {
         headers.push(("Content-Type".into(), meta.content_type.clone()));
         headers.push(("Last-Modified".into(), xml::http_date(meta.mtime)));
         headers.push(("Content-Length".into(), length.to_string()));
+        // M11 门禁:分片级 checksum 回显(AWS:partNumber GET/HEAD 返回该
+        // 分片的 checksum 与 checksum-type;非 multipart 对象 PartNumber=1
+        // 回对象级值)
+        let part_ck = if meta.parts.is_empty() {
+            meta.checksum.as_ref()
+        } else {
+            meta.part_checksums
+                .get(part_number as usize - 1)
+                .and_then(|c| c.as_ref())
+        };
+        if let Some(info) = part_ck {
+            headers.push(crate::checksum::response_header(info));
+            let ctype = meta
+                .checksum_type()
+                .unwrap_or_else(|| info.algorithm.default_checksum_type());
+            headers.push(("x-amz-checksum-type".into(), ctype.s3_name().into()));
+        }
+        // M11 E1-2:SSE-C 回显(algorithm + key-MD5 回显请求值)
+        if let Some(s) = &ssec {
+            headers.extend(crate::sse::response_headers(s));
+        }
+        // M11 K1-2:SSE-S3 对象恒回显 AES256(GetObjectPart 同 GET 族)
+        if matches!(&meta.sse, Some(s) if s.kind == fs3_core::SseKind::SseS3) {
+            headers.push(crate::sse::sse_s3_response_header());
+        }
         if length == 0 {
             return Ok(ServiceResponse {
                 status: 200,
@@ -3447,6 +4443,7 @@ impl S3Service {
                 zc_fd,
                 zc_verify,
                 versioning: bkt.versioning,
+                sse_key: ssec.map(|s| s.key),
             },
         })
     }
@@ -3501,17 +4498,28 @@ impl S3Service {
             return Err(S3Error::new(S3ErrorCode::InvalidRequest)
                 .with_message("This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes."));
         }
+        // M11 E1-5(ADR-12 DE3):目标侧与 copy-source 侧 SSE-C 三头解析
+        // (写前校验,非法值显式错误;密钥仅请求期内存持有,随响应构造
+        // 结束 Drop zeroize)
+        let dst_ssec = crate::sse::parse_customer_headers(req)?;
+        let cs_ssec = crate::sse::parse_copy_source_customer_headers(req)?;
         let mut engine = self.engine.write();
-        let dst_versioning = match engine
+        let dst_bkt = match engine
             .meta()
             .get_bucket(bucket)
             .map_err(|e| map_engine_error(e, bucket, ""))?
         {
-            Some(b) => b.versioning,
+            Some(b) => b,
             None => {
                 return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket))
             }
         };
+        let dst_versioning = dst_bkt.versioning;
+        // M11 K1-2/K1-3(DS2/DS3):目标侧 SSE-S3 意愿 = 显式 AES256 头 >
+        // 目标桶默认(SSE-C 头优先,同现显式互斥 400;aws:kms 等非法值已在
+        // 解析内显式拒绝,K1-4)
+        let dst_use_s3 =
+            crate::sse::sse_s3_write_intent(req, dst_ssec.as_ref(), dst_bkt.default_encryption)?;
         if engine
             .meta()
             .get_bucket(&copy_source.bucket)
@@ -3576,6 +4584,43 @@ impl S3Service {
                 }
                 Err(e) => return Err(map_engine_error(e, &copy_source.bucket, &copy_source.key)),
             };
+        // M11 E1-5/K1-3(ADR-12 DE3/DS3)显式错误(不静默):源加密且目标
+        // 未指定加密 → InvalidRequest(防静默解密落盘;**目标桶默认加密在场
+        // = 目标已指定加密**(AWS 口径:copy 未带头时按目标桶默认加密),经
+        // 上方意愿裁决落入 dst_use_s3);源 SSE-C 而 copy-source 侧未给密钥
+        // → InvalidRequest(重加密/同密钥判定必需;源 SSE-S3 由服务端 KEK
+        // 体系自持解包,无客户头语义,携带 SSE-C 源侧头 → 显式拒绝混用)。
+        // 同密钥 COW 直灌、异密钥/跨算法解密重加密、明文源加密写由引擎按
+        // 矩阵执行(见 copy_object_version_for)
+        let dst_encrypted = dst_ssec.is_some() || dst_use_s3;
+        if src_meta.sse.is_some() && !dst_encrypted {
+            return Err(S3Error::new(S3ErrorCode::InvalidRequest).with_message(
+                "The copy source is SSE-C encrypted; the destination of the copy must specify SSE-C encryption.",
+            ));
+        }
+        if matches!(&src_meta.sse, Some(s) if s.kind == fs3_core::SseKind::SseC)
+            && cs_ssec.is_none()
+        {
+            return Err(S3Error::new(S3ErrorCode::InvalidRequest).with_message(
+                "The copy source is SSE-C encrypted; x-amz-copy-source-server-side-encryption-customer-* headers are required.",
+            ));
+        }
+        if matches!(&src_meta.sse, Some(s) if s.kind == fs3_core::SseKind::SseS3)
+            && cs_ssec.is_some()
+        {
+            return Err(S3Error::new(S3ErrorCode::InvalidRequest).with_message(
+                "The copy source is SSE-S3 encrypted; copy-source SSE-C headers are not applicable.",
+            ));
+        }
+        // M11 H1-1(D-E5 对齐到 copy 源侧):copy-source 错 key 早判——请求
+        // key-MD5 与源对象落盘 `SseInfo.key_md5` 校验子比对,不符 → 400
+        // InvalidRequest(与 GET/HEAD 读路径同码同消息;此前由引擎数据路径
+        // GCM 认证失败兜成 500)。上方语义判定已保证:源 SSE-C ⇒ cs_ssec
+        // 在场;check_object_key_md5 按 kind 仅对 SseC 生效(删除标记源
+        // 无 SSE 元数据,天然跳过)。
+        if let (Some(sse), Some(h)) = (&src_meta.sse, &cs_ssec) {
+            crate::sse::check_object_key_md5(sse, h)?;
+        }
         // 复制条件头(412 PreconditionFailed;按所寻址版本判定,§3.4.5)
         if let Some(em) = if_match {
             if !etag_matches(&src_meta.etag_full(), em) {
@@ -3618,6 +4663,23 @@ impl S3Service {
         } else {
             (None, None, None)
         };
+        // M11 K1-1:目标侧 SSE-S3 写密钥签发(当前代 KEK 包裹;COW 臂
+        // 同代直灌继承、异代元数据级重包裹,见引擎矩阵注释)
+        let s3_key = if dst_use_s3 {
+            Some(
+                engine
+                    .sse_s3_mint_write_key()
+                    .map_err(|e| map_engine_error(e, bucket, key))?,
+            )
+        } else {
+            None
+        };
+        let dst_wk = match (&dst_ssec, &s3_key) {
+            (Some(s), None) => Some(fs3_core::SseWriteKey::SseC(&s.key)),
+            (None, Some(w)) => Some(fs3_core::SseWriteKey::SseS3(w)),
+            (None, None) => None,
+            (Some(_), Some(_)) => unreachable!("SSE-C/SSE-S3 互斥已在意愿裁决判定"),
+        };
         let meta = engine
             .copy_object_version_for(
                 &copy_source.bucket,
@@ -3630,6 +4692,9 @@ impl S3Service {
                 rh.as_deref(),
                 replace_tags.as_deref(),
                 dst_versioning,
+                // M11 E1-5:copy-source 侧/目标侧客户密钥(矩阵裁决在引擎)
+                cs_ssec.as_ref().map(|s| &s.key),
+                dst_wk.as_ref(),
             )
             .map_err(|e| map_engine_error(e, &copy_source.bucket, &copy_source.key))?;
         let xml = xml::render_copy_object(&meta.etag_full(), &xml::ts_to_rfc3339(meta.mtime));
@@ -3644,6 +4709,14 @@ impl S3Service {
         }
         if let Some(v) = write_version_id_header(dst_versioning, &meta) {
             headers.push(("x-amz-version-id".into(), v));
+        }
+        // M11 E1-5:目标加密时回显 algorithm + key-MD5(AWS 口径)
+        if let Some(s) = &dst_ssec {
+            headers.extend(crate::sse::response_headers(s));
+        }
+        // M11 K1-2:目标侧 SSE-S3 回显(显式头/目标桶默认生效,恒 AES256)
+        if dst_use_s3 {
+            headers.push(crate::sse::sse_s3_response_header());
         }
         Ok(ServiceResponse {
             status: 200,
@@ -3802,7 +4875,7 @@ impl S3Service {
                     // V6-1 实测:botocore 对该 XML 元素按 RFC 7231 IMF-fixdate
                     // 序列化("Thu, 01 Jan 2015 00:00:00 GMT"),非 ISO8601;
                     // 双格式解析,非法才 400
-                    match parse_iso8601(lm).or_else(|| parse_http_date(lm)) {
+                    match crate::xml::parse_iso8601(lm).or_else(|| parse_http_date(lm)) {
                         Some(ts) => p.if_match_mtime = Some(ts),
                         None => {
                             errors.push((
@@ -4033,6 +5106,73 @@ fn write_version_id_header(
     }
 }
 
+/// M11 L5:x-amz-expiration 响应头(AWS:对象命中 Enabled 过期规则
+/// (Expiration Days/Date)时 PUT/GET/HEAD 回显最早到期时刻与规则 ID;
+/// 多条命中取最早到期;纯 ExpiredObjectDeleteMarker 规则不产生该头)。
+/// 到期时刻与执行器同 DL4 午夜语义(days_deadline);Filter 匹配复用
+/// 执行器同一语义(filter_matches)。规则读取失败按无规则处理——响应
+/// 头缺失优于请求失败(该头为提示性信息,不承载删除语义)。
+fn lifecycle_expiration_header(
+    engine: &Engine,
+    bucket: &str,
+    key: &str,
+    meta: &fs3_core::ObjectMeta,
+) -> Option<(String, String)> {
+    let rules = engine.meta().get_lifecycle_rules(bucket).ok()?;
+    let mut best: Option<(i64, &str)> = None;
+    for r in &rules {
+        if r.status != fs3_core::LifecycleStatus::Enabled {
+            continue;
+        }
+        let Some(exp) = &r.expiration else {
+            continue;
+        };
+        let expiry = match (exp.days, exp.date) {
+            (Some(d), _) => fs3_engine::lifecycle::days_deadline(meta.mtime, d),
+            (None, Some(d)) => d,
+            // 纯 ExpiredObjectDeleteMarker 规则(AWS 同样不回该头)
+            (None, None) => continue,
+        };
+        if !fs3_engine::lifecycle::filter_matches(&r.filter, key, &meta.tags) {
+            continue;
+        }
+        if best.is_none_or(|(t, _)| expiry < t) {
+            best = Some((expiry, r.id.as_str()));
+        }
+    }
+    let (t, id) = best?;
+    Some((
+        "x-amz-expiration".into(),
+        format!("expiry-date=\"{}\", rule-id=\"{}\"", xml::http_date(t), id),
+    ))
+}
+
+/// M11 G-1:GetObject 响应头覆盖(AWS Response Header Overrides:
+/// response-content-type/-language/-expires/-cache-control/
+/// -content-disposition/-content-encoding 查询参数,仅 GetObject 族受理)。
+/// 覆盖 = 替换既有同名响应头(含 PUT 期存储的 Content-Type 与
+/// resp_headers 回显),不追加重复;未携带参数 → 零变化。
+fn apply_response_header_overrides(req: &S3Request, headers: &mut Vec<(String, String)>) {
+    const PAIRS: &[(&str, &str)] = &[
+        ("response-content-type", "Content-Type"),
+        ("response-content-language", "Content-Language"),
+        ("response-expires", "Expires"),
+        ("response-cache-control", "Cache-Control"),
+        ("response-content-disposition", "Content-Disposition"),
+        ("response-content-encoding", "Content-Encoding"),
+    ];
+    for (param, hdr_name) in PAIRS {
+        if let Some((_, v)) = req
+            .query
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(param))
+        {
+            headers.retain(|(k, _)| !k.eq_ignore_ascii_case(hdr_name));
+            headers.push((hdr_name.to_string(), v.clone()));
+        }
+    }
+}
+
 /// 版本化读取命中删除标记的错误渲染(ADR-11 §3.4.3):
 /// 无 versionId → 404 NoSuchKey;带 versionId → 405 MethodNotAllowed;
 /// 均携带 x-amz-delete-marker: true + x-amz-version-id(展示串)。
@@ -4101,53 +5241,66 @@ fn parse_write_precondition(
     Ok(if p.is_empty() { None } else { Some(p) })
 }
 
-/// 解析 ISO8601 时间戳(DeleteObjects 条件元素 LastModifiedTime 的兼容
-/// 格式之一;`YYYY-MM-DDTHH:MM:SS[.fff][Z|±HH:MM]`)→ unix 秒。
-/// 非法 → None(调用方 400)。注:botocore rest-xml 对该元素实测按
-/// RFC 7231 IMF-fixdate 序列化,调用点以 parse_http_date 兜底。
-fn parse_iso8601(s: &str) -> Option<i64> {
-    let s = s.trim();
-    let (date, time) = s
-        .split_once('T')
-        .or_else(|| s.split_once('t'))
-        .or_else(|| s.split_once(' '))?;
-    let dp: Vec<&str> = date.split('-').collect();
-    if dp.len() != 3 {
-        return None;
-    }
-    let year: i64 = dp[0].parse().ok()?;
-    let month: u32 = dp[1].parse().ok()?;
-    let day: u32 = dp[2].parse().ok()?;
-    // 时区后缀:Z / +HH:MM / -HH:MM(小数秒先剥离)
-    let mut time = time;
-    let mut tz_sign = 0i64; // 秒;本地时间 → UTC 的修正量
-    if let Some(t) = time.strip_suffix('Z').or_else(|| time.strip_suffix('z')) {
-        time = t;
-    } else if let Some(i) = time.rfind(['+', '-']) {
-        let off = &time[i..];
-        let (oh, om) = off[1..].split_once(':')?;
-        let secs = oh.parse::<i64>().ok()? * 3600 + om.parse::<i64>().ok()? * 60;
-        tz_sign = if off.starts_with('-') { secs } else { -secs };
-        time = &time[..i];
-    }
-    let time = time.split('.').next().unwrap_or(time);
-    let tp: Vec<&str> = time.split(':').collect();
-    if tp.len() != 3 {
-        return None;
-    }
-    let h: i64 = tp[0].parse().ok()?;
-    let mi: i64 = tp[1].parse().ok()?;
-    let sec: i64 = tp[2].parse().ok()?;
-    let days = auth::days_from_civil_pub(year, month, day);
-    Some(days * 86400 + h * 3600 + mi * 60 + sec + tz_sign)
-}
-
+/// DeleteObjects 条件元素 LastModifiedTime 的解析已迁至 `xml::parse_iso8601`
+/// (M11 L1 与生命周期 Expiration Date 共用)。
 fn user_meta(req: &S3Request) -> Vec<(String, String)> {
     req.headers
         .iter()
         .filter(|(k, _)| k.starts_with("x-amz-meta-"))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
+}
+
+/// M11 H1-1:对象键长上限(AWS:键 UTF-8 字节长 >1024 → 400
+/// KeyTooLongError;此前静默放行,H1-1 错误码触发路径补全)。
+fn check_object_key_length(key: &str) -> Result<(), S3Error> {
+    if key.len() > fs3_core::MAX_OBJECT_KEY_LEN {
+        return Err(S3Error::new(S3ErrorCode::KeyTooLongError));
+    }
+    Ok(())
+}
+
+/// M11 H1-1:用户元数据尺寸上限(AWS:`x-amz-meta-*` 键名+值 UTF-8 字节
+/// 和(含 `x-amz-meta-` 前缀,保守口径)>2KiB → 400 MetadataTooLarge)。
+/// 仅在**实际受理**用户元数据的写路径调用(PutObject 缓冲/流式、
+/// CreateMultipartUpload、CopyObject-REPLACE、PostObject 表单)。
+fn check_user_meta_size(pairs: &[(String, String)]) -> Result<(), S3Error> {
+    let total: usize = pairs.iter().map(|(k, v)| k.len() + v.len()).sum();
+    if total > fs3_core::MAX_USER_META_SIZE {
+        return Err(S3Error::new(S3ErrorCode::MetadataTooLarge));
+    }
+    Ok(())
+}
+
+/// M11 H1-1:缓冲入口(handle_inner)的请求级尺寸上限门控。键长:一切
+/// 地址到键的 op 统一判定(路径键经 `route_op_bucket_key` 提取,桶级/
+/// 服务级 op 键为空串天然放行;copy 两 op 另判 copy-source 键)。元数据:
+/// 仅实际受理 `x-amz-meta-*` 的写 op(PutObject/CreateMultipartUpload/
+/// CopyObject-REPLACE;PostObject 表单键与元数据在 op_post_object 内
+/// 同口径判定,不重复计)。
+fn check_request_size_limits(req: &S3Request, op: &Operation) -> Result<(), S3Error> {
+    let (_, _, _, path_key) = route_op_bucket_key(req);
+    check_object_key_length(&path_key)?;
+    let meta_consumed = match op {
+        Operation::PutObject { .. } | Operation::CreateMultipartUpload { .. } => true,
+        Operation::CopyObject {
+            copy_source,
+            metadata_directive,
+            ..
+        } => {
+            check_object_key_length(&copy_source.key)?;
+            metadata_directive.as_deref() == Some("REPLACE")
+        }
+        Operation::UploadPartCopy { copy_source, .. } => {
+            check_object_key_length(&copy_source.key)?;
+            false
+        }
+        _ => false,
+    };
+    if meta_consumed {
+        check_user_meta_size(&user_meta(req))?;
+    }
+    Ok(())
 }
 
 /// M10 S1:x-amz-tagging 头解析(AWS:URL-encoded `k=v&...`;≤10 标签,
@@ -4464,6 +5617,11 @@ fn route_op_bucket_key(req: &S3Request) -> (fs3_core::metrics::Op, String, Strin
         ("PUT", _, "") if has_q("policy") => (Op::Other, "PutBucketPolicy"),
         ("GET", _, "") if has_q("policy") => (Op::Other, "GetBucketPolicy"),
         ("DELETE", _, "") if has_q("policy") => (Op::Other, "DeleteBucketPolicy"),
+        // M11 L1:生命周期子资源审计名(AWS IAM 动作名无 Bucket 中缀:
+        // s3:{Get,Put,Delete}LifecycleConfiguration)
+        ("PUT", _, "") if has_q("lifecycle") => (Op::Other, "PutLifecycleConfiguration"),
+        ("GET", _, "") if has_q("lifecycle") => (Op::Other, "GetLifecycleConfiguration"),
+        ("DELETE", _, "") if has_q("lifecycle") => (Op::Other, "DeleteLifecycleConfiguration"),
         // M10 V3:版本化子资源审计名
         ("PUT", _, "") if has_q("versioning") => (Op::Other, "PutBucketVersioning"),
         ("GET", _, "") if has_q("versioning") => (Op::Other, "GetBucketVersioning"),
@@ -4474,6 +5632,10 @@ fn route_op_bucket_key(req: &S3Request) -> (fs3_core::metrics::Op, String, Strin
         ("PUT", _, _) if has_q("tagging") => (Op::Put, "PutObjectTagging"),
         ("GET", _, _) if has_q("tagging") => (Op::Get, "GetObjectTagging"),
         ("DELETE", _, _) if has_q("tagging") => (Op::Delete, "DeleteObjectTagging"),
+        // M11 C1-3:GetObjectAttributes 审计/策略名(AWS 动作
+        // s3:GetObjectAttributes;对象级操作——桶级 ?attributes 归列表回退,
+        // 不归此名;须在通配 GET 臂之前)
+        ("GET", _, k) if !k.is_empty() && has_q("attributes") => (Op::Get, "GetObjectAttributes"),
         ("PUT", _, "") => (Op::CreateBucket, "CreateBucket"),
         ("DELETE", _, "") => (Op::DeleteBucket, "DeleteBucket"),
         ("HEAD", _, "") => (Op::Other, "HeadBucket"),
@@ -4524,6 +5686,10 @@ fn map_engine_error(e: CoreError, bucket: &str, key: &str) -> S3Error {
         CoreError::PreconditionFailed(m) => {
             S3Error::new(S3ErrorCode::PreconditionFailed).with_message(m)
         }
+        // checksum 不符(M11 C1-4:Complete 逐分片/复合验算)→ 400 BadDigest
+        CoreError::BadDigest(m) => S3Error::new(S3ErrorCode::BadDigest).with_message(m),
+        // 复合无法合成等请求语义非法(M11 C1-4)→ 400 InvalidRequest
+        CoreError::InvalidRequest(m) => S3Error::new(S3ErrorCode::InvalidRequest).with_message(m),
         // 删除标记命中(未走显式判定的兜底路径;§3.4.3:无 versionId = 404)
         CoreError::DeleteMarker(_) => S3Error::new(S3ErrorCode::NoSuchKey)
             .with_extra("Key", key)
@@ -4705,6 +5871,7 @@ mod tests {
     #[test]
     fn iso8601_parsing() {
         // DeleteObjects 条件元素 LastModifiedTime(botocore rest-xml 形态)
+        use crate::xml::parse_iso8601;
         assert_eq!(parse_iso8601("2024-08-20T12:00:00Z"), Some(1_724_155_200));
         assert_eq!(
             parse_iso8601("2024-08-20T12:00:00.123456Z"),
@@ -4853,16 +6020,16 @@ mod tests {
     #[test]
     fn unimplemented_headers_explicitly_rejected() {
         let (_d, _engine, service) = service_fixture();
-        // A1:SSE 家族 + object-lock + website 重定向 → 501 NotImplemented
-        // (M10 S1:x-amz-tagging 已实现,出表)
+        // A1:SSE-KMS 参数头族 + object-lock + website 重定向 → 501
+        // NotImplemented(M10 S1:x-amz-tagging 已实现,出表;M11 E1-2:
+        // SSE-C 三头已实现单对象链路,出表;M11 K1-2:x-amz-server-side-
+        // encryption 已实现(PutObject/CreateMultipartUpload/CopyObject 受理,
+        // 仅 AES256;KMS 算法值由 sse.rs 显式 400),出表——KMS 参数头族
+        // 保留 501 显式拒绝路径,K1-4 钉住)
         for h in [
-            "x-amz-server-side-encryption",
             "x-amz-server-side-encryption-aws-kms-key-id",
             "x-amz-server-side-encryption-context",
             "x-amz-server-side-encryption-bucket-key-enabled",
-            "x-amz-server-side-encryption-customer-algorithm",
-            "x-amz-server-side-encryption-customer-key",
-            "x-amz-server-side-encryption-customer-key-md5",
             "x-amz-sse-kms-key-id",
             "x-amz-object-lock-mode",
             "x-amz-object-lock-retain-until-date",
@@ -4874,6 +6041,23 @@ mod tests {
             assert_eq!(err.code, S3ErrorCode::NotImplemented, "header {h}");
             assert_eq!(err.status(), 501, "header {h}");
         }
+        // M11 E1-2:SSE-C 三头不再 501(头表检查放行;非法值由 sse.rs
+        // 解析显式拒绝,multipart/copy 由 op 门控显式 501)
+        for h in [
+            "x-amz-server-side-encryption-customer-algorithm",
+            "x-amz-server-side-encryption-customer-key",
+            "x-amz-server-side-encryption-customer-key-md5",
+        ] {
+            let req = headers_req(&[(h, "some-value")]);
+            assert!(
+                service.check_unimplemented_headers(&req).is_ok(),
+                "header {h}"
+            );
+        }
+        // M11 K1-2:SSE-S3 算法头不再 501(头表放行;值合法性与 op 受理
+        // 范围由 sse.rs/门控判定)
+        let s3h = headers_req(&[("x-amz-server-side-encryption", "AES256")]);
+        assert!(service.check_unimplemented_headers(&s3h).is_ok());
         // M10 S1:x-amz-tagging 不再 501(由写路径解析落 ObjectMeta.tags)
         let tagged = headers_req(&[("x-amz-tagging", "k=v")]);
         assert!(service.check_unimplemented_headers(&tagged).is_ok());

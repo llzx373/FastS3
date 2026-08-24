@@ -52,6 +52,14 @@ pub const DEFAULT_IO_RING_DEPTH: u32 = 1024;
 /// 对象大小上限(对齐 AWS:5TiB)。
 pub const MAX_OBJECT_SIZE: u64 = 5 * 1024 * 1024 * 1024 * 1024;
 
+/// 对象键长上限(对齐 AWS:键 UTF-8 字节长 ≤1024;M11 H1-1 起强制,
+/// 超限 → 400 KeyTooLongError)。
+pub const MAX_OBJECT_KEY_LEN: usize = 1024;
+
+/// 用户元数据(`x-amz-meta-*`)总量上限(对齐 AWS:键名+值 UTF-8 字节和
+/// ≤2KiB;M11 H1-1 起强制,超限 → 400 MetadataTooLarge)。
+pub const MAX_USER_META_SIZE: usize = 2 * 1024;
+
 /// multipart:除最后一片外的最小分片大小(对齐 AWS:5MiB)。
 pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 /// multipart:单片大小上限(对齐 AWS:5GiB)。

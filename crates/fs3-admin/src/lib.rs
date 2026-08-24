@@ -18,6 +18,8 @@
 //! - `POST /v1/admin/uploads/{id}/abort`        强制中止会话
 //! - `GET  /v1/admin/audit?limit=`              审计日志
 //! - `POST /v1/admin/repair`                    泄漏扫描修复(C4)
+//! - `POST /v1/admin/sse/rotate`                SSE-S3 KEK 轮换 + 后台重包裹(M11 K1-1)
+//! - `GET  /v1/admin/sse/status`                KEK 代数/轮换时间/重包裹进度(零密钥材料)
 //! - `POST /v1/admin/config/reload`             热重载配置(H3;fs3d 提供回调)
 //! - `WS   /v1/admin/ws?token=`                 实时推送(H3):snapshot 5s/audit 尾随/health/ping
 //!
@@ -81,6 +83,9 @@ pub struct AdminServer {
     config_get: Option<Arc<ConfigGetFn>>,
     /// 设置页应用供应器(空 = PATCH /v1/admin/config 返回 501)。
     config_patch: Option<Arc<ConfigPatchFn>>,
+    /// 生命周期执行器指标(M11 L3-2;worker 启用时由 fs3d 注入,
+    /// None = 未启用,/metrics 相应指标组缺席)。
+    lifecycle_stats: Option<Arc<fs3_engine::lifecycle::LifecycleStats>>,
 }
 
 impl AdminServer {
@@ -92,12 +97,22 @@ impl AdminServer {
             reload: None,
             config_get: None,
             config_patch: None,
+            lifecycle_stats: None,
         }
     }
 
     /// 注入配置热重载回调(H3)。
     pub fn with_reload(mut self, reload: Option<Arc<ReloadFn>>) -> Self {
         self.reload = reload;
+        self
+    }
+
+    /// 注入生命周期执行器指标(M11 L3-2;/metrics 渲染 fasts3_lifecycle_*)。
+    pub fn with_lifecycle_stats(
+        mut self,
+        stats: Option<Arc<fs3_engine::lifecycle::LifecycleStats>>,
+    ) -> Self {
+        self.lifecycle_stats = stats;
         self
     }
 
@@ -183,6 +198,7 @@ impl AdminServer {
             reload: self.reload.clone(),
             config_get: self.config_get.clone(),
             config_patch: self.config_patch.clone(),
+            lifecycle_stats: self.lifecycle_stats.clone(),
         })
     }
 
@@ -420,11 +436,72 @@ impl AdminServer {
             ("PATCH", ["config"]) => self.handle_config_patch(body),
             ("POST", ["repair"]) => self.handle_repair(),
             ("POST", ["config", "reload"]) => self.handle_config_reload(),
+            // M11 K1-1(ADR-12 DS1):SSE-S3 KEK 轮换与状态(零密钥材料:
+            // 只暴露代数/时间戳/重包裹进度,红线)
+            ("POST", ["sse", "rotate"]) => self.handle_sse_rotate(),
+            ("GET", ["sse", "status"]) => self.handle_sse_status(),
             _ => json::err(StatusCode::NOT_FOUND, "not_found", "unknown admin endpoint"),
         }
     }
 
     // ─────────────────────────── handlers ───────────────────────────
+
+    /// M11 K1-1(ADR-12 DS1):SSE-S3 KEK 轮换——gen+1 持久化,随后起后台
+    /// 重包裹线程(幂等:已在跑则复用本轮;重包裹完成前旧代对象恒可读,
+    /// 全部历史代 KEK 由 seed 确定性派生)。**永不出明文**:响应只含代数
+    /// 与时间戳。
+    fn handle_sse_rotate(&self) -> Response<String> {
+        let engine = self.engine.write();
+        match engine.sse_s3_rotate_kek() {
+            Ok(st) => {
+                let spawned = engine.spawn_sse_s3_rewrap();
+                json::ok(serde_json::json!({
+                    "gen": st.gen,
+                    "last_rotated_at": st.last_rotated_at,
+                    "rewrap_done_gen": st.rewrap_done_gen,
+                    "rewrap": if spawned { "started" } else { "already_running" },
+                }))
+            }
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    /// M11 K1-1:SSE-S3 KEK 状态(当前代/末次轮换时间/重包裹进度;
+    /// 零密钥材料,红线)。
+    fn handle_sse_status(&self) -> Response<String> {
+        let engine = self.engine.read();
+        match engine.sse_s3_kek_state() {
+            Ok(st) => {
+                let p = engine.sse_s3_rewrap_progress();
+                let p = p.lock().unwrap();
+                json::ok(serde_json::json!({
+                    "gen": st.gen,
+                    "last_rotated_at": st.last_rotated_at,
+                    "rewrap_done_gen": st.rewrap_done_gen,
+                    "rewrap_pending": st.gen > st.rewrap_done_gen,
+                    "rewrap": {
+                        "running": p.running,
+                        "target_gen": p.target_gen,
+                        "scanned": p.scanned,
+                        "rewrapped": p.rewrapped,
+                        "errors": p.errors,
+                        "started_at": p.started_at,
+                        "finished_at": p.finished_at,
+                        "last_error": p.last_error,
+                    },
+                }))
+            }
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
 
     fn handle_status(&self) -> Response<String> {
         let engine = self.engine.read();
@@ -510,6 +587,14 @@ impl AdminServer {
             "fasts3_alloc_live_bytes {}\n",
             engine.allocator().live_bytes_total()
         ));
+        // M11 E1-3(ADR-12 DE1):SSE 对象读路径解密过 CPU(失零拷贝),
+        // 按字节计解密量指标
+        text.push_str("# HELP fasts3_sse_decrypt_bytes_total Bytes decrypted on SSE-C read path\n");
+        text.push_str("# TYPE fasts3_sse_decrypt_bytes_total counter\n");
+        text.push_str(&format!(
+            "fasts3_sse_decrypt_bytes_total {}\n",
+            engine.sse_decrypt_bytes()
+        ));
         // REVIEW §3.7:掉盘降级状态入 Prometheus(1 = degraded / 只读),
         // 供 alerts.yml FastS3DeviceDegraded 直接告警(替换原恒假占位表达式)。
         text.push_str("# HELP fasts3_device_degraded Device degraded (read-only); 1 = degraded\n");
@@ -518,6 +603,48 @@ impl AdminServer {
             "fasts3_device_degraded {}\n",
             if engine.degraded() { 1 } else { 0 }
         ));
+        // M11 L3-2(ADR-12 DL5):生命周期执行器指标;worker 启用时由 fs3d
+        // 注入(未启用 = 指标组缺席,告警规则按「缺席即未启用」口径处理)。
+        // 删除计数/字节为累计值;last_cycle_timestamp 供停滞告警(超 2 个
+        // 周期未运行 → FastS3LifecycleStalled,见 deploy/grafana/alerts.yml)。
+        if let Some(stats) = &self.lifecycle_stats {
+            let s = stats.snapshot();
+            text.push_str(
+                "# HELP fasts3_lifecycle_cycles_total Lifecycle executor cycles completed\n",
+            );
+            text.push_str("# TYPE fasts3_lifecycle_cycles_total counter\n");
+            text.push_str(&format!("fasts3_lifecycle_cycles_total {}\n", s.cycles));
+            text.push_str("# HELP fasts3_lifecycle_deleted_objects_total Objects deleted by lifecycle rules\n");
+            text.push_str("# TYPE fasts3_lifecycle_deleted_objects_total counter\n");
+            text.push_str(&format!(
+                "fasts3_lifecycle_deleted_objects_total {}\n",
+                s.deleted_objects
+            ));
+            text.push_str("# HELP fasts3_lifecycle_deleted_bytes_total Bytes reclaimed by lifecycle deletions\n");
+            text.push_str("# TYPE fasts3_lifecycle_deleted_bytes_total counter\n");
+            text.push_str(&format!(
+                "fasts3_lifecycle_deleted_bytes_total {}\n",
+                s.deleted_bytes
+            ));
+            text.push_str("# HELP fasts3_lifecycle_aborted_uploads_total Multipart uploads aborted by lifecycle rules\n");
+            text.push_str("# TYPE fasts3_lifecycle_aborted_uploads_total counter\n");
+            text.push_str(&format!(
+                "fasts3_lifecycle_aborted_uploads_total {}\n",
+                s.aborted_uploads
+            ));
+            text.push_str("# HELP fasts3_lifecycle_skipped_locked_total Lifecycle deletions skipped due to object lock (reserved)\n");
+            text.push_str("# TYPE fasts3_lifecycle_skipped_locked_total counter\n");
+            text.push_str(&format!(
+                "fasts3_lifecycle_skipped_locked_total {}\n",
+                s.skipped_locked
+            ));
+            text.push_str("# HELP fasts3_lifecycle_last_cycle_timestamp Unix time of last completed lifecycle cycle (0 = never)\n");
+            text.push_str("# TYPE fasts3_lifecycle_last_cycle_timestamp gauge\n");
+            text.push_str(&format!(
+                "fasts3_lifecycle_last_cycle_timestamp {}\n",
+                s.last_cycle_at
+            ));
+        }
         Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/plain; version=0.0.4")

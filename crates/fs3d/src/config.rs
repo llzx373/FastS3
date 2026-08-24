@@ -15,6 +15,20 @@ pub struct RootConfig {
     pub admin: AdminConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
+    #[serde(default)]
+    pub audit: AuditConfig,
+}
+
+/// 审计配置(M11 L3-1;ADR-12 DL5 `s:audit` 持久化环形)。
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+pub struct AuditConfig {
+    /// 审计持久化开关(默认 true):push 同步落 `s:audit` 环形(同步小写,
+    /// 组提交口径),serve 启动回放重建内存检索面(/v1/admin/audit 零变化);
+    /// false = 纯内存现状(重启即清空)。只读引擎(read_only)强制回退内存。
+    pub persist: Option<bool>,
+    /// 磁盘条数上限(默认 100_000;超上限 + slack 批量截断删最旧)。
+    /// 与内存环形容量(4096,检索面)相互独立。
+    pub max_entries: Option<usize>,
 }
 
 /// 限额与抗滥用(H4,DESIGN §9「限额与抗滥用」)。
@@ -94,6 +108,12 @@ pub struct StorageConfig {
     /// 压缩迁移与大对象流式读存在已跟踪并发竞态(见 tests/s3-tests/README.md
     /// 「运行」节),门禁环境关闭;生产保持默认。
     pub compaction_enabled: Option<bool>,
+    /// 生命周期执行器开关(M11 L2-2;默认 true)。周期扫描有生命周期规则的
+    /// 桶执行过期删除/会话中止;无规则桶零动作(现状不变)。
+    pub lifecycle_enabled: Option<bool>,
+    /// 生命周期执行周期秒数(M11 L2-2;默认 86400 = 24h,ADR-12 DL3 全量
+    /// 扫描口径;可配小周期供测试/演练)。
+    pub lifecycle_interval_secs: Option<u64>,
 }
 
 pub fn load_config(path: Option<&Path>) -> Result<RootConfig> {
@@ -165,5 +185,19 @@ mod tests {
         assert_eq!(parse_size("1GiB").unwrap(), 1024 * 1024 * 1024);
         assert!(parse_size("").is_err());
         assert!(parse_size("xx").is_err());
+    }
+
+    /// M11 L3-1:[audit] 段解析(缺省 = None,消费侧 unwrap_or 默认值)。
+    #[test]
+    fn audit_config_parse() {
+        let cfg: RootConfig = toml::from_str("[storage]\ndevices=[\"/d\"]\n").unwrap();
+        assert!(cfg.audit.persist.is_none());
+        assert!(cfg.audit.max_entries.is_none());
+        let cfg: RootConfig = toml::from_str(
+            "[storage]\ndevices=[\"/d\"]\n[audit]\npersist=false\nmax_entries=1000\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.audit.persist, Some(false));
+        assert_eq!(cfg.audit.max_entries, Some(1000));
     }
 }

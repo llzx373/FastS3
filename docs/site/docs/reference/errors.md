@@ -35,6 +35,7 @@ AWS 客户端按规范映射。
 | `InvalidRange` | 416 | Range 越界(带 `x-amz-actual-object-size`;多段 Range → 206 multipart/byteranges) |
 | `XAmzContentSHA256Mismatch` | 400 | `x-amz-content-sha256` 声明与实际载荷不符(M9;BadDigest 仅用于 Content-MD5) |
 | `InvalidStorageClass` | 400 | `x-amz-storage-class` 非 STANDARD(M9 显式拒绝,不静默) |
+| `KeyTooLongError` / `MetadataTooLarge` | 400 | 对象键 >1024 字节 / `x-amz-meta-*` 总量 >2KiB(M11 H1-1 起强制,AWS 上限口径) |
 | `PreconditionFailed` | 412 | 条件头(If-Match 等)失败 |
 | `NotModified` | 304 | If-None-Match 命中 |
 | `NoSuchVersion` | 404 | `VersionId` 不存在(版本控制未启用) |

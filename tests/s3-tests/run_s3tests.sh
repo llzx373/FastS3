@@ -7,7 +7,7 @@
 #   任何落在排除集之外的失败 = 未预期的兼容缺陷 → gate 失败(需修复)。
 #   这样「支持子集 100%」= 排除集之外的测试 100% 通过,且新缺陷必然暴露。
 #
-# 说明:排除集为路线图未排期特性(v1.1 版本 / v1.2 加密·CRC / v1.3 合规 /
+# 说明:排除集为路线图未排期特性(v1.1 版本 / v1.2 加密·生命周期 / v1.3 合规 /
 # 依赖桶策略的用例 / ACL 全矩阵 / 新 ownership 语义 / 日志中继等)。
 # 排除依据与版本映射见 README.md。
 #
@@ -26,11 +26,14 @@ trap 'rm -f "$OUT"' EXIT
 [ -d "$S3TESTS" ] || { echo "s3-tests not found: set S3TESTS_DIR"; exit 2; }
 
 # ── 文档化排除集 ──
-# ① 路线图未排期特性(README 排除矩阵):加密/生命周期/日志/
+# ① 路线图未排期特性(README 排除矩阵):日志/
 #    通知/复制/ACL 全矩阵/block-public/account 等
 #    (M10 S5 出集:Tagging/CORS/桶策略/POST 表单/ownership 纯配置族已交付并移出,
 #     gate 服务按 README「运行」节带 --allow-anonymous;
-#     M10 V6-1 出集:Versioning/条件写族已交付并移出)
+#     M10 V6-1 出集:Versioning/条件写族已交付并移出;
+#     M11 C 出集:checksum/GetObjectAttributes 族;
+#     M11 G-1 出集:encryption/sse(SSE-C/SSE-S3/桶加密)/copy_enc/copy_part_enc/
+#     lifecycle/encrypted_transfer 族,残余逐名见 ⑦)
 # ② v0.5.x 已知开放兼容项残余(README「已知开放项」公开跟踪,非静默丢弃;
 #    M9 已关闭 fetch-owner/encoding-type=url/unicode 元数据/Cache-Control·Expires 回显/
 #    x-amz-expires 越界/DeleteObjects 键数上限/bucket 重建属性/chunked+content-encoding 并出集;
@@ -59,10 +62,51 @@ trap 'rm -f "$OUT"' EXIT
 #    'false' = RGW 口径)|delete_object_current_if_match( -|$)(锚定:仅精确名;
 #    版本化桶 DELETE 不存在键插入删除标记 = AWS 口径,用例按目录桶/RGW 口径
 #    断言无标记;fails_on_aws 族;last_modified_time/size 变体已通过不误放)|
-#    delete_marker_expiration(依赖 PutBucketLifecycle 501,lifecycle 行)|
-#    multipart_copy_versioned(UploadPartCopy 源 versionId 显式 501 红线)|
-#    versioned_object_attributes(GetObjectAttributes 显式 501,checksum 族 v1.2)
-EXCLUDE='encryption|sse|kms|lifecycle|object_lock|objectlock|legal|retention|governance|website|logging|notification|replication|requester_pays|public_access|block_public|account_|bucket_acl|put_bucket_acl|get_bucket_acl|checksum|use_cksum|get_object_attributes|copy_enc|copy_part_enc|tenant|request_payment|expected_bucket_owner|bucket_create_exists|head_extended|access_bucket|torrent|object_manifest|head_bucket_usage|multipart_upload_owner|_objects_anonymous|anon_put_write_access|not_owned|encrypted_transfer|multipart_resend_first_finishes_last|special_key_names|object_acl|canned|header_acl|public_block|ignore_public|multipart_object_attributes|bucket_owner|object_writer|raw_get_object_acl|_v2|existing_tag|request_obj_tag|put_obj_grant|s3_noenc|copy_source|IfExists|policy_acl|put_obj_acl|policy_multipart|policy_upload_part_copy|404_with_policy|policy_status|anonymous_request|success_code|put_acl|return_version_id|delete_marker_nonversioned|delete_object_current_if_match( -|$)|delete_marker_expiration|multipart_copy_versioned|versioned_object_attributes'
+#    multipart_copy_versioned(UploadPartCopy 源 versionId 显式 501 红线);
+#    delete_marker_expiration 已并入 ⑦ lifecycle 逐名残余(M11 L2 执行器交付后
+#    该用例为时间墙残余,非执行缺失)
+# ⑥ M11 C 补充(2026-08-24,checksum/GetObjectAttributes 族出集):
+#    M11 C1-1~C1-4 交付五算法(CRC32/CRC32C/SHA1/SHA256/CRC64NVME)header+trailer
+#    验算、x-amz-decoded-content-length 强制对照、GetObjectAttributes(GET ?attributes)、
+#    multipart 分片校验 + CompositeChecksum(-N)验算;移除 token:
+#    checksum|use_cksum|get_object_attributes|multipart_object_attributes|
+#    versioned_object_attributes(SSE-C 组合用例
+#    test_get_sse_c_encrypted_object_attributes 已于 G-1 随 E1 出集转绿)
+# ⑦ M11 G-1 补充(2026-08-24,encryption/sse/copy_enc/lifecycle 族出集,
+#    全量 gate 两轮 0 意外;实测记录见 README「M11 G-1 实测记录」):
+#    移除 token:encryption|sse|lifecycle|copy_enc|copy_part_enc|encrypted_transfer|
+#    delete_marker_expiration(族交付:E1 SSE-C/K1 SSE-S3+桶默认/L1~L5 生命周期);
+#    kms 恒留(DS4 SSE-KMS 显式拒绝,族恒排除)。保留逐名残余(全部文档化):
+#    - sse_c_post_object_authenticated_request(DE4 裁决:POST 表单不支持
+#      SSE-C,显式 400;用例期望 204 = RGW 口径)
+#    - sse_c_enforced_with_bucket_policy|sse_c_deny_algo_with_bucket_policy|
+#      incorrect_algo_sse_s3(桶策略 Condition 超集——Null/StringNotEquals ×
+#      sse 键,显式 MalformedPolicy 红线,与 ④ Condition 超集行同类)
+#    - copy_enc\[sse-c-unencrypted|copy_part_enc\[sse-c-unencrypted|
+#      copy_enc\[sse-s3-unencrypted|copy_part_enc\[sse-s3-unencrypted
+#      (10 例,DE3 裁决:加密源 → 目标未指定加密 = 显式 400 InvalidRequest
+#      红线;用例期望复制成功 = RGW 口径)
+#    - 宽 token 误掩发现(旧 sse token 子串命中 "AssertionError" 致 3 例
+#      核心用例长期被静默排除;G-1 收窄后暴露,逐名裁决):
+#      test_bucket_list_unordered( -|$)|test_bucket_listv2_unordered( -|$)
+#      (RGW 专有 allow-unordered 参数语义,fails_on_aws 族;FastS3 与 AWS
+#      同口径忽略未知查询参数 → delimiter 列表正常,用例期望 400 不成立)|
+#      test_100_continue( -|$)(用例后半依赖 put_bucket_acl public-read-write
+#      = ACL 全矩阵远期 501 恒排;附带 100-continue 先于认证应答的次序
+#      差异,单独修次序整例亦不可绿)
+#    - lifecycle 逐名 15(锚定 ( -|$) 精确名;时间墙 11 = DL4 午夜语义需真实
+#      跨天/fails_on_aws 族,botocore 版本漂移 2 = set_invalid_date×2,
+#      ObjectSize* 显式 501 未排期 2;逐名清单与理由见 README 排除矩阵
+#      lifecycle 行):test_lifecycle_expiration( -|$)|test_lifecyclev2_expiration( -|$)|
+#      test_lifecycle_expiration_tags1( -|$)|test_lifecycle_expiration_tags2( -|$)|
+#      test_lifecycle_expiration_versioned_tags2( -|$)|
+#      test_lifecycle_expiration_noncur_tags1( -|$)|test_lifecycle_noncur_expiration( -|$)|
+#      test_lifecycle_deletemarker_expiration( -|$)|
+#      test_lifecycle_deletemarker_expiration_with_days_tag( -|$)|
+#      test_lifecycle_multipart_expiration( -|$)|test_delete_marker_expiration( -|$)|
+#      test_lifecycle_set_invalid_date( -|$)|test_lifecycle_transition_set_invalid_date( -|$)|
+#      test_lifecycle_expiration_size_gt( -|$)|test_lifecycle_expiration_size_lt( -|$)
+EXCLUDE='kms|sse_c_post_object_authenticated_request|sse_c_enforced_with_bucket_policy|sse_c_deny_algo_with_bucket_policy|incorrect_algo_sse_s3|test_bucket_list_unordered( -|$)|test_bucket_listv2_unordered( -|$)|test_100_continue( -|$)|test_lifecycle_expiration( -|$)|test_lifecyclev2_expiration( -|$)|test_lifecycle_expiration_tags1( -|$)|test_lifecycle_expiration_tags2( -|$)|test_lifecycle_expiration_versioned_tags2( -|$)|test_lifecycle_expiration_noncur_tags1( -|$)|test_lifecycle_noncur_expiration( -|$)|test_lifecycle_deletemarker_expiration( -|$)|test_lifecycle_deletemarker_expiration_with_days_tag( -|$)|test_lifecycle_multipart_expiration( -|$)|test_delete_marker_expiration( -|$)|test_lifecycle_set_invalid_date( -|$)|test_lifecycle_transition_set_invalid_date( -|$)|test_lifecycle_expiration_size_gt( -|$)|test_lifecycle_expiration_size_lt( -|$)|object_lock|objectlock|legal|retention|governance|website|logging|notification|replication|requester_pays|public_access|block_public|account_|bucket_acl|put_bucket_acl|get_bucket_acl|copy_enc\[sse-c-unencrypted|copy_part_enc\[sse-c-unencrypted|copy_enc\[sse-s3-unencrypted|copy_part_enc\[sse-s3-unencrypted|tenant|request_payment|expected_bucket_owner|bucket_create_exists|head_extended|access_bucket|torrent|object_manifest|head_bucket_usage|multipart_upload_owner|_objects_anonymous|anon_put_write_access|not_owned|multipart_resend_first_finishes_last|special_key_names|object_acl|canned|header_acl|public_block|ignore_public|bucket_owner|object_writer|raw_get_object_acl|_v2|existing_tag|request_obj_tag|put_obj_grant|s3_noenc|copy_source|IfExists|policy_acl|put_obj_acl|policy_multipart|policy_upload_part_copy|404_with_policy|policy_status|anonymous_request|success_code|put_acl|return_version_id|delete_marker_nonversioned|delete_object_current_if_match( -|$)|multipart_copy_versioned'
 
 cd "$S3TESTS" && S3TEST_CONF="$CONF" python3 -m pytest s3tests/functional/test_s3.py -q --tb=no > "$OUT" 2>&1
 TOTAL=$?

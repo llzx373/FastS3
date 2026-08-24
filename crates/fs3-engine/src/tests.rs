@@ -38,6 +38,15 @@ fn open_engine(cfg: &EngineConfig) -> Engine {
     e
 }
 
+/// CompletePart 便捷构造(M11 C1-4;无逐分片 checksum 声明)。
+fn cp(part_number: u32, etag_hex: String) -> CompletePart {
+    CompletePart {
+        part_number,
+        etag_hex,
+        checksum: None,
+    }
+}
+
 /// 确定性伪随机数据(种子区分内容)。
 fn rnd(len: usize, seed: u8) -> Vec<u8> {
     (0..len as u32)
@@ -203,6 +212,13 @@ fn recovery_without_close_resumes_open_extent() {
     e.get_to("b1", "b", 0..u64::MAX, &mut out).unwrap();
     assert_eq!(out, vec![7u8; 100_000]);
     assert_eq!(e.allocator().allocated_count(), 1, "续写不新开 extent");
+    // 恢复水位必须为 4KiB 对齐物理端点(段长记实际字节,尾垫补零):
+    // 300_000 的非对齐逻辑端点 → 续写段起点 = align_up(300_000, 4KiB);
+    // 非对齐恢复水位会让 O_DIRECT 追加 EINVAL(ext4/xfs;tmpfs 不强制)。
+    let segs = &e.meta().get_object("b1", "b").unwrap().unwrap().extents;
+    assert_eq!(segs.len(), 1);
+    assert_eq!(segs[0].offset % 4096, 0, "续写段起点必须 4KiB 对齐");
+    assert_eq!(segs[0].offset, 303_104, "align_up(300_000, 4KiB)");
     e.close().unwrap();
 }
 
@@ -371,6 +387,8 @@ fn inline_with_meta_headers() {
             vec![("cache-control".into(), "max-age=60".into())],
             vec![],
             None,
+            None,
+            None,
         )
         .unwrap();
     assert_eq!(m.content_type, "text/plain");
@@ -379,6 +397,74 @@ fn inline_with_meta_headers() {
         m.resp_headers,
         vec![("cache-control".into(), "max-age=60".into())]
     );
+    e.close().unwrap();
+}
+
+/// M11 C1-2:声明 checksum 算法时引擎边写边算并落 ObjectMeta.checksum
+/// (内联 + extent 两条路径);未声明时不算不记。
+#[test]
+fn put_with_checksum_records_inline_and_extent() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+
+    // 内联路径(小对象)
+    let small = rnd(1_000, 7);
+    let m = e
+        .put_with_meta(
+            "b1",
+            "ck-inline",
+            &mut Cursor::new(small.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            Some(ChecksumAlgorithm::Crc32c),
+            None,
+        )
+        .unwrap();
+    let expect = fs3_core::checksum_one_shot(ChecksumAlgorithm::Crc32c, &small);
+    assert_eq!(
+        m.checksum,
+        Some(ChecksumInfo {
+            algorithm: ChecksumAlgorithm::Crc32c,
+            value: expect,
+        })
+    );
+    // 读回元数据同样带值(序列化往返)
+    let got = e.head("b1", "ck-inline").unwrap().unwrap();
+    assert_eq!(got.checksum, m.checksum);
+
+    // extent 路径(> small_object_limit)
+    let big = rnd(200_000, 9);
+    let m = e
+        .put_with_meta(
+            "b1",
+            "ck-extent",
+            &mut Cursor::new(big.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            Some(ChecksumAlgorithm::Sha256),
+            None,
+        )
+        .unwrap();
+    assert!(m.inline.is_none() && !m.extents.is_empty());
+    assert_eq!(
+        m.checksum,
+        Some(ChecksumInfo {
+            algorithm: ChecksumAlgorithm::Sha256,
+            value: fs3_core::checksum_one_shot(ChecksumAlgorithm::Sha256, &big),
+        })
+    );
+
+    // 未声明算法:不算不记(现状零变化)
+    let m = e
+        .put("b1", "ck-none", &mut Cursor::new(rnd(100, 1)))
+        .unwrap();
+    assert_eq!(m.checksum, None);
     e.close().unwrap();
 }
 
@@ -407,6 +493,9 @@ fn multipart_upload_complete_roundtrip() {
             vec![("k".into(), "v".into())],
             vec![("content-encoding".into(), "gzip".into())],
             Vec::new(),
+            None,
+            None,
+            None,
         )
         .unwrap();
     assert_eq!(uid.len(), 32);
@@ -414,13 +503,13 @@ fn multipart_upload_complete_roundtrip() {
     // 分片 1:5MiB(内联阈值 32KiB 之上 → extent);分片 2:小内联
     let part1 = vec![0x11u8; 5 * 1024 * 1024];
     let p1 = e
-        .upload_part(&uid, 1, &mut Cursor::new(part1.clone()))
+        .upload_part(&uid, 1, &mut Cursor::new(part1.clone()), None, None)
         .unwrap();
     assert_eq!(p1.size, part1.len() as u64);
     assert!(p1.inline.is_none() && !p1.extents.is_empty());
     let part2 = vec![0x22u8; 1000];
     let p2 = e
-        .upload_part(&uid, 2, &mut Cursor::new(part2.clone()))
+        .upload_part(&uid, 2, &mut Cursor::new(part2.clone()), None, None)
         .unwrap();
     assert!(p2.inline.is_some());
 
@@ -432,7 +521,14 @@ fn multipart_upload_complete_roundtrip() {
 
     // 完成:混合路径(数据组合)
     let m = e
-        .complete_multipart("b1", "big", &uid, &[(1, p1.etag_hex()), (2, p2.etag_hex())])
+        .complete_multipart(
+            "b1",
+            "big",
+            &uid,
+            &[cp(1, p1.etag_hex()), cp(2, p2.etag_hex())],
+            None,
+            None,
+        )
         .unwrap();
     assert_eq!(m.size, (part1.len() + part2.len()) as u64);
     assert_eq!(m.parts, vec![part1.len() as u64, 1000]);
@@ -446,22 +542,580 @@ fn multipart_upload_complete_roundtrip() {
     assert_eq!(&out[part1.len()..], &part2[..]);
     // 二次 Complete 幂等(同 ETag/Size)
     let m2 = e
-        .complete_multipart("b1", "big", &uid, &[(1, p1.etag_hex()), (2, p2.etag_hex())])
+        .complete_multipart(
+            "b1",
+            "big",
+            &uid,
+            &[cp(1, p1.etag_hex()), cp(2, p2.etag_hex())],
+            None,
+            None,
+        )
         .unwrap();
     assert_eq!(m2.etag, m.etag);
     assert_eq!(m2.size, m.size);
 
     // 会话仍在(重传分片可 reactivate)
     let p_new = e
-        .upload_part(&uid, 1, &mut Cursor::new(vec![0x33u8; 100]))
+        .upload_part(&uid, 1, &mut Cursor::new(vec![0x33u8; 100]), None, None)
         .unwrap();
     let m3 = e
-        .complete_multipart("b1", "big", &uid, &[(1, p_new.etag_hex())])
+        .complete_multipart("b1", "big", &uid, &[cp(1, p_new.etag_hex())], None, None)
         .unwrap();
     assert_eq!(m3.size, 100);
     let mut out3 = Vec::new();
     e.get_to("b1", "big", 0..100, &mut out3).unwrap();
     assert_eq!(out3, vec![0x33u8; 100]);
+    e.close().unwrap();
+}
+
+// ─────────────────── M11 C1-4:分片 checksum 落值与 Complete 复合验算 ───────────────────
+
+#[test]
+fn upload_part_stores_checksum_inline_and_extent() {
+    // ADR-12 D-E3:声明算法时引擎边写边算并落 PartMeta.checksum(内联/
+    // extent 两臂);未声明 → None。
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let uid = e
+        .create_multipart(
+            "b1",
+            "k",
+            None,
+            vec![],
+            Vec::new(),
+            vec![],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    // 内联臂(≤ 内联阈值)
+    let small = b"part-inline".to_vec();
+    let p1 = e
+        .upload_part(
+            &uid,
+            1,
+            &mut Cursor::new(small.clone()),
+            Some(ChecksumAlgorithm::Sha256),
+            None,
+        )
+        .unwrap();
+    assert!(p1.inline.is_some());
+    let expect1 = ChecksumInfo {
+        algorithm: ChecksumAlgorithm::Sha256,
+        value: fs3_core::checksum_one_shot(ChecksumAlgorithm::Sha256, &small),
+    };
+    assert_eq!(p1.checksum, Some(expect1.clone()));
+    // extent 臂(> 内联阈值)
+    let big = vec![0x5Au8; 100_000];
+    let p2 = e
+        .upload_part(
+            &uid,
+            2,
+            &mut Cursor::new(big.clone()),
+            Some(ChecksumAlgorithm::Crc32c),
+            None,
+        )
+        .unwrap();
+    assert!(p2.inline.is_none() && !p2.extents.is_empty());
+    let expect2 = ChecksumInfo {
+        algorithm: ChecksumAlgorithm::Crc32c,
+        value: fs3_core::checksum_one_shot(ChecksumAlgorithm::Crc32c, &big),
+    };
+    assert_eq!(p2.checksum, Some(expect2.clone()));
+    // 落盘持久化:list_parts 读回同值
+    let parts = e.list_parts(&uid).unwrap();
+    assert_eq!(parts[0].1.checksum, Some(expect1));
+    assert_eq!(parts[1].1.checksum, Some(expect2));
+    // 未声明算法 → 不算不记
+    let p3 = e
+        .upload_part(&uid, 3, &mut Cursor::new(b"x".to_vec()), None, None)
+        .unwrap();
+    assert_eq!(p3.checksum, None);
+    e.close().unwrap();
+}
+
+/// 构造带逐分片 checksum 声明的 CompletePart(与落盘值一致的正例声明)。
+fn cp_ck(p: &PartMeta, no: u32) -> CompletePart {
+    CompletePart {
+        part_number: no,
+        etag_hex: p.etag_hex(),
+        checksum: p.checksum.clone(),
+    }
+}
+
+/// 复合值 = alg(concat(各分片 checksum 原始字节))(AWS CompositeChecksum)。
+fn composite_of(alg: ChecksumAlgorithm, parts: &[&PartMeta]) -> CompositeChecksum {
+    let mut concat = Vec::new();
+    for p in parts {
+        concat.extend_from_slice(&p.checksum.as_ref().unwrap().value);
+    }
+    CompositeChecksum {
+        algorithm: alg,
+        value: fs3_core::checksum_one_shot(alg, &concat),
+        parts: Some(parts.len() as u32),
+    }
+}
+
+#[test]
+fn complete_multipart_checksum_validation() {
+    // 正例:逐分片声明 + 复合头一致 → 复合值落 ObjectMeta.checksum,
+    // 逐分片落 part_checksums(混合臂:extent + 内联);反例逐一断言
+    // (验算失败在写路径之前,分片/会话原样保留,可重试)。
+    // 算法取 Sha256:默认类型 COMPOSITE(AWS 口径;CRC 族默认 FULL_OBJECT,
+    // 见 complete_multipart_full_object_* 测试)。
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let alg = ChecksumAlgorithm::Sha256;
+    let uid = e
+        .create_multipart(
+            "b1",
+            "k",
+            None,
+            vec![],
+            Vec::new(),
+            vec![],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    let d1 = vec![0x11u8; 5 * 1024 * 1024];
+    let d2 = vec![0x22u8; 1000];
+    let p1 = e
+        .upload_part(&uid, 1, &mut Cursor::new(d1), Some(alg), None)
+        .unwrap();
+    let p2 = e
+        .upload_part(&uid, 2, &mut Cursor::new(d2), Some(alg), None)
+        .unwrap();
+    let good = composite_of(alg, &[&p1, &p2]);
+
+    // 反例 1:逐分片声明值与落盘不符 → BadDigest
+    let mut bad_part = cp_ck(&p1, 1);
+    bad_part.checksum = Some(ChecksumInfo {
+        algorithm: alg,
+        value: vec![0u8; 32],
+    });
+    let r = e.complete_multipart(
+        "b1",
+        "k",
+        &uid,
+        &[bad_part, cp_ck(&p2, 2)],
+        Some(&good),
+        None,
+    );
+    assert!(matches!(r, Err(Error::BadDigest(_))), "{r:?}");
+    // 反例 2:逐分片声明算法与落盘不符 → BadDigest
+    let mut bad_alg = cp_ck(&p1, 1);
+    bad_alg.checksum = Some(ChecksumInfo {
+        algorithm: ChecksumAlgorithm::Sha1,
+        value: vec![0u8; 20],
+    });
+    let r = e.complete_multipart("b1", "k", &uid, &[bad_alg, cp_ck(&p2, 2)], None, None);
+    assert!(matches!(r, Err(Error::BadDigest(_))), "{r:?}");
+    // 反例 3:复合值不符 → BadDigest
+    let bad_composite = CompositeChecksum {
+        value: vec![0u8; 32],
+        ..good.clone()
+    };
+    let r = e.complete_multipart(
+        "b1",
+        "k",
+        &uid,
+        &[cp_ck(&p1, 1), cp_ck(&p2, 2)],
+        Some(&bad_composite),
+        None,
+    );
+    assert!(matches!(r, Err(Error::BadDigest(_))), "{r:?}");
+    // 反例 4:复合 -N 分片数不符 → BadDigest
+    let bad_count = CompositeChecksum {
+        parts: Some(3),
+        ..good.clone()
+    };
+    let r = e.complete_multipart(
+        "b1",
+        "k",
+        &uid,
+        &[cp_ck(&p1, 1), cp_ck(&p2, 2)],
+        Some(&bad_count),
+        None,
+    );
+    assert!(matches!(r, Err(Error::BadDigest(_))), "{r:?}");
+    // 反例 5:COMPOSITE 算法给裸值(缺 -N)→ BadDigest(形态不符)
+    let bare = CompositeChecksum {
+        parts: None,
+        ..good.clone()
+    };
+    let r = e.complete_multipart(
+        "b1",
+        "k",
+        &uid,
+        &[cp_ck(&p1, 1), cp_ck(&p2, 2)],
+        Some(&bare),
+        None,
+    );
+    assert!(matches!(r, Err(Error::BadDigest(_))), "{r:?}");
+
+    // 正例(混合臂)
+    let m = e
+        .complete_multipart(
+            "b1",
+            "k",
+            &uid,
+            &[cp_ck(&p1, 1), cp_ck(&p2, 2)],
+            Some(&good),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        m.checksum,
+        Some(ChecksumInfo {
+            algorithm: alg,
+            value: good.value.clone(),
+        })
+    );
+    assert_eq!(
+        m.part_checksums,
+        vec![p1.checksum.clone(), p2.checksum.clone()]
+    );
+    // 对象级读回(GetObjectAttributes ObjectParts 的查询路径)
+    let h = e.head_version("b1", "k", None).unwrap();
+    assert_eq!(h.part_checksums.len(), 2);
+    assert_eq!(h.checksum, m.checksum);
+    e.close().unwrap();
+}
+
+#[test]
+fn complete_multipart_composite_requires_part_checksums() {
+    // 复合头在场但分片无落盘 checksum(或算法不一致)→ InvalidRequest
+    // (AWS 口径:无法复合);逐分片声明落在无 checksum 分片上 → BadDigest。
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let alg = ChecksumAlgorithm::Sha256;
+    let uid = e
+        .create_multipart(
+            "b1",
+            "k",
+            None,
+            vec![],
+            Vec::new(),
+            vec![],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    // part 1 带 checksum(≥5MiB,非最后分片下限);part 2 不带;part 3 带异种算法
+    let p1 = e
+        .upload_part(
+            &uid,
+            1,
+            &mut Cursor::new(vec![1u8; 5 * 1024 * 1024]),
+            Some(alg),
+            None,
+        )
+        .unwrap();
+    let p2 = e
+        .upload_part(&uid, 2, &mut Cursor::new(vec![2u8; 100]), None, None)
+        .unwrap();
+    let p3 = e
+        .upload_part(
+            &uid,
+            3,
+            &mut Cursor::new(vec![3u8; 100]),
+            Some(ChecksumAlgorithm::Crc32c),
+            None,
+        )
+        .unwrap();
+    // 缺 checksum 的分片参与复合 → InvalidRequest
+    let comp = composite_of(alg, &[&p1]); // 值无关,验算在缺片处先失败
+    let r = e.complete_multipart(
+        "b1",
+        "k",
+        &uid,
+        &[cp_ck(&p1, 1), cp(2, p2.etag_hex())],
+        Some(&CompositeChecksum {
+            parts: Some(2),
+            ..comp.clone()
+        }),
+        None,
+    );
+    assert!(matches!(r, Err(Error::InvalidRequest(_))), "{r:?}");
+    // 异种算法分片参与复合 → InvalidRequest
+    let r = e.complete_multipart(
+        "b1",
+        "k",
+        &uid,
+        &[cp_ck(&p1, 1), cp_ck(&p3, 3)],
+        Some(&CompositeChecksum {
+            parts: Some(2),
+            ..comp.clone()
+        }),
+        None,
+    );
+    assert!(matches!(r, Err(Error::InvalidRequest(_))), "{r:?}");
+    // 逐分片声明落在无 checksum 分片上 → BadDigest(声明无法匹配缺失值)
+    let mut declared = cp(2, p2.etag_hex());
+    declared.checksum = Some(ChecksumInfo {
+        algorithm: alg,
+        value: vec![0u8; 32],
+    });
+    let r = e.complete_multipart("b1", "k", &uid, &[cp_ck(&p1, 1), declared], None, None);
+    assert!(matches!(r, Err(Error::BadDigest(_))), "{r:?}");
+    e.close().unwrap();
+}
+
+#[test]
+fn complete_multipart_session_algorithm_auto_compute() {
+    // M11 门禁补强(AWS 口径):Create 声明 x-amz-checksum-algorithm 的会话,
+    // Complete 无任何客户端 checksum 头也由服务端代算对象级 checksum 落值;
+    // 客户端头仅作验算。类型 = 算法默认(Sha256 → COMPOSITE 复合 -N 形态)。
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let alg = ChecksumAlgorithm::Sha256;
+    let uid = e
+        .create_multipart(
+            "b1",
+            "k",
+            None,
+            vec![],
+            Vec::new(),
+            vec![],
+            Some(alg),
+            None,
+            None,
+        )
+        .unwrap();
+    let p1 = e
+        .upload_part(&uid, 1, &mut Cursor::new(vec![7u8; 1000]), Some(alg), None)
+        .unwrap();
+    // 无复合头、无逐分片声明:服务端代算复合值并落对象
+    let m = e
+        .complete_multipart("b1", "k", &uid, &[cp(1, p1.etag_hex())], None, None)
+        .unwrap();
+    let expect = composite_of(alg, &[&p1]);
+    assert_eq!(
+        m.checksum,
+        Some(ChecksumInfo {
+            algorithm: alg,
+            value: expect.value.clone(),
+        })
+    );
+    // 会话算法与客户端复合头算法相左 → InvalidRequest
+    let uid2 = e
+        .create_multipart(
+            "b1",
+            "k2",
+            None,
+            vec![],
+            Vec::new(),
+            vec![],
+            Some(alg),
+            None,
+            None,
+        )
+        .unwrap();
+    let q1 = e
+        .upload_part(&uid2, 1, &mut Cursor::new(vec![7u8; 1000]), Some(alg), None)
+        .unwrap();
+    let clash = CompositeChecksum {
+        algorithm: ChecksumAlgorithm::Crc32,
+        value: vec![0u8; 4],
+        parts: Some(1),
+    };
+    let r = e.complete_multipart("b1", "k2", &uid2, &[cp_ck(&q1, 1)], Some(&clash), None);
+    assert!(matches!(r, Err(Error::InvalidRequest(_))), "{r:?}");
+    e.close().unwrap();
+}
+
+#[test]
+fn complete_multipart_full_object_crc_family() {
+    // FULL_OBJECT(CRC 族默认类型):对象级 checksum = alg(拼接字节流),
+    // 与分片是否带 checksum 无关;客户端裸 base64 头验算,-N 形态拒绝。
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let alg = ChecksumAlgorithm::Crc32c;
+    let uid = e
+        .create_multipart(
+            "b1",
+            "k",
+            None,
+            vec![],
+            Vec::new(),
+            vec![],
+            Some(alg),
+            None,
+            None,
+        )
+        .unwrap();
+    let d1 = vec![0x31u8; 5 * 1024 * 1024];
+    let d2 = vec![0x32u8; 1000];
+    // part1 带 checksum(extent 臂);part2 不带(内联臂)——FULL_OBJECT
+    // 走数据流,不依赖逐分片落值
+    let p1 = e
+        .upload_part(&uid, 1, &mut Cursor::new(d1.clone()), Some(alg), None)
+        .unwrap();
+    let p2 = e
+        .upload_part(&uid, 2, &mut Cursor::new(d2.clone()), None, None)
+        .unwrap();
+    let mut data = d1.clone();
+    data.extend_from_slice(&d2);
+    let full = fs3_core::checksum_one_shot(alg, &data);
+    // -N 形态(FULL_OBJECT 会话)→ BadDigest
+    let dash = CompositeChecksum {
+        algorithm: alg,
+        value: full.clone(),
+        parts: Some(2),
+    };
+    let r = e.complete_multipart(
+        "b1",
+        "k",
+        &uid,
+        &[cp(1, p1.etag_hex()), cp(2, p2.etag_hex())],
+        Some(&dash),
+        None,
+    );
+    assert!(matches!(r, Err(Error::BadDigest(_))), "{r:?}");
+    // 裸值不符 → BadDigest
+    let wrong = CompositeChecksum {
+        algorithm: alg,
+        value: vec![0u8; 4],
+        parts: None,
+    };
+    let r = e.complete_multipart(
+        "b1",
+        "k",
+        &uid,
+        &[cp(1, p1.etag_hex()), cp(2, p2.etag_hex())],
+        Some(&wrong),
+        None,
+    );
+    assert!(matches!(r, Err(Error::BadDigest(_))), "{r:?}");
+    // 裸值正确 → 200(混合臂:extent + 内联)
+    let m = e
+        .complete_multipart(
+            "b1",
+            "k",
+            &uid,
+            &[cp(1, p1.etag_hex()), cp(2, p2.etag_hex())],
+            Some(&CompositeChecksum {
+                algorithm: alg,
+                value: full.clone(),
+                parts: None,
+            }),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        m.checksum,
+        Some(ChecksumInfo {
+            algorithm: alg,
+            value: full,
+        })
+    );
+    e.close().unwrap();
+}
+
+#[test]
+fn complete_multipart_checksum_three_arms() {
+    // 三臂落值:全内联 / 全 extent 均落复合 checksum 与逐分片明细
+    // (混合臂见 complete_multipart_checksum_validation)。
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let alg = ChecksumAlgorithm::Sha256;
+    // 全内联臂(AWS 非最后分片 ≥5MiB 约束下,全内联只可能单片:
+    // 单小分片带 checksum,复合值 = alg(该分片 checksum),-1 形态)
+    let uid = e
+        .create_multipart(
+            "b1",
+            "inl",
+            None,
+            vec![],
+            Vec::new(),
+            vec![],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    let p1 = e
+        .upload_part(&uid, 1, &mut Cursor::new(vec![1u8; 100]), Some(alg), None)
+        .unwrap();
+    let comp = composite_of(alg, &[&p1]);
+    let m = e
+        .complete_multipart("b1", "inl", &uid, &[cp_ck(&p1, 1)], Some(&comp), None)
+        .unwrap();
+    assert!(m.inline.is_some(), "全内联臂");
+    assert_eq!(m.checksum.as_ref().map(|c| &c.value), Some(&comp.value));
+    assert_eq!(m.part_checksums.len(), 1);
+    // 全 extent 臂(大分片,零数据搬运)
+    let uid = e
+        .create_multipart(
+            "b1",
+            "ext",
+            None,
+            vec![],
+            Vec::new(),
+            vec![],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    let p1 = e
+        .upload_part(
+            &uid,
+            1,
+            &mut Cursor::new(vec![3u8; 5 * 1024 * 1024]),
+            Some(alg),
+            None,
+        )
+        .unwrap();
+    let p2 = e
+        .upload_part(
+            &uid,
+            2,
+            &mut Cursor::new(vec![4u8; 5 * 1024 * 1024]),
+            Some(alg),
+            None,
+        )
+        .unwrap();
+    let comp = composite_of(alg, &[&p1, &p2]);
+    let m = e
+        .complete_multipart(
+            "b1",
+            "ext",
+            &uid,
+            &[cp_ck(&p1, 1), cp_ck(&p2, 2)],
+            Some(&comp),
+            None,
+        )
+        .unwrap();
+    assert!(m.inline.is_none() && !m.extents.is_empty(), "全 extent 臂");
+    assert_eq!(m.checksum.as_ref().map(|c| &c.value), Some(&comp.value));
+    assert_eq!(m.part_checksums.len(), 2);
+    // 无 checksum 分片完成(复合头缺席)→ checksum None、part_checksums 空
+    let uid = e
+        .create_multipart(
+            "b1",
+            "plain",
+            None,
+            vec![],
+            Vec::new(),
+            vec![],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    let p = e
+        .upload_part(&uid, 1, &mut Cursor::new(vec![9u8; 10]), None, None)
+        .unwrap();
+    let m = e
+        .complete_multipart("b1", "plain", &uid, &[cp(1, p.etag_hex())], None, None)
+        .unwrap();
+    assert_eq!(m.checksum, None);
+    assert!(m.part_checksums.is_empty());
     e.close().unwrap();
 }
 
@@ -471,18 +1125,30 @@ fn multipart_extent_concat_no_copy() {
     let (_d, cfg) = setup();
     let mut e = open_engine(&cfg);
     let uid = e
-        .create_multipart("b1", "big", None, vec![], Vec::new(), vec![])
+        .create_multipart(
+            "b1",
+            "big",
+            None,
+            vec![],
+            Vec::new(),
+            vec![],
+            None,
+            None,
+            None,
+        )
         .unwrap();
     let mut total_refs = 0usize;
     let mut parts_meta = Vec::new();
     for i in 0..3 {
         let data = vec![i as u8; 5 * 1024 * 1024];
-        let p = e.upload_part(&uid, i + 1, &mut Cursor::new(data)).unwrap();
+        let p = e
+            .upload_part(&uid, i + 1, &mut Cursor::new(data), None, None)
+            .unwrap();
         total_refs += p.extents.len();
-        parts_meta.push((i + 1, p.etag_hex()));
+        parts_meta.push(cp(i + 1, p.etag_hex()));
     }
     let m = e
-        .complete_multipart("b1", "big", &uid, &parts_meta)
+        .complete_multipart("b1", "big", &uid, &parts_meta, None, None)
         .unwrap();
     assert_eq!(m.extents.len(), total_refs);
     assert_eq!(m.size, 15 * 1024 * 1024);
@@ -503,18 +1169,34 @@ fn multipart_parts_pack_with_objects() {
     let (_d, cfg) = setup();
     let mut e = open_engine(&cfg);
     let uid = e
-        .create_multipart("b1", "big", None, vec![], Vec::new(), vec![])
+        .create_multipart(
+            "b1",
+            "big",
+            None,
+            vec![],
+            Vec::new(),
+            vec![],
+            None,
+            None,
+            None,
+        )
         .unwrap();
     // 5MiB 分片:独占整块 + 尾段(1028KiB,开放)
     let p1 = e
-        .upload_part(&uid, 1, &mut Cursor::new(vec![1u8; 5 * 1024 * 1024]))
+        .upload_part(
+            &uid,
+            1,
+            &mut Cursor::new(vec![1u8; 5 * 1024 * 1024]),
+            None,
+            None,
+        )
         .unwrap();
     // 普通对象进入同一开放 extent(打包)
     e.put("b1", "plain", &mut Cursor::new(vec![2u8; 100_000]))
         .unwrap();
     // 末分片(无大小约束)继续打包
     let p2 = e
-        .upload_part(&uid, 2, &mut Cursor::new(vec![3u8; 100_000]))
+        .upload_part(&uid, 2, &mut Cursor::new(vec![3u8; 100_000]), None, None)
         .unwrap();
     let p1_seg = &p1.extents[0];
     let plain_seg = &e.head("b1", "plain").unwrap().unwrap().extents[0];
@@ -527,7 +1209,14 @@ fn multipart_parts_pack_with_objects() {
     assert_eq!(p2_seg.extent_id, plain_seg.extent_id, "末分片继续打包");
 
     let m = e
-        .complete_multipart("b1", "big", &uid, &[(1, p1.etag_hex()), (2, p2.etag_hex())])
+        .complete_multipart(
+            "b1",
+            "big",
+            &uid,
+            &[cp(1, p1.etag_hex()), cp(2, p2.etag_hex())],
+            None,
+            None,
+        )
         .unwrap();
     assert_eq!(m.size, (5 * 1024 * 1024 + 100_000) as u64);
     let mut out = Vec::new();
@@ -546,62 +1235,101 @@ fn multipart_validation_errors() {
     let (_d, cfg) = setup();
     let mut e = open_engine(&cfg);
     let uid = e
-        .create_multipart("b1", "k", None, vec![], Vec::new(), vec![])
+        .create_multipart(
+            "b1",
+            "k",
+            None,
+            vec![],
+            Vec::new(),
+            vec![],
+            None,
+            None,
+            None,
+        )
         .unwrap();
 
     // 未知会话
     assert!(matches!(
-        e.upload_part("nope", 1, &mut Cursor::new(vec![1u8; 10])),
+        e.upload_part("nope", 1, &mut Cursor::new(vec![1u8; 10]), None, None),
         Err(Error::NoSuchUpload(_))
     ));
     assert!(matches!(
-        e.complete_multipart("b1", "k", "nope", &[(1, "x".into())]),
+        e.complete_multipart("b1", "k", "nope", &[cp(1, "x".into())], None, None),
         Err(Error::NoSuchUpload(_))
     ));
     // 分片 ETag 不匹配 → InvalidPart
     let p = e
-        .upload_part(&uid, 1, &mut Cursor::new(vec![0u8; 1]))
+        .upload_part(&uid, 1, &mut Cursor::new(vec![0u8; 1]), None, None)
         .unwrap();
     assert!(matches!(
         e.complete_multipart(
             "b1",
             "k",
             &uid,
-            &[(1, "ffffffffffffffffffffffffffffffff".into())]
+            &[cp(1, "ffffffffffffffffffffffffffffffff".into())],
+            None,
+            None
         ),
         Err(Error::InvalidPart(_))
     ));
     // 列出不存在的分片号 → InvalidPart(s3-tests missing_part)
     let p2 = e
-        .upload_part(&uid, 3, &mut Cursor::new(vec![0u8; 1]))
+        .upload_part(&uid, 3, &mut Cursor::new(vec![0u8; 1]), None, None)
         .unwrap();
     assert!(matches!(
-        e.complete_multipart("b1", "k", &uid, &[(9999, p.etag_hex())]),
+        e.complete_multipart("b1", "k", &uid, &[cp(9999, p.etag_hex())], None, None),
         Err(Error::InvalidPart(_))
     ));
     // 非最后分片 < 5MiB → PartTooSmall(part 1 非最后且 < 5MiB)
     assert!(matches!(
-        e.complete_multipart("b1", "k", &uid, &[(1, p.etag_hex()), (3, p2.etag_hex())]),
+        e.complete_multipart(
+            "b1",
+            "k",
+            &uid,
+            &[cp(1, p.etag_hex()), cp(3, p2.etag_hex())],
+            None,
+            None
+        ),
         Err(Error::PartTooSmall(_))
     ));
     // 乱序 part_no:REVIEW §3.10 后客户端列表必须严格递增 → InvalidPartOrder
     // (此前 BTreeMap 自动排序被静默接受,乱序 + 小分片只能报 PartTooSmall)
     assert!(matches!(
-        e.complete_multipart("b1", "k", &uid, &[(3, p2.etag_hex()), (1, p.etag_hex())]),
+        e.complete_multipart(
+            "b1",
+            "k",
+            &uid,
+            &[cp(3, p2.etag_hex()), cp(1, p.etag_hex())],
+            None,
+            None
+        ),
         Err(Error::InvalidPartOrder(_))
     ));
     // 重复 part_no 同样非严格递增 → InvalidPartOrder
     assert!(matches!(
-        e.complete_multipart("b1", "k", &uid, &[(1, p.etag_hex()), (1, p2.etag_hex())]),
+        e.complete_multipart(
+            "b1",
+            "k",
+            &uid,
+            &[cp(1, p.etag_hex()), cp(1, p2.etag_hex())],
+            None,
+            None
+        ),
         Err(Error::InvalidPartOrder(_))
     ));
     // resend_first_finishes_last 语义:重新上传同一分片号(覆盖)后,
     // complete 列表只含该分片号一次、用新 ETag → 新数据生效
     let big = e
-        .upload_part(&uid, 1, &mut Cursor::new(vec![0x55u8; 5 * 1024 * 1024]))
+        .upload_part(
+            &uid,
+            1,
+            &mut Cursor::new(vec![0x55u8; 5 * 1024 * 1024]),
+            None,
+            None,
+        )
         .unwrap();
     let m = e
-        .complete_multipart("b1", "k", &uid, &[(1, big.etag_hex())])
+        .complete_multipart("b1", "k", &uid, &[cp(1, big.etag_hex())], None, None)
         .unwrap();
     assert_eq!(m.size, 5 * 1024 * 1024);
     let mut out = Vec::new();
@@ -609,7 +1337,7 @@ fn multipart_validation_errors() {
     assert!(out.iter().all(|&b| b == 0x55));
     // 空列表 → InvalidArgument(服务层映射 MalformedXML)
     assert!(matches!(
-        e.complete_multipart("b1", "k", &uid, &[]),
+        e.complete_multipart("b1", "k", &uid, &[], None, None),
         Err(Error::InvalidArgument(_))
     ));
     e.close().unwrap();
@@ -620,10 +1348,26 @@ fn multipart_abort_frees_extents() {
     let (_d, cfg) = setup();
     let mut e = open_engine(&cfg);
     let uid = e
-        .create_multipart("b1", "k", None, vec![], Vec::new(), vec![])
+        .create_multipart(
+            "b1",
+            "k",
+            None,
+            vec![],
+            Vec::new(),
+            vec![],
+            None,
+            None,
+            None,
+        )
         .unwrap();
-    e.upload_part(&uid, 1, &mut Cursor::new(vec![1u8; 5 * 1024 * 1024]))
-        .unwrap();
+    e.upload_part(
+        &uid,
+        1,
+        &mut Cursor::new(vec![1u8; 5 * 1024 * 1024]),
+        None,
+        None,
+    )
+    .unwrap();
     assert!(e.alloc.allocated_count() >= 1);
     e.abort_multipart(&uid).unwrap();
     assert_eq!(e.alloc.allocated_count(), 0);
@@ -698,14 +1442,30 @@ fn multipart_sweep_expired() {
     let (_d, cfg) = setup();
     let mut e = open_engine(&cfg);
     let uid = e
-        .create_multipart("b1", "k", None, vec![], Vec::new(), vec![])
+        .create_multipart(
+            "b1",
+            "k",
+            None,
+            vec![],
+            Vec::new(),
+            vec![],
+            None,
+            None,
+            None,
+        )
         .unwrap();
-    e.upload_part(&uid, 1, &mut Cursor::new(vec![1u8; 5 * 1024 * 1024]))
-        .unwrap();
+    e.upload_part(
+        &uid,
+        1,
+        &mut Cursor::new(vec![1u8; 5 * 1024 * 1024]),
+        None,
+        None,
+    )
+    .unwrap();
     let n = e.sweep_expired_sessions(0).unwrap();
     assert_eq!(n, 1);
     assert!(matches!(
-        e.complete_multipart("b1", "k", &uid, &[]),
+        e.complete_multipart("b1", "k", &uid, &[], None, None),
         Err(Error::NoSuchUpload(_))
     ));
     e.close().unwrap();
@@ -1562,10 +2322,13 @@ fn etag_fast_crc32c_mode() {
             Vec::new(),
             vec![],
             Vec::new(),
+            None,
+            None,
+            None,
         )
         .unwrap();
     let part_data = rnd(16 * 1024, 13);
-    e.upload_part(&upload, 1, &mut Cursor::new(part_data.clone()))
+    e.upload_part(&upload, 1, &mut Cursor::new(part_data.clone()), None, None)
         .unwrap();
     let stored = e.list_parts(&upload).unwrap();
     let (_, pm) = &stored[0];
@@ -1606,20 +2369,42 @@ fn multipart_complete_with_holes_uses_request_subset() {
     let (_d, cfg) = setup();
     let mut e = open_engine(&cfg);
     let uid = e
-        .create_multipart("b1", "sub", None, vec![], Vec::new(), vec![])
+        .create_multipart(
+            "b1",
+            "sub",
+            None,
+            vec![],
+            Vec::new(),
+            vec![],
+            None,
+            None,
+            None,
+        )
         .unwrap();
     // 1 号分片极小(<5MiB,若被检查 EntityTooSmall 必失败;此处刻意不列
     // 入 complete 请求,验证不参与检查)
     let _p1 = e
-        .upload_part(&uid, 1, &mut Cursor::new(vec![0x11u8; 100]))
+        .upload_part(&uid, 1, &mut Cursor::new(vec![0x11u8; 100]), None, None)
         .unwrap();
     // 2 号分片存在但**不**出现在 complete 请求里(5MiB)
     let p2 = e
-        .upload_part(&uid, 2, &mut Cursor::new(vec![0x22u8; 5 * 1024 * 1024]))
+        .upload_part(
+            &uid,
+            2,
+            &mut Cursor::new(vec![0x22u8; 5 * 1024 * 1024]),
+            None,
+            None,
+        )
         .unwrap();
     // 3 号分片 5MiB
     let p3 = e
-        .upload_part(&uid, 3, &mut Cursor::new(vec![0x33u8; 5 * 1024 * 1024]))
+        .upload_part(
+            &uid,
+            3,
+            &mut Cursor::new(vec![0x33u8; 5 * 1024 * 1024]),
+            None,
+            None,
+        )
         .unwrap();
 
     // 只完成 [1, 3]:1 是非末分片但 <5MiB → 按请求子集检查应报 EntityTooSmall
@@ -1627,7 +2412,14 @@ fn multipart_complete_with_holes_uses_request_subset() {
 
     // 先验证正常的空洞场景:完成 [2, 3](1 号未列出、虽然小,但不参与检查)
     let m = e
-        .complete_multipart("b1", "sub", &uid, &[(2, p2.etag_hex()), (3, p3.etag_hex())])
+        .complete_multipart(
+            "b1",
+            "sub",
+            &uid,
+            &[cp(2, p2.etag_hex()), cp(3, p3.etag_hex())],
+            None,
+            None,
+        )
         .unwrap();
     assert_eq!(m.size, 10 * 1024 * 1024, "only parts 2+3 combined");
     assert_eq!(
@@ -1651,15 +2443,38 @@ fn multipart_complete_with_holes_uses_request_subset() {
     // 单独验证 EntityTooSmall 仍对请求内非末分片生效:新会话,完成 [1, 2]
     // 必须先重开(上一个会话已 completed)
     let uid2 = e
-        .create_multipart("b1", "sub2", None, vec![], Vec::new(), vec![])
+        .create_multipart(
+            "b1",
+            "sub2",
+            None,
+            vec![],
+            Vec::new(),
+            vec![],
+            None,
+            None,
+            None,
+        )
         .unwrap();
     let a = e
-        .upload_part(&uid2, 1, &mut Cursor::new(vec![0xAAu8; 100]))
+        .upload_part(&uid2, 1, &mut Cursor::new(vec![0xAAu8; 100]), None, None)
         .unwrap();
     let b = e
-        .upload_part(&uid2, 2, &mut Cursor::new(vec![0xBBu8; 5 * 1024 * 1024]))
+        .upload_part(
+            &uid2,
+            2,
+            &mut Cursor::new(vec![0xBBu8; 5 * 1024 * 1024]),
+            None,
+            None,
+        )
         .unwrap();
-    let r = e.complete_multipart("b1", "sub2", &uid2, &[(1, a.etag_hex()), (2, b.etag_hex())]);
+    let r = e.complete_multipart(
+        "b1",
+        "sub2",
+        &uid2,
+        &[cp(1, a.etag_hex()), cp(2, b.etag_hex())],
+        None,
+        None,
+    );
     assert!(matches!(r, Err(Error::PartTooSmall(_))), "{r:?}");
     e.close().unwrap();
 }
@@ -1882,7 +2697,7 @@ fn off_fast_path_state_aware_reads_equivalent() {
         let n1 = e.read_at_version("b1", key, None, 0, &mut b1).unwrap();
         let mut b2 = vec![0u8; data.len()];
         let n2 = e
-            .read_at_version_for("b1", key, None, 0, &mut b2, VersioningState::Off)
+            .read_at_version_for("b1", key, None, 0, &mut b2, VersioningState::Off, None)
             .unwrap();
         assert_eq!(n1, n2);
         assert_eq!(b1, b2);
@@ -2140,33 +2955,53 @@ fn complete_multipart_lands_new_version() {
     set_versioning(&e, VersioningState::Enabled);
     let p1 = rnd(100_000, 12);
     let uid = e
-        .create_multipart("b1", "mp", None, vec![], Vec::new(), vec![])
+        .create_multipart(
+            "b1",
+            "mp",
+            None,
+            vec![],
+            Vec::new(),
+            vec![],
+            None,
+            None,
+            None,
+        )
         .unwrap();
     let part = e
-        .upload_part(&uid, 1, &mut Cursor::new(p1.clone()))
+        .upload_part(&uid, 1, &mut Cursor::new(p1.clone()), None, None)
         .unwrap();
     let m = e
-        .complete_multipart("b1", "mp", &uid, &[(1, part.etag_hex())])
+        .complete_multipart("b1", "mp", &uid, &[cp(1, part.etag_hex())], None, None)
         .unwrap();
     let v1 = m.version_id.expect("Complete 落新版本");
     assert_eq!(read_all(&e, "b1", "mp"), p1);
     assert_eq!(stats_of(&e), (1, 100_000));
     // 幂等重放:相同 ETag,不重复入账
     let replay = e
-        .complete_multipart("b1", "mp", &uid, &[(1, part.etag_hex())])
+        .complete_multipart("b1", "mp", &uid, &[cp(1, part.etag_hex())], None, None)
         .unwrap();
     assert_eq!(replay.etag, m.etag);
     assert_eq!(stats_of(&e), (1, 100_000));
     // 第二次 Complete(新会话)= 第二个版本;旧版本可读
     let p2 = rnd(120_000, 13);
     let uid2 = e
-        .create_multipart("b1", "mp", None, vec![], Vec::new(), vec![])
+        .create_multipart(
+            "b1",
+            "mp",
+            None,
+            vec![],
+            Vec::new(),
+            vec![],
+            None,
+            None,
+            None,
+        )
         .unwrap();
     let part2 = e
-        .upload_part(&uid2, 1, &mut Cursor::new(p2.clone()))
+        .upload_part(&uid2, 1, &mut Cursor::new(p2.clone()), None, None)
         .unwrap();
     let m3 = e
-        .complete_multipart("b1", "mp", &uid2, &[(1, part2.etag_hex())])
+        .complete_multipart("b1", "mp", &uid2, &[cp(1, part2.etag_hex())], None, None)
         .unwrap();
     assert!(m3.version_id.unwrap() > v1);
     assert_eq!(read_all(&e, "b1", "mp"), p2);
@@ -2176,13 +3011,23 @@ fn complete_multipart_lands_new_version() {
     set_versioning(&e, VersioningState::Suspended);
     let p3 = rnd(80_000, 14);
     let uid3 = e
-        .create_multipart("b1", "mp", None, vec![], Vec::new(), vec![])
+        .create_multipart(
+            "b1",
+            "mp",
+            None,
+            vec![],
+            Vec::new(),
+            vec![],
+            None,
+            None,
+            None,
+        )
         .unwrap();
     let part3 = e
-        .upload_part(&uid3, 1, &mut Cursor::new(p3.clone()))
+        .upload_part(&uid3, 1, &mut Cursor::new(p3.clone()), None, None)
         .unwrap();
     let m4 = e
-        .complete_multipart("b1", "mp", &uid3, &[(1, part3.etag_hex())])
+        .complete_multipart("b1", "mp", &uid3, &[cp(1, part3.etag_hex())], None, None)
         .unwrap();
     assert_eq!(m4.version_id, None, "Suspended Complete 落 null 槽");
     // D1a:null 槽与真实版本同秒时真实版本胜出;确定性拨快 null 槽 mtime,
@@ -2703,6 +3548,8 @@ fn conditional_put_preconditions() {
             vec![],
             vec![],
             Some(&none_match_star()),
+            None,
+            None,
         ),
         Err(Error::PreconditionFailed(_))
     ));
@@ -2716,6 +3563,8 @@ fn conditional_put_preconditions() {
         vec![],
         vec![],
         Some(&none_match_star()),
+        None,
+        None,
     )
     .unwrap();
     // If-Match 命中当前 ETag → 放行;不匹配 → 412
@@ -2732,6 +3581,8 @@ fn conditional_put_preconditions() {
         vec![],
         vec![],
         Some(&if_match_hit()),
+        None,
+        None,
     )
     .unwrap();
     let if_match_miss = || WritePrecondition {
@@ -2748,6 +3599,8 @@ fn conditional_put_preconditions() {
             vec![],
             vec![],
             Some(&if_match_miss()),
+            None,
+            None,
         ),
         Err(Error::PreconditionFailed(_))
     ));
@@ -2762,6 +3615,8 @@ fn conditional_put_preconditions() {
             vec![],
             vec![],
             Some(&if_match_miss()),
+            None,
+            None,
         ),
         Err(Error::NotFound(_))
     ));
@@ -2782,6 +3637,8 @@ fn conditional_put_preconditions() {
             vec![],
             vec![],
             Some(&bad_size),
+            None,
+            None,
         ),
         Err(Error::PreconditionFailed(_))
     ));
@@ -2800,6 +3657,8 @@ fn conditional_put_preconditions() {
         vec![],
         vec![],
         Some(&good_combo),
+        None,
+        None,
     )
     .unwrap();
     // Enabled 桶:判定对 D1a 当前版本执行(与 Off 同语义)
@@ -2814,6 +3673,8 @@ fn conditional_put_preconditions() {
             vec![],
             vec![],
             Some(&none_match_star()),
+            None,
+            None,
         ),
         Err(Error::PreconditionFailed(_))
     ));
@@ -2828,6 +3689,8 @@ fn conditional_put_preconditions() {
         vec![],
         vec![],
         Some(&none_match_star()),
+        None,
+        None,
     )
     .unwrap();
     e.delete("b1", "k").unwrap();
@@ -2846,6 +3709,8 @@ fn conditional_put_preconditions() {
             vec![],
             vec![],
             Some(&if_match_star),
+            None,
+            None,
         ),
         Err(Error::NotFound(_))
     ));
@@ -2916,5 +3781,1515 @@ fn object_meta_for_precond(size: u64, mtime: i64) -> ObjectMeta {
         checksum: None,
         retention: None,
         legal_hold: false,
+        part_checksums: Vec::new(),
     }
+}
+
+// ─────────────────────────── M11 E1-7/E1-3:SSE-C 引擎链路 ───────────────────────────
+
+/// SSE-C 测试密钥(固定字节,测试确定性)。
+fn sse_test_key() -> fs3_core::SseCKey {
+    fs3_core::SseCKey::from_bytes(&[0x5Au8; 32]).unwrap()
+}
+
+/// 独立重放写路径网格:按 meta.sse 的 nonce_base 对明文逐 chunk 加密,
+/// 得期望密文(ETag=密文 MD5 / 内联密文等断言用)。
+fn sse_reencrypt(plain: &[u8], sse: &fs3_core::SseInfo) -> Vec<u8> {
+    let key = sse_test_key();
+    let mut cipher = fs3_core::ChunkedGcm::new(key.data_key(), sse.nonce_base);
+    let mut ct = Vec::with_capacity(plain.len());
+    for (no, c) in plain.chunks(fs3_core::SSE_CHUNK_SIZE).enumerate() {
+        let (c, tag) = cipher.encrypt_chunk(no as u64, c);
+        assert_eq!(tag, sse.chunk_tags[no], "chunk {no} tag 与落盘一致");
+        ct.extend_from_slice(&c);
+    }
+    ct
+}
+
+/// M11 E1-7/E1-3:内联 + extent 两臂加密写读往返;ETag = 密文 MD5(DE2);
+/// chunk_tags 网格 = ceil(size/64KiB)(尾部 partial 也有 tag)。
+#[test]
+fn sse_c_put_get_roundtrip() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let key = sse_test_key();
+
+    // —— 内联臂(≤32KiB,恒单 chunk)——
+    let small = rnd(1_000, 3);
+    let m = e
+        .put_with_meta(
+            "b1",
+            "sse-small",
+            &mut Cursor::new(small.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            Some(&fs3_core::SseWriteKey::SseC(&key)),
+        )
+        .unwrap();
+    let sse = m.sse.as_ref().expect("sse meta");
+    assert_eq!(sse.kind, fs3_core::SseKind::SseC);
+    assert_eq!(sse.kek_id, 0, "SSE-C 不用 KEK(约定 0)");
+    assert!(sse.wrapped_dek.is_empty(), "SSE-C 不落 DEK(约定空)");
+    assert_eq!(sse.key_md5, key.key_md5(), "D-E5:校验子 = 客户密钥 MD5");
+    assert_eq!(sse.chunk_tags.len(), 1, "内联恒单 chunk(D-E1 口径)");
+    let ct = m.inline.as_ref().expect("inline ciphertext");
+    assert_ne!(*ct, small, "落盘为密文");
+    assert_eq!(ct.len(), small.len(), "密文等长(DE1)");
+    assert_eq!(ct, &sse_reencrypt(&small, sse), "写路径网格 = ssec 网格");
+    // ETag = 密文 MD5(DE2)
+    let expect_etag: [u8; 16] = md5::Md5::digest(ct).into();
+    assert_eq!(m.etag, expect_etag, "ETag = 密文 MD5");
+    assert_ne!(m.etag, md5::Md5::digest(&small).as_slice(), "非明文 MD5");
+    // 持久化往返(读回 meta 一致)
+    let got = e.head("b1", "sse-small").unwrap().unwrap();
+    assert_eq!(got.sse, m.sse);
+    // 带密钥读回 = 明文
+    let mut buf = vec![0u8; small.len()];
+    let n = e
+        .read_at_version_for(
+            "b1",
+            "sse-small",
+            None,
+            0,
+            &mut buf,
+            VersioningState::Off,
+            Some(&key),
+        )
+        .unwrap();
+    assert_eq!(&buf[..n], &small[..]);
+
+    // —— extent 臂(200_000B = 3×64KiB 满块 + 3_392B 尾块)——
+    let big = rnd(200_000, 9);
+    let chunks = big.len().div_ceil(fs3_core::SSE_CHUNK_SIZE);
+    assert_eq!(chunks, 4);
+    let m = e
+        .put_with_meta(
+            "b1",
+            "sse-big",
+            &mut Cursor::new(big.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            Some(&fs3_core::SseWriteKey::SseC(&key)),
+        )
+        .unwrap();
+    assert!(m.inline.is_none() && !m.extents.is_empty());
+    let sse = m.sse.as_ref().expect("sse meta");
+    assert_eq!(sse.chunk_tags.len(), chunks, "尾部 partial 也有 tag");
+    let ct = sse_reencrypt(&big, sse);
+    let expect_etag: [u8; 16] = md5::Md5::digest(&ct).into();
+    assert_eq!(m.etag, expect_etag, "extent 臂 ETag = 密文 MD5");
+    // 整体读回(get_to_meta SSE 臂)与流式读回(read_at_meta)一致
+    let mut out = Vec::new();
+    e.get_to_meta(&m, 0..u64::MAX, &mut out, Some(&key))
+        .unwrap();
+    assert_eq!(out, big, "get_to_meta SSE 臂解密往返");
+    let mut buf = vec![0u8; big.len()];
+    let n = e
+        .read_at_version_for(
+            "b1",
+            "sse-big",
+            None,
+            0,
+            &mut buf,
+            VersioningState::Off,
+            Some(&key),
+        )
+        .unwrap();
+    assert_eq!(&buf[..n], &big[..], "read_at SSE 臂解密往返");
+    // 解密字节指标(全对象两遍:get_to + read_at)
+    assert_eq!(
+        e.sse_decrypt_bytes(),
+        (small.len() + 2 * big.len()) as u64,
+        "按字节计解密量(DE1 指标)"
+    );
+    e.close().unwrap();
+}
+
+/// M11 E1-3:Range/偏移读只解密命中 chunk(首尾 partial 网格裁剪);
+/// 跨 chunk 边界窗口逐字节一致。
+#[test]
+fn sse_c_range_read_chunk_aligned() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let key = sse_test_key();
+    let big = rnd(200_000, 11);
+    e.put_with_meta(
+        "b1",
+        "sse-r",
+        &mut Cursor::new(big.clone()),
+        None,
+        vec![],
+        vec![],
+        vec![],
+        None,
+        None,
+        Some(&fs3_core::SseWriteKey::SseC(&key)),
+    )
+    .unwrap();
+    let grid = fs3_core::SSE_CHUNK_SIZE as u64;
+    let before = e.sse_decrypt_bytes();
+    // 命中单个 chunk 中部:[70_000, 70_100)——只解密 chunk 1(64KiB)
+    let mut buf = vec![0u8; 100];
+    let n = e
+        .read_at_version_for(
+            "b1",
+            "sse-r",
+            None,
+            70_000,
+            &mut buf,
+            VersioningState::Off,
+            Some(&key),
+        )
+        .unwrap();
+    assert_eq!(n, 100);
+    assert_eq!(&buf[..], &big[70_000..70_100]);
+    assert_eq!(
+        e.sse_decrypt_bytes() - before,
+        grid,
+        "单 chunk 命中只解密一个 chunk"
+    );
+    // 跨 chunk 边界、首尾 partial:[60_000, 140_000)跨 chunk 0/1/2
+    let mut buf = vec![0u8; 80_000];
+    let n = e
+        .read_at_version_for(
+            "b1",
+            "sse-r",
+            None,
+            60_000,
+            &mut buf,
+            VersioningState::Off,
+            Some(&key),
+        )
+        .unwrap();
+    assert_eq!(n, 80_000);
+    assert_eq!(&buf[..], &big[60_000..140_000]);
+    // 尾 chunk partial:[199_000, 200_000)
+    let mut buf = vec![0u8; 1_000];
+    let n = e
+        .read_at_version_for(
+            "b1",
+            "sse-r",
+            None,
+            199_000,
+            &mut buf,
+            VersioningState::Off,
+            Some(&key),
+        )
+        .unwrap();
+    assert_eq!(&buf[..n], &big[199_000..]);
+    e.close().unwrap();
+}
+
+/// M11 E1-3:错密钥 / 篡改 tag / 篡改密文 → 解密验 tag 失败(Corrupt,
+/// 数据不可读语义);无密钥读 SSE 对象 → 显式 InvalidRequest(不返回密文)。
+#[test]
+fn sse_c_read_failure_modes() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let key = sse_test_key();
+    let data = rnd(100_000, 13);
+    e.put_with_meta(
+        "b1",
+        "sse-f",
+        &mut Cursor::new(data.clone()),
+        None,
+        vec![],
+        vec![],
+        vec![],
+        None,
+        None,
+        Some(&fs3_core::SseWriteKey::SseC(&key)),
+    )
+    .unwrap();
+
+    // 无密钥:read_at / get_to 显式报错(内部调用方拿不到密文)
+    let mut buf = vec![0u8; 4096];
+    let err = e.read_at("b1", "sse-f", 0, &mut buf).unwrap_err();
+    assert!(matches!(err, Error::InvalidRequest(_)), "{err}");
+    let mut out = Vec::new();
+    let err = e.get_to("b1", "sse-f", 0..u64::MAX, &mut out).unwrap_err();
+    assert!(matches!(err, Error::InvalidRequest(_)), "{err}");
+
+    // 错密钥:GCM 认证失败 → Corrupt(不泄漏密钥信息)
+    let wrong = fs3_core::SseCKey::from_bytes(&[0xA5u8; 32]).unwrap();
+    let err = e
+        .read_at_version_for(
+            "b1",
+            "sse-f",
+            None,
+            0,
+            &mut buf,
+            VersioningState::Off,
+            Some(&wrong),
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::Corrupt(_)), "{err}");
+    let msg = err.to_string();
+    assert!(!msg.contains("5a5a"), "错误消息不含密钥材料: {msg}");
+
+    // 篡改 chunk_tags[0](经 meta 直接改值)→ 读 chunk 0 失败,chunk 1 仍可读
+    let raw = fs3_meta::keys::object_key("b1", "sse-f");
+    let mut m = e.head("b1", "sse-f").unwrap().unwrap();
+    m.sse.as_mut().unwrap().chunk_tags[0][0] ^= 0x80;
+    e.meta().commit_object_meta_update(&raw, &m).unwrap();
+    let err = e
+        .read_at_version_for(
+            "b1",
+            "sse-f",
+            None,
+            0,
+            &mut buf,
+            VersioningState::Off,
+            Some(&key),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::Corrupt(_)),
+        "篡改 tag → Corrupt: {err}"
+    );
+    let mut buf2 = vec![0u8; 100];
+    let n = e
+        .read_at_version_for(
+            "b1",
+            "sse-f",
+            None,
+            fs3_core::SSE_CHUNK_SIZE as u64,
+            &mut buf2,
+            VersioningState::Off,
+            Some(&key),
+        )
+        .unwrap();
+    assert_eq!(
+        &buf2[..n],
+        &data[fs3_core::SSE_CHUNK_SIZE..fs3_core::SSE_CHUNK_SIZE + 100],
+        "未篡改 chunk 不受影响"
+    );
+    e.close().unwrap();
+}
+
+/// M11 E1-3(DE1):SSE 对象禁零拷贝(object_segments_meta → None);
+/// 空对象 SSE-C(零 chunk)往返;ETag=fast(crc32c)组合 ETag 落密文 CRC。
+#[test]
+fn sse_c_zero_copy_disabled_and_edges() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let key = sse_test_key();
+    // extent 对象(零拷贝候选形态)加密后禁零拷贝
+    let big = rnd(100_000, 17);
+    e.put_with_meta(
+        "b1",
+        "sse-zc",
+        &mut Cursor::new(big),
+        None,
+        vec![],
+        vec![],
+        vec![],
+        None,
+        None,
+        Some(&fs3_core::SseWriteKey::SseC(&key)),
+    )
+    .unwrap();
+    assert!(e
+        .object_segments_version_for("b1", "sse-zc", None, 0, 1, VersioningState::Off)
+        .unwrap()
+        .is_none());
+    // 同对象未加密重写后恢复零拷贝(对照)
+    e.put("b1", "plain-zc", &mut Cursor::new(rnd(100_000, 19)))
+        .unwrap();
+    assert!(e
+        .object_segments_version_for("b1", "plain-zc", None, 0, 1, VersioningState::Off)
+        .unwrap()
+        .is_some());
+
+    // 空对象 + SSE-C:零 chunk、零 tag,往返一致
+    let m = e
+        .put_with_meta(
+            "b1",
+            "sse-empty",
+            &mut Cursor::new(Vec::new()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            Some(&fs3_core::SseWriteKey::SseC(&key)),
+        )
+        .unwrap();
+    assert_eq!(m.size, 0);
+    assert_eq!(m.sse.as_ref().unwrap().chunk_tags.len(), 0);
+    let mut out = Vec::new();
+    e.get_to_meta(&m, 0..u64::MAX, &mut out, Some(&key))
+        .unwrap();
+    assert!(out.is_empty());
+    e.close().unwrap();
+}
+
+/// M11 E1-7:EtagMode::Crc32c(etag=fast)组合下 SSE 对象 ETag = 密文
+/// CRC32C(DE2 组合口径);checksum tee 在明文侧(与加密顺序:明文
+/// checksum → 加密)。
+#[test]
+fn sse_c_etag_fast_and_plaintext_checksum() {
+    let (_d, cfg) = setup();
+    let mut cfg2 = cfg.clone();
+    cfg2.etag_mode = fs3_core::EtagMode::Crc32c;
+    let mut e = open_engine(&cfg2);
+    let key = sse_test_key();
+    let data = rnd(150_000, 23);
+    let m = e
+        .put_with_meta(
+            "b1",
+            "sse-fast",
+            &mut Cursor::new(data.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            Some(ChecksumAlgorithm::Sha256),
+            Some(&fs3_core::SseWriteKey::SseC(&key)),
+        )
+        .unwrap();
+    let sse = m.sse.as_ref().unwrap();
+    // ETag 低 4 字节 = 密文 CRC32C(etag=fast 口径)
+    let ct = sse_reencrypt(&data, sse);
+    let expect_crc = crc32c(&ct, 0).to_be_bytes();
+    assert_eq!(&m.etag[12..16], &expect_crc, "ETag = 密文 CRC32C(DE2 组合)");
+    // checksum 为明文语义(ADR-12 checksum 决策:先于加密)
+    assert_eq!(
+        m.checksum,
+        Some(ChecksumInfo {
+            algorithm: ChecksumAlgorithm::Sha256,
+            value: fs3_core::checksum_one_shot(ChecksumAlgorithm::Sha256, &data),
+        }),
+        "checksum 落明文值"
+    );
+    // 读回明文一致
+    let mut out = Vec::new();
+    e.get_to_meta(&m, 0..u64::MAX, &mut out, Some(&key))
+        .unwrap();
+    assert_eq!(out, data);
+    e.close().unwrap();
+}
+
+// ─────────────────────────── M11 E1-4:multipart SSE-C ───────────────────────────
+
+/// 第二把测试密钥(异密钥重加密路径用)。
+fn sse_test_key_b() -> fs3_core::SseCKey {
+    fs3_core::SseCKey::from_bytes(&[0xA5u8; 32]).unwrap()
+}
+
+/// 创建 SSE-C multipart 会话(会话只落 key-MD5,引擎不校验其值——逐值
+/// 比对在协议层;此处给真实 base64(md5(key)) 保持形态真实)。
+fn create_sse_upload(e: &mut Engine, key: &str) -> String {
+    let md5_b64 = "BuASUiSbvhMWBKAmsiYRhg=="; // base64(md5([0x5A;32]))
+    e.create_multipart(
+        "b1",
+        key,
+        None,
+        vec![],
+        vec![],
+        vec![],
+        None,
+        Some(md5_b64.into()),
+        None,
+    )
+    .unwrap()
+}
+
+/// M11 E1-4(DE2 + D-E4/D-E6 裁决):multipart SSE-C 全流程——每 part 独立
+/// 加密(D-E6 确定性派生 nonce_base,重传幂等;part ETag = 密文 MD5,
+/// PartMeta.sse 落 nonce/tags/key_md5;extent + 内联两臂),Complete 解密
+/// 重加密为单一 nonce_base 对象网格,复合 ETag 维持 md5-N,GET 带密钥往返。
+#[test]
+fn sse_c_multipart_full_flow() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let key = sse_test_key();
+
+    // part1 = 5MiB(extent 臂,非末片 ≥ 5MiB 门槛);part2 = 100B(内联臂)
+    let p1_data = rnd(5 * 1024 * 1024, 31);
+    let p2_data = rnd(100, 37);
+    let uid = create_sse_upload(&mut e, "mp-sse");
+    let p1 = e
+        .upload_part(&uid, 1, &mut Cursor::new(p1_data.clone()), None, Some(&key))
+        .unwrap();
+    let p2 = e
+        .upload_part(&uid, 2, &mut Cursor::new(p2_data.clone()), None, Some(&key))
+        .unwrap();
+    // 每 part 独立加密:PartMeta.sse 落 nonce_base + chunk_tags;两 part
+    // nonce_base 不同(D-E6 派生按 part_number 区分);part ETag = 密文
+    // MD5(≠ 明文 MD5)
+    let s1 = p1.sse.as_ref().expect("part1 sse");
+    let s2 = p2.sse.as_ref().expect("part2 sse");
+    assert_ne!(s1.nonce_base, s2.nonce_base, "每 part 独立 nonce_base(DE2)");
+    // D-E6:nonce_base = HMAC-SHA256(data_key, "fasts3-sse-c-part" ‖
+    // upload_id ‖ be32(part_number)) 前 12B(确定性派生,与 ssec 公式逐值一致)
+    let dk = key.data_key();
+    assert_eq!(
+        s1.nonce_base,
+        fs3_core::derive_part_nonce_base(&dk, &uid, 1)
+    );
+    assert_eq!(
+        s2.nonce_base,
+        fs3_core::derive_part_nonce_base(&dk, &uid, 2)
+    );
+    // D-E6:同 part 同内容重传 ⇒ 同 nonce 同密文 ⇒ ETag 稳定(重传幂等;
+    // part1 = extent 臂,part2 = 内联臂,两臂同口径)
+    let p1r = e
+        .upload_part(&uid, 1, &mut Cursor::new(p1_data.clone()), None, Some(&key))
+        .unwrap();
+    let p2r = e
+        .upload_part(&uid, 2, &mut Cursor::new(p2_data.clone()), None, Some(&key))
+        .unwrap();
+    assert_eq!(p1r.etag, p1.etag, "extent 臂重传 ETag 稳定");
+    assert_eq!(p2r.etag, p2.etag, "内联臂重传 ETag 稳定");
+    assert_eq!(
+        p1r.sse.as_ref().unwrap().nonce_base,
+        s1.nonce_base,
+        "重传复用同一派生 nonce_base"
+    );
+    assert_eq!(
+        s1.chunk_tags.len(),
+        p1_data.len().div_ceil(fs3_core::SSE_CHUNK_SIZE)
+    );
+    assert_eq!(s2.chunk_tags.len(), 1, "内联 part 恒单 chunk");
+    assert_eq!(
+        p1.etag,
+        md5::Md5::digest(sse_reencrypt(&p1_data, s1)).as_slice()
+    );
+    assert_eq!(
+        p2.etag,
+        md5::Md5::digest(sse_reencrypt(&p2_data, s2)).as_slice()
+    );
+    assert_ne!(
+        p1.etag,
+        md5::Md5::digest(&p1_data).as_slice(),
+        "ETag = 密文 MD5"
+    );
+    // D-E5:校验子落盘 = 客户密钥 MD5(part 级与下方对象级同口径)
+    assert_eq!(s1.key_md5, key.key_md5());
+    assert_eq!(s2.key_md5, key.key_md5());
+
+    // Complete:重加密为单一对象网格(D-E4);复合 ETag = md5(各 part 密文
+    // MD5 拼接)-N(N=2)
+    let m = e
+        .complete_multipart(
+            "b1",
+            "mp-sse",
+            &uid,
+            &[cp(1, p1.etag_hex()), cp(2, p2.etag_hex())],
+            None,
+            Some(&key),
+        )
+        .unwrap();
+    let total = p1_data.len() + p2_data.len();
+    assert_eq!(m.size, total as u64);
+    let osse = m.sse.as_ref().expect("object sse");
+    assert_eq!(osse.key_md5, key.key_md5(), "D-E5:对象级校验子同密钥 MD5");
+    assert_eq!(
+        osse.chunk_tags.len(),
+        total.div_ceil(fs3_core::SSE_CHUNK_SIZE),
+        "对象全局 64KiB 网格(单一 nonce_base)"
+    );
+    assert_ne!(osse.nonce_base, s1.nonce_base);
+    assert_ne!(osse.nonce_base, s2.nonce_base);
+    let mut concat = Vec::new();
+    concat.extend_from_slice(&p1.etag);
+    concat.extend_from_slice(&p2.etag);
+    assert_eq!(
+        m.etag,
+        md5::Md5::digest(&concat).as_slice(),
+        "复合 ETag = md5-N"
+    );
+    assert_eq!(m.parts, vec![p1_data.len() as u64, p2_data.len() as u64]);
+    assert!(m.inline.is_none(), "5MiB+ 对象走 extent 臂");
+
+    // GET 往返(带密钥 = 拼接明文;持久化重读同口径)
+    let mut expect = p1_data.clone();
+    expect.extend_from_slice(&p2_data);
+    let mut out = Vec::new();
+    e.get_to_meta(&m, 0..u64::MAX, &mut out, Some(&key))
+        .unwrap();
+    assert_eq!(out, expect, "Complete 后 GET 解密往返");
+    let m2 = e.head("b1", "mp-sse").unwrap().unwrap();
+    assert_eq!(m2.sse, m.sse, "对象级 SseInfo 持久化一致");
+    let mut out = Vec::new();
+    e.get_to_meta(&m2, 0..u64::MAX, &mut out, Some(&key))
+        .unwrap();
+    assert_eq!(out, expect);
+    // 无密钥读 → 显式 InvalidRequest(不返回密文);错密钥 → Corrupt
+    let mut out = Vec::new();
+    let err = e.get_to_meta(&m2, 0..u64::MAX, &mut out, None).unwrap_err();
+    assert!(matches!(err, Error::InvalidRequest(_)), "{err}");
+    let mut out = Vec::new();
+    let err = e
+        .get_to_meta(&m2, 0..u64::MAX, &mut out, Some(&sse_test_key_b()))
+        .unwrap_err();
+    assert!(matches!(err, Error::Corrupt(_)), "{err}");
+    e.close().unwrap();
+}
+
+/// M11 E1-4:SSE-C 全内联 multipart(总大小 ≤ 内联阈值)→ Complete 内联
+/// 臂整体加密(恒单 chunk);会话一致性错误矩阵(缺头/多头/Complete 缺
+/// 密钥 → InvalidRequest)。
+#[test]
+fn sse_c_multipart_inline_and_consistency() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let key = sse_test_key();
+
+    // 全内联:单片 200B,Complete 走内联重加密臂
+    let data = rnd(200, 41);
+    let uid = create_sse_upload(&mut e, "mp-inl");
+    let p1 = e
+        .upload_part(&uid, 1, &mut Cursor::new(data.clone()), None, Some(&key))
+        .unwrap();
+    assert!(p1.inline.is_some() && p1.sse.is_some());
+    let m = e
+        .complete_multipart(
+            "b1",
+            "mp-inl",
+            &uid,
+            &[cp(1, p1.etag_hex())],
+            None,
+            Some(&key),
+        )
+        .unwrap();
+    let osse = m.sse.as_ref().expect("object sse");
+    assert_eq!(osse.chunk_tags.len(), 1, "内联对象恒单 chunk(D-E1 口径)");
+    let ct = m.inline.as_ref().expect("inline ciphertext");
+    assert_ne!(*ct, data, "落盘为密文");
+    assert_eq!(*ct, sse_reencrypt(&data, osse), "对象网格 = ssec 网格");
+    let mut out = Vec::new();
+    e.get_to_meta(&m, 0..u64::MAX, &mut out, Some(&key))
+        .unwrap();
+    assert_eq!(out, data);
+
+    // —— 会话一致性(引擎兜底;协议层另有 key-MD5 逐值比对)——
+    // SSE 会话 UploadPart 缺密钥 → InvalidRequest
+    let uid2 = create_sse_upload(&mut e, "mp-c1");
+    let err = e
+        .upload_part(&uid2, 1, &mut Cursor::new(rnd(10, 1)), None, None)
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidRequest(_)), "{err}");
+    // SSE 会话 Complete 缺密钥 → InvalidRequest(重加密必需密钥本体)
+    e.upload_part(&uid2, 1, &mut Cursor::new(rnd(10, 1)), None, Some(&key))
+        .unwrap();
+    let p = e.list_parts(&uid2).unwrap()[0].1.clone();
+    let err = e
+        .complete_multipart("b1", "mp-c1", &uid2, &[cp(1, p.etag_hex())], None, None)
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidRequest(_)), "{err}");
+    // 明文会话 UploadPart 带密钥 → InvalidRequest(不静默加密)
+    let uid3 = e
+        .create_multipart(
+            "b1",
+            "mp-c2",
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    let err = e
+        .upload_part(&uid3, 1, &mut Cursor::new(rnd(10, 1)), None, Some(&key))
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidRequest(_)), "{err}");
+    // 明文会话 Complete 带密钥 → InvalidRequest
+    let p = e
+        .upload_part(&uid3, 1, &mut Cursor::new(rnd(10, 1)), None, None)
+        .unwrap();
+    let err = e
+        .complete_multipart(
+            "b1",
+            "mp-c2",
+            &uid3,
+            &[cp(1, p.etag_hex())],
+            None,
+            Some(&key),
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidRequest(_)), "{err}");
+    e.close().unwrap();
+}
+
+/// M11 E1-4:SSE-C 会话 + checksum 组合——分片 checksum 落明文值(上传期
+/// tee 在加密前);Create 声明算法时 Complete 由服务端按明文代算对象级
+/// 值(FullObject 臂经 read_part_plain_to 解密重算,不明文落密文)。
+#[test]
+fn sse_c_multipart_with_checksum() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let key = sse_test_key();
+    let alg = ChecksumAlgorithm::Crc32c; // FullObject 默认类型
+    let md5_b64 = "BuASUiSbvhMWBKAmsiYRhg==";
+    let uid = e
+        .create_multipart(
+            "b1",
+            "mp-ck",
+            None,
+            vec![],
+            vec![],
+            vec![],
+            Some(alg),
+            Some(md5_b64.into()),
+            None,
+        )
+        .unwrap();
+    let p1_data = rnd(5 * 1024 * 1024, 43);
+    let p2_data = rnd(50_000, 47);
+    let p1 = e
+        .upload_part(
+            &uid,
+            1,
+            &mut Cursor::new(p1_data.clone()),
+            Some(alg),
+            Some(&key),
+        )
+        .unwrap();
+    let p2 = e
+        .upload_part(
+            &uid,
+            2,
+            &mut Cursor::new(p2_data.clone()),
+            Some(alg),
+            Some(&key),
+        )
+        .unwrap();
+    // 分片 checksum = 明文值(加密在前则值不同)
+    assert_eq!(
+        p1.checksum.as_ref().unwrap().value,
+        fs3_core::checksum_one_shot(alg, &p1_data),
+        "分片 checksum 落明文值"
+    );
+    let m = e
+        .complete_multipart(
+            "b1",
+            "mp-ck",
+            &uid,
+            &[cp(1, p1.etag_hex()), cp(2, p2.etag_hex())],
+            None,
+            Some(&key),
+        )
+        .unwrap();
+    // 对象级 FullObject 值 = alg(拼接明文),非密文值
+    let mut expect = p1_data.clone();
+    expect.extend_from_slice(&p2_data);
+    assert_eq!(
+        m.checksum,
+        Some(ChecksumInfo {
+            algorithm: alg,
+            value: fs3_core::checksum_one_shot(alg, &expect),
+        }),
+        "对象级 checksum 为明文语义(ADR-12 checksum 决策)"
+    );
+    assert_eq!(m.part_checksums.len(), 2, "逐分片 checksum 随对象持久化");
+    let mut out = Vec::new();
+    e.get_to_meta(&m, 0..u64::MAX, &mut out, Some(&key))
+        .unwrap();
+    assert_eq!(out, expect);
+    e.close().unwrap();
+}
+
+// ─────────────────────────── M11 E1-5:copy 加密语义(DE3) ───────────────────────────
+
+/// M11 E1-5(DE3):CopyObject 四象限——明文→加密(数据路径)/加密→同密钥
+/// (COW 直灌)/加密→异密钥(解密重加密)/加密→未指定(InvalidRequest);
+/// 缺 copy-source 密钥 → InvalidRequest;错源密钥 → Corrupt。内联/extent
+/// 两形态各过一遍。
+#[test]
+fn sse_c_copy_matrix() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let ka = sse_test_key();
+    let kb = sse_test_key_b();
+    let small = rnd(1_000, 51); // 内联形态
+    let big = rnd(200_000, 53); // extent 形态
+    for (name, data) in [("small", &small), ("big", &big)] {
+        e.put_with_meta(
+            "b1",
+            &format!("plain-{name}"),
+            &mut Cursor::new(data.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        e.put_with_meta(
+            "b1",
+            &format!("enc-{name}"),
+            &mut Cursor::new(data.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            Some(&fs3_core::SseWriteKey::SseC(&ka)),
+        )
+        .unwrap();
+        // —— 象限 1:源未加密 + 目标 SSE-C → 数据路径加密写 ——
+        let m = e
+            .copy_object_version_for(
+                "b1",
+                &format!("plain-{name}"),
+                None,
+                "b1",
+                &format!("q1-{name}"),
+                None,
+                None,
+                None,
+                None,
+                VersioningState::Off,
+                None,
+                Some(&fs3_core::SseWriteKey::SseC(&ka)),
+            )
+            .unwrap();
+        let sse = m.sse.as_ref().expect("q1 encrypted");
+        assert_eq!(sse.kind, fs3_core::SseKind::SseC);
+        assert_ne!(m.etag, md5::Md5::digest(data).as_slice(), "ETag = 密文 MD5");
+        let mut out = Vec::new();
+        e.get_to_meta(&m, 0..u64::MAX, &mut out, Some(&ka)).unwrap();
+        assert_eq!(&out, data, "q1 带密钥读回 = 源明文");
+        let mut out = Vec::new();
+        let err = e.get_to_meta(&m, 0..u64::MAX, &mut out, None).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidRequest(_)),
+            "q1 无密钥显式拒绝: {err}"
+        );
+
+        // —— 象限 2:源 SSE-C + 同密钥 COW 直灌(SseInfo 原样继承)——
+        let src = e.head("b1", &format!("enc-{name}")).unwrap().unwrap();
+        let m = e
+            .copy_object_version_for(
+                "b1",
+                &format!("enc-{name}"),
+                None,
+                "b1",
+                &format!("q2-{name}"),
+                None,
+                None,
+                None,
+                None,
+                VersioningState::Off,
+                Some(&ka),
+                Some(&fs3_core::SseWriteKey::SseC(&ka)),
+            )
+            .unwrap();
+        assert_eq!(m.sse, src.sse, "同密钥 COW:SseInfo 原样继承(零数据搬运)");
+        assert_eq!(m.etag, src.etag, "COW 不动密文,ETag 不变");
+        let mut out = Vec::new();
+        e.get_to_meta(&m, 0..u64::MAX, &mut out, Some(&ka)).unwrap();
+        assert_eq!(&out, data, "q2 带密钥读回 = 源明文");
+
+        // —— 象限 3:源 SSE-C + 异密钥 → 解密重加密(数据路径)——
+        let m = e
+            .copy_object_version_for(
+                "b1",
+                &format!("enc-{name}"),
+                None,
+                "b1",
+                &format!("q3-{name}"),
+                None,
+                None,
+                None,
+                None,
+                VersioningState::Off,
+                Some(&ka),
+                Some(&fs3_core::SseWriteKey::SseC(&kb)),
+            )
+            .unwrap();
+        let sse3 = m.sse.as_ref().expect("q3 encrypted");
+        assert_ne!(
+            sse3.nonce_base,
+            src.sse.as_ref().unwrap().nonce_base,
+            "iter {name}"
+        );
+        let mut out = Vec::new();
+        e.get_to_meta(&m, 0..u64::MAX, &mut out, Some(&kb)).unwrap();
+        assert_eq!(&out, data, "q3 新密钥读回 = 源明文");
+        let mut out = Vec::new();
+        let err = e
+            .get_to_meta(&m, 0..u64::MAX, &mut out, Some(&ka))
+            .unwrap_err();
+        assert!(matches!(err, Error::Corrupt(_)), "q3 旧密钥不再可读: {err}");
+
+        // —— 象限 4:源 SSE-C + 目标未指定加密 → InvalidRequest(DE3)——
+        let err = e
+            .copy_object_version_for(
+                "b1",
+                &format!("enc-{name}"),
+                None,
+                "b1",
+                &format!("q4-{name}"),
+                None,
+                None,
+                None,
+                None,
+                VersioningState::Off,
+                Some(&ka),
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidRequest(_)), "{err}");
+
+        // 源 SSE-C + 目标 SSE-C 但缺 copy-source 密钥 → InvalidRequest
+        let err = e
+            .copy_object_version_for(
+                "b1",
+                &format!("enc-{name}"),
+                None,
+                "b1",
+                &format!("q5-{name}"),
+                None,
+                None,
+                None,
+                None,
+                VersioningState::Off,
+                None,
+                Some(&fs3_core::SseWriteKey::SseC(&kb)),
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidRequest(_)), "{err}");
+
+        // 异密钥路径 + 错源密钥 → 解密验 tag 失败 Corrupt(不泄漏)
+        let err = e
+            .copy_object_version_for(
+                "b1",
+                &format!("enc-{name}"),
+                None,
+                "b1",
+                &format!("q6-{name}"),
+                None,
+                None,
+                None,
+                None,
+                VersioningState::Off,
+                Some(&kb),
+                Some(&fs3_core::SseWriteKey::SseC(&ka)),
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::Corrupt(_)), "{err}");
+    }
+    e.close().unwrap();
+}
+
+/// M11 E1-5:UploadPartCopy 矩阵——明文源灌入 SSE 会话(加密 part)、SSE
+/// 源同密钥灌入(解密→重加密)、SSE 源 + 明文会话 → InvalidRequest、SSE
+/// 源缺 copy-source 密钥 → InvalidRequest、会话缺目标密钥 → InvalidRequest;
+/// range 直灌与 Complete 后整对象读回。
+#[test]
+fn sse_c_upload_part_copy_matrix() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let key = sse_test_key();
+    // 源:5MiB+100B(extent;range 跨 64KiB 网格非对齐),SSE-C 加密与明文各一
+    let src_data = rnd(5 * 1024 * 1024 + 200_000, 57);
+    e.put_with_meta(
+        "b1",
+        "upc-enc",
+        &mut Cursor::new(src_data.clone()),
+        None,
+        vec![],
+        vec![],
+        vec![],
+        None,
+        None,
+        Some(&fs3_core::SseWriteKey::SseC(&key)),
+    )
+    .unwrap();
+    e.put_with_meta(
+        "b1",
+        "upc-plain",
+        &mut Cursor::new(src_data.clone()),
+        None,
+        vec![],
+        vec![],
+        vec![],
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+
+    // SSE 会话:明文源 + 目标密钥 → part 加密(非对齐 range)
+    let uid = create_sse_upload(&mut e, "upc-dst");
+    let range = 60_000..(5 * 1024 * 1024 + 200_000);
+    let expect: Vec<u8> = src_data[range.start as usize..].to_vec();
+    let p = e
+        .upload_part_copy(&uid, 1, "b1", "upc-plain", range.clone(), None, Some(&key))
+        .unwrap();
+    let psse = p.sse.as_ref().expect("part encrypted");
+    assert_eq!(p.size, expect.len() as u64);
+    assert_eq!(
+        p.etag,
+        md5::Md5::digest(sse_reencrypt(&expect, psse)).as_slice(),
+        "part ETag = 密文 MD5"
+    );
+    // SSE 源 + 同密钥 → 解密后重加密为 part 网格(part2 = 末片,无 5MiB 门槛)
+    let p2 = e
+        .upload_part_copy(&uid, 2, "b1", "upc-enc", 0..100, Some(&key), Some(&key))
+        .unwrap();
+    assert!(p2.sse.is_some());
+    // Complete 后整对象读回 = 两段明文拼接
+    let m = e
+        .complete_multipart(
+            "b1",
+            "upc-dst",
+            &uid,
+            &[cp(1, p.etag_hex()), cp(2, p2.etag_hex())],
+            None,
+            Some(&key),
+        )
+        .unwrap();
+    let mut expect_all = expect.clone();
+    expect_all.extend_from_slice(&src_data[..100]);
+    let mut out = Vec::new();
+    e.get_to_meta(&m, 0..u64::MAX, &mut out, Some(&key))
+        .unwrap();
+    assert_eq!(out, expect_all, "UploadPartCopy 混合源 Complete 后读回一致");
+
+    // —— 错误路径 ——
+    // SSE 源 + 明文会话(目标未加密)→ InvalidRequest(DE3 防静默解密落盘)
+    let uid2 = e
+        .create_multipart(
+            "b1",
+            "upc-e1",
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    let err = e
+        .upload_part_copy(&uid2, 1, "b1", "upc-enc", 0..100, Some(&key), None)
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidRequest(_)), "{err}");
+    // SSE 源 + SSE 会话但缺 copy-source 密钥 → InvalidRequest
+    let uid3 = create_sse_upload(&mut e, "upc-e2");
+    let err = e
+        .upload_part_copy(&uid3, 1, "b1", "upc-enc", 0..100, None, Some(&key))
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidRequest(_)), "{err}");
+    // SSE 会话缺目标密钥 → InvalidRequest(会话一致性)
+    let err = e
+        .upload_part_copy(&uid3, 1, "b1", "upc-plain", 0..100, None, None)
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidRequest(_)), "{err}");
+    // 明文会话带目标密钥 → InvalidRequest(不静默加密)
+    let err = e
+        .upload_part_copy(&uid2, 1, "b1", "upc-plain", 0..100, None, Some(&key))
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidRequest(_)), "{err}");
+    e.close().unwrap();
+}
+
+// ─────────────────────────── M11 K1-1:SSE-S3 KEK/DEK 引擎链路 ───────────────────────────
+
+/// SSE-S3 写密钥签发(引擎 mint;当前代包裹)并包装为写路径枚举借用。
+fn s3_write_key(e: &Engine) -> fs3_core::SseS3WriteKey {
+    e.sse_s3_mint_write_key().unwrap()
+}
+
+/// SSE-S3 会话创建(会话级 DEK 包裹值随会话落盘;DEK 明文零落盘)。
+fn create_s3_upload(e: &mut Engine, key: &str) -> String {
+    let wk = e.sse_s3_mint_write_key().unwrap();
+    e.create_multipart(
+        "b1",
+        key,
+        None,
+        vec![],
+        vec![],
+        vec![],
+        None,
+        None,
+        Some(fs3_meta::SessionSseS3 {
+            kek_id: wk.kek_id(),
+            wrapped_dek: wk.wrapped_dek().to_vec(),
+        }),
+    )
+    .unwrap()
+}
+
+/// K1-1:内联 + extent 两臂 SSE-S3 写读往返;SseInfo 形态(kind/kek_id/
+/// wrapped_dek 60B/key_md5 恒零);**读侧零客户头**(引擎自持解包);
+/// wrapped_dek 损坏 → Corrupt(数据不可读)。
+#[test]
+fn sse_s3_put_get_roundtrip() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+
+    // —— 内联臂(≤32KiB,恒单 chunk)——
+    let small = rnd(1_000, 3);
+    let wk = s3_write_key(&e);
+    let wk_ref = fs3_core::SseWriteKey::SseS3(&wk);
+    let m = e
+        .put_with_meta(
+            "b1",
+            "s3-small",
+            &mut Cursor::new(small.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            Some(&wk_ref),
+        )
+        .unwrap();
+    let sse = m.sse.as_ref().expect("sse meta");
+    assert_eq!(sse.kind, fs3_core::SseKind::SseS3);
+    assert_eq!(sse.kek_id, 1, "初始代 = 1");
+    assert_eq!(
+        sse.wrapped_dek.len(),
+        fs3_core::SSE_S3_WRAPPED_DEK_LEN,
+        "nonce‖ct‖tag = 60B"
+    );
+    assert_eq!(sse.key_md5, [0u8; 16], "SSE-S3 校验子恒零(D-E5)");
+    assert_eq!(sse.chunk_tags.len(), 1, "内联恒单 chunk");
+    let ct = m.inline.as_ref().expect("inline ciphertext");
+    assert_ne!(*ct, small, "落盘为密文");
+    assert_eq!(ct.len(), small.len(), "密文等长");
+    // 持久化往返
+    let got = e.head("b1", "s3-small").unwrap().unwrap();
+    assert_eq!(got.sse, m.sse);
+    // 读侧**零密钥**(服务端自持解包):流式读回 = 明文
+    let mut buf = vec![0u8; small.len()];
+    let n = e
+        .read_at_version_for(
+            "b1",
+            "s3-small",
+            None,
+            0,
+            &mut buf,
+            VersioningState::Off,
+            None,
+        )
+        .unwrap();
+    assert_eq!(&buf[..n], &small[..]);
+
+    // —— extent 臂(200_000B = 3 满 chunk + 尾块)——
+    let big = rnd(200_000, 9);
+    let wk = s3_write_key(&e);
+    let wk_ref = fs3_core::SseWriteKey::SseS3(&wk);
+    let m = e
+        .put_with_meta(
+            "b1",
+            "s3-big",
+            &mut Cursor::new(big.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            Some(&wk_ref),
+        )
+        .unwrap();
+    assert!(m.inline.is_none() && !m.extents.is_empty());
+    assert_eq!(m.sse.as_ref().unwrap().chunk_tags.len(), 4);
+    // 每对象随机 DEK:同明文两对象密文不同
+    let wk2 = s3_write_key(&e);
+    let wk2_ref = fs3_core::SseWriteKey::SseS3(&wk2);
+    let m2 = e
+        .put_with_meta(
+            "b1",
+            "s3-big2",
+            &mut Cursor::new(big.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            Some(&wk2_ref),
+        )
+        .unwrap();
+    assert_ne!(m.etag, m2.etag, "随机 DEK ⇒ 同明文异密文(DS1)");
+    assert_ne!(
+        m.sse.as_ref().unwrap().wrapped_dek,
+        m2.sse.as_ref().unwrap().wrapped_dek
+    );
+    // 无密钥整体读回 + Range 读回
+    let mut out = Vec::new();
+    e.get_to_meta(&m, 0..u64::MAX, &mut out, None).unwrap();
+    assert_eq!(out, big, "get_to_meta SSE-S3 臂解密往返(零客户头)");
+    let mut out = Vec::new();
+    e.get_to_meta(&m, 60_000..140_000, &mut out, None).unwrap();
+    assert_eq!(out, big[60_000..140_000], "Range 跨 chunk 解密一致");
+
+    // wrapped_dek 损坏 → 读 = Corrupt(数据不可读,不静默)
+    let mut bad = m.clone();
+    let mut sse_bad = bad.sse.clone().unwrap();
+    sse_bad.wrapped_dek[20] ^= 1;
+    bad.sse = Some(sse_bad);
+    let mut out = Vec::new();
+    let err = e
+        .get_to_meta(&bad, 0..u64::MAX, &mut out, None)
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::Corrupt(_)),
+        "unwrap 失败 → Corrupt: {err}"
+    );
+    e.close().unwrap();
+}
+
+/// K1-1(DS1):轮换 = 新 KEK 代 + 后台重包裹;两代对象重包裹前后恒可读,
+/// rewrap 后 kek_id 收敛到当前代,rewrap_done_gen 落盘,幂等重跑。
+#[test]
+fn sse_s3_rotation_and_rewrap() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    // 初始代状态:gen 1(惰性)
+    let st = e.sse_s3_kek_state().unwrap();
+    assert_eq!((st.gen, st.rewrap_done_gen), (1, 1));
+
+    // 代 1 两个对象(内联 + extent)
+    let d1 = rnd(1_000, 5);
+    let d2 = rnd(150_000, 6);
+    for (k, d) in [("g1-a", &d1), ("g1-b", &d2)] {
+        let wk = s3_write_key(&e);
+        let r = fs3_core::SseWriteKey::SseS3(&wk);
+        e.put_with_meta(
+            "b1",
+            k,
+            &mut Cursor::new(d.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            Some(&r),
+        )
+        .unwrap();
+    }
+    // 轮换 → 代 2;rewrap 待办标记拉开
+    let st = e.sse_s3_rotate_kek().unwrap();
+    assert_eq!(st.gen, 2);
+    assert!(st.last_rotated_at > 0);
+    assert_eq!(st.rewrap_done_gen, 1, "轮换后重包裹待办");
+    // 代 2 新对象
+    let d3 = rnd(2_000, 7);
+    let wk = s3_write_key(&e);
+    assert_eq!(wk.kek_id(), 2, "mint 恒用当前代");
+    let r = fs3_core::SseWriteKey::SseS3(&wk);
+    e.put_with_meta(
+        "b1",
+        "g2-a",
+        &mut Cursor::new(d3.clone()),
+        None,
+        vec![],
+        vec![],
+        vec![],
+        None,
+        None,
+        Some(&r),
+    )
+    .unwrap();
+
+    // 重包裹前:两代对象恒可读(旧代 KEK 由 seed 确定性派生)
+    for (k, d) in [("g1-a", &d1), ("g1-b", &d2), ("g2-a", &d3)] {
+        let mut out = Vec::new();
+        let m = e.head("b1", k).unwrap().unwrap();
+        e.get_to_meta(&m, 0..u64::MAX, &mut out, None).unwrap();
+        assert_eq!(&out, d, "{k} 轮换后旧代可读");
+    }
+    assert_eq!(
+        e.head("b1", "g1-a").unwrap().unwrap().sse.unwrap().kek_id,
+        1
+    );
+
+    // 后台重包裹(直调一轮,同工作线程主体)
+    let progress = e.sse_s3_rewrap_progress();
+    crate::run_sse_s3_rewrap(e.meta(), &progress).unwrap();
+    let p = progress.lock().unwrap().clone();
+    assert_eq!(p.rewrapped, 2, "两个代 1 对象被重包裹");
+    assert_eq!(p.errors, 0);
+    assert_eq!(p.target_gen, 2);
+    let st = e.sse_s3_kek_state().unwrap();
+    assert_eq!(st.rewrap_done_gen, 2, "完成收敛落盘");
+    for k in ["g1-a", "g1-b", "g2-a"] {
+        let m = e.head("b1", k).unwrap().unwrap();
+        assert_eq!(m.sse.as_ref().unwrap().kek_id, 2, "{k} kek_id 收敛");
+    }
+    // 重包裹后全部仍可读
+    for (k, d) in [("g1-a", &d1), ("g1-b", &d2), ("g2-a", &d3)] {
+        let mut out = Vec::new();
+        let m = e.head("b1", k).unwrap().unwrap();
+        e.get_to_meta(&m, 0..u64::MAX, &mut out, None).unwrap();
+        assert_eq!(&out, d, "{k} 重包裹后可读");
+    }
+    // 幂等重跑:无待办 → 零重写
+    crate::run_sse_s3_rewrap(e.meta(), &progress).unwrap();
+    assert_eq!(progress.lock().unwrap().rewrapped, 2, "幂等(无新增)");
+    e.close().unwrap();
+}
+
+/// K1-1(DS1/DE3):copy 象限——SSE-S3→SSE-S3 同代 COW(SseInfo 逐字节
+/// 继承);异代 COW + 元数据级重包裹(数据零搬运,kek_id 收敛);SSE-S3→
+/// SSE-C / SSE-C→SSE-S3 换密钥 = 解密重加密;SSE-S3 源 + 目标未加密 →
+/// InvalidRequest(DS3 同口径)。
+#[test]
+fn sse_s3_copy_matrix() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let data = rnd(100_000, 21); // extent 臂
+    let wk = s3_write_key(&e);
+    let r = fs3_core::SseWriteKey::SseS3(&wk);
+    let src = e
+        .put_with_meta(
+            "b1",
+            "s3-src",
+            &mut Cursor::new(data.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            Some(&r),
+        )
+        .unwrap();
+    let ssec = sse_test_key();
+    let ckey = fs3_core::SseWriteKey::SseC(&ssec);
+
+    // 象限 A:同代 SSE-S3 → SSE-S3 COW(SseInfo 逐字节继承,零数据搬运)
+    let w2 = s3_write_key(&e);
+    let w2r = fs3_core::SseWriteKey::SseS3(&w2);
+    let m = e
+        .copy_object_version_for(
+            "b1",
+            "s3-src",
+            None,
+            "b1",
+            "s3-cow",
+            None,
+            None,
+            None,
+            None,
+            VersioningState::Off,
+            None,
+            Some(&w2r),
+        )
+        .unwrap();
+    assert_eq!(m.sse, src.sse, "同代 COW:SseInfo 逐字节继承");
+    assert_eq!(m.etag, src.etag, "COW 不动密文");
+    let mut out = Vec::new();
+    e.get_to_meta(&m, 0..u64::MAX, &mut out, None).unwrap();
+    assert_eq!(out, data, "COW 目标无密钥读回 = 明文");
+
+    // 象限 B:轮换后异代 SSE-S3 → SSE-S3 = COW + 元数据重包裹
+    e.sse_s3_rotate_kek().unwrap(); // gen 2
+    let w3 = s3_write_key(&e);
+    assert_eq!(w3.kek_id(), 2);
+    let w3r = fs3_core::SseWriteKey::SseS3(&w3);
+    let m = e
+        .copy_object_version_for(
+            "b1",
+            "s3-src",
+            None,
+            "b1",
+            "s3-cow2",
+            None,
+            None,
+            None,
+            None,
+            VersioningState::Off,
+            None,
+            Some(&w3r),
+        )
+        .unwrap();
+    let sse = m.sse.as_ref().unwrap();
+    assert_eq!(sse.kek_id, 2, "异代 copy:kek_id 收敛到目标代");
+    assert_ne!(
+        sse.wrapped_dek,
+        src.sse.as_ref().unwrap().wrapped_dek,
+        "重包裹 = 新包裹值"
+    );
+    assert_eq!(
+        sse.nonce_base,
+        src.sse.as_ref().unwrap().nonce_base,
+        "元数据级重包裹:数据面零触碰(nonce_base/网格共享)"
+    );
+    let mut out = Vec::new();
+    e.get_to_meta(&m, 0..u64::MAX, &mut out, None).unwrap();
+    assert_eq!(out, data, "异代 COW 目标读回 = 明文");
+
+    // 象限 C:SSE-S3 源 → SSE-C 目标 = 解密重加密(换密钥,数据路径)
+    let m = e
+        .copy_object_version_for(
+            "b1",
+            "s3-src",
+            None,
+            "b1",
+            "s3-to-c",
+            None,
+            None,
+            None,
+            None,
+            VersioningState::Off,
+            None,
+            Some(&ckey),
+        )
+        .unwrap();
+    let sse = m.sse.as_ref().unwrap();
+    assert_eq!(sse.kind, fs3_core::SseKind::SseC);
+    assert_eq!(sse.key_md5, ssec.key_md5());
+    let mut out = Vec::new();
+    e.get_to_meta(&m, 0..u64::MAX, &mut out, Some(&ssec))
+        .unwrap();
+    assert_eq!(out, data, "SSE-S3→SSE-C 重加密后按客户密钥读回");
+    assert_ne!(m.etag, src.etag, "重加密 ETag 变(密文变)");
+
+    // 象限 D:SSE-C 源 → SSE-S3 目标 = 解密重加密
+    let csrc = e
+        .put_with_meta(
+            "b1",
+            "c-src",
+            &mut Cursor::new(data.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            Some(&ckey),
+        )
+        .unwrap();
+    let w4 = s3_write_key(&e);
+    let w4r = fs3_core::SseWriteKey::SseS3(&w4);
+    let m = e
+        .copy_object_version_for(
+            "b1",
+            "c-src",
+            None,
+            "b1",
+            "c-to-s3",
+            None,
+            None,
+            None,
+            None,
+            VersioningState::Off,
+            Some(&ssec),
+            Some(&w4r),
+        )
+        .unwrap();
+    let sse = m.sse.as_ref().unwrap();
+    assert_eq!(sse.kind, fs3_core::SseKind::SseS3);
+    assert_eq!(sse.key_md5, [0u8; 16]);
+    let mut out = Vec::new();
+    e.get_to_meta(&m, 0..u64::MAX, &mut out, None).unwrap();
+    assert_eq!(out, data, "SSE-C→SSE-S3 重加密后无密钥读回");
+    assert_ne!(m.etag, csrc.etag);
+
+    // 象限 E:SSE-S3 源 + 目标未指定加密 → InvalidRequest(DS3 同 DE3 口径)
+    let err = e
+        .copy_object_version_for(
+            "b1",
+            "s3-src",
+            None,
+            "b1",
+            "s3-q4",
+            None,
+            None,
+            None,
+            None,
+            VersioningState::Off,
+            None,
+            None,
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidRequest(_)), "{err}");
+    e.close().unwrap();
+}
+
+/// K1-1(D-E4 复用):SSE-S3 multipart 端到端——Create 会话级 DEK;
+/// UploadPart 无客户头(会话 DEK 现解);part 重传幂等(D-E6 确定性
+/// nonce);Complete 零头(新签发对象级 DEK);对象读回 = 明文;会话
+/// 混用 SSE-C 密钥显式拒绝。
+#[test]
+fn sse_s3_multipart_e2e() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let uid = create_s3_upload(&mut e, "s3-mp");
+    // 两个 extent 分片(≥5MiB 非末片门槛)+ 内联尾片
+    let p1d = rnd(5 * 1024 * 1024 + 100, 31);
+    let p2d = rnd(1000, 32);
+    let p1 = e
+        .upload_part(&uid, 1, &mut Cursor::new(p1d.clone()), None, None)
+        .unwrap();
+    let psse = p1.sse.as_ref().expect("SSE-S3 分片产物");
+    assert_eq!(psse.kind, fs3_core::SseKind::SseS3);
+    assert_eq!(psse.kek_id, 1);
+    assert_eq!(psse.wrapped_dek.len(), fs3_core::SSE_S3_WRAPPED_DEK_LEN);
+    // 重传同内容 ⇒ 同 ETag(D-E6 确定性 nonce,会话级 DEK)
+    let p1r = e
+        .upload_part(&uid, 1, &mut Cursor::new(p1d.clone()), None, None)
+        .unwrap();
+    assert_eq!(p1r.etag, p1.etag, "分片重传幂等(ETag 稳定)");
+    let p2 = e
+        .upload_part(&uid, 2, &mut Cursor::new(p2d.clone()), None, None)
+        .unwrap();
+    // Complete:零客户头(服务端自持)
+    let m = e
+        .complete_multipart(
+            "b1",
+            "s3-mp",
+            &uid,
+            &[cp(1, p1.etag_hex()), cp(2, p2.etag_hex())],
+            None,
+            None,
+        )
+        .unwrap();
+    let sse = m.sse.as_ref().unwrap();
+    assert_eq!(
+        sse.kind,
+        fs3_core::SseKind::SseS3,
+        "D-E4:对象级 SseInfo 单网格同形态"
+    );
+    let mut expect = p1d.clone();
+    expect.extend_from_slice(&p2d);
+    let mut out = Vec::new();
+    e.get_to_meta(&m, 0..u64::MAX, &mut out, None).unwrap();
+    assert_eq!(out, expect, "Complete 后整对象无密钥读回 = 拼接明文");
+
+    // 会话混用:SSE-S3 会话 UploadPart 携带 SSE-C 密钥 → InvalidRequest
+    let uid2 = create_s3_upload(&mut e, "s3-mp2");
+    let key = sse_test_key();
+    let err = e
+        .upload_part(&uid2, 1, &mut Cursor::new(rnd(10, 1)), None, Some(&key))
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidRequest(_)), "{err}");
+    let err = e
+        .complete_multipart(
+            "b1",
+            "s3-mp2",
+            &uid2,
+            &[cp(1, "x".into())],
+            None,
+            Some(&key),
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidRequest(_)), "{err}");
+    e.close().unwrap();
 }

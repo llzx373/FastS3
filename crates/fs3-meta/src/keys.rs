@@ -13,9 +13,13 @@
 //! - `bt:{bucket}` 桶级标签文档(M10 S1;ADR-11 D8,值 = 规范化 XML)
 //! - `bo:{bucket}` 桶级 OwnershipControls 文档(M10 S7,值 = 规范化 XML)
 //! - `bp:{bucket}` 桶策略文档(M10 S3;ADR-11 D9,值 = 原始 JSON 文本)
+//! - `r:{bucket}\0{rule_id}` 生命周期规则(M11 L1;ADR-12 DL1,值 =
+//!   postcard LifecycleRule;单事务整体替换;两段式同 `m:` 先例)
 //!
 //! s: 前缀下的系统键:`s:seq`(单调计数器)、`s:key_seed_salt`(M3)、
-//! `s:value_rewrite_v3_done`(M10 V5-3 值格式重写完成标记)。
+//! `s:value_rewrite_v3_done`(M10 V5-3 值格式重写完成标记)、
+//! `s:sse_kek_seed` / `s:sse_kek_gen`(M11 K1-1 SSE-S3 KEK 体系)、
+//! `s:audit\0{seq be64}` 审计环形条目(M11 L3-1;ADR-12 DL5)。
 //!
 //! 转义规则:0x00 → 0xFF 0x00;0xFF → 0xFF 0xFF;其余原样。
 //! 保证 `o:{bucket}\0` 前缀扫描恰好覆盖该桶全部对象。
@@ -51,6 +55,10 @@ pub const PREFIX_TXN: &[u8] = b"t:";
 pub const PREFIX_SYS: &[u8] = b"s:";
 /// 访问密钥(`k:{access_key}` → KeyRecord;M3)。
 pub const PREFIX_KEY: &[u8] = b"k:";
+/// 生命周期规则(M11 L1;ADR-12 DL1:`r:{bucket}\0{rule_id}` → postcard
+/// LifecycleRule;每条规则一键,规则变更 = 单事务整体替换;删桶事务前缀
+/// 扫描清理——两段式桶级键,故不在 BucketConf::ALL 单段式清理列表)。
+pub const PREFIX_LIFECYCLE_RULE: &[u8] = b"r:";
 
 /// 系统单调计数器(每个事务 +1,单点序列化;ADR-5)。
 pub const SYS_SEQ: &[u8] = b"s:seq";
@@ -61,6 +69,22 @@ pub const SYS_KEY_SEED_SALT: &[u8] = b"s:key_seed_salt";
 /// 故 meta-export DTO 与 check 可达性扫描无需联动(§2.2 三处联动仅约束
 /// 新前缀)。
 pub const SYS_KEY_VALUE_REWRITE_V3_DONE: &[u8] = b"s:value_rewrite_v3_done";
+/// SSE-S3 KEK 种子(M11 K1-1,ADR-12 DS1;64 字节随机,首次需要时生成,
+/// 持久化;**与 s:key_seed_salt 访问密钥种子相互独立**)。红线:seed 及
+/// 其派生的 KEK/DEK 明文零导出、零日志、永不下发——meta-export DTO 不
+/// 含本键(DTO 只导桶/对象/会话类键,s: 系统键不入导出)。s: 既有前缀
+/// 系统键,删桶清理列表不受影响(桶级键域不相交)。
+pub const SYS_SSE_KEK_SEED: &[u8] = b"s:sse_kek_seed";
+/// SSE-S3 当前 KEK 代状态(M11 K1-1;值 = postcard(SseKekGenState),
+/// gen 从 1 起,当前代 = 最大代;键缺席 = 初始代 1,惰性不落盘)。
+pub const SYS_SSE_KEK_GEN: &[u8] = b"s:sse_kek_gen";
+/// 审计环形条目前缀(M11 L3-1;ADR-12 DL5):`s:audit\0{seq be64}` →
+/// postcard(fs3_core::audit::AuditEntry),每条目一键;be64 字典序 =
+/// 写入序(回放取尾、截断删头的扫描边界)。s: 既有前缀下的系统键族,
+/// 不新增前缀——meta-export DTO 不导出(s: 系统键不入导出)、check
+/// 可达性扫描与删桶清理域不相交,三处联动无需改动(同
+/// SYS_KEY_VALUE_REWRITE_V3_DONE 注释口径)。
+pub const PREFIX_AUDIT: &[u8] = b"s:audit\x00";
 
 /// 转义:S3 对象键可含任意字节,0x00/0xFF 需转义以保持键内无分隔符。
 pub fn escape(raw: &[u8]) -> Vec<u8> {
@@ -253,6 +277,26 @@ pub fn txn_key(seq: u64) -> Vec<u8> {
     k
 }
 
+/// 审计条目键:`s:audit\0{seq be64}`(M11 L3-1;字典序 = 数值序 =
+/// 写入序,同 a:/t: be64 先例)。
+pub fn audit_entry_key(seq: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(PREFIX_AUDIT.len() + 8);
+    k.extend_from_slice(PREFIX_AUDIT);
+    k.extend_from_slice(&seq.to_be_bytes());
+    k
+}
+
+/// 解析 `s:audit\0` 键中的 seq(回放种子/截断边界用)。
+pub fn parse_audit_seq(raw: &[u8]) -> Result<u64> {
+    let body = raw
+        .strip_prefix(PREFIX_AUDIT)
+        .ok_or_else(|| Error::Corrupt("audit key missing prefix".into()))?;
+    if body.len() != 8 {
+        return Err(Error::Corrupt("audit key malformed".into()));
+    }
+    Ok(u64::from_be_bytes(body.try_into().unwrap()))
+}
+
 /// 会话主键:`u:{uploadId}`。
 pub fn session_key(upload_id: &str) -> Vec<u8> {
     let mut k = Vec::with_capacity(PREFIX_UPLOAD.len() + upload_id.len());
@@ -292,6 +336,28 @@ pub fn parse_session_index_key(raw: &[u8]) -> Result<String> {
     let uid = String::from_utf8(body[sep + 1..].to_vec())
         .map_err(|_| Error::Corrupt("upload id not utf8".into()))?;
     Ok(uid)
+}
+
+/// 生命周期规则键:`r:{bucket}\0{rule_id}`(M11 L1;ADR-12 DL1;两段式同
+/// `m:` 先例——桶名/rule_id 均为 UTF-8 文本,桶名不含 0x00,分隔符唯一
+/// 可辨;rule_id 协议层限非空 ≤255 字符)。
+pub fn lifecycle_rule_key(bucket: &str, rule_id: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(PREFIX_LIFECYCLE_RULE.len() + bucket.len() + 1 + rule_id.len());
+    k.extend_from_slice(PREFIX_LIFECYCLE_RULE);
+    k.extend_from_slice(bucket.as_bytes());
+    k.push(0x00);
+    k.extend_from_slice(rule_id.as_bytes());
+    k
+}
+
+/// 桶级生命周期规则前缀:`r:{bucket}\0`(规则整体替换/删桶清理的扫描
+/// 边界;桶间天然隔离)。
+pub fn lifecycle_rules_prefix(bucket: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(PREFIX_LIFECYCLE_RULE.len() + bucket.len() + 1);
+    k.extend_from_slice(PREFIX_LIFECYCLE_RULE);
+    k.extend_from_slice(bucket.as_bytes());
+    k.push(0x00);
+    k
 }
 
 /// 分片键:`p:{uploadId}\0{part_no be32}`。
@@ -492,6 +558,40 @@ mod tests {
         let k10 = alloc_key(10);
         assert!(k1 < k9 && k9 < k10);
         assert_eq!(parse_alloc_seq(&k10).unwrap(), 10);
+    }
+
+    #[test]
+    fn audit_entry_key_byte_level_and_ordering() {
+        // M11 L3-1(ADR-12 DL5):`s:audit\0{seq be64}` 形态与排序不变量
+        assert_eq!(
+            audit_entry_key(1),
+            b"s:audit\x00\x00\x00\x00\x00\x00\x00\x00\x01".as_slice()
+        );
+        let (k1, k9, k10) = (audit_entry_key(1), audit_entry_key(9), audit_entry_key(10));
+        assert!(k1 < k9 && k9 < k10, "be64 字典序 == 数值序");
+        assert_eq!(parse_audit_seq(&k10).unwrap(), 10);
+        for k in [&k1, &k9, &k10] {
+            assert!(k.starts_with(PREFIX_AUDIT));
+        }
+        // 与既有 s: 系统键不相交(s:seq/s:key_seed_salt 等不以 s:audit\0 开头)
+        assert!(!SYS_SEQ.starts_with(PREFIX_AUDIT));
+        assert!(!SYS_SSE_KEK_GEN.starts_with(PREFIX_AUDIT));
+        assert!(parse_audit_seq(SYS_SEQ).is_err());
+        assert!(parse_audit_seq(b"s:audit\x00\x01").is_err());
+    }
+
+    #[test]
+    fn lifecycle_rule_key_byte_level_and_prefix_isolation() {
+        // M11 L1(ADR-12 DL1):`r:{bucket}\0{rule_id}` 两段式形态
+        assert_eq!(lifecycle_rule_key("b1", "r1"), b"r:b1\x00r1".as_slice());
+        assert_eq!(lifecycle_rules_prefix("b1"), b"r:b1\x00".as_slice());
+        // 规则键恒落在本桶前缀内;不串桶(含同头桶名 b1/b12)
+        assert!(lifecycle_rule_key("b1", "r1").starts_with(&lifecycle_rules_prefix("b1")));
+        assert!(!lifecycle_rule_key("b12", "r1").starts_with(&lifecycle_rules_prefix("b1")));
+        assert!(!lifecycle_rule_key("b1", "r1").starts_with(&lifecycle_rules_prefix("b12")));
+        // 与既有前缀域不相交(r: 独立前缀)
+        assert!(!lifecycle_rule_key("b1", "r1").starts_with(PREFIX_OBJECT));
+        assert!(!object_key("b1", "k").starts_with(&lifecycle_rules_prefix("b1")));
     }
 
     proptest::proptest! {

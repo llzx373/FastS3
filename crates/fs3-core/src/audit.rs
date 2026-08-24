@@ -1,11 +1,24 @@
-//! 审计环形缓冲(DESIGN §8 / TODO M3 H2)。
+//! 审计环形缓冲(DESIGN §8 / TODO M3 H2;M11 L3-1 可选持久化)。
 //!
 //! 记录 S3 操作 who/what/when/result,固定容量环形覆盖。
 //! 写路径用短锁(审计记录是每请求一次的管理面开销,不在数据热路径)。
+//!
+//! M11 L3-1(ADR-12 DL5):可选持久化环形——配置开启时 push 同步落
+//! `s:audit`(实现 = fs3-meta [`AuditPersist`]),serve 启动回放重建内存
+//! 环形。**口径写死:内存环形仍是检索面(/v1/admin/audit 零变化),
+//! 持久化是冷备 + 重启连续性**;磁盘条数上限(默认 10 万)可大于内存
+//! 容量,回放只取最新 cap 条(更旧条目仅留盘,全量磁盘检索属后续项)。
+//! 红线:审计不含密钥材料;持久化写失败只 warn 降级,绝不让请求失败。
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::Result;
+
+/// 内存环形默认容量(检索面上限;持久化冷备条数由 `[audit] max_entries`
+/// 另配,二者独立)。
+pub const DEFAULT_CAP: usize = 4096;
 
 /// 审计条目。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -26,16 +39,26 @@ pub struct AuditEntry {
     pub peer: String,
 }
 
+/// 审计持久化后端(M11 L3-1;ADR-12 DL5)。实现 = fs3-meta `s:audit` 环形
+/// (`AuditStore`);fs3-core 只依赖本 trait,不反向依赖存储层。
+/// seq 分配、条数上限与周期截断均由实现侧负责。
+pub trait AuditPersist: Send + Sync + std::fmt::Debug {
+    /// 追加一条。失败由 [`AuditRing::push`] warn 降级——实现不得 panic。
+    fn append(&self, entry: &AuditEntry) -> Result<()>;
+}
+
 /// 固定容量环形缓冲(默认 4096 条;超出覆盖最旧)。
 #[derive(Debug)]
 pub struct AuditRing {
     buf: Mutex<VecDeque<AuditEntry>>,
     cap: usize,
+    /// 持久化后端(None = 纯内存现状;M11 L3-1)。
+    persist: Option<Arc<dyn AuditPersist>>,
 }
 
 impl Default for AuditRing {
     fn default() -> Self {
-        Self::new(4096)
+        Self::new(DEFAULT_CAP)
     }
 }
 
@@ -107,10 +130,36 @@ impl AuditRing {
         AuditRing {
             buf: Mutex::new(VecDeque::with_capacity(cap.min(65536))),
             cap,
+            persist: None,
         }
     }
 
-    /// 追加一条审计记录;超容量覆盖最旧。
+    /// 持久化环形构造(M11 L3-1):`replayed` = 启动回放条目(旧→新;
+    /// 超 cap 只留最新 cap 条——内存环形是检索面,持久化是冷备,口径见
+    /// 模块文档)。回放条目不再触发持久化写(它们本就来自盘)。
+    pub fn with_persist(
+        cap: usize,
+        persist: Arc<dyn AuditPersist>,
+        replayed: Vec<AuditEntry>,
+    ) -> Self {
+        let mut buf = VecDeque::with_capacity(cap.min(65536));
+        for e in replayed {
+            if buf.len() >= cap {
+                buf.pop_front();
+            }
+            buf.push_back(e);
+        }
+        AuditRing {
+            buf: Mutex::new(buf),
+            cap,
+            persist: Some(persist),
+        }
+    }
+
+    /// 追加一条审计记录;超容量覆盖最旧。持久化开启时同步落 `s:audit`
+    /// (锁内小写:WAL 缓冲追加 µs 级,内存序 == 落盘序;写放大 = 单条
+    /// 小值,前台延迟无感——取舍写死:同步小写 + 批量截断,不批量刷盘,
+    /// 换来「重启连续性无需刷盘排程」的最简实现)。
     pub fn push(&self, who: &str, op: &str, bucket: &str, key: &str, status: u16, peer: &str) {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -130,6 +179,12 @@ impl AuditRing {
             buf.pop_front();
         }
         buf.push_back(entry);
+        if let Some(p) = &self.persist {
+            // 红线:审计写失败不得让请求失败——warn 降级,内存环形不受影响
+            if let Err(e) = p.append(buf.back().unwrap()) {
+                tracing::warn!("audit persist failed (entry kept in memory ring): {e}");
+            }
+        }
     }
 
     /// 取最近 N 条(最新在前)。
@@ -170,6 +225,35 @@ impl AuditRing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 持久化后端 mock:记录 append;`fail` 时注入错误(降级路径用)。
+    #[derive(Debug, Default)]
+    struct MockPersist {
+        appended: Mutex<Vec<AuditEntry>>,
+        fail: bool,
+    }
+
+    impl AuditPersist for MockPersist {
+        fn append(&self, entry: &AuditEntry) -> Result<()> {
+            if self.fail {
+                return Err(crate::Error::Meta("injected persist failure".into()));
+            }
+            self.appended.lock().unwrap().push(entry.clone());
+            Ok(())
+        }
+    }
+
+    fn entry(key: &str) -> AuditEntry {
+        AuditEntry {
+            ts: 1,
+            who: "ak".into(),
+            op: "PutObject".into(),
+            bucket: "b".into(),
+            key: key.into(),
+            status: 200,
+            peer: String::new(),
+        }
+    }
 
     #[test]
     fn ring_roundtrip() {
@@ -241,5 +325,43 @@ mod tests {
             ..Default::default()
         };
         assert!(ring.search(&f).is_empty());
+    }
+
+    // ── M11 L3-1:可选持久化 ──
+
+    #[test]
+    fn with_persist_replay_loads_newest_cap() {
+        let p = Arc::new(MockPersist::default());
+        let replayed: Vec<AuditEntry> = (0..6).map(|i| entry(&format!("k{i}"))).collect();
+        // 回放条目超 cap:只留最新 cap 条(冷备口径,检索面 = 内存环形)
+        let ring = AuditRing::with_persist(4, p, replayed);
+        assert_eq!(ring.len(), 4);
+        let recent = ring.recent(10);
+        assert_eq!(recent[0].key, "k5");
+        assert_eq!(recent[3].key, "k2");
+    }
+
+    #[test]
+    fn push_persists_when_enabled() {
+        let p = Arc::new(MockPersist::default());
+        let ring = AuditRing::with_persist(8, p.clone(), vec![entry("old")]);
+        ring.push("ak", "DeleteObject", "b", "k1", 204, "");
+        // 内存 + 持久化各一条新条目;回放条目不重复落盘
+        assert_eq!(p.appended.lock().unwrap().len(), 1);
+        assert_eq!(p.appended.lock().unwrap()[0].key, "k1");
+        assert_eq!(ring.len(), 2);
+    }
+
+    #[test]
+    fn push_persist_failure_degrades_to_memory_only() {
+        let p = Arc::new(MockPersist {
+            appended: Mutex::new(Vec::new()),
+            fail: true,
+        });
+        let ring = AuditRing::with_persist(8, p, vec![]);
+        // 红线:持久化写失败不 panic、请求面(内存环形)不受影响
+        ring.push("system:lifecycle", "DeleteObject", "b", "k", 204, "");
+        assert_eq!(ring.len(), 1);
+        assert_eq!(ring.recent(1)[0].who, "system:lifecycle");
     }
 }

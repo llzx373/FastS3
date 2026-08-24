@@ -21,9 +21,7 @@
 //! 压缩 worker **不获取引擎大锁**:只通过 `meta`(rocksdb 乐观事务)、`alloc`
 //! (内部 Mutex)、`io`(短临界区)交互(§6.3)。
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use fs3_alloc::{Allocator, Staged};
 use fs3_core::crc32c::crc32c;
@@ -32,6 +30,7 @@ use fs3_device::AlignedBuffer;
 use fs3_meta::{AllocDraft, MetaStore};
 
 use crate::io::{read_exact, write_all, IoEngine};
+use crate::worker::{BackgroundWorker, BatchOutcome, Throttle};
 
 /// 压缩配置(ADR-9 §6.4 节流;默认值按 §6.4)。
 #[derive(Debug, Clone)]
@@ -131,7 +130,11 @@ impl Compactor {
     }
 
     /// 一轮压缩(发现 → 拷贝 → 迁移 → 释放/封口)。
-    pub fn compact_batch(&self) -> Result<CompactionReport> {
+    ///
+    /// `budget` = 全局共享令牌桶(ADR-12 DL2,`worker::Throttle`):速率
+    /// 口径不变(rate × 100ms 突发 + rate 匀速回充);前台 compact_once
+    /// 与后台 worker 走同一桶,与生命周期执行器等后续实例共享。
+    pub fn compact_batch(&self, budget: &Throttle) -> Result<CompactionReport> {
         let _guard = match self.running.try_lock() {
             Ok(g) => g,
             Err(_) => return Ok(CompactionReport::default()), // 已有批次在跑
@@ -156,7 +159,6 @@ impl Compactor {
         if candidates.is_empty() {
             return Ok(CompactionReport::default());
         }
-        let started = Instant::now();
         let mut report = CompactionReport {
             candidates: candidates.len(),
             ..Default::default()
@@ -241,21 +243,24 @@ impl Compactor {
         let mut first_committed = false;
 
         for item in &mut plan {
-            // 速率预算(ADR-9 §6.4 全局速率上限):每批含 rate × 100ms 的
-            // 突发额度(小批量一次完成),之后按 rate × 已过时间 节流
-            let elapsed = started.elapsed().as_secs_f64();
-            let grace = 0.1f64;
-            let mut allowed =
-                (self.cfg.rate_limit_bytes_per_sec as f64 * elapsed.max(grace)) as u64;
-            // REVIEW §3.8 / ADR-9 §6.4:容量水位提速——使用率 > 85% 时预算 ×4
-            // (空间比延迟更稀缺时提高压缩优先级)。
-            let total_cap = self.alloc.len() * capacity;
-            if total_cap > 0 && self.alloc.live_bytes_total() * 100 / total_cap > 85 {
-                allowed = allowed.saturating_mul(4);
-            }
-            if report.copied_bytes > allowed {
+            // 速率预算(ADR-9 §6.4 全局速率上限;ADR-12 DL2 起由全局
+            // 共享令牌桶执行,口径不变):桶已透支(等价旧实现
+            // copied_bytes > rate × max(elapsed, 100ms))即中止本批,
+            // 余下候选留下轮;单个对象/分片的段序列仍整体拷完(item
+            // 原子性同旧实现,超支记负余额)。
+            if budget.overdrawn() {
                 break;
             }
+            // REVIEW §3.8 / ADR-9 §6.4:容量水位提速——使用率 > 85% 时
+            // 提速 ×4(空间比延迟更稀缺时提高压缩优先级)。桶口径下消费
+            // 按 1/4 记账(旧实现为预算 ×4,数学等价)。
+            let total_cap = self.alloc.len() * capacity;
+            let cost_divisor: u64 =
+                if total_cap > 0 && self.alloc.live_bytes_total() * 100 / total_cap > 85 {
+                    4
+                } else {
+                    1
+                };
             // 容量预算(M10 S5 gate 实测缺陷):压缩 extent 数据区上限为 capacity,
             // 候选 extent 数(top_k)不约束累计活段字节;本对象/分片的段放不进
             // 剩余空间就整体跳过(留给下一轮的新 extent),绝不溢出写到相邻
@@ -270,6 +275,9 @@ impl Compactor {
                     Ok(new_seg) => {
                         item.new_segments.push(new_seg);
                         report.copied_bytes += old.len as u64;
+                        // 段成功即向全局桶记账(含半拷贝消费,口径同旧
+                        // 实现 copied_bytes)
+                        budget.consume(old.len as u64 / cost_divisor);
                     }
                     Err(e) => {
                         ok = false;
@@ -445,55 +453,18 @@ fn to_alloc_draft(staged: &Staged) -> AllocDraft {
     }
 }
 
-/// 后台 worker 句柄。
-pub struct CompactorHandle {
-    stop: Arc<AtomicBool>,
-    paused: Arc<AtomicBool>,
-    join: Option<std::thread::JoinHandle<()>>,
-}
-
-impl CompactorHandle {
-    pub fn spawn(compactor: Arc<Compactor>, cfg: &CompactionConfig) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let paused = Arc::new(AtomicBool::new(false));
-        let (s, p) = (stop.clone(), paused.clone());
-        let poll = Duration::from_millis(cfg.poll_interval_ms.max(10));
-        let join = std::thread::Builder::new()
-            .name("fs3-compactor".to_string())
-            .spawn(move || {
-                while !s.load(Ordering::Acquire) {
-                    if !p.load(Ordering::Acquire) {
-                        if let Err(e) = compactor.compact_batch() {
-                            tracing::warn!("compaction batch failed: {e}");
-                        }
-                    }
-                    std::thread::sleep(poll);
-                }
-            })
-            .expect("spawn compactor thread");
-        CompactorHandle {
-            stop,
-            paused,
-            join: Some(join),
-        }
-    }
-
-    pub fn set_paused(&self, paused: bool) {
-        self.paused.store(paused, Ordering::Release);
-    }
-
-    /// 停止并回收线程(引擎关闭/崩溃模拟时调用)。
-    pub fn stop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
-    }
-}
-
-impl Drop for CompactorHandle {
-    fn drop(&mut self) {
-        self.stop();
+/// 压缩 worker = `BackgroundWorker` 抽象的首个实例(ADR-12 DL2):
+/// 调度(spawn/stop/pause/轮询)与令牌桶节流由 `crate::worker` 承担,
+/// 此处只做批处理业务与批额度汇报。前后台互斥仍由 `running` 锁保证
+/// (compact_batch 内 try_lock),与调度层正交。
+impl BackgroundWorker for Arc<Compactor> {
+    fn run_batch(&mut self, budget: &Throttle) -> Result<BatchOutcome> {
+        let r = self.compact_batch(budget)?;
+        Ok(BatchOutcome {
+            bytes: r.copied_bytes,
+            items: (r.migrated_objects + r.migrated_parts) as u64,
+            more: r.candidates > 0,
+        })
     }
 }
 
@@ -502,6 +473,15 @@ mod tests {
     use super::*;
     use crate::Engine;
     use std::io::Cursor;
+
+    /// CompletePart 便捷构造(M11 C1-4;无逐分片 checksum 声明)。
+    fn cp(part_number: u32, etag_hex: String) -> fs3_core::CompletePart {
+        fs3_core::CompletePart {
+            part_number,
+            etag_hex,
+            checksum: None,
+        }
+    }
 
     #[test]
     fn compaction_reclaims_hole_extents() {
@@ -794,10 +774,20 @@ mod tests {
         let mut metas = Vec::new();
         for i in 0..4 {
             let uid = e
-                .create_multipart("b1", &format!("big{i}"), None, vec![], vec![], vec![])
+                .create_multipart(
+                    "b1",
+                    &format!("big{i}"),
+                    None,
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                    None,
+                    None,
+                )
                 .unwrap();
             let pm = e
-                .upload_part(&uid, 1, &mut Cursor::new(payload.clone()))
+                .upload_part(&uid, 1, &mut Cursor::new(payload.clone()), None, None)
                 .unwrap();
             uids.push(uid);
             metas.push(pm);
@@ -831,7 +821,14 @@ mod tests {
 
         // 剩余会话仍可完成,数据完好
         let m = e
-            .complete_multipart("b1", "big3", &uids[3], &[(1, metas[3].etag_hex())])
+            .complete_multipart(
+                "b1",
+                "big3",
+                &uids[3],
+                &[cp(1, metas[3].etag_hex())],
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(m.size, payload.len() as u64);
         let mut out = Vec::new();
@@ -873,10 +870,10 @@ mod tests {
             e.put("b1", "k0", &mut Cursor::new(data.clone())).unwrap();
             // 分片同样写 extent 0:p: 前缀对象
             let uid = e
-                .create_multipart("b1", "big", None, vec![], vec![], vec![])
+                .create_multipart("b1", "big", None, vec![], vec![], vec![], None, None, None)
                 .unwrap();
             let pm = e
-                .upload_part(&uid, 1, &mut Cursor::new(data.clone()))
+                .upload_part(&uid, 1, &mut Cursor::new(data.clone()), None, None)
                 .unwrap();
             e.delete("b1", "k0").unwrap(); // seal-on-delete + 候选(活段 1MiB)
                                            // 手动阶段 2:分配压缩 extent + 拷贝分片数据,但不提交迁移事务
@@ -907,7 +904,7 @@ mod tests {
         let (uid, etag) = datasets;
         // 完成 multipart → 数据从旧段读出,必须完好
         let m = e
-            .complete_multipart("b1", "big", &uid, &[(1, etag)])
+            .complete_multipart("b1", "big", &uid, &[cp(1, etag)], None, None)
             .unwrap();
         assert_eq!(m.size, 1024 * 1024);
         let mut out = Vec::new();

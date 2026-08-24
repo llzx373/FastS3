@@ -474,7 +474,14 @@ async fn handle(
             .collect(),
         _ => vec![],
     };
-    let decoded_path = percent_decode(&raw_path);
+    // M11 G-1:路径 percent-decode 后须为合法 UTF-8 且不含控制字符
+    // (AWS 口径:→ 400 InvalidURI "Couldn't parse the specified URI.";
+    // 此前 from_utf8_lossy 静默替换 → 404,RGW 同口径,s3-tests
+    // test_object_read_unreadable 标 fails_on_rgw、对 AWS 期望 400)。
+    let Some(decoded_path) = percent_decode_checked(&raw_path) else {
+        let err = S3Error::new(fs3_s3::S3ErrorCode::InvalidURI);
+        return Ok(error_response(&err, &host_id, &request_id));
+    };
 
     // M10 S2:OPTIONS 处理(须在 S3 路由之前;免认证,AWS 预检语义)——
     // - 预检(带 Origin + Access-Control-Request-Method):匹配桶级 CORS
@@ -745,6 +752,7 @@ fn render_with(
             zc_fd,
             zc_verify,
             versioning,
+            sse_key,
         } => {
             // 零拷贝候选(h1 + 设备支持 + 对象 extent 段 + 未开 verify_reads)
             let zc_body = zc.and_then(|(ctx, is_h2)| {
@@ -814,6 +822,8 @@ fn render_with(
                         length,
                         &mut pos,
                         &mut buf,
+                        // M11 E1-3:SSE 对象回传请求期密钥解密(零拷贝已禁)
+                        sse_key.as_ref(),
                     ) {
                         Ok(n) => n,
                         Err(e) => {
@@ -855,6 +865,7 @@ fn render_with(
             boundary,
             part_content_type,
             versioning,
+            sse_key,
         } => {
             let total_len: u64 = ranges
                 .iter()
@@ -898,6 +909,8 @@ fn render_with(
                             len,
                             &mut pos,
                             &mut buf,
+                            // M11 E1-3:SSE 对象回传请求期密钥解密
+                            sse_key.as_ref(),
                         ) {
                             Ok(n) => n,
                             Err(err) => {
@@ -1065,6 +1078,34 @@ pub fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// percent_decode 的校验变体(M11 G-1,请求路径专用):解码结果须为
+/// 合法 UTF-8 且不含控制字符(Unicode Cc:C0/C1/DEL——AWS 对
+/// `\xae\x8a` 一类键回 400 InvalidURI "Couldn't parse the specified
+/// URI.",s3-tests test_object_read_unreadable 逐字断言);不满足 →
+/// None(调用方回 400 InvalidURI)。合法输入与 [`percent_decode`]
+/// 逐字节一致(含非法 %XX 保持字面)。
+fn percent_decode_checked(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() + 1 && i + 2 <= bytes.len() - 1 + 1 {
+            if let (Some(h), Some(l)) = (hex_val(bytes.get(i + 1)), hex_val(bytes.get(i + 2))) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    let s = String::from_utf8(out).ok()?;
+    if s.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    Some(s)
+}
+
 fn hex_val(b: Option<&u8>) -> Option<u8> {
     match b {
         Some(b'0'..=b'9') => Some(b.unwrap() - b'0'),
@@ -1086,6 +1127,24 @@ mod tests {
         assert_eq!(percent_decode("%E4%B8%AD"), "中");
         assert_eq!(percent_decode("100%"), "100%");
         assert_eq!(percent_decode("a+b"), "a+b");
+    }
+
+    #[test]
+    fn percent_decode_checked_rejects_invalid_utf8() {
+        // 合法输入与 percent_decode 一致(含多字节 UTF-8 与字面 %)
+        assert_eq!(
+            percent_decode_checked("/b/k%20x").as_deref(),
+            Some("/b/k x")
+        );
+        assert_eq!(percent_decode_checked("%E4%B8%AD").as_deref(), Some("中"));
+        assert_eq!(percent_decode_checked("100%").as_deref(), Some("100%"));
+        // 非法 UTF-8 字节序列 → None
+        assert_eq!(percent_decode_checked("%FF"), None);
+        // 合法 UTF-8 但含 C1 控制符(s3-tests test_object_read_unreadable
+        // 的 '\xae\x8a-' = %C2%AE%C2%8A- 形态)→ None → 400 InvalidURI
+        assert_eq!(percent_decode_checked("/b/%C2%AE%C2%8A-"), None);
+        // C0 控制符同拒
+        assert_eq!(percent_decode_checked("/b/%09tab"), None);
     }
 
     #[test]

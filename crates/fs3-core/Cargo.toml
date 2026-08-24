@@ -12,14 +12,23 @@ serde.workspace = true
 # 密钥加盐哈希(KeyRecord::hash_secret;HMAC-SHA256)
 hmac.workspace = true
 sha2.workspace = true
+# M11 checksum 五族(ADR-12):SHA1 封装见 checksum.rs(SHA256 复用上方 sha2)
+sha1.workspace = true
 hex.workspace = true
 # 密钥密文(AES-256-GCM;ADR:secret 磁盘存储 = 加盐哈希 + 种子盐派生
 # 密钥加密,重启可恢复明文用于 SigV4 验证;admin API 只下发一次)
 aes-gcm = "0.10"
+# M11 E1-1 SSE-C 密钥材料 Drop 擦除(ADR-12 DE1:HKDF 派生后 zeroize
+# 擦除原始 key);锁树已有 1.9(rustls/aws-lc-rs 传递引入),无新增包。
+zeroize = "1"
+# SSE-C 密钥 MD5 校验子(ADR-12 D-E5:SseCKey::key_md5)
+md-5.workspace = true
 base64.workspace = true
 # 对象元数据值编码(ADR-9 §13:[版本字节] + postcard);本 crate 提供
 # ObjectMeta::encode_value/decode_value,供 fs3-meta 存储层使用。
 postcard.workspace = true
+# M11 L3-1 审计持久化:写失败降级 warn 日志(红线 = 请求不失败)。
+tracing.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

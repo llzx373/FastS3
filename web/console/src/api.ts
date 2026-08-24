@@ -187,6 +187,19 @@ export interface S3Tag {
   value: string;
 }
 
+/**
+ * M11:桶级生命周期规则(AWS Rule 子集;Expiration 三字段互斥恰选其一;
+ * Filter 单 Tag 起步,缺省 = 全部对象)。
+ */
+export interface LifecycleRule {
+  ID: string;
+  Status: "Enabled" | "Disabled";
+  Filter?: { Prefix?: string; Tag?: { Key: string; Value: string } };
+  Expiration?: { Days?: number; Date?: string; ExpiredObjectDeleteMarker?: boolean };
+  NoncurrentVersionExpiration?: { NoncurrentDays?: number };
+  AbortIncompleteMultipartUpload?: { DaysAfterInitiation?: number };
+}
+
 export interface ListResult {
   objects: ListedObject[];
   prefixes: string[];
@@ -324,6 +337,24 @@ export const api = {
     }),
   deleteBucketPolicy: (bucket: string) =>
     request<Record<string, unknown>>("DELETE", `/api/buckets/${encodeURIComponent(bucket)}/policy`),
+
+  // ── M11:生命周期 / 桶默认加密 ──
+  getLifecycle: (bucket: string) =>
+    request<{ Rules: LifecycleRule[] }>("GET", `/api/buckets/${encodeURIComponent(bucket)}/lifecycle`),
+  putLifecycle: (bucket: string, rules: LifecycleRule[]) =>
+    request<{ Rules: LifecycleRule[] }>("PUT", `/api/buckets/${encodeURIComponent(bucket)}/lifecycle`, {
+      Rules: rules,
+    }),
+  deleteLifecycle: (bucket: string) =>
+    request<Record<string, unknown>>("DELETE", `/api/buckets/${encodeURIComponent(bucket)}/lifecycle`),
+  getEncryption: (bucket: string) =>
+    request<{ SSEAlgorithm: string }>("GET", `/api/buckets/${encodeURIComponent(bucket)}/encryption`),
+  putEncryption: (bucket: string) =>
+    request<{ SSEAlgorithm: string }>("PUT", `/api/buckets/${encodeURIComponent(bucket)}/encryption`, {
+      SSEAlgorithm: "AES256",
+    }),
+  deleteEncryption: (bucket: string) =>
+    request<Record<string, unknown>>("DELETE", `/api/buckets/${encodeURIComponent(bucket)}/encryption`),
   getObjectTags: (bucket: string, key: string) =>
     request<{ tags: S3Tag[] }>(
       "GET",

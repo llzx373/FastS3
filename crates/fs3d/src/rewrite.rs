@@ -1,17 +1,20 @@
 //! 值格式在线重写(M10 V5-3;ADR-11 D0 / DESIGN-FUTURE §2.4):ObjectMeta
-//! v2 → v3 逐键重写工具。
+//! 旧版本值(v2/v3)→ 当前版本逐键重写工具。
 //!
 //! 背景:v1.0.x 写入的存量对象值 = `[版本字节 2] + postcard(v2 结构)`;v1.1
-//! 起写入恒为 v3。双读(decode_value)使旧值零迁移可读,但为:
+//! 起写入恒为 v3,M11 起恒为 v4(ADR-12 D-E3 尾部追加 part_checksums)。
+//! 双读(decode_value)使旧值零迁移可读,但为:
 //! ① 消除每次读的回退解码尝试;② 落实「重写完成前禁回滚」的升级纪律
-//! (§2.4:v3 值旧二进制拒绝解码,回滚到 v1.0.x 仅在重写**未完成**且
+//! (§2.4:v3+ 值旧二进制拒绝解码,回滚到 v1.0.x 仅在重写**未完成**且
 //! 无 v1.1 新写时可行;完成标记 = `s:value_rewrite_v3_done`) —— 本工具
-//! 在停机/维护窗口把全部对象值重写为 v3。
+//! 在停机/维护窗口把全部对象值归一重写为当前版本。
 //!
 //! 语义:
-//! - 幂等:重写 = 双读结果按 v3 重编码同值;已 v3 的值跳过,中断可续跑;
-//! - 跳过:已 v3 值与删除标记(标记恒 v3 —— 版本化是 v1.1 新键,写入
-//!   恒 v3;若防御性遇到 v2 标记仍重写,完成不变量 = 全库零 v2);
+//! - 幂等:重写 = 双读结果按当前版本重编码同值;已当前版本的值跳过,
+//!   中断可续跑;
+//! - 跳过:当前版本值与删除标记(标记恒为当前版本 —— 版本化是 v1.1 新键,
+//!   写入恒当前版本;若防御性遇到旧版本标记仍重写,完成不变量 = 全库零
+//!   v2);
 //! - 节流:Tier2 语义(每秒最多 `rate` 次重写,默认 500/s;0 = 不限速);
 //! - 暂停:`--pause-file <path>` 存在即暂停(轮询 1s,`touch` 暂停 /
 //!   `rm` 恢复);
@@ -38,12 +41,12 @@ pub struct RewriteValuesArgs {
     /// 存在即暂停(轮询 1s;`touch` 暂停,`rm` 恢复)
     #[arg(long)]
     pub pause_file: Option<PathBuf>,
-    /// 只探测值版本分布(v2/v3 计数)不重写(演练/巡检断言用)
+    /// 只探测值版本分布(v2/当前可读计数)不重写(演练/巡检断言用)
     #[arg(long)]
     pub count_only: bool,
 }
 
-/// 跑一轮值格式重写:v2 → v3(全部 o: 键,含版本条目)。
+/// 跑一轮值格式重写:旧版本值 → 当前版本(全部 o: 键,含版本条目)。
 pub fn run_rewrite(meta_dir: &Path, args: &RewriteValuesArgs) -> Result<RewriteReport> {
     let store = MetaStore::open(meta_dir, &MetaConfig::default())?;
     if store.value_rewrite_v3_done()? {
@@ -68,7 +71,8 @@ pub fn run_rewrite(meta_dir: &Path, args: &RewriteValuesArgs) -> Result<RewriteR
                 std::thread::sleep(Duration::from_secs(1));
             }
         }
-        // 已 v3:跳过(删除标记恒落此处 —— 版本化键是 v1.1 新键,写入恒 v3)
+        // 已当前版本:跳过(删除标记恒落此处 —— 版本化键是 v1.1 新键,
+        // 写入恒当前版本)
         if e.value_version == fs3_core::OBJECT_META_VERSION {
             if e.meta.is_delete_marker {
                 skipped_marker += 1;
@@ -85,7 +89,7 @@ pub fn run_rewrite(meta_dir: &Path, args: &RewriteValuesArgs) -> Result<RewriteR
                 std::thread::sleep(Duration::from_secs_f64(lag.min(1.0)));
             }
         }
-        // 重写 = 双读归一后的同值 v3 重编码(幂等);单事务,不改统计/分配
+        // 重写 = 双读归一后的同值当前版本重编码(幂等);单事务,不改统计/分配
         match store.commit_object_meta_update(&e.raw_key, &e.meta) {
             Ok(_) => rewritten += 1,
             Err(err) => {
@@ -108,7 +112,7 @@ pub fn run_rewrite(meta_dir: &Path, args: &RewriteValuesArgs) -> Result<RewriteR
         if v2 == 0 {
             store.mark_value_rewrite_v3_done()?;
             println!(
-                "rewrite-values: all values at v3; done marker written (s:value_rewrite_v3_done)."
+                "rewrite-values: all values at current version; done marker written (s:value_rewrite_v3_done)."
             );
             println!(
                 "rewrite-values: 回滚纪律(§2.4):此后禁止回滚到 v1.0.x 二进制(其拒绝解码 \
@@ -195,6 +199,7 @@ mod tests {
             checksum: None,
             retention: None,
             legal_hold: false,
+            part_checksums: Vec::new(),
         }
     }
 
@@ -211,7 +216,7 @@ mod tests {
         }
     }
 
-    /// 混合库:v3 单键 + v2 单键 + v3 版本条目 + v2 版本条目 + v3 删除标记。
+    /// 混合库:当前版本单键 + v2 单键 + 当前版本版本条目 + v2 版本条目 + 删除标记。
     fn mixed_store(dir: &Path) -> (MetaStore, [u8; 16], [u8; 16]) {
         let s = MetaStore::open(dir, &MetaConfig::default()).unwrap();
         s.commit_bucket_put("b1", &bucket_meta()).unwrap();

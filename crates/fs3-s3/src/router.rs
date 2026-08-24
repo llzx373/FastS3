@@ -77,6 +77,33 @@ pub enum Operation {
     DeleteBucketPolicy {
         bucket: String,
     },
+    // —— 桶默认加密(M11 K1-2;ADR-12 DS2/DS3,BucketMeta v2 字段填充) ——
+    /// PUT ?encryption:XML 路由层已解析校验(仅 AES256;KMS 类显式拒绝)。
+    PutBucketEncryption {
+        bucket: String,
+        algorithm: fs3_core::SseAlgorithm,
+    },
+    GetBucketEncryption {
+        bucket: String,
+    },
+    DeleteBucketEncryption {
+        bucket: String,
+    },
+    // —— 桶生命周期(M11 L1;ADR-12 DL1,`r:{bucket}\0{rule_id}` 键) ——
+    /// PUT ?lifecycle:规则集路由层已解析校验(v1.2 子集;Transition 族与
+    /// ObjectSize* 过滤器显式 NotImplemented)。AWS 现名
+    /// PutBucketLifecycleConfiguration,旧名 PutBucketLifecycle 同线格式
+    /// 同语义,单路由承载。
+    PutBucketLifecycleConfiguration {
+        bucket: String,
+        rules: Vec<fs3_core::LifecycleRule>,
+    },
+    GetBucketLifecycleConfiguration {
+        bucket: String,
+    },
+    DeleteBucketLifecycleConfiguration {
+        bucket: String,
+    },
     /// POST 表单上传(M10 S4;浏览器 POST policy)。仅 multipart/form-data
     /// 在服务层受理;其他 Content-Type 维持原 MethodNotAllowed。
     PostObject {
@@ -157,8 +184,9 @@ pub enum Operation {
         bucket: String,
         key: String,
         upload_id: String,
-        /// 客户端声明的 (part_no, etag hex)。
-        parts: Vec<(u32, String)>,
+        /// 客户端声明的分片列表(part_no, etag hex, 可选逐分片 checksum;
+        /// M11 C1-4 起 checksum 元素参与服务端比对)。
+        parts: Vec<fs3_core::CompletePart>,
     },
     AbortMultipartUpload {
         bucket: String,
@@ -216,6 +244,14 @@ pub enum Operation {
         bucket: String,
         key: String,
         /// ?versionId 寻址(ADR-11 §3.4.3;None = 当前版本)。
+        version_id: Option<VersionIdArg>,
+    },
+    /// GetObjectAttributes(M11 C1-3,ADR-12 D-E2:对象级 GET ?attributes):
+    /// 请求属性列表由 x-amz-object-attributes 头携带(服务层解析;五种:
+    /// ETag/ObjectSize/Checksum/ObjectParts/StorageClass)。
+    GetObjectAttributes {
+        bucket: String,
+        key: String,
         version_id: Option<VersionIdArg>,
     },
     HeadObject {
@@ -541,13 +577,40 @@ impl Router {
                     _ => Err(S3Error::new(S3ErrorCode::MethodNotAllowed)),
                 };
             }
+            // M11 K1-2:桶默认加密(ADR-12 DS2/DS3;BucketMeta v2 字段,无独立
+            // 键;XML body 路由层解析校验,仅 AES256,KMS 类显式拒绝)
+            if has_q("encryption") {
+                return match method {
+                    "PUT" => Ok(Operation::PutBucketEncryption {
+                        bucket,
+                        algorithm: crate::xml::parse_bucket_encryption(body)?,
+                    }),
+                    "GET" => Ok(Operation::GetBucketEncryption { bucket }),
+                    "DELETE" => Ok(Operation::DeleteBucketEncryption { bucket }),
+                    _ => Err(S3Error::new(S3ErrorCode::MethodNotAllowed)),
+                };
+            }
+            // M11 L1:桶生命周期(ADR-12 DL1;`r:` 键;XML body 路由层解析
+            // 校验——v1.2 子集,Transition 族/ObjectSize* 显式 NotImplemented)
+            if has_q("lifecycle") {
+                return match method {
+                    "PUT" => Ok(Operation::PutBucketLifecycleConfiguration {
+                        bucket,
+                        rules: crate::xml::parse_lifecycle_configuration(body)?,
+                    }),
+                    "GET" => Ok(Operation::GetBucketLifecycleConfiguration { bucket }),
+                    "DELETE" => Ok(Operation::DeleteBucketLifecycleConfiguration { bucket }),
+                    _ => Err(S3Error::new(S3ErrorCode::MethodNotAllowed)),
+                };
+            }
             // 不支持/未实现的子资源
             for unsupported in [
                 "acl",
                 // GetBucketPolicyStatus 属 PublicAccessBlock 族(远期;M10 S3 不做,
                 // 显式 501 不静默落列表)
                 "policyStatus",
-                "lifecycle",
+                // "lifecycle" 自 M11 L1 起已实现(Put/Get/DeleteBucketLifecycle-
+                // Configuration),出表接线
                 "website",
                 "notification",
                 "replication",
@@ -558,7 +621,6 @@ impl Router {
                 "partNumber",
                 "versions",
                 "versionId",
-                "encryption",
                 "object-lock",
                 "publicAccessBlock",
                 "accelerate",
@@ -704,10 +766,13 @@ impl Router {
                 key,
                 version_id: parse_version_id_param(get_q("versionId").as_deref())?,
             }),
-            // V6-1:GetObjectAttributes 属 checksum 族(v1.2);此前静默落到
-            // GetObject 返回对象体(客户端 200 解析失败重试风暴),改显式 501
-            "GET" if has_q("attributes") => Err(S3Error::new(S3ErrorCode::NotImplemented)
-                .with_message("GetObjectAttributes is not implemented")),
+            // M11 C1-3:GetObjectAttributes(ADR-12 D-E2:对象级 GET
+            // ?attributes,支持 ?versionId;属性列表头在服务层解析)
+            "GET" if has_q("attributes") => Ok(Operation::GetObjectAttributes {
+                bucket,
+                key,
+                version_id: parse_version_id_param(get_q("versionId").as_deref())?,
+            }),
             "DELETE" if has_q("tagging") => Ok(Operation::DeleteObjectTagging {
                 bucket,
                 key,
@@ -932,10 +997,33 @@ mod tests {
                 bucket: "b1".into()
             }
         );
-        // 未实现子资源(?policy 自 M10 S3 起已实现,改用 lifecycle 断言)
-        let q = vec![("lifecycle".into(), "".into())];
+        // 未实现子资源(?policy 自 M10 S3、?lifecycle 自 M11 L1 起已实现,
+        // 改用 website 断言)
+        let q = vec![("website".into(), "".into())];
         let err = r.route("GET", "localhost", "/b1", &q, b"").unwrap_err();
         assert_eq!(err.code, S3ErrorCode::NotImplemented);
+        // M11 L1:?lifecycle 三方法分流(XML 路由层解析校验)
+        let q = vec![("lifecycle".into(), "".into())];
+        let op = r.route("GET", "localhost", "/b1", &q, b"").unwrap();
+        assert!(
+            matches!(op, Operation::GetBucketLifecycleConfiguration { bucket } if bucket == "b1")
+        );
+        let lc = br#"<LifecycleConfiguration><Rule><ID>r1</ID><Filter/><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>"#;
+        let op = r.route("PUT", "localhost", "/b1", &q, lc).unwrap();
+        assert!(
+            matches!(op, Operation::PutBucketLifecycleConfiguration { bucket, ref rules } if bucket == "b1" && rules.len() == 1)
+        );
+        // PUT 非法规则体 → 路由层即 400
+        let err = r
+            .route("PUT", "localhost", "/b1", &q, b"<oops")
+            .unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::MalformedXML);
+        let op = r.route("DELETE", "localhost", "/b1", &q, b"").unwrap();
+        assert!(
+            matches!(op, Operation::DeleteBucketLifecycleConfiguration { bucket } if bucket == "b1")
+        );
+        let err = r.route("POST", "localhost", "/b1", &q, b"").unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::MethodNotAllowed);
         // M10 S3:?policy 三方法分流
         let q = vec![("policy".into(), "".into())];
         let op = r.route("GET", "localhost", "/b1", &q, b"").unwrap();
@@ -1011,7 +1099,14 @@ mod tests {
             Operation::CompleteMultipartUpload {
                 parts, upload_id, ..
             } => {
-                assert_eq!(parts, vec![(1, "a".to_string())]);
+                assert_eq!(
+                    parts,
+                    vec![fs3_core::CompletePart {
+                        part_number: 1,
+                        etag_hex: "a".to_string(),
+                        checksum: None,
+                    }]
+                );
                 assert_eq!(upload_id, "u1");
             }
             other => panic!("{other:?}"),
@@ -1317,6 +1412,42 @@ mod tests {
         assert!(matches!(
             op,
             Operation::GetObjectTagging {
+                version_id: Some(VersionIdArg::Vk(_)),
+                ..
+            }
+        ));
+        // M11 C1-3:GET ?attributes 路由(含 ?versionId 寻址;不再 501)
+        let op = r
+            .route(
+                "GET",
+                "localhost",
+                "/b1/k",
+                &[("attributes".into(), "".into())],
+                b"",
+            )
+            .unwrap();
+        assert!(matches!(
+            op,
+            Operation::GetObjectAttributes {
+                version_id: None,
+                ..
+            }
+        ));
+        let op = r
+            .route(
+                "GET",
+                "localhost",
+                "/b1/k",
+                &[
+                    ("attributes".into(), "".into()),
+                    ("versionId".into(), vid.into()),
+                ],
+                b"",
+            )
+            .unwrap();
+        assert!(matches!(
+            op,
+            Operation::GetObjectAttributes {
                 version_id: Some(VersionIdArg::Vk(_)),
                 ..
             }

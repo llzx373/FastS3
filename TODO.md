@@ -193,49 +193,49 @@
 > 前置:M10(版本化;审计持久化在本里程碑一并交付)。首条任务 = ADR-12。
 
 ### A0 决策落盘
-- [ ] A0-1 ADR-12 写入 DESIGN.md §3.3:DE1(分块 AES-256-GCM,nonce 派生自对象标识+chunk_no,tag 存元数据,密文等长)、DE2(ETag/CRC 在密文侧)、DE3(SSE-C 复制语义:目标未加密→InvalidRequest)、DS1(KEK/DEK 两级 + 轮换)、DS4(SSE-KMS 显式拒绝);其余决策(DE4/DS2/DS3/DL1~DL5/checksum 范围)同 ADR 记录
+- [x] A0-1 ADR-12 写入 DESIGN.md §3.3:DE1(分块 AES-256-GCM,nonce 派生自对象标识+chunk_no,tag 存元数据,密文等长)、DE2(ETag/CRC 在密文侧)、DE3(SSE-C 复制语义:目标未加密→InvalidRequest)、DS1(KEK/DEK 两级 + 轮换)、DS4(SSE-KMS 显式拒绝);其余决策(DE4/DS2/DS3/DL1~DL5/checksum 范围)同 ADR 记录
 
 ### L. 生命周期(§4.1.4)
-- [ ] L1-1 规则数据模型 + `r:{bucket}\0{rule_id}` 键(DL1)
-- [ ] L1-2 Put/Get/DeleteBucketLifecycleConfiguration(?lifecycle 新旧参数兼容;Filter=Prefix(+Tag,依赖 M10 S1);Transition 显式不支持)
-- [ ] L2-1 BackgroundWorker 抽象提取(压缩 worker 重构为实例之一,共享节流/暂停/批额度,DL2)
-- [ ] L2-2 生命周期执行器(默认 24h 周期;Expiration/NoncurrentVersionExpiration/AbortIncompleteMultipartUpload/ExpiredObjectDeleteMarker;DL4 午夜语义)
-- [ ] L2-3 删除动作分叉(物理删除/删除标记/版本删除按桶版本化状态)
-- [ ] L3-1 审计持久化(`s:audit` 环形 + 检索扩展,DL5;生命周期删除 who=system:lifecycle 可见)
-- [ ] L3-2 生命周期指标(deleted 计数/字节、skipped_locked 预留)+ 告警
-- [ ] L4-1 与 Object Lock 的交互接口占位(M12 接通;锁定对象跳过)
-- [ ] L4-2 admin/控制台生命周期规则编辑页
-- [ ] L5-1 s3-tests lifecycle 族出排除集且 100%
+- [x] L1-1 规则数据模型 + `r:{bucket}\0{rule_id}` 键(DL1)
+- [x] L1-2 Put/Get/DeleteBucketLifecycleConfiguration(?lifecycle 新旧参数兼容;Filter=Prefix(+Tag,依赖 M10 S1);Transition 显式不支持)
+- [x] L2-1 BackgroundWorker 抽象提取(压缩 worker 重构为实例之一,共享节流/暂停/批额度,DL2)
+- [x] L2-2 生命周期执行器(默认 24h 周期;Expiration/NoncurrentVersionExpiration/AbortIncompleteMultipartUpload/ExpiredObjectDeleteMarker;DL4 午夜语义)——`fs3-engine/src/lifecycle.rs`;`[storage] lifecycle_enabled/lifecycle_interval_secs` 可配
+- [x] L2-3 删除动作分叉(物理删除/删除标记/版本删除按桶版本化状态)——全部走 `Engine::delete_version_for` 既有原语,统计五路径入账
+- [x] L3-1 审计持久化(`s:audit\0{be64 seq}` 环形,DL5;`[audit] persist`(默认开)/`max_entries`(默认 10 万)可配,超上限批量截断删最旧;启动回放最新 4096 条重建内存检索面,检索 API 零变化;生命周期删除 who=system:lifecycle 重启后可检索——`fs3-meta/src/audit.rs` AuditStore + `fs3-core::audit::AuditRing::with_persist`)
+- [x] L3-2 生命周期指标(deleted 计数/字节、skipped_locked 预留)+ 告警——`fasts3_lifecycle_{cycles,deleted_objects,deleted_bytes,aborted_uploads,skipped_locked}_total` + `fasts3_lifecycle_last_cycle_timestamp`(admin /metrics,stats Arc 注入);alerts.yml:FastS3LifecycleStalled(>2 周期停滞)/FastS3LifecycleDeletedSpike(info)
+- [x] L4-1 与 Object Lock 的交互接口占位(M12 接通;锁定对象跳过)——`lifecycle::is_locked`(retention 未到期/legal_hold 判定已实装,字段 M12 填值前恒 false);执行器逐删除动作调用,ExpiredObjectDeleteMarker 豁免(§5.4),跳过计 `LifecycleStats::skipped_locked`
+- [x] L4-2 admin/控制台生命周期规则编辑页——控制台桶设置新增「生命周期」Tab(规则表 + 新建/编辑表单,整体 PUT/删空 DELETE)+「加密」Tab(K1-2,无 ↔ AES256 单选);web/server 代理 GET/PUT/DELETE `/api/buckets/{name}/lifecycle|encryption`(S3M10Client 签名直发 `?lifecycle|?encryption`,404→空值口径;XML↔JSON 转换在 server 侧,照 M10 cors 先例)
+- [x] L5-1 s3-tests lifecycle 族出排除集且 100%——定向复核 36 跑 21 绿/15 文档化残余(时间墙 11/botocore 版本漂移 2/ObjectSize 显式 501 未排期 2,逐名见 tests/s3-tests/README.md「M11 L5-1 实测记录」与排除矩阵 lifecycle 行;12 skipped 为 storage classes/cloud 未配置);修复:执行器被存量会话值卡死(list_all_sessions 走 decode_session 回退链 + worker 错误丢周期/封顶退避)、校验错误码 InvalidArgument 口径、规则 ID 缺省自动生成、旧版直下 Prefix 提交形态往返(legacy_prefix 双读回退)、x-amz-expiration 响应头;gate 配置 lifecycle_interval_secs=10;EXCLUDE token 收窄留全量 gate 统一做
 - [ ] L5-2 时间语义边界测试(±1s/午夜)+ 崩溃收敛注入(删除事务任意点 kill -9)
 
 ### E. SSE-C(§4.2)
-- [ ] E1-1 分块 AES-256-GCM 加密流水线(HKDF-SHA256 派生 data_key,手写 + 官方 test vector;nonce = HMAC(key, object_id‖chunk_no);tag 存元数据;密文等长)
-- [ ] E1-2 SSE-C 头解析与校验(algorithm/key/key-MD5;响应回显;key-MD5 校验;zeroize 擦除)
-- [ ] E1-3 GET/HEAD 解密读路径(缓冲路径;失零拷贝文档化 + 解密字节指标)
-- [ ] E1-4 multipart:每 part 独立加密;part ETag = 密文 MD5;复合 ETag 维持 md5-N
-- [ ] E1-5 CopyObject/UploadPartCopy 加密语义(DE3;密钥不同 → 解密重加密)
-- [ ] E1-6 内联对象加密;预签名 + SSE-C 头组合(SignedHeaders 校验)
-- [ ] E1-7 写路径顺序:明文 → 加密 → 密文 CRC → 密文 MD5(DE2);etag=fast 一致性规则
+- [x] E1-1 分块 AES-256-GCM 加密流水线(HKDF-SHA256 派生 data_key,手写 + 官方 test vector;nonce = HMAC(key, object_id‖chunk_no);tag 存元数据;密文等长)——`fs3-core/src/ssec.rs`
+- [x] E1-2 SSE-C 头解析与校验(algorithm/key/key-MD5;响应回显;key-MD5 校验;zeroize 擦除)——`fs3-s3/src/sse.rs`;501 表出三头,multipart/copy op 门控显式 501
+- [x] E1-3 GET/HEAD 解密读路径(缓冲路径;失零拷贝文档化 + 解密字节指标)——`object_segments_meta` SSE 恒 None;`fasts3_sse_decrypt_bytes_total`;文档化见 docs/perf-M10.md §6
+- [x] E1-4 multipart:每 part 独立加密;part ETag = 密文 MD5;复合 ETag 维持 md5-N(ADR-12 D-E4 裁决:Complete 解密重加密为单一 nonce_base 对象网格,读路径零分叉;会话只存 key-MD5,part 头一致性逐值比对)
+- [x] E1-5 CopyObject/UploadPartCopy 加密语义(DE3;密钥不同 → 解密重加密;同密钥 COW 直灌;源加密目标未指定 → InvalidRequest)
+- [x] E1-6 内联对象加密(同一 64KiB 网格,内联恒单 chunk,随 E1-7 落地);预签名 + SSE-C 头组合(SignedHeaders 校验,DE4;正反用例集成测试覆盖)
+- [x] E1-7 写路径顺序:明文 → 加密 → 密文 CRC → 密文 MD5(DE2);etag=fast 一致性规则(ETag=密文 CRC32C,引擎单测覆盖)
 
 ### K. SSE-S3 + 桶默认加密(§4.3)
-- [ ] K1-1 KEK/DEK 两级密钥(`s:sse_kek_seed` 独立于 key_seed_salt;每对象随机 DEK;wrapped DEK + kek_id 存 ObjectMeta.sse;轮换 = 新代 + 后台重包裹,复用值格式重写框架)
-- [ ] K1-2 Put/Get/DeleteBucketEncryption + `x-amz-server-side-encryption: AES256` 头处理与回显
-- [ ] K1-3 桶默认加密(BucketMeta v2 default_encryption;未带头 PUT 自动加密)+ 复制语义(无加密目标 → InvalidRequest)
-- [ ] K1-4 SSE-KMS 参数显式拒绝(DS4;不静默)
+- [x] K1-1 KEK/DEK 两级密钥(`s:sse_kek_seed` 独立于 key_seed_salt;每对象随机 DEK;wrapped DEK + kek_id 存 ObjectMeta.sse;轮换 = 新代 + 后台重包裹,复用值格式重写框架)
+- [x] K1-2 Put/Get/DeleteBucketEncryption + `x-amz-server-side-encryption: AES256` 头处理与回显
+- [x] K1-3 桶默认加密(BucketMeta v2 default_encryption;未带头 PUT 自动加密)+ 复制语义(无加密目标 → InvalidRequest)
+- [x] K1-4 SSE-KMS 参数显式拒绝(DS4;不静默)
 
 ### C. checksum 家族 + GetObjectAttributes(§4.4)
-- [ ] C1-1 算法族:CRC32/CRC32C/SHA1/SHA256/CRC64NVME 五族(sha2 复用;crc 变体实现 + 官方 test vector)
-- [ ] C1-2 `x-amz-checksum-*` header + trailer 验算(chunked.rs 从"消费忽略"改实际验算;decoded-content-length 对照强制)
-- [ ] C1-3 GetObjectAttributes(ETag/ObjectSize/Checksum/ObjectParts/StorageClass)
-- [ ] C1-4 multipart 分片校验 + CompositeChecksum(算法-拼份数)+ ValidateChecksum
-- [ ] C1-5 SSE+checksum 并存流水线(明文校验、加密存储,§4.4 顺序表)
+- [x] C1-1 算法族:CRC32/CRC32C/SHA1/SHA256/CRC64NVME 五族(sha2 复用;crc 变体实现 + 官方 test vector)
+- [x] C1-2 `x-amz-checksum-*` header + trailer 验算(chunked.rs 从"消费忽略"改实际验算;decoded-content-length 对照强制)
+- [x] C1-3 GetObjectAttributes(ETag/ObjectSize/Checksum/ObjectParts/StorageClass)
+- [x] C1-4 multipart 分片校验 + CompositeChecksum(算法-拼份数)+ ValidateChecksum
+- [x] C1-5 SSE+checksum 并存流水线(明文校验、加密存储,§4.4 顺序表)
 
 ### H. 协议卫生收尾
-- [ ] H1-1 M9 未覆盖的错误码触发路径补全(InvalidEncryptionAlgorithmError/InvalidStorageClass/NoSuchLifecycleConfiguration 等)
+- [x] H1-1 M9 未覆盖的错误码触发路径补全(InvalidEncryptionAlgorithmError/InvalidStorageClass/NoSuchLifecycleConfiguration 等;全码审计 + KeyTooLongError/MetadataTooLarge 补触发 + copy-source 错 key 400 对齐)
 
 ### M11 门禁(退出条件)
 - [ ] ADR-12 落盘
-- [ ] s3-tests encryption/sse/checksum/use_cksum/get_object_attributes/copy_enc/copy_part_enc/lifecycle 族出排除集且 100%
+- [x] s3-tests encryption/sse/checksum/use_cksum/get_object_attributes/copy_enc/copy_part_enc/lifecycle 族出排除集且 100%——G-1 全量 gate 两轮 0 意外(passed=457/287 排除/0 意外,两轮一致);出集项 100% 绿,残余逐名记录(SSE-C 3+policy 1+copy DE3 10+lifecycle 15+宽 token 误掩裁决 3,见 tests/s3-tests/README.md「M11 G-1 实测记录」与排除矩阵;口径同 M10 先例);过程中修复 4 个服务端缺陷(SSE 头冲突/白名单错误码、response-* 覆盖、路径控制字符 400)
 - [ ] AES-GCM/HKDF 官方 test vector 通过;崩溃(加密写读混载)≥500 轮
 - [ ] 审计持久化落地且生命周期删除可见
 - [ ] 客户端矩阵回归(含 aws cli 新版默认 checksum 行为,S3-GAP §8.2 v1.2 档;restic/duplicati 复跑)

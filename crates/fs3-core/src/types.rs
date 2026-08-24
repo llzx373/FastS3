@@ -65,6 +65,13 @@ impl AllocRecord {
 /// > v3 演进说明(ADR-11 D0):尾部一次性预留版本化与 v1.2/v1.3 字段
 /// > (version_id/is_delete_marker/tags/sse/checksum/retention/legal_hold),
 /// > 后续里程碑只填充不重排版;写入恒 v3,读取 v2/v3 双读。
+/// > v4 演进说明(ADR-12 D-E3 / M11 C1-4):尾部追加 `part_checksums`
+/// > (multipart 各分片 checksum,GetObjectAttributes ObjectParts 渲染
+/// > 所需——Complete 后 `p:` 分片记录即删除,分片 checksum 必须随对象
+/// > 持久化);写入恒 v4,读取 v2/v3/v4 三读。
+/// > M11 E1 说明(ADR-12 D-E1):`SseInfo` 在 v4 内重排版(追加
+/// > kind/chunk_tags)不 bump 版本——`sse` 字段自 v3 起全落盘点恒为
+/// > None,`Some` 编码路径无任何存量值可读(理由详见 SseInfo 注释)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectMeta {
     pub size: u64,
@@ -100,27 +107,107 @@ pub struct ObjectMeta {
     pub retention: Option<Retention>,
     /// v1.3 填充(ADR-11 D0):法定保留(§5.2,与 retention 取更严格者)。
     pub legal_hold: bool,
+    /// multipart 各分片 checksum(M11 C1-4,ADR-12 D-E3;v4 尾部追加字段):
+    /// 索引与 `parts` 对齐(空 = 非 multipart 或全部分片无 checksum;非空
+    /// 时长度恒等于 `parts.len()`);v3/v2 双读补空表。
+    pub part_checksums: Vec<Option<ChecksumInfo>>,
 }
 
-/// 对象元数据值格式版本(ADR-11 D0:`[version: u8 = 3] + postcard(ObjectMeta)`;
-/// v2/v3 双读、写入恒 v3;无版本字节的旧值放弃前置兼容,直接拒绝)。
-pub const OBJECT_META_VERSION: u8 = 3;
+/// 对象元数据值格式版本(ADR-11 D0 + ADR-12 D-E3:
+/// `[version: u8 = 4] + postcard(ObjectMeta)`;v2/v3/v4 三读、写入恒 v4;
+/// 无版本字节的旧值放弃前置兼容,直接拒绝)。
+pub const OBJECT_META_VERSION: u8 = 4;
+
+/// v3 值格式版本(ADR-11 D0;M11 起为三读回退格式,见 decode_value)。
+pub const OBJECT_META_VERSION_V3: u8 = 3;
 
 /// v2 值格式版本(ADR-9 §13;M10 起为双读回退格式,见 decode_value)。
 const OBJECT_META_VERSION_V2: u8 = 2;
 
+/// SSE 类型判别(M11 E1,ADR-12 D-E1。变体序 = postcard 编码序,只允许
+/// 尾部追加)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SseKind {
+    /// SSE-C:客户提供密钥(§4.2;data_key 由请求期客户密钥 HKDF 派生,
+    /// 零落盘)。`kek_id`/`wrapped_dek` 不使用(约定恒 0 / 空)。
+    SseC,
+    /// SSE-S3:KEK/DEK 两级(§4.3 DS1;Phase K 填充)。
+    SseS3,
+}
+
 /// 服务端加密信息(v1.2 填充,ADR-11 D0;§4.3 DS1 两级密钥 KEK/DEK)。
+///
+/// > M11 E1 定型(ADR-12 D-E1):尾部追加 `kind`(SSE-C/SSE-S3 判别)与
+/// > `chunk_tags`(分块 GCM tag)。**不触发 ObjectMeta 值格式 v5**:自
+/// > v3 引入 `sse` 字段起全部写点恒为 `None`,磁盘上不存在任何
+/// > `Some(SseInfo)` 值(v4 同为本周期的未发布产物),postcard 的
+/// > `Option` 判别字节不变,结构体重排版只影响 `Some` 的编码路径,
+/// > 双读纪律零破坏——同 D-E1 预裁决原文。M11 定向验证补录(ADR-12
+/// > D-E5):尾部再追加 `key_md5`(SSE-C 错 key 校验子),同一未发布
+/// > 窗口内直接改结构,不触发 v5。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SseInfo {
-    /// KEK 代 id(轮换用;KEK 明文永不下发)。
+    /// SSE 类型(D-E1;SSE-C / SSE-S3)。
+    pub kind: SseKind,
+    /// KEK 代 id(SSE-S3 轮换用,KEK 明文永不下发;SSE-C 约定恒 0)。
     pub kek_id: u32,
-    /// DEK 密文(AES-256-GCM 包裹:nonce || ct)。
+    /// DEK 密文(SSE-S3:AES-256-GCM 包裹 nonce || ct;SSE-C 约定恒空
+    /// ——客户密钥零落盘,DE1)。
     pub wrapped_dek: Vec<u8>,
     /// 每对象随机 nonce 基址(chunk nonce 派生,§4.2 DE1)。
     pub nonce_base: [u8; 12],
+    /// 每 64KiB chunk 的 16B GCM tag(D-E1;索引 = chunk_no,与
+    /// `ssec::SSE_CHUNK_SIZE` 对象字节流网格对齐:尾部不足一整 chunk
+    /// 也有 tag,tag 数 = `ceil(size / 64KiB)`,空对象为 0)。内联对象
+    /// 同一网格口径(内联数据 ≤ small_object_limit = 32KiB < 64KiB,
+    /// 恒为单 chunk,读写法与 extent 臂零分叉)。
+    pub chunk_tags: Vec<[u8; 16]>,
+    /// 密钥校验子(D-E5,AWS/RGW 同思路:服务端存校验材料,错 key 读
+    /// 判 400 `InvalidRequest`,不等 GCM 认证失败)。**SSE-C = 客户密钥
+    /// 的 MD5**(即请求头 `x-amz-server-side-encryption-customer-key-md5`
+    /// 的解码值;密钥本体零落盘红线不破——MD5 单向,且该值本就随每个
+    /// 请求明文传输);**SSE-S3 约定全零**(Phase K 填充时写死:DEK 由
+    /// 服务端 KEK 体系持有,无客户校验子概念)。
+    pub key_md5: [u8; 16],
 }
 
-/// checksum 算法(v1.2 填充,ADR-11 D0;§4.4 四族。
+impl SseInfo {
+    /// SSE-C 形态构造(kek_id/wrapped_dek 按约定置 0/空——SSE-C 不使用
+    /// KEK/DEK 两级体系,客户密钥零落盘)。`key_md5` = 客户密钥 MD5
+    /// (D-E5 校验子,`SseCKey::key_md5` 输出)。
+    pub fn sse_c(nonce_base: [u8; 12], chunk_tags: Vec<[u8; 16]>, key_md5: [u8; 16]) -> Self {
+        SseInfo {
+            kind: SseKind::SseC,
+            kek_id: 0,
+            wrapped_dek: Vec::new(),
+            nonce_base,
+            chunk_tags,
+            key_md5,
+        }
+    }
+
+    /// SSE-S3 形态构造(M11 K1-1,ADR-12 DS1):`kek_id` = 包裹 DEK 的 KEK
+    /// 代(轮换重包裹的比对基准);`wrapped_dek` = AES-256-GCM(KEK, DEK)
+    /// 包裹值(nonce‖ct‖tag 60B);`key_md5` 恒零(D-E5 约定:SSE-S3 无
+    /// 客户校验子,DEK 由服务端 KEK 体系持有)。
+    pub fn sse_s3(
+        kek_id: u32,
+        wrapped_dek: Vec<u8>,
+        nonce_base: [u8; 12],
+        chunk_tags: Vec<[u8; 16]>,
+    ) -> Self {
+        SseInfo {
+            kind: SseKind::SseS3,
+            kek_id,
+            wrapped_dek,
+            nonce_base,
+            chunk_tags,
+            key_md5: [0u8; 16],
+        }
+    }
+}
+
+/// checksum 算法(v1.2 填充,ADR-11 D0;§4.4 五族,ADR-12。
 /// 变体序 = postcard 编码序,只允许尾部追加)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChecksumAlgorithm {
@@ -131,12 +218,85 @@ pub enum ChecksumAlgorithm {
     Crc64Nvme,
 }
 
+/// checksum 类型(AWS ChecksumType;M11 门禁口径:**不持久化**——非默认
+/// 组合在 CreateMultipartUpload 显式 400 拒绝,对象上出现的类型恒等于
+/// 算法默认类型,见 `ChecksumAlgorithm::default_checksum_type`)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChecksumType {
+    /// 复合:`alg(concat(各分片 checksum 原始字节))`,渲染 base64 + `-N`。
+    Composite,
+    /// 全对象:`alg(整对象字节流)`,渲染纯 base64。
+    FullObject,
+}
+
+impl ChecksumType {
+    /// S3 协议值(`x-amz-checksum-type` 头 / `<ChecksumType>` 元素)。
+    pub fn s3_name(self) -> &'static str {
+        match self {
+            Self::Composite => "COMPOSITE",
+            Self::FullObject => "FULL_OBJECT",
+        }
+    }
+
+    /// 协议值解析(AWS 枚举大写精确)。
+    pub fn from_s3_name(name: &str) -> Option<Self> {
+        match name {
+            "COMPOSITE" => Some(Self::Composite),
+            "FULL_OBJECT" => Some(Self::FullObject),
+            _ => None,
+        }
+    }
+}
+
+impl ChecksumAlgorithm {
+    /// 默认 checksum 类型(AWS:CRC32/CRC32C/CRC64NVME = FULL_OBJECT
+    /// (CRC64NVME 在 AWS 也仅支持该类型);SHA1/SHA256 = COMPOSITE)。
+    pub fn default_checksum_type(self) -> ChecksumType {
+        match self {
+            Self::Crc32 | Self::Crc32c | Self::Crc64Nvme => ChecksumType::FullObject,
+            Self::Sha1 | Self::Sha256 => ChecksumType::Composite,
+        }
+    }
+}
+
 /// 对象校验和(v1.2 填充,ADR-11 D0;multipart 为复合值,§4.4)。
+///
+/// 复合形态(AWS CompositeChecksum):multipart 对象 Complete 时记录
+/// `alg(concat(各分片 checksum 原始字节))`,协议层渲染为
+/// `base64(value)-N`。`-N` 的分片数 **不在本结构落盘**:复合值出现的
+/// 对象恒为 multipart(`ObjectMeta.parts` 非空),N = `parts.len()` 直接
+/// 派生(与 `etag_full` 的 `-N` 同一既有不变量),避免嵌套结构体重排版
+/// 破坏 ObjectMeta v3/v4 解码链。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChecksumInfo {
     pub algorithm: ChecksumAlgorithm,
     /// 校验和原始字节(未 base64;长度由算法定)。
     pub value: Vec<u8>,
+}
+
+/// CompleteMultipartUpload 请求的单分片声明(M11 C1-4,ADR-12;XML
+/// `<Part>` 元素:PartNumber/ETag + 可选 checksum 元素)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletePart {
+    pub part_number: u32,
+    /// 客户端声明的 ETag(hex,去引号)。
+    pub etag_hex: String,
+    /// 客户端声明的分片 checksum(XML `<ChecksumCRC32>` 等元素,base64
+    /// 已解码;None = 未声明,不比对)。
+    pub checksum: Option<ChecksumInfo>,
+}
+
+/// CompleteMultipartUpload 复合 checksum 声明(M11 C1-4,ADR-12;协议层
+/// 已从 `x-amz-checksum-{alg}` 头值剥离 base64 与 `-N` 后缀)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompositeChecksum {
+    pub algorithm: ChecksumAlgorithm,
+    /// 客户端声明的复合原始字节(= alg(concat(各分片 checksum 原始字节)))。
+    pub value: Vec<u8>,
+    /// `-N` 后缀的分片数(None = 裸 base64 形态,即 FULL_OBJECT 全对象
+    /// 校验和;COMPOSITE 形态必须携带且与 Complete 请求分片数一致,
+    /// 引擎按会话/算法默认类型校验)。
+    pub parts: Option<u32>,
 }
 
 /// Object Lock 保留模式(v1.3 填充,ADR-11 D0;§5.1。
@@ -193,6 +353,19 @@ impl ObjectMeta {
         }
     }
 
+    /// 对象级 checksum 的渲染类型(None = 对象无 checksum):单 PUT 恒
+    /// FULL_OBJECT;multipart = 算法默认类型(M11 门禁口径:非默认组合在
+    /// Create 显式拒绝,类型恒可由算法派生,不占值格式字段;v4 窗口期
+    /// (C1-4)以 CRC 族算法写入的复合值为未发布开发产物,不在兼容范围)。
+    pub fn checksum_type(&self) -> Option<ChecksumType> {
+        let info = self.checksum.as_ref()?;
+        if self.parts.is_empty() {
+            Some(ChecksumType::FullObject)
+        } else {
+            Some(info.algorithm.default_checksum_type())
+        }
+    }
+
     /// 编码为值格式:`[version: u8] + postcard(Self)`。
     pub fn encode_value(&self) -> Result<Vec<u8>> {
         let mut v = Vec::with_capacity(64);
@@ -207,17 +380,21 @@ impl ObjectMeta {
 
     /// 解码值格式;版本字节缺失/不符 → Corrupt(旧布局无前置兼容)。
     ///
-    /// M10/ADR-11 D0 双读:版本字节 3 = 现格式;2 = v2 格式(沿用 M9/C3
-    /// 「新格式优先、旧格式回退」链:v1.1.0 含 resp_headers 的 v2 结构优先,
-    /// 失败回退 v1.0.0 无 resp_headers 结构,v3 尾部字段补默认
-    /// None/false/空)。新旧值在磁盘上共存(新写入恒为 v3;存量对象保持
-    /// 可读)。回退仅发生在字段截断,其它损坏各格式都解码失败 → Corrupt。
+    /// M11/ADR-12 D-E3 三读:版本字节 4 = 现格式;3 = v3 格式(无
+    /// part_checksums 尾部字段,补空表);2 = v2 格式(沿用既有回退链:
+    /// v1.1.0 含 resp_headers 的 v2 结构优先,失败回退 v1.0.0 结构,v3/v4
+    /// 尾部字段补默认 None/false/空)。新旧值在磁盘上共存(新写入恒为
+    /// v4;存量对象保持可读)。回退仅发生在字段截断,其它损坏各格式都
+    /// 解码失败 → Corrupt。
     pub fn decode_value(buf: &[u8]) -> Result<Self> {
         let Some(&ver) = buf.first() else {
             return Err(Error::Corrupt("object meta value too short".into()));
         };
         match ver {
             OBJECT_META_VERSION => postcard::from_bytes(&buf[1..])
+                .map_err(|e| Error::Corrupt(format!("postcard decode object meta: {e}"))),
+            OBJECT_META_VERSION_V3 => postcard::from_bytes::<ObjectMetaV3>(&buf[1..])
+                .map(Into::into)
                 .map_err(|e| Error::Corrupt(format!("postcard decode object meta: {e}"))),
             OBJECT_META_VERSION_V2 => match postcard::from_bytes::<ObjectMetaV2>(&buf[1..]) {
                 Ok(m) => Ok(m.into()),
@@ -231,6 +408,51 @@ impl ObjectMeta {
             _ => Err(Error::Corrupt(format!(
                 "object meta version {ver} unsupported (expected {OBJECT_META_VERSION})"
             ))),
+        }
+    }
+}
+
+/// v3 值格式(v1.1.0;无 `part_checksums` 尾部字段;M11 三读回退用)。
+#[derive(Serialize, Deserialize)]
+struct ObjectMetaV3 {
+    size: u64,
+    etag: [u8; 16],
+    mtime: i64,
+    extents: Vec<Segment>,
+    content_type: String,
+    user_meta: Vec<(String, String)>,
+    inline: Option<Vec<u8>>,
+    parts: Vec<u64>,
+    resp_headers: Vec<(String, String)>,
+    version_id: Option<[u8; 16]>,
+    is_delete_marker: bool,
+    tags: Vec<(String, String)>,
+    sse: Option<SseInfo>,
+    checksum: Option<ChecksumInfo>,
+    retention: Option<Retention>,
+    legal_hold: bool,
+}
+
+impl From<ObjectMetaV3> for ObjectMeta {
+    fn from(l: ObjectMetaV3) -> Self {
+        ObjectMeta {
+            size: l.size,
+            etag: l.etag,
+            mtime: l.mtime,
+            extents: l.extents,
+            content_type: l.content_type,
+            user_meta: l.user_meta,
+            inline: l.inline,
+            parts: l.parts,
+            resp_headers: l.resp_headers,
+            version_id: l.version_id,
+            is_delete_marker: l.is_delete_marker,
+            tags: l.tags,
+            sse: l.sse,
+            checksum: l.checksum,
+            retention: l.retention,
+            legal_hold: l.legal_hold,
+            part_checksums: Vec::new(),
         }
     }
 }
@@ -268,6 +490,7 @@ impl From<ObjectMetaV2> for ObjectMeta {
             checksum: None,
             retention: None,
             legal_hold: false,
+            part_checksums: Vec::new(),
         }
     }
 }
@@ -304,6 +527,7 @@ impl From<LegacyObjectMeta> for ObjectMeta {
             checksum: None,
             retention: None,
             legal_hold: false,
+            part_checksums: Vec::new(),
         }
     }
 }
@@ -350,6 +574,80 @@ pub enum VersioningState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SseAlgorithm {
     Aes256,
+}
+
+// ───────────────────── 生命周期规则(M11 L1;ADR-12 DL1)─────────────────────
+//
+// 键 `r:{bucket}\0{rule_id}`,值 = postcard(LifecycleRule);规则变更 = 单
+// 事务整体替换(读旧写新)。范围 = DESIGN-FUTURE §4.1.1 显式子集:Expiration
+// (Days/Date/ExpiredObjectDeleteMarker)、NoncurrentVersionExpiration、
+// AbortIncompleteMultipartUpload、Filter(Prefix + Tag);Transition 族与
+// ObjectSize* 过滤器不做(协议层显式拒绝,不落盘)。
+// 演进纪律:结构只许尾部追加字段/变体(postcard 序),改语义须走值格式版本。
+
+/// 规则状态(AWS:Enabled/Disabled;Disabled = 规则存而不执行。
+/// 变体序 = postcard 编码序,只允许尾部追加)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LifecycleStatus {
+    Enabled,
+    Disabled,
+}
+
+/// 规则过滤器(v1.2 子集:Prefix + Tag;prefix 为空且 tags 为空 = 全桶对象,
+/// 对应 AWS 空 `<Filter/>`)。Tag 匹配按对象标签(M10 S1 ObjectMeta.tags)
+/// 全包含语义(tags 全中才算命中;执行器 L2-2 用)。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleFilter {
+    pub prefix: String,
+    pub tags: Vec<(String, String)>,
+}
+
+/// 当前版本过期动作(Days/Date/ExpiredObjectDeleteMarker 三选一,
+/// 协议层校验互斥;Days/Date 语义 = DL4 午夜取整,执行器兑现)。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleExpiration {
+    /// 对象年龄满 Days 整天后过期(AWS 午夜语义:次日 00:00 UTC 起可删)。
+    pub days: Option<u32>,
+    /// 绝对过期时刻(unix 秒;XML 为 ISO8601 时间戳)。
+    pub date: Option<i64>,
+    /// 清理「唯一的当前版本是删除标记」的条目(版本化桶)。
+    pub expired_object_delete_marker: bool,
+}
+
+/// 历史版本过期动作(版本化桶;两字段可同现,取更激进者,AWS 语义)。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoncurrentVersionExpiration {
+    /// 成为非当前版本满 NoncurrentDays 整天后过期。
+    pub noncurrent_days: Option<u32>,
+    /// 至多保留 NewerNoncurrentVersions 个较新历史版本,超出者过期。
+    pub newer_noncurrent_versions: Option<u32>,
+}
+
+/// 未完成 multipart 会话中止动作(替代硬编码 7 天惰性清扫,桶可配)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbortIncompleteMultipartUpload {
+    /// 会话创建满 DaysAfterInitiation 整天后中止。
+    pub days_after_initiation: u32,
+}
+
+/// 生命周期规则(每条规则一键 `r:{bucket}\0{rule_id}`;DL1)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleRule {
+    /// 规则 ID(桶内唯一,非空,≤ 255 字符;AWS 为可选——缺省时协议层
+    /// 自动生成随机 ID(M11 L5),键按 rule_id 寻址不变)。
+    pub id: String,
+    pub status: LifecycleStatus,
+    /// 过滤器(空 = 全桶对象;AWS 旧版 Rule 直下 `<Prefix>` 由协议层
+    /// 归一到本结构,原始形态记于 `legacy_prefix`)。
+    pub filter: LifecycleFilter,
+    pub expiration: Option<LifecycleExpiration>,
+    pub noncurrent_expiration: Option<NoncurrentVersionExpiration>,
+    pub abort_incomplete_multipart: Option<AbortIncompleteMultipartUpload>,
+    /// 提交形态标记(M11 L5):true = 规则以 AWS 旧版 Rule 直下
+    /// `<Prefix>` 形态写入,GET 原样回渲染 `<Prefix>`(AWS/RGW 按原始
+    /// 文档形态往返);false = `<Filter>` 形态。旧版 Prefix 不携带 Tag
+    /// (tags 恒空)。序列化尾部追加字段,存量规则值回退解码按 false。
+    pub legacy_prefix: bool,
 }
 
 impl BucketMeta {
@@ -1072,9 +1370,12 @@ mod tests {
             is_delete_marker: false,
             tags: vec![("t".into(), "1".into())],
             sse: Some(SseInfo {
+                kind: SseKind::SseC,
                 kek_id: 1,
                 wrapped_dek: vec![1, 2, 3],
                 nonce_base: [9u8; 12],
+                chunk_tags: vec![[0xAA; 16], [0xBB; 16]],
+                key_md5: [0x5Cu8; 16],
             }),
             checksum: Some(ChecksumInfo {
                 algorithm: ChecksumAlgorithm::Crc32c,
@@ -1085,20 +1386,60 @@ mod tests {
                 retain_until: 1_800_000_000,
             }),
             legal_hold: true,
+            part_checksums: vec![
+                Some(ChecksumInfo {
+                    algorithm: ChecksumAlgorithm::Crc32,
+                    value: vec![1, 2, 3, 4],
+                }),
+                None,
+            ],
         };
         let v = m.encode_value().unwrap();
         assert_eq!(v[0], OBJECT_META_VERSION);
-        assert_eq!(v[0], 3, "M10 起写入恒 v3");
+        assert_eq!(v[0], 4, "M11 起写入恒 v4");
         assert_eq!(ObjectMeta::decode_value(&v).unwrap(), m);
         // 无版本字节(旧布局值)→ 拒绝
         let legacy = postcard::to_allocvec(&m).unwrap();
         assert!(ObjectMeta::decode_value(&legacy).is_err());
-        // 版本字节不符 → 拒绝(2 为回退格式,不在此列)
-        for bad_ver in [0u8, 1, 4, 0xFF] {
+        // 版本字节不符 → 拒绝(2/3 为回退格式,不在此列)
+        for bad_ver in [0u8, 1, 5, 0xFF] {
             let mut bad = v.clone();
             bad[0] = bad_ver;
             assert!(ObjectMeta::decode_value(&bad).is_err());
         }
+        // M11 三读:v3 值(v1.1.0 格式,无 part_checksums 尾部字段)回退补空表
+        let v3_value = {
+            let mut b = vec![3u8];
+            let m3 = ObjectMetaV3 {
+                size: m.size,
+                etag: m.etag,
+                mtime: m.mtime,
+                extents: m.extents.clone(),
+                content_type: m.content_type.clone(),
+                user_meta: m.user_meta.clone(),
+                inline: m.inline.clone(),
+                parts: m.parts.clone(),
+                resp_headers: m.resp_headers.clone(),
+                version_id: m.version_id,
+                is_delete_marker: m.is_delete_marker,
+                tags: m.tags.clone(),
+                sse: m.sse.clone(),
+                checksum: m.checksum.clone(),
+                retention: m.retention,
+                legal_hold: m.legal_hold,
+            };
+            b.extend_from_slice(&postcard::to_allocvec(&m3).unwrap());
+            b
+        };
+        let dec = ObjectMeta::decode_value(&v3_value).unwrap();
+        assert_eq!(dec.checksum, m.checksum, "v3 值的 checksum 原样保留");
+        assert_eq!(
+            dec.part_checksums,
+            Vec::<Option<ChecksumInfo>>::new(),
+            "v3 值无 part_checksums 字段,补空表"
+        );
+        assert_eq!(dec.version_id, m.version_id);
+        assert!(dec.legal_hold);
         // M10 双读:v2 值(v1.1.0 格式,无 v3 尾部字段)回退补默认
         #[derive(serde::Serialize, serde::Deserialize)]
         struct ObjectMetaV2 {
@@ -1142,6 +1483,7 @@ mod tests {
         assert_eq!(dec.checksum, None);
         assert_eq!(dec.retention, None);
         assert!(!dec.legal_hold);
+        assert_eq!(dec.part_checksums, Vec::<Option<ChecksumInfo>>::new());
         // M9/C3 双读兼容:v1.0.0 存量值(版本字节 2,无 resp_headers 字段)
         // 按空表解码,v3 尾部字段同样补默认
         #[derive(serde::Serialize, serde::Deserialize)]
@@ -1195,6 +1537,64 @@ mod tests {
         let enc = postcard::to_allocvec(&rec).unwrap();
         let dec: AllocRecord = postcard::from_bytes(&enc).unwrap();
         assert_eq!(rec, dec);
+    }
+
+    /// M11 L1(ADR-12 DL1):LifecycleRule postcard 往返(各动作组合)。
+    #[test]
+    fn lifecycle_rule_postcard_roundtrip() {
+        // 全字段形态:Filter(Prefix+Tag)+ Expiration(Days)+
+        // NoncurrentVersionExpiration(双字段)+ AbortIncompleteMultipartUpload
+        let full = LifecycleRule {
+            id: "rule-1".into(),
+            status: LifecycleStatus::Enabled,
+            filter: LifecycleFilter {
+                prefix: "logs/".into(),
+                tags: vec![("class".into(), "archive".into())],
+            },
+            expiration: Some(LifecycleExpiration {
+                days: Some(30),
+                date: None,
+                expired_object_delete_marker: false,
+            }),
+            noncurrent_expiration: Some(NoncurrentVersionExpiration {
+                noncurrent_days: Some(90),
+                newer_noncurrent_versions: Some(3),
+            }),
+            abort_incomplete_multipart: Some(AbortIncompleteMultipartUpload {
+                days_after_initiation: 7,
+            }),
+            legacy_prefix: false,
+        };
+        let enc = postcard::to_allocvec(&full).unwrap();
+        assert_eq!(postcard::from_bytes::<LifecycleRule>(&enc).unwrap(), full);
+        // Date / ExpiredObjectDeleteMarker / Disabled / 空 Filter 形态
+        let marker = LifecycleRule {
+            id: "r2".into(),
+            status: LifecycleStatus::Disabled,
+            filter: LifecycleFilter::default(),
+            expiration: Some(LifecycleExpiration {
+                days: None,
+                date: Some(1_724_155_200),
+                expired_object_delete_marker: false,
+            }),
+            noncurrent_expiration: None,
+            abort_incomplete_multipart: None,
+            legacy_prefix: true,
+        };
+        let enc = postcard::to_allocvec(&marker).unwrap();
+        assert_eq!(postcard::from_bytes::<LifecycleRule>(&enc).unwrap(), marker);
+        let dm = LifecycleRule {
+            expiration: Some(LifecycleExpiration {
+                days: None,
+                date: None,
+                expired_object_delete_marker: true,
+            }),
+            ..marker.clone()
+        };
+        let enc = postcard::to_allocvec(&dm).unwrap();
+        assert_eq!(postcard::from_bytes::<LifecycleRule>(&enc).unwrap(), dm);
+        // 截断值 → 解码失败(不静默)
+        assert!(postcard::from_bytes::<LifecycleRule>(&enc[..enc.len() / 2]).is_err());
     }
 
     #[test]
