@@ -23,7 +23,7 @@
 | --- | --- | --- | --- | --- |
 | [M9 协议卫生与正确性补丁](#m9-v10x-协议卫生与正确性补丁) | v1.0.x | ≈2 周 | §3.7 九项协议修复 + 头显式化 + 列表/边界收敛 | ✅ 完成(v1.0.1,2026-08-22) |
 | [M10 版本控制](#m10-v110-版本控制--4-补全项) | v1.1.0 | ≈7 周 | Versioning/删除标记/条件写 + 标签/CORS/桶策略/POST 表单 | ✅ 完成(v1.1.0,2026-08-23) |
-| [M11 生命周期与加密](#m11-v120-生命周期与加密) | v1.2.0 | ≈7 周 | Lifecycle/SSE-C/SSE-S3/checksum/GetObjectAttributes/审计持久化 | ⬜ 未开始 |
+| [M11 生命周期与加密](#m11-v120-生命周期与加密) | v1.2.0 | ≈7 周 | Lifecycle/SSE-C/SSE-S3/checksum/GetObjectAttributes/审计持久化 | 🟡 实现+G-2/G-1 复测已过;perf/覆盖率/发版未勾 |
 | [M12 Object Lock / WORM](#m12-v130-object-lock--worm) | v1.3.0 | ≈3 周 | 治理/合规保留 + 法定保留 + 可信时钟 | ⬜ 未开始 |
 | [M13 容量与底座](#m13-v140-容量与底座) | v1.4.0 | ≈6 周 | 多设备扩容/再平衡 + 元数据分区过渡 + zstd | ⬜ 未开始 |
 | [M14 集中纳管与生态](#m14-v200-集中纳管与生态) | v2.0.0 | ≈7 周 | agent 纳管/HTTP3/热缓存/Terraform·Operator 评估 | ⬜ 未开始 |
@@ -206,7 +206,7 @@
 - [x] L4-1 与 Object Lock 的交互接口占位(M12 接通;锁定对象跳过)——`lifecycle::is_locked`(retention 未到期/legal_hold 判定已实装,字段 M12 填值前恒 false);执行器逐删除动作调用,ExpiredObjectDeleteMarker 豁免(§5.4),跳过计 `LifecycleStats::skipped_locked`
 - [x] L4-2 admin/控制台生命周期规则编辑页——控制台桶设置新增「生命周期」Tab(规则表 + 新建/编辑表单,整体 PUT/删空 DELETE)+「加密」Tab(K1-2,无 ↔ AES256 单选);web/server 代理 GET/PUT/DELETE `/api/buckets/{name}/lifecycle|encryption`(S3M10Client 签名直发 `?lifecycle|?encryption`,404→空值口径;XML↔JSON 转换在 server 侧,照 M10 cors 先例)
 - [x] L5-1 s3-tests lifecycle 族出排除集且 100%——定向复核 36 跑 21 绿/15 文档化残余(时间墙 11/botocore 版本漂移 2/ObjectSize 显式 501 未排期 2,逐名见 tests/s3-tests/README.md「M11 L5-1 实测记录」与排除矩阵 lifecycle 行;12 skipped 为 storage classes/cloud 未配置);修复:执行器被存量会话值卡死(list_all_sessions 走 decode_session 回退链 + worker 错误丢周期/封顶退避)、校验错误码 InvalidArgument 口径、规则 ID 缺省自动生成、旧版直下 Prefix 提交形态往返(legacy_prefix 双读回退)、x-amz-expiration 响应头;gate 配置 lifecycle_interval_secs=10;EXCLUDE token 收窄留全量 gate 统一做
-- [ ] L5-2 时间语义边界测试(±1s/午夜)+ 崩溃收敛注入(删除事务任意点 kill -9)
+- [x] L5-2 时间语义边界测试(±1s/午夜)+ 崩溃收敛注入(删除事务任意点 kill -9)——`days_deadline`/`match_entry_midnight_boundary_plus_minus_1s`(fs3-engine lifecycle 单测);崩溃侧由 `run_crash_enc.sh` 每 25 轮灌 120 键使 kill 落入删除事务(G-2 500 轮过)
 
 ### E. SSE-C(§4.2)
 - [x] E1-1 分块 AES-256-GCM 加密流水线(HKDF-SHA256 派生 data_key,手写 + 官方 test vector;nonce = HMAC(key, object_id‖chunk_no);tag 存元数据;密文等长)——`fs3-core/src/ssec.rs`
@@ -234,13 +234,20 @@
 - [x] H1-1 M9 未覆盖的错误码触发路径补全(InvalidEncryptionAlgorithmError/InvalidStorageClass/NoSuchLifecycleConfiguration 等;全码审计 + KeyTooLongError/MetadataTooLarge 补触发 + copy-source 错 key 400 对齐)
 
 ### M11 门禁(退出条件)
-- [ ] ADR-12 落盘
-- [x] s3-tests encryption/sse/checksum/use_cksum/get_object_attributes/copy_enc/copy_part_enc/lifecycle 族出排除集且 100%——G-1 全量 gate 两轮 0 意外(passed=457/287 排除/0 意外,两轮一致);出集项 100% 绿,残余逐名记录(SSE-C 3+policy 1+copy DE3 10+lifecycle 15+宽 token 误掩裁决 3,见 tests/s3-tests/README.md「M11 G-1 实测记录」与排除矩阵;口径同 M10 先例);过程中修复 4 个服务端缺陷(SSE 头冲突/白名单错误码、response-* 覆盖、路径控制字符 400)
-- [ ] AES-GCM/HKDF 官方 test vector 通过;崩溃(加密写读混载)≥500 轮
-- [ ] 审计持久化落地且生命周期删除可见
-- [ ] 客户端矩阵回归(含 aws cli 新版默认 checksum 行为,S3-GAP §8.2 v1.2 档;restic/duplicati 复跑)
-- [ ] perf:SSE 开/关对照、checksum 开销对照;未加密负载回退 <5%
-- [ ] 覆盖率 ≥80%;cargo audit 清零;发布 v1.2.0
+- [x] ADR-12 落盘——DESIGN.md §3.3;与实现无偏离(G-2 复测复核)
+- [x] s3-tests encryption/sse/checksum/use_cksum/get_object_attributes/copy_enc/copy_part_enc/lifecycle 族出排除集且 100%——G-1 全量 gate 两轮 0 意外(passed=457/287 排除/0 意外,两轮一致);出集项 100% 绿,残余逐名记录(SSE-C 3+policy 1+copy DE3 10+lifecycle 15+宽 token 误掩裁决 3,见 tests/s3-tests/README.md「M11 G-1 实测记录」与排除矩阵;口径同 M10 先例);过程中修复 4 个服务端缺陷(SSE 头冲突/白名单错误码、response-* 覆盖、路径控制字符 400);干净复测(2026-08-24,TZ=UTC,独立 2GiB 镜像 ×2)同数
+- [x] AES-GCM/HKDF 官方 test vector 通过;崩溃(加密写读混载)≥500 轮——向量随 `cargo test -p fs3-core`;G-2 `run_crash_enc.sh 500 --fresh` PASS(kills=218,零泄漏/零撕裂/账目零漂移,elapsed=6694s,log=`tests/crash/run/crash-enc-last.log`)
+- [x] 审计持久化落地且生命周期删除可见——harness 断言 4(`who=system:lifecycle` 重启后可检索);G-2 500 轮覆盖
+- [x] 客户端矩阵回归(含 aws cli 新版默认 checksum 行为,S3-GAP §8.2 v1.2 档;restic/duplicati 复跑)——aws cli 2.36.28 默认 CRC64NVME PUT 回 `ChecksumCRC64NVME` 且 GET 往返;client_smoke(aws/boto3/mc/rclone)全过;restic 0.19.1 backup/restore/check 过;duplicati 2.3.0.4 备份/恢复过(`--dbpath` + restore `"*"`)
+- [ ] perf:SSE 开/关对照、checksum 开销对照;未加密负载回退 <5%——脚本 `tests/bench/perf-m11-compare.sh`;对照未达标前不发 v1.2.0(见下方实测)
+- [ ] 覆盖率 ≥80%;cargo audit 清零;发布 v1.2.0——`cargo audit` 0 漏洞(2 条 allowed 信息级:RUSTSEC-2023-0089/RUSTSEC-2025-0134,同 v1.1 集);llvm-cov 本轮未重跑;不 bump 版本/不打 tag
+
+> **M11 G-2 干净复测记录(2026-08-24~25)**:
+> - 失败根因(不可先删现场盲跑 500):SSE 流式 GET 在 hyper worker 上同步 io_uring + `blocking_send` → 客户端 Raw ReadTimeout;Complete/abort 把开放 extent 水位回退或从 0 重开,覆写已提交打包密文 → GCM。修复:ObjectStream/`MultiRange` 走 `spawn_blocking`;SSE GET 在承诺 200/206 前探测起点 chunk;abort 不回退水位;Complete 加密臂 `after_release`;`open_new_extent` 按快照活段 max_end 垫高水位。回归见 fs3-engine/fs3-s3 单测(含 false-free 钩子)。
+> - 崩溃:`FASTS3D=target/release/fasts3d bash tests/crash/run_crash_enc.sh 30 19620 --fresh` PASS(kills=11,328s)后 `... 500 ... --fresh` PASS(kills=218,6694s);零泄漏零撕裂 stats drift=0;ssec_put=387 sses3_put=387 get_verify=115740 lc_deleted_sum=2551。
+> - G-1 复测:2GiB、`compaction_enabled=false`、`lifecycle_interval_secs=10`、`--allow-anonymous`、**TZ=UTC**(非 UTC 下 `test_lifecycle_expiration_header_tags_head` 用本地 naive now 减 UTC 午夜会把正确头判失败)。两轮 `passed=457 skipped=94 excluded_failures=287 unexpected_failures=0`。
+> - perf 未加密回退门禁未过:同机 A=v1.1 Off / B=当前 Off,loadgen GET 仍见约 -30% 吞吐回退(脚本见 `tests/bench/perf-m11-compare.sh`);生命周期规则桶级缓存与 spawn_blocking 已落地,对照需再跑才勾选。
+> - 不打 git tag、不跑 `tools/package/`。
 
 ---
 

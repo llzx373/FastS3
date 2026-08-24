@@ -3475,6 +3475,21 @@ impl S3Service {
                     }
                 }
                 let status = 206;
+                if !head_only && meta.sse.is_some() && meta.size > 0 {
+                    let mut probe = [0u8; 1];
+                    let probe_off = parts[0].start.min(meta.size - 1);
+                    engine
+                        .read_at_version_for(
+                            bucket,
+                            key,
+                            vk.as_ref(),
+                            probe_off,
+                            &mut probe,
+                            bkt.versioning,
+                            ssec.as_ref().map(|s| &s.key),
+                        )
+                        .map_err(|e| map_engine_error(e, bucket, key))?;
+                }
                 return Ok(ServiceResponse {
                     status,
                     headers,
@@ -3578,6 +3593,26 @@ impl S3Service {
                 headers,
                 body: ResponseBody::Empty,
             });
+        }
+
+        // M11 G-2:SSE 对象在发 200 + Content-Length 之前探测 Range 起点
+        // 所在 64KiB chunk(GCM 验 tag)。密钥正确但密文撕裂时,流内失败
+        // 只会在已承诺长度后断流,客户端 ReadTimeout 挂死(crash-enc
+        // rnd64 m11-enc-c/a0)。探测失败 → 500 InternalError XML。
+        if meta.sse.is_some() && meta.size > 0 {
+            let mut probe = [0u8; 1];
+            let probe_off = start.min(meta.size - 1);
+            engine
+                .read_at_version_for(
+                    bucket,
+                    key,
+                    vk.as_ref(),
+                    probe_off,
+                    &mut probe,
+                    bkt.versioning,
+                    ssec.as_ref().map(|s| &s.key),
+                )
+                .map_err(|e| map_engine_error(e, bucket, key))?;
         }
 
         // 零拷贝段(同一锁内算好,避免 HTTP 层重复取锁;版本寻址形态)
@@ -4423,6 +4458,21 @@ impl S3Service {
                 headers,
                 body: ResponseBody::Empty,
             });
+        }
+        // M11 G-2:分片 GET 同整对象,SSE 起点 chunk 先探测再承诺长度。
+        if meta.sse.is_some() && length > 0 {
+            let mut probe = [0u8; 1];
+            engine
+                .read_at_version_for(
+                    bucket,
+                    key,
+                    None,
+                    start,
+                    &mut probe,
+                    bkt.versioning,
+                    ssec.as_ref().map(|s| &s.key),
+                )
+                .map_err(|e| map_engine_error(e, bucket, key))?;
         }
         let zc_segments = engine
             .object_segments_version_for(bucket, key, None, start, length, bkt.versioning)

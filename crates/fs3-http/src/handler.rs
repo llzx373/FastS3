@@ -2,7 +2,9 @@
 //!
 //! - 小 PUT(Content-Length ≤ 阈值)缓冲后走 `handle`(可先验载荷哈希);
 //! - 大 PUT / aws-chunked 走 `put_object_stream`(通道泵 + 同步读);
-//! - GET/HEAD 走 `handle`;ObjectStream 响应由后台任务逐块拉取发送。
+//! - GET/HEAD 走 `handle`;ObjectStream / 多段 Range 在 `spawn_blocking`
+//!   上同步读+发送(io_uring / SSE GCM 不得占 hyper worker,否则客户端
+//!   ReadTimeout;M11 G-2)。零拷贝 sendfile/splice 路径不经此泵。
 
 use std::io::Read;
 use std::sync::Arc;
@@ -278,11 +280,11 @@ fn empty_body() -> RespBody {
 }
 
 /// 多段 Range 流:非空字节即发(空发返回 true 保持语义简单)。
-async fn send_range_bytes(
+fn send_range_bytes(
     tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
     bytes: &[u8],
 ) -> bool {
-    if !bytes.is_empty() && tx.send(Ok(Bytes::copy_from_slice(bytes))).await.is_err() {
+    if !bytes.is_empty() && tx.blocking_send(Ok(Bytes::copy_from_slice(bytes))).is_err() {
         return false;
     }
     true
@@ -809,7 +811,11 @@ fn render_with(
             }
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
             let svc = service.clone();
-            tokio::spawn(async move {
+            // M11 G-2:流式读是同步 io_uring(+ SSE 解密),不得占用 hyper
+            // worker,否则发送端阻塞时接收端无法 poll(ReadTimeout)。
+            // spawn_blocking 走 runtime 阻塞池,避免每请求 std::thread
+            // 创建把未加密 GET 吞吐打穿,同时仍不占用 worker。
+            tokio::task::spawn_blocking(move || {
                 let mut pos = 0u64;
                 let mut buf = vec![0u8; 4 * 1024 * 1024];
                 loop {
@@ -822,14 +828,13 @@ fn render_with(
                         length,
                         &mut pos,
                         &mut buf,
-                        // M11 E1-3:SSE 对象回传请求期密钥解密(零拷贝已禁)
                         sse_key.as_ref(),
                     ) {
                         Ok(n) => n,
                         Err(e) => {
-                            let _ = tx
-                                .send(Err(std::io::Error::other(e.render_xml("", ""))))
-                                .await;
+                            let _ = tx.blocking_send(Err(std::io::Error::other(
+                                e.render_xml("", ""),
+                            )));
                             break;
                         }
                     };
@@ -837,14 +842,12 @@ fn render_with(
                         break;
                     }
                     if tx
-                        .send(Ok(Bytes::copy_from_slice(&buf[..n])))
-                        .await
+                        .blocking_send(Ok(Bytes::copy_from_slice(&buf[..n])))
                         .is_err()
                     {
                         break;
                     }
                 }
-                // 流结束:释放准入
                 if let Some((a, n)) = &admit {
                     a.release(*n);
                 }
@@ -888,13 +891,13 @@ fn render_with(
             };
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
             let svc = service.clone();
-            tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
                 let mut buf = vec![0u8; 4 * 1024 * 1024];
                 for (s, e) in &ranges {
                     let header = format!(
                         "--{boundary}\r\nContent-Type: {part_content_type}\r\nContent-Range: bytes {s}-{e}/{total}\r\n\r\n"
                     );
-                    if !send_range_bytes(&tx, header.as_bytes()).await {
+                    if !send_range_bytes(&tx, header.as_bytes()) {
                         break;
                     }
                     let len = e - s + 1;
@@ -909,14 +912,13 @@ fn render_with(
                             len,
                             &mut pos,
                             &mut buf,
-                            // M11 E1-3:SSE 对象回传请求期密钥解密
                             sse_key.as_ref(),
                         ) {
                             Ok(n) => n,
                             Err(err) => {
-                                let _ = tx
-                                    .send(Err(std::io::Error::other(err.render_xml("", ""))))
-                                    .await;
+                                let _ = tx.blocking_send(Err(std::io::Error::other(
+                                    err.render_xml("", ""),
+                                )));
                                 break;
                             }
                         };
@@ -924,19 +926,18 @@ fn render_with(
                             break;
                         }
                         if tx
-                            .send(Ok(Bytes::copy_from_slice(&buf[..n])))
-                            .await
+                            .blocking_send(Ok(Bytes::copy_from_slice(&buf[..n])))
                             .is_err()
                         {
                             break;
                         }
                     }
-                    if !send_range_bytes(&tx, b"\r\n").await {
+                    if !send_range_bytes(&tx, b"\r\n") {
                         break;
                     }
                 }
                 let tail = format!("--{boundary}--\r\n");
-                let _ = send_range_bytes(&tx, tail.as_bytes()).await;
+                let _ = send_range_bytes(&tx, tail.as_bytes());
                 if let Some((a, n)) = &admit {
                     a.release(*n);
                 }

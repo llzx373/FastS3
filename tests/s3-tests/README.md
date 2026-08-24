@@ -77,9 +77,12 @@ FastS3 v0.5 的协议一致性门禁 = **已实现特性的完整兼容**。跑 
 #    才可见删除(过去 Date 立即到期/NewerNoncurrentVersions 保量两用例
 #    由此转绿);DL4 午夜语义的 Days 族仍需真实跨天,维持排除(排除矩阵
 #    lifecycle 行逐名)。
+#    M11 G-1 干净复测起 runner 固定 TZ=UTC:非 UTC 时区下
+#    test_lifecycle_expiration_header_tags_head 用本地 naive now 减 UTC
+#    午夜会把正确的 x-amz-expiration 头判失败(UTC+8 必现)。
 fasts3d serve --config s3tests-server.toml --key test:secret123 --allow-anonymous &
 # 2) 配置 s3tests.conf(host/port/ak/sk 指向上一步;tests/m8/regression.sh 自动生成)
-# 3) 门禁(全量跑 + 排除集校验;脚本无执行位,用 bash 调用)
+# 3) 门禁(全量跑 + 排除集校验;脚本无执行位,用 bash 调用;TZ=UTC 由 runner 导出)
 S3TEST_CONF=/tmp/s3-tests/s3tests.conf bash tests/s3-tests/run_s3tests.sh
 ```
 
@@ -231,6 +234,10 @@ S3TEST_CONF=/tmp/s3-tests/s3tests.conf bash tests/s3-tests/run_s3tests.sh
   RESULT: PASS**(较 C 轮基线 passed+84 / excluded−84 = 出集族转绿净额;
   排除集构成:kms 族 61 + lifecycle 逐名 15 + copy DE3 10 + sse 逐名 4 +
   误掩裁决 3 + 既有排除 194)。
+- **干净复测(2026-08-24,G-2 hang/overwrite 修复后)**:独立 2GiB 镜像,
+  同上配置,**TZ=UTC**,两轮同数 `457/94/287/0`。非 UTC 下
+  `test_lifecycle_expiration_header_tags_head` 会把正确头当失败
+  (runner 已 `export TZ=UTC`)。
 
 
 ## M11 L5-1 实测记录(2026-08-24,lifecycle 族定向复核 + 缺陷修复)

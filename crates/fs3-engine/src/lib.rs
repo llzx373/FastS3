@@ -1,7 +1,8 @@
 //! FastS3 存储引擎(ADR-9 打包段布局):PUT/GET/DELETE 全链路、崩溃恢复、检查点策略。
 //!
 //! 时序保证(DESIGN §4.5):数据先落盘(O_DIRECT 写返回)、元数据后提交
-//! (rocksdb 事务 + 组提交,ADR-8);客户端中断 → 不提交事务,段/水位回滚。
+//! (rocksdb 事务 + 组提交,ADR-8);客户端中断 → 不提交事务、分配回滚;
+//! 开放 extent 水位不回退(避免覆写已提交打包段)。
 //! 启动恢复(DESIGN §4.10 + ADR-9 §5.7):超级块 → rocksdb WAL → 检查点 →
 //! a: 重放 → **段级可达性扫描**(live_bytes/引用计数/共享段表/watermark 重建)
 //! → 开放 extent 识别与续写 → 泄漏报告。
@@ -20,7 +21,7 @@ pub mod worker;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
@@ -357,6 +358,15 @@ impl Engine {
         &self.alloc
     }
 
+    /// 测试钩子:只改内存分配账目,不删元数据。模拟 `dec_live` 把仍被
+    /// 快照引用的 extent 当成空闲(G-2 重分配从水位 0 覆写)。
+    #[cfg(test)]
+    pub(crate) fn debug_false_free_segments(&mut self, segs: &[Segment]) {
+        let mut draft = Staged::default();
+        self.alloc.release_object(&mut draft, segs);
+        self.open_extent = None;
+    }
+
     pub fn io_engine_name(&self) -> &'static str {
         self.io.lock().unwrap().name()
     }
@@ -390,8 +400,17 @@ impl Engine {
         }
     }
 
+    /// 成功提交后记录开放 extent 已提交水位(诊断/与 watermark 对齐;
+    /// abort_draft 不再回退水位,见该函数注释)。
+    fn mark_open_committed(&mut self) {
+        if let Some(oe) = &mut self.open_extent {
+            oe.committed_end = oe.watermark;
+        }
+    }
+
     /// 每个写操作后调用:处理检查点定时 tick 与分配增量触发。
     fn maybe_checkpoint(&mut self) -> Result<()> {
+        self.mark_open_committed();
         let due = {
             let mut st = self.checkpoint.lock().unwrap();
             let tick = matches!(self.checkpoint_tick.lock().unwrap().try_recv(), Ok(()));
@@ -546,8 +565,9 @@ impl Engine {
 
     /// 写路径版本化分叉(ADR-11 §3.4.2):返回提交目标与旧值视图。
     ///
-    /// - Off:读旧未版本化条目(旧路径原样;`counted` 保持旧口径 =
-    ///   旧段非空,覆盖空/内联旧值仍 +1 的历史行为逐字节保留);
+    /// - Off:读旧未版本化条目;`counted` = 旧数据版本存在(含内联,
+    ///   extents 可空)。覆盖内联不得再 +1 objects,否则生命周期物理
+    ///   删除后桶统计残留 (1,0)(M11 G-2 m11-lcoff);
     /// - Enabled:新 vk 纯追加——**不读旧版本段**,仅一次最大 vk 反扫
     ///   (vk 防回拨,D2);旧版本段由旧版本元数据继续持有,零释放;
     /// - Suspended(D1a-1):存在 Off 时代遗留未版本化单键 → **原地覆盖
@@ -569,7 +589,7 @@ impl Engine {
                     WriteTarget::Unversioned,
                     OldVersion {
                         existed: old.is_some(),
-                        counted: !segments.is_empty(),
+                        counted: old.as_ref().is_some_and(|o| !o.is_delete_marker),
                         segments,
                         size,
                     },
@@ -1061,7 +1081,7 @@ impl Engine {
         if !old_segments.is_empty() {
             self.alloc.release_object(&mut draft, &old_segments);
         }
-        // 统计(D5):Off 保持旧路径口径(旧段空 = 新对象);Enabled 纯追加
+        // 统计(D5):Off = 旧数据版本覆盖 objects 不变;Enabled 纯追加
         // 恒 +1/+size;Suspended 覆盖 null 槽 = 先扣旧 null 数据版本再加新。
         let delta = StatsDelta {
             objects: if old.counted { 0 } else { 1 },
@@ -1074,7 +1094,10 @@ impl Engine {
             return Err(e);
         }
         match self.commit_put_plan(bucket, key, target, &meta, to_alloc_draft(&draft), delta) {
-            Ok(_) => Ok(meta),
+            Ok(_) => {
+                self.mark_open_committed();
+                Ok(meta)
+            }
             Err(e) => {
                 self.abort_draft(&draft);
                 Err(e)
@@ -1131,17 +1154,81 @@ impl Engine {
     }
 
     /// 分配新开放 extent(首段 alloc 记录随所属对象事务提交;ADR-9 §4.5)。
+    ///
+    /// 若刚分配的 id 在对象/分片快照里仍有活段(`dec_live` 误清位图后
+    /// 重分配),水位从活段 max_end 的 4KiB 对齐上界起跳,避免从 0 覆写
+    /// 已提交打包密文(M11 G-2 SSE GCM)。已写满的误释放 extent 封口后
+    /// 换下一个 id。
     fn open_new_extent(&mut self, draft: &mut Staged) -> Result<()> {
-        let id = self.alloc.allocate(draft, 1)?.remove(0);
-        self.note_alloc(1);
-        self.alloc.mark_open(id);
-        self.open_extent = Some(OpenExtent {
-            extent_id: id as u32,
-            watermark: 0,
-            committed_end: 0,
-            participants: 1,
-        });
-        Ok(())
+        let capacity = self.sb.extent_capacity();
+        let n = self.sb.extent_count();
+        for _ in 0..n {
+            let id = self.alloc.allocate(draft, 1)?.remove(0);
+            self.note_alloc(1);
+            let (max_end, live_sum, holders) = self.live_extent_occupancy(id as u32)?;
+            if max_end == 0 {
+                self.alloc.mark_open(id);
+                self.open_extent = Some(OpenExtent {
+                    extent_id: id as u32,
+                    watermark: 0,
+                    committed_end: 0,
+                    participants: 1,
+                });
+                return Ok(());
+            }
+            self.alloc.restore_occupancy(id, live_sum, holders.max(1));
+            let wm = align_up(max_end as u64, SECTOR_SIZE);
+            if wm < capacity {
+                self.alloc.mark_open(id);
+                self.open_extent = Some(OpenExtent {
+                    extent_id: id as u32,
+                    watermark: wm as u32,
+                    committed_end: wm as u32,
+                    // 快照仍有持有者:封口必须走打包头,不得判独占
+                    participants: holders.max(2),
+                });
+                return Ok(());
+            }
+            self.alloc.mark_sealed(id);
+        }
+        Err(Error::NoSpace)
+    }
+
+    /// 对象 + 未完成分片快照中 `extent_id` 的占用:(max_end, live_sum, holders)。
+    fn live_extent_occupancy(&self, extent_id: u32) -> Result<(u32, u32, u32)> {
+        let mut max_end = 0u32;
+        let mut uniq: HashSet<(u32, u32)> = HashSet::new();
+        let mut holders = 0u32;
+        for (_, _, _, m) in self.meta.snapshot_all_objects()? {
+            let mut hit = false;
+            for s in &m.extents {
+                if s.extent_id == extent_id {
+                    max_end = max_end.max(s.offset.saturating_add(s.len));
+                    uniq.insert((s.offset, s.len));
+                    hit = true;
+                }
+            }
+            if hit {
+                holders = holders.saturating_add(1);
+            }
+        }
+        for (_, _, p) in self.meta.snapshot_all_parts()? {
+            let mut hit = false;
+            for s in &p.extents {
+                if s.extent_id == extent_id {
+                    max_end = max_end.max(s.offset.saturating_add(s.len));
+                    uniq.insert((s.offset, s.len));
+                    hit = true;
+                }
+            }
+            if hit {
+                holders = holders.saturating_add(1);
+            }
+        }
+        let live_sum = uniq
+            .iter()
+            .fold(0u32, |acc, (_, len)| acc.saturating_add(*len));
+        Ok((max_end, live_sum, holders))
     }
 
     /// 封口当前开放 extent:写头(数据之后写,防撕裂)+ 状态 Sealed。
@@ -1233,15 +1320,15 @@ impl Engine {
         Ok(crcs)
     }
 
-    /// 事务失败统一处理:回滚分配草稿;开放 extent 回退水位到已提交水位
-    /// (孤儿数据被后续追加覆盖)或丢弃被回滚释放的 extent。
+    /// 事务失败统一处理:回滚分配草稿。开放 extent 若已被回滚释放则丢弃;
+    /// 否则**不回退水位**——失败写入留下的孤儿区由后续追加跳过,由恢复
+    /// 按活段 max_end 覆盖。回退到陈旧 committed_end 会覆写已提交打包段
+    /// (M11 G-2 SSE GCM 失败)。
     fn abort_draft(&mut self, draft: &Staged) {
         self.alloc.rollback(draft);
-        if let Some(oe) = &mut self.open_extent {
+        if let Some(oe) = &self.open_extent {
             if !self.alloc.test_bit(oe.extent_id as u64) {
                 self.open_extent = None;
-            } else {
-                oe.watermark = oe.committed_end;
             }
         }
     }
@@ -2349,6 +2436,9 @@ impl Engine {
                 .put_part(upload_id, part_no, &part, to_alloc_draft(&draft));
             return match seq {
                 Ok(_) => {
+                    // 分片元数据已提交:此后不得 abort_draft(否则 live_bytes
+                    // 低于仍在 meta 中的段,后续追加会覆写已提交打包前驱)。
+                    self.mark_open_committed();
                     if self
                         .meta
                         .get_multipart(upload_id)?
@@ -2374,6 +2464,7 @@ impl Engine {
         );
         match seq {
             Ok(_) => {
+                self.mark_open_committed();
                 if self
                     .meta
                     .get_multipart(upload_id)?
@@ -2488,19 +2579,24 @@ impl Engine {
             };
             self.meta
                 .put_part(upload_id, part_no, &part, to_alloc_draft(&draft))?;
-            if self
-                .meta
-                .get_multipart(upload_id)?
-                .map(|s| s.completed)
-                .unwrap_or(false)
-            {
-                self.meta.touch_multipart(upload_id)?;
-            }
-            self.maybe_checkpoint()?;
             Ok(part)
         })();
         match result {
-            Ok(part) => Ok(part),
+            Ok(part) => {
+                // put_part 已提交:不得 abort_draft。touch/checkpoint 失败
+                // 仍把已提交水位记下,避免后续失败写覆写前驱。
+                self.mark_open_committed();
+                if self
+                    .meta
+                    .get_multipart(upload_id)?
+                    .map(|s| s.completed)
+                    .unwrap_or(false)
+                {
+                    self.meta.touch_multipart(upload_id)?;
+                }
+                self.maybe_checkpoint()?;
+                Ok(part)
+            }
             Err(e) => {
                 self.abort_draft(&draft);
                 Err(e)
@@ -2868,6 +2964,7 @@ impl Engine {
                     }
                     self.alloc.add_object(&mut draft, &extents);
                     self.alloc.release_object(&mut draft, &part_segments);
+                    self.after_release(&part_segments)?;
                     ObjectMeta {
                         size: total_size,
                         etag,
@@ -3029,11 +3126,13 @@ impl Engine {
                 to_alloc_draft(&draft),
                 delta,
             )?;
-            self.maybe_checkpoint()?;
             Ok(meta)
         })();
         match result {
-            Ok(meta) => Ok(meta),
+            Ok(meta) => {
+                self.maybe_checkpoint()?;
+                Ok(meta)
+            }
             Err(e) => {
                 self.abort_draft(&draft);
                 Err(e)
@@ -4113,8 +4212,7 @@ impl WriteTarget {
 struct OldVersion {
     /// 旧条目存在(copy/complete 的 Off 分支保持旧口径 = old.is_some())。
     existed: bool,
-    /// 旧版本是否计入桶统计(数据版本 = true;删除标记/无旧值 = false;
-    /// Off 分支保持旧口径 = 旧段非空)。
+    /// 旧版本是否计入桶统计(数据版本 = true,含内联;删除标记/无旧值 = false)。
     counted: bool,
     /// 旧版本段列表(无旧值/删除标记/Enabled = 空)。
     segments: Vec<Segment>,

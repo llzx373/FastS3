@@ -48,6 +48,9 @@
 # 前置:target/release/fasts3d 已构建(FASTS3D 环境变量可覆盖);boto3 可用。
 # CRC32C/CRC64NVME 在 harness 内纯 Python 实现(与 fs3-core 同参数同向量),
 # 不依赖 botocore[crt]。
+#
+# 干净复测(2026-08-25):500 --fresh PASS(kills=218,零泄漏/零撕裂/账目零漂移)。
+# abort 不回退打包水位;SSE GET 承诺 Content-Length 前探测起点 chunk。
 
 set -u
 

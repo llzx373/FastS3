@@ -17,6 +17,9 @@
 #   前置:fasts3d 已 serve(s3tests.conf 指向);venv 有 pytest + boto3。
 
 set -u
+# M11 G-1:lifecycle 头用例用本地 naive now 对照 UTC 午夜;非 UTC 时区
+# (如 UTC+8)会把正确的 x-amz-expiration 判失败。门禁固定 UTC。
+export TZ=UTC
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 S3TESTS="${S3TESTS_DIR:-/tmp/s3-tests}"
 CONF="${S3TEST_CONF:-$S3TESTS/s3tests.conf}"

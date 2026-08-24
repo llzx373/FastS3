@@ -128,6 +128,31 @@ fn overwrite_releases_old_segments() {
     e.close().unwrap();
 }
 
+/// M11 G-2:Off 桶内联覆盖不得把 objects +1。历史口径 `counted = 段非空`
+/// 把内联(extents 空)当成新对象,覆盖后再被生命周期物理删除会留下
+/// admin stats (1,0) 而列表为空。
+#[test]
+fn off_inline_overwrite_does_not_inflate_object_count() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    e.put("b1", "k", &mut Cursor::new(vec![1u8; 100])).unwrap();
+    assert_eq!(stats_of(&e), (1, 100));
+    e.put("b1", "k", &mut Cursor::new(vec![2u8; 200])).unwrap();
+    assert_eq!(
+        stats_of(&e),
+        (1, 200),
+        "inline overwrite must not increment objects"
+    );
+    let big = vec![3u8; 100_000];
+    e.put("b1", "k", &mut Cursor::new(big)).unwrap();
+    assert_eq!(stats_of(&e), (1, 100_000), "inline→extent overwrite");
+    e.put("b1", "k", &mut Cursor::new(vec![4u8; 50])).unwrap();
+    assert_eq!(stats_of(&e), (1, 50), "extent→inline overwrite");
+    assert!(e.delete("b1", "k").unwrap().is_some());
+    assert_eq!(stats_of(&e), (0, 0));
+    e.close().unwrap();
+}
+
 #[test]
 fn put_interrupted_rolls_back() {
     let (_d, cfg) = setup();
@@ -157,16 +182,216 @@ fn put_interrupted_rolls_back() {
         },
     );
     assert!(r.is_err());
-    // 未提交事务:对象不可见,extent 全部回滚,开放 extent 水位回退
+    // 未提交事务:对象不可见;位图回滚后开放会话丢弃(非水位回退覆写)
     assert!(e.head("b1", "partial").unwrap().is_none());
     assert_eq!(e.allocator().allocated_count(), 0);
-    // 回退后可继续写入(孤儿区被覆盖)
+    // 释放后可继续写入(新 extent)
     let d = vec![9u8; 100_000];
     e.put("b1", "after", &mut Cursor::new(d.clone())).unwrap();
     let mut out = Vec::new();
     e.get_to("b1", "after", 0..u64::MAX, &mut out).unwrap();
     assert_eq!(out, d);
     assert_eq!(e.allocator().allocated_count(), 1);
+    e.close().unwrap();
+}
+
+/// 已提交打包对象之后的失败 PUT 必须回退到该对象之后,不得从
+/// committed_end=0 覆写前驱(开放 extent 在进程内跨多次 PUT 存活)。
+#[test]
+fn abort_does_not_overwrite_committed_packed_predecessor() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let a = rnd(100_000, 11);
+    e.put("b1", "a", &mut Cursor::new(a.clone())).unwrap();
+    struct FailingReader {
+        remaining: usize,
+    }
+    impl Read for FailingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "client gone",
+                ));
+            }
+            let n = buf.len().min(1024).min(self.remaining);
+            buf[..n].fill(0xEE);
+            self.remaining -= n;
+            Ok(n)
+        }
+    }
+    assert!(e
+        .put("b1", "partial", &mut FailingReader { remaining: 200_000 },)
+        .is_err());
+    let c = rnd(80_000, 13);
+    e.put("b1", "c", &mut Cursor::new(c.clone())).unwrap();
+    let mut out = Vec::new();
+    e.get_to("b1", "a", 0..u64::MAX, &mut out).unwrap();
+    assert_eq!(out, a, "committed predecessor must survive abort_draft");
+    out.clear();
+    e.get_to("b1", "c", 0..u64::MAX, &mut out).unwrap();
+    assert_eq!(out, c);
+    e.close().unwrap();
+}
+
+/// 同上,SSE-C 网格:覆写密文表现为 GCM tag 失败而非明文错字节。
+#[test]
+fn abort_does_not_overwrite_committed_sse_packed_predecessor() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let key = sse_test_key();
+    let a = rnd(100_000, 17);
+    e.put_with_meta(
+        "b1",
+        "a",
+        &mut Cursor::new(a.clone()),
+        None,
+        vec![],
+        vec![],
+        vec![],
+        None,
+        None,
+        Some(&fs3_core::SseWriteKey::SseC(&key)),
+    )
+    .unwrap();
+    struct FailingReader {
+        remaining: usize,
+    }
+    impl Read for FailingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "client gone",
+                ));
+            }
+            let n = buf.len().min(1024).min(self.remaining);
+            buf[..n].fill(0xEE);
+            self.remaining -= n;
+            Ok(n)
+        }
+    }
+    assert!(e
+        .put_with_meta(
+            "b1",
+            "partial",
+            &mut FailingReader { remaining: 200_000 },
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            Some(&fs3_core::SseWriteKey::SseC(&key)),
+        )
+        .is_err());
+    let mut out = vec![0u8; a.len()];
+    let n = e
+        .read_at_version_for(
+            "b1",
+            "a",
+            None,
+            0,
+            &mut out,
+            VersioningState::Off,
+            Some(&key),
+        )
+        .unwrap();
+    assert_eq!(&out[..n], a.as_slice(), "SSE predecessor must decrypt");
+    e.close().unwrap();
+}
+
+/// 已提交打包 SSE 对象之后的失败 upload_part 同样不得覆写前驱。
+#[test]
+fn abort_upload_part_does_not_overwrite_committed_sse_packed_predecessor() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let key = sse_test_key();
+    let a = rnd(100_000, 19);
+    e.put_with_meta(
+        "b1",
+        "a",
+        &mut Cursor::new(a.clone()),
+        None,
+        vec![],
+        vec![],
+        vec![],
+        None,
+        None,
+        Some(&fs3_core::SseWriteKey::SseC(&key)),
+    )
+    .unwrap();
+    struct FailingReader {
+        remaining: usize,
+    }
+    impl Read for FailingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "client gone",
+                ));
+            }
+            let n = buf.len().min(1024).min(self.remaining);
+            buf[..n].fill(0xEE);
+            self.remaining -= n;
+            Ok(n)
+        }
+    }
+    let uid = create_sse_upload(&mut e, "partial-part");
+    assert!(e
+        .upload_part(
+            &uid,
+            1,
+            &mut FailingReader { remaining: 200_000 },
+            None,
+            Some(&key),
+        )
+        .is_err());
+    let c = rnd(80_000, 23);
+    e.put_with_meta(
+        "b1",
+        "c",
+        &mut Cursor::new(c.clone()),
+        None,
+        vec![],
+        vec![],
+        vec![],
+        None,
+        None,
+        Some(&fs3_core::SseWriteKey::SseC(&key)),
+    )
+    .unwrap();
+    let mut out = vec![0u8; a.len()];
+    let n = e
+        .read_at_version_for(
+            "b1",
+            "a",
+            None,
+            0,
+            &mut out,
+            VersioningState::Off,
+            Some(&key),
+        )
+        .unwrap();
+    assert_eq!(
+        &out[..n],
+        a.as_slice(),
+        "SSE predecessor must survive failed part"
+    );
+    out = vec![0u8; c.len()];
+    let n = e
+        .read_at_version_for(
+            "b1",
+            "c",
+            None,
+            0,
+            &mut out,
+            VersioningState::Off,
+            Some(&key),
+        )
+        .unwrap();
+    assert_eq!(&out[..n], c.as_slice());
     e.close().unwrap();
 }
 
@@ -5291,5 +5516,248 @@ fn sse_s3_multipart_e2e() {
         )
         .unwrap_err();
     assert!(matches!(err, Error::InvalidRequest(_)), "{err}");
+    e.close().unwrap();
+}
+
+/// M11 G-2:SSE-S3 Complete 后同一开放 extent 上的遗留 multipart 分片
+/// 不得从水位 0 覆写已提交对象(crash-enc rnd4 m11-enc-s3/b3:extent 7
+/// 上 leftover part 与 completed 对象段重叠 → GCM 失败)。
+#[test]
+fn sse_s3_complete_then_leftover_parts_do_not_tear() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let p1d = rnd(5 * 1024 * 1024, 41);
+    let p2d = rnd(400_000, 42);
+    let uid = create_s3_upload(&mut e, "s3-mp-pack");
+    let p1 = e
+        .upload_part(&uid, 1, &mut Cursor::new(p1d.clone()), None, None)
+        .unwrap();
+    let p2 = e
+        .upload_part(&uid, 2, &mut Cursor::new(p2d.clone()), None, None)
+        .unwrap();
+    let m = e
+        .complete_multipart(
+            "b1",
+            "s3-mp-pack",
+            &uid,
+            &[cp(1, p1.etag_hex()), cp(2, p2.etag_hex())],
+            None,
+            None,
+        )
+        .unwrap();
+    for i in 0..2 {
+        let uid_l = e
+            .create_multipart(
+                "b1",
+                &format!("leftover-{i}"),
+                None,
+                vec![],
+                vec![],
+                vec![],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        e.upload_part(
+            &uid_l,
+            1,
+            &mut Cursor::new(vec![0xABu8; 300_000]),
+            None,
+            None,
+        )
+        .unwrap();
+    }
+    let mut expect = p1d.clone();
+    expect.extend_from_slice(&p2d);
+    let mut out = Vec::new();
+    e.get_to_meta(&m, 0..u64::MAX, &mut out, None).unwrap();
+    assert_eq!(
+        out, expect,
+        "leftover parts must not tear completed SSE object"
+    );
+    e.close().unwrap();
+}
+
+/// 模拟 `dec_live` 误清位图后重分配:open_new_extent 必须垫高水位,
+/// 不得从 0 覆写仍被元数据引用的打包段(G-2 rnd4 SSE-S3 GCM)。
+#[test]
+fn open_new_extent_floors_watermark_when_meta_still_holds() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let a = rnd(100_000, 21);
+    e.put("b1", "keep", &mut Cursor::new(a.clone())).unwrap();
+    let m = e.head("b1", "keep").unwrap().unwrap();
+    assert!(!m.extents.is_empty());
+    e.debug_false_free_segments(&m.extents);
+    let b = rnd(80_000, 22);
+    e.put("b1", "next", &mut Cursor::new(b.clone())).unwrap();
+    let mut out = Vec::new();
+    e.get_to("b1", "keep", 0..u64::MAX, &mut out).unwrap();
+    assert_eq!(
+        out, a,
+        "predecessor must survive reallocation of its extent"
+    );
+    out.clear();
+    e.get_to("b1", "next", 0..u64::MAX, &mut out).unwrap();
+    assert_eq!(out, b);
+    e.close().unwrap();
+}
+
+/// 同上,SSE-C 网格:从水位 0 覆写会表现为 GCM tag 失败。
+#[test]
+fn open_new_extent_floors_watermark_sse_c() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let key = sse_test_key();
+    let a = rnd(200_000, 23);
+    let m = e
+        .put_with_meta(
+            "b1",
+            "keep",
+            &mut Cursor::new(a.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            Some(&fs3_core::SseWriteKey::SseC(&key)),
+        )
+        .unwrap();
+    e.debug_false_free_segments(&m.extents);
+    let b = rnd(80_000, 24);
+    e.put_with_meta(
+        "b1",
+        "next",
+        &mut Cursor::new(b),
+        None,
+        vec![],
+        vec![],
+        vec![],
+        None,
+        None,
+        Some(&fs3_core::SseWriteKey::SseC(&key)),
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    e.get_to_meta(&m, 0..u64::MAX, &mut out, Some(&key))
+        .unwrap();
+    assert_eq!(
+        out, a,
+        "SSE predecessor must survive false-free reallocation"
+    );
+    e.close().unwrap();
+}
+
+/// Complete 后再误清已提交对象所在 extent:遗留 multipart 分片不得撕裂。
+#[test]
+fn leftover_parts_after_false_free_do_not_tear_sse() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let p1d = rnd(5 * 1024 * 1024, 41);
+    let p2d = rnd(400_000, 42);
+    let uid = create_s3_upload(&mut e, "s3-mp-ff");
+    let p1 = e
+        .upload_part(&uid, 1, &mut Cursor::new(p1d.clone()), None, None)
+        .unwrap();
+    let p2 = e
+        .upload_part(&uid, 2, &mut Cursor::new(p2d.clone()), None, None)
+        .unwrap();
+    let m = e
+        .complete_multipart(
+            "b1",
+            "s3-mp-ff",
+            &uid,
+            &[cp(1, p1.etag_hex()), cp(2, p2.etag_hex())],
+            None,
+            None,
+        )
+        .unwrap();
+    e.debug_false_free_segments(&m.extents);
+    for i in 0..2 {
+        let uid_l = e
+            .create_multipart(
+                "b1",
+                &format!("leftover-ff-{i}"),
+                None,
+                vec![],
+                vec![],
+                vec![],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        e.upload_part(
+            &uid_l,
+            1,
+            &mut Cursor::new(vec![0xABu8; 300_000]),
+            None,
+            None,
+        )
+        .unwrap();
+    }
+    let mut expect = p1d.clone();
+    expect.extend_from_slice(&p2d);
+    let mut out = Vec::new();
+    e.get_to_meta(&m, 0..u64::MAX, &mut out, None).unwrap();
+    assert_eq!(
+        out, expect,
+        "leftover parts after false-free must not tear completed SSE object"
+    );
+    e.close().unwrap();
+}
+
+/// Corrupt,不得挂死。HTTP 层在承诺 200+Content-Length 前探测同一路径,
+/// 避免客户端 Raw ReadTimeout(crash-enc rnd64 m11-enc-c/a0)。
+#[test]
+fn sse_c_corrupt_ciphertext_fails_fast() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let key = sse_test_key();
+    let plain = rnd(200_000, 9);
+    e.put_with_meta(
+        "b1",
+        "sse-torn",
+        &mut Cursor::new(plain),
+        None,
+        vec![],
+        vec![],
+        vec![],
+        None,
+        None,
+        Some(&fs3_core::SseWriteKey::SseC(&key)),
+    )
+    .unwrap();
+    let meta = e.head("b1", "sse-torn").unwrap().unwrap();
+    let seg = meta.extents.first().expect("extent-backed SSE-C object");
+    let off = e.extent_data_offset(seg.extent_id as u64) + seg.offset as u64;
+    let aligned = off - (off % SECTOR_SIZE);
+    let mut buf = fs3_device::AlignedBuffer::new(SECTOR_SIZE as usize).unwrap();
+    e.device.pread_aligned(buf.as_mut_slice(), aligned).unwrap();
+    let skip = (off - aligned) as usize;
+    buf.as_mut_slice()[skip] ^= 0xff;
+    e.device.pwrite_aligned(buf.as_slice(), aligned).unwrap();
+
+    let t0 = std::time::Instant::now();
+    let mut out = vec![0u8; 1024];
+    let err = e
+        .read_at_version_for(
+            "b1",
+            "sse-torn",
+            None,
+            0,
+            &mut out,
+            VersioningState::Off,
+            Some(&key),
+        )
+        .unwrap_err();
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(2),
+        "torn SSE-C read must not hang: {:?}",
+        t0.elapsed()
+    );
+    assert!(matches!(err, Error::Corrupt(_)), "{err}");
     e.close().unwrap();
 }

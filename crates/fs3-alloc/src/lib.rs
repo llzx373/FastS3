@@ -298,7 +298,7 @@ impl Allocator {
             draft.live_dec.push((id, len));
             return;
         }
-        // live_bytes 归零:末段消亡 → 位图清位 + ref_dec 记录
+        // 末段消亡 → 位图清位 + ref_dec 记录
         self.live_bytes[id as usize].store(0, Ordering::Release);
         if self.bitmap.test(id) {
             self.bitmap.clear_bit(id);
@@ -474,6 +474,17 @@ impl Allocator {
         self.live_bytes[id as usize].load(Ordering::Acquire)
     }
 
+    /// `allocate()` 之后发现元数据仍引用该 extent 时回填派生账目。
+    ///
+    /// `dec_live` 在 live_bytes 归零时清位图,即使另有对象仍持有该
+    /// extent(账目与快照不一致)。随后 `allocate` 会把同一 id 当成空
+    /// extent 交出;引擎按快照垫高水位续写,本方法避免 `leaks()` 把
+    /// 「位图已置位但 live_bytes 仍为 0」误报成泄漏。
+    pub fn restore_occupancy(&self, id: u64, live: u32, refcount: u32) {
+        self.live_bytes[id as usize].store(live, Ordering::Release);
+        self.refcounts[id as usize].store(refcount, Ordering::Release);
+    }
+
     /// 全设备活字节总数(check 报告/利用率)。
     pub fn live_bytes_total(&self) -> u64 {
         (0..self.n).map(|id| self.live_bytes_of(id) as u64).sum()
@@ -620,6 +631,19 @@ mod tests {
         assert_eq!(a.allocated_count(), 0);
         assert_eq!(a.live_bytes_total(), 0);
         assert_eq!(d.ref_dec.len(), 4, "每个 extent 末段消亡都发 ref_dec");
+        Ok(())
+    }
+
+    #[test]
+    fn restore_occupancy_after_allocate() -> Result<()> {
+        let a = Allocator::new(8);
+        let mut d = Staged::default();
+        let id = a.allocate(&mut d, 1)?[0];
+        assert_eq!(a.live_bytes_of(id), 0);
+        a.restore_occupancy(id, 4096, 2);
+        assert_eq!(a.live_bytes_of(id), 4096);
+        assert_eq!(a.refcount(id), 2);
+        assert!(a.test_bit(id));
         Ok(())
     }
 

@@ -6451,6 +6451,38 @@ fn sse_c_extent_and_range_roundtrip() {
     read_body(&svc, &rget, &plain[60_000..140_000]);
 }
 
+/// M11 G-2:GCM 起点 chunk 损坏时 GET 必须立刻 500 InternalError,
+/// 不得先承诺 200+Content-Length 再在流内失败(客户端 ReadTimeout)。
+#[test]
+fn sse_c_get_corrupt_chunk_returns_internal_error() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/enc", vec![]))), 200);
+    let key = ssec_key();
+    let sh = ssec_headers(&key);
+    let sr = ssec_refs(&sh);
+    let plain: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let r = svc.handle(&req_h("PUT", "/enc/torn", &sr, plain));
+    assert_eq!(status(&r), 200, "{r:?}");
+
+    {
+        let e = svc.engine().write();
+        let raw = fs3_meta::keys::object_key("enc", "torn");
+        let mut m = e.head("enc", "torn").unwrap().unwrap();
+        m.sse.as_mut().unwrap().chunk_tags[0][0] ^= 0x80;
+        e.meta().commit_object_meta_update(&raw, &m).unwrap();
+    }
+
+    let t0 = std::time::Instant::now();
+    let get = svc.handle(&req_h("GET", "/enc/torn", &sr, vec![]));
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(2),
+        "corrupt SSE-C GET must not hang: {:?}",
+        t0.elapsed()
+    );
+    assert_eq!(status(&get), 500, "{get:?}");
+    assert_eq!(err_code(&get), "InternalError");
+}
+
 /// E1-7:流式 PUT HexSha256 分支 + SSE-C;chunked trailer + checksum +
 /// SSE-C 组合(明文 checksum 验算在前,加密在后,顺序不可颠倒)。
 #[test]

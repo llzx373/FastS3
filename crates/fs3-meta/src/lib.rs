@@ -5,6 +5,7 @@
 //! 回滚),组提交窗口由后台线程按 `flush_every_ms` 批量 `flush_wal` 实现
 //! (ADR-8,替代 sled 内建 `flush_every_ms`)。
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -542,6 +543,9 @@ pub struct MetaStore {
     /// 组提交刷盘线程句柄:仅靠 Drop 停止/回收线程(字段本身不读取)。
     #[allow(dead_code)]
     flusher: Option<Flusher>,
+    /// 桶级生命周期规则缓存(GET/HEAD 每请求求 x-amz-expiration;
+    /// 无规则桶避免反复 prefix scan。put/delete 规则随 commit 失效)。
+    lifecycle_cache: Mutex<HashMap<String, Vec<fs3_core::LifecycleRule>>>,
 }
 
 /// rocksdb 错误 → fs3 Error。
@@ -1016,6 +1020,7 @@ impl MetaStore {
             write_opts,
             txn_opts,
             flusher,
+            lifecycle_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1790,6 +1795,15 @@ impl MetaStore {
                         // Full:每事务显式 fsync
                         self.db.flush_wal(true).map_err(rocks_err)?;
                     }
+                    for op in ops {
+                        match op {
+                            Op::LifecycleRulesReplace { bucket, .. }
+                            | Op::LifecycleRulesDelete { bucket } => {
+                                self.lifecycle_cache.lock().unwrap().remove(bucket);
+                            }
+                            _ => {}
+                        }
+                    }
                     return Ok(seq);
                 }
                 Err(e) if e.kind() == ErrorKind::Busy || e.kind() == ErrorKind::TryAgain => {
@@ -1978,12 +1992,24 @@ impl MetaStore {
     /// 字典序——每规则一键的存储形态不保留提交序,执行器 L2-2 对顺序
     /// 不敏感;无规则/桶不存在 → 空表,桶存在性判定归协议层)。
     pub fn get_lifecycle_rules(&self, bucket: &str) -> Result<Vec<fs3_core::LifecycleRule>> {
+        if let Some(hit) = self.lifecycle_cache.lock().unwrap().get(bucket) {
+            return Ok(hit.clone());
+        }
         let mut rules = Vec::new();
         for item in scan_prefix(&self.db, &lifecycle_rules_prefix(bucket)) {
             let (_k, v) = item?;
             rules.push(decode_lifecycle_rule(&v)?);
         }
+        self.lifecycle_cache
+            .lock()
+            .unwrap()
+            .insert(bucket.to_string(), rules.clone());
         Ok(rules)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_clear_lifecycle_cache(&self) {
+        self.lifecycle_cache.lock().unwrap().clear();
     }
 
     /// 生命周期规则整体替换(单事务读旧写新;桶不存在 → NotFound)。
@@ -3311,6 +3337,7 @@ mod tests {
         s.db.put(lifecycle_rule_key("b1", "r2"), &bytes)
             .map_err(rocks_err)
             .unwrap();
+        s.debug_clear_lifecycle_cache();
         let got = s.get_lifecycle_rules("b1").unwrap();
         let r2 = got.iter().find(|r| r.id == "r2").unwrap();
         assert!(!r2.legacy_prefix, "初版格式值回退 legacy_prefix=false");

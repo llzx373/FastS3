@@ -56,7 +56,7 @@ extent 总大小 4MiB = 4,194,304B,含 4KiB 头 → 数据区容量 = 4,190,208B
 | 段(segment) | extent 数据区内一段 4KiB 对齐的连续区间,是对象→设备引用的基本单位(替代"整 extent 引用") |
 | 开放 extent | 当前正在被追加写入的 extent(每引擎/未来每核一个),由 watermark 标记已写水位 |
 | 封口(seal) | 开放 extent 停止追加,写 extent 头,状态变为 sealed;封口后不可再写 |
-| watermark | 开放 extent 已写字节水位(追加位置);恒等于"已写数据最大 end" |
+| watermark | 开放 extent 已写字节水位(追加位置);可领先于活段最大 end(失败写入孤儿区不回退,以免覆写已提交打包段);恢复时按活段 max_end 重建 |
 | 死段/活段 | 被对象元数据可达引用 = 活段;已删除/未提交 = 死段 |
 | 打包 extent | 内含 ≥ 2 个对象段(或 1 个对象 + 剩余空间)的 extent,头带 packed 标志 |
 | 独占 extent | 整个数据区只属于一个对象的 extent(大对象整块),走既有头 CRC 路径 |
@@ -194,7 +194,9 @@ struct OpenExtent { extent_id: u32, watermark: u32, chunk_crcs: Vec<u32> }  // �
 PUT 数据流(每对象一个 ExtentWriter,共享本引擎的开放 extent):
   开放 extent 不存在或已封口
     → alloc.allocate(1) 申请新 extent(首段事务发 alloc 记录)
-    → 初始化为 Open{watermark: 0}
+    → 若该 id 在对象/分片快照仍有活段(live_bytes 误归零后重分配)
+      → watermark = align_up(活段 max_end),不得从 0 覆写;已写满则封口换 id
+    → 否则初始化为 Open{watermark: 0}
   当前段 = 从 watermark 起写(4KiB 对齐):
     够装 → 整段写入,watermark += len,对象段列表追加 {E, old_watermark, len}
     不够装 → 写满当前 extent(watermark = 容量)封口;申请新 extent,
@@ -209,7 +211,7 @@ PUT 数据流(每对象一个 ExtentWriter,共享本引擎的开放 extent):
 要点:
 
 - **writer 跨对象存活**是核心重构:现状 `ExtentWriter` 每对象一个、extent 随对象消亡;改造后"extent 会话"跨对象,每对象复用同一 watermark 推进逻辑(代码改动集中在 `ExtentWriter` 生命周期 + `finalize_extent` 拆分出"段引用"与"封口");
-- 首段 alloc 记录随首段所属对象的元数据事务提交;若该事务失败,内存位图经既有 staged 回滚——与现状"写入中断释放 extent"完全一致;
+- 首段 alloc 记录随首段所属对象的元数据事务提交;若该事务失败,内存位图经既有 staged 回滚——与现状"写入中断释放 extent"一致;**开放 extent 水位不回退**(孤儿区由后续追加跳过,恢复按活段 max_end 覆盖)。回退陈旧水位会覆写已提交打包段。
 - 大对象自动收益:3.9MiB 对象写满 extent 后自然续接,其尾段剩余空间由后续对象填充,**"大对象尾浪费"问题顺带消除**;
 - 并发:现状 service 层 engine 写锁串行写路径,开放 extent 天然单写者;M5 thread-per-core 后每核引擎实例各持一个开放 extent,互不干扰。
 
@@ -261,7 +263,8 @@ PUT 数据流(每对象一个 ExtentWriter,共享本引擎的开放 extent):
    - 段级引用计数(共享段 → 稀疏表)
    - live_bytes[E] = Σ 活段 len;归零且位图置位 → 泄漏,回收
    - watermark(开放 extent)= 该 extent 活段最大 end(跨崩溃会话的孤儿区
-     [旧 watermark, 旧 written_end) 无活段 → 新追加自然覆盖,无残留风险)
+     [旧 watermark, 旧 written_end) 无活段 → 新追加自然覆盖,无残留风险;
+     进程内 abort 同样不把水位退回陈旧 committed_end)
 5. (后台)泄漏扫描复核 / 开放服务
 ```
 

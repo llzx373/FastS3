@@ -771,7 +771,7 @@ user_meta: { "x-amz-meta-*": "..." }
 - **数据先落盘、元数据后提交**:极端情况下元数据事务丢失 → 对象不可见,但绝不会出现"可见但数据缺失"的撕裂对象;孤儿 extent 由泄漏扫描回收(§4.9);
 - **O_DIRECT 写返回即数据已发出**,`sync_mode=group` 下数据不单独 fsync——底层 HA 卷负责最终落盘;`sync_mode=full`(合规场景)对每次写入追加 `IORING_FSYNC`(在元数据组提交内一并完成,不增加额外序列化点);
 - 全程**无 read-modify-write**:S3 对象写入是整对象语义,extent 内 offset 恒从对象头对齐开始;
-- 写入中客户端断连 → 事务不提交,extent 直接释放,零垃圾。
+- 写入中客户端断连 → 事务不提交、分配草稿回滚;开放 extent **水位不回退**(失败写入留下的孤儿区由后续追加跳过)。回退到陈旧水位会覆写同一打包 extent 上已提交的段(M11 G-2 SSE GCM)。若分配器误把仍被元数据引用的 extent 当空闲交出,新开放水位从活段 max_end 对齐上界起跳,不得从 0 覆写。
 
 ### 4.6 读路径(GetObject 时序)
 
@@ -789,12 +789,13 @@ GET → 鉴权 → 查 o:{bucket}\0{key}(rocksdb 命中,微秒级)
 - Range / suffix-range / 多段 Range(单段为主,S3 语义)按需裁剪首尾 chunk;
 - CRC 校验:`verify_reads=false`(默认,信任介质 + TLS)时为纯裸读;**true 时并行读 chunk CRC 校验**,开销约 3~5% 吞吐;
 - 条件头 `If-Modified-Since/If-None-Match/If-Match` 在元数据层直接判定,零设备 I/O。
+- SSE 对象失去零拷贝(ADR-12 DE1):HTTP 层 ObjectStream / 多段 Range 在 `spawn_blocking` 上同步读+解密,避免占满 hyper worker 导致客户端 ReadTimeout;发 200/206 之前探测 Range 起点所在 GCM chunk,失败则 500 InternalError,不先承诺 Content-Length 再断流。
 
 ### 4.7 Multipart 上传
 
 - `CreateMultipartUpload` → 创建 `u:` 记录,返回 uploadId(128 位随机);
 - `UploadPart` → 每个 part 就是一个"隐藏对象"(数据写 extent,元数据挂到 `u:` 会话下),完成即应;
-- `CompleteMultipartUpload` → 一条 rocksdb 事务:把所有 part 的 extent 列表按 part 序拼接进最终对象元数据,**零数据搬运**;ETag = MD5(各 part ETag 十六进制串拼接)+"-N"(与 AWS 完全一致);
+- `CompleteMultipartUpload` → 一条 rocksdb 事务:明文会话把 part 的 extent 列表按 part 序拼接进最终对象元数据,**零数据搬运**;SSE 会话 Complete 解密重加密为单一对象网格(ADR-12 D-E4),新段 `add_object` 后必须 `release_object` **且** `after_release` 分片旧段(seal-on-delete / 丢弃已清位的开放 extent)。ETag = MD5(各 part ETag 十六进制串拼接)+"-N"(与 AWS 完全一致);
 - `AbortMultipartUpload` / 会话超时(默认 7 天)→ 释放全部 extent;
 - 好处:GET 完全不知道 multipart 的存在,extent 列表天然支持跨 part 连续读。
 

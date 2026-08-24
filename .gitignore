@@ -22,3 +22,8 @@ docs/site/site/
 
 # 明文凭据不入库(模板见 config.example.json;运行时由部署方生成)
 web/server/config.json
+
+# 本地运行产物(init 向导默认落仓库根;含 admin token / TLS 私钥)
+/fasts3-data/
+/fasts3.toml
+*.pid

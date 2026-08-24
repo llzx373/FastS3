@@ -161,7 +161,10 @@ python3 tests/bench/list_versions_bench.py http://127.0.0.1:19200 b 1000000 2
   **sendfile/splice 零拷贝对该类对象整体禁用**,强制走缓冲解密路径
   (大对象读带宽上限 = AES-GCM 解密速率,每核 ~3-5GB/s AES-NI);
   解密字节量经 `fasts3_sse_decrypt_bytes_total`(admin /metrics)计量。
-  未加密对象零拷贝路径零变化。
+  未加密对象零拷贝(sendfile/splice)路径不变。M11 G-2 起缓冲 ObjectStream /
+  多段 Range 走 `spawn_blocking`(避免 SSE GET 占满 hyper worker);未加密
+  缓冲 GET 对照见 `tests/bench/perf-m11-compare.sh` 与 TODO.md M11 实测段,
+  本报告不重测。
 
 ## 7. F-1 处置(2026-08-23 追加;§3.3 p50 +7% 信号闭环)
 
