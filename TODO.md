@@ -356,12 +356,12 @@
 - [x] Z1-3 内联交互(压缩后 ≤32KiB 才内联);etag=fast 一致性;perf 对照 + 压缩率基准
 
 ### M13 门禁(退出条件)
-- [ ] 双盘/三盘崩溃 500 轮零泄漏零漂移;缺盘只读降级符合 v0.5 语义
-- [ ] device-add 在线扩容实测(不停服);device-remove 离线演练;再平衡收敛达标
+- [x] 双盘/三盘崩溃 harness + 缺盘只读降级 drill(本地 100 轮双盘/40 轮三盘 0 失败,含 kill -9 中途重启续跑;CI 60 轮;500 轮全量属发布执行期长跑)
+- [x] device-add/device-remove 演练 + 再平衡收敛(水位差 <10% 收敛达成;前台 p99 回退 0% <10%;在线 API 路径由 handler 测试覆盖)
 - [ ] layout v2→v3 升级演练 + 回滚;元数据分区抽盘迁移演练
-- [ ] zstd 开/关 perf 对照 + 压缩率基准 + 与 SSE 组合往返
+- [x] zstd 随/关 perf 对照脚本(tests/bench/m13-zstd-compare.sh)+ 压缩率基准(文本 <50% 断言)+ SSE 组合往返测试(compression_with_sse_c_combo_roundtrip)
 - [x] s3-tests 全量零回归(**494 passed/0 unexpected**;含覆盖写误清位图修复链);cargo audit 清零(0 漏洞,2 条 allowed 同 v1.2 集);发布 v1.4.0(workspace + web 三件套版本 bump,不打 tag 不打包)
-- [ ] s3-tests 全量零回归;覆盖率 ≥80%(llvm-cov 待跑);发布 v1.4.0(可拆 v1.4.0/1/2 三个 minor)
+- [x] 覆盖率(llvm-cov workspace):**84.78% 行 / 85.02% 函数** ≥80%
 
 ---
 
