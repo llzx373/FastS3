@@ -72,11 +72,48 @@ pub type MigrationEntry = (u32, u32, MigrationFn);
 /// 当前内置迁移注册表。
 ///
 /// 布局 v2(ADR-9)是首个正式布局;v1 已被明确放弃前置兼容
-/// (旧布局设备直接拒绝,无混合模式)。未来 v3+ 迁移在此登记:
-/// ```ignore
-/// static MIGRATIONS: &[MigrationEntry] = &[(2, 3, migrate_2_to_3)];
-/// ```
-pub static MIGRATIONS: &[MigrationEntry] = &[];
+/// (旧布局设备直接拒绝,无混合模式)。
+/// v2 → v3(M13 M3-3,ADR-15):零数据搬迁——仅重写超块
+/// (version=3、metadata 字段清零、features |= MULTI_DEVICE;
+/// checkpoints/位图/数据区不动)。回滚 = 框架备份恢复(实测见测试)。
+pub static MIGRATIONS: &[MigrationEntry] = &[(2, 3, migrate_2_to_3)];
+
+/// M13 M3-3:v2 → v3 迁移(零数据搬迁;只写超级块扇区,备份覆盖区内)。
+/// 只读打开设备、解码 v2 超块、以 v3 形态重写:
+/// - layout_version 2 → 3;metadata_offset/len = 0(N1 方案 C 填充);
+/// - features |= FEATURE_MULTI_DEVICE(池布局特性位);
+/// - 数据区/检查点区/位图逐字节不动。
+///
+/// 崩溃安全:单扇区 pwrite + fsync;半写由 CRC(v3 112..116)甄别,失败
+/// 路径由框架 restore_backup 恢复备份字节。
+fn migrate_2_to_3(ctx: &mut UpgradeContext) -> Result<()> {
+    use fs3_core::{SuperBlock, FEATURE_MULTI_DEVICE};
+    let old = SuperBlock::decode(&ctx.sb_bytes)?;
+    if old.layout_version != 2 {
+        return Err(Error::InvalidLayout(format!(
+            "migrate_2_to_3 called on layout v{}",
+            old.layout_version
+        )));
+    }
+    let new_sb = SuperBlock {
+        layout_version: fs3_core::LAYOUT_VERSION,
+        features: old.features | FEATURE_MULTI_DEVICE,
+        metadata_offset: 0,
+        metadata_len: 0,
+        ..old
+    };
+    let bytes = new_sb.encode();
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(ctx.device)
+        .map_err(Error::Io)?;
+    use std::io::{Seek, SeekFrom, Write};
+    f.seek(SeekFrom::Start(0)).map_err(Error::Io)?;
+    f.write_all(&bytes).map_err(Error::Io)?;
+    f.sync_all().map_err(Error::Io)?;
+    println!("  v2→v3: superblock rewritten (uuid preserved, features |= MULTI_DEVICE)");
+    Ok(())
+}
 
 /// 从 from 走注册表到 to 的迁移链(from==to → 空链)。
 pub fn migration_chain(from: u32, to: u32, registry: &[MigrationEntry]) -> Vec<&MigrationEntry> {
@@ -538,6 +575,127 @@ mod tests {
         };
         let e = fs3_engine::Engine::open(&cfg).unwrap();
         e.abort();
+    }
+
+    /// 把初始化好的 v3 设备改回 v2 形态(模拟 v1.3.0 存量;CRC 92..96 覆盖
+    /// 0..92,metadata 区清零)。
+    fn to_v2_superblock(p: &std::path::Path) -> fs3_core::Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        let raw = read_raw_superblock(p)?;
+        let mut bytes = raw.bytes;
+        bytes[32..36].copy_from_slice(&2u32.to_le_bytes());
+        bytes[96..112].fill(0);
+        let crc = fs3_core::crc32c::crc32c(&bytes[..92], 0);
+        bytes[92..96].copy_from_slice(&crc.to_le_bytes());
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(p)
+            .map_err(fs3_core::Error::Io)?;
+        f.seek(SeekFrom::Start(0)).map_err(fs3_core::Error::Io)?;
+        f.write_all(&bytes).map_err(fs3_core::Error::Io)?;
+        f.sync_all().map_err(fs3_core::Error::Io)?;
+        Ok(())
+    }
+
+    /// M13 M3-3 门禁:布局 v2→v3 升级演练(零数据搬迁)+ 回滚实测。
+    #[test]
+    fn upgrade_v2_to_v3_drill_with_rollback() -> fs3_core::Result<()> {
+        let (_d, p) = tmp_img(64 * 1024 * 1024);
+        fs3_device::init_device(&p, 4 * 1024 * 1024, 0, false).unwrap();
+        to_v2_superblock(&p).unwrap();
+        assert_eq!(read_layout_version(&p).unwrap(), Some(2));
+        let meta = _d.path().join("meta");
+
+        // 存量数据(v2 设备 + v1.3 引擎打开写入)
+        {
+            let cfg = fs3_engine::EngineConfig {
+                devices: vec![p.clone()],
+                meta_dir: meta.clone(),
+                compaction: fs3_engine::CompactionConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut e = fs3_engine::Engine::open(&cfg).unwrap();
+            e.ensure_bucket("b1").unwrap();
+            let data = vec![0x5au8; 300 * 1024];
+            e.put("b1", "k", &mut std::io::Cursor::new(data.clone()))
+                .unwrap();
+            e.close().unwrap();
+        }
+        assert_eq!(
+            migration_chain(2, fs3_core::LAYOUT_VERSION, MIGRATIONS).len(),
+            1,
+            "v2→v3 迁移已注册"
+        );
+
+        // 执行迁移(框架原语:备份 → migrate_2_to_3)
+        let raw = read_raw_superblock(&p).unwrap();
+        let backup = create_backup(&p, &meta, &raw).unwrap();
+        let mut ctx = UpgradeContext {
+            device: &p,
+            meta_dir: &meta,
+            sb_bytes: backup.superblock.clone(),
+            checkpoint_offset: raw.checkpoint_offset,
+            checkpoint_len: raw.checkpoint_len,
+            from: 2,
+            to: fs3_core::LAYOUT_VERSION,
+        };
+        migrate_2_to_3(&mut ctx).unwrap();
+        assert_eq!(read_layout_version(&p).unwrap(), Some(3));
+        // MULTI_DEVICE 特性位已置;metadata 字段为零
+        let sb = fs3_core::SuperBlock::decode(&read_raw_superblock(&p).unwrap().bytes).unwrap();
+        assert_ne!(sb.features & fs3_core::FEATURE_MULTI_DEVICE, 0);
+        assert_eq!(sb.metadata_offset, 0);
+        assert_eq!(sb.metadata_len, 0);
+
+        // 升级后:引擎开 v3 + 旧检查点 → 数据零搬迁完好
+        {
+            let cfg = fs3_engine::EngineConfig {
+                devices: vec![p.clone()],
+                meta_dir: meta.clone(),
+                compaction: fs3_engine::CompactionConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut e = fs3_engine::Engine::open(&cfg).unwrap();
+            let mut out = Vec::new();
+            e.get_to("b1", "k", 0..300 * 1024, &mut out).unwrap();
+            assert_eq!(out, vec![0x5au8; 300 * 1024]);
+            e.close().unwrap();
+        }
+
+        // 回滚实测:恢复备份 → 回 v2,数据仍完整
+        restore_backup(&p, &raw, &backup).unwrap();
+        assert_eq!(read_layout_version(&p).unwrap(), Some(2));
+        {
+            let cfg = fs3_engine::EngineConfig {
+                devices: vec![p.clone()],
+                meta_dir: meta.clone(),
+                compaction: fs3_engine::CompactionConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let e = fs3_engine::Engine::open(&cfg).unwrap();
+            let mut out = Vec::new();
+            let sbv = e.superblock();
+            assert_eq!(sbv.layout_version, 2, "rollback must restore v2 layout");
+            let n = e.get_to("b1", "k", 0..300 * 1024, &mut out).unwrap();
+            assert_eq!(n, 300 * 1024);
+            assert_eq!(
+                out,
+                vec![0x5au8; 300 * 1024],
+                "rollback read must be intact"
+            );
+            assert_eq!(e.check_report().unwrap().leaks.len(), 0);
+            e.abort();
+        }
+        Ok(())
     }
 
     #[test]

@@ -960,7 +960,9 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// 超级块(DESIGN §4.2;0..4KiB)。
 ///
-/// 手工定长编码,布局:
+/// 手工定长编码。v2(ADR-9)与 v3(M13 M3-3,ADR-15)双形态,v3 向后兼容
+/// v2 解码(N-1 原地升级;旧二进制对 v3 设备:92..96 恒零 → CRC 不匹配
+/// → 拒绝,即「新布局 + 旧二进制」天然互斥,回滚 = restore_backup):
 /// ```text
 /// 0..4   magic "FS3S"
 /// 4      format_version u8
@@ -974,8 +976,11 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// 68..76 data_start u64
 /// 76..84 data_end u64
 /// 84..92 features u64
-/// 92..96 crc32c u32(覆盖 0..92)
-/// 96..4096 reserved(零)
+/// 92..96 v2: crc32c(覆盖 0..92);v3: reserved(零)
+/// 96..104 v3: metadata_offset u64(设备内元数据区预留;v2 读为零)
+/// 104..112 v3: metadata_len u64
+/// 112..116 v3: crc32c(覆盖 0..112)
+/// 116..4096 reserved(零)
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SuperBlock {
@@ -988,9 +993,16 @@ pub struct SuperBlock {
     pub data_start: u64,
     pub data_end: u64,
     pub features: u64,
+    /// v3 设备内元数据区偏移(ADR-15 DM5;v2 设备恒 0,方案 C/B 共用预留)。
+    pub metadata_offset: u64,
+    /// v3 设备内元数据区长度(未分配 = 0)。
+    pub metadata_len: u64,
 }
 
-const SB_CRC_END: usize = 92;
+/// v2 CRC 覆盖终点。
+const SB_CRC_END_V2: usize = 92;
+/// v3 CRC 覆盖终点(含 metadata 字段)。
+const SB_CRC_END_V3: usize = 112;
 
 impl SuperBlock {
     pub fn encode(&self) -> [u8; SUPERBLOCK_SIZE as usize] {
@@ -1006,8 +1018,11 @@ impl SuperBlock {
         b[68..76].copy_from_slice(&self.data_start.to_le_bytes());
         b[76..84].copy_from_slice(&self.data_end.to_le_bytes());
         b[84..92].copy_from_slice(&self.features.to_le_bytes());
-        let crc = crc32c(&b[..SB_CRC_END], 0);
-        b[92..96].copy_from_slice(&crc.to_le_bytes());
+        // v3:92..96 恒零(旧二进制读到 CRC 不匹配 → 拒绝新布局)
+        b[96..104].copy_from_slice(&self.metadata_offset.to_le_bytes());
+        b[104..112].copy_from_slice(&self.metadata_len.to_le_bytes());
+        let crc = crc32c(&b[..SB_CRC_END_V3], 0);
+        b[112..116].copy_from_slice(&crc.to_le_bytes());
         b
     }
 
@@ -1024,16 +1039,40 @@ impl SuperBlock {
                 buf[4]
             )));
         }
-        let stored = u32::from_le_bytes(buf[92..96].try_into().unwrap());
-        let calc = crc32c(&buf[..SB_CRC_END], 0);
-        if stored != calc {
-            return Err(Error::Corrupt("superblock crc mismatch".into()));
-        }
         let layout_version = u32::from_le_bytes(buf[32..36].try_into().unwrap());
+        // v2(v1.3.0 存量):CRC 92..96 覆盖 0..92,无 metadata 字段
+        if layout_version == 2 {
+            let stored = u32::from_le_bytes(buf[92..96].try_into().unwrap());
+            let calc = crc32c(&buf[..SB_CRC_END_V2], 0);
+            if stored != calc {
+                return Err(Error::Corrupt("superblock crc mismatch".into()));
+            }
+            let sb = SuperBlock {
+                uuid: buf[16..32].try_into().unwrap(),
+                layout_version,
+                device_generation: u64::from_le_bytes(buf[36..44].try_into().unwrap()),
+                extent_size: u64::from_le_bytes(buf[44..52].try_into().unwrap()),
+                checkpoint_offset: u64::from_le_bytes(buf[52..60].try_into().unwrap()),
+                checkpoint_len: u64::from_le_bytes(buf[60..68].try_into().unwrap()),
+                data_start: u64::from_le_bytes(buf[68..76].try_into().unwrap()),
+                data_end: u64::from_le_bytes(buf[76..84].try_into().unwrap()),
+                features: u64::from_le_bytes(buf[84..92].try_into().unwrap()),
+                metadata_offset: 0,
+                metadata_len: 0,
+            };
+            sb.validate()?;
+            return Ok(sb);
+        }
         if layout_version != LAYOUT_VERSION {
             return Err(Error::InvalidLayout(format!(
                 "layout version {layout_version} unsupported (expected {LAYOUT_VERSION})"
             )));
+        }
+        // v3:CRC 112..116 覆盖 0..112
+        let stored = u32::from_le_bytes(buf[112..116].try_into().unwrap());
+        let calc = crc32c(&buf[..SB_CRC_END_V3], 0);
+        if stored != calc {
+            return Err(Error::Corrupt("superblock crc mismatch".into()));
         }
         let sb = SuperBlock {
             uuid: buf[16..32].try_into().unwrap(),
@@ -1045,6 +1084,8 @@ impl SuperBlock {
             data_start: u64::from_le_bytes(buf[68..76].try_into().unwrap()),
             data_end: u64::from_le_bytes(buf[76..84].try_into().unwrap()),
             features: u64::from_le_bytes(buf[84..92].try_into().unwrap()),
+            metadata_offset: u64::from_le_bytes(buf[96..104].try_into().unwrap()),
+            metadata_len: u64::from_le_bytes(buf[104..112].try_into().unwrap()),
         };
         sb.validate()?;
         Ok(sb)
@@ -1358,6 +1399,8 @@ mod tests {
             data_start: 1024 * 1024 + 8192,
             data_end: 64 * 1024 * 1024,
             features: 1,
+            metadata_offset: 0,
+            metadata_len: 0,
         };
         let enc = sb.encode();
         let dec = SuperBlock::decode(&enc).unwrap();
@@ -1366,6 +1409,39 @@ mod tests {
         let mut bad = enc;
         bad[20] ^= 0xFF;
         assert!(SuperBlock::decode(&bad).is_err());
+        // metadata 字段篡改(仅 v3 CRC 覆盖区)→ 必须报错
+        let mut bad2 = enc;
+        bad2[96] ^= 0x01;
+        assert!(SuperBlock::decode(&bad2).is_err());
+    }
+
+    /// M13 M3-3:v3 解码兼容 v2 超块(N-1 原地升级;CRC 92..96 覆盖 0..92)。
+    #[test]
+    fn superblock_v2_decode_compat() -> Result<()> {
+        let mut b = [0u8; SUPERBLOCK_SIZE as usize];
+        b[0..4].copy_from_slice(&SUPERBLOCK_MAGIC);
+        b[4] = SUPERBLOCK_FORMAT_VERSION;
+        b[16..32].copy_from_slice(&[9u8; 16]);
+        b[32..36].copy_from_slice(&2u32.to_le_bytes()); // v2
+        b[36..44].copy_from_slice(&1u64.to_le_bytes());
+        b[44..52].copy_from_slice(&DEFAULT_EXTENT_SIZE.to_le_bytes());
+        b[52..60].copy_from_slice(&(1024u64 * 1024).to_le_bytes());
+        b[60..68].copy_from_slice(&4096u64.to_le_bytes());
+        b[68..76].copy_from_slice(&(1024u64 * 1024 + 8192).to_le_bytes());
+        b[76..84].copy_from_slice(&(64u64 * 1024 * 1024).to_le_bytes());
+        b[84..92].copy_from_slice(&3u64.to_le_bytes()); // features
+        let crc = crc32c(&b[..92], 0);
+        b[92..96].copy_from_slice(&crc.to_le_bytes());
+        let sb = SuperBlock::decode(&b)?;
+        assert_eq!(sb.layout_version, 2);
+        assert_eq!(sb.metadata_offset, 0);
+        assert_eq!(sb.metadata_len, 0);
+        assert_eq!(sb.features, 3);
+        // v2 超块的 metadata 区(96..112 零)不受 v3 CRC 影响(分支解码)
+        assert!(SuperBlock::decode(&b).is_ok());
+        // 旧二进制行为(新布局 + 旧 CRC 位)→ v3 设备在 v2 解码下不一致:
+        // 本测试只验证 v2 形态本身。
+        Ok(())
     }
 
     #[test]

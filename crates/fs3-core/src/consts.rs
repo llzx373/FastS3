@@ -12,9 +12,11 @@ pub const SUPERBLOCK_MAGIC: [u8; 4] = *b"FS3S";
 /// 超级块格式版本。
 pub const SUPERBLOCK_FORMAT_VERSION: u8 = 1;
 
-/// 磁盘布局版本(ADR-9 v2:打包段布局;放弃旧布局前置兼容,
-/// 旧版本设备直接拒绝打开)。
-pub const LAYOUT_VERSION: u32 = 2;
+/// 磁盘布局版本(M13 M3-3:ADR-9 v2 打包段布局 → v3 多设备池布局。
+/// v3 向后兼容 v2 解码:`read_superblock` 按版本字段分支,v2 设备仍可打开
+/// (N-1 原地兼容纪律);v3 新增 metadata_offset/metadata_len(设备内元数据
+/// 区预留,ADR-15 DM5)与 FEATURE_MULTI_DEVICE。)
+pub const LAYOUT_VERSION: u32 = 3;
 
 /// 保留区终点:超级块之后到 1MiB(未来:设备内元数据区 / WAL / 加密头)。
 pub const RESERVED_REGION_END: u64 = 1024 * 1024;
@@ -76,6 +78,8 @@ pub const MAX_EXTENTS: u64 = 16 * 1024 * 1024;
 pub const FEATURE_IO_URING: u64 = 1 << 0;
 /// 特征位:位 1 = 打包 extent 布局(ADR-9;布局版本 2 下恒置位)。
 pub const FEATURE_PACKED_EXTENTS: u64 = 1 << 1;
+/// 特征位:位 2 = 多设备池(M13 M3-3,ADR-15 DM1';v3 布局恒置位)。
+pub const FEATURE_MULTI_DEVICE: u64 = 1 << 2;
 
 /// extent 头 flags:位 0 = packed(打包 extent,无头 CRC 表;
 /// 各段 CRC 存对象元数据)。未置位 = 独占 extent(头带完整 CRC 表)。
