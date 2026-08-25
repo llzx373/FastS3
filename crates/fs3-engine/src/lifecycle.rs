@@ -779,9 +779,10 @@ impl<E: EngineAccess> LifecycleWorker<E> {
                 else {
                     continue; // 目标条目已并发消失:幂等跳过
                 };
-                // L4-1:锁保留跳过(ExpiredObjectDeleteMarker 豁免,§5.4)
+                // L4-1/W4-1:锁判定走可信时钟 lock_now(ADR-13:回拨不缩短
+                // 保留),与生命周期规则时钟解耦。ExpiredObjectDeleteMarker 豁免。
                 if !matches!(ga.action, LifecycleAction::ExpireDeleteMarker)
-                    && is_locked(tmeta, now)
+                    && is_locked(tmeta, e.lock_now())
                 {
                     d.skipped_locked += 1;
                     continue;
@@ -1662,11 +1663,12 @@ mod tests {
         e.put("b1", "lk", &mut Cursor::new(vec![5u8; 24])).unwrap();
         let mtime = e.meta().get_object("b1", "lk").unwrap().unwrap().mtime;
         let deadline = days_deadline(mtime, 1);
-        // L4-1:构造带 retention 的 meta(M12 前无写路径,直改元数据)
+        // 保留 until 相对可信时钟,与生命周期注入时钟解耦(W4-1)
+        let until = e.lock_now() + 3_600;
         let mut m = e.meta().get_object("b1", "lk").unwrap().unwrap();
         m.retention = Some(Retention {
             mode: RetentionMode::Compliance,
-            retain_until: deadline + 100,
+            retain_until: until,
         });
         e.meta()
             .commit_object_meta_update(&fs3_meta::keys::object_key("b1", "lk"), &m)
@@ -1675,13 +1677,15 @@ mod tests {
         r.expiration = exp_days(1);
         e.meta().put_lifecycle_rules("b1", &[r]).unwrap();
         let meta = e.meta_arc();
-        // 保留期:跳过并计 skipped_locked
+        // 生命周期已到期、保留未到期 → 跳过
         let rep = run_at(&mut e, deadline, None);
         assert_eq!(rep.deleted_objects, 0);
         assert_eq!(rep.skipped_locked, 1);
         assert!(meta.get_object("b1", "lk").unwrap().is_some());
-        // 保留到期:下周期收敛删除
-        let rep = run_at(&mut e, deadline + 100, None);
+        // 注入墙钟越过 until:可信时钟放行,下周期删除
+        let st = e.trusted_clock_state();
+        e.debug_inject_clock(until + 1, st.last_mono_ns);
+        let rep = run_at(&mut e, deadline, None);
         assert_eq!((rep.deleted_objects, rep.skipped_locked), (1, 0));
         assert!(meta.get_object("b1", "lk").unwrap().is_none());
     }

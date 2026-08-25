@@ -646,7 +646,7 @@ impl AdminServer {
                 "fasts3_lifecycle_aborted_uploads_total {}\n",
                 s.aborted_uploads
             ));
-            text.push_str("# HELP fasts3_lifecycle_skipped_locked_total Lifecycle deletions skipped due to object lock (reserved)\n");
+            text.push_str("# HELP fasts3_lifecycle_skipped_locked_total Lifecycle deletions skipped due to Object Lock retention or legal hold\n");
             text.push_str("# TYPE fasts3_lifecycle_skipped_locked_total counter\n");
             text.push_str(&format!(
                 "fasts3_lifecycle_skipped_locked_total {}\n",

@@ -20,6 +20,9 @@
 //! 共享段(COW,refcount > 1)默认跳过(§6.5):留在旧 extent,不阻止其余段迁移。
 //! 压缩 worker **不获取引擎大锁**:只通过 `meta`(rocksdb 乐观事务)、`alloc`
 //! (内部 Mutex)、`io`(短临界区)交互(§6.3)。
+//!
+//! Object Lock(M12 W4-1):压缩**可搬**锁定版本的段(切换事务不删对象),
+//! 不得把锁定版本当泄漏回收(W4-2 check --fix 另防)。
 
 use std::sync::{Arc, Mutex};
 
@@ -536,6 +539,46 @@ mod tests {
         assert_eq!(m.extents.len(), 1);
         assert_ne!(m.extents[0].extent_id, 0);
         assert!(m.extents[0].offset < cap as u32);
+        e.close().unwrap();
+    }
+
+    #[test]
+    fn compaction_migrates_locked_object_keeps_retention() {
+        // W4-1:压缩可搬锁定版本数据,不可当泄漏回收。
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("disk.img");
+        std::fs::File::create(&img)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
+        let cfg = crate::EngineConfig {
+            device: img,
+            meta_dir: dir.path().join("meta"),
+            compaction: CompactionConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut e = crate::Engine::open(&cfg).unwrap();
+        e.ensure_bucket("b1").unwrap();
+        let data = vec![0x22u8; 1024 * 1024];
+        for i in 0..3 {
+            e.put("b1", &format!("k{i}"), &mut Cursor::new(data.clone()))
+                .unwrap();
+        }
+        e.set_object_legal_hold("b1", "k2", None, true).unwrap();
+        e.delete("b1", "k0").unwrap();
+        e.delete("b1", "k1").unwrap();
+        let r = e.compact_once().unwrap();
+        assert_eq!(r.migrated_objects, 1);
+        let mut out = Vec::new();
+        e.get_to("b1", "k2", 0..u64::MAX, &mut out).unwrap();
+        assert_eq!(out, data);
+        let m = e.head("b1", "k2").unwrap().unwrap();
+        assert!(m.legal_hold, "压缩不得丢掉 legal hold");
+        assert!(e.allocator().leaks().is_empty());
         e.close().unwrap();
     }
 
