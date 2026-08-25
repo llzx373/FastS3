@@ -360,7 +360,8 @@
 - [ ] device-add 在线扩容实测(不停服);device-remove 离线演练;再平衡收敛达标
 - [ ] layout v2→v3 升级演练 + 回滚;元数据分区抽盘迁移演练
 - [ ] zstd 开/关 perf 对照 + 压缩率基准 + 与 SSE 组合往返
-- [ ] s3-tests 全量零回归;覆盖率 ≥80%;cargo audit 清零;发布 v1.4.0(可拆 v1.4.0/1/2 三个 minor)
+- [x] s3-tests 全量零回归(**494 passed/0 unexpected**;含覆盖写误清位图修复链);cargo audit 清零(0 漏洞,2 条 allowed 同 v1.2 集);发布 v1.4.0(workspace + web 三件套版本 bump,不打 tag 不打包)
+- [ ] s3-tests 全量零回归;覆盖率 ≥80%(llvm-cov 待跑);发布 v1.4.0(可拆 v1.4.0/1/2 三个 minor)
 
 ---
 
