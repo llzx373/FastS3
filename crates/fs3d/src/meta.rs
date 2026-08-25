@@ -806,6 +806,8 @@ pub fn run_meta_import(
                 }),
                 None => None,
             },
+            retention: None,
+            legal_hold: None,
         };
         store.create_multipart(&u.upload_id, &session)?;
         for p in &u.parts {

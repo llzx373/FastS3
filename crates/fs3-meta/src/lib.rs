@@ -151,6 +151,11 @@ pub struct MultipartSession {
     /// 二选一,协议层判定)。序列化尾部追加字段,decode_session 六读回退,
     /// 存量会话按 None。
     pub sse_s3: Option<SessionSseS3>,
+    /// Create 时对象级保留(M12 W2-3;None = Complete 时继承桶默认)。
+    /// 序列化尾部追加,decode_session 七读回退。
+    pub retention: Option<fs3_core::Retention>,
+    /// Create 时法定保留(None = 未指定 / OFF;Some(true) = ON)。
+    pub legal_hold: Option<bool>,
 }
 
 /// 当前 Unix 秒(会话时间戳用)。
@@ -189,7 +194,19 @@ impl MultipartSession {
             checksum_alg,
             sse_key_md5,
             sse_s3,
+            retention: None,
+            legal_hold: None,
         }
+    }
+
+    pub fn with_object_lock(
+        mut self,
+        retention: Option<fs3_core::Retention>,
+        legal_hold: Option<bool>,
+    ) -> Self {
+        self.retention = retention;
+        self.legal_hold = legal_hold;
+        self
     }
 }
 
@@ -354,6 +371,20 @@ pub enum Op {
         key: String,
         vk: Option<[u8; 16]>,
         tags: Vec<(String, String)>,
+    },
+    /// 对象保留单事务读改写(M12 W2-3;PutObjectRetention 落地)。
+    ObjectSetRetention {
+        bucket: String,
+        key: String,
+        vk: Option<[u8; 16]>,
+        retention: Option<fs3_core::Retention>,
+    },
+    /// 对象法定保留单事务读改写(M12 W2-3;PutObjectLegalHold 落地)。
+    ObjectSetLegalHold {
+        bucket: String,
+        key: String,
+        vk: Option<[u8; 16]>,
+        legal_hold: bool,
     },
     ObjectDelete {
         bucket: String,
@@ -719,27 +750,50 @@ fn decode_session(v: &[u8]) -> Result<MultipartSession> {
             checksum_alg,
             sse_key_md5,
             sse_s3: None,
+            retention: None,
+            legal_hold: None,
         }
+    }
+    /// M12 前会话格式(含 sse_s3,无 object lock;W2-3 回退用)。
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct SessionV12d {
+        bucket: String,
+        key: String,
+        content_type: String,
+        user_meta: Vec<(String, String)>,
+        resp_headers: Vec<(String, String)>,
+        created: i64,
+        completed: bool,
+        final_etag: [u8; 16],
+        final_size: u64,
+        final_mtime: i64,
+        tags: Vec<(String, String)>,
+        checksum_alg: Option<fs3_core::ChecksumAlgorithm>,
+        sse_key_md5: Option<String>,
+        sse_s3: Option<SessionSseS3>,
     }
     match postcard::from_bytes::<MultipartSession>(v) {
         Ok(s) => Ok(s),
-        Err(_) => match postcard::from_bytes::<SessionV12c>(v) {
-            Ok(s) => Ok(into_session(
-                s.bucket,
-                s.key,
-                s.content_type,
-                s.user_meta,
-                s.resp_headers,
-                s.created,
-                s.completed,
-                s.final_etag,
-                s.final_size,
-                s.final_mtime,
-                s.tags,
-                s.checksum_alg,
-                s.sse_key_md5,
-            )),
-            Err(_) => match postcard::from_bytes::<SessionV12b>(v) {
+        Err(_) => match postcard::from_bytes::<SessionV12d>(v) {
+            Ok(s) => Ok(MultipartSession {
+                bucket: s.bucket,
+                key: s.key,
+                content_type: s.content_type,
+                user_meta: s.user_meta,
+                resp_headers: s.resp_headers,
+                created: s.created,
+                completed: s.completed,
+                final_etag: s.final_etag,
+                final_size: s.final_size,
+                final_mtime: s.final_mtime,
+                tags: s.tags,
+                checksum_alg: s.checksum_alg,
+                sse_key_md5: s.sse_key_md5,
+                sse_s3: s.sse_s3,
+                retention: None,
+                legal_hold: None,
+            }),
+            Err(_) => match postcard::from_bytes::<SessionV12c>(v) {
                 Ok(s) => Ok(into_session(
                     s.bucket,
                     s.key,
@@ -753,9 +807,9 @@ fn decode_session(v: &[u8]) -> Result<MultipartSession> {
                     s.final_mtime,
                     s.tags,
                     s.checksum_alg,
-                    None,
+                    s.sse_key_md5,
                 )),
-                Err(_) => match postcard::from_bytes::<SessionV12>(v) {
+                Err(_) => match postcard::from_bytes::<SessionV12b>(v) {
                     Ok(s) => Ok(into_session(
                         s.bucket,
                         s.key,
@@ -768,10 +822,10 @@ fn decode_session(v: &[u8]) -> Result<MultipartSession> {
                         s.final_size,
                         s.final_mtime,
                         s.tags,
-                        None,
+                        s.checksum_alg,
                         None,
                     )),
-                    Err(_) => match postcard::from_bytes::<SessionV11>(v) {
+                    Err(_) => match postcard::from_bytes::<SessionV12>(v) {
                         Ok(s) => Ok(into_session(
                             s.bucket,
                             s.key,
@@ -783,30 +837,48 @@ fn decode_session(v: &[u8]) -> Result<MultipartSession> {
                             s.final_etag,
                             s.final_size,
                             s.final_mtime,
-                            Vec::new(),
+                            s.tags,
                             None,
                             None,
                         )),
-                        Err(_) => {
-                            let legacy: LegacySession = postcard::from_bytes(v).map_err(|e| {
-                                Error::Corrupt(format!("postcard decode session: {e}"))
-                            })?;
-                            Ok(into_session(
-                                legacy.bucket,
-                                legacy.key,
-                                legacy.content_type,
-                                legacy.user_meta,
-                                Vec::new(),
-                                legacy.created,
-                                legacy.completed,
-                                legacy.final_etag,
-                                legacy.final_size,
-                                legacy.final_mtime,
+                        Err(_) => match postcard::from_bytes::<SessionV11>(v) {
+                            Ok(s) => Ok(into_session(
+                                s.bucket,
+                                s.key,
+                                s.content_type,
+                                s.user_meta,
+                                s.resp_headers,
+                                s.created,
+                                s.completed,
+                                s.final_etag,
+                                s.final_size,
+                                s.final_mtime,
                                 Vec::new(),
                                 None,
                                 None,
-                            ))
-                        }
+                            )),
+                            Err(_) => {
+                                let legacy: LegacySession =
+                                    postcard::from_bytes(v).map_err(|e| {
+                                        Error::Corrupt(format!("postcard decode session: {e}"))
+                                    })?;
+                                Ok(into_session(
+                                    legacy.bucket,
+                                    legacy.key,
+                                    legacy.content_type,
+                                    legacy.user_meta,
+                                    Vec::new(),
+                                    legacy.created,
+                                    legacy.completed,
+                                    legacy.final_etag,
+                                    legacy.final_size,
+                                    legacy.final_mtime,
+                                    Vec::new(),
+                                    None,
+                                    None,
+                                ))
+                            }
+                        },
                     },
                 },
             },
@@ -2086,6 +2158,36 @@ impl MetaStore {
         }])
     }
 
+    pub fn commit_object_set_retention(
+        &self,
+        bucket: &str,
+        key: &str,
+        vk: Option<[u8; 16]>,
+        retention: Option<fs3_core::Retention>,
+    ) -> Result<u64> {
+        self.commit(&[Op::ObjectSetRetention {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            vk,
+            retention,
+        }])
+    }
+
+    pub fn commit_object_set_legal_hold(
+        &self,
+        bucket: &str,
+        key: &str,
+        vk: Option<[u8; 16]>,
+        legal_hold: bool,
+    ) -> Result<u64> {
+        self.commit(&[Op::ObjectSetLegalHold {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            vk,
+            legal_hold,
+        }])
+    }
+
     /// 桶删除。
     pub fn commit_bucket_delete(&self, name: &str) -> Result<u64> {
         self.commit(&[Op::BucketDelete {
@@ -2861,6 +2963,38 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
                     .ok_or_else(|| Error::NotFound(format!("object {bucket}/{key}")))?;
                 let mut meta = decode_object(&cur)?;
                 meta.tags = tags.clone();
+                tinsert(tx, k, meta.encode_value()?)?;
+            }
+            Op::ObjectSetRetention {
+                bucket,
+                key,
+                vk,
+                retention,
+            } => {
+                let k = match vk {
+                    Some(vk) => object_version_key(bucket, key, vk),
+                    None => object_key(bucket, key),
+                };
+                let cur = tget(tx, &k)?
+                    .ok_or_else(|| Error::NotFound(format!("object {bucket}/{key}")))?;
+                let mut meta = decode_object(&cur)?;
+                meta.retention = retention.clone();
+                tinsert(tx, k, meta.encode_value()?)?;
+            }
+            Op::ObjectSetLegalHold {
+                bucket,
+                key,
+                vk,
+                legal_hold,
+            } => {
+                let k = match vk {
+                    Some(vk) => object_version_key(bucket, key, vk),
+                    None => object_key(bucket, key),
+                };
+                let cur = tget(tx, &k)?
+                    .ok_or_else(|| Error::NotFound(format!("object {bucket}/{key}")))?;
+                let mut meta = decode_object(&cur)?;
+                meta.legal_hold = *legal_hold;
                 tinsert(tx, k, meta.encode_value()?)?;
             }
             Op::ObjectPut { bucket, key, meta } => {

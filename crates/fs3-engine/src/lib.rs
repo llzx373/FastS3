@@ -31,7 +31,7 @@ use fs3_core::crc32c::crc32c;
 use fs3_core::{
     align_up, new_version_vk, random_bytes, BucketMeta, BucketStats, ChecksumAlgorithm,
     ChecksumHasher, ChecksumInfo, ChecksumType, CompletePart, CompositeChecksum, Error,
-    ExtentHeader, ObjectMeta, Result, Segment, TrustedClockState, VersioningState,
+    ExtentHeader, ObjectLockWrite, ObjectMeta, Result, Segment, TrustedClockState, VersioningState,
     CHECKPOINT_ALLOC_DELTA, EXTENT_FLAG_PACKED, EXTENT_HEADER_SIZE, SECTOR_SIZE, SEGMENT_CRC_GRID,
 };
 use fs3_device::{open_device, BlockDevice};
@@ -956,6 +956,38 @@ impl Engine {
         checksum_alg: Option<ChecksumAlgorithm>,
         sse_key: Option<&fs3_core::SseWriteKey>,
     ) -> Result<ObjectMeta> {
+        self.put_with_lock(
+            bucket,
+            key,
+            reader,
+            content_type,
+            user_meta,
+            resp_headers,
+            tags,
+            precond,
+            checksum_alg,
+            sse_key,
+            ObjectLockWrite::default(),
+        )
+    }
+
+    /// [`put_with_meta`] 的 Object Lock 落值形态(M12 W2-3):`lock` 与数据
+    /// 同事务写入(覆盖写 = 新版本,不继承旧版本保留)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn put_with_lock(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        reader: &mut dyn Read,
+        content_type: Option<&str>,
+        user_meta: Vec<(String, String)>,
+        resp_headers: Vec<(String, String)>,
+        tags: Vec<(String, String)>,
+        precond: Option<&WritePrecondition>,
+        checksum_alg: Option<ChecksumAlgorithm>,
+        sse_key: Option<&fs3_core::SseWriteKey>,
+        lock: ObjectLockWrite,
+    ) -> Result<ObjectMeta> {
         let Some(bkt) = self.meta.get_bucket(bucket)? else {
             return Err(Error::NotFound(format!("bucket {bucket}")));
         };
@@ -1037,8 +1069,8 @@ impl Engine {
                 tags,
                 sse,
                 checksum: tee.finish(),
-                retention: None,
-                legal_hold: false,
+                retention: lock.retention.clone(),
+                legal_hold: lock.legal_hold,
                 part_checksums: Vec::new(),
             };
             let mut draft = Staged::default();
@@ -1089,6 +1121,7 @@ impl Engine {
             tags,
             sse_key,
             checksum_out: &checksum_out,
+            lock,
         });
         match result {
             Ok(meta) => {
@@ -1127,6 +1160,7 @@ impl Engine {
             tags,
             sse_key,
             checksum_out,
+            lock,
         } = ctx;
         let old_size = old.size;
         let old_segments = old.segments;
@@ -1161,8 +1195,8 @@ impl Engine {
             tags,
             sse,
             checksum,
-            retention: None,
-            legal_hold: false,
+            retention: lock.retention.clone(),
+            legal_hold: lock.legal_hold,
             part_checksums: Vec::new(),
         };
 
@@ -2342,6 +2376,37 @@ impl Engine {
         sse_key_md5: Option<String>,
         sse_s3: Option<fs3_meta::SessionSseS3>,
     ) -> Result<String> {
+        self.create_multipart_lock(
+            bucket,
+            key,
+            content_type,
+            user_meta,
+            resp_headers,
+            tags,
+            checksum_alg,
+            sse_key_md5,
+            sse_s3,
+            None,
+            None,
+        )
+    }
+
+    /// [`create_multipart`] 的 Object Lock 头落会话形态(M12 W2-3)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_multipart_lock(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        content_type: Option<&str>,
+        user_meta: Vec<(String, String)>,
+        resp_headers: Vec<(String, String)>,
+        tags: Vec<(String, String)>,
+        checksum_alg: Option<ChecksumAlgorithm>,
+        sse_key_md5: Option<String>,
+        sse_s3: Option<fs3_meta::SessionSseS3>,
+        retention: Option<fs3_core::Retention>,
+        legal_hold: Option<bool>,
+    ) -> Result<String> {
         if self.meta.get_bucket(bucket)?.is_none() {
             return Err(Error::NotFound(format!("bucket {bucket}")));
         }
@@ -2362,7 +2427,8 @@ impl Engine {
             checksum_alg,
             sse_key_md5,
             sse_s3,
-        );
+        )
+        .with_object_lock(retention, legal_hold);
         self.meta.create_multipart(&upload_id, &session)?;
         Ok(upload_id)
     }
@@ -2952,11 +3018,14 @@ impl Engine {
 
         // 版本化分叉(ADR-11 §3.4.5):Complete 落最终对象 = 一个新版本
         // (Enabled 新 vk / Suspended 覆盖 null 槽;会话/分片键不变)。
-        let versioning = self
-            .meta
-            .get_bucket(bucket)?
-            .map(|b| b.versioning)
-            .unwrap_or_default();
+        let bkt = self.meta.get_bucket(bucket)?;
+        let versioning = bkt.as_ref().map(|b| b.versioning).unwrap_or_default();
+        let lock = ObjectLockWrite::from_explicit_or_default(
+            session.retention.clone(),
+            session.legal_hold.unwrap_or(false),
+            bkt.as_ref().and_then(|b| b.default_retention.as_ref()),
+            self.lock_now(),
+        );
         let (target, old) = self.plan_object_write(bucket, key, versioning)?;
         // Suspended null 族落对象的 mtime 保序(D1a 同秒裁决,见
         // null_family_mtime);Enabled/Off = 当前秒
@@ -3033,8 +3102,8 @@ impl Engine {
                         tags: session.tags.clone(),
                         sse: Some(wkey.build_sse_info(nonce_base, tags)),
                         checksum: object_checksum.clone(),
-                        retention: None,
-                        legal_hold: false,
+                        retention: lock.retention.clone(),
+                        legal_hold: lock.legal_hold,
                         part_checksums: part_checksums.clone(),
                     }
                 } else {
@@ -3072,8 +3141,8 @@ impl Engine {
                         tags: session.tags.clone(),
                         sse,
                         checksum: object_checksum.clone(),
-                        retention: None,
-                        legal_hold: false,
+                        retention: lock.retention.clone(),
+                        legal_hold: lock.legal_hold,
                         part_checksums: part_checksums.clone(),
                     }
                 }
@@ -3100,8 +3169,8 @@ impl Engine {
                     tags: session.tags.clone(),
                     sse: None,
                     checksum: object_checksum.clone(),
-                    retention: None,
-                    legal_hold: false,
+                    retention: lock.retention.clone(),
+                    legal_hold: lock.legal_hold,
                     part_checksums: part_checksums.clone(),
                 }
             } else if all_extent {
@@ -3126,8 +3195,8 @@ impl Engine {
                     tags: session.tags.clone(),
                     sse: None,
                     checksum: object_checksum.clone(),
-                    retention: None,
-                    legal_hold: false,
+                    retention: lock.retention.clone(),
+                    legal_hold: lock.legal_hold,
                     part_checksums: part_checksums.clone(),
                 }
             } else {
@@ -3167,8 +3236,8 @@ impl Engine {
                     tags: session.tags.clone(),
                     sse: None,
                     checksum: object_checksum.clone(),
-                    retention: None,
-                    legal_hold: false,
+                    retention: lock.retention.clone(),
+                    legal_hold: lock.legal_hold,
                     part_checksums: part_checksums.clone(),
                 }
             };
@@ -3561,6 +3630,42 @@ impl Engine {
         sse_src_key: Option<&fs3_core::SseCKey>,
         sse_dst_key: Option<&fs3_core::SseWriteKey>,
     ) -> Result<ObjectMeta> {
+        self.copy_object_with_lock(
+            src_bucket,
+            src_key,
+            src_version,
+            dst_bucket,
+            dst_key,
+            replace_content_type,
+            replace_user_meta,
+            replace_resp_headers,
+            replace_tags,
+            dst_versioning,
+            sse_src_key,
+            sse_dst_key,
+            ObjectLockWrite::default(),
+        )
+    }
+
+    /// [`copy_object_version_for`] 的 Object Lock 落值形态(M12 W2-3):
+    /// 新版本不继承源保留,由 `lock` 覆盖(头或桶默认;默认空 = 无锁)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_object_with_lock(
+        &mut self,
+        src_bucket: &str,
+        src_key: &str,
+        src_version: Option<&[u8; 16]>,
+        dst_bucket: &str,
+        dst_key: &str,
+        replace_content_type: Option<&str>,
+        replace_user_meta: Option<&[(String, String)]>,
+        replace_resp_headers: Option<&[(String, String)]>,
+        replace_tags: Option<&[(String, String)]>,
+        dst_versioning: VersioningState,
+        sse_src_key: Option<&fs3_core::SseCKey>,
+        sse_dst_key: Option<&fs3_core::SseWriteKey>,
+        lock: ObjectLockWrite,
+    ) -> Result<ObjectMeta> {
         let src = self.resolve_object_entry(src_bucket, src_key, src_version, None)?;
         let (target, old) = self.plan_object_write(dst_bucket, dst_key, dst_versioning)?;
 
@@ -3580,6 +3685,9 @@ impl Engine {
         if let Some(t) = replace_tags {
             meta.tags = t.to_vec();
         }
+        // M12 W2-3:覆盖写/复制 = 新版本,不继承源保留;协议层传入头或桶默认。
+        meta.retention = lock.retention;
+        meta.legal_hold = lock.legal_hold;
         meta.version_id = target.meta_version_id();
         if src.is_delete_marker && target == WriteTarget::Unversioned {
             return Err(Error::InvalidArgument(format!(
@@ -3839,6 +3947,91 @@ impl Engine {
         }
         meta.tags = tags.clone();
         self.meta.commit_object_set_tags(bucket, key, vk, tags)?;
+        Ok(meta)
+    }
+
+    /// PutObjectRetention 落地(M12 W2-3):仅改 retention 字段,不触碰数据段。
+    pub fn set_object_retention(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version: Option<&[u8; 16]>,
+        retention: Option<fs3_core::Retention>,
+    ) -> Result<ObjectMeta> {
+        let vk = self.lock_write_vk(bucket, key, version)?;
+        let mut meta = self.lock_write_meta(bucket, key, &vk)?;
+        meta.retention = retention.clone();
+        self.meta
+            .commit_object_set_retention(bucket, key, vk, retention)?;
+        Ok(meta)
+    }
+
+    /// PutObjectLegalHold 落地(M12 W2-3):仅改 legal_hold 字段。
+    pub fn set_object_legal_hold(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version: Option<&[u8; 16]>,
+        legal_hold: bool,
+    ) -> Result<ObjectMeta> {
+        let vk = self.lock_write_vk(bucket, key, version)?;
+        let mut meta = self.lock_write_meta(bucket, key, &vk)?;
+        meta.legal_hold = legal_hold;
+        self.meta
+            .commit_object_set_legal_hold(bucket, key, vk, legal_hold)?;
+        Ok(meta)
+    }
+
+    fn lock_write_vk(
+        &self,
+        bucket: &str,
+        key: &str,
+        version: Option<&[u8; 16]>,
+    ) -> Result<Option<[u8; 16]>> {
+        match version {
+            Some(vk) if *vk != VK_NULL => Ok(Some(*vk)),
+            Some(_) => {
+                if self.meta.get_object(bucket, key)?.is_some() {
+                    Ok(None)
+                } else {
+                    Ok(Some(VK_NULL))
+                }
+            }
+            None => match self.meta.get_current_version(bucket, key)? {
+                Some((vk, _)) if vk != VK_NULL => Ok(Some(vk)),
+                Some(_) => {
+                    if self.meta.get_object(bucket, key)?.is_some() {
+                        Ok(None)
+                    } else {
+                        Ok(Some(VK_NULL))
+                    }
+                }
+                None => Err(Error::NotFound(format!("object {bucket}/{key}"))),
+            },
+        }
+    }
+
+    fn lock_write_meta(
+        &self,
+        bucket: &str,
+        key: &str,
+        vk: &Option<[u8; 16]>,
+    ) -> Result<ObjectMeta> {
+        let meta = match vk {
+            Some(vk) => self
+                .meta
+                .get_object_version(bucket, key, vk)?
+                .ok_or_else(|| Error::NotFound(format!("object {bucket}/{key}")))?,
+            None => self
+                .meta
+                .get_object(bucket, key)?
+                .ok_or_else(|| Error::NotFound(format!("object {bucket}/{key}")))?,
+        };
+        if meta.is_delete_marker {
+            return Err(Error::DeleteMarker(version_id_display(
+                meta.version_id.as_ref(),
+            )));
+        }
         Ok(meta)
     }
 
@@ -4275,6 +4468,7 @@ struct PutCtx<'a> {
     /// checksum EOF 共享出口(M11 C1-2 extent 臂):tee 读尽后结果在此,
     /// 提交前取回落 ObjectMeta.checksum(修复落盘恒 None 的时序缺口)。
     checksum_out: &'a std::cell::RefCell<Option<ChecksumInfo>>,
+    lock: ObjectLockWrite,
 }
 
 /// 版本化写入目标(ADR-11 §3.4.2;put/copy/complete 共用分叉)。

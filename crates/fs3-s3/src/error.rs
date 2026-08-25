@@ -117,6 +117,8 @@ pub enum S3ErrorCode {
     OperationAborted,
     /// 桶无 Object Lock 配置(M12 W2-2;GetObjectLockConfiguration 的 AWS 404 码)。
     ObjectLockConfigurationNotFoundError,
+    /// 对象无保留配置(M12 W2-3;GetObjectRetention 的 AWS 404 码)。
+    NoSuchObjectLockConfiguration,
     /// 桶无 OwnershipControls 配置(M10 S7;AWS 404)。
     OwnershipControlsNotFoundError,
     /// 桶无默认加密配置(M11 K1-2;GetBucketEncryption 的 AWS 404 码)。
@@ -231,6 +233,9 @@ impl S3ErrorCode {
             ObjectLockConfigurationNotFoundError => {
                 "The bucket does not have Object Lock enabled."
             }
+            NoSuchObjectLockConfiguration => {
+                "The specified object does not have a ObjectLock configuration"
+            }
             OwnershipControlsNotFoundError => {
                 "The bucket does not have ownership controls configured."
             }
@@ -289,6 +294,7 @@ impl S3ErrorCode {
             | NoSuchLifecycleConfiguration
             | NoSuchTagSet
             | ObjectLockConfigurationNotFoundError
+            | NoSuchObjectLockConfiguration
             | OwnershipControlsNotFoundError
             | ServerSideEncryptionConfigurationNotFoundError => 404,
             MethodNotAllowed => 405,

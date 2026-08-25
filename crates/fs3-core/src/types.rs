@@ -342,6 +342,35 @@ impl ObjectLockDefaultRetention {
     }
 }
 
+/// 一次对象写的 Object Lock 落值(M12 W2-3;PUT/Copy/Complete 同事务写入)。
+/// 协议层已把 PUT 头与桶默认保留裁决成此结构;引擎只落字段不裁决。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjectLockWrite {
+    pub retention: Option<Retention>,
+    pub legal_hold: bool,
+}
+
+impl ObjectLockWrite {
+    /// 显式保留优先;未指定时继承桶默认(从 `now` 起算 until)。
+    pub fn from_explicit_or_default(
+        explicit_retention: Option<Retention>,
+        legal_hold: bool,
+        default: Option<&ObjectLockDefaultRetention>,
+        now: i64,
+    ) -> Self {
+        let retention = explicit_retention.or_else(|| {
+            default.map(|d| Retention {
+                mode: d.mode,
+                retain_until: d.retain_until(now),
+            })
+        });
+        Self {
+            retention,
+            legal_hold,
+        }
+    }
+}
+
 /// ETag 计算模式(M5「CPU 优化」etag=fast 降级开关;DESIGN §6.7)。
 ///
 /// - `Md5`(默认):严格 S3 兼容,返回 MD5 摘要;

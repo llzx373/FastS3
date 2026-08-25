@@ -248,6 +248,29 @@ pub enum Operation {
         key: String,
         version_id: Option<VersionIdArg>,
     },
+    // —— 对象级 Object Lock(M12 W2-3;ADR-13) ——
+    PutObjectRetention {
+        bucket: String,
+        key: String,
+        version_id: Option<VersionIdArg>,
+        retention: fs3_core::Retention,
+    },
+    GetObjectRetention {
+        bucket: String,
+        key: String,
+        version_id: Option<VersionIdArg>,
+    },
+    PutObjectLegalHold {
+        bucket: String,
+        key: String,
+        version_id: Option<VersionIdArg>,
+        legal_hold: bool,
+    },
+    GetObjectLegalHold {
+        bucket: String,
+        key: String,
+        version_id: Option<VersionIdArg>,
+    },
     GetObject {
         bucket: String,
         key: String,
@@ -764,6 +787,22 @@ impl Router {
                         tags: crate::xml::parse_tagging(body, crate::xml::MAX_OBJECT_TAGS)?,
                     });
                 }
+                if has_q("retention") {
+                    return Ok(Operation::PutObjectRetention {
+                        bucket,
+                        key,
+                        version_id: parse_version_id_param(get_q("versionId").as_deref())?,
+                        retention: crate::object_lock::parse_retention_body(body)?,
+                    });
+                }
+                if has_q("legal-hold") {
+                    return Ok(Operation::PutObjectLegalHold {
+                        bucket,
+                        key,
+                        version_id: parse_version_id_param(get_q("versionId").as_deref())?,
+                        legal_hold: crate::object_lock::parse_legal_hold_body(body)?,
+                    });
+                }
                 if has_q("versionId") {
                     // PUT 无版本寻址语义(AWS 同样拒绝);显式 400 不静默
                     return Err(S3Error::new(S3ErrorCode::InvalidArgument)
@@ -781,6 +820,16 @@ impl Router {
             // M10 S1:GetObjectTagging/DeleteObjectTagging(此前显式 501;
             // ?versionId 按版本寻址)
             "GET" if has_q("tagging") => Ok(Operation::GetObjectTagging {
+                bucket,
+                key,
+                version_id: parse_version_id_param(get_q("versionId").as_deref())?,
+            }),
+            "GET" if has_q("retention") => Ok(Operation::GetObjectRetention {
+                bucket,
+                key,
+                version_id: parse_version_id_param(get_q("versionId").as_deref())?,
+            }),
+            "GET" if has_q("legal-hold") => Ok(Operation::GetObjectLegalHold {
                 bucket,
                 key,
                 version_id: parse_version_id_param(get_q("versionId").as_deref())?,
@@ -1428,6 +1477,55 @@ mod tests {
                 assert!(matches!(op, Operation::DeleteObjectTagging { .. }), "{m}");
             }
         }
+        // M12 W2-3:?retention / ?legal-hold 对象级分流
+        let rb = br#"<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>2026-01-01T00:00:00.000Z</RetainUntilDate></Retention>"#;
+        let op = r
+            .route(
+                "PUT",
+                "localhost",
+                "/b1/k",
+                &[("retention".into(), "".into())],
+                rb,
+            )
+            .unwrap();
+        assert!(matches!(op, Operation::PutObjectRetention { .. }));
+        let op = r
+            .route(
+                "GET",
+                "localhost",
+                "/b1/k",
+                &[("retention".into(), "".into())],
+                b"",
+            )
+            .unwrap();
+        assert!(matches!(op, Operation::GetObjectRetention { .. }));
+        let lb = br#"<LegalHold><Status>ON</Status></LegalHold>"#;
+        let op = r
+            .route(
+                "PUT",
+                "localhost",
+                "/b1/k",
+                &[("legal-hold".into(), "".into())],
+                lb,
+            )
+            .unwrap();
+        assert!(matches!(
+            op,
+            Operation::PutObjectLegalHold {
+                legal_hold: true,
+                ..
+            }
+        ));
+        let op = r
+            .route(
+                "GET",
+                "localhost",
+                "/b1/k",
+                &[("legal-hold".into(), "".into())],
+                b"",
+            )
+            .unwrap();
+        assert!(matches!(op, Operation::GetObjectLegalHold { .. }));
         // PUT ?tagging 空 body → MalformedXML;?tagging&versionId 版本寻址
         let e = r
             .route(

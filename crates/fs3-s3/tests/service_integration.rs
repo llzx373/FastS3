@@ -7550,6 +7550,122 @@ fn bucket_object_lock_configuration_apis() {
     assert_eq!(err_code(&r), "NoSuchBucket", "{r:?}");
 }
 
+/// M12 W2-3:对象级 PUT 头 + Put/Get Retention/LegalHold + 默认保留继承。
+#[test]
+fn object_lock_put_headers_and_retention_apis() {
+    let (_d, svc) = setup();
+    let ol = &[("object-lock", "")];
+    let ret_q = &[("retention", "")];
+    let hold_q = &[("legal-hold", "")];
+    // 建锁桶 + 默认保留 7 天 GOVERNANCE
+    assert_eq!(status(&svc.handle(&req("PUT", "/olk", vec![]))), 200);
+    let cfg = b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>7</Days></DefaultRetention></Rule></ObjectLockConfiguration>".to_vec();
+    assert_eq!(status(&svc.handle(&req_q("PUT", "/olk", ol, cfg))), 200);
+
+    // 未锁桶显式头 → InvalidRequest
+    assert_eq!(status(&svc.handle(&req("PUT", "/plain", vec![]))), 200);
+    let r = svc.handle(&req_h(
+        "PUT",
+        "/plain/k",
+        &[("x-amz-object-lock-legal-hold", "ON")],
+        b"x".to_vec(),
+    ));
+    assert_eq!(err_code(&r), "InvalidRequest", "{r:?}");
+
+    // 未带头 PUT → 继承桶默认;GET/HEAD 回显 mode
+    let r = svc.handle(&req("PUT", "/olk/def", b"hi".to_vec()));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let head = svc.handle(&req("HEAD", "/olk/def", vec![])).unwrap();
+    let mode = head
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-amz-object-lock-mode"))
+        .map(|(_, v)| v.as_str());
+    assert_eq!(mode, Some("GOVERNANCE"), "{head:?}");
+    let r = svc.handle(&req_q("GET", "/olk/def", ret_q, vec![]));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let xml = body_str(&r.unwrap());
+    assert!(xml.contains("<Mode>GOVERNANCE</Mode>"), "{xml}");
+
+    // 显式头覆盖默认 + legal-hold ON
+    let until = "2030-01-01T00:00:00.000Z";
+    let r = svc.handle(&req_h(
+        "PUT",
+        "/olk/hdr",
+        &[
+            ("x-amz-object-lock-mode", "COMPLIANCE"),
+            ("x-amz-object-lock-retain-until-date", until),
+            ("x-amz-object-lock-legal-hold", "ON"),
+        ],
+        b"yy".to_vec(),
+    ));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let get = svc.handle(&req("GET", "/olk/hdr", vec![])).unwrap();
+    let hold = get
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-amz-object-lock-legal-hold"))
+        .map(|(_, v)| v.as_str());
+    assert_eq!(hold, Some("ON"), "{get:?}");
+    let xml = body_str(
+        &svc.handle(&req_q("GET", "/olk/hdr", ret_q, vec![]))
+            .unwrap(),
+    );
+    assert!(xml.contains("<Mode>COMPLIANCE</Mode>"), "{xml}");
+    let xml = body_str(
+        &svc.handle(&req_q("GET", "/olk/hdr", hold_q, vec![]))
+            .unwrap(),
+    );
+    assert!(xml.contains("<Status>ON</Status>"), "{xml}");
+
+    // PutObjectRetention 延长 COMPLIANCE OK;缩短 403
+    let longer = b"<Retention><Mode>COMPLIANCE</Mode><RetainUntilDate>2031-01-01T00:00:00.000Z</RetainUntilDate></Retention>".to_vec();
+    assert_eq!(
+        status(&svc.handle(&req_q("PUT", "/olk/hdr", ret_q, longer))),
+        200
+    );
+    let shorter = b"<Retention><Mode>COMPLIANCE</Mode><RetainUntilDate>2027-01-01T00:00:00.000Z</RetainUntilDate></Retention>".to_vec();
+    let r = svc.handle(&req_q("PUT", "/olk/hdr", ret_q, shorter));
+    assert_eq!(err_code(&r), "AccessDenied", "{r:?}");
+
+    // GOVERNANCE 缩短需 bypass 头
+    let r = svc.handle(&req_q(
+        "PUT",
+        "/olk/def",
+        ret_q,
+        b"<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>2020-01-01T00:00:00.000Z</RetainUntilDate></Retention>".to_vec(),
+    ));
+    assert_eq!(err_code(&r), "AccessDenied", "{r:?}");
+    let r = svc.handle(&req_qh(
+        "PUT",
+        "/olk/def",
+        ret_q,
+        &[("x-amz-bypass-governance-retention", "true")],
+        b"<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>2020-01-01T00:00:00.000Z</RetainUntilDate></Retention>".to_vec(),
+    ));
+    assert_eq!(status(&r), 200, "{r:?}");
+
+    // Put/Get LegalHold OFF
+    let r = svc.handle(&req_q(
+        "PUT",
+        "/olk/hdr",
+        hold_q,
+        b"<LegalHold><Status>OFF</Status></LegalHold>".to_vec(),
+    ));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let xml = body_str(
+        &svc.handle(&req_q("GET", "/olk/hdr", hold_q, vec![]))
+            .unwrap(),
+    );
+    assert!(xml.contains("<Status>OFF</Status>"), "{xml}");
+
+    // 未锁桶 GetObjectRetention → InvalidRequest
+    assert_eq!(
+        err_code(&svc.handle(&req_q("GET", "/plain/k", ret_q, vec![]))),
+        "InvalidRequest"
+    );
+}
+
 /// K1-4:SSE-KMS 显式拒绝矩阵(钉住,不静默)——aws:kms 算法值全入口
 /// 400 InvalidEncryptionAlgorithmError;KMS 参数头族 501 NotImplemented;
 /// PutBucketEncryption 的 KMSKeyID/BucketKeyEnabled 元素 400

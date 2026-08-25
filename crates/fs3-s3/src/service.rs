@@ -822,10 +822,11 @@ impl S3Service {
 
     /// M9/A1:未实现头显式拒绝(红线 6:静默忽略客户端头 = 拒绝合入)。
     ///
-    /// - SSE-KMS 家族 / Object Lock / 网站重定向 → 501 NotImplemented
+    /// - SSE-KMS 家族 / 网站重定向 → 501 NotImplemented
     ///   (错误码自带语义 "A header you provided implies functionality that is not implemented";
     ///   M11 K1-4:`aws:kms` 算法值另有 InvalidEncryptionAlgorithmError 显式
     ///   拒绝,见 sse.rs;KMS 参数头族保留本表);
+    /// - Object Lock 头自 M12 W2-3 起**出表实现**;
     /// - SSE-C 三头(customer-algorithm/-key/-key-MD5)自 M11 E1-2 起**出表
     ///   实现**:单对象 PUT/GET/HEAD(见 sse.rs);E1-4 multipart 与 E1-5
     ///   copy 目标侧同受理;Abort/ListParts 等其余操作携带时由
@@ -846,9 +847,8 @@ impl S3Service {
             "x-amz-server-side-encryption-context",
             "x-amz-server-side-encryption-bucket-key-enabled",
             "x-amz-sse-kms-key-id",
-            "x-amz-object-lock-mode",
-            "x-amz-object-lock-retain-until-date",
-            "x-amz-object-lock-legal-hold",
+            // M12 W2-3:x-amz-object-lock-* 出表实现(PutObject / CreateMultipart /
+            // CopyObject 受理;其余 op 由 handle_inner 门控 400)
             "x-amz-website-redirect-location",
         ];
         for (k, _) in &req.headers {
@@ -1032,6 +1032,20 @@ impl S3Service {
         {
             return Err(S3Error::new(S3ErrorCode::InvalidArgument)
                 .with_message("SSE-S3 header is not accepted for this operation."));
+        }
+        // M12 W2-3:对象级 Object Lock 头受理范围——PutObject /
+        // CreateMultipartUpload / CopyObject 写路径;PutObjectRetention
+        // 另受理 bypass 头。其余 op 携带 → 400(不静默)。
+        if !matches!(
+            op,
+            Operation::PutObject { .. }
+                | Operation::CreateMultipartUpload { .. }
+                | Operation::CopyObject { .. }
+                | Operation::PutObjectRetention { .. }
+        ) && crate::object_lock::has_object_lock_headers(&req.headers)
+        {
+            return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                .with_message("Object Lock headers are not accepted for this operation."));
         }
         let mut headers = self.base_headers();
         let resp = match op {
@@ -1272,6 +1286,28 @@ impl S3Service {
                 key,
                 version_id,
             } => Ok(self.op_delete_object_tagging(&bucket, &key, version_id)?),
+            Operation::PutObjectRetention {
+                bucket,
+                key,
+                version_id,
+                retention,
+            } => Ok(self.op_put_object_retention(req, &bucket, &key, version_id, retention)?),
+            Operation::GetObjectRetention {
+                bucket,
+                key,
+                version_id,
+            } => Ok(self.op_get_object_retention(&bucket, &key, version_id)?),
+            Operation::PutObjectLegalHold {
+                bucket,
+                key,
+                version_id,
+                legal_hold,
+            } => Ok(self.op_put_object_legal_hold(&bucket, &key, version_id, legal_hold)?),
+            Operation::GetObjectLegalHold {
+                bucket,
+                key,
+                version_id,
+            } => Ok(self.op_get_object_legal_hold(&bucket, &key, version_id)?),
             Operation::GetObject {
                 bucket,
                 key,
@@ -1455,6 +1491,12 @@ impl S3Service {
             return Err(S3Error::new(S3ErrorCode::InvalidArgument)
                 .with_message("x-amz-tagging is not valid for UploadPart"));
         }
+        if crate::object_lock::has_object_lock_headers(&req.headers)
+            && matches!(target, StreamTarget::Part { .. })
+        {
+            return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                .with_message("Object Lock headers are not valid for UploadPart"));
+        }
         // M11 C1-2:checksum 头/trailer 声明统一解析(非法值显式拒绝;
         // 校验时机照 Content-MD5 先例:写前解析、写后比对)
         let cksum = crate::checksum::parse_request_checksum(req)?;
@@ -1563,8 +1605,14 @@ impl S3Service {
                             unreachable!("SSE-C/SSE-S3 互斥已在意愿裁决判定")
                         }
                     };
+                    let lock = crate::object_lock::resolve_write(
+                        &req.headers,
+                        bkt.object_lock,
+                        bkt.default_retention.as_ref(),
+                        engine.lock_now(),
+                    )?;
                     engine
-                        .put_with_meta(
+                        .put_with_lock(
                             bucket,
                             key,
                             reader,
@@ -1581,6 +1629,7 @@ impl S3Service {
                             // 验算 → 加密;chunked trailer 明文验算在更外层
                             // reader,先于加密,不可颠倒)
                             write_key.as_ref(),
+                            lock,
                         )
                         .map(|m| (m.etag, Some(m), None))
                         .map_err(|e| map_engine_error(e, bucket, key))
@@ -2731,7 +2780,7 @@ impl S3Service {
         // 桶必须存在(AWS:NoSuchBucket)+ 取版本化状态(响应头口径同 V3-5)
         // K1-3:桶默认加密(AES256)对 POST 同样生效(AWS:默认加密覆盖全部
         // 写入口;表单无 SSE 字段可覆盖默认)
-        let (bucket_versioning, bucket_default_encryption) = {
+        let (bucket_versioning, bucket_default_encryption, bucket_lock, bucket_default_retention) = {
             let engine = self.engine.read();
             let bkt = engine
                 .meta()
@@ -2740,7 +2789,12 @@ impl S3Service {
                 .ok_or_else(|| {
                     S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket)
                 })?;
-            (bkt.versioning, bkt.default_encryption)
+            (
+                bkt.versioning,
+                bkt.default_encryption,
+                bkt.object_lock,
+                bkt.default_retention,
+            )
         };
         let mut engine = self.engine.write();
         // M11 K1-1:桶默认 → SSE-S3 写密钥签发(当前代包裹;明文零落盘)
@@ -2754,8 +2808,24 @@ impl S3Service {
             None
         };
         let post_wk = s3_key.as_ref().map(fs3_core::SseWriteKey::SseS3);
+        let mut post_lock_hdrs: Vec<(String, String)> = Vec::new();
+        for name in [
+            "x-amz-object-lock-mode",
+            "x-amz-object-lock-retain-until-date",
+            "x-amz-object-lock-legal-hold",
+        ] {
+            if let Some(v) = form.field(name) {
+                post_lock_hdrs.push((name.into(), v.to_string()));
+            }
+        }
+        let post_lock = crate::object_lock::resolve_write(
+            &post_lock_hdrs,
+            bucket_lock,
+            bucket_default_retention.as_ref(),
+            engine.lock_now(),
+        )?;
         let meta = engine
-            .put_with_meta(
+            .put_with_lock(
                 bucket,
                 &key,
                 &mut std::io::Cursor::new(form.file.clone()),
@@ -2770,6 +2840,7 @@ impl S3Service {
                 // ADR-12 DE4:POST 表单不支持 SSE-C(字段已在上方显式拒绝;
                 // SSE-C 恒 None);K1-3:桶默认 SSE-S3 生效
                 post_wk.as_ref(),
+                post_lock,
             )
             .map_err(|e| map_engine_error(e, bucket, &key))?;
         // M11 门禁:checksum 写后比对(不符回滚 + BadDigest,同 PUT 口径)
@@ -2948,6 +3019,119 @@ impl S3Service {
             },
             other => map_engine_error(other, bucket, key),
         }
+    }
+
+    fn op_put_object_retention(
+        &self,
+        req: &S3Request,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionIdArg>,
+        retention: fs3_core::Retention,
+    ) -> Result<ServiceResponse, S3Error> {
+        let mut engine = self.engine.write();
+        let bkt = engine
+            .meta()
+            .get_bucket(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?
+            .ok_or_else(|| {
+                S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket)
+            })?;
+        crate::object_lock::require_bucket_lock(bkt.object_lock)?;
+        let vk = version_id.map(|v| v.vk());
+        let cur = engine
+            .head_version(bucket, key, vk.as_ref())
+            .map_err(|e| self.tagging_op_error(e, bucket, key, version_id))?;
+        crate::object_lock::check_retention_change(
+            cur.retention.as_ref(),
+            &retention,
+            engine.lock_now(),
+            crate::object_lock::bypass_governance(&req.headers),
+        )?;
+        engine
+            .set_object_retention(bucket, key, vk.as_ref(), Some(retention))
+            .map_err(|e| self.tagging_op_error(e, bucket, key, version_id))?;
+        Ok(ServiceResponse {
+            status: 200,
+            headers: vec![],
+            body: ResponseBody::Empty,
+        })
+    }
+
+    fn op_get_object_retention(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionIdArg>,
+    ) -> Result<ServiceResponse, S3Error> {
+        let engine = self.engine.read();
+        let bkt = engine
+            .meta()
+            .get_bucket(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?
+            .ok_or_else(|| {
+                S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket)
+            })?;
+        crate::object_lock::require_bucket_lock(bkt.object_lock)?;
+        let vk = version_id.map(|v| v.vk());
+        let meta = engine
+            .head_version(bucket, key, vk.as_ref())
+            .map_err(|e| self.tagging_op_error(e, bucket, key, version_id))?;
+        let r = meta
+            .retention
+            .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchObjectLockConfiguration))?;
+        Ok(Self::xml_response(crate::object_lock::render_retention(&r)))
+    }
+
+    fn op_put_object_legal_hold(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionIdArg>,
+        legal_hold: bool,
+    ) -> Result<ServiceResponse, S3Error> {
+        let mut engine = self.engine.write();
+        let bkt = engine
+            .meta()
+            .get_bucket(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?
+            .ok_or_else(|| {
+                S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket)
+            })?;
+        crate::object_lock::require_bucket_lock(bkt.object_lock)?;
+        let vk = version_id.map(|v| v.vk());
+        engine
+            .set_object_legal_hold(bucket, key, vk.as_ref(), legal_hold)
+            .map_err(|e| self.tagging_op_error(e, bucket, key, version_id))?;
+        Ok(ServiceResponse {
+            status: 200,
+            headers: vec![],
+            body: ResponseBody::Empty,
+        })
+    }
+
+    fn op_get_object_legal_hold(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionIdArg>,
+    ) -> Result<ServiceResponse, S3Error> {
+        let engine = self.engine.read();
+        let bkt = engine
+            .meta()
+            .get_bucket(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?
+            .ok_or_else(|| {
+                S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket)
+            })?;
+        crate::object_lock::require_bucket_lock(bkt.object_lock)?;
+        let vk = version_id.map(|v| v.vk());
+        let meta = engine
+            .head_version(bucket, key, vk.as_ref())
+            .map_err(|e| self.tagging_op_error(e, bucket, key, version_id))?;
+        Ok(Self::xml_response(crate::object_lock::render_legal_hold(
+            meta.legal_hold,
+        )))
     }
 
     /// M10 S2:桶级 CORS 规则评估(HTTP 层预检/实际请求注头用;免认证——
@@ -3310,8 +3494,14 @@ impl S3Service {
             (None, None) => None,
             (Some(_), Some(_)) => unreachable!("SSE-C/SSE-S3 互斥已在意愿裁决判定"),
         };
+        let lock = crate::object_lock::resolve_write(
+            &req.headers,
+            bkt.object_lock,
+            bkt.default_retention.as_ref(),
+            engine.lock_now(),
+        )?;
         let meta = engine
-            .put_with_meta(
+            .put_with_lock(
                 bucket,
                 key,
                 &mut std::io::Cursor::new(req.body.clone()),
@@ -3326,6 +3516,7 @@ impl S3Service {
                 // M11 E1-7/K1-1:SSE 写密钥透传(明文 checksum → 加密 →
                 // 密文 CRC/MD5,顺序见引擎 put_with_meta 注释)
                 write_key.as_ref(),
+                lock,
             )
             .map_err(|e| map_engine_error(e, bucket, key))?;
         if md5_ok == Some(false) {
@@ -3518,6 +3709,7 @@ impl S3Service {
                 if !meta.tags.is_empty() {
                     headers.push(("x-amz-tagging-count".into(), meta.tags.len().to_string()));
                 }
+                headers.extend(crate::object_lock::response_headers(&meta));
                 // M11 L5:x-amz-expiration(命中 Enabled 过期规则时回显)
                 if let Some(h) = lifecycle_expiration_header(&engine, bucket, key, &meta) {
                     headers.push(h);
@@ -3624,6 +3816,7 @@ impl S3Service {
         if !meta.tags.is_empty() {
             headers.push(("x-amz-tagging-count".into(), meta.tags.len().to_string()));
         }
+        headers.extend(crate::object_lock::response_headers(&meta));
         // M11 L5:x-amz-expiration(命中 Enabled 过期规则时回显最早到期
         // 时刻与规则 ID;s3-tests lifecycle_expiration_header 族依赖)
         if let Some(h) = lifecycle_expiration_header(&engine, bucket, key, &meta) {
@@ -3902,10 +4095,14 @@ impl S3Service {
         } else {
             None
         };
+        let (lock_ret, lock_hold) = crate::object_lock::parse_write_headers(&req.headers)?;
+        if lock_ret.is_some() || lock_hold.is_some() {
+            crate::object_lock::require_bucket_lock(bkt.object_lock)?;
+        }
         // 惰性过期回收(每次创建顺带扫一遍,成本可忽略的规模)
         let _ = engine.sweep_expired_sessions(fs3_core::MULTIPART_TTL_SECS);
         let uid = engine
-            .create_multipart(
+            .create_multipart_lock(
                 bucket,
                 key,
                 header(req, "content-type"),
@@ -3921,6 +4118,8 @@ impl S3Service {
                 ssec.as_ref().map(|s| s.key_md5_b64.clone()),
                 // M11 K1-1:SSE-S3 会话 DEK 包裹值绑定会话
                 sess_s3,
+                lock_ret,
+                lock_hold,
             )
             .map_err(|e| map_engine_error(e, bucket, key))?;
         let xml = xml::render_initiate_multipart(bucket, key, &uid);
@@ -4803,8 +5002,14 @@ impl S3Service {
             (None, None) => None,
             (Some(_), Some(_)) => unreachable!("SSE-C/SSE-S3 互斥已在意愿裁决判定"),
         };
+        let lock = crate::object_lock::resolve_write(
+            &req.headers,
+            dst_bkt.object_lock,
+            dst_bkt.default_retention.as_ref(),
+            engine.lock_now(),
+        )?;
         let meta = engine
-            .copy_object_version_for(
+            .copy_object_with_lock(
                 &copy_source.bucket,
                 &copy_source.key,
                 src_vk.as_ref(),
@@ -4818,6 +5023,7 @@ impl S3Service {
                 // M11 E1-5:copy-source 侧/目标侧客户密钥(矩阵裁决在引擎)
                 cs_ssec.as_ref().map(|s| &s.key),
                 dst_wk.as_ref(),
+                lock,
             )
             .map_err(|e| map_engine_error(e, &copy_source.bucket, &copy_source.key))?;
         let xml = xml::render_copy_object(&meta.etag_full(), &xml::ts_to_rfc3339(meta.mtime));
@@ -5757,6 +5963,10 @@ fn route_op_bucket_key(req: &S3Request) -> (fs3_core::metrics::Op, String, Strin
         ("PUT", _, _) if has_q("tagging") => (Op::Put, "PutObjectTagging"),
         ("GET", _, _) if has_q("tagging") => (Op::Get, "GetObjectTagging"),
         ("DELETE", _, _) if has_q("tagging") => (Op::Delete, "DeleteObjectTagging"),
+        ("PUT", _, k) if !k.is_empty() && has_q("retention") => (Op::Put, "PutObjectRetention"),
+        ("GET", _, k) if !k.is_empty() && has_q("retention") => (Op::Get, "GetObjectRetention"),
+        ("PUT", _, k) if !k.is_empty() && has_q("legal-hold") => (Op::Put, "PutObjectLegalHold"),
+        ("GET", _, k) if !k.is_empty() && has_q("legal-hold") => (Op::Get, "GetObjectLegalHold"),
         // M11 C1-3:GetObjectAttributes 审计/策略名(AWS 动作
         // s3:GetObjectAttributes;对象级操作——桶级 ?attributes 归列表回退,
         // 不归此名;须在通配 GET 臂之前)
@@ -6145,20 +6355,13 @@ mod tests {
     #[test]
     fn unimplemented_headers_explicitly_rejected() {
         let (_d, _engine, service) = service_fixture();
-        // A1:SSE-KMS 参数头族 + object-lock + website 重定向 → 501
-        // NotImplemented(M10 S1:x-amz-tagging 已实现,出表;M11 E1-2:
-        // SSE-C 三头已实现单对象链路,出表;M11 K1-2:x-amz-server-side-
-        // encryption 已实现(PutObject/CreateMultipartUpload/CopyObject 受理,
-        // 仅 AES256;KMS 算法值由 sse.rs 显式 400),出表——KMS 参数头族
-        // 保留 501 显式拒绝路径,K1-4 钉住)
+        // A1:SSE-KMS 参数头族 + website 重定向 → 501 NotImplemented
+        // (M12 W2-3:x-amz-object-lock-* 已实现,出表)
         for h in [
             "x-amz-server-side-encryption-aws-kms-key-id",
             "x-amz-server-side-encryption-context",
             "x-amz-server-side-encryption-bucket-key-enabled",
             "x-amz-sse-kms-key-id",
-            "x-amz-object-lock-mode",
-            "x-amz-object-lock-retain-until-date",
-            "x-amz-object-lock-legal-hold",
             "x-amz-website-redirect-location",
         ] {
             let req = headers_req(&[(h, "some-value")]);
