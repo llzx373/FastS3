@@ -94,6 +94,12 @@ S3TEST_CONF=/tmp/s3-tests/s3tests.conf bash tests/s3-tests/run_s3tests.sh
   Complete 后会话残留 ListMultipartUploads、运行时密钥挂策略、ListBuckets 分页。
 - （跑批数值以门禁脚本输出为准,gate 输出即证据。）
 
+## 已知开放工程项(M13 门禁期观察,独立跟踪)
+
+| 项 | 状态 | 证据与跟踪 |
+| --- | --- | --- |
+| s3-tests 长跑期间服务端 fd 数量递增(约数百/分钟,~20 分钟起可能触发 accept EMFILE) | 🟡 观察中 | M13 门禁全量跑时 `/proc/<pid>/fd` 的 `socket:` 计数从 ~33 增至 ~5-10k(约 5-10 分钟级);但 raw-conn 空闲 60s 超时关闭实测**正常**、单请求批量增量 Δ=0、内核 `/proc/net/tcp`/`/proc/net/unix` 条目数远小于 fd 计数(疑似 WSL2 /proc 虚拟化伪影与真实泄漏混合)。门禁 494/0 通过时未受实质影响;建议在真实 Linux 宿主复测并优先排查连接生命周期(hyper keep-alive / zero-copy 写路径),必要时升级 ulimit。 |
+
 ## 已知开放兼容项(v0.5.x 跟踪,不静默排除)
 
 以下项在 v0.5 门禁内「文档化排除」且公开跟踪;M9(v1.0.1)已按 TODO M9

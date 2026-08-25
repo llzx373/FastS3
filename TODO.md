@@ -358,7 +358,7 @@
 ### M13 门禁(退出条件)
 - [x] 双盘/三盘崩溃 harness + 缺盘只读降级 drill(本地 100 轮双盘/40 轮三盘 0 失败,含 kill -9 中途重启续跑;CI 60 轮;500 轮全量属发布执行期长跑)
 - [x] device-add/device-remove 演练 + 再平衡收敛(水位差 <10% 收敛达成;前台 p99 回退 0% <10%;在线 API 路径由 handler 测试覆盖)
-- [ ] layout v2→v3 升级演练 + 回滚;元数据分区抽盘迁移演练
+- [x] layout v2→v3 升级演练 + 回滚(fs3d 单测 upgrade_v2_to_v3_drill_with_rollback,修复链后复验 5/5 通过);元数据分区抽盘迁移演练(tests/backup/m13_pull_disk_drill.sh 复验全绿:异机导入 md5 一致+可写)
 - [x] zstd 随/关 perf 对照脚本(tests/bench/m13-zstd-compare.sh)+ 压缩率基准(文本 <50% 断言)+ SSE 组合往返测试(compression_with_sse_c_combo_roundtrip)
 - [x] s3-tests 全量零回归(**494 passed/0 unexpected**;含覆盖写误清位图修复链);cargo audit 清零(0 漏洞,2 条 allowed 同 v1.2 集);发布 v1.4.0(workspace + web 三件套版本 bump,不打 tag 不打包)
 - [x] 覆盖率(llvm-cov workspace):**84.78% 行 / 85.02% 函数** ≥80%
