@@ -45,7 +45,7 @@ use crate::compaction::Compactor;
 use crate::io::{fsync, open_io_engine, read_exact, read_exact_batch, write_all, IoEngine};
 use crate::worker::{Throttle, WorkerHandle};
 
-pub use crate::compaction::{CompactionConfig, CompactionReport};
+pub use crate::compaction::{CompactionConfig, CompactionReport, CompactorMode, RebalanceConfig};
 
 #[derive(Clone)]
 pub struct EngineConfig {
@@ -70,6 +70,8 @@ pub struct EngineConfig {
     pub etag_mode: fs3_core::EtagMode,
     /// Tier 2 惰性压缩配置(ADR-9 §6)。
     pub compaction: CompactionConfig,
+    /// M13 M4-1 跨盘再平衡配置(默认关;候选 = 高水位盘,目标 = 低水位盘)。
+    pub rebalance: RebalanceConfig,
     /// 测试/故障注入覆盖:I/O 引擎替换(默认 None = 正常打开)。
     /// 掉盘模拟用:注入一个会在 N 次写后失败的 IoEngine。
     #[doc(hidden)]
@@ -96,6 +98,7 @@ impl Default for EngineConfig {
             small_object_limit: fs3_core::SMALL_OBJECT_LIMIT,
             etag_mode: fs3_core::EtagMode::Md5,
             compaction: CompactionConfig::default(),
+            rebalance: RebalanceConfig::default(),
             debug_io: None,
             clock_offset_secs: 0,
         }
@@ -302,6 +305,11 @@ pub struct Engine {
     compactor: Option<Arc<Compactor>>,
     /// 压缩配置存档(M13 M3-1 device-add 重建压缩器用;open 时快照)。
     compaction_cfg: CompactionConfig,
+    /// M13 M4-1 再平衡核心 + worker(默认关;与压缩共用节流桶)。
+    rebalancer: Option<Arc<crate::compaction::Compactor>>,
+    _rebalancer_thread: Option<WorkerHandle>,
+    /// 再平衡配置存档(worker 重建用;open 时快照)。
+    rebalance_cfg: RebalanceConfig,
     /// 后台 worker 句柄(ADR-12 DL2 通用抽象;压缩为首个实例)。
     _compactor_thread: Option<WorkerHandle>,
     /// 后台任务全局共享令牌桶(ADR-12 DL2:压缩与生命周期执行器
@@ -642,6 +650,7 @@ impl Engine {
                 alloc.clone(),
                 io.clone(),
                 devices.clone(),
+                CompactorMode::Compaction,
                 cfg.compaction.clone(),
             ));
             let h = if cfg.compaction.enabled {
@@ -654,6 +663,29 @@ impl Engine {
             } else {
                 None
             };
+            (Some(c), h)
+        };
+        // M13 M4-1:再平衡 worker(默认关;与压缩同一全局令牌桶)。
+        let (rebalancer, rebalancer_thread) = if read_only_effective || !cfg.rebalance.enabled {
+            (None, None)
+        } else {
+            let c = Arc::new(Compactor::new(
+                meta.clone(),
+                alloc.clone(),
+                io.clone(),
+                devices.clone(),
+                CompactorMode::Rebalance {
+                    high_watermark: cfg.rebalance.high_watermark,
+                    low_watermark: cfg.rebalance.low_watermark,
+                },
+                cfg.compaction.clone(),
+            ));
+            let h = Some(WorkerHandle::spawn(
+                "fs3-rebalancer",
+                c.clone(),
+                throttle.clone(),
+                std::time::Duration::from_millis(cfg.rebalance.poll_interval_ms),
+            ));
             (Some(c), h)
         };
 
@@ -701,6 +733,9 @@ impl Engine {
             compactor,
             compaction_cfg: cfg.compaction.clone(),
             _compactor_thread: compactor_thread,
+            rebalancer,
+            _rebalancer_thread: rebalancer_thread,
+            rebalance_cfg: cfg.rebalance.clone(),
             throttle,
             closed: false,
             degraded: degraded.clone(),
@@ -890,16 +925,9 @@ impl Engine {
         manifest.validate()?;
         // 清单落盘(单事务;崩溃于此 = 幂等重跑)
         self.meta.save_pool(&manifest)?;
-        // 独占期:停压缩后台 worker 并 join(其共享 alloc/基础表;扩容期间
+        // 独占期:停全部后台 worker 并 join(其共享 alloc/基础表;扩容期间
         // Vec 重定位与并发访问不兼容;引擎写锁已排除其余引擎操作)
-        let had_compactor = self.compactor.is_some();
-        if let Some(mut h) = self._compactor_thread.take() {
-            h.stop();
-            self._compactor_thread = None;
-        }
-        // 释放压缩器对 alloc 的 Arc 引用(get_mut 独占扩展;前台 compact_once
-        // 也被写锁排除;扩完后 restart_compactor 重建)
-        self.compactor = None;
+        let (had_compactor, had_rebalance) = self.stop_background();
         let alloc_mut = Arc::get_mut(&mut self.alloc).ok_or_else(|| {
             Error::InvalidArgument(
                 "allocator still referenced by background components; retry".into(),
@@ -919,8 +947,8 @@ impl Engine {
         self.devices = Arc::new(slots);
         self.open_extents.push(None);
         self.zc_fds.push(fs3_device::open_zerocopy_fd(path).ok());
-        // 压缩器重建(新设备表;原启停状态原样恢复)
-        self.restart_compactor(had_compactor);
+        // worker 重建(新设备表;原启停状态原样恢复)
+        self.restart_background(had_compactor, had_rebalance);
         tracing::info!(
             "DEVICE ADDED: {} (uuid {}, {extent_count} extents, base {base}); \
              weighted rotation will skew new allocations to it (ADR-15 DM2)",
@@ -981,24 +1009,20 @@ impl Engine {
                 path.display()
             )));
         }
+        let remove_count = slot.extent_count;
         let report = DeviceRemoveReport {
             uuid: slot.sb.uuid,
             path: entry.path.clone(),
-            extent_count: slot.extent_count,
+            extent_count: remove_count,
             base: slot.base,
             total_devices: self.devices.len() - 1,
         };
 
-        // 独占期(同 device_add):停压缩 worker → 收缩 → 表切换 → 重建
-        let had_compactor = self.compactor.is_some();
-        if let Some(mut h) = self._compactor_thread.take() {
-            h.stop();
-            self._compactor_thread = None;
-        }
-        self.compactor = None;
+        // 独占期(同 device_add):停全部后台 worker → 收缩 → 表切换 → 重建
+        let (had_compactor, had_rebalance) = self.stop_background();
         let alloc_mut = Arc::get_mut(&mut self.alloc)
             .ok_or_else(|| Error::InvalidArgument("allocator still referenced; retry".into()))?;
-        alloc_mut.shrink_tail(slot.extent_count);
+        alloc_mut.shrink_tail(remove_count);
 
         let mut manifest = manifest;
         manifest.devices.pop();
@@ -1012,7 +1036,7 @@ impl Engine {
         self.zc_fds.pop();
         // 活动设备收敛(尾部即当前轮转落点;越界防御)
         self.cur_device = self.cur_device.min(self.devices.len().saturating_sub(1));
-        self.restart_compactor(had_compactor);
+        self.restart_background(had_compactor, had_rebalance);
         tracing::info!(
             "DEVICE REMOVED: {} (uuid {}, {} extents, base {}); pool now {} device(s)",
             report.path,
@@ -1064,33 +1088,6 @@ impl Engine {
 
     /// 前台执行一轮压缩(测试 / check --compact);返回本轮报告。
     /// 与后台 worker 共用同一全局令牌桶(ADR-12 DL2)。
-    /// (重)启后台压缩 worker(M13 M3-1 device-add 后重建;`had` = 原是否
-    /// 启用,失败路径也要恢复)。压缩器持有新设备表 Arc。
-    fn restart_compactor(&mut self, had: bool) {
-        if !had {
-            return;
-        }
-        let c = Arc::new(Compactor::new(
-            self.meta.clone(),
-            self.alloc.clone(),
-            self.io.clone(),
-            self.devices.clone(),
-            self.compaction_cfg.clone(),
-        ));
-        let h = if self.compaction_cfg.enabled {
-            Some(WorkerHandle::spawn(
-                "fs3-compactor",
-                c.clone(),
-                self.throttle.clone(),
-                std::time::Duration::from_millis(self.compaction_cfg.poll_interval_ms),
-            ))
-        } else {
-            None
-        };
-        self.compactor = Some(c);
-        self._compactor_thread = h;
-    }
-
     pub fn compact_once(&self) -> Result<CompactionReport> {
         if self.read_only {
             return Err(Error::Unsupported(
@@ -1102,6 +1099,95 @@ impl Engine {
             None => Ok(CompactionReport::default()),
         }
     }
+
+    /// 停全部后台 worker(压缩 + 再平衡)并释放其对 alloc/设备表的 Arc
+    /// 引用;返回原启停状态 (had_compactor, had_rebalance)。
+    fn stop_background(&mut self) -> (bool, bool) {
+        let had_compactor = self.compactor.is_some();
+        if let Some(mut h) = self._compactor_thread.take() {
+            h.stop();
+            self._compactor_thread = None;
+        }
+        self.compactor = None;
+        let had_rebalance = self.rebalancer.is_some();
+        if let Some(mut h) = self._rebalancer_thread.take() {
+            h.stop();
+            self._rebalancer_thread = None;
+        }
+        self.rebalancer = None;
+        (had_compactor, had_rebalance)
+    }
+
+    /// 按原启停状态重建后台 worker(M13 M3-1/M3-2 扩容/移除后;失败路径
+    /// 也必须恢复)。两者持有**新**设备表 Arc。
+    fn restart_background(&mut self, had_compactor: bool, had_rebalance: bool) {
+        if had_compactor {
+            let c = Arc::new(Compactor::new(
+                self.meta.clone(),
+                self.alloc.clone(),
+                self.io.clone(),
+                self.devices.clone(),
+                CompactorMode::Compaction,
+                self.compaction_cfg.clone(),
+            ));
+            let h = if self.compaction_cfg.enabled {
+                Some(WorkerHandle::spawn(
+                    "fs3-compactor",
+                    c.clone(),
+                    self.throttle.clone(),
+                    std::time::Duration::from_millis(self.compaction_cfg.poll_interval_ms),
+                ))
+            } else {
+                None
+            };
+            self.compactor = Some(c);
+            self._compactor_thread = h;
+        }
+        if had_rebalance {
+            let c = Arc::new(Compactor::new(
+                self.meta.clone(),
+                self.alloc.clone(),
+                self.io.clone(),
+                self.devices.clone(),
+                CompactorMode::Rebalance {
+                    high_watermark: self.rebalance_cfg.high_watermark,
+                    low_watermark: self.rebalance_cfg.low_watermark,
+                },
+                self.compaction_cfg.clone(),
+            ));
+            let h = Some(WorkerHandle::spawn(
+                "fs3-rebalancer",
+                c.clone(),
+                self.throttle.clone(),
+                std::time::Duration::from_millis(self.rebalance_cfg.poll_interval_ms),
+            ));
+            self.rebalancer = Some(c);
+            self._rebalancer_thread = h;
+        }
+    }
+
+    /// M13 M4-1:前台执行一轮再平衡(测试 / 手动收敛);返回本轮报告。
+    pub fn rebalance_once(&self) -> Result<CompactionReport> {
+        if self.read_only {
+            return Err(Error::Unsupported(
+                "rebalance requires a writable engine".into(),
+            ));
+        }
+        match &self.rebalancer {
+            Some(c) => c.compact_batch(&self.throttle),
+            None => Ok(CompactionReport::default()),
+        }
+    }
+
+    /// M13 M4-1:再平衡暂停原语(管理面/admin API 可调用)。
+    #[allow(dead_code)] // admin API 绑定后续里程碑
+    pub fn set_rebalance_paused(&self, paused: bool) {
+        if let Some(h) = &self._rebalancer_thread {
+            h.set_paused(paused);
+        }
+    }
+
+
 
     /// 压缩器句柄(crate 内测试/崩溃注入用;REVIEW §3.8 阶段 2 模拟)。
     #[cfg(test)]

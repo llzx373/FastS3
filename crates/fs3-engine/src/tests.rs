@@ -6555,3 +6555,98 @@ fn device_remove_rejects_middle_and_nonempty() -> Result<()> {
     e.abort();
     Ok(())
 }
+
+// ─────────────────────────── M13 M4-1 再平衡 ───────────────────────────
+
+#[test]
+fn rebalance_moves_high_water_to_low_water_and_converges() -> Result<()> {
+    // 两盘写满(高水位)→ device-add 空盘(低水位)→ 再平衡收敛:
+    // 水位差 <10%、数据完整、零泄漏
+    let (_d, _imgs, mut cfg) = setup_multi(&[16 * 1024 * 1024, 16 * 1024 * 1024]);
+    cfg.rebalance = RebalanceConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    let mut e = open_engine(&cfg);
+    // 填充两盘(两盘逻辑容量 ≈ 24MiB;20MiB 后两盘均接近满)
+    let data = vec![0x41u8; 1024 * 1024];
+    for i in 0..20 {
+        e.put("b1", &format!("k{i}"), &mut Cursor::new(data.clone()))
+            .unwrap();
+    }
+    // 水位口径 = 活字节/容量(与引擎 device_usage 一致;打包死区不计)
+    let usage = |e: &Engine, di: usize| {
+        let s = &e.device_slots()[di];
+        let live = e.allocator().live_bytes_in_range(s.base, s.extent_count);
+        let cap = s.extent_count * s.sb.extent_size;
+        live as f64 / cap as f64
+    };
+    assert!(
+        usage(&e, 0) > 0.7 && usage(&e, 1) > 0.7,
+        "both devices high-water"
+    );
+    // 空盘(device-add;低水位目标)
+    let img3 = _d.path().join("disk3.img");
+    std::fs::File::create(&img3)
+        .unwrap()
+        .set_len(16 * 1024 * 1024)
+        .unwrap();
+    e.device_add(&img3, false).unwrap();
+    assert!(usage(&e, 2) < 0.05, "new device is the low-water target");
+
+    // 再平衡收敛(前台逐轮;预算节流下每轮 ≤ 突发额度)
+    let mut rounds = 0;
+    loop {
+        let r = e.rebalance_once().unwrap();
+        rounds += 1;
+        if rounds > 200 {
+            panic!("rebalance did not converge after 200 rounds: {r:?}");
+        }
+        if r.candidates == 0 && r.copied_bytes == 0 {
+            break;
+        }
+        if r.errors > 0 {
+            panic!("rebalance errors: {r:?}");
+        }
+    }
+    // 收敛:全部设备水位 < 高水位阈值(0.85),两两差 <10%
+    let usages = [usage(&e, 0), usage(&e, 1), usage(&e, 2)];
+    assert!(
+        usages[2] > 0.1,
+        "data must have moved to the new device: {usages:?}"
+    );
+    let max = usages.iter().cloned().fold(0.0f64, f64::max);
+    let min = usages.iter().cloned().fold(1.0f64, f64::min);
+    assert!(max < 0.85, "high water must be relieved: {usages:?}");
+    assert!(
+        (max - min) < 0.10,
+        "water level spread must converge within 10%: {usages:?}"
+    );
+
+    // 数据完整 + 零泄漏 + 重开一致
+    for i in 0..20 {
+        let mut out = Vec::new();
+        e.get_to("b1", &format!("k{i}"), 0..data.len() as u64, &mut out)
+            .unwrap();
+        assert_eq!(out, data);
+    }
+    let live_before = e.allocator().live_bytes_total();
+    assert!(e.check_report().unwrap().leaks.is_empty());
+    e.checkpoint()?;
+    e.close().unwrap();
+    drop(e);
+
+    let mut cfg2 = cfg.clone();
+    cfg2.devices.push(img3);
+    let e2 = open_engine(&cfg2);
+    for i in 0..20 {
+        let mut out = Vec::new();
+        e2.get_to("b1", &format!("k{i}"), 0..data.len() as u64, &mut out)
+            .unwrap();
+        assert_eq!(out, data);
+    }
+    assert_eq!(e2.allocator().live_bytes_total(), live_before);
+    assert!(e2.check_report().unwrap().leaks.is_empty());
+    e2.abort();
+    Ok(())
+}

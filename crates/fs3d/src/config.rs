@@ -108,6 +108,10 @@ pub struct StorageConfig {
     /// 压缩迁移与大对象流式读存在已跟踪并发竞态(见 tests/s3-tests/README.md
     /// 「运行」节),门禁环境关闭;生产保持默认。
     pub compaction_enabled: Option<bool>,
+    /// M13 M4-1 跨盘再平衡开关(默认 false 关;候选 = 高水位盘,目标 =
+    /// 低水位盘;与压缩共用节流;watermark 档位取默认 0.85/0.5,
+    /// 收敛目标 = 水位差 <10%)。
+    pub rebalance_enabled: Option<bool>,
     /// 生命周期执行器开关(M11 L2-2;默认 true)。周期扫描有生命周期规则的
     /// 桶执行过期删除/会话中止;无规则桶零动作(现状不变)。
     pub lifecycle_enabled: Option<bool>,

@@ -232,6 +232,15 @@ impl Allocator {
         count - self.bitmap.count_ones_range(start, count)
     }
 
+    /// 区间内活字节总数(M13 M4-1 水位口径:`live_bytes` 为权威活段字节,
+    /// 与 DESIGN「水位 = data_end − live_bytes」一致;分配位含打包死区,
+    /// 不作为水位)。
+    pub fn live_bytes_in_range(&self, start: u64, count: u64) -> u64 {
+        (start..start + count)
+            .map(|id| self.live_bytes_of(id) as u64)
+            .sum()
+    }
+
     /// 标记 extent 为开放(开放 extent 首次使用时;状态为派生,无事务性)。
     pub fn mark_open(&self, id: u64) {
         self.state[id as usize].store(ExtentState::Open as u8, Ordering::Release);

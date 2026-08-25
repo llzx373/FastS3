@@ -340,7 +340,7 @@
 - [x] M3-1 `fasts3d device-add` 在线扩容(初始化 → 追加池清单 → 新分配倾斜;layout v3 + MULTI_DEVICE 特性位)
 - [x] M3-2 `fasts3d device-remove` 离线 drain(迁空确认 → 尾部移除;禁止中间移除)
 - [x] M3-3 layout v2→v3 单盘升级迁移(零数据搬迁)+ 回滚实测
-- [ ] M4-1 再平衡 worker(复用 Op::ObjectMigrate;候选=高水位盘,目标=低水位盘;节流/暂停;默认关)
+- [x] M4-1 再平衡 worker(复用 Op::ObjectMigrate;候选=高水位盘,目标=低水位盘;节流/暂停;默认关)
 - [ ] M4-2 容量统一视图 + 单盘水位 >85% 告警
 - [ ] M5-1 双盘/三盘崩溃 500 轮;缺盘降级;add/remove 演练;均衡收敛(水位差 <10%,前台 p99 回退 <10%)
 

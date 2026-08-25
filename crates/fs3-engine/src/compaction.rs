@@ -36,6 +36,38 @@ use crate::io::{read_exact, write_all, IoEngine};
 use crate::worker::{BackgroundWorker, BatchOutcome, Throttle};
 use crate::PoolDevices;
 
+/// 再平衡配置(M13 M4-1,ADR-15 DM2/DM4;默认关)。
+///
+/// 候选 = 高水位盘(usage ≥ `high_watermark`)上的段;目标 = 低水位盘
+/// (usage ≤ `low_watermark`,剩余空间最大者优先);迁移复用压缩的
+/// Op::ObjectMigrate 事务(拷贝先行 → 事务切换 → 释放,崩溃任意点收敛)。
+/// 节流/暂停原语与压缩共用全局令牌桶与 BackgroundWorker 抽象。
+#[derive(Debug, Clone)]
+pub struct RebalanceConfig {
+    /// 后台 worker 开关(默认关)。
+    pub enabled: bool,
+    /// 高水位阈值:设备使用率(已分配字节/逻辑容量)≥ 此值 → 候选源。
+    pub high_watermark: f64,
+    /// 低水位阈值:设备使用率 ≤ 此值 → 迁移目标。
+    pub low_watermark: f64,
+    /// 拷贝 + 迁移字节速率上限(默认 64 MiB/s)。
+    pub rate_limit_bytes_per_sec: u64,
+    /// worker 轮询间隔。
+    pub poll_interval_ms: u64,
+}
+
+impl Default for RebalanceConfig {
+    fn default() -> Self {
+        RebalanceConfig {
+            enabled: false,
+            high_watermark: 0.85,
+            low_watermark: 0.5,
+            rate_limit_bytes_per_sec: 64 * 1024 * 1024,
+            poll_interval_ms: 1000,
+        }
+    }
+}
+
 /// 压缩配置(ADR-9 §6.4 节流;默认值按 §6.4)。
 #[derive(Debug, Clone)]
 pub struct CompactionConfig {
@@ -96,6 +128,17 @@ struct PlanItem {
     copied_full: bool,
 }
 
+/// 压缩器运行模式(M13 M4-1):Compaction = 空间压缩(候选按活段浪费);
+/// Rebalance = 跨盘再平衡(候选 = 高水位盘,目标 = 低水位盘)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CompactorMode {
+    Compaction,
+    Rebalance {
+        high_watermark: f64,
+        low_watermark: f64,
+    },
+}
+
 /// 压缩器(独立组件,不持有引擎大锁;ADR-9 §6.3 锁域分解)。
 pub struct Compactor {
     meta: Arc<MetaStore>,
@@ -104,6 +147,8 @@ pub struct Compactor {
     /// 池设备表(M13 M1-2:源/目标段按全局 extent id 解析所属设备)。
     devices: PoolDevices,
     cfg: CompactionConfig,
+    /// M13 M4-1:运行模式(决定候选集与目标设备)。
+    mode: CompactorMode,
     /// 串行化批量执行(后台 worker 与前台 compact_once 互斥)。
     running: Mutex<()>,
     /// 本压缩器创建的 extent(防抖动:自产 extent 不立即成为候选,否则
@@ -130,6 +175,7 @@ impl Compactor {
         alloc: Arc<Allocator>,
         io: Arc<Mutex<Box<dyn IoEngine>>>,
         devices: PoolDevices,
+        mode: CompactorMode,
         cfg: CompactionConfig,
     ) -> Self {
         Compactor {
@@ -138,9 +184,51 @@ impl Compactor {
             io,
             devices,
             cfg,
+            mode,
             running: Mutex::new(()),
             recent: Mutex::new(Vec::new()),
         }
+    }
+
+    /// 设备水位(活字节 / 逻辑容量;0..1;M13 M4-1——DESIGN §6.1「水位 =
+    /// data_end − live_bytes」;打包死区(分配位 × 未用空间)不计入水位,
+    /// 迁移按活段收敛,源盘死区随迁空自然回收)。
+    pub(crate) fn device_usage(&self, di: usize) -> f64 {
+        let slot = &self.devices[di];
+        let live = self.alloc.live_bytes_in_range(slot.base, slot.extent_count);
+        let capacity_bytes = slot.extent_count * slot.sb.extent_size;
+        if capacity_bytes == 0 {
+            return 1.0;
+        }
+        live as f64 / capacity_bytes as f64
+    }
+
+    /// 再平衡计划(实施期细化,ADR-15 DM2 门禁口径):`(sources, target)`。
+    /// 收敛目标 = 水位差 <10%(M13 门禁「均衡收敛」)——只要
+    /// `max − min ≥ 0.10`,源 = 使用率高于中间值(`min + spread/2`)的设备,
+    /// 目标 = 使用率最低的设备;水位差收敛到阈值内后返回 None。
+    /// 阈值档位(high/low)保留为配置口径,但不再作为候选/目标的硬边界
+    /// (否则空盘填到 low 即停,sources 尚未排空,不收敛)。
+    pub(crate) fn rebalance_plan(&self) -> Option<(Vec<usize>, usize)> {
+        let n = self.devices.len();
+        if n < 2 {
+            return None;
+        }
+        let usages: Vec<f64> = (0..n).map(|di| self.device_usage(di)).collect();
+        let max = usages.iter().cloned().fold(0.0f64, f64::max);
+        let min = usages.iter().cloned().fold(1.0f64, f64::min);
+        let spread = max - min;
+        if spread < 0.10 {
+            return None; // 已收敛(水位差 <10%)
+        }
+        let mid = min + spread / 2.0;
+        let sources: Vec<usize> = (0..n).filter(|&i| usages[i] >= mid).collect();
+        let target = usages
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)?;
+        Some((sources, target))
     }
 
     /// 一轮压缩(发现 → 拷贝 → 迁移 → 释放/封口)。
@@ -154,22 +242,39 @@ impl Compactor {
             Err(_) => return Ok(CompactionReport::default()), // 已有批次在跑
         };
         let capacity = self.devices[0].extent_capacity();
-        let candidates = self
-            .alloc
-            .compaction_candidates(self.cfg.threshold, self.cfg.top_k, capacity)
-            .into_iter()
-            .filter(|&id| {
-                let recent = self.recent.lock().unwrap();
-                if recent.contains(&id) {
-                    // 防抖动:自产 extent 仅当活段降到阈值一半以下(删除显著)
-                    // 才重新成为候选
-                    let lb = self.alloc.live_bytes_of(id) as f64;
-                    lb < capacity as f64 * self.cfg.threshold * 0.5
-                } else {
-                    true
-                }
-            })
-            .collect::<Vec<u64>>();
+        // M13 M4-1:候选集按模式分派——Compaction = 浪费阈值 + 防抖动;
+        // Rebalance = 高水位盘上的全部已分配 extent(按段迁移到低水位盘)
+        let candidates: Vec<u64> = match self.mode {
+            CompactorMode::Compaction => self
+                .alloc
+                .compaction_candidates(self.cfg.threshold, self.cfg.top_k, capacity)
+                .into_iter()
+                .filter(|&id| {
+                    let recent = self.recent.lock().unwrap();
+                    if recent.contains(&id) {
+                        // 防抖动:自产 extent 仅当活段降到阈值一半以下(删除显著)
+                        // 才重新成为候选
+                        let lb = self.alloc.live_bytes_of(id) as f64;
+                        lb < capacity as f64 * self.cfg.threshold * 0.5
+                    } else {
+                        true
+                    }
+                })
+                .collect::<Vec<u64>>(),
+            CompactorMode::Rebalance { .. } => {
+                let Some((sources, _target)) = self.rebalance_plan() else {
+                    return Ok(CompactionReport::default());
+                };
+                sources
+                    .iter()
+                    .flat_map(|&di| {
+                        let slot = &self.devices[di];
+                        slot.base..slot.base + slot.extent_count
+                    })
+                    .filter(|&id| self.alloc.test_bit(id) && self.alloc.live_bytes_of(id) > 0)
+                    .collect::<Vec<u64>>()
+            }
+        };
         if candidates.is_empty() {
             return Ok(CompactionReport::default());
         }
@@ -250,7 +355,23 @@ impl Compactor {
         // 新 extent 的首段 alloc 记录随第一个成功的迁移事务提交(§4.5);
         // 若整批无一成功,分配回滚释放,设备上的孤儿数据由扫描判 free。
         let mut rd = Staged::default();
-        let eid = self.alloc.allocate(&mut rd, 1)?.remove(0) as u32;
+        let eid = match self.mode {
+            CompactorMode::Compaction => self.alloc.allocate(&mut rd, 1)?.remove(0) as u32,
+            // M13 M4-1:目标盘 = 使用率最低者;区间内分配,失败(满)则
+            // 全局兜底(单盘池/退化语义)
+            CompactorMode::Rebalance { .. } => {
+                match self.rebalance_plan().and_then(|(_, target)| {
+                    let slot = &self.devices[target];
+                    self.alloc
+                        .allocate_in_range(&mut rd, slot.base, slot.extent_count)
+                        .ok()
+                        .flatten()
+                }) {
+                    Some(id) => id as u32,
+                    None => self.alloc.allocate(&mut rd, 1)?.remove(0) as u32,
+                }
+            }
+        };
         let mut batch_alloc = Some(rd.alloc.clone());
         self.alloc.mark_open(eid as u64);
         let mut wm: u32 = 0;

@@ -481,7 +481,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
             web_root,
             drain_secs,
         } => {
-            let engine_cfg = engine_config(
+            let mut engine_cfg = engine_config(
                 devices.clone(),
                 meta_dir,
                 sync_mode,
@@ -491,6 +491,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 etag_mode,
                 clock_offset_secs,
             )?;
+            engine_cfg.rebalance.enabled = storage.rebalance_enabled.unwrap_or(false);
             cmd_serve(
                 cli.config.clone(),
                 &engine_cfg,
@@ -878,6 +879,7 @@ pub(crate) fn engine_config_inner_multi(
             enabled: false,
             ..Default::default()
         },
+        rebalance: fs3_engine::RebalanceConfig::default(),
         clock_offset_secs: 0,
     })
 }
@@ -922,6 +924,7 @@ fn engine_config(
             enabled: false,
             ..Default::default()
         },
+        rebalance: fs3_engine::RebalanceConfig::default(),
         clock_offset_secs,
     })
 }
