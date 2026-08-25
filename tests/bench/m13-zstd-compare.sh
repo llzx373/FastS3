@@ -1,85 +1,75 @@
 #!/usr/bin/env bash
-# FastS3 M13 Z1-3 perf 对照 + 压缩率基准(压缩开/关;文本数据)。
+# FastS3 M13 Z1-3 perf 对照 + 压缩率基准(zstd 开/关;CLI 直测版)。
+#
+# 对照口径:同一 32MiB 高压缩文本载荷,在压缩关/开两个独立池上
+# put/get 耗时对比(CLI 直测:无 serve/端口依赖,任何环境可复现);
+# 压缩率与读回一致由引擎单测断言(文本 <50%、SSE 组合往返)。
 #
 # 用法: ./m13-zstd-compare.sh
-# 前置:target/release/fasts3d;bc。
-# 输出:压缩率(元数据口径由引擎测试断言 <50%;此处对照吞吐)与
-#       开/关吞吐对照(文档化附注:文本压缩写路径 CPU 开销 vs 落盘字节)。
+# 前置:已构建 target/release/fasts3d。
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="$ROOT/target/release/fasts3d"
 WORK="$(mktemp -d /tmp/fs3-zstd.XXXXXX)"
-cleanup() { pkill -f "fasts3d serve --config $WORK" 2>/dev/null; rm -rf "$WORK"; }
+FAILED=0
+
+cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 
 [ -x "$BIN" ] || { echo "error: $BIN not found"; exit 2; }
 
-run_pair() {
-    local label="$1" body
-    # body = raw | text
-    local -a seed_opts=("--no-tls")
-    "$BIN" init --device "$WORK/d.img" --size 2GiB --yes "${seed_opts[@]}" \
-        --meta-dir "$WORK/meta" --data-dir "$WORK" --config "$WORK/f.toml" >/dev/null 2>&1
-    # 通用文本载荷(可压缩)
-    python3 - "$WORK" <<'PY'
-import sys, os
+# 32MiB 高压缩文本
+python3 - "$WORK" <<'PY'
+import sys
 work = sys.argv[1]
 with open(f"{work}/payload.bin", "w") as f:
-    for i in range(20000):
-        f.write(f"FastS3 zstd benchmark payload line {i}: abcd1234efgh5678ijkl9100\n")
-# 不可压缩载荷
-with open(f"{work}/random.bin", "wb") as f:
-    f.write(os.urandom(2 * 1024 * 1024))
+    for i in range(400_000):
+        f.write(f"FastS3 zstd benchmark payload line {i}: "
+                f"abcd1234efgh5678ijkl9100qrstuvwxyz0123456789\n")
 PY
-    local text_bytes=$(stat -c %s "$WORK/payload.bin")
-    local body="$1"
-    if [ "$body" = "text" ]; then
-        echo "== $label: 文本载荷($text_bytes B)=="
-    else
-        echo "== $label: 随机载荷(2MiB)=="
-    fi
-    # 开/关两次 serve(压缩经 storage.compression_enabled)
-    for mode in off on; do
-        python3 - "$WORK/f.toml" "$mode" <<'PY'
+SIZE=$(stat -c %s "$WORK/payload.bin")
+
+measure() {
+    local mode="$1" dir="$2"
+    "$BIN" init --device "$dir/d.img" --size 2GiB --yes --no-tls \
+        --meta-dir "$dir/meta" --data-dir "$dir" --config "$dir/f.toml" >/dev/null 2>&1
+    if [ "$mode" = "on" ]; then
+        python3 - "$dir/f.toml" <<'PY'
 import sys
-cfg, mode = sys.argv[1], sys.argv[2]
-lines = open(cfg).read().split('\n')
-out = []
-inserted = False
-for l in lines:
-    if l.strip().startswith('compression_enabled'):
-        continue
-    out.append(l)
-    if l.strip() == '[storage]' and not inserted:
-        out.append(f"compression_enabled = {'true' if mode == 'on' else 'false'}")
-        inserted = True
-# [storage] 未出现(异常)则顶格补
-if not inserted:
-    out.append(f"[storage]\ncompression_enabled = {'true' if mode == 'on' else 'false'}")
-open(cfg, 'w').write('\n'.join(out))
+cfg = sys.argv[1]
+res = []
+in_storage = False
+for l in open(cfg).read().split('\n'):
+    if l.strip() == '[storage]':
+        in_storage = True
+    if l.strip().startswith('[') and l.strip() != '[storage]':
+        in_storage = False
+    if in_storage and l.strip().startswith('sync_mode'):
+        res.append('compression_enabled = true')
+    else:
+        res.append(l)
+open(cfg, 'w').write('\n'.join(res))
 PY
-        "$BIN" serve --config "$WORK/f.toml" --listen 127.0.0.1:19190 \
-            --key test:secret123 >/dev/null 2>&1 &
-        sleep 1.2
-        local payload="$WORK/payload.bin"
-        [ "$body" = "random" ] && payload="$WORK/random.bin"
-        local wr
-        wr=$("$BIN" loadgen --endpoint http://127.0.0.1:19190 --key test:secret123 \
-            --bucket z --ops put --size "$(stat -c %s "$payload")" --size-dist fixed \
-            --duration 3 --concurrency 4 2>/dev/null | sed -n 's/.*ops_s: \([0-9.]*\).*/ops\/s=\1/p')
-        local rd
-        rd=$("$BIN" loadgen --endpoint http://127.0.0.1:19190 --key test:secret123 \
-            --bucket z --ops get --size "$(stat -c %s "$payload")" --size-dist fixed \
-            --keys 200 --duration 3 --concurrency 4 2>/dev/null | sed -n 's/.*ops_s: \([0-9.]*\).*/ops\/s=\1/p')
-        echo "  compression=$mode  write: ${wr:-N/A}  read: ${rd:-N/A}"
-        pkill -f "fasts3d serve --config $WORK/f.toml" 2>/dev/null; sleep 0.5
-        "$BIN" del --config "$WORK/f.toml" --bucket z "$WORK/f.toml" 2>/dev/null || true
-        # loadgen put 创建的 keys 无法枚举清楚;直接换新目录重开
-        pkill -f "fasts3d (put|loadgen)" 2>/dev/null || true
-    done
-    echo ""
+    fi
+    local t0 t1 tw tr ok
+    t0=$(date +%s.%N)
+    "$BIN" put --config "$dir/f.toml" --bucket z big "$WORK/payload.bin" >/dev/null 2>&1
+    t1=$(date +%s.%N)
+    "$BIN" get --config "$dir/f.toml" --bucket z big "$dir/out.bin" >/dev/null 2>&1
+    tr=$(date +%s.%N)
+    if cmp -s "$dir/out.bin" "$WORK/payload.bin"; then
+        ok="roundtrip-ok"
+    else
+        ok="ROUNDTRIP-FAIL"; FAILED=$((FAILED + 1))
+    fi
+    tw=$(echo "$t1 $t0" | awk '{printf "%.2f", $1-$2}')
+    tr=$(echo "$tr $t1" | awk '{printf "%.2f", $1-$2}')
+    echo "  compression=$mode  put=${tw}s  get=${tr}s  $ok (${SIZE} B text)"
 }
 
-run_pair "文本数据" text
-run_pair "随机数据" random
-echo "== zstd 对照完成(数值受 CI 宿主影响;比率看相对口径)=="
+echo "== M13 Z1-3 perf 对照(zstd 开/关;32MiB 文本载荷;CLI 直测)=="
+measure off "$WORK/off"
+measure on "$WORK/on"
+echo "== done: failed=$FAILED =="
+[ "$FAILED" -eq 0 ] && exit 0
+exit 1

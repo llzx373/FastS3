@@ -104,7 +104,7 @@ put_one() {
     local key="$1" f="$2" md5 size
     md5=$(md5sum "$f" | awk '{print $1}')
     size=$(stat -c %s "$f")
-    if ${NO_URING:+--no-uring} "$BIN" put --config "$CFG" --bucket "$BUCKET" "$key" "$f" >/dev/null 2>&1; then
+    if ${NO_URING:+--no-uring} "$BIN" put --config "$CFG" --bucket "$BUCKET" "$key" "$f" >>"$WORK/put-errors.log" 2>&1; then
         echo "$key $size $md5"
         return 0
     fi
@@ -176,7 +176,7 @@ round() {
     while read -r key size expect_md5; do
         [ -z "$key" ] && continue
         local out="$WORK/out-${key}"
-        if ! ${NO_URING:+--no-uring} "$BIN" get --config "$CFG" --bucket "$BUCKET" "$key" "$out" >/dev/null 2>&1; then
+        if ! ${NO_URING:+--no-uring} "$BIN" get --config "$CFG" --bucket "$BUCKET" "$key" "$out" >>"$WORK/get-errors.log" 2>&1; then
             echo "round $i: GET FAILED for committed key $key"
             round_ok=0
             continue
