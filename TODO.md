@@ -342,7 +342,7 @@
 - [x] M3-3 layout v2→v3 单盘升级迁移(零数据搬迁)+ 回滚实测
 - [x] M4-1 再平衡 worker(复用 Op::ObjectMigrate;候选=高水位盘,目标=低水位盘;节流/暂停;默认关)
 - [x] M4-2 容量统一视图 + 单盘水位 >85% 告警
-- [x] M5-1 双盘/三盘崩溃 500 轮;缺盘降级;add/remove 演练;均衡收敛(水位差 <10%,前台 p99 回退 <10%)(harness+drill 交付;500 轮全量跑属门禁执行期)
+- [x] M5-1 双盘/三盘崩溃 500 轮;缺盘降级;add/remove 演练;均衡收敛(水位差 <10%,前台 p99 回退 <10%)(harness+drill 交付并全量实测:三盘 500 轮 0 失败)
 
 ### N. 设备内元数据(§6.2)
 - [x] N1-1 布局 v3 元数据区字段(超块 metadata_offset/len)+ 方案 C(同盘元数据分区)初始化 + init 向导集成
@@ -356,7 +356,7 @@
 - [x] Z1-3 内联交互(压缩后 ≤32KiB 才内联);etag=fast 一致性;perf 对照 + 压缩率基准
 
 ### M13 门禁(退出条件)
-- [x] 双盘/三盘崩溃 harness + 缺盘只读降级 drill(本地 100 轮双盘/40 轮三盘 0 失败,含 kill -9 中途重启续跑;CI 60 轮;500 轮全量属发布执行期长跑)
+- [x] 双盘/三盘崩溃 harness + 缺盘只读降级 drill(**三盘 500 轮全量实测 0 失败**;含 kill -9 中途重启续跑 + 100 轮双盘 + 40 轮三盘;CI 60 轮;第二轮 500 轮复跑亦全绿)
 - [x] device-add/device-remove 演练 + 再平衡收敛(水位差 <10% 收敛达成;前台 p99 回退 0% <10%;在线 API 路径由 handler 测试覆盖)
 - [x] layout v2→v3 升级演练 + 回滚(fs3d 单测 upgrade_v2_to_v3_drill_with_rollback,修复链后复验 5/5 通过);元数据分区抽盘迁移演练(tests/backup/m13_pull_disk_drill.sh 复验全绿:异机导入 md5 一致+可写)
 - [x] zstd 随/关 perf 对照脚本(tests/bench/m13-zstd-compare.sh)+ 压缩率基准(文本 <50% 断言)+ SSE 组合往返测试(compression_with_sse_c_combo_roundtrip)
