@@ -14,6 +14,13 @@ import { emptySnapshotData, type MetricsSnapshot, type MetricsSnapshotData } fro
 export interface Dashboard {
   version: string;
   uptimeSecs: number;
+  /** M13 M4-2:每设备容量视图(≥2 盘池或全量渲染;前端按 devices 渲染,
+   * 无 devices 时退回 node 单盘口径)。 */
+  devices: DeviceView[];
+  degraded: boolean;
+  poolCapacity: number;
+  poolLiveBytes: number;
+  poolUsage: number;
   node: {
     device: string;
     ioEngine: string;
@@ -61,6 +68,19 @@ async function fetchStatusAndMetrics(admin: AdminClient): Promise<{
   return { status, metricsText };
 }
 
+/** M13 M4-2:单盘容量视图(统一视图;控制台渲染 + >85% 告警)。 */
+export interface DeviceView {
+  path: string;
+  capacity: number;
+  extentSize: number;
+  extentCount: number;
+  allocatedExtents: number;
+  liveBytes: number;
+  usage: number; // 0..1 水位
+  usagePercent: number;
+  base: number;
+}
+
 /** 聚合核心:status + Prometheus 文本 → Dashboard(可独立测试)。 */
 export function aggregateDashboard(
   status: Record<string, unknown>,
@@ -71,6 +91,25 @@ export function aggregateDashboard(
   const alerts: string[] = [];
   const watermark = Number(status.watermark ?? 0);
   if (watermark > 0.85) alerts.push(`容量水位 ${(watermark * 100).toFixed(1)}% > 85%`);
+  // M13 M4-2:单盘水位 >85% 告警(统一视图逐盘)
+  const devices: DeviceView[] = Array.isArray(status.devices)
+    ? (status.devices as Record<string, unknown>[]).map((d) => ({
+        path: String(d.path ?? ""),
+        capacity: Number(d.capacity ?? 0),
+        extentSize: Number(d.extent_size ?? 0),
+        extentCount: Number(d.extent_count ?? 0),
+        allocatedExtents: Number(d.allocated_extents ?? 0),
+        liveBytes: Number(d.live_bytes ?? 0),
+        usage: Number(d.usage ?? 0),
+        usagePercent: Number(d.usage_percent ?? 0),
+        base: Number(d.base ?? 0),
+      }))
+    : [];
+  for (const d of devices) {
+    if (d.usage > 0.85) {
+      alerts.push(`设备水位 ${d.path}: ${(d.usage * 100).toFixed(1)}% > 85%`);
+    }
+  }
   const leaks = Number(status.leaks ?? 0);
   if (leaks > 0) alerts.push(`泄漏扫描发现 ${leaks} 个孤儿 extent(运行 fasts3d check --fix)`);
   if (Number(status.errors_total ?? 0) > 0) {
@@ -120,6 +159,11 @@ export function aggregateDashboard(
     healthy: leaks === 0 && Number(status.requests_total ?? 0) >= 0,
     alerts,
     updatedAt: new Date().toISOString(),
+    devices,
+    degraded: Boolean(status.degraded ?? false),
+    poolCapacity: Number(status.pool_capacity ?? 0),
+    poolLiveBytes: Number(status.pool_live_bytes ?? 0),
+    poolUsage: Number(status.pool_usage ?? 0),
   };
 }
 
@@ -219,6 +263,12 @@ export function dashboardFromSnapshot(s: MetricsSnapshot): Dashboard {
   return {
     version: "ws",
     uptimeSecs: d.uptime,
+    // M13 M4-2:WS 快照不含逐盘视图;退化为空列表 + 单盘口径
+    devices: [],
+    degraded: d.degraded,
+    poolCapacity: d.device_capacity,
+    poolLiveBytes: d.device_used,
+    poolUsage: Math.round(watermark * 10000) / 10000,
     node: {
       device: "",
       ioEngine: "ws",

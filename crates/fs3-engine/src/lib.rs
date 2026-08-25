@@ -139,6 +139,34 @@ pub struct DeviceRemoveReport {
     pub total_devices: usize,
 }
 
+/// 单盘容量视图(M13 M4-2):统一视图 = 每设备水位 + 池合计。
+#[derive(Debug, Clone)]
+pub struct DeviceStatus {
+    /// 设备路径(池清单记录序)。
+    pub path: String,
+    /// 逻辑容量字节(extent_count × extent_size)。
+    pub capacity: u64,
+    pub extent_size: u64,
+    pub extent_count: u64,
+    /// 已分配 extent 数(位图口径;含打包死区)。
+    pub allocated_extents: u64,
+    /// 活字节(DESIGN §6.1 水位口径:`data_end − live_bytes`)。
+    pub live_bytes: u64,
+    /// 水位(活字节/容量;0..1)。
+    pub usage: f64,
+    /// 派生映射基址。
+    pub base: u64,
+}
+
+/// 池容量统一视图(M13 M4-2)。
+#[derive(Debug, Clone)]
+pub struct PoolStatus {
+    pub devices: Vec<DeviceStatus>,
+    pub pool_capacity: u64,
+    pub pool_live_bytes: u64,
+    pub pool_usage: f64,
+}
+
 /// 只读摘要(check 命令)。
 #[derive(Debug, Default)]
 pub struct CheckReport {
@@ -1053,6 +1081,48 @@ impl Engine {
         u.iter().map(|b| format!("{b:02x}")).collect()
     }
 
+    /// 池容量统一视图(M13 M4-2,DESIGN §6.1):每设备水位 + 池合计;
+    /// 单盘水位 >85% 由管理面告警规则消费(admin status / metrics)。
+    pub fn pool_status(&self) -> Result<PoolStatus> {
+        let manifest = self.pool_manifest()?;
+        let mut devices = Vec::with_capacity(self.devices.len());
+        let mut pool_capacity = 0u64;
+        let mut pool_live_bytes = 0u64;
+        for slot in self.devices.iter() {
+            let capacity = slot.extent_count * slot.sb.extent_size;
+            let live = self.alloc.live_bytes_in_range(slot.base, slot.extent_count);
+            let allocated =
+                slot.extent_count - self.alloc.free_in_range(slot.base, slot.extent_count);
+            pool_capacity += capacity;
+            pool_live_bytes += live;
+            devices.push(DeviceStatus {
+                path: slot.dev.path().display().to_string(),
+                capacity,
+                extent_size: slot.sb.extent_size,
+                extent_count: slot.extent_count,
+                allocated_extents: allocated,
+                live_bytes: live,
+                usage: if capacity > 0 {
+                    live as f64 / capacity as f64
+                } else {
+                    0.0
+                },
+                base: slot.base,
+            });
+        }
+        let _ = manifest;
+        Ok(PoolStatus {
+            pool_usage: if pool_capacity > 0 {
+                pool_live_bytes as f64 / pool_capacity as f64
+            } else {
+                0.0
+            },
+            devices,
+            pool_capacity,
+            pool_live_bytes,
+        })
+    }
+
     /// 池清单(管理面状态渲染用;M13 M4-2 容量视图扩展)。
     pub fn pool_manifest(&self) -> Result<fs3_core::pool::PoolManifest> {
         self.meta
@@ -1186,8 +1256,6 @@ impl Engine {
             h.set_paused(paused);
         }
     }
-
-
 
     /// 压缩器句柄(crate 内测试/崩溃注入用;REVIEW §3.8 阶段 2 模拟)。
     #[cfg(test)]

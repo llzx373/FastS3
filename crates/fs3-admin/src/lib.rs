@@ -526,6 +526,36 @@ impl AdminServer {
         } else {
             0.0
         };
+        // M13 M4-2:容量统一视图 = 每设备水位 + 池合计(单盘水位 >85% 由
+        // 控制台告警规则消费;快照异常 → 降级返回设备级详情)
+        let pool = match engine.pool_status() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!("pool_status failed: {e}");
+                None
+            }
+        };
+        let devices = pool
+            .as_ref()
+            .map(|p| {
+                p.devices
+                    .iter()
+                    .map(|d| {
+                        serde_json::json!({
+                            "path": d.path,
+                            "capacity": d.capacity,
+                            "extent_size": d.extent_size,
+                            "extent_count": d.extent_count,
+                            "allocated_extents": d.allocated_extents,
+                            "live_bytes": d.live_bytes,
+                            "usage": (d.usage * 10000.0).round() / 10000.0,
+                            "usage_percent": (d.usage * 10000.0).round() / 100.0,
+                            "base": d.base,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         json::ok(serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
             "uptime_secs": metrics.uptime_secs(),
@@ -548,6 +578,11 @@ impl AdminServer {
             "bytes_read": metrics.bytes_read(),
             "bytes_written": metrics.bytes_written(),
             "leaks": check.leaks.len(),
+            "degraded": engine.degraded(),
+            "devices": devices,
+            "pool_capacity": pool.as_ref().map(|p| p.pool_capacity).unwrap_or(capacity),
+            "pool_live_bytes": pool.as_ref().map(|p| p.pool_live_bytes).unwrap_or(used),
+            "pool_usage": pool.as_ref().map(|p| (p.pool_usage * 10000.0).round() / 10000.0).unwrap_or(watermark),
         }))
     }
 
@@ -613,6 +648,24 @@ impl AdminServer {
         ));
         // REVIEW §3.7:掉盘降级状态入 Prometheus(1 = degraded / 只读),
         // 供 alerts.yml FastS3DeviceDegraded 直接告警(替换原恒假占位表达式)。
+        // M13 M4-2:每设备水位 gauge(单盘 >85% 告警规则消费)
+        if let Ok(pool) = engine.pool_status() {
+            text.push_str(
+                "# HELP fasts3_device_usage Device usage ratio (live bytes / capacity)\n",
+            );
+            text.push_str("# TYPE fasts3_device_usage gauge\n");
+            for d in &pool.devices {
+                text.push_str(&format!(
+                    "fasts3_device_usage{{device=\"{}\"}} {}\n",
+                    d.path.replace('\\', "/"),
+                    (d.usage * 10000.0).round() / 10000.0
+                ));
+            }
+            text.push_str(&format!(
+                "fasts3_pool_usage {}\n",
+                (pool.pool_usage * 10000.0).round() / 10000.0
+            ));
+        }
         text.push_str("# HELP fasts3_device_degraded Device degraded (read-only); 1 = degraded\n");
         text.push_str("# TYPE fasts3_device_degraded gauge\n");
         text.push_str(&format!(

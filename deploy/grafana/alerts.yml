@@ -70,6 +70,20 @@ groups:
           summary: "可信时钟与墙钟偏离(Object Lock)"
           description: "墙钟落后于持久化单调高水位;Object Lock 到期判定使用 trusted_now,保留不会因回拨提前解除。立即核查 NTP/chrony,勿在停机期手动拨时钟"
 
+      # 单盘水位 >85%(M13 M4-2:统一视图逐盘;快照粒度 = 活字节/容量,
+      # 与 DESIGN §6.1「水位 = data_end − live_bytes」口径一致)。
+      # 持续 15 分钟超限即告警(写入突发会短暂冲高);再平衡 worker 开启
+      # 后新盘倾斜会自动缓解,告警应收敛。
+      - alert: FastS3DeviceWatermarkHigh
+        expr: |
+          fasts3_device_usage{device!=""} > 0.85
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "单盘水位 >85%"
+          description: "{{ $labels.device }} 水位超过 85%(活字节/容量);若长期高水位,考虑 device-add 扩容或开启 rebalance.enabled=true"
+
       # 设备已降级(掉盘 → 只读)
       # REVIEW §3.7:指标源已接入(/v1/admin/metrics 输出 fasts3_device_degraded,
       # 由引擎 degraded 状态驱动);持续 5 分钟降级即告警,避免瞬时抖动误报。

@@ -719,3 +719,76 @@ fn admin_device_add_online() {
     assert_eq!(code, 400);
     drop(handle);
 }
+
+/// M13 M4-2:容量统一视图——status.devices 逐盘水位 + metrics 设备 gauge。
+#[test]
+fn admin_pool_device_views_and_usage_metrics() {
+    let (_d, img) = setup();
+    let img2 = _d.path().join("disk2.img");
+    std::fs::File::create(&img2)
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    fs3_device::init_device(&img2, 4 * 1024 * 1024, 0, false).unwrap();
+    let cfg = EngineConfig {
+        devices: vec![img.clone(), img2.clone()],
+        meta_dir: img.parent().unwrap().join("meta3"),
+        compaction: fs3_engine::CompactionConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    // 预置清单(两盘;引擎拒绝改配置入池 → 直写 meta)
+    {
+        let store = fs3_meta::MetaStore::open(
+            &cfg.meta_dir,
+            &fs3_meta::MetaConfig {
+                flush_every_ms: 2,
+                sync_mode: fs3_meta::SyncMode::Group,
+                cache_capacity: None,
+            },
+        )
+        .unwrap();
+        let entries = cfg
+            .devices
+            .iter()
+            .map(|p| {
+                let dev = fs3_device::open_device(p, true).unwrap();
+                let sb = fs3_device::read_superblock(dev.as_ref()).unwrap();
+                fs3_core::pool::DeviceEntry {
+                    uuid: sb.uuid,
+                    path: p.display().to_string(),
+                    capacity: sb.data_end,
+                    extent_count: sb.extent_count(),
+                    weight: 1,
+                    added_at: 0,
+                }
+            })
+            .collect();
+        store
+            .save_pool(&fs3_core::pool::PoolManifest { devices: entries })
+            .unwrap();
+        store.flush().unwrap();
+    }
+    let (sock, handle) = start_admin(&cfg, "sekret");
+    let sock = sock.trim_start_matches("unix://");
+
+    // status.devices:双盘视图 + 池合计
+    let (code, body) = http_unix(sock, "GET", "/v1/admin/status", None, "sekret");
+    assert_eq!(code, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let devices = v["devices"].as_array().expect("devices array");
+    assert_eq!(devices.len(), 2, "{body}");
+    assert_eq!(devices[0]["usage"], 0.0);
+    assert_eq!(v["pool_live_bytes"], 0);
+    assert!(v["pool_capacity"].as_u64().unwrap() > 0, "{body}");
+    assert_eq!(v["pool_usage"], 0.0);
+
+    // metrics:每设备 usage gauge
+    let (code, text) = http_unix(sock, "GET", "/v1/admin/metrics", None, "sekret");
+    assert_eq!(code, 200);
+    assert!(text.contains("fasts3_device_usage{"), "{text}");
+    assert!(text.contains("fasts3_pool_usage 0"), "{text}");
+    drop(handle);
+}
