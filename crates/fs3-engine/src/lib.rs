@@ -464,15 +464,33 @@ impl Engine {
         let mut assembly: Vec<(&fs3_core::pool::DeviceEntry, Option<String>)> = Vec::new();
         // 配置中已被清单消费的设备序集合(装配后仍未被消费的 = 未入池设备)
         let mut consumed_cfg: Vec<bool> = vec![false; cfg.devices.len()];
+        // 路径匹配(N4-1 支持):先按路径精确匹配;路径失配(异机导入/目录
+        // 迁移)时,按「uuid 绑定」回退匹配未消费的配置设备——uuid 是权威
+        // 绑定,防错盘/防改配置入池的语义不变(错盘 uuid 不匹配 → 拒绝)。
+        let mut cfg_candidates: Vec<usize> = (0..cfg.devices.len()).collect();
         for entry in &manifest.devices {
-            let cidx = cfg
-                .devices
-                .iter()
-                .position(|p| p.as_path() == std::path::Path::new(&entry.path));
+            // 1) 精确路径匹配(同机常态)
+            let mut cidx =
+                cfg.devices.iter().enumerate().find_map(|(i, p)| {
+                    (p.as_path() == std::path::Path::new(&entry.path)).then_some(i)
+                });
+            // 2) uuid 回退匹配(路径失配:异机导入/目录迁移时,以 uuid 为准,
+            // 仅从未消费的配置设备中找;消费后剔除,防同一盘映射两次)
+            if cidx.is_none() {
+                if let Some(i) = cfg_candidates.iter().copied().find(|&i| {
+                    opened[i]
+                        .as_ref()
+                        .is_some_and(|(_, _, sb)| sb.uuid == entry.uuid)
+                }) {
+                    cidx = Some(i);
+                    cfg_candidates.retain(|&x| x != i);
+                }
+            }
             let Some(cidx) = cidx else {
                 return Err(Error::InvalidLayout(format!(
-                    "pool device {} is not listed in config; add it to \
-                     storage.devices (device-add 后配置须包含新盘)",
+                    "pool device {} is not listed in config (and no uuid match \
+                     among remaining config devices); add it to storage.devices \
+                     (device-add 后配置须包含新盘)",
                     entry.path
                 )));
             };

@@ -499,10 +499,15 @@ pub fn run_wizard(args: &WizardArgs, global_config: Option<&Path>) -> Result<Gen
     );
 
     // 5. 凭据生成(管理员账号 + 首对密钥)
-    let meta_dir = args
-        .meta_dir
-        .clone()
-        .unwrap_or_else(|| data_dir.join("meta"));
+    // M13 N1-1(ADR-15 DM5/DM6):方案 C「同盘元数据」——默认元数据目录 =
+    // 数据设备同目录(镜像/裸设备的同盘等价物;目录迁移/抽盘整体可移植)。
+    let meta_dir = args.meta_dir.clone().unwrap_or_else(|| {
+        if let Some(parent) = device.parent() {
+            parent.join("meta")
+        } else {
+            data_dir.join("meta")
+        }
+    });
     let access_key = gen_alnum(20)?;
     let secret_key = gen_alnum(40)?;
     let admin_token = args
