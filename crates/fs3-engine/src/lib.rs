@@ -342,6 +342,8 @@ pub struct Engine {
     _rebalancer_thread: Option<WorkerHandle>,
     /// 再平衡配置存档(worker 重建用;open 时快照)。
     rebalance_cfg: RebalanceConfig,
+    /// M13 Z1 数据压缩配置存档(Write 路径读取;open 时校验快照)。
+    compression_cfg: fs3_core::CompressionConfig,
     /// 后台 worker 句柄(ADR-12 DL2 通用抽象;压缩为首个实例)。
     _compactor_thread: Option<WorkerHandle>,
     /// 后台任务全局共享令牌桶(ADR-12 DL2:压缩与生命周期执行器
@@ -786,6 +788,7 @@ impl Engine {
             rebalancer,
             _rebalancer_thread: rebalancer_thread,
             rebalance_cfg: cfg.rebalance.clone(),
+            compression_cfg: cfg.compression,
             throttle,
             closed: false,
             degraded: degraded.clone(),
@@ -1913,27 +1916,70 @@ impl Engine {
         if prefix.len() <= limit {
             // —— 内联路径(E3):零设备 I/O,一条 rocksdb 事务 ——
             let size = prefix.len() as u64;
+            // M13 Z1 内联交互:压缩后仍 ≤ 32KiB 才内联(压缩流存 inline,
+            // 明文长度记账;超限 → 落到 extent 臂继续走流式压缩)。
+            // 注意:此分支一旦成立即提交;压缩超限须在此判定(prefix 已
+            // 读尽,extent 臂用同一 prefixed reader 重放,零重读)。
+            let mut compression_info: Option<fs3_core::CompressionInfo> = None;
+            let mut inline_buf: Option<Vec<u8>> = None; // 压缩流(明文)
+            if self.compression_cfg.enabled && !prefix.is_empty() {
+                let compressed_bytes =
+                    zstd::bulk::compress(&prefix, self.compression_cfg.level as i32)
+                        .map_err(|e| Error::Meta(format!("zstd inline compress: {e}")))?;
+                if compressed_bytes.len() <= limit {
+                    compression_info = Some(fs3_core::CompressionInfo {
+                        algorithm: fs3_core::CompressionAlgorithm::Zstd,
+                        level: self.compression_cfg.level,
+                        original_size: size,
+                        compressed_size: compressed_bytes.len() as u64,
+                    });
+                    inline_buf = Some(compressed_bytes);
+                }
+            }
+            // M13 Z1:MD5 模式 ETag = MD5(明文)(S3 语义);crc32c(etag=fast)
+            // = CRC32C(压缩流)(DZ1 与 extent 臂一致)——明文 MD5 在 prefix
+            // 被消费前先算(压缩内联时用)
+            let plain_md5 = compression_info.as_ref().and_then(|_| {
+                (self.etag_mode == fs3_core::EtagMode::Md5)
+                    .then(|| md5::Md5::digest(&prefix[..size as usize]).into())
+            });
             // M11 E1-7:SSE 内联臂——整体加密后密文存 inline(同一
             // 64KiB 网格:内联 ≤ limit 恒单 chunk,空对象零 chunk);
             // ETag = 密文摘要(DE2),nonce_base 每对象随机,tag 与类型
-            // 静态字段(K1-1 分派)落 meta
+            // 静态字段(K1-1 分派)落 meta;压缩对象 = 加密压缩流
             let (inline_data, sse) = match sse_key {
                 Some(k) => {
+                    // 压缩对象拒绝 SSE 内联(32KiB 内联密文网格语义与压缩
+                    // 流组合仅单 chunk;压缩+SSE 走 extent 臂,保持统一)
+                    if compression_info.is_some() {
+                        compression_info = None;
+                        inline_buf = None;
+                    }
+                    let data: &[u8] = match &inline_buf {
+                        Some(b) => b.as_slice(),
+                        None => &prefix[..],
+                    };
                     let mut nonce_base = [0u8; 12];
                     fs3_core::random_bytes(&mut nonce_base)?;
                     let mut cipher = fs3_core::ChunkedGcm::new(k.data_key(), nonce_base);
-                    let mut ct = Vec::with_capacity(prefix.len());
+                    let mut ct = Vec::with_capacity(data.len());
                     let mut tags = Vec::new();
-                    for (no, chunk) in prefix.chunks(fs3_core::SSE_CHUNK_SIZE).enumerate() {
+                    for (no, chunk) in data.chunks(fs3_core::SSE_CHUNK_SIZE).enumerate() {
                         let (c, tag) = cipher.encrypt_chunk(no as u64, chunk);
                         ct.extend_from_slice(&c);
                         tags.push(tag);
                     }
                     (ct, Some(k.build_sse_info(nonce_base, tags)))
                 }
-                None => (prefix, None),
+                _ => (
+                    match inline_buf {
+                        Some(b) => b,
+                        None => prefix,
+                    },
+                    None,
+                ),
             };
-            let etag = self.compute_etag(&inline_data);
+            let etag = plain_md5.unwrap_or_else(|| self.compute_etag(&inline_data));
             let mtime = self.write_mtime(&target, bucket, key)?;
             let meta = ObjectMeta {
                 size,
@@ -1955,7 +2001,7 @@ impl Engine {
                 retention: lock.retention.clone(),
                 legal_hold: lock.legal_hold,
                 part_checksums: Vec::new(),
-                compressed: None,
+                compressed: compression_info,
             };
             let mut draft = Staged::default();
             if !old.segments.is_empty() {
@@ -2049,15 +2095,28 @@ impl Engine {
         let old_size = old.size;
         let old_segments = old.segments;
         let mut draft = Staged::default();
-        let (segments, size, etag, sse) =
-            match self.stream_to_extents(reader, &mut draft, sse_key, None) {
-                Ok(v) => v,
-                Err(e) => {
-                    // 流中断(客户端断连):回滚已暂存分配 + 开放 extent 水位
-                    self.abort_draft(&draft);
-                    return Err(e);
-                }
-            };
+        let outcome = match self.stream_to_extents(reader, &mut draft, sse_key, None) {
+            Ok(v) => v,
+            Err(e) => {
+                // 流中断(客户端断连):回滚已暂存分配 + 开放 extent 水位
+                self.abort_draft(&draft);
+                return Err(e);
+            }
+        };
+        let StreamWriteOutcome {
+            segments,
+            size,
+            etag,
+            sse,
+            compressed_size,
+        } = outcome;
+        // M13 Z1:压缩对象落压缩信息(算法/档位/明文与压缩字节数)
+        let compressed = compressed_size.map(|compressed_size| fs3_core::CompressionInfo {
+            algorithm: fs3_core::CompressionAlgorithm::Zstd,
+            level: self.compression_cfg.level,
+            original_size: size,
+            compressed_size,
+        });
         // M11 C1-2:tee 已读尽(EOF 落值),提交前取回 checksum(未声明 = None)
         let checksum = checksum_out.borrow_mut().take();
 
@@ -2082,7 +2141,7 @@ impl Engine {
             retention: lock.retention.clone(),
             legal_hold: lock.legal_hold,
             part_checksums: Vec::new(),
-            compressed: None,
+            compressed,
         };
 
         // 覆盖语义(ADR-9 §5.4):新段记账必须在旧段释放**之前**——开放 extent
@@ -2137,8 +2196,19 @@ impl Engine {
                 "engine is read-only (degraded pool or tool mode); extent writes rejected".into(),
             ));
         }
-        let mut writer =
-            ExtentWriter::new(self.chunk_size, self.etag_mode, sse_key, sse_nonce_base)?;
+        let compression_level = if self.compression_cfg.enabled {
+            self.compression_cfg.level
+        } else {
+            0
+        };
+
+        let mut writer = ExtentWriter::new(
+            self.chunk_size,
+            self.etag_mode,
+            sse_key,
+            sse_nonce_base,
+            compression_level,
+        )?;
         let mut inbuf = fs3_device::AlignedBuffer::new(self.chunk_size)?;
         loop {
             let n = read_up_to(reader, inbuf.as_mut_slice())?;
@@ -2564,6 +2634,11 @@ impl Engine {
         if start >= end {
             return Ok(0);
         }
+        // M13 Z1:压缩对象走解压读路径(明文 → zstd → (SSE) → 落盘的反演:
+        // 密文(可选)→ 解密(可选)→ zstd 解压 → Range 窗口裁剪)
+        if meta.compressed.is_some() {
+            return self.read_compressed_meta(meta, start..end, out, sse_key);
+        }
 
         // M11 E1-3:SSE 对象按 64KiB chunk 网格读密文(经既有段路径,
         // verify_reads 的 CRC 校验仍在密文上,DE2 语义不变)→ 验 tag 解密
@@ -2603,6 +2678,131 @@ impl Engine {
             return Ok(written);
         }
         self.get_raw_to_meta(meta, start..end, out)
+    }
+
+    /// M13 Z1:压缩对象读取(明文窗口[start,end)为输出;全量解压后裁剪
+    /// ——zstd 帧无随机访问,Range 大对象的解压成本 = 全对象,文档化)。
+    ///
+    /// 流程:压缩流来源(内联字节 / 逐段原始字节)→ (SSE:按 64KiB 压缩流
+    /// 网格验 tag 解密)→ zstd 流式解压 → 写明文窗口。verify_reads 对
+    /// 压缩对象暂不逐段校验(默认关;段 CRC 属存储侧,数据面完整性由
+    /// zstd 帧校验兜底——损坏帧解码必然失败)。
+    fn read_compressed_meta(
+        &self,
+        meta: &ObjectMeta,
+        range: std::ops::Range<u64>,
+        out: &mut dyn Write,
+        sse_key: Option<&fs3_core::SseCKey>,
+    ) -> Result<u64> {
+        use std::io::Write;
+        let start = range.start;
+        let end = range.end;
+        // 解压输出收集器(zstd 输出 → 本侧 Rc sink;每批 drain 后写窗口)
+        let sink = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut dec = zstd::stream::write::Decoder::new(ZstdSink(sink.clone()))
+            .map_err(|e| Error::Meta(format!("zstd decoder: {e}")))?;
+        // 明文输出(全量解压,窗口裁剪)
+        let mut written = 0u64;
+        let mut window_pos = 0u64;
+        let mut flush = |written: &mut u64, window_pos: &mut u64| -> Result<()> {
+            let pt = std::mem::take(&mut *sink.borrow_mut());
+            if pt.is_empty() {
+                return Ok(());
+            }
+            let lo = start.max(*window_pos);
+            let hi = end.min(*window_pos + pt.len() as u64);
+            if lo < hi {
+                let s = (lo - *window_pos) as usize;
+                let e = (hi - *window_pos) as usize;
+                out.write_all(&pt[s..e])?;
+                *written += (e - s) as u64;
+            }
+            *window_pos += pt.len() as u64;
+            Ok(())
+        };
+        let mut feed = |buf: &[u8]| -> Result<()> {
+            dec.write_all(buf)
+                .map_err(|e| Error::Meta(format!("zstd decode feed: {e}")))?;
+            flush(&mut written, &mut window_pos)
+        };
+        // —— 压缩流来源:内联或逐段原始字节 ——
+        if let Some(inline) = &meta.inline {
+            if let Some(sse) = &meta.sse {
+                let data_key = self.sse_read_data_key(sse, sse_key)?;
+                let cipher = fs3_core::ChunkedGcm::new(data_key, sse.nonce_base);
+                let tag = sse.chunk_tags.first().ok_or_else(|| {
+                    Error::Corrupt("sse inline compressed object missing chunk tag".into())
+                })?;
+                let pt = cipher.decrypt_chunk(0, inline, tag).map_err(|_| {
+                    Error::Corrupt("sse inline compressed chunk authentication failed".into())
+                })?;
+                self.sse_decrypt_bytes
+                    .fetch_add(pt.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                feed(&pt)?;
+            } else {
+                feed(inline)?;
+            }
+        } else {
+            // 逐段读压缩流原始字节(SSE 时按压缩流 64KiB 网格解密)
+            let mut stream_pos = 0u64;
+            for seg in &meta.extents {
+                let raw = self.read_segment_raw(seg)?;
+                if let Some(sse) = &meta.sse {
+                    let data_key = self.sse_read_data_key(sse, sse_key)?;
+                    let cipher = fs3_core::ChunkedGcm::new(data_key, sse.nonce_base);
+                    let grid = fs3_core::SSE_CHUNK_SIZE as u64;
+                    let mut off = 0usize;
+                    while off < raw.len() {
+                        let cno = (stream_pos + off as u64) / grid;
+                        // chunk 起于段内 offset:chunk 边界 = 压缩流全局网格
+                        let chunk_start_in_stream = cno * grid;
+                        let in_seg = chunk_start_in_stream.saturating_sub(stream_pos) as usize;
+                        let take = grid.min(stream_pos + raw.len() as u64 - chunk_start_in_stream)
+                            as usize;
+                        let s = in_seg.max(off);
+                        let e = (in_seg + take).min(off + (raw.len() - off));
+                        if s >= e {
+                            off += (in_seg + take).saturating_sub(off).max(1);
+                            continue;
+                        }
+                        let tag = sse.chunk_tags.get(cno as usize).ok_or_else(|| {
+                            Error::Corrupt(format!("sse chunk_tags too short (need chunk {cno})"))
+                        })?;
+                        let pt = cipher.decrypt_chunk(cno, &raw[s..e], tag).map_err(|_| {
+                            Error::Corrupt(format!(
+                                "sse-c chunk {cno} authentication failed (compressed stream)"
+                            ))
+                        })?;
+                        self.sse_decrypt_bytes
+                            .fetch_add(pt.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                        feed(&pt)?;
+                        off = e;
+                    }
+                    stream_pos += raw.len() as u64;
+                } else {
+                    feed(&raw)?;
+                    stream_pos += raw.len() as u64;
+                }
+            }
+        }
+        // 冲刷解压尾部(write::Decoder 无 finish;flush 把全部解压输出
+        // 推入 sink)
+        dec.flush()
+            .map_err(|e| Error::Meta(format!("zstd decode flush: {e}")))?;
+        flush(&mut written, &mut window_pos)?;
+        Ok(written)
+    }
+
+    /// 读一个段的原始字节(压缩流;打包/独占通用;不校验 CRC)。
+    fn read_segment_raw(&self, seg: &Segment) -> Result<Vec<u8>> {
+        let mut raw = Vec::with_capacity(seg.len as usize);
+        let dev_off = self.extent_data_offset(seg.extent_id as u64)? + seg.offset as u64;
+        let fd = self.device_fd_of(seg.extent_id as u64)?;
+        let _n = self.read_batched_blocks(fd, dev_off, seg.len as usize, |data| {
+            raw.extend_from_slice(data);
+            Ok(())
+        })?;
+        Ok(raw)
     }
 
     /// 未加密对象整体读主体(get_to_meta 的非 SSE 臂;SSE 臂逐 chunk
@@ -3526,6 +3726,15 @@ impl Engine {
         let Some(session) = self.meta.get_multipart(upload_id)? else {
             return Err(Error::NoSuchUpload(upload_id.to_string()));
         };
+        // M13 Z1:v1.4 压缩开启时 multipart 分片明确不支持(分片独立帧 +
+        // Complete 混拼 + SSE 重加密的组合面暂不开放;门禁组合由单对象
+        // PUT 路径覆盖)。默认关 → 零影响。
+        if self.compression_cfg.enabled {
+            return Err(Error::Unsupported(
+                "data compression (zstd) is not supported for multipart uploads in                  v1.4; disable compression or use single PUT (ADR-15 DZ1)"
+                    .into(),
+            ));
+        }
         // E1-4 会话一致性(防御纵深;协议层已先行按 key-MD5 比对)
         if session.sse_key_md5.is_some() != sse_key.is_some() {
             return Err(Error::InvalidRequest(
@@ -3606,7 +3815,7 @@ impl Engine {
             let mut draft = Staged::default();
             // M11 E1-4:分片 SSE——stream_to_extents 按 part 内 64KiB
             // 网格分块加密(D-E6 确定性 nonce_base),sse 产物落 PartMeta
-            let (extents, size, etag, sse) = match self.stream_to_extents(
+            let outcome = match self.stream_to_extents(
                 &mut prefixed,
                 &mut draft,
                 write_key.as_ref(),
@@ -3618,6 +3827,19 @@ impl Engine {
                     return Err(e);
                 }
             };
+            let StreamWriteOutcome {
+                segments: extents,
+                size,
+                etag,
+                sse,
+                compressed_size,
+            } = outcome;
+            // M13 Z1:压缩开启时 multipart 分片不受支持(见上传入口拒绝),
+            // 此处压缩输出恒 None;防御性拒绝(防未来漏网)
+            debug_assert!(
+                compressed_size.is_none(),
+                "multipart part compression is unsupported in v1.4 (Z1)"
+            );
             debug_assert_eq!(sse.is_some(), write_key.is_some());
             self.alloc.add_object(&mut draft, &extents);
             let part = PartMeta {
@@ -3760,10 +3982,19 @@ impl Engine {
                 self.etag_mode,
                 write_key.as_ref(),
                 part_nonce_base,
+                0, // Copy/Complete 重加密臂不做数据压缩(M13 Z1)
             )?;
             self.feed_object_plain(&mut writer, &mut draft, &src, start..end, src_sse_key)?;
-            let (extents, size, etag, sse) = writer.finish(self, &mut draft)?;
+            let outcome = writer.finish(self, &mut draft)?;
+            let StreamWriteOutcome {
+                segments: extents,
+                size,
+                etag,
+                sse,
+                compressed_size,
+            } = outcome;
             debug_assert_eq!(size, len);
+            debug_assert!(compressed_size.is_none() || self.compression_cfg.enabled);
             debug_assert_eq!(sse.is_some(), write_key.is_some());
             self.alloc.add_object(&mut draft, &extents);
             let part = PartMeta {
@@ -4151,15 +4382,28 @@ impl Engine {
                 } else {
                     // extent:逐 part 解密直灌 SSE 写上下文(单一对象网格;
                     // 对象级 nonce_base 仍每 Complete 随机,D-E6 只约束分片)
-                    let mut writer =
-                        ExtentWriter::new(self.chunk_size, self.etag_mode, Some(wkey), None)?;
+                    let mut writer = ExtentWriter::new(
+                        self.chunk_size,
+                        self.etag_mode,
+                        Some(wkey),
+                        None,
+                        0, // SSE Complete 重加密臂不做数据压缩(M13 Z1)
+                    )?;
                     for (_, p) in &combined {
                         let part_sse = p.sse.as_ref().expect("sse parts checked above");
                         let pt = self.decrypt_part(p, part_sse, part_dk)?;
                         writer.feed(self, &mut draft, &pt)?;
                     }
-                    let (extents, size, _, sse) = writer.finish(self, &mut draft)?;
+                    let outcome = writer.finish(self, &mut draft)?;
+                    let StreamWriteOutcome {
+                        segments: extents,
+                        size,
+                        etag: _,
+                        sse,
+                        compressed_size,
+                    } = outcome;
                     debug_assert_eq!(size, total_size);
+                    debug_assert!(compressed_size.is_none() || self.compression_cfg.enabled);
                     // 新段记账 + 分片旧段释放(同事务;仅请求子集)
                     let mut part_segments: Vec<Segment> = Vec::new();
                     for (_, p) in &combined {
@@ -4251,14 +4495,28 @@ impl Engine {
                     self.read_part_to(p, &mut sink)?;
                 }
                 // 明文会话恒不加密(SSE-C 会话在上方 D-E4 臂先行接管)
-                let (extents, size, _, sse) = self.stream_to_extents(
+                let outcome = self.stream_to_extents(
                     &mut std::io::Cursor::new(sink),
                     &mut draft,
                     None,
                     None,
                 )?;
+                let StreamWriteOutcome {
+                    segments: extents,
+                    size,
+                    etag: _,
+                    sse,
+                    compressed_size,
+                } = outcome;
                 debug_assert!(sse.is_none(), "plaintext session assembly never encrypts");
                 debug_assert_eq!(size, total_size);
+                // M13 Z1:Complete 组装走整对象写臂,可压缩(混合路径)
+                let compressed = compressed_size.map(|compressed_size| fs3_core::CompressionInfo {
+                    algorithm: fs3_core::CompressionAlgorithm::Zstd,
+                    level: self.compression_cfg.level,
+                    original_size: size,
+                    compressed_size,
+                });
                 // 分片旧段释放(同事务;ADR-9 §5.4 覆盖语义;仅请求子集)
                 let mut part_segments: Vec<Segment> = Vec::new();
                 for (_, p) in &combined {
@@ -4284,7 +4542,7 @@ impl Engine {
                     retention: lock.retention.clone(),
                     legal_hold: lock.legal_hold,
                     part_checksums: part_checksums.clone(),
-                    compressed: None,
+                    compressed,
                 }
             };
 
@@ -4810,8 +5068,13 @@ impl Engine {
                 } else {
                     // extent 臂:源明文窗口化直灌 SSE 写上下文(对象级
                     // nonce_base 随机,None = 由 writer 自行生成)
-                    let mut writer =
-                        ExtentWriter::new(self.chunk_size, self.etag_mode, Some(k), None)?;
+                    let mut writer = ExtentWriter::new(
+                        self.chunk_size,
+                        self.etag_mode,
+                        Some(k),
+                        None,
+                        0, // 重加密臂不做数据压缩(M13 Z1)
+                    )?;
                     self.feed_object_plain(
                         &mut writer,
                         &mut draft,
@@ -4819,7 +5082,14 @@ impl Engine {
                         0..src.size,
                         sse_src_key,
                     )?;
-                    let (extents, size, etag, sse) = writer.finish(self, &mut draft)?;
+                    let outcome = writer.finish(self, &mut draft)?;
+                    let StreamWriteOutcome {
+                        segments: extents,
+                        size,
+                        etag,
+                        sse,
+                        compressed_size: _, // 拷贝/重加密臂不做压缩(Z1)
+                    } = outcome;
                     debug_assert_eq!(size, src.size);
                     self.alloc.add_object(&mut draft, &extents);
                     meta.etag = etag;
@@ -5143,6 +5413,10 @@ impl Engine {
         // (sendfile/splice 只能发密文)——返回 None 强制走缓冲解密路径
         // (文档化见 docs/perf-M10.md §6;按字节计 fasts3_sse_decrypt_bytes_total)
         if meta.sse.is_some() {
+            return Ok(None);
+        }
+        // M13 Z1:压缩对象读路径必须过 zstd 解压,**禁零拷贝**
+        if meta.compressed.is_some() {
             return Ok(None);
         }
         if meta.inline.is_some() || meta.extents.is_empty() {
@@ -5764,9 +6038,16 @@ pub struct DevSegment {
     pub len: u64,
 }
 
-/// 段流水线产物(stream_to_extents / ExtentWriter::finish 返回):
-/// (段列表, 对象大小, ETag, SSE 产物)。
-type StreamWriteOutcome = (Vec<Segment>, u64, [u8; 16], Option<fs3_core::SseInfo>);
+/// 段流水线产物(stream_to_extents / ExtentWriter::finish 返回)。
+pub(crate) struct StreamWriteOutcome {
+    pub segments: Vec<Segment>,
+    /// 对象大小 = **明文长度**(M13 Z1:压缩后 size 仍为明文,S3 语义)。
+    pub size: u64,
+    pub etag: [u8; 16],
+    pub sse: Option<fs3_core::SseInfo>,
+    /// M13 Z1:zstd 输出字节(加密前);None = 未压缩。
+    pub compressed_size: Option<u64>,
+}
 
 /// SSE-S3 重包裹进度(M11 K1-1,ADR-12 DS1;admin GET /v1/admin/sse/status
 /// 渲染源)。内存态;持久判定标记 = meta 的 `rewrap_done_gen`(重启后
@@ -5909,6 +6190,70 @@ struct SseWriteState {
 /// 进行中的对象写状态(ADR-9 §5.1):每对象一个 writer,共享引擎的开放
 /// extent;段 = 开放 extent 数据区内 4KiB 对齐区间,CRC 网格 = 段内 64KiB
 /// (尾部按实际数据 CRC、补零落盘,与 v1 逐字节一致;独占段 CRC 进头)。
+/// M13 Z1 流式 zstd 编码器(明文入 → 压缩流出;增量落流):
+/// 编码器独占持有 sink 的一个 `Rc` 克隆,压缩输出经另一个克隆随时可取
+/// (引擎写锁域内单线程,RefCell 无竞争)——避免 Encoder::flush 不返回
+/// 底层 writer 的 API 限制,也不退化到 bulk 逐块压缩(保压缩率)。
+struct ZstdSink(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+impl std::io::Write for ZstdSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// 流式 zstd 编码器(写路径;明文 → 压缩流)。
+struct ZstdEncoder {
+    enc: zstd::stream::write::Encoder<'static, ZstdSink>,
+    sink: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+    /// 累计压缩输出字节(加密前;落 CompressionInfo.compressed_size)。
+    out_bytes: u64,
+}
+
+impl ZstdEncoder {
+    fn new(level: u32) -> Result<Self> {
+        let sink = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let enc = zstd::stream::write::Encoder::new(ZstdSink(sink.clone()), level as i32)
+            .map_err(|e| Error::Meta(format!("zstd encoder: {e}")))?;
+        let _ = level;
+        Ok(ZstdEncoder {
+            enc,
+            sink,
+            out_bytes: 0,
+        })
+    }
+
+    /// 压缩一段明文;flush 后取出已产生的压缩字节(增量输出)。
+    fn compress(&mut self, plain: &[u8]) -> Result<Vec<u8>> {
+        use std::io::Write;
+        self.enc
+            .write_all(plain)
+            .map_err(|e| Error::Meta(format!("zstd encode: {e}")))?;
+        self.enc
+            .flush()
+            .map_err(|e| Error::Meta(format!("zstd flush: {e}")))?;
+        let out = std::mem::take(&mut *self.sink.borrow_mut());
+        self.out_bytes += out.len() as u64;
+        Ok(out)
+    }
+
+    /// 流结束:finish 输出尾部压缩字节(此后不可再 encode)。
+    fn finish(mut self) -> Result<Vec<u8>> {
+        // Encoder::finish 返回 W(ZstdSink);释放编码器后取残余输出
+        let _ = self
+            .enc
+            .finish()
+            .map_err(|e| Error::Meta(format!("zstd finish: {e}")))?;
+        let out = std::mem::take(&mut *self.sink.borrow_mut());
+        self.out_bytes += out.len() as u64;
+        Ok(out)
+    }
+}
+
 struct ExtentWriter {
     chunk_size: usize,
     capacity: u64,
@@ -5930,9 +6275,17 @@ struct ExtentWriter {
     /// 当前段实际数据字节数(watermark 按 4KiB 对齐推进,段长按实际字节)。
     seg_written: u32,
     segments: Vec<Segment>,
+    /// 明文长度(压缩臂下 size 记账在 feed() 明文侧,M13 Z1)。
     size: u64,
     /// SSE-C 写侧状态(M11 E1-7;None = 未加密,零开销透传)。
     sse: Option<SseWriteState>,
+    /// M13 Z1 数据压缩臂(None = 关;zstd 档位 1~3):
+    /// 明文 → zstd → (SSE) → 落盘;存储侧 CRC/段 CRC 在压缩流上。
+    compression: Option<ZstdEncoder>,
+    /// 压缩流总输出字节(记账 compressed_size;加密前)。
+    compressed_out: u64,
+    /// MD5/客户端摘要已按明文口径喂入(压缩臂;feed_bytes 不再重复)。
+    hasher_plain_fed: bool,
 }
 
 impl ExtentWriter {
@@ -5948,7 +6301,14 @@ impl ExtentWriter {
         etag_mode: fs3_core::EtagMode,
         sse_key: Option<&fs3_core::SseWriteKey>,
         sse_nonce_base: Option<[u8; 12]>,
+        compression_level: u32,
     ) -> Result<Self> {
+        // M13 Z1:压缩臂(0 = 关;明文 → zstd → (SSE) → 落盘)
+        let compression = if compression_level == 0 {
+            None
+        } else {
+            Some(ZstdEncoder::new(compression_level)?)
+        };
         // M11 E1-7:SSE 上下文(data_key 请求期派生,随 writer Drop 擦除,
         // 零落盘;nonce_base 默认每对象随机,分片路径由调用方确定性派生)
         let sse = match sse_key {
@@ -6000,6 +6360,9 @@ impl ExtentWriter {
             segments: Vec::new(),
             size: 0,
             sse,
+            compression,
+            compressed_out: 0,
+            hasher_plain_fed: false,
         })
     }
 
@@ -6020,11 +6383,30 @@ impl ExtentWriter {
         if self.size > fs3_core::MAX_OBJECT_SIZE {
             return Err(Error::InvalidArgument("object exceeds 5TiB limit".into()));
         }
+        // M13 Z1 压缩臂:明文 → zstd;MD5 按**明文**口径喂入(S3 ETag 语义),
+        // 存储侧 CRC 留在压缩流(feed_bytes)
+        if let Some(z) = &mut self.compression {
+            if let Some(h) = &mut self.hasher {
+                h.update(data);
+            }
+            self.hasher_plain_fed = true;
+            let out = z.compress(data)?;
+            self.compressed_out = z.out_bytes;
+            if out.is_empty() {
+                return Ok(());
+            }
+            return self.feed_stream(engine, draft, &out);
+        }
+        self.feed_stream(engine, draft, data)
+    }
+
+    /// 压缩/明文流 → SSE 加密臂或直线落流(共享;SSE 网格在压缩流上)。
+    fn feed_stream(&mut self, engine: &mut Engine, draft: &mut Staged, data: &[u8]) -> Result<()> {
         if self.sse.is_none() {
             return self.feed_bytes(engine, draft, data);
         }
         // M11 E1-7:凑满 64KiB 加密一个 chunk(chunk_no = 网格序号,
-        // 与读路径/Range 解密同一网格)
+        // 与读路径/Range 解密同一网格;输入 = 压缩流)
         let mut off = 0usize;
         while off < data.len() {
             let take = {
@@ -6110,6 +6492,19 @@ impl ExtentWriter {
     /// 恰好写满则走 end_segment 封口判定);返回 (segments, size, etag,
     /// sse)(sse = SSE-C 写侧产物 nonce_base + chunk_tags,未加密 = None)。
     fn finish(mut self, engine: &mut Engine, draft: &mut Staged) -> Result<StreamWriteOutcome> {
+        // M13 Z1:压缩臂尾部——zstd 帧结束字节冲刷进流水线(此后不可再
+        // encode);计数同步(压缩流总长落 CompressionInfo)
+        if let Some(z) = self.compression.take() {
+            self.compressed_out = z.out_bytes;
+            let tail = z.finish()?;
+            self.compressed_out += tail.len() as u64;
+            if !tail.is_empty() {
+                if let Some(h) = &mut self.hasher {
+                    h.update(b"");
+                }
+                self.feed_stream(engine, draft, &tail)?;
+            }
+        }
         // M11 E1-7:尾块(不足 64KiB)同样有 tag(D-E1 网格口径);尾块密文
         // 可能恰好写满/新开 extent,必须走真实 draft(分配记账不丢)
         if self.sse.as_ref().is_some_and(|st| !st.staging.is_empty()) {
@@ -6172,7 +6567,17 @@ impl ExtentWriter {
             chunk_tags: st.chunk_tags,
             key_md5: st.key_md5,
         });
-        Ok((self.segments, self.size, etag, sse))
+        Ok(StreamWriteOutcome {
+            segments: self.segments,
+            size: self.size,
+            etag,
+            sse,
+            compressed_size: if self.compressed_out > 0 || self.hasher_plain_fed {
+                Some(self.compressed_out)
+            } else {
+                None
+            },
+        })
     }
 }
 
@@ -6453,8 +6858,11 @@ impl Engine {
         // 浪费 ≤ 4KiB/对象(ADR-9 D1)。
         self.cur_open_mut().unwrap().watermark += write_len as u32;
         w.seg_written += fill as u32;
-        if let Some(h) = w.hasher.as_mut() {
-            h.update(data);
+        // M13 Z1:压缩路径 hasher 已在明文侧喂入(feed),此处跳过
+        if !w.hasher_plain_fed {
+            if let Some(h) = w.hasher.as_mut() {
+                h.update(data);
+            }
         }
         w.fill = 0;
         Ok(())

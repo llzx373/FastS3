@@ -6651,3 +6651,214 @@ fn rebalance_moves_high_water_to_low_water_and_converges() -> Result<()> {
     e2.abort();
     Ok(())
 }
+
+// ─────────────────────────── M13 Z1 zstd 数据压缩 ───────────────────────────
+
+fn comp_cfg(e: bool, level: u32) -> EngineConfig {
+    let (_d, img, mut cfg) = setup_multi(&[64 * 1024 * 1024]);
+    let _ = _d;
+    let _ = img;
+    cfg.compression = fs3_core::CompressionConfig { enabled: e, level };
+    cfg
+}
+
+#[test]
+fn compression_extent_roundtrip_and_metadata() -> Result<()> {
+    // 明文(高压缩比文本)→ 压缩落盘 → 读回一致;元数据压缩信息齐全
+    let mut cfg = comp_cfg(true, 2);
+    let (_d, _img, _) = (tempfile::tempdir().unwrap(), (), ());
+    cfg.meta_dir = _d.path().join("meta");
+    cfg.devices = vec![_d.path().join("d.img")];
+    std::fs::File::create(&cfg.devices[0])
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    fs3_device::init_device(&cfg.devices[0], 4 * 1024 * 1024, 0, false).unwrap();
+    let mut e = open_engine(&cfg);
+    // 可压缩文本(行重复,压缩率显著)
+    let mut data = Vec::new();
+    for i in 0..2000 {
+        data.extend_from_slice(
+            format!("FastS3 data-compression test line {i}: 000111222333444555666777888999aaaabbbbccccdddd\n")
+                .as_bytes(),
+        );
+    }
+    assert!(data.len() > 32 * 1024, "extent path required");
+    e.put("b1", "c", &mut Cursor::new(data.clone())).unwrap();
+    let meta = e.meta().get_object("b1", "c")?.unwrap();
+    let ci = meta.compressed.as_ref().expect("compression info");
+    assert_eq!(ci.algorithm, fs3_core::CompressionAlgorithm::Zstd);
+    assert_eq!(ci.level, 2);
+    assert_eq!(ci.original_size, data.len() as u64);
+    assert!(
+        ci.compressed_size < ci.original_size / 2,
+        "text must compress well: {} vs {}",
+        ci.compressed_size,
+        ci.original_size
+    );
+    assert!(meta.inline.is_none());
+    // 读回一致(全量 + Range)
+    let mut out = Vec::new();
+    e.get_to("b1", "c", 0..data.len() as u64, &mut out).unwrap();
+    assert_eq!(out, data);
+    let mut rng = Vec::new();
+    e.get_to("b1", "c", 1000..5000, &mut rng).unwrap();
+    assert_eq!(rng, data[1000..5000]);
+    // 重开一致(压缩对象跨恢复)
+    e.checkpoint()?;
+    e.close().unwrap();
+    drop(e);
+    let e2 = open_engine(&cfg);
+    let mut out2 = Vec::new();
+    e2.get_to("b1", "c", 0..data.len() as u64, &mut out2)
+        .unwrap();
+    assert_eq!(out2, data);
+    assert!(e2.check_report().unwrap().leaks.is_empty());
+    e2.abort();
+    Ok(())
+}
+
+#[test]
+fn compression_inline_when_small_after() -> Result<()> {
+    // 内联交互:压缩后仍 ≤ 32KiB 才内联(压缩流存 inline,明文记账)
+    let cfg = comp_cfg(true, 3);
+    let (_d, img) = (tempfile::tempdir().unwrap(), cfg.devices.clone());
+    let _ = img;
+    let mut cfg2 = cfg.clone();
+    cfg2.meta_dir = _d.path().join("meta");
+    cfg2.devices = vec![_d.path().join("d.img")];
+    std::fs::File::create(&cfg2.devices[0])
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    fs3_device::init_device(&cfg2.devices[0], 4 * 1024 * 1024, 0, false).unwrap();
+    let mut e = open_engine(&cfg2);
+    // 可压缩但明文 > 内联阈值?不:明文 8KiB 本就内联 —— 压缩后仍内联,
+    // 且 inline 保存的是**压缩流**
+    let data = vec![b'x'; 8192];
+    e.put("b1", "i", &mut Cursor::new(data.clone())).unwrap();
+    let meta = e.meta().get_object("b1", "i")?.unwrap();
+    let ci = meta.compressed.as_ref().expect("compressed");
+    assert!(
+        meta.inline.is_some(),
+        "compressed small object stays inline"
+    );
+    assert_eq!(
+        meta.inline.as_ref().unwrap().len(),
+        ci.compressed_size as usize
+    );
+    assert!(ci.compressed_size < ci.original_size);
+    let mut out = Vec::new();
+    e.get_to("b1", "i", 0..data.len() as u64, &mut out).unwrap();
+    assert_eq!(out, data);
+    // 明文超过阈值(64KiB)> 压缩后仍 >32KiB?高压缩内容使压缩后小:
+    // 验证「压缩后超限 → 落盘」路径:用不可压缩随机数据(压缩 ≈ 1:1 > 32KiB)
+    let rnd = {
+        let mut v = vec![0u8; 48 * 1024];
+        for (i, b) in v.iter_mut().enumerate() {
+            *b = (i as u64 * 2654435761 % 251) as u8;
+        }
+        v
+    };
+    e.put("b1", "r", &mut Cursor::new(rnd.clone())).unwrap();
+    let meta_r = e.meta().get_object("b1", "r")?.unwrap();
+    assert!(
+        meta_r.inline.is_none(),
+        "incompressible data must fall to extent path (compressed > 32KiB)"
+    );
+    let mut out_r = Vec::new();
+    e.get_to("b1", "r", 0..rnd.len() as u64, &mut out_r)
+        .unwrap();
+    assert_eq!(out_r, rnd);
+    e.abort();
+    Ok(())
+}
+
+#[test]
+fn compression_with_sse_c_combo_roundtrip() -> Result<()> {
+    // 明文 → zstd → SSE-C 加密 → CRC;读 = CRC → 解密 → 解压 往返一致
+    let mut cfg = comp_cfg(true, 1);
+    let (_d, _) = (tempfile::tempdir().unwrap(), ());
+    cfg.meta_dir = _d.path().join("meta");
+    cfg.devices = vec![_d.path().join("d.img")];
+    std::fs::File::create(&cfg.devices[0])
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    fs3_device::init_device(&cfg.devices[0], 4 * 1024 * 1024, 0, false).unwrap();
+    let mut e = open_engine(&cfg);
+    let key = fs3_core::SseCKey::from_bytes(&[7u8; 32]).unwrap();
+    let data = {
+        let mut v = Vec::new();
+        for i in 0..2000 {
+            v.extend_from_slice(
+                format!("sse-compress combo line {i}: abcdefghiabcdefghiabcdefghiabcdefghi\n")
+                    .as_bytes(),
+            );
+        }
+        v
+    };
+    let wk = fs3_core::SseWriteKey::SseC(&key);
+    e.put_with_meta(
+        "b1",
+        "s",
+        &mut Cursor::new(data.clone()),
+        None,
+        vec![],
+        vec![],
+        vec![],
+        None,
+        None,
+        Some(&wk),
+    )
+    .unwrap();
+    let meta = e.meta().get_object("b1", "s")?.unwrap();
+    assert!(meta.sse.is_some(), "sse info present");
+    assert!(meta.compressed.is_some(), "compressed present with sse");
+    let mut out = Vec::new();
+    e.get_to_meta(&meta, 0..data.len() as u64, &mut out, Some(&key))
+        .unwrap();
+    assert_eq!(out, data, "SSE-C + zstd combo roundtrip must match");
+    // 无密钥读取 → 报错(既有语义,压缩对象不破坏)
+    let mut out2 = Vec::new();
+    assert!(e.get_to_meta(&meta, 0..10, &mut out2, None).is_err());
+    e.abort();
+    Ok(())
+}
+
+#[test]
+fn multipart_rejected_when_compression_enabled() -> Result<()> {
+    let mut cfg = comp_cfg(true, 1);
+    let (_d, _) = (tempfile::tempdir().unwrap(), ());
+    cfg.meta_dir = _d.path().join("meta");
+    cfg.devices = vec![_d.path().join("d.img")];
+    std::fs::File::create(&cfg.devices[0])
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    fs3_device::init_device(&cfg.devices[0], 4 * 1024 * 1024, 0, false).unwrap();
+    let mut e = open_engine(&cfg);
+    let uid = e
+        .create_multipart(
+            "b1",
+            "mp",
+            Some("application/octet-stream"),
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    let err = match e.upload_part(&uid, 1, &mut Cursor::new(vec![0u8; 1024]), None, None) {
+        Ok(_) => panic!("multipart must be rejected under compression"),
+        Err(err) => err,
+    };
+    assert!(
+        format!("{err}").contains("compression"),
+        "unexpected: {err}"
+    );
+    e.abort();
+    Ok(())
+}

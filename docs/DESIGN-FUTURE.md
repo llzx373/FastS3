@@ -677,7 +677,7 @@ AWS SSE-C 语义:ETag = 密文的 MD5(上传时算),响应 ETag 不变;客户端
 
 **DZ1 决策点**:
 - **范围**:写入时压缩(`x-amz-content-encoding` 无关,存储层压缩透明),桶级或全局开关,默认关;压缩算法 zstd 档位 1~3(CPU/压缩率折中);**不做**后台"冷数据压缩"迁移(v1.4;评估放 v1.x);
-- **流水线顺序**:`明文 → (SSE 加密) → zstd → 落盘`,CRC/ETag 在**压缩流**上(存储侧完整性),客户端侧 MD5 仍是明文(上传时先算)——与 SSE 的"密文 CRC"同构,共用段 CRC 网格结构;**读路径**:解压必过缓冲(与 SSE 同理失去零拷贝);压缩对象 = 元数据标记 `compressed: Option<CompressionInfo>`(ObjectMeta v3 占位字段补上);
+- **流水线顺序**(实施期补遗,ADR-15 DZ1):`明文 → zstd → (SSE 加密) → 落盘`,CRC/ETag 在**落盘流**上(存储侧完整性),客户端侧 MD5 仍是明文(上传时先算)——与 SSE 的"密文 CRC"同构,共用段 CRC 网格结构;**读路径**:CRC → 解密(若有)→ zstd 解压 → Range 裁剪,必过缓冲(与 SSE 同理失去零拷贝);压缩对象 = 元数据标记 `compressed: Option<CompressionInfo>`(ObjectMeta v5 尾部字段,v4 双读回退);
 - **术语区分**:现有 Tier2"压缩"= 空间压缩(compaction),新特性 = 数据压缩(data compression),代码/文档/指标命名全部区分(`compaction` vs `compression`);
 - **交互**:etag=fast 模式下 ETag = 压缩流 CRC32C(一致性规则同 §4.2 DE2);内联小对象:压缩后仍 ≤32KiB 才内联,否则落盘;
 - **预算**:zstd level1 ~500MB/s/核(写)+ 解压 ~1.5GB/s/核(读),文档化;收益 = 典型文本/日志类数据 2~4× 容量。

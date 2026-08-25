@@ -834,14 +834,20 @@ v1.5~v1.6 立项 B2(布局版本 +1,迁移 = meta-export/import 或在线搬迁)
 目录保留为可选缓存/降级形态(掉元数据区 → 读降级 + 告警,同掉盘语义)。
 
 **DZ1(zstd 范围与顺序)**:仅写时压缩(与 `x-amz-content-encoding`
-无关,存储层透明);桶级或全局开关,**默认关**;档位 1~3;不做后台冷数据
-压缩迁移。流水线 = `明文 → (SSE 加密) → zstd → CRC`,CRC/ETag 在
-**压缩流**上(存储侧完整性;与 SSE 密文 CRC 同构,共用段 CRC 网格),
-客户端侧 MD5 仍明文(上传时先算);读路径解压必过缓冲(失去零拷贝);
-`ObjectMeta.compressed: Option<CompressionInfo>`(D0 预留字段补上);
+无关,存储层透明);全局开关,**默认关**(桶级覆盖留作增强);档位 1~3;
+不做后台冷数据压缩迁移。流水线 = `明文 → zstd → (SSE 加密) → CRC`
+(**实施期补遗,原稿 `明文 → (SSE 加密) → zstd` 经评审修正**:AES-GCM
+密文为伪随机流,先加密后压缩压缩率恒 ≈1:1 只耗 CPU;调整为先压缩后
+加密——对加密对象同样获得 2~4× 容量收益;CRC/ETag 在**落盘流**(密文
+或压缩明文)上(存储侧完整性;与 SSE 密文 CRC 同构,共用段 CRC 网格),
+客户端侧 MD5 仍明文(上传时先算);读路径 = CRC → 解密(若有)→ zstd
+解压 → Range 裁剪,必过缓冲(失去零拷贝);`ObjectMeta.compressed:
+Option<CompressionInfo>`(v5 值格式尾部追加,v4 双读回退);
 术语:compaction = 空间压缩,Tier2 既有;compression = 数据压缩,新特性;
-内联交互:压缩后仍 ≤32KiB 才内联;etag=fast 下 ETag = 压缩流 CRC32C
-(一致性规则同 §4.2 DE2)。
+内联交互:压缩后仍 ≤32KiB 才内联(内联保存压缩流);MD5 模式 ETag =
+MD5(明文),etag=fast 下 ETag = 落盘流 CRC32C;v1.4 限制:multipart
+分片在压缩开启时明确拒绝(分片独立帧 + Complete 混拼 + SSE 重加密的
+组合面暂不开放,单对象 PUT 路径覆盖门禁组合)。
 
 **perf 口径**:zstd level1 写 ~500MB/s/核 + 解压 ~1.5GB/s/核(文档化);
 再平衡开启后前台 p99 回退 <10%(门禁 §6.4);默认全关路径零变化(无

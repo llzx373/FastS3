@@ -19,6 +19,8 @@ tracing.workspace = true
 # M11 K1-1 SSE-S3:seed/DEK 局部副本用完即擦(ADR-12 DS1 红线;fs3-core
 # 已引入同 crate 同大版本,非新增外部依赖)
 zeroize = "1"
+# M13 Z1 数据压缩(zstd crate;压缩=compression,区别于 compaction)
+zstd.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
