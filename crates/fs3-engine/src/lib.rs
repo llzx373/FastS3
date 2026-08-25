@@ -589,6 +589,7 @@ impl Engine {
             versioning: fs3_core::VersioningState::Off,
             default_encryption: None,
             object_lock: false,
+            default_retention: None,
         };
         self.meta.commit_bucket_put(name, &meta)?;
         Ok(())
@@ -4023,6 +4024,7 @@ impl Engine {
             versioning: fs3_core::VersioningState::Off,
             default_encryption: None,
             object_lock: false,
+            default_retention: None,
         };
         self.meta.commit_bucket_put(name, &meta)?;
         Ok(())

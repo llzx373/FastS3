@@ -3107,6 +3107,7 @@ mod tests {
             versioning: fs3_core::VersioningState::Off,
             default_encryption: None,
             object_lock: false,
+            default_retention: None,
         }
     }
 

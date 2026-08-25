@@ -384,6 +384,9 @@ pub struct BucketDto {
     /// v1.3 填充:Object Lock 启用位(ADR-11 D0;v1 导出无此字段 → false)。
     #[serde(default)]
     pub object_lock: bool,
+    /// v1.3 填充(ADR-13):桶默认保留;旧导出无此字段 → None。
+    #[serde(default)]
+    pub default_retention: Option<fs3_core::ObjectLockDefaultRetention>,
     /// D9 桶级配置文档(M10 S1 桶标签 `bt:`;规范化 XML;旧导出无此字段
     /// → None = 无配置)。ADR-11 D9 三处联动之一(另两处:fs3-meta keys.rs
     /// 前缀表 + 删桶事务清理;check 可达性扫描只读 o:/p: 段引用键,天然安全)。
@@ -502,6 +505,7 @@ pub fn run_meta_export(
                 versioning: m.versioning,
                 default_encryption: m.default_encryption,
                 object_lock: m.object_lock,
+                default_retention: m.default_retention.clone(),
                 tagging: conf(fs3_meta::BucketConf::Tagging),
                 cors: conf(fs3_meta::BucketConf::Cors),
                 ownership_controls: conf(fs3_meta::BucketConf::Ownership),
@@ -662,6 +666,7 @@ pub fn run_meta_import(
             versioning: b.versioning,
             default_encryption: b.default_encryption,
             object_lock: b.object_lock,
+            default_retention: b.default_retention.clone(),
         };
         store.commit_bucket_put_with_location(
             &b.name,
@@ -1258,6 +1263,7 @@ mod tests {
                 "versioning",
                 "default_encryption",
                 "object_lock",
+                "default_retention",
                 // M10 S1/S2/S7:D9 桶级配置文档(serde default 双读)
                 "tagging",
                 "cors",

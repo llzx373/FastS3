@@ -264,7 +264,7 @@
 - [x] W1-2 `trusted_clock_divergence` 指标 + 告警(升级现有 clock_jumps);NTP/部署基线文档 + 停机期篡改边界声明(§5.3)
 
 ### W2 语义与强制矩阵(≈1.5 pw)
-- [ ] W2-1 ObjectMeta v3 retention/legal_hold 字段 + BucketMeta v2 object_lock 配置
+- [x] W2-1 ObjectMeta v3 retention/legal_hold 字段 + BucketMeta v2 object_lock 配置
 - [ ] W2-2 Put/GetObjectLockConfiguration(Enabled 不可逆;**自动开启版本化且此后不可关**)+ 默认保留继承
 - [ ] W2-3 对象级:PUT 头 `x-amz-object-lock-mode/retain-until-date/legal-hold`;Put/GetObjectRetention、Put/GetObjectLegalHold
 - [ ] W2-4 强制矩阵逐格实现(§5.4):受保留版本删除 → 403/409;COMPLIANCE 仅可延长;GOVERNANCE bypass 头;Legal Hold 最严优先;桶删除/版本化关闭拦截

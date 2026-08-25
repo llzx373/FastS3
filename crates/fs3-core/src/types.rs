@@ -315,6 +315,33 @@ pub struct Retention {
     pub retain_until: i64,
 }
 
+/// 桶默认保留的时间单位(ADR-13;AWS Object Lock Years = 365 天)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RetentionPeriodUnit {
+    Days,
+    Years,
+}
+
+/// 桶默认保留规则(ADR-13:BucketMeta 尾部追加;`Days` XOR `Years`)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectLockDefaultRetention {
+    pub mode: RetentionMode,
+    pub unit: RetentionPeriodUnit,
+    /// 天数或年数(≥ 1;协议层校验)。
+    pub n: i32,
+}
+
+impl ObjectLockDefaultRetention {
+    /// 从 `from_unix` 起算的 retain-until(unix 秒)。Years = 365 天。
+    pub fn retain_until(&self, from_unix: i64) -> i64 {
+        let days = match self.unit {
+            RetentionPeriodUnit::Days => self.n as i64,
+            RetentionPeriodUnit::Years => self.n as i64 * 365,
+        };
+        from_unix.saturating_add(days.saturating_mul(86_400))
+    }
+}
+
 /// ETag 计算模式(M5「CPU 优化」etag=fast 降级开关;DESIGN §6.7)。
 ///
 /// - `Md5`(默认):严格 S3 兼容,返回 MD5 摘要;
@@ -554,6 +581,9 @@ pub struct BucketMeta {
     /// v1.3 填充(ADR-11 D0):Object Lock 启用位(§5.1;启用后不可关闭,
     /// 开启自动连带版本化)。
     pub object_lock: bool,
+    /// v1.3 填充(ADR-13):桶默认保留;None = 无默认(Enabled 仍可无 Rule)。
+    /// 尾部追加,decode 双读无该字段的 v2 存量。
+    pub default_retention: Option<ObjectLockDefaultRetention>,
 }
 
 /// 桶元数据值格式版本(ADR-11:`[version: u8 = 2] + postcard(BucketMeta)`;
@@ -663,9 +693,10 @@ impl BucketMeta {
             })
     }
 
-    /// 解码桶值(M10/ADR-11 双读):首字节 == BUCKET_META_VERSION 且新格式
-    /// 解码成功 → v2;否则按存量格式回退(v1.1.0 五字段优先、v1.0.0 四字段
-    /// 次之,均无版本字节),存量桶零迁移读取。
+    /// 解码桶值(M10/ADR-11 双读 + ADR-13 尾部字段):首字节 ==
+    /// BUCKET_META_VERSION 且新格式解码成功 → 现 v2(含 default_retention);
+    /// 失败则回退无 default_retention 的 v2 形态;再否则按存量无版本字节
+    /// 格式回退(v1.1.0 五字段优先、v1.0.0 四字段次之)。
     ///
     /// 首字节消歧论证:存量值首字段 `created` 为 unix 秒,postcard 按 zigzag
     /// varint 编码;现实时间戳(≥ 1.7e9 秒)zigzag 后逾 34 亿,首字节必带
@@ -675,6 +706,9 @@ impl BucketMeta {
         if buf.first() == Some(&BUCKET_META_VERSION) {
             if let Ok(m) = postcard::from_bytes::<BucketMeta>(&buf[1..]) {
                 return Ok(m);
+            }
+            if let Ok(old) = postcard::from_bytes::<BucketMetaV2NoDefault>(&buf[1..]) {
+                return Ok(old.into());
             }
             // 新格式解码失败:上述 1970 年理论歧义或损坏,继续按存量格式
             // 尝试,均失败 → Corrupt。
@@ -686,6 +720,35 @@ impl BucketMeta {
                     .map_err(|e| Error::Corrupt(format!("postcard decode bucket meta: {e}")))?;
                 Ok(l.into())
             }
+        }
+    }
+}
+
+/// M12 之前的 BucketMeta v2(无 default_retention 尾部;ADR-13 双读回退)。
+#[derive(Serialize, Deserialize)]
+struct BucketMetaV2NoDefault {
+    created: i64,
+    owner: String,
+    stats: BucketStats,
+    quota: Option<u64>,
+    created_with_acl: bool,
+    versioning: VersioningState,
+    default_encryption: Option<SseAlgorithm>,
+    object_lock: bool,
+}
+
+impl From<BucketMetaV2NoDefault> for BucketMeta {
+    fn from(l: BucketMetaV2NoDefault) -> Self {
+        BucketMeta {
+            created: l.created,
+            owner: l.owner,
+            stats: l.stats,
+            quota: l.quota,
+            created_with_acl: l.created_with_acl,
+            versioning: l.versioning,
+            default_encryption: l.default_encryption,
+            object_lock: l.object_lock,
+            default_retention: None,
         }
     }
 }
@@ -711,6 +774,7 @@ impl From<BucketMetaV1> for BucketMeta {
             versioning: VersioningState::Off,
             default_encryption: None,
             object_lock: false,
+            default_retention: None,
         }
     }
 }
@@ -735,6 +799,7 @@ impl From<LegacyBucketMeta> for BucketMeta {
             versioning: VersioningState::Off,
             default_encryption: None,
             object_lock: false,
+            default_retention: None,
         }
     }
 }
@@ -1612,6 +1677,11 @@ mod tests {
             versioning: VersioningState::Suspended,
             default_encryption: Some(SseAlgorithm::Aes256),
             object_lock: true,
+            default_retention: Some(ObjectLockDefaultRetention {
+                mode: RetentionMode::Compliance,
+                unit: RetentionPeriodUnit::Days,
+                n: 30,
+            }),
         };
         let v = m.encode_value().unwrap();
         assert_eq!(v[0], BUCKET_META_VERSION);
@@ -1640,6 +1710,37 @@ mod tests {
         assert_eq!(dec.versioning, VersioningState::Off);
         assert_eq!(dec.default_encryption, None);
         assert!(!dec.object_lock);
+        assert_eq!(dec.default_retention, None);
+        // M12 ADR-13:无 default_retention 的 v2 值双读补 None
+        #[derive(serde::Serialize)]
+        struct BucketMetaV2NoDefault {
+            created: i64,
+            owner: String,
+            stats: BucketStats,
+            quota: Option<u64>,
+            created_with_acl: bool,
+            versioning: VersioningState,
+            default_encryption: Option<SseAlgorithm>,
+            object_lock: bool,
+        }
+        let mut old_v2 = vec![BUCKET_META_VERSION];
+        old_v2.extend(
+            postcard::to_allocvec(&BucketMetaV2NoDefault {
+                created: m.created,
+                owner: "u".into(),
+                stats: m.stats,
+                quota: m.quota,
+                created_with_acl: true,
+                versioning: VersioningState::Enabled,
+                default_encryption: None,
+                object_lock: true,
+            })
+            .unwrap(),
+        );
+        let dec = BucketMeta::decode_value(&old_v2).unwrap();
+        assert!(dec.object_lock);
+        assert_eq!(dec.versioning, VersioningState::Enabled);
+        assert_eq!(dec.default_retention, None);
         // v1.0.0 存量值(四字段)回退:created_with_acl = false
         #[derive(serde::Serialize)]
         struct LegacyBucket {
@@ -1658,6 +1759,7 @@ mod tests {
         let dec = BucketMeta::decode_value(&v10).unwrap();
         assert!(!dec.created_with_acl);
         assert_eq!(dec.versioning, VersioningState::Off);
+        assert_eq!(dec.default_retention, None);
         // 损坏值(空/垃圾)→ Corrupt
         assert!(matches!(
             BucketMeta::decode_value(&[]),
@@ -1685,6 +1787,22 @@ mod tests {
         // 回读一致性
         let dec: VersioningState = postcard::from_bytes(&[2]).unwrap();
         assert_eq!(dec, VersioningState::Suspended);
+    }
+
+    #[test]
+    fn default_retention_years_are_365_days() {
+        let d = ObjectLockDefaultRetention {
+            mode: RetentionMode::Governance,
+            unit: RetentionPeriodUnit::Days,
+            n: 1,
+        };
+        assert_eq!(d.retain_until(0), 86_400);
+        let y = ObjectLockDefaultRetention {
+            mode: RetentionMode::Compliance,
+            unit: RetentionPeriodUnit::Years,
+            n: 1,
+        };
+        assert_eq!(y.retain_until(0), 365 * 86_400);
     }
 
     proptest::proptest! {

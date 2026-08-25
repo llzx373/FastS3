@@ -2952,6 +2952,7 @@ mod tests {
             versioning: fs3_core::VersioningState::Off,
             default_encryption: None,
             object_lock: false,
+            default_retention: None,
         };
         let xml = render_list_buckets("owner1", &[("b1".into(), meta)], false, None);
         assert!(xml.contains(
