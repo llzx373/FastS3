@@ -846,6 +846,38 @@ v1.5~v1.6 立项 B2(布局版本 +1,迁移 = meta-export/import 或在线搬迁)
 **perf 口径**:zstd level1 写 ~500MB/s/核 + 解压 ~1.5GB/s/核(文档化);
 再平衡开启后前台 p99 回退 <10%(门禁 §6.4);默认全关路径零变化(无
 zstd 依赖热路径开销)。
+
+#### ADR-16(M13 N2-1 spike 结论):rust-rocksdb 自定义 Env 挂载可行性
+
+**问题**:设备内元数据(BlueFS 路线 B2)需要 rocksdb 经自定义 `Env` 落盘到
+设备内微型文件系统;先验证 rust-rocksdb 绑定是否提供该挂载点(1 pw spike,
+ADR-15 DM5 的 B1 步)。
+
+**spike 发现(rust-rocksdb 0.25.0,源码 + 实测)**:
+
+1. **挂载点存在**:`Options::set_env(&Env)`(db_options.rs:1403)与
+   `Env::from_raw(*mut rocksdb_env_t)`(env.rs:71)均可用;`Env::mem_env()`
+   实测全链路成立(打开/写入/读取/flush 通过,见 fs3-meta spike 测试)。
+2. **关键限制**:可构造的 Env 只有默认 env / mem env;`from_raw` 只接收
+   **C++ 层的 env 指针** —— rust-rocksdb 无法从纯 Rust 合成 C++ 的
+   `rocksdb::Env` 子类,而 BlueFS 式设备内 VFS(约 40 个虚方法:
+   NewSequentialFile/NewRandomAccessFile/NewWritableFile/GetChildren/
+   LockFile/FileExists/DeleteFile/GetFileSize/…)必须实现该 C++ 子类。
+   因此 B2 的工程形态 = **C++ shim(cc crate 编译)+ bindgen FFI**,而非
+   纯 Rust 扩展绑定;该工作量与 DESIGN-FUTURE §6.2 的 N3 预算(5~7 pw)
+   一致。
+
+**裁决(按 ADR-15 DM5 的决策规则)**:
+
+- spike **技术性通过**(挂载点可行、mem_env 验证了 plumb 全链路),但
+  **不追加 N3 立项**——现阶段无设备内元数据的实际用户诉求,v1.4/v1.5
+  内 **方案 C(同盘元数据,已交付)常态化并文档化局限**:
+  - 局限 1:元数据仍走 OS 文件系统(少一层 FS 日志的收益未拿到);
+  - 局限 2:单盘整体迁移已满足(meta 与镜像同目录,抽盘演练 N4-1 通过);
+  - 局限 3:掉盘时元数据与数据同命运(与「抽盘即迁移」目标一致,视为特性)。
+- N3 立项条件(持有):出现设备内元数据的实际诉求(如裸设备无根分区可挂
+  载、元数据 I/O 成为瓶颈)时,以 C++ shim + bindgen 形态立项,预算沿用
+  5~7 pw;挂载点代码示例(本 spike 测试)可直接作为 N3 的起点。
 ---
 
 ## 4. 存储引擎设计(Rust)

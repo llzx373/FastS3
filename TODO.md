@@ -346,7 +346,7 @@
 
 ### N. 设备内元数据(§6.2)
 - [x] N1-1 布局 v3 元数据区字段(超块 metadata_offset/len)+ 方案 C(同盘元数据分区)初始化 + init 向导集成
-- [ ] N2-1 BlueFS spike:rust-rocksdb 自定义 Env 挂载可行性验证(1 pw)→ 结论 ADR(spike 通过 → 追加 N3 立项;不通过 → 方案 C 常态化 + 文档化局限)
+- [x] N2-1 BlueFS spike:rust-rocksdb 自定义 Env 挂载可行性验证(1 pw)→ 结论 ADR(spike 通过 → 追加 N3 立项;不通过 → 方案 C 常态化 + 文档化局限)(ADR-16:挂载点可行,C++ shim 形态;暂不立项 N3,方案 C 常态化)
 - [x] N4-1 抽盘迁移演练(元数据分区形态:单盘抽离 → 异机导入 → 对象 md5 一致)
 - [ ] (待立项)N3 设备内 mini-FS + rocksdb 挂载(5~7 pw,spike 通过后拆细)
 

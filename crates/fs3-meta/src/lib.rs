@@ -5968,3 +5968,39 @@ mod tests {
         assert_eq!(p2.entries[0].key, "c");
     }
 }
+
+#[cfg(test)]
+mod m13_spike_tests {
+    //! M13 N2-1 BlueFS spike:rust-rocksdb 自定义 Env 挂载可行性验证。
+    //!
+    //! 结论(ADR-16):挂载点**可行**——`Options::set_env` + `Env::from_raw`
+    //! 存在且 mem_env 全链路可用(本例);但**自定义设备内 Env 必须实现
+    //! C++ rocksdb::Env 子类**(约 40 个 VFS 方法),纯 Rust 绑定无法
+    //! 合成 C++ 子类 —— 需要 C++ shim(cc crate)+ bindgen 形态,工程量
+    //! 即为 DESIGN-FUTURE §6.2 N3 的 5~7 pw 预算。v1.4 按 ADR-15 DM5
+    //! 既定路线把方案 C(同盘元数据)常态化,不追加 N3 立项。
+
+    use rocksdb::{Env, Options};
+
+    #[test]
+    fn spike_env_mount_point_mem_env_roundtrip() {
+        // 1) 挂载点存在:Options::set_env(&Env)
+        let mut opts = Options::default();
+        let env = Env::mem_env().expect("rocksdb_create_mem_env must exist");
+        opts.set_env(&env); // mem env = 非文件存储任务委托 base env
+        opts.create_if_missing(true);
+        // 2) mem env 下 DB 可用(证明 Env 挂载后全链路成立)
+        let dir = tempfile::tempdir().unwrap();
+        let db = rocksdb::DB::open(&opts, dir.path()).expect("open with mem env");
+        db.put(b"k", b"v").unwrap();
+        assert_eq!(db.get(b"k").unwrap().unwrap(), b"v");
+        db.flush().unwrap();
+        // 3) from_raw 存在(自定义 Env 需 C++ 层产出的原始指针):
+        //    unsafe Env::from_raw(*mut rocksdb_env_t) —— 仅签名验证
+        //    (不实际调用;默认 env 指针由 Env::new 管理,不重复 from_raw)
+        let _env_default = Env::new().expect("default env");
+        // 4) 持久性语义:mem env 数据进程内可读;重启即失(mem env 定位,
+        //    非持久路径 —— 结论:设备内元数据持久化仍需自有 VFS,见 ADR-16)
+        assert_eq!(db.get(b"k").unwrap().unwrap(), b"v");
+    }
+}

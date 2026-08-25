@@ -18,3 +18,5 @@ postcard.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true
+# M13 N2-1 BlueFS spike:直接使用 rust-rocksdb Env API(挂载点验证)
+rocksdb = { workspace = true }
