@@ -55,6 +55,17 @@ pub fn parse_retention_mode(v: &str) -> Result<RetentionMode, S3Error> {
     }
 }
 
+/// XML 体中的 Mode(PutObjectRetention / 默认保留):非法值 → MalformedXML
+/// (s3-tests object_lock_*_invalid_mode)。
+fn parse_retention_mode_xml(v: &str) -> Result<RetentionMode, S3Error> {
+    match v {
+        "GOVERNANCE" => Ok(RetentionMode::Governance),
+        "COMPLIANCE" => Ok(RetentionMode::Compliance),
+        _ => Err(S3Error::new(S3ErrorCode::MalformedXML)
+            .with_message(format!("invalid Object Lock mode: {v}"))),
+    }
+}
+
 pub fn mode_name(m: RetentionMode) -> &'static str {
     match m {
         RetentionMode::Governance => "GOVERNANCE",
@@ -191,7 +202,7 @@ pub fn parse_retention_body(body: &[u8]) -> Result<Retention, S3Error> {
                 };
                 match local.as_slice() {
                     b"Retention" => saw_root = true,
-                    b"Mode" => mode = Some(parse_retention_mode(&text(&mut reader)?)?),
+                    b"Mode" => mode = Some(parse_retention_mode_xml(&text(&mut reader)?)?),
                     b"RetainUntilDate" => {
                         let v = text(&mut reader)?;
                         until = Some(xml::parse_iso8601(&v).ok_or_else(|| {
@@ -251,7 +262,13 @@ pub fn parse_legal_hold_body(body: &[u8]) -> Result<bool, S3Error> {
                         .read_text(e.name())
                         .map_err(|err| malformed(format!("malformed XML: {err}")))?;
                     let v = xml_unescape(raw.as_ref()).map_err(malformed)?;
-                    status = Some(parse_legal_hold(&v)?);
+                    status = Some(match v.as_str() {
+                        "ON" => true,
+                        "OFF" => false,
+                        _ => {
+                            return Err(malformed(format!("invalid LegalHold Status: {v}")));
+                        }
+                    });
                 }
             }
             Ok(quick_xml::events::Event::Eof) => break,
@@ -380,6 +397,13 @@ mod tests {
         assert!(on);
         let off = parse_legal_hold_body(render_legal_hold(false).as_bytes()).unwrap();
         assert!(!off);
+        let e = parse_legal_hold_body(b"<LegalHold><Status>abc</Status></LegalHold>").unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::MalformedXML);
+        let e = parse_retention_body(
+            b"<Retention><Mode>governance</Mode><RetainUntilDate>2026-01-01T00:00:00.000Z</RetainUntilDate></Retention>",
+        )
+        .unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::MalformedXML);
     }
 
     #[test]

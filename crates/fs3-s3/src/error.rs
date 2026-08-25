@@ -46,8 +46,9 @@ pub enum S3ErrorCode {
     InvalidAddressingHeader,
     InvalidArgument,
     InvalidBucketName,
-    /// 桶状态不允许该操作(M12 W2-2:Object Lock 桶禁止 Suspend 版本化;
-    /// 409,与 AWS InvalidBucketState 同码)。
+    /// 桶状态不允许该操作(M12:Object Lock 桶禁止 Suspend 版本化;
+    /// PutObjectLockConfiguration 在 Off/Suspended 桶上启用 → 409;
+    /// 与 AWS InvalidBucketState 同码)。
     InvalidBucketState,
     InvalidDigest,
     InvalidEncryptionAlgorithmError,
@@ -61,6 +62,9 @@ pub enum S3ErrorCode {
     InvalidPayer,
     InvalidPolicyDocument,
     InvalidRange,
+    /// Object Lock 默认保留 Days/Years 非法(n < 1;M12 W5-1,s3-tests
+    /// `InvalidRetentionPeriod`)。
+    InvalidRetentionPeriod,
     InvalidRequest,
     /// 预留:AWS 通用参数码;本实现具体参数错误统一归 InvalidArgument。
     InvalidRequestParameter,
@@ -196,6 +200,9 @@ impl S3ErrorCode {
             InvalidPayer => "All access to this object has been disabled.",
             InvalidPolicyDocument => "The content of the form does not meet the conditions specified in the policy document.",
             InvalidRange => "The requested range is not satisfiable",
+            InvalidRetentionPeriod => {
+                "retention period must be a positive integer value"
+            }
             InvalidRequest => "Invalid Request",
             InvalidRequestParameter => "Invalid Request Parameter",
             InvalidSignature => "The request signature we calculated does not match the signature you provided. Check your AWS secret access key and signing method.",

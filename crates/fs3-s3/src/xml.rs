@@ -1343,11 +1343,14 @@ pub struct DeletedEntry {
     pub delete_marker_version_id: Option<String>,
 }
 
+/// DeleteObjects 错误项(M12 W5-1:AWS/s3-tests 要求 Error 带回显 VersionId)。
+pub type DeleteError<'a> = (String, Option<String>, &'a str, &'a str); // key, versionId, code, message
+
 /// DeleteObjects 响应(Quiet/Verbose;版本化语义 ADR-11 §3.4.4)。
 pub fn render_delete_result(
     quiet: bool,
     deleted: &[DeletedEntry],
-    errors: &[(String, &str, &str)], // (key, code, message)
+    errors: &[DeleteError<'_>],
 ) -> String {
     let mut xml = String::with_capacity(256);
     let _ = write!(
@@ -1373,11 +1376,14 @@ pub fn render_delete_result(
             xml.push_str("</Deleted>");
         }
     }
-    for (key, code, msg) in errors {
+    for (key, version_id, code, msg) in errors {
+        let _ = write!(xml, "<Error><Key>{}</Key>", escape_xml(key));
+        if let Some(v) = version_id {
+            let _ = write!(xml, "<VersionId>{}</VersionId>", escape_xml(v));
+        }
         let _ = write!(
             xml,
-            "<Error><Key>{}</Key><Code>{}</Code><Message>{}</Message></Error>",
-            escape_xml(key),
+            "<Code>{}</Code><Message>{}</Message></Error>",
             escape_xml(code),
             escape_xml(msg)
         );
@@ -1845,7 +1851,7 @@ pub fn parse_object_lock_configuration(
                     b"ObjectLockEnabled" => {
                         let v = text(&mut reader)?;
                         if v != "Enabled" {
-                            return Err(S3Error::new(S3ErrorCode::InvalidArgument).with_message(
+                            return Err(S3Error::new(S3ErrorCode::MalformedXML).with_message(
                                 "ObjectLockEnabled must be Enabled (cannot be disabled)",
                             ));
                         }
@@ -1866,11 +1872,11 @@ pub fn parse_object_lock_configuration(
                     b"Days" => {
                         let v = text(&mut reader)?;
                         let n: i32 = v.parse().map_err(|_| {
-                            S3Error::new(S3ErrorCode::InvalidArgument)
-                                .with_message("Days must be a positive integer")
+                            S3Error::new(S3ErrorCode::MalformedXML)
+                                .with_message("Days must be an integer")
                         })?;
                         if n < 1 {
-                            return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                            return Err(S3Error::new(S3ErrorCode::InvalidRetentionPeriod)
                                 .with_message("Days must be >= 1"));
                         }
                         days = Some(n);
@@ -1878,11 +1884,11 @@ pub fn parse_object_lock_configuration(
                     b"Years" => {
                         let v = text(&mut reader)?;
                         let n: i32 = v.parse().map_err(|_| {
-                            S3Error::new(S3ErrorCode::InvalidArgument)
-                                .with_message("Years must be a positive integer")
+                            S3Error::new(S3ErrorCode::MalformedXML)
+                                .with_message("Years must be an integer")
                         })?;
                         if n < 1 {
-                            return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                            return Err(S3Error::new(S3ErrorCode::InvalidRetentionPeriod)
                                 .with_message("Years must be >= 1"));
                         }
                         years = Some(n);
@@ -3438,6 +3444,7 @@ mod tests {
             ],
             &[(
                 "k3".into(),
+                Some("deadbeef".into()),
                 "NoSuchKey",
                 "The specified key does not exist.",
             )],
@@ -3446,7 +3453,8 @@ mod tests {
         assert!(xml.contains(
             "<Deleted><Key>k2</Key><VersionId>null</VersionId><DeleteMarker>true</DeleteMarker><DeleteMarkerVersionId>null</DeleteMarkerVersionId></Deleted>"
         ));
-        assert!(xml.contains("<Error><Key>k3</Key><Code>NoSuchKey</Code>"));
+        assert!(xml
+            .contains("<Error><Key>k3</Key><VersionId>deadbeef</VersionId><Code>NoSuchKey</Code>"));
         let quiet_xml = render_delete_result(true, &[entry("k1", None, false, None)], &[]);
         assert!(!quiet_xml.contains("<Deleted>"));
     }
@@ -4050,7 +4058,17 @@ mod tests {
             b"<ObjectLockConfiguration><ObjectLockEnabled>Disabled</ObjectLockEnabled></ObjectLockConfiguration>",
         )
         .unwrap_err();
-        assert_eq!(e.code, S3ErrorCode::InvalidArgument);
+        assert_eq!(e.code, S3ErrorCode::MalformedXML);
+        let e = parse_object_lock_configuration(
+            b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>0</Days></DefaultRetention></Rule></ObjectLockConfiguration>",
+        )
+        .unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::InvalidRetentionPeriod);
+        let e = parse_object_lock_configuration(
+            b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Years>-1</Years></DefaultRetention></Rule></ObjectLockConfiguration>",
+        )
+        .unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::InvalidRetentionPeriod);
         let e = parse_object_lock_configuration(b"<oops/>").unwrap_err();
         assert_eq!(e.code, S3ErrorCode::MalformedXML);
         let e = parse_object_lock_configuration(

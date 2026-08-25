@@ -628,6 +628,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
           if (hasYears) cfg.DefaultRetention.Years = d.Years as number;
         }
         try {
+          await m10.putBucketVersioning(req.params.name, "Enabled");
           await m10.putObjectLockConfiguration(req.params.name, cfg);
           return cfg;
         } catch (e) {

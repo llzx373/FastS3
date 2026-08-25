@@ -54,6 +54,9 @@ test("GET/PUT /api/buckets/:name/object-lock 中转配置;拒绝关闭", async (
   let stored: ObjectLockConfig = { ObjectLockEnabled: false };
   const fake = {
     getObjectLockConfiguration: async () => stored,
+    putBucketVersioning: async (bucket: string, status: string) => {
+      calls.push(`ver:${bucket}:${status}`);
+    },
     putObjectLockConfiguration: async (bucket: string, cfg: ObjectLockConfig) => {
       calls.push(`put:${bucket}`);
       stored = cfg;
@@ -78,7 +81,7 @@ test("GET/PUT /api/buckets/:name/object-lock 中转配置;拒绝关闭", async (
     ObjectLockEnabled: true,
     DefaultRetention: { Mode: "GOVERNANCE", Days: 7 },
   });
-  assert.deepEqual(calls, ["put:b1"]);
+  assert.deepEqual(calls, ["ver:b1:Enabled", "put:b1"]);
 
   r = await authReq(app, "PUT", "/api/buckets/b1/object-lock", {
     ObjectLockEnabled: true,

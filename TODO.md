@@ -279,7 +279,7 @@
 - [x] W4-3 管理面:锁状态展示/保留编辑/审计过滤
 
 ### W5 测试(≈1.5 pw)
-- [ ] W5-1 s3-tests object_lock/legal/retention/governance 族出排除集且 100%
+- [x] W5-1 s3-tests object_lock/legal/retention/governance 族出排除集且 100%
 - [ ] W5-2 时钟回拨注入(回拨 1h/1d)→ COMPLIANCE 保留不可缩短(自动化断言)
 - [ ] W5-3 崩溃 500 轮(锁+删除混载);强制矩阵逐格测试(§5.4 表)
 

@@ -2567,6 +2567,21 @@ impl S3Service {
         default_retention: Option<fs3_core::ObjectLockDefaultRetention>,
     ) -> Result<ServiceResponse, S3Error> {
         let engine = self.engine.write();
+        let bkt = engine
+            .meta()
+            .get_bucket(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?
+            .ok_or_else(|| {
+                S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket)
+            })?;
+        // AWS / s3-tests:未锁桶上启用 Object Lock 要求 Versioning=Enabled;
+        // Off/Suspended → 409 InvalidBucketState。已锁桶只改默认保留。
+        // CreateBucket `x-amz-bucket-object-lock-enabled: true` 仍自动开版本化。
+        if !bkt.object_lock && bkt.versioning != fs3_core::VersioningState::Enabled {
+            return Err(S3Error::new(S3ErrorCode::InvalidBucketState).with_message(
+                "versioning must be Enabled before Object Lock can be enabled on an existing bucket",
+            ));
+        }
         engine
             .meta()
             .commit_bucket_set_object_lock(bucket, default_retention)
@@ -5265,9 +5280,10 @@ impl S3Service {
             return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
         };
         let mut deleted: Vec<xml::DeletedEntry> = Vec::new();
-        let mut errors: Vec<(String, &str, &str)> = Vec::new();
+        let mut errors: Vec<xml::DeleteError<'_>> = Vec::new();
         for entry in keys {
             let key = entry.key.as_str();
+            let req_vid = entry.version_id.clone();
             // 条目 VersionId:"null" → null 族;32 hex → 精确版本;非法 →
             // 该条 InvalidArgument(沿用现状口径)
             let varg = match entry.version_id.as_deref() {
@@ -5279,6 +5295,7 @@ impl S3Service {
                         Err(_) => {
                             errors.push((
                                 key.into(),
+                                req_vid,
                                 "InvalidArgument",
                                 "Invalid version id specified",
                             ));
@@ -5289,6 +5306,7 @@ impl S3Service {
                 Some(_) => {
                     errors.push((
                         key.into(),
+                        req_vid,
                         "InvalidArgument",
                         "Invalid version id specified",
                     ));
@@ -5303,6 +5321,7 @@ impl S3Service {
             {
                 errors.push((
                     key.into(),
+                    req_vid,
                     "InvalidArgument",
                     "Invalid version id specified",
                 ));
@@ -5323,6 +5342,7 @@ impl S3Service {
                         None => {
                             errors.push((
                                 key.into(),
+                                req_vid.clone(),
                                 "InvalidArgument",
                                 "Invalid LastModifiedTime specified",
                             ));
@@ -5348,6 +5368,7 @@ impl S3Service {
                         CoreError::PreconditionFailed(_) => {
                             errors.push((
                                 key.into(),
+                                req_vid.clone(),
                                 "PreconditionFailed",
                                 "At least one of the pre-conditions you specified did not hold",
                             ));
@@ -5396,10 +5417,11 @@ impl S3Service {
                     deleted.push(de);
                 }
                 Err(CoreError::AccessDenied(_)) => {
-                    errors.push((key.to_string(), "AccessDenied", "Access Denied"))
+                    errors.push((key.to_string(), req_vid, "AccessDenied", "Access Denied"))
                 }
                 Err(_) => errors.push((
                     key.to_string(),
+                    req_vid,
                     "InternalError",
                     "We encountered an internal error. Please try again.",
                 )),

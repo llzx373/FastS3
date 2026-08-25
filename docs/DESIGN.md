@@ -753,9 +753,10 @@ postcard `TrustedClockState{last_wall: i64(unix 秒), last_mono_ns: i64
 
 **协议面口径(以 AWS + s3-tests 为裁决,实施期对照)**:
 
-- 开启:CreateBucket 头 `x-amz-bucket-object-lock-enabled: true`,或对已有
-  桶 `PutObjectLockConfiguration`(`ObjectLockEnabled=Enabled`);Enabled
-  **不可逆**;开启**自动开启版本化且此后不可关**(PutBucketVersioning
+- 开启:CreateBucket 头 `x-amz-bucket-object-lock-enabled: true`,或对**已
+  Enabled 版本化**的桶 `PutObjectLockConfiguration`(`ObjectLockEnabled=Enabled`;
+  Off/Suspended → 409 `InvalidBucketState`,与 AWS / s3-tests 一致);Enabled
+  **不可逆**;CreateBucket 锁头路径**自动开启版本化且此后不可关**(PutBucketVersioning
   Enabled→Off / Suspended 在锁桶上均拒绝);桶含锁定对象不可删。
 - 对象级:PUT 头 `x-amz-object-lock-mode` /
   `x-amz-object-lock-retain-until-date` / `x-amz-object-lock-legal-hold`;

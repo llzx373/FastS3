@@ -2060,6 +2060,17 @@ fn get_versioning(svc: &S3Service, bucket: &str) -> String {
     body_str(&r)
 }
 
+/// CreateBucket + `x-amz-bucket-object-lock-enabled: true`(自动 Enabled 版本化)。
+fn create_lock_bucket(svc: &S3Service, bucket: &str) {
+    let r = svc.handle(&req_h(
+        "PUT",
+        &format!("/{bucket}"),
+        &[("x-amz-bucket-object-lock-enabled", "true")],
+        vec![],
+    ));
+    assert_eq!(status(&r), 200, "create lock bucket {bucket}: {r:?}");
+}
+
 #[test]
 fn versioning_state_machine() {
     let (_d, svc) = setup();
@@ -7467,9 +7478,21 @@ fn bucket_object_lock_configuration_apis() {
     assert_eq!(status(&r), 404, "{r:?}");
     assert_eq!(err_code(&r), "ObjectLockConfigurationNotFoundError");
 
-    // PUT Enabled(无 Rule)→ 200;GET 回显 Enabled、无 Rule;连带版本化 Enabled
+    // Off 桶 PutLock → 409 InvalidBucketState(s3-tests / AWS)
     let enabled = b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>".to_vec();
-    let r = svc.handle(&req_q("PUT", "/olock", q, enabled));
+    let r = svc.handle(&req_q("PUT", "/olock", q, enabled.clone()));
+    assert_eq!(status(&r), 409, "{r:?}");
+    assert_eq!(err_code(&r), "InvalidBucketState");
+
+    // Suspended 同样 409
+    assert_eq!(status(&put_versioning(&svc, "olock", "Suspended")), 200);
+    let r = svc.handle(&req_q("PUT", "/olock", q, enabled.clone()));
+    assert_eq!(status(&r), 409, "{r:?}");
+    assert_eq!(err_code(&r), "InvalidBucketState");
+
+    // Versioning=Enabled 后 PutLock → 200;GET 回显 Enabled、无 Rule
+    assert_eq!(status(&put_versioning(&svc, "olock", "Enabled")), 200);
+    let r = svc.handle(&req_q("PUT", "/olock", q, enabled.clone()));
     assert_eq!(status(&r), 200, "{r:?}");
     let r = svc.handle(&req_q("GET", "/olock", q, vec![]));
     assert_eq!(status(&r), 200, "{r:?}");
@@ -7543,7 +7566,7 @@ fn bucket_object_lock_configuration_apis() {
     // ObjectLockEnabled ≠ Enabled → 400;桶不存在 → NoSuchBucket
     let dis = b"<ObjectLockConfiguration><ObjectLockEnabled>Disabled</ObjectLockEnabled></ObjectLockConfiguration>".to_vec();
     let r = svc.handle(&req_q("PUT", "/olock", q, dis));
-    assert_eq!(err_code(&r), "InvalidArgument", "{r:?}");
+    assert_eq!(err_code(&r), "MalformedXML", "{r:?}");
     let r = svc.handle(&req_q("PUT", "/ghost", q, b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>".to_vec()));
     assert_eq!(err_code(&r), "NoSuchBucket", "{r:?}");
     let r = svc.handle(&req_q("GET", "/ghost", q, vec![]));
@@ -7558,7 +7581,7 @@ fn object_lock_put_headers_and_retention_apis() {
     let ret_q = &[("retention", "")];
     let hold_q = &[("legal-hold", "")];
     // 建锁桶 + 默认保留 7 天 GOVERNANCE
-    assert_eq!(status(&svc.handle(&req("PUT", "/olk", vec![]))), 200);
+    create_lock_bucket(&svc, "olk");
     let cfg = b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>7</Days></DefaultRetention></Rule></ObjectLockConfiguration>".to_vec();
     assert_eq!(status(&svc.handle(&req_q("PUT", "/olk", ol, cfg))), 200);
 
@@ -7673,7 +7696,7 @@ fn object_lock_bypass_requires_policy_action() {
     let (_d, svc) = setup();
     let ol = &[("object-lock", "")];
     let ret_q = &[("retention", "")];
-    assert_eq!(status(&svc.handle(&req("PUT", "/olk", vec![]))), 200);
+    create_lock_bucket(&svc, "olk");
     let cfg = b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>7</Days></DefaultRetention></Rule></ObjectLockConfiguration>".to_vec();
     assert_eq!(status(&svc.handle(&req_q("PUT", "/olk", ol, cfg))), 200);
     assert_eq!(
@@ -7726,21 +7749,12 @@ fn object_lock_enforcement_matrix() {
     let ol = &[("object-lock", "")];
     let hold_q = &[("legal-hold", "")];
     let bypass = &[("x-amz-bypass-governance-retention", "true")];
-    assert_eq!(status(&svc.handle(&req("PUT", "/olk", vec![]))), 200);
+    create_lock_bucket(&svc, "olk");
     let cfg = b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>".to_vec();
     assert_eq!(status(&svc.handle(&req_q("PUT", "/olk", ol, cfg))), 200);
 
     // 空锁桶可删
-    assert_eq!(status(&svc.handle(&req("PUT", "/empty-ol", vec![]))), 200);
-    assert_eq!(
-        status(&svc.handle(&req_q(
-            "PUT",
-            "/empty-ol",
-            ol,
-            b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>".to_vec()
-        ))),
-        200
-    );
+    create_lock_bucket(&svc, "empty-ol");
     assert_eq!(
         status(&svc.handle(&req("DELETE", "/empty-ol", vec![]))),
         204
@@ -7868,7 +7882,7 @@ fn object_lock_audit_bypass_and_retention() {
     let ol = &[("object-lock", "")];
     let ret_q = &[("retention", "")];
     let bypass = &[("x-amz-bypass-governance-retention", "true")];
-    assert_eq!(status(&svc.handle(&req("PUT", "/olk", vec![]))), 200);
+    create_lock_bucket(&svc, "olk");
     let cfg = b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>".to_vec();
     assert_eq!(status(&svc.handle(&req_q("PUT", "/olk", ol, cfg))), 200);
     let until = "2030-01-01T00:00:00.000Z";
