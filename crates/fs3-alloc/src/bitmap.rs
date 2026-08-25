@@ -111,6 +111,60 @@ impl Bitmap {
         None
     }
 
+    /// 在 `[start, start+count)` 窗口内找一个空闲位并 CAS 置位(M13 M2-1
+    /// 每设备分配;hint 越界时从窗口起点开始;扫描覆盖窗口全部词)。
+    pub fn alloc_one_in_range(&self, hint: &mut u64, start: u64, count: u64) -> Option<u64> {
+        if count == 0 {
+            return None;
+        }
+        let end = start + count;
+        debug_assert!(end <= self.n);
+        let start_word = self.word_idx(start);
+        let end_word = self.word_idx(end - 1);
+        let nwords = end_word - start_word + 1;
+        let hint_word = if *hint < start || *hint >= end {
+            start_word
+        } else {
+            self.word_idx(*hint)
+        };
+        let start_bit_mask = !((1u64 << (start % 64)) - 1);
+        // end%64==0 → 末词(即 end-1 所在词)整词有效;否则屏蔽 >= end%64
+        let end_bit_mask = if end.is_multiple_of(64) {
+            u64::MAX
+        } else {
+            (1u64 << (end % 64)) - 1
+        };
+        for step in 0..nwords {
+            let wi = start_word + (hint_word - start_word + step) % nwords;
+            let w = &self.words[wi];
+            let mut cur = w.load(Ordering::Acquire);
+            loop {
+                let mut free = !cur;
+                if wi == start_word {
+                    free &= start_bit_mask;
+                }
+                if wi == end_word {
+                    free &= end_bit_mask;
+                }
+                if free == 0 {
+                    break;
+                }
+                let bit = free.trailing_zeros() as u64;
+                let id = wi as u64 * 64 + bit;
+                let mask = 1u64 << bit;
+                match w.compare_exchange_weak(cur, cur | mask, Ordering::AcqRel, Ordering::Acquire)
+                {
+                    Ok(_) => {
+                        *hint = id + 1;
+                        return Some(id);
+                    }
+                    Err(actual) => cur = actual,
+                }
+            }
+        }
+        None
+    }
+
     /// 序列化为字节(bit i → byte i/8 的第 i%8 位,LSB first)。
     pub fn serialize(&self) -> Vec<u8> {
         let nbytes = self.n.div_ceil(8) as usize;
@@ -246,6 +300,38 @@ mod tests {
         assert_eq!(ids[129], 129);
         assert_eq!(b.count_ones(), 130);
         assert!(b.alloc_one(&mut hint).is_none());
+    }
+
+    #[test]
+    fn alloc_one_in_range_confines_window() {
+        // M13 M2-1:窗口 [start, start+count) 只在该区间内分配
+        let b = Bitmap::new(200);
+        // 预占窗口外与前部位,确保 hint 无法越界
+        b.set_bit(0);
+        b.set_bit(199);
+        let mut hint = 0;
+        let mut got = Vec::new();
+        while let Some(id) = b.alloc_one_in_range(&mut hint, 8, 64) {
+            assert!((8..72).contains(&id), "id {id} outside window");
+            got.push(id);
+        }
+        assert_eq!(got.len(), 64, "window must yield exactly its free bits");
+        assert_eq!(got[0], 8);
+        assert_eq!(got[63], 71);
+        // 窗口写满后 → None
+        assert!(b.alloc_one_in_range(&mut hint, 8, 64).is_none());
+        // 窗口外未受影响
+        assert!(!b.test(7));
+        assert!(b.test(199));
+        // 非字节对齐窗口 + 跨词窗口
+        let c = Bitmap::new(300);
+        let mut h2 = 0;
+        let mut got2 = Vec::new();
+        while let Some(id) = c.alloc_one_in_range(&mut h2, 61, 130) {
+            assert!((61..191).contains(&id));
+            got2.push(id);
+        }
+        assert_eq!(got2.len(), 130);
     }
 
     #[test]

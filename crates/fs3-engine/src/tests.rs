@@ -6021,12 +6021,20 @@ fn multi_device_pool_put_get_checkpoint_roundtrip() -> Result<()> {
         e.put("b1", &format!("k{i}"), &mut Cursor::new(data.clone()))
             .unwrap();
     }
-    // 两设备都应有分配(池生效)
+    // 加权轮转(DM2):两设备都应有分配;权重按剩余空间(设备 1 更大 → 更多)
+    let d0 = &e.device_slots()[0];
     let d1 = &e.device_slots()[1];
+    let on_d0 = (d0.base..d0.base + d0.extent_count)
+        .filter(|&id| e.allocator().test_bit(id))
+        .count();
     let on_d1 = (d1.base..d1.base + d1.extent_count)
         .filter(|&id| e.allocator().test_bit(id))
         .count();
-    assert_eq!(on_d1, 1, "exactly one spare extent should land on device 1");
+    assert!(on_d0 >= 1, "weighted rotation must reach device 0");
+    assert!(
+        on_d1 > on_d0,
+        "larger device must take the larger share (d0={on_d0}, d1={on_d1})"
+    );
     e.checkpoint()?;
 
     // 读回一致
@@ -6151,5 +6159,110 @@ fn multi_device_manifest_uuid_mismatch_rejected() -> Result<()> {
         msg.contains("uuid does not match") || msg.contains("InvalidLayout"),
         "unexpected error: {msg}"
     );
+    Ok(())
+}
+
+#[test]
+fn per_device_open_extents_retained_across_rotation() -> Result<()> {
+    // M13 M2-1:等权重双盘,对象交替落盘;两盘开放 extent 同时存活
+    let (_d, _imgs, cfg) = setup_multi(&[64 * 1024 * 1024, 64 * 1024 * 1024]);
+    let mut e = open_engine(&cfg);
+    let data = vec![11u8; 300 * 1024];
+    for i in 0..8 {
+        e.put("b1", &format!("o{i}"), &mut Cursor::new(data.clone()))
+            .unwrap();
+    }
+    // SWRR 等权重 → 交替落盘;每设备开放 extent 跨对象存活
+    let snap = e.open_extent_snapshot();
+    assert!(
+        snap[0].is_some(),
+        "device 0 open extent must survive rotation"
+    );
+    assert!(snap[1].is_some(), "device 1 open extent must be active");
+    assert_ne!(
+        snap[0].map(|s| s.0),
+        snap[1].map(|s| s.0),
+        "open extents must be distinct per device"
+    );
+    for i in 0..8 {
+        let mut out = Vec::new();
+        e.get_to("b1", &format!("o{i}"), 0..data.len() as u64, &mut out)
+            .unwrap();
+        assert_eq!(out, data);
+    }
+    e.checkpoint()?;
+    e.close().unwrap();
+    drop(e);
+    // 重开:全部设备开放 extent 有头;数据一致零泄漏
+    let e2 = open_engine(&cfg);
+    for i in 0..8 {
+        let mut out = Vec::new();
+        e2.get_to("b1", &format!("o{i}"), 0..data.len() as u64, &mut out)
+            .unwrap();
+        assert_eq!(out, data);
+    }
+    assert!(e2.check_report().unwrap().leaks.is_empty());
+    e2.abort();
+    Ok(())
+}
+
+#[test]
+fn full_device_excluded_from_weighted_rotation() -> Result<()> {
+    // M13 M2-1:等尺寸双盘(各 1 extent);大对象填满设备 0 后,后续分配
+    // 全部落设备 1(剩余空间权重 = 0 的盘不再被轮转选为目标)
+    let (_d, _imgs, cfg) = setup_multi(&[8 * 1024 * 1024, 8 * 1024 * 1024]);
+    let mut e = open_engine(&cfg);
+    // 4MiB 对象 > 单 extent 容量(4MiB-4KiB)→ 溢出 4KiB 到第二盘
+    let big = vec![3u8; 4 * 1024 * 1024];
+    e.put("b1", "fill", &mut Cursor::new(big.clone())).unwrap();
+    let d0_base = e.device_slots()[0].base;
+    let d0_count = e.device_slots()[0].extent_count;
+    let d1_base = e.device_slots()[1].base;
+    let d1_count = e.device_slots()[1].extent_count;
+    let on = |alloc: &Allocator, base: u64, count: u64| {
+        (base..base + count).filter(|&i| alloc.test_bit(i)).count()
+    };
+    assert_eq!(
+        on(e.allocator(), d0_base, d0_count),
+        1,
+        "device 0 must be full"
+    );
+    assert_eq!(
+        on(e.allocator(), d1_base, d1_count),
+        1,
+        "spill must land on device 1"
+    );
+
+    let more = vec![4u8; 1024 * 1024];
+    for i in 0..3 {
+        e.put("b1", &format!("m{i}"), &mut Cursor::new(more.clone()))
+            .unwrap();
+    }
+    // 设备 0 已满 → 不再获得新分配;设备 1 继续吃进
+    assert_eq!(
+        on(e.allocator(), d0_base, d0_count),
+        1,
+        "full device must not receive new extents"
+    );
+    // 设备 1 开放 extent 剩余 ~4MiB 吸收全部新数据(4096+3MiB < 容量),
+    // 无需新分配——剩余空间权重把开放 extent 空间计入(字节口径)
+    assert_eq!(
+        on(e.allocator(), d1_base, d1_count),
+        1,
+        "device 1 open extent must absorb the new data"
+    );
+
+    // 数据完整
+    for i in 0..3 {
+        let mut out = Vec::new();
+        e.get_to("b1", &format!("m{i}"), 0..more.len() as u64, &mut out)
+            .unwrap();
+        assert_eq!(out, more);
+    }
+    let mut out = Vec::new();
+    e.get_to("b1", "fill", 0..big.len() as u64, &mut out)
+        .unwrap();
+    assert_eq!(out, big);
+    e.abort();
     Ok(())
 }

@@ -176,6 +176,45 @@ impl DeviceSlot {
 /// 池设备表(不可变共享视图;Engine 与 Compactor 同 Arc 借用)。
 pub(crate) type PoolDevices = Arc<Vec<DeviceSlot>>;
 
+/// 剩余空间加权轮转选择器(M13 M2-1 DM2;nginx SWRR 平滑加权):
+/// 每次调用把各设备当前权重(剩余空闲 extent × 清单权重)累加到各自
+/// current,取 current 最大者,并将该设备 current 减去本轮总权重。
+/// 权重随分配动态变化(剩余空间收缩),天然让新盘快速吃进新数据。
+///
+/// 引擎写锁域内串行调用(无内部锁);单设备池恒返回 0,零开销。
+#[derive(Debug, Default)]
+struct WeightedRotator {
+    current: Vec<f64>,
+}
+
+impl WeightedRotator {
+    /// 按权重表取下一个设备(tie → 最小序;总权重 ≤ 0 → 0)。
+    /// `weights[i]` = 设备 i 当前权重;调用后内部状态推进。
+    fn next(&mut self, weights: &[f64]) -> usize {
+        if self.current.len() != weights.len() {
+            self.current = vec![0.0; weights.len()];
+        }
+        let mut total = 0.0f64;
+        let mut best = 0usize;
+        let mut best_v = f64::NEG_INFINITY;
+        for (i, w) in weights.iter().enumerate() {
+            let c = self.current[i] + w;
+            self.current[i] = c;
+            total += w;
+            if c > best_v {
+                best_v = c;
+                best = i;
+            }
+        }
+        if total <= 0.0 || best_v == f64::NEG_INFINITY {
+            self.current.iter_mut().for_each(|c| *c = 0.0);
+            return 0;
+        }
+        self.current[best] -= total;
+        best
+    }
+}
+
 /// 开放 extent(ADR-9 §4.4/§5.1):当前正在被追加写入的 extent,每设备一个。
 #[derive(Debug, Clone)]
 struct OpenExtent {
@@ -227,9 +266,10 @@ pub struct Engine {
     /// 开放 extent(每设备一个;与 devices 平行;写路径当前活动设备 =
     /// cur_device)。
     open_extents: Vec<Option<OpenExtent>>,
-    /// 写路径当前活动设备(分配选址目标;M13 M1-2 装配期恒 0,M2-1 起
-    /// 剩余空间加权轮转)。
+    /// 写路径当前活动设备(分配选址目标;M13 M2-1 起剩余空间加权轮转)。
     cur_device: usize,
+    /// 剩余空间加权轮转状态(M13 M2-1 DM2;引擎写锁域内串行)。
+    rotator: WeightedRotator,
     checkpoint: std::sync::Mutex<CheckpointState>,
     checkpoint_tick: std::sync::Mutex<Receiver<()>>,
     _checkpoint_thread: Option<std::thread::JoinHandle<()>>,
@@ -591,6 +631,7 @@ impl Engine {
             etag_mode: cfg.etag_mode,
             open_extents,
             cur_device: 0,
+            rotator: WeightedRotator::default(),
             checkpoint: std::sync::Mutex::new(CheckpointState {
                 seq: checkpoint_seq_min.max(last_seq),
                 alloc_since: 0,
@@ -699,6 +740,15 @@ impl Engine {
 
     pub fn allocator(&self) -> &Allocator {
         &self.alloc
+    }
+
+    /// M13 M2-1 测试钩子:各设备开放 extent 快照 (extent_id, watermark)。
+    #[cfg(test)]
+    pub(crate) fn open_extent_snapshot(&self) -> Vec<Option<(u32, u32)>> {
+        self.open_extents
+            .iter()
+            .map(|o| o.as_ref().map(|oe| (oe.extent_id, oe.watermark)))
+            .collect()
     }
 
     /// 测试钩子:只改内存分配账目,不删元数据。模拟 `dec_live` 把仍被
@@ -1596,13 +1646,15 @@ impl Engine {
 
     // ──────── 开放 extent 管理(ADR-9 §5.1/§5.2/§5.4;M13 M1-2 每设备) ────────
 
-    /// 对象起点封口判定(b):当前活动设备开放 extent 剩余空间 < 32KiB
-    /// (装不下任何非内联对象)→ 封口,下个对象使用新 extent。
+    /// 对象起点选择目标设备 + 封口判定(b):按剩余空间加权轮转选盘
+    /// (DM2;每对象一次),目标设备开放 extent 剩余空间 < 32KiB(装不下
+    /// 任何非内联对象)→ 封口,下个对象使用新 extent。
     fn rotate_for_new_object(&mut self) -> Result<()> {
-        let (di, capacity) = {
-            let (di, slot) = self.cur_slot();
-            (di, slot.extent_capacity())
-        };
+        let di = self.pick_device();
+        if di != self.cur_device {
+            self.cur_device = di;
+        }
+        let capacity = self.devices[di].extent_capacity();
         let should_seal = self
             .open_extents
             .get(di)
@@ -1625,32 +1677,87 @@ impl Engine {
     /// 已提交打包密文(M11 G-2 SSE GCM)。已写满的误释放 extent 封口后
     /// 换下一个 id。
     ///
-    /// M13 M1-2:开放 extent 落位 = 分配的全局 id 所属设备(`open_open_extent`
-    /// 同步 cur_device);M2-1 起在该函数内做加权设备选址。
-    fn open_new_extent(&mut self, draft: &mut Staged) -> Result<()> {
+    /// M13 M2-1(DM2):设备选址 = 剩余空间加权轮转——`prefer`(对象起点
+    /// 刚轮转选中的设备)优先,其后按权重降序尝试其余设备;设备内窗口
+    /// 分配(`allocate_in_range`),全部无空闲 → NoSpace。
+    fn open_new_extent(&mut self, draft: &mut Staged, prefer: Option<usize>) -> Result<()> {
         let capacity = self.main_sb.extent_capacity();
-        // 全池 extent 数(单设备 = 原语义;多设备 = Σ)
-        let total: u64 = self.devices.iter().map(|d| d.extent_count).sum();
-        for _ in 0..total {
-            let id = self.alloc.allocate(draft, 1)?.remove(0);
-            self.note_alloc(1);
-            let (max_end, live_sum, holders) = self.live_extent_occupancy(id as u32)?;
-            if max_end == 0 {
-                self.alloc.mark_open(id);
-                self.open_open_extent(id, 0, 0, 1);
-                return Ok(());
+        let order = self.device_rotation_order(prefer);
+        for &d in &order {
+            let slot = &self.devices[d];
+            let mut attempts = 0u64;
+            while attempts < slot.extent_count {
+                attempts += 1;
+                let Some(id) = self
+                    .alloc
+                    .allocate_in_range(draft, slot.base, slot.extent_count)?
+                else {
+                    break; // 该设备无空闲
+                };
+                self.note_alloc(1);
+                let (max_end, live_sum, holders) = self.live_extent_occupancy(id as u32)?;
+                if max_end == 0 {
+                    self.alloc.mark_open(id);
+                    self.open_open_extent(id, 0, 0, 1);
+                    return Ok(());
+                }
+                self.alloc.restore_occupancy(id, live_sum, holders.max(1));
+                let wm = align_up(max_end as u64, SECTOR_SIZE);
+                if wm < capacity {
+                    self.alloc.mark_open(id);
+                    // 快照仍有持有者:封口必须走打包头,不得判独占
+                    self.open_open_extent(id, wm as u32, wm as u32, holders.max(2));
+                    return Ok(());
+                }
+                self.alloc.mark_sealed(id);
             }
-            self.alloc.restore_occupancy(id, live_sum, holders.max(1));
-            let wm = align_up(max_end as u64, SECTOR_SIZE);
-            if wm < capacity {
-                self.alloc.mark_open(id);
-                // 快照仍有持有者:封口必须走打包头,不得判独占
-                self.open_open_extent(id, wm as u32, wm as u32, holders.max(2));
-                return Ok(());
-            }
-            self.alloc.mark_sealed(id);
         }
         Err(Error::NoSpace)
+    }
+
+    /// 剩余空间加权轮转选盘(DM2):权重 = 每设备空闲 extent × 清单权重。
+    /// 剩余空间加权轮转选盘(DM2):权重 = (空闲 extent × extent_size +
+    /// 开放 extent 剩余空间)× 清单权重——**字节口径**,开放 extent 有剩余
+    /// 空间但无空闲 extent 的设备仍可被选中续写(全池分配满 ≠ 满)。
+    fn pick_device(&mut self) -> usize {
+        let weights = self.device_space_weights();
+        self.rotator.next(&weights)
+    }
+
+    /// 设备尝试顺序:`prefer` 在前(通常 = 刚轮转选中的设备),其余按
+    /// 当前剩余空间降序(稳定:同权重保持设备序)。
+    fn device_rotation_order(&mut self, prefer: Option<usize>) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.devices.len()).collect();
+        if let Some(p) = prefer {
+            if p < order.len() {
+                order.remove(p);
+                order.insert(0, p);
+            }
+        }
+        let weights = self.device_space_weights();
+        order[1..].sort_by(|&a, &b| {
+            weights[b]
+                .partial_cmp(&weights[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        order
+    }
+
+    /// 每设备剩余空间字节(空闲 extent + 开放 extent 剩余;分配权重口径)。
+    fn device_space_weights(&self) -> Vec<f64> {
+        self.devices
+            .iter()
+            .enumerate()
+            .map(|(i, slot)| {
+                let free_bytes =
+                    self.alloc.free_in_range(slot.base, slot.extent_count) * slot.sb.extent_size;
+                let open_remaining = self.open_extents[i]
+                    .as_ref()
+                    .map(|oe| slot.extent_capacity() - oe.watermark as u64)
+                    .unwrap_or(0);
+                (free_bytes + open_remaining) as f64 * slot.weight as f64
+            })
+            .collect()
     }
 
     /// 设置某设备的开放 extent(每设备一个;`cur_device` 跟随落位)。
@@ -5446,7 +5553,9 @@ impl ExtentWriter {
                 }
             }
             if engine.cur_open().is_none() {
-                engine.open_new_extent(draft)?;
+                let prefer = Some(engine.cur_device);
+
+                engine.open_new_extent(draft, prefer)?;
                 self.begin_segment(engine);
             }
             // 攒批 flush:acc 满 64KiB,或 extent 将满
@@ -5485,9 +5594,11 @@ impl ExtentWriter {
             let ct = self.encrypt_staged_chunk();
             self.feed_bytes(engine, draft, &ct)?;
         }
+
         if self.fill > 0 {
             engine.flush_acc(&mut self)?;
         }
+
         // 输入恰好把 extent 写满:走正常封口判定(独占 vs 打包)
         let full = engine
             .cur_open()

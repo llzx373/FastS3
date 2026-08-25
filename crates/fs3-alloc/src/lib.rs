@@ -164,6 +164,37 @@ impl Allocator {
         Ok(out)
     }
 
+    /// 在 `[start, start+count)` 窗口内分配一个 extent(M13 M2-1 每设备
+    /// 分配;窗口无空闲 → None,不动 draft)。计数/代数语义同 allocate。
+    pub fn allocate_in_range(
+        &self,
+        draft: &mut Staged,
+        start: u64,
+        count: u64,
+    ) -> Result<Option<u64>> {
+        let mut out = None;
+        HINT.with(|hint| -> Result<()> {
+            let mut h = hint.get();
+            if let Some(id) = self.bitmap.alloc_one_in_range(&mut h, start, count) {
+                hint.set(h);
+                self.refcounts[id as usize].store(0, Ordering::Release);
+                self.generations[id as usize].fetch_add(1, Ordering::Relaxed);
+                self.total_alloc.fetch_add(1, Ordering::Relaxed);
+                out = Some(id);
+            }
+            Ok(())
+        })?;
+        if let Some(id) = out {
+            draft.alloc.push((id, 1));
+        }
+        Ok(out)
+    }
+
+    /// 区间内空闲 extent 数(加权轮转权重口径:剩余空间;M13 M2-1 DM2)。
+    pub fn free_in_range(&self, start: u64, count: u64) -> u64 {
+        count - self.bitmap.count_ones_range(start, count)
+    }
+
     /// 标记 extent 为开放(开放 extent 首次使用时;状态为派生,无事务性)。
     pub fn mark_open(&self, id: u64) {
         self.state[id as usize].store(ExtentState::Open as u8, Ordering::Release);
