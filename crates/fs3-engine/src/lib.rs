@@ -311,38 +311,7 @@ impl Engine {
                 "no data devices configured (storage.devices)".into(),
             ));
         }
-        // 0. 打开全部配置设备 + 读超块(先按配置序装载,随后按清单序重排)
-        let mut opened: Vec<(
-            std::path::PathBuf,
-            Box<dyn BlockDevice>,
-            fs3_core::SuperBlock,
-        )> = Vec::new();
-        for path in &cfg.devices {
-            let dev = open_device(path, cfg.read_only)?;
-            let sb = fs3_device::read_superblock(dev.as_ref())?;
-            opened.push((path.clone(), dev, sb));
-        }
-        // extent_size / layout_version 全池一致(主设备 0 为口径)
-        let (extent_size, layout_version) = {
-            let sb0 = &opened[0].2;
-            (sb0.extent_size, sb0.layout_version)
-        };
-        for (_, _, sb) in &opened[1..] {
-            if sb.extent_size != extent_size {
-                return Err(Error::InvalidLayout(format!(
-                    "devices must share extent_size: found {} and {}",
-                    extent_size, sb.extent_size
-                )));
-            }
-            if sb.layout_version != layout_version {
-                return Err(Error::InvalidLayout(format!(
-                    "devices must share layout_version: found {} and {}",
-                    layout_version, sb.layout_version
-                )));
-            }
-        }
-
-        // 逐一打开元数据(rocksdb,其自身 WAL 恢复)前的准备
+        // 0. 元数据先开(池清单在 rocksdb;其自身 WAL 恢复)
         let meta_cfg = MetaConfig {
             flush_every_ms: cfg.group_commit_ms,
             sync_mode: cfg.sync_mode,
@@ -350,9 +319,38 @@ impl Engine {
         };
         let meta = Arc::new(MetaStore::open(&cfg.meta_dir, &meta_cfg)?);
 
-        // 1. 池清单:加载 / 自举 / 校验(ADR-15 DM1';s:pool)
-        //    缺席 = 单设备 v2 存量 → 初始化为单元素(零数据搬迁,升级路径);
-        //    多设备配置缺清单 → 拒绝(必须走 device-add,不得改配置入池)。
+        // 1. 打开全部配置设备 + 读超块(容错收集:打开失败暂存;
+        //    容错仅在「清单存在」时生效——单设备未初始化仍回传原始错误)
+        // 与 cfg.devices 平行:opened = 打开结果;open_errors = 打开失败原因
+        // (打开带容错收集;容错仅在「清单存在」时生效,见 §2 装配)
+        type OpenedDevice = Option<(
+            std::path::PathBuf,
+            Box<dyn BlockDevice>,
+            fs3_core::SuperBlock,
+        )>;
+        let mut opened: Vec<OpenedDevice> = Vec::new();
+        let mut open_errors: Vec<Option<Error>> = Vec::new();
+        for path in &cfg.devices {
+            match open_device(path, cfg.read_only) {
+                Ok(dev) => match fs3_device::read_superblock(dev.as_ref()) {
+                    Ok(sb) => {
+                        opened.push(Some((path.clone(), dev, sb)));
+                        open_errors.push(None);
+                    }
+                    Err(e) => {
+                        opened.push(None);
+                        open_errors.push(Some(e));
+                    }
+                },
+                Err(e) => {
+                    opened.push(None);
+                    open_errors.push(Some(e));
+                }
+            }
+        }
+        // 池清单:加载 / 自举 / 校验(ADR-15 DM1';s:pool)
+        // 缺席 = 单设备 v2 存量 → 初始化为单元素(零数据搬迁,升级路径);
+        // 多设备配置缺清单 → 拒绝(必须走 device-add,不得改配置入池)。
         let manifest = match meta.load_pool()? {
             Some(m) => {
                 m.validate()?;
@@ -367,10 +365,13 @@ impl Engine {
                             .into(),
                     ));
                 }
-                if opened.len() != 1 {
-                    return Err(Error::InvalidLayout("device open mismatch".into()));
+                // 单设备无清单 = (未初始化 / 坏设备):保持原错误语义
+                // (仅当确有打开错误才消费;成功时保留平行数组供装配匹配)
+                if open_errors.first().is_some_and(|o| o.is_some()) {
+                    return Err(open_errors.remove(0).unwrap());
                 }
-                let (path, _, sb) = &opened[0];
+                // 只借读,不消费(装配循环仍要按路径匹配该设备)
+                let (path, _, sb) = opened[0].as_ref().expect("single device");
                 let m = fs3_core::pool::PoolManifest {
                     devices: vec![fs3_core::pool::DeviceEntry {
                         uuid: sb.uuid,
@@ -389,61 +390,84 @@ impl Engine {
             }
         };
 
-        // 2. 按清单序装配设备表(配置序仅用于装载;清单序 = 推导映射序)
+        // 2. 按清单序装配设备表(M13 M2-2,ADR-15 DM3):
+        //    - 配置缺清单设备 / 配置含未入池设备 = 配置错误,硬拒绝;
+        //    - 打开失败 / uuid 不匹配 / 布局不匹配 = **缺盘 → 只读降级 + 告警**
+        //      (对齐 v0.5 掉盘语义:位图区间按清单留零、统计按未分配计,
+        //      恢复跳过该设备;写路径经 read_only 拒绝)。
         let mut slots: Vec<DeviceSlot> = Vec::with_capacity(manifest.devices.len());
+        let mut degraded_devices: Vec<String> = Vec::new();
+        // (清单设备, 装配结果)的逐项问题记录:None = 正常
+        let mut assembly: Vec<(&fs3_core::pool::DeviceEntry, Option<String>)> = Vec::new();
+        // 配置中已被清单消费的设备序集合(装配后仍未被消费的 = 未入池设备)
+        let mut consumed_cfg: Vec<bool> = vec![false; cfg.devices.len()];
         for entry in &manifest.devices {
-            let idx = opened
+            let cidx = cfg
+                .devices
                 .iter()
-                .position(|(p, _, _)| p.as_path() == std::path::Path::new(&entry.path))
-                .ok_or_else(|| {
-                    Error::InvalidLayout(format!(
-                        "pool device {} is not listed in config; add it to \
-                         storage.devices (device-add 后配置须包含新盘)",
-                        entry.path
-                    ))
-                })?;
-            let (_, dev, sb) = opened.remove(idx);
-            // 一致性校验:清单 uuid 绑定(ADR-15 DM3;错误盘 → 硬拒绝,
-            // M13 M2-2 扩展为缺盘只读降级路径)+ 冗余 extent_count/capacity
-            if sb.uuid != entry.uuid {
+                .position(|p| p.as_path() == std::path::Path::new(&entry.path));
+            let Some(cidx) = cidx else {
                 return Err(Error::InvalidLayout(format!(
-                    "device {} uuid does not match pool manifest (uuid mismatch: \
-                     wrong disk attached?); run `fasts3d device-remove` after \
-                     migrating data if this device was replaced",
+                    "pool device {} is not listed in config; add it to \
+                     storage.devices (device-add 后配置须包含新盘)",
                     entry.path
                 )));
-            }
-            let ec = sb.extent_count();
-            if ec != entry.extent_count || sb.data_end != entry.capacity {
-                return Err(Error::InvalidLayout(format!(
-                    "device {} layout mismatch vs pool manifest: superblock \
-                     extent_count={ec} capacity={} vs manifest {} / {}",
-                    entry.path, sb.data_end, entry.extent_count, entry.capacity
-                )));
-            }
-            slots.push(DeviceSlot {
-                dev,
-                sb,
-                base: 0, // 下方按清单序重算
-                extent_count: ec,
-                weight: entry.weight,
-            });
+            };
+            consumed_cfg[cidx] = true;
+            // 打开失败(已按配置序收集)优先判定 → 缺盘只读降级
+            let problem = match open_errors.get(cidx).expect("parallel index") {
+                Some(e) => Some(format!("open failed: {e}")),
+                None => {
+                    let (_, dev, sb) = opened[cidx].take().expect("opened entry");
+                    if sb.uuid != entry.uuid {
+                        Some("uuid mismatch (wrong disk attached?)".into())
+                    } else if sb.extent_count() != entry.extent_count
+                        || sb.data_end != entry.capacity
+                    {
+                        Some(format!(
+                            "layout mismatch: superblock {} extents / {} bytes vs \
+                             manifest {} / {}",
+                            sb.extent_count(),
+                            sb.data_end,
+                            entry.extent_count,
+                            entry.capacity
+                        ))
+                    } else {
+                        slots.push(DeviceSlot {
+                            dev,
+                            sb,
+                            base: 0, // 下方按清单序重算
+                            extent_count: sb.extent_count(),
+                            weight: entry.weight,
+                        });
+                        None
+                    }
+                }
+            };
+            assembly.push((entry, problem));
         }
         // 配置里不属于清单的设备 → 拒绝(未入池设备必须走 device-add 初始化)
-        if !opened.is_empty() {
+        if let Some((ci, _)) = consumed_cfg.iter().enumerate().find(|(_, &c)| !c) {
             return Err(Error::InvalidLayout(format!(
-                "config lists {} device(s) not in the pool (first: {}); run \
-                 `fasts3d device-add` to add them",
-                opened.len(),
-                opened[0].0.display()
+                "config device {} is not in the pool; run `fasts3d device-add` \
+                 to add it (never edit config to add devices)",
+                cfg.devices[ci].display()
             )));
         }
-        // 推导式映射基址:Σ 前序设备 extent 数(ADR-15 DM1')
+        // 推导式映射基址:Σ 前序设备 extent 数(ADR-15 DM1';**含缺位设备**,
+        // 以清单 extent_count 计,保证全局 id 空间与清单一致)
         {
             let mut base = 0u64;
-            for slot in slots.iter_mut() {
-                slot.base = base;
-                base += slot.extent_count;
+            let mut si = 0usize;
+            for (entry, problem) in &assembly {
+                if problem.is_some() {
+                    degraded_devices.push(format!("{}: {}", entry.path, problem.as_ref().unwrap()));
+                    base += entry.extent_count;
+                    continue;
+                }
+                slots[si].base = base;
+                base += slots[si].extent_count;
+                si += 1;
             }
             if base > u32::MAX as u64 {
                 return Err(Error::InvalidLayout(format!(
@@ -451,7 +475,13 @@ impl Engine {
                 )));
             }
         }
-        let total_extents: u64 = slots.iter().map(|s| s.extent_count).sum();
+        let total_extents: u64 = manifest.devices.iter().map(|d| d.extent_count).sum();
+        let degraded = !degraded_devices.is_empty();
+        for d in &degraded_devices {
+            tracing::error!(
+                "POOL DEGRADED: {d}; service opens READ-ONLY until the device is restored"
+            );
+        }
         let devices = Arc::new(slots);
         let main_sb = devices[0].sb;
 
@@ -502,8 +532,10 @@ impl Engine {
             alloc.apply_record(rec);
         }
 
-        // M4 D4:降级标志(掉盘检测)在 open 期确定并贯穿整个引擎生命周期
-        let degraded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // M4 D4 + M13 M2-2:降级标志在 open 期确定(缺盘/uuid 不匹配 → 只读
+        // 降级)并贯穿整个引擎生命周期;运行期 IO 故障同样置位(DegradeAware)。
+        let read_only_effective = cfg.read_only || degraded;
+        let degraded = Arc::new(std::sync::atomic::AtomicBool::new(degraded));
         let io_raw: Box<dyn IoEngine> = match cfg.debug_io.clone() {
             Some(io) => {
                 let mut lock = io.lock().unwrap();
@@ -542,7 +574,7 @@ impl Engine {
         // 5. 开放 extent 识别与续写(ADR-9 §5.7):每设备独立——有活段、
         //    无有效头(或代数陈旧)的 extent = 崩溃时的开放 extent;
         //    watermark = 活段最大 end,跨会话孤儿区由新追加自然覆盖
-        let open_extents = if cfg.read_only {
+        let open_extents = if read_only_effective {
             devices.iter().map(|_| None).collect()
         } else {
             devices
@@ -575,7 +607,7 @@ impl Engine {
         // 抽象(worker.rs),节流 = 全局共享令牌桶——生命周期执行器(L2-2)
         // 注册时克隆同一 throttle,防后台任务叠加侵蚀前台。
         let throttle = Throttle::new(cfg.compaction.rate_limit_bytes_per_sec);
-        let (compactor, compactor_thread) = if cfg.read_only {
+        let (compactor, compactor_thread) = if read_only_effective {
             (None, None)
         } else {
             let c = Arc::new(Compactor::new(
@@ -605,11 +637,11 @@ impl Engine {
         let mono = monotonic_ns();
         let clock_state =
             TrustedClockState::rebaseline_on_boot(meta.load_trusted_clock()?, wall, mono);
-        if !cfg.read_only {
+        if !read_only_effective {
             meta.put_trusted_clock(&clock_state)?;
         }
         // 零拷贝 fd(尽力而为;失败则禁用零拷贝读路径;每设备一个)
-        let zc_fds = if cfg.read_only {
+        let zc_fds = if read_only_effective {
             devices.iter().map(|_| None).collect::<Vec<Option<i32>>>()
         } else {
             devices
@@ -626,7 +658,7 @@ impl Engine {
             io,
             chunk_size: fs3_core::DEFAULT_CHUNK_SIZE,
             verify_reads: cfg.verify_reads,
-            read_only: cfg.read_only,
+            read_only: read_only_effective,
             small_object_limit: cfg.small_object_limit,
             etag_mode: cfg.etag_mode,
             open_extents,
@@ -674,34 +706,50 @@ impl Engine {
     }
 
     /// 全局 extent id → (设备序, 本地 id)(ADR-15 DM1' 推导式映射)。
-    fn resolve_extent(&self, extent_id: u64) -> (usize, u64) {
+    /// 越界 = 元数据引用了池外/缺盘设备的 extent(降级模式)→ None,
+    /// 调用方按错误处理(读路径显式报错,写路径 id 恒在界内)。
+    fn resolve_extent(&self, extent_id: u64) -> Option<(usize, u64)> {
         let mut base = 0u64;
         for (di, slot) in self.devices.iter().enumerate() {
             if extent_id < base + slot.extent_count {
-                return (di, extent_id - base);
+                return Some((di, extent_id - base));
             }
             base += slot.extent_count;
         }
-        // 越界:调用方保证合法(Segment 均出自分配器);防御性取末设备
-        (self.devices.len() - 1, extent_id - base)
+        None
     }
 
-    /// 全局 extent id 所属设备的 raw fd。
-    fn device_fd_of(&self, extent_id: u64) -> i32 {
-        let (di, _) = self.resolve_extent(extent_id);
-        self.devices[di].dev.raw_fd()
+    /// 全局 extent id 所属设备的 raw fd(缺失 → Corrupt,缺盘降级语义)。
+    fn device_fd_of(&self, extent_id: u64) -> Result<i32> {
+        let (di, _) = self.resolve_extent(extent_id).ok_or_else(|| {
+            Error::Corrupt(format!(
+                "extent {extent_id} references a device not present in the \
+                 pool (degraded mode: disk missing?)"
+            ))
+        })?;
+        Ok(self.devices[di].dev.raw_fd())
     }
 
     /// extent 数据区在所属设备上的绝对偏移(含 extent 头)。
-    fn extent_data_offset(&self, extent_id: u64) -> u64 {
-        let (di, local) = self.resolve_extent(extent_id);
-        self.devices[di].data_offset(local)
+    fn extent_data_offset(&self, extent_id: u64) -> Result<u64> {
+        let (di, local) = self.resolve_extent(extent_id).ok_or_else(|| {
+            Error::Corrupt(format!(
+                "extent {extent_id} references a device not present in the \
+                 pool (degraded mode: disk missing?)"
+            ))
+        })?;
+        Ok(self.devices[di].data_offset(local))
     }
 
     /// extent 头在所属设备上的绝对偏移。
-    fn extent_header_offset(&self, extent_id: u64) -> u64 {
-        let (di, local) = self.resolve_extent(extent_id);
-        self.devices[di].header_offset(local)
+    fn extent_header_offset(&self, extent_id: u64) -> Result<u64> {
+        let (di, local) = self.resolve_extent(extent_id).ok_or_else(|| {
+            Error::Corrupt(format!(
+                "extent {extent_id} references a device not present in the \
+                 pool (degraded mode: disk missing?)"
+            ))
+        })?;
+        Ok(self.devices[di].header_offset(local))
     }
 
     /// 当前活动设备(写路径追加目标)。
@@ -1631,6 +1679,13 @@ impl Engine {
         sse_key: Option<&fs3_core::SseWriteKey>,
         sse_nonce_base: Option<[u8; 12]>,
     ) -> Result<StreamWriteOutcome> {
+        // M13 M2-2(对齐 v0.5 掉盘语义):降级/只读引擎拒绝设备写;
+        // 内联路径(纯元数据)不经过此处,由服务层 read_only 门闩兜底。
+        if self.read_only {
+            return Err(Error::Unsupported(
+                "engine is read-only (degraded pool or tool mode); extent writes rejected".into(),
+            ));
+        }
         let mut writer =
             ExtentWriter::new(self.chunk_size, self.etag_mode, sse_key, sse_nonce_base)?;
         let mut inbuf = fs3_device::AlignedBuffer::new(self.chunk_size)?;
@@ -1762,7 +1817,9 @@ impl Engine {
 
     /// 设置某设备的开放 extent(每设备一个;`cur_device` 跟随落位)。
     fn open_open_extent(&mut self, id: u64, watermark: u32, committed: u32, participants: u32) {
-        let (di, _) = self.resolve_extent(id);
+        let (di, _) = self
+            .resolve_extent(id)
+            .expect("newly allocated extent is always in pool range");
         self.cur_device = di;
         self.open_extents[di] = Some(OpenExtent {
             extent_id: id as u32,
@@ -1813,8 +1870,10 @@ impl Engine {
         };
         let mut hbuf = fs3_device::AlignedBuffer::new(SECTOR_SIZE as usize)?;
         hbuf.as_mut_slice().copy_from_slice(&header.encode());
-        let (di, _) = self.resolve_extent(extent_id as u64);
-        let off = self.extent_header_offset(extent_id as u64);
+        let (di, _) = self
+            .resolve_extent(extent_id as u64)
+            .ok_or_else(|| Error::Corrupt("extent out of pool range".into()))?;
+        let off = self.extent_header_offset(extent_id as u64)?;
         write_all(
             &mut **self.io.lock().unwrap(),
             self.devices[di].dev.raw_fd(),
@@ -1828,8 +1887,10 @@ impl Engine {
     /// 由调用方与分配器代数比较判定)。
     fn read_extent_header(&self, extent_id: u64) -> Result<Option<ExtentHeader>> {
         let mut hbuf = fs3_device::AlignedBuffer::new(SECTOR_SIZE as usize)?;
-        let (di, _) = self.resolve_extent(extent_id);
-        let off = self.extent_header_offset(extent_id);
+        let (di, _) = self
+            .resolve_extent(extent_id)
+            .ok_or_else(|| Error::Corrupt("extent out of pool range".into()))?;
+        let off = self.extent_header_offset(extent_id)?;
         read_exact(
             &mut **self.io.lock().unwrap(),
             self.devices[di].dev.raw_fd(),
@@ -1886,8 +1947,10 @@ impl Engine {
     /// 此处防御性重算 CRC(仅封口判定 b / seal-on-delete / 优雅关闭)。
     /// 重算 extent 数据区全部 64KiB 网格 CRC(恢复期补写独占头用)。
     fn compute_extent_crcs(&self, extent_id: u64, capacity: u64) -> Result<Vec<u32>> {
-        let (di, _) = self.resolve_extent(extent_id);
-        let base = self.extent_data_offset(extent_id);
+        let (di, _) = self
+            .resolve_extent(extent_id)
+            .ok_or_else(|| Error::Corrupt("extent out of pool range".into()))?;
+        let base = self.extent_data_offset(extent_id)?;
         let mut crcs = Vec::new();
         let mut off = 0u64;
         while off < capacity {
@@ -2132,10 +2195,11 @@ impl Engine {
                 self.read_verified_segment(seg, payload_off, len, out, &mut written)?;
             } else {
                 // 批量读:整段 ≤16×64KiB 一批,一次 submit(调用栈优化)
-                let dev_off =
-                    self.extent_data_offset(seg.extent_id as u64) + seg.offset as u64 + payload_off;
+                let dev_off = self.extent_data_offset(seg.extent_id as u64)?
+                    + seg.offset as u64
+                    + payload_off;
                 let fd = self.device_fd_of(seg.extent_id as u64);
-                written += self.read_batched_blocks(fd, dev_off, len, |data| {
+                written += self.read_batched_blocks(fd?, dev_off, len, |data| {
                     out.write_all(data)?;
                     Ok(())
                 })? as u64;
@@ -2181,10 +2245,10 @@ impl Engine {
                     ((chunk_start + chunk_size).min(seg.len as u64) - chunk_start) as usize;
                 let read_len = align_up(chunk_len as u64, SECTOR_SIZE) as usize;
                 let mut cbuf = fs3_device::AlignedBuffer::new(read_len)?;
-                let dev_off = self.extent_data_offset(seg.extent_id as u64) + chunk_start;
+                let dev_off = self.extent_data_offset(seg.extent_id as u64)? + chunk_start;
                 read_exact(
                     &mut **self.io.lock().unwrap(),
-                    self.device_fd_of(seg.extent_id as u64),
+                    self.device_fd_of(seg.extent_id as u64)?,
                     cbuf.as_mut_slice(),
                     dev_off,
                 )?;
@@ -2212,11 +2276,12 @@ impl Engine {
                 let chunk_len = ((chunk_start + grid).min(seg.len as u64) - chunk_start) as usize;
                 let read_len = align_up(chunk_len as u64, SECTOR_SIZE) as usize;
                 let mut cbuf = fs3_device::AlignedBuffer::new(read_len)?;
-                let dev_off =
-                    self.extent_data_offset(seg.extent_id as u64) + seg.offset as u64 + chunk_start;
+                let dev_off = self.extent_data_offset(seg.extent_id as u64)?
+                    + seg.offset as u64
+                    + chunk_start;
                 read_exact(
                     &mut **self.io.lock().unwrap(),
-                    self.device_fd_of(seg.extent_id as u64),
+                    self.device_fd_of(seg.extent_id as u64)?,
                     cbuf.as_mut_slice(),
                     dev_off,
                 )?;
@@ -2373,10 +2438,10 @@ impl Engine {
             let avail = (seg_end - cur) as usize;
             let take = (want - done).min(avail);
             let dev_base =
-                self.extent_data_offset(seg.extent_id as u64) + seg.offset as u64 + in_seg;
+                self.extent_data_offset(seg.extent_id as u64)? + seg.offset as u64 + in_seg;
             // 批量读(调用栈优化:一次 submit,无每块堆分配)
             let fd = self.device_fd_of(seg.extent_id as u64);
-            let n = self.read_batched_blocks(fd, dev_base, take, |data| {
+            let n = self.read_batched_blocks(fd?, dev_base, take, |data| {
                 buf[done..done + data.len()].copy_from_slice(data);
                 done += data.len();
                 Ok(())
@@ -3913,7 +3978,7 @@ impl Engine {
         }
         let mut written = 0u64;
         for seg in &part.extents {
-            let dev_off = self.extent_data_offset(seg.extent_id as u64) + seg.offset as u64;
+            let dev_off = self.extent_data_offset(seg.extent_id as u64)? + seg.offset as u64;
             let mut done = 0usize;
             let len = seg.len as usize;
             while done < len {
@@ -3925,7 +3990,7 @@ impl Engine {
                 let mut rbuf = fs3_device::AlignedBuffer::new(block_len)?;
                 read_exact(
                     &mut **self.io.lock().unwrap(),
-                    self.device_fd_of(seg.extent_id as u64),
+                    self.device_fd_of(seg.extent_id as u64)?,
                     rbuf.as_mut_slice(),
                     block_off,
                 )?;
@@ -4641,7 +4706,7 @@ impl Engine {
                 continue;
             }
             segs.push(DevSegment {
-                dev_offset: self.extent_data_offset(seg.extent_id as u64)
+                dev_offset: self.extent_data_offset(seg.extent_id as u64)?
                     + seg.offset as u64
                     + (s - seg_begin),
                 len: e - s,
@@ -5916,8 +5981,10 @@ impl Engine {
             let oe = self.cur_open_mut().expect("open extent");
             (oe.extent_id, oe.watermark)
         };
-        let dev_off = self.extent_data_offset(extent_id as u64) + watermark as u64;
-        let (di, _) = self.resolve_extent(extent_id as u64);
+        let dev_off = self.extent_data_offset(extent_id as u64)? + watermark as u64;
+        let (di, _) = self
+            .resolve_extent(extent_id as u64)
+            .ok_or_else(|| Error::Corrupt("extent out of pool range".into()))?;
         write_all(
             &mut **self.io.lock().unwrap(),
             self.devices[di].dev.raw_fd(),

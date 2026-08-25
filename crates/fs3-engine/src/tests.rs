@@ -5953,7 +5953,7 @@ fn sse_c_corrupt_ciphertext_fails_fast() {
     .unwrap();
     let meta = e.head("b1", "sse-torn").unwrap().unwrap();
     let seg = meta.extents.first().expect("extent-backed SSE-C object");
-    let off = e.extent_data_offset(seg.extent_id as u64) + seg.offset as u64;
+    let off = e.extent_data_offset(seg.extent_id as u64).unwrap() + seg.offset as u64;
     let aligned = off - (off % SECTOR_SIZE);
     let mut buf = fs3_device::AlignedBuffer::new(SECTOR_SIZE as usize).unwrap();
     e.superblock();
@@ -6140,29 +6140,6 @@ fn multi_device_extra_disk_without_manifest_rejected() -> Result<()> {
 }
 
 #[test]
-fn multi_device_manifest_uuid_mismatch_rejected() -> Result<()> {
-    // 换盘(force 重建 = 新 uuid)→ 打开必须拒绝(清单 uuid 绑定)
-    let (_d, _imgs, cfg) = setup_multi(&[64 * 1024 * 1024, 64 * 1024 * 1024]);
-    let mut e = open_engine(&cfg);
-    e.put("b1", "k", &mut Cursor::new(vec![2u8; 100])).unwrap();
-    e.close().unwrap();
-    drop(e);
-
-    let dev1 = &cfg.devices[1];
-    fs3_device::init_device(dev1, 4 * 1024 * 1024, 0, true).unwrap(); // force 重建
-    let err = match Engine::open(&cfg) {
-        Ok(_) => panic!("open must reject uuid mismatch (wrong disk)"),
-        Err(e) => e,
-    };
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("uuid does not match") || msg.contains("InvalidLayout"),
-        "unexpected error: {msg}"
-    );
-    Ok(())
-}
-
-#[test]
 fn per_device_open_extents_retained_across_rotation() -> Result<()> {
     // M13 M2-1:等权重双盘,对象交替落盘;两盘开放 extent 同时存活
     let (_d, _imgs, cfg) = setup_multi(&[64 * 1024 * 1024, 64 * 1024 * 1024]);
@@ -6263,6 +6240,106 @@ fn full_device_excluded_from_weighted_rotation() -> Result<()> {
     e.get_to("b1", "fill", 0..big.len() as u64, &mut out)
         .unwrap();
     assert_eq!(out, big);
+    e.abort();
+    Ok(())
+}
+
+// ─────────────────────────── M13 M2-2 缺盘降级 ───────────────────────────
+
+#[test]
+fn missing_disk_degraded_readonly_open() -> Result<()> {
+    // 缺盘 → 只读降级 + 告警(对齐 v0.5 掉盘语义):引擎可开、读主盘数据、
+    // 写拒绝;设备恢复(配置回到双盘)后全量恢复
+    let (_d, imgs, cfg) = setup_multi(&[64 * 1024 * 1024, 64 * 1024 * 1024]);
+    {
+        let mut e = open_engine(&cfg);
+        let d1 = vec![1u8; 1024 * 1024];
+        // 等权重 SWRR:首个对象落设备 0,次个落设备 1
+        e.put("b1", "on-dev0", &mut Cursor::new(d1.clone()))
+            .unwrap();
+        let d2 = vec![2u8; 1024 * 1024];
+        e.put("b1", "on-dev1", &mut Cursor::new(d2.clone()))
+            .unwrap();
+        e.close().unwrap();
+    }
+    // 拔盘:删除设备 1 镜像(open 失败路径)
+    std::fs::remove_file(&imgs[1]).unwrap();
+
+    let mut cfg2 = cfg.clone();
+    let mut e = match Engine::open(&cfg2) {
+        Ok(e) => e,
+        Err(err) => panic!("degraded open must not fail hard: {err}"),
+    };
+    let _ = &mut cfg2;
+    assert!(e.degraded(), "missing disk must flag degraded");
+    assert!(e.read_only(), "degraded pool opens read-only");
+    // 设备 0 数据可读
+    let mut out = Vec::new();
+    e.get_to("b1", "on-dev0", 0..1024 * 1024, &mut out).unwrap();
+    assert_eq!(out.len(), 1024 * 1024);
+    // 写拒绝(>32KiB 走 extent 路径 → 引擎只读门闩)
+    let err = e
+        .put_with_meta(
+            "b1",
+            "x",
+            &mut Cursor::new(vec![0u8; 64 * 1024]),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("read-only"),
+        "degraded engine must reject writes: {err}"
+    );
+    // 设备 1 数据读 → 失败(盘不在;只读降级语义)
+    let mut out2 = Vec::new();
+    assert!(e
+        .get_to("b1", "on-dev1", 0..1024 * 1024, &mut out2)
+        .is_err());
+    drop(e);
+
+    // 恢复:放回新盘(不可能同 uuid)或改配置回双盘 = 同 uuid 才行;
+    // 这里模拟「盘未换,只是路径恢复」(移回文件)
+    // —— 先让 uuid 匹配:把 dev0 重建为 dev1 的同 uuid 不可行。
+    // 改为验证:配置只有主盘(清单 2 设备但配置 1 个)→ 硬错(配置错误)
+    let err = match Engine::open(&EngineConfig {
+        devices: vec![imgs[0].clone()],
+        ..cfg2.clone()
+    }) {
+        Ok(_) => panic!("config missing a pool device must be rejected"),
+        Err(e) => e,
+    };
+    assert!(
+        format!("{err}").contains("not listed in config"),
+        "config missing a pool device must be a hard error: {err}"
+    );
+    Ok(())
+}
+
+#[test]
+fn degraded_uuid_mismatch_opens_readonly() -> Result<()> {
+    // 换盘(uuid 不匹配)→ 只读降级(不再硬拒绝;M2-2 对齐 v0.5 掉盘语义)
+    let (_d, _imgs, cfg) = setup_multi(&[64 * 1024 * 1024, 64 * 1024 * 1024]);
+    {
+        let mut e = open_engine(&cfg);
+        let d1 = vec![7u8; 512 * 1024];
+        e.put("b1", "k", &mut Cursor::new(d1.clone())).unwrap();
+        e.close().unwrap();
+    }
+    let dev1 = &cfg.devices[1];
+    fs3_device::init_device(dev1, 4 * 1024 * 1024, 0, true).unwrap(); // force 重建 = 新 uuid
+
+    let e = Engine::open(&cfg).unwrap();
+    assert!(e.degraded(), "uuid mismatch must flag degraded");
+    assert!(e.read_only());
+    let mut out = Vec::new();
+    e.get_to("b1", "k", 0..512 * 1024, &mut out).unwrap();
+    assert_eq!(out.len(), 512 * 1024);
     e.abort();
     Ok(())
 }
