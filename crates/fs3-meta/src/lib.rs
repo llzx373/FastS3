@@ -1931,6 +1931,24 @@ impl MetaStore {
         })
     }
 
+    // —— 可信时钟(M12 W1-1,ADR-13 DL6) ——
+
+    /// 读持久化可信时钟(键缺席 → None)。
+    pub fn load_trusted_clock(&self) -> Result<Option<fs3_core::TrustedClockState>> {
+        match self.db.get(SYS_TRUSTED_CLOCK).map_err(rocks_err)? {
+            Some(v) => decode(&v).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// 写可信时钟(直写 + fsync,同 seed_salt 先例;调用方持引擎写锁/启动单点)。
+    pub fn put_trusted_clock(&self, st: &fs3_core::TrustedClockState) -> Result<()> {
+        self.db
+            .put(SYS_TRUSTED_CLOCK, encode(st)?)
+            .map_err(rocks_err)?;
+        self.db.flush_wal(true).map_err(rocks_err)
+    }
+
     /// 桶版本化状态更新(单事务读改写;l: location 等其余字段不动;
     /// V3 PutBucketVersioning 落地路径)。
     pub fn commit_bucket_set_versioning(
@@ -3132,6 +3150,22 @@ mod tests {
         assert_eq!(s.list_buckets().unwrap().len(), 1);
         s.commit_bucket_delete("b1").unwrap();
         assert!(s.get_bucket("b1").unwrap().is_none());
+    }
+
+    #[test]
+    fn trusted_clock_persist_roundtrip() {
+        // M12 W1-1:s:trusted_clock 缺席/往返/重开可读
+        let (d, s) = open_tmp();
+        assert!(s.load_trusted_clock().unwrap().is_none());
+        let st = fs3_core::TrustedClockState {
+            last_wall: 1_700_000_000,
+            last_mono_ns: 42_000_000_000,
+        };
+        s.put_trusted_clock(&st).unwrap();
+        assert_eq!(s.load_trusted_clock().unwrap(), Some(st));
+        drop(s);
+        let s2 = MetaStore::open(d.path(), &MetaConfig::default()).unwrap();
+        assert_eq!(s2.load_trusted_clock().unwrap(), Some(st));
     }
 
     #[test]

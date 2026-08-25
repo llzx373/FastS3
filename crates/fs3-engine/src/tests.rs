@@ -502,6 +502,52 @@ fn checkpoint_rolls_bitmap() {
 }
 
 #[test]
+fn trusted_clock_persists_high_water_across_reopen() {
+    // M12 W1-1:启动落盘;检查点刷新后重开 last_wall 不回退。
+    let (_d, cfg) = setup();
+    let first = {
+        let mut e = open_engine(&cfg);
+        let t0 = e.trusted_clock_state().last_wall;
+        assert!(t0 > 0, "首次启动以墙钟为初值");
+        e.debug_inject_clock(t0 + 3600, 10_000_000_000);
+        e.debug_refresh_trusted_clock().unwrap();
+        assert_eq!(e.trusted_clock_state().last_wall, t0 + 3600);
+        e.close().unwrap();
+        t0 + 3600
+    };
+    let e = Engine::open(&cfg).unwrap();
+    assert!(
+        e.trusted_clock_state().last_wall >= first,
+        "重开保留 last_wall 高水位"
+    );
+    // 注入回拨:同一次采样的 mono 不回退,lock_now 不得低于高水位
+    let st = e.trusted_clock_state();
+    e.debug_inject_clock(st.last_wall - 86_400, st.last_mono_ns);
+    assert!(e.lock_now() >= st.last_wall);
+    let mut e = e;
+    e.close().unwrap();
+}
+
+#[test]
+fn trusted_clock_rollback_does_not_unexpire() {
+    // 已到期(until < last_wall):回拨墙钟不得复活。
+    let (_d, cfg) = setup();
+    let e = open_engine(&cfg);
+    let wall = 2_000_000_000i64;
+    e.debug_inject_clock(wall, 0);
+    e.debug_refresh_trusted_clock().unwrap();
+    e.debug_inject_clock(wall - 3600, 1_000_000_000);
+    let lock = e.lock_now();
+    assert!(lock >= wall, "回拨后 lock_now 仍取单调下界");
+    let trusted = e
+        .trusted_clock_state()
+        .trusted_now(wall - 3600, 1_000_000_000);
+    assert!(fs3_core::retention_expired(wall - 1, wall - 3600, trusted));
+    let mut e = e;
+    e.close().unwrap();
+}
+
+#[test]
 fn list_objects_prefix() {
     let (_d, cfg) = setup();
     let mut e = open_engine(&cfg);

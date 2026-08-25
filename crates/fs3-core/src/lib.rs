@@ -4,6 +4,7 @@
 
 pub mod audit;
 pub mod checksum;
+pub mod clock;
 pub mod consts;
 pub mod crc32;
 pub mod crc32c;
@@ -16,6 +17,7 @@ pub mod types;
 pub mod util;
 
 pub use checksum::{checksum_one_shot, ChecksumHasher};
+pub use clock::{retention_expired, TrustedClockState};
 pub use consts::*;
 pub use error::{Error, Result};
 pub use ssec::{

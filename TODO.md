@@ -260,7 +260,7 @@
 - [x] A0-1 ADR-13 写入 DESIGN.md §3.3:DL6(可信时钟:持久化 wall+mono 对 + 单调推导 + 回拨取下界;停机期边界文档化)、DL7(策略 Condition 最小集:s3:BypassGovernanceRetention、s3:ObjectLockRemainingRetentionDays + bypass 强制审计)、DL8(生命周期跳过锁定对象)
 
 ### W1 可信时钟(≈1 pw)
-- [ ] W1-1 持久化 `s:trusted_clock{last_wall,last_mono}` + CLOCK_MONOTONIC 推导;保留到期判定 = `until ≤ max(wall_now, trusted_now)`;回拨不缩短剩余保留
+- [x] W1-1 持久化 `s:trusted_clock{last_wall,last_mono}` + CLOCK_MONOTONIC 推导;保留到期判定 = `until ≤ max(wall_now, trusted_now)`;回拨不缩短剩余保留
 - [ ] W1-2 `trusted_clock_divergence` 指标 + 告警(升级现有 clock_jumps);NTP/部署基线文档 + 停机期篡改边界声明(§5.3)
 
 ### W2 语义与强制矩阵(≈1.5 pw)

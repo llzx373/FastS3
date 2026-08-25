@@ -19,7 +19,8 @@
 //! s: 前缀下的系统键:`s:seq`(单调计数器)、`s:key_seed_salt`(M3)、
 //! `s:value_rewrite_v3_done`(M10 V5-3 值格式重写完成标记)、
 //! `s:sse_kek_seed` / `s:sse_kek_gen`(M11 K1-1 SSE-S3 KEK 体系)、
-//! `s:audit\0{seq be64}` 审计环形条目(M11 L3-1;ADR-12 DL5)。
+//! `s:audit\0{seq be64}` 审计环形条目(M11 L3-1;ADR-12 DL5)、
+//! `s:trusted_clock`(M12 W1-1;ADR-13 DL6 可信时钟 wall+mono 对)。
 //!
 //! 转义规则:0x00 → 0xFF 0x00;0xFF → 0xFF 0xFF;其余原样。
 //! 保证 `o:{bucket}\0` 前缀扫描恰好覆盖该桶全部对象。
@@ -78,6 +79,11 @@ pub const SYS_SSE_KEK_SEED: &[u8] = b"s:sse_kek_seed";
 /// SSE-S3 当前 KEK 代状态(M11 K1-1;值 = postcard(SseKekGenState),
 /// gen 从 1 起,当前代 = 最大代;键缺席 = 初始代 1,惰性不落盘)。
 pub const SYS_SSE_KEK_GEN: &[u8] = b"s:sse_kek_gen";
+/// 可信时钟状态(M12 W1-1,ADR-13 DL6;值 = postcard TrustedClockState
+/// `{last_wall, last_mono_ns}`)。s: 既有前缀下的新系统键,不新增前缀,
+/// 故 meta-export DTO 与 check 可达性扫描无需联动(同
+/// SYS_KEY_VALUE_REWRITE_V3_DONE 注释口径)。
+pub const SYS_TRUSTED_CLOCK: &[u8] = b"s:trusted_clock";
 /// 审计环形条目前缀(M11 L3-1;ADR-12 DL5):`s:audit\0{seq be64}` →
 /// postcard(fs3_core::audit::AuditEntry),每条目一键;be64 字典序 =
 /// 写入序(回放取尾、截断删头的扫描边界)。s: 既有前缀下的系统键族,
@@ -576,6 +582,8 @@ mod tests {
         // 与既有 s: 系统键不相交(s:seq/s:key_seed_salt 等不以 s:audit\0 开头)
         assert!(!SYS_SEQ.starts_with(PREFIX_AUDIT));
         assert!(!SYS_SSE_KEK_GEN.starts_with(PREFIX_AUDIT));
+        assert!(!SYS_TRUSTED_CLOCK.starts_with(PREFIX_AUDIT));
+        assert_eq!(SYS_TRUSTED_CLOCK, b"s:trusted_clock");
         assert!(parse_audit_seq(SYS_SEQ).is_err());
         assert!(parse_audit_seq(b"s:audit\x00\x01").is_err());
     }

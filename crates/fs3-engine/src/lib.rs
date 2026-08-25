@@ -31,8 +31,8 @@ use fs3_core::crc32c::crc32c;
 use fs3_core::{
     align_up, new_version_vk, random_bytes, BucketMeta, BucketStats, ChecksumAlgorithm,
     ChecksumHasher, ChecksumInfo, ChecksumType, CompletePart, CompositeChecksum, Error,
-    ExtentHeader, ObjectMeta, Result, Segment, VersioningState, CHECKPOINT_ALLOC_DELTA,
-    EXTENT_FLAG_PACKED, EXTENT_HEADER_SIZE, SECTOR_SIZE, SEGMENT_CRC_GRID,
+    ExtentHeader, ObjectMeta, Result, Segment, TrustedClockState, VersioningState,
+    CHECKPOINT_ALLOC_DELTA, EXTENT_FLAG_PACKED, EXTENT_HEADER_SIZE, SECTOR_SIZE, SEGMENT_CRC_GRID,
 };
 use fs3_device::{open_device, BlockDevice};
 use fs3_meta::keys::{part_key, VK_NULL};
@@ -136,6 +136,22 @@ struct OpenExtent {
     participants: u32,
 }
 
+/// 运行期可信时钟(ADR-13 DL6):持久化状态 + 可选测试注入。
+struct TrustedClockRt {
+    state: TrustedClockState,
+    /// 测试注入 `(wall_secs, mono_ns)`;None = 采样真实时钟。
+    inject: Option<(i64, i64)>,
+}
+
+impl TrustedClockRt {
+    fn sample(&self) -> (i64, i64) {
+        match self.inject {
+            Some(p) => p,
+            None => (now_ts(), monotonic_ns()),
+        }
+    }
+}
+
 pub struct Engine {
     device: Box<dyn BlockDevice>,
     /// 零拷贝专用 fd(无 O_DIRECT;sendfile/splice 用;None = 不可用)。
@@ -173,6 +189,8 @@ pub struct Engine {
     /// SSE-S3 重包裹进度(M11 K1-1;admin rotate/status 与工作线程共享;
     /// 内存态——重启后经 meta 的 rewrap_done_gen 持久标记判定待办)。
     sse_s3_rewrap: Arc<std::sync::Mutex<SseS3RewrapProgress>>,
+    /// 可信时钟(M12 W1-1,ADR-13 DL6;启动加载 + 检查点刷新)。
+    trusted_clock: std::sync::Mutex<TrustedClockRt>,
 }
 
 impl Engine {
@@ -304,6 +322,13 @@ impl Engine {
         };
 
         let last_seq = meta.last_seq()?;
+        let wall = now_ts();
+        let mono = monotonic_ns();
+        let clock_state =
+            TrustedClockState::rebaseline_on_boot(meta.load_trusted_clock()?, wall, mono);
+        if !cfg.read_only {
+            meta.put_trusted_clock(&clock_state)?;
+        }
         Ok(Engine {
             zc_fd,
             device,
@@ -331,6 +356,10 @@ impl Engine {
             degraded: degraded.clone(),
             sse_decrypt_bytes: std::sync::atomic::AtomicU64::new(0),
             sse_s3_rewrap: Arc::new(std::sync::Mutex::new(SseS3RewrapProgress::default())),
+            trusted_clock: std::sync::Mutex::new(TrustedClockRt {
+                state: clock_state,
+                inject: None,
+            }),
         })
     }
 
@@ -450,7 +479,43 @@ impl Engine {
         st.alloc_since = 0;
         st.dirty = false;
         tracing::debug!("checkpoint saved: gen {gen}, seq {seq}");
+        self.refresh_trusted_clock()?;
         Ok(())
+    }
+
+    /// Object Lock 判定用「现在」(ADR-13 DL6):`max(wall, trusted)`。
+    pub fn lock_now(&self) -> i64 {
+        let clk = self.trusted_clock.lock().unwrap();
+        let (wall, mono) = clk.sample();
+        clk.state.lock_now(wall, mono)
+    }
+
+    /// 当前可信时钟状态(测试/管理面)。
+    pub fn trusted_clock_state(&self) -> TrustedClockState {
+        self.trusted_clock.lock().unwrap().state
+    }
+
+    /// 检查点周期刷新可信时钟高水位(只读引擎跳过)。
+    fn refresh_trusted_clock(&self) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
+        let mut clk = self.trusted_clock.lock().unwrap();
+        let (wall, mono) = clk.sample();
+        clk.state = clk.state.refresh(wall, mono);
+        self.meta.put_trusted_clock(&clk.state)
+    }
+
+    /// 测试注入墙钟/单调时钟(`doc(hidden)`;W5-2 回拨用例)。
+    #[doc(hidden)]
+    pub fn debug_inject_clock(&self, wall: i64, mono_ns: i64) {
+        self.trusted_clock.lock().unwrap().inject = Some((wall, mono_ns));
+    }
+
+    /// 测试:按当前采样(含注入)立即刷新并落盘。
+    #[doc(hidden)]
+    pub fn debug_refresh_trusted_clock(&self) -> Result<()> {
+        self.refresh_trusted_clock()
     }
 
     /// 模拟崩溃(kill -9):跳过最终检查点与封口直接释放资源。
@@ -4809,6 +4874,22 @@ fn now_ts() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// CLOCK_MONOTONIC 纳秒(ADR-13 DL6;失败 → 0,trusted_now 不前进)。
+fn monotonic_ns() -> i64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: timespec 为输出缓冲;CLOCK_MONOTONIC 在 Linux 恒合法。
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    if rc != 0 {
+        return 0;
+    }
+    ts.tv_sec
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec)
 }
 
 fn to_alloc_draft(staged: &Staged) -> AllocDraft {
