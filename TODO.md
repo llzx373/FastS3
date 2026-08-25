@@ -330,7 +330,7 @@
 > 本里程碑为磁盘布局首次大改(layout v2→v3),严格走 §2.3/§2.4 迁移纪律。
 
 ### A0 决策落盘
-- [ ] A0-1 ADR:DM1/DM1'(全局 extent id + 推导式映射,Segment 零改动)、DM2(剩余空间加权轮转)、DM3(每设备独立检查点/恢复 + 池清单校验)、DM4(在线 add/离线 drain 后尾部 remove)、DM5(B 路线 BlueFS spike + C 同盘分区过渡)、DM6(设备内元数据为权威)、DZ1(zstd 范围与顺序)按推荐写入 DESIGN.md §3.3
+- [x] A0-1 ADR:DM1/DM1'(全局 extent id + 推导式映射,Segment 零改动)、DM2(剩余空间加权轮转)、DM3(每设备独立检查点/恢复 + 池清单校验)、DM4(在线 add/离线 drain 后尾部 remove)、DM5(B 路线 BlueFS spike + C 同盘分区过渡)、DM6(设备内元数据为权威)、DZ1(zstd 范围与顺序)按推荐写入 DESIGN.md §3.3
 
 ### M. 多设备扩容与再平衡(§6.1)
 - [ ] M1-1 池清单 `s:pool` + 全局 extent id 推导式映射(设备序×每设备 extent 数;仅尾部增删)
