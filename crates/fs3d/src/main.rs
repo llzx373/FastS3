@@ -1104,7 +1104,15 @@ fn cmd_check_fix(cfg: &EngineConfig) -> fs3_core::Result<()> {
         "repair:       freed {} extents, reclaimed {} bytes",
         rep.freed_extents, rep.bytes_reclaimed
     );
-    println!("repair:       checkpoint written");
+    if rep.skipped_locked > 0 {
+        println!(
+            "repair:       skipped {} locked extent(s) still referenced by Object Lock (not reclaimed)",
+            rep.skipped_locked
+        );
+    }
+    if rep.freed_extents > 0 {
+        println!("repair:       checkpoint written");
+    }
     Ok(())
 }
 

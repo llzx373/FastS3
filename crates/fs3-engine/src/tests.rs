@@ -2416,6 +2416,66 @@ fn repair_leaks_recovers_bitmap() {
     assert!(r2.leaks.is_empty(), "leaks after repair: {:?}", r2.leaks);
 }
 
+/// W4-2:候选泄漏若仍被 legal_hold 版本引用,拒绝释放;真正不可达泄漏照收。
+#[test]
+fn repair_leaks_skips_locked_referenced_extents() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    e.put("b1", "locked", &mut Cursor::new(rnd(64 * 1024, 7)))
+        .unwrap();
+    e.set_object_legal_hold("b1", "locked", None, true).unwrap();
+    let locked_ids: Vec<u64> = e
+        .head("b1", "locked")
+        .unwrap()
+        .unwrap()
+        .extents
+        .iter()
+        .map(|s| u64::from(s.extent_id))
+        .collect();
+    assert!(!locked_ids.is_empty());
+    for &id in &locked_ids {
+        e.allocator().restore_occupancy(id, 0, 0);
+    }
+    let genuine = {
+        use fs3_alloc::Staged;
+        let mut draft = Staged::default();
+        let ids = e.allocator().allocate(&mut draft, 1).unwrap();
+        e.meta()
+            .commit(&[Op::Alloc {
+                draft: fs3_meta::AllocDraft {
+                    alloc: draft.alloc.clone(),
+                    ref_inc: vec![],
+                    ref_dec: vec![],
+                },
+            }])
+            .unwrap();
+        ids[0]
+    };
+    assert!(
+        !locked_ids.contains(&genuine),
+        "genuine leak must not collide with locked extents"
+    );
+    let r = e.check_report().unwrap();
+    assert!(r.leaks.contains(&genuine));
+    for &id in &locked_ids {
+        assert!(r.leaks.contains(&id), "zeroed live_bytes → leak candidate");
+    }
+    let rep = e.repair_leaks().unwrap();
+    assert!(rep.skipped_locked >= locked_ids.len() as u64);
+    assert_eq!(rep.freed_extents, 1);
+    assert!(!e.allocator().test_bit(genuine), "genuine leak reclaimed");
+    for &id in &locked_ids {
+        assert!(
+            e.allocator().test_bit(id),
+            "locked extent {id} must not be reclaimed"
+        );
+    }
+    let mut out = Vec::new();
+    e.get_to("b1", "locked", 0..u64::MAX, &mut out).unwrap();
+    assert_eq!(out, rnd(64 * 1024, 7));
+    assert!(e.head("b1", "locked").unwrap().unwrap().legal_hold);
+}
+
 /// 无泄漏时修复为幂等空操作。
 #[test]
 fn repair_no_leaks_is_noop() {

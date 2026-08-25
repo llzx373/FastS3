@@ -418,7 +418,12 @@ export const api = {
   /** J5:热重载配置(admin 已有端点)。 */
   reloadConfig: () => request<Record<string, unknown>>("POST", "/api/config/reload"),
 
-  repair: () => request<{ freed_extents: number; leaks_found: number; bytes_reclaimed: number }>(
+  repair: () => request<{
+    freed_extents: number;
+    leaks_found: number;
+    bytes_reclaimed: number;
+    skipped_locked: number;
+  }>(
     "POST",
     "/api/repair",
     { confirm: true }

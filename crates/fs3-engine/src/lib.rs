@@ -4345,16 +4345,29 @@ impl Engine {
     ///
     /// 设计语义(DESIGN §4.9):"位图说已分配但元数据不可达的 extent =
     /// 泄漏,回收入位图"。只读模式拒绝。
+    ///
+    /// W4-2:sweep 前若候选仍被未到期 retention / legal_hold 版本引用,
+    /// 拒绝释放并告警(实现缺陷信号,不得以 --fix 绕过 WORM)。
     pub fn repair_leaks(&mut self) -> Result<LeakRepairReport> {
         if self.read_only {
             return Err(Error::InvalidArgument(
                 "repair requires read-write engine (read_only engine)".into(),
             ));
         }
+        let locked = locked_referenced_extents(self.meta.as_ref(), self.lock_now())?;
         let leaks = self.alloc.leaks();
         let mut draft = Staged::default();
         let mut freed = 0u64;
+        let mut skipped_locked = 0u64;
         for &id in &leaks {
+            if locked.contains(&id) {
+                tracing::warn!(
+                    extent_id = id,
+                    "check --fix refused to reclaim extent referenced by Object Lock retention or legal hold (implementation defect signal; DESIGN W4-2)"
+                );
+                skipped_locked += 1;
+                continue;
+            }
             if self.alloc.release_leaked(&mut draft, id) {
                 freed += 1;
             }
@@ -4364,6 +4377,7 @@ impl Engine {
             leaks_found: leaks.len() as u64,
             freed_extents: freed,
             bytes_reclaimed: freed * self.sb.extent_size,
+            skipped_locked,
         };
         if freed == 0 {
             return Ok(report);
@@ -4385,6 +4399,19 @@ impl Engine {
     }
 }
 
+/// 未到期 retention / legal_hold 版本仍引用的 extent(W4-2 防御集)。
+fn locked_referenced_extents(meta: &MetaStore, now: i64) -> Result<HashSet<u64>> {
+    let mut out = HashSet::new();
+    for (_, _, _, m) in meta.snapshot_all_objects()? {
+        if crate::lifecycle::is_locked(&m, now) {
+            for s in &m.extents {
+                out.insert(u64::from(s.extent_id));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// C4 泄漏修复报告。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LeakRepairReport {
@@ -4396,6 +4423,8 @@ pub struct LeakRepairReport {
     pub freed_extents: u64,
     /// 回收字节数。
     pub bytes_reclaimed: u64,
+    /// 因仍被锁定版本引用而拒绝释放的候选数(W4-2)。
+    pub skipped_locked: u64,
 }
 
 impl Drop for Engine {

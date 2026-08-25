@@ -1080,6 +1080,7 @@ impl AdminServer {
                 "leaks_found": rep.leaks_found,
                 "freed_extents": rep.freed_extents,
                 "bytes_reclaimed": rep.bytes_reclaimed,
+                "skipped_locked": rep.skipped_locked,
             })),
             Err(e) => json::err(
                 StatusCode::INTERNAL_SERVER_ERROR,
