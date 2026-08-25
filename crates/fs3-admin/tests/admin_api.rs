@@ -149,6 +149,15 @@ fn admin_status_metrics_and_auth() {
         body.contains("fasts3_sse_decrypt_bytes_total"),
         "metrics body: {body}"
     );
+    // M12 W1-2:可信时钟偏离指标
+    assert!(
+        body.contains("fasts3_trusted_clock_divergence_seconds"),
+        "metrics body: {body}"
+    );
+    assert!(
+        body.contains("fasts3_trusted_clock_divergence_events_total"),
+        "metrics body: {body}"
+    );
     // M11 L3-2:未注入生命周期指标(worker 未启用)时指标组缺席
     assert!(
         !body.contains("fasts3_lifecycle_cycles_total"),

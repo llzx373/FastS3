@@ -261,7 +261,7 @@
 
 ### W1 可信时钟(≈1 pw)
 - [x] W1-1 持久化 `s:trusted_clock{last_wall,last_mono}` + CLOCK_MONOTONIC 推导;保留到期判定 = `until ≤ max(wall_now, trusted_now)`;回拨不缩短剩余保留
-- [ ] W1-2 `trusted_clock_divergence` 指标 + 告警(升级现有 clock_jumps);NTP/部署基线文档 + 停机期篡改边界声明(§5.3)
+- [x] W1-2 `trusted_clock_divergence` 指标 + 告警(升级现有 clock_jumps);NTP/部署基线文档 + 停机期篡改边界声明(§5.3)
 
 ### W2 语义与强制矩阵(≈1.5 pw)
 - [ ] W2-1 ObjectMeta v3 retention/legal_hold 字段 + BucketMeta v2 object_lock 配置

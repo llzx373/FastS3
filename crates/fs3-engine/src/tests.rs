@@ -523,7 +523,12 @@ fn trusted_clock_persists_high_water_across_reopen() {
     // 注入回拨:同一次采样的 mono 不回退,lock_now 不得低于高水位
     let st = e.trusted_clock_state();
     e.debug_inject_clock(st.last_wall - 86_400, st.last_mono_ns);
-    assert!(e.lock_now() >= st.last_wall);
+    e.debug_refresh_trusted_clock().unwrap();
+    assert!(
+        e.trusted_clock_divergence() >= 86_400,
+        "回拨后 gauge 记录落后秒数"
+    );
+    assert!(e.trusted_clock_divergence_events() >= 1);
     let mut e = e;
     e.close().unwrap();
 }

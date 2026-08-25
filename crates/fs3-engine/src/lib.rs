@@ -191,6 +191,10 @@ pub struct Engine {
     sse_s3_rewrap: Arc<std::sync::Mutex<SseS3RewrapProgress>>,
     /// 可信时钟(M12 W1-1,ADR-13 DL6;启动加载 + 检查点刷新)。
     trusted_clock: std::sync::Mutex<TrustedClockRt>,
+    /// 墙钟落后单调推导的秒数(M12 W1-2;0 = 无回拨;admin 渲染 gauge)。
+    trusted_clock_divergence: std::sync::atomic::AtomicU64,
+    /// 回拨事件计数(divergence 从 0→正 的边沿;admin 渲染 counter)。
+    trusted_clock_divergence_events: std::sync::atomic::AtomicU64,
 }
 
 impl Engine {
@@ -329,7 +333,7 @@ impl Engine {
         if !cfg.read_only {
             meta.put_trusted_clock(&clock_state)?;
         }
-        Ok(Engine {
+        let e = Engine {
             zc_fd,
             device,
             sb,
@@ -360,7 +364,11 @@ impl Engine {
                 state: clock_state,
                 inject: None,
             }),
-        })
+            trusted_clock_divergence: std::sync::atomic::AtomicU64::new(0),
+            trusted_clock_divergence_events: std::sync::atomic::AtomicU64::new(0),
+        };
+        e.note_clock_divergence(wall, clock_state.last_wall);
+        Ok(e)
     }
 
     pub fn superblock(&self) -> &fs3_core::SuperBlock {
@@ -503,7 +511,25 @@ impl Engine {
         let mut clk = self.trusted_clock.lock().unwrap();
         let (wall, mono) = clk.sample();
         clk.state = clk.state.refresh(wall, mono);
-        self.meta.put_trusted_clock(&clk.state)
+        let st = clk.state;
+        drop(clk);
+        self.note_clock_divergence(wall, st.last_wall);
+        self.meta.put_trusted_clock(&st)
+    }
+
+    fn note_clock_divergence(&self, wall: i64, trusted_or_high_water: i64) {
+        let d = trusted_or_high_water.saturating_sub(wall).max(0) as u64;
+        let prev = self
+            .trusted_clock_divergence
+            .swap(d, std::sync::atomic::Ordering::Relaxed);
+        if d > 0 && prev == 0 {
+            self.trusted_clock_divergence_events
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                divergence_secs = d,
+                "TRUSTED CLOCK DIVERGENCE: wall clock behind monotonic high-water; Object Lock expiry uses trusted_now (ADR-13 DL6)"
+            );
+        }
     }
 
     /// 测试注入墙钟/单调时钟(`doc(hidden)`;W5-2 回拨用例)。
@@ -3928,6 +3954,18 @@ impl Engine {
     /// SSE-C 累计解密字节数(M11 E1-3 指标;admin /metrics 渲染)。
     pub fn sse_decrypt_bytes(&self) -> u64 {
         self.sse_decrypt_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 墙钟落后可信时钟高水位的秒数(M12 W1-2;0 = 同步)。
+    pub fn trusted_clock_divergence(&self) -> u64 {
+        self.trusted_clock_divergence
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 回拨事件次数(divergence 0→正边沿)。
+    pub fn trusted_clock_divergence_events(&self) -> u64 {
+        self.trusted_clock_divergence_events
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 

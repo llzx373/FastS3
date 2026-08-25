@@ -595,6 +595,20 @@ impl AdminServer {
             "fasts3_sse_decrypt_bytes_total {}\n",
             engine.sse_decrypt_bytes()
         ));
+        // M12 W1-2(ADR-13 DL6):可信时钟与墙钟的偏差;升级 clock_jumps
+        // (后者仍计 SigV4 路径回拨)。gauge=当前落后秒数,counter=边沿次数。
+        text.push_str("# HELP fasts3_trusted_clock_divergence_seconds Wall clock lag behind trusted monotonic high-water (Object Lock)\n");
+        text.push_str("# TYPE fasts3_trusted_clock_divergence_seconds gauge\n");
+        text.push_str(&format!(
+            "fasts3_trusted_clock_divergence_seconds {}\n",
+            engine.trusted_clock_divergence()
+        ));
+        text.push_str("# HELP fasts3_trusted_clock_divergence_events_total Times wall clock fell behind trusted high-water\n");
+        text.push_str("# TYPE fasts3_trusted_clock_divergence_events_total counter\n");
+        text.push_str(&format!(
+            "fasts3_trusted_clock_divergence_events_total {}\n",
+            engine.trusted_clock_divergence_events()
+        ));
         // REVIEW §3.7:掉盘降级状态入 Prometheus(1 = degraded / 只读),
         // 供 alerts.yml FastS3DeviceDegraded 直接告警(替换原恒假占位表达式)。
         text.push_str("# HELP fasts3_device_degraded Device degraded (read-only); 1 = degraded\n");

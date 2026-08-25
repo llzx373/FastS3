@@ -125,7 +125,7 @@ curl -sS --unix-socket /run/fasts3/admin.sock \
   环形缓冲,遥测数据可丢);
 - **实时推送**:`WS /v1/admin/ws?token=`(snapshot 5s / audit 尾随 / health);
 - **Grafana**:deploy/grafana/ 提供仪表盘 JSON 与告警规则(磁盘水位、
-  错误率、泄漏、掉盘降级、时钟回拨)。
+  错误率、泄漏、掉盘降级、时钟回拨、可信时钟偏离)。
 
 告警水位建议:watermark ≥ 80% 提示扩容评估;≥ 95% 紧急(写入将 ENOSPC 507);
 `degraded=true` 立即处理(设备 I/O 故障只读降级)。

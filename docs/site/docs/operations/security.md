@@ -28,9 +28,12 @@
    `NoNewPrivileges`/`ProtectSystem=strict`);
 6. 备份体系就绪:meta-export 快照 + 底层卷快照双保险(演练脚本周期跑);
 7. 监控告警接入:Prometheus 指标 + Grafana 仪表盘 + alerts.yml
-   (5xx/延迟/时钟回拨/ring 饱和);
+   (5xx/延迟/时钟回拨/可信时钟偏离/ring 饱和);
 8. 版本与供应链:使用带**签名 + SBOM** 的发布产物;`Cargo.lock`/
    `pnpm-lock.yaml` 已入库;升级保留 N-1 回滚能力。
+9. **NTP/chrony 常开**(Object Lock 部署硬门槛):保证运行期墙钟不回拨。
+   FastS3 保证运行期内单调(回拨不解除保留);**跨停机拨时钟**只以持久化
+   `last_wall` 为下界,不能证明停机窗外墙钟未被拨快——见 ADR-13 承诺边界。
 
 ## 3. CVE 响应流程(SLA ≤ 7 天)
 

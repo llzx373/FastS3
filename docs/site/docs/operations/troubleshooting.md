@@ -114,7 +114,14 @@ rocksdb 自带 WAL/校验;极端损坏时启动报错。恢复路径(不要手�
 ## 5. 监控/告警误报
 
 - watermark 突增:检查 `GET /v1/admin/uploads`(僵尸 multipart 会话);
-- 时钟回拨告警:确认 NTP 正常;回拨影响 SigV4 时间窗与 mtime 记录;
+- 时钟回拨告警(`FastS3ClockJump`):确认 NTP/chrony 正常;回拨影响 SigV4
+  时间窗与 mtime 记录;
+- 可信时钟偏离告警(`FastS3TrustedClockDivergence`):墙钟落后于
+  `s:trusted_clock` 高水位。Object Lock 到期判定使用单调推导,保留不会
+  因回拨提前解除;立即校时,禁止在停机期手动把系统时钟拨到过去。指标:
+  `fasts3_trusted_clock_divergence_seconds`(当前落后秒)、
+  `fasts3_trusted_clock_divergence_events_total`(边沿次数)。
+  承诺边界:运行期内单调;跨停机篡改依赖 NTP 基线(ADR-13 DL6)。
 - 审计缺日志:确认管理面与数据面 admin 通道连通(Node 代理层无本地存储,
   日志全在 Rust 侧 audit ring)。
 
