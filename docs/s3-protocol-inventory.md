@@ -156,10 +156,10 @@ AccessDenied、AccountProblem、AmbiguousGrantByEmailAddress、AuthorizationHead
 > M9 修复状态:✅ 1/2/3/4/5/10 已按 TODO M9 关闭;**7/8/9(M10 版本化)、
 > SigV2、POST 表单** 维持路线图排期。
 
-1. **SSE-C / SSE-S3 / 桶加密全套缺失** — ✅ M9/A1 起显式 501 拒绝(不再静默);完整实现 🔜 v1.2(M11)。
+1. **SSE-C / SSE-S3 / 桶加密全套缺失** — ✅ v1.2(M11)已交付;SSE-KMS 维持显式拒绝。
 2. **x-amz-tagging / Object Tagging 缺失** — ✅ M9/A1 起显式 501;完整实现 🔜 v1.1(M10 S1)。
 3. **storage-class 缺失** — ✅ M9/A1 起非 STANDARD 显式 400 InvalidStorageClass;多存储类 🔜 远期。
-4. **~~`XAmzContentSHA256Mismatch`~~** — ✅ M9/B2 已修复;CRC 校验头族 🔜 v1.2。
+4. **~~`XAmzContentSHA256Mismatch`~~** — ✅ M9/B2 已修复;checksum 五族 ✅ v1.2。
 5. **~~多段 Range 静默回整对象~~** — ✅ M9/B4 已修复(206 multipart/byteranges)。
 6. **~~multipart ETag 非标准 `md5-拼份数` 形式~~** — ✅ M9/B1 已修复(AWS 二进制拼接)。
 7. **SigV2 完全不支持**(s3cmd 老客户端不可用)——维持(远期评估)。

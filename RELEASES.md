@@ -1,4 +1,36 @@
 # FastS3 发布记录
+## v1.2.0 — M11 生命周期与加密(季度 minor 轨道)(2026-08-25)
+
+> 发布状态:与 M11 交付同步;git tag/发布流水线属执行期步骤(与 v1.1.x 同口径,
+> 尚未正式打 tag)。决策记录:ADR-12(docs/DESIGN.md §3.3);性能报告
+> [docs/perf-M11.md](./docs/perf-M11.md)。
+
+### 变更(TODO M11 全项:L/E/K/C/H + 门禁)
+
+- **生命周期**:Put/Get/DeleteBucketLifecycle;Expiration / NoncurrentVersionExpiration /
+  AbortIncompleteMultipartUpload / ExpiredObjectDeleteMarker;DL4 午夜;执行器指标;
+  `x-amz-expiration`;控制台生命周期 Tab。
+- **SSE-C / SSE-S3**:分块 AES-256-GCM + HKDF 向量;桶默认 AES256;KEK/DEK 轮换重包裹;
+  SSE-KMS 显式拒绝;multipart Complete 解密重加密;控制台加密 Tab。
+- **checksum + GetObjectAttributes**:CRC32/CRC32C/SHA1/SHA256/CRC64NVME;trailer 验算;
+  复合/FULL_OBJECT;aws cli 2.36 默认 CRC64NVME 往返。
+- **审计持久化**:`s:audit` 环形;生命周期删除 `who=system:lifecycle` 重启可检索。
+- **G-2 修复**:SSE GET 挂死(探测 chunk + 仅加密 `spawn_blocking`);打包 extent 覆写
+  (abort 不回退水位;活段垫高水位;`after_release`)。
+
+### 验证(门禁,实测记录见 TODO.md M11 段)
+
+- `cargo test --workspace` / clippy / fmt;覆盖率 **84.80% 行**(llvm-cov workspace;
+  ≥80%;区域 79.00% 如实记录);cargo audit 0 漏洞。
+- s3-tests 全量 gate:**457 passed / 94 skipped / 287 excluded / 0 unexpected
+  (两轮一致,TZ=UTC)**。
+- 崩溃 500 轮加密混载(kills=218)零撕裂/零泄漏/账目零漂移。
+- perf(perf-M11.md):未加密 Off vs v1.1 PUT −0.4%/GET −1.7%(<5%);SSE-S3 GET −75.7%
+  为失零拷贝预期,后续专项优化。
+- 客户端:aws cli/boto3/mc/rclone 冒烟;restic 0.19.1;duplicati 2.3.0.4。
+- **企业硬门槛覆盖率**:A 档达标 **9/10**(v1.2 清零 #7 checksum / #10 SSE;
+  余 #3 Object Lock → v1.3);B 档 #11 Lifecycle / #18 审计持久化清零。
+
 ## v1.1.0 — M10 版本控制 + 4 补全项(季度 minor 轨道)(2026-08-23)
 
 > 发布状态:与 M10 交付同步;git tag/发布流水线属执行期步骤(与 v1.0.x 同口径,

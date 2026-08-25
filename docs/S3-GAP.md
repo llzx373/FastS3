@@ -213,23 +213,23 @@
 | 4 | 版本控制 + 删除标记 + ListObjectVersions | ✅ v1.1 达标 | — |
 | 5 | 条件写入(If-None-Match: * 等) | ✅ v1.1 达标 | — |
 | 6 | Range + 条件头(含 304) | ✅ 达标(v1.0.1 多段 Range 已实现;v1.1 条件写出集) | — |
-| 7 | Checksum 家族 + 复合校验 | ⛔ | 🔜 v1.2 |
+| 7 | Checksum 家族 + 复合校验 | ✅ v1.2 达标 | — |
 | 8 | 强读后写一致 + Head/404 确定性 | ✅ 达标(强于 AWS) | — |
 | 9 | 桶策略 + 条件授权 | ✅ v1.1 达标(桶级 + 最小 Condition 键集) | — |
-| 10 | 静态加密 + 密钥托管(SSE-S3/C + 轮换审计) | ⛔ | 🔜 v1.2 |
+| 10 | 静态加密 + 密钥托管(SSE-S3/C + 轮换审计) | ✅ v1.2 达标(SSE-KMS 显式拒绝) | — |
 
 ### B 档:缺失即工作流失败(8 项)
 
 | # | 门槛 | FastS3 现状 | 差距动作 |
 | --- | --- | --- | --- |
-| 11 | Lifecycle(过期/非当前版本/过滤) | ⛔ | 🔜 v1.2 |
+| 11 | Lifecycle(过期/非当前版本/过滤) | ✅ v1.2 达标(时间墙 15 逐名残余见 s3-tests README) | — |
 | 12 | 事件通知(≥Webhook/SQS 形态) | ⛔ | v2.x 倾向做 |
 | 13 | 复制/DR | ⛔ 内置;策略 = 底层 HA + 迁移脚本(mc mirror/rclone 已演练) | 文档化定位;v2.x 评估 |
 | 14 | 预签名 + STS/Session Policy | 🟡 预签名 ✓;STS ⛔ | STS → v2.x |
 | 15 | 多租户隔离 + 配额/计量 | 🟡 隔离(桶)/配额 ✓;计量 ⛔ | Inventory 评估 |
 | 16 | RestoreObject + 归档层 | ⛔ | v2.x 评估 |
 | 17 | CORS + 预检 | ✅ v1.1 达标 | — |
-| 18 | 访问日志 + 审计面 | 🟡 审计内存环形 | 🔜 v1.2 持久化 |
+| 18 | 访问日志 + 审计面 | ✅ v1.2 审计持久化(访问日志仍不做) | — |
 
 ### C 档:锦上添花(2 项代表)
 
@@ -243,7 +243,7 @@
 | 缺口 | 归属版本 | 状态 |
 | --- | --- | --- |
 | 版本控制、条件写入、?versionId 寻址、ListObjectVersions | v1.1(DESIGN-FUTURE §3) | 已入路线 |
-| Lifecycle、SSE-C/SSE-S3、桶默认加密、checksum 家族、GetObjectAttributes、审计持久化 | v1.2(§4) | 已入路线 |
+| Lifecycle、SSE-C/SSE-S3、桶默认加密、checksum 家族、GetObjectAttributes、审计持久化 | v1.2(§4) | **M11 已交付**(v1.2.0,2026-08-25) |
 | Object Lock、可信时钟、治理 bypass | v1.3(§5) | 已入路线 |
 | 多设备扩容/再平衡、设备内元数据、zstd | v1.4(§6) | 已入路线 |
 | 纳管 agent、HTTP/3、热缓存、Terraform/Operator 评估 | v2.0(§7) | 已入路线 |

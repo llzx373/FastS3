@@ -508,7 +508,7 @@ AWS SSE-C 语义:ETag = 密文的 MD5(上传时算),响应 ETag 不变;客户端
 
 **合计 ≈ 13 pw**(2 人并行 ≈ 7 周;与 v1.1 共属 9~24 个月窗口内两个季度)。发布 v1.2.0。
 
-**v1.2 门禁**:s3-tests `encryption|sse|lifecycle|checksum|use_cksum|get_object_attributes|copy_enc|copy_part_enc` 出排除集且 100%;AWS 加密 test vector 通过;崩溃(加密路径)≥500 轮;SSE 开/关 perf 对照 <5% 回退(未加密负载);审计持久化落地且生命周期删除可见;覆盖率 ≥80%。
+**v1.2 门禁**(M11 已交付,2026-08-25):s3-tests `encryption|sse|lifecycle|checksum|use_cksum|get_object_attributes|copy_enc|copy_part_enc` 出排除集且 100%;AWS 加密 test vector 通过;崩溃(加密路径)≥500 轮;SSE 开/关 perf 对照未加密负载回退 <5%(docs/perf-M11.md);审计持久化落地且生命周期删除可见;覆盖率 ≥80%。
 
 ---
 

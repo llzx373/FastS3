@@ -2,9 +2,7 @@
 //!
 //! - 小 PUT(Content-Length ≤ 阈值)缓冲后走 `handle`(可先验载荷哈希);
 //! - 大 PUT / aws-chunked 走 `put_object_stream`(通道泵 + 同步读);
-//! - GET/HEAD 走 `handle`;ObjectStream / 多段 Range 在 `spawn_blocking`
-//!   上同步读+发送(io_uring / SSE GCM 不得占 hyper worker,否则客户端
-//!   ReadTimeout;M11 G-2)。零拷贝 sendfile/splice 路径不经此泵。
+//! - GET/HEAD 走 `handle`;未加密流式 GET 走 `tokio::spawn`(v1.1);SSE 走 `spawn_blocking`(M11 G-2)。
 
 use std::io::Read;
 use std::sync::Arc;
@@ -280,7 +278,17 @@ fn empty_body() -> RespBody {
 }
 
 /// 多段 Range 流:非空字节即发(空发返回 true 保持语义简单)。
-fn send_range_bytes(
+async fn send_range_bytes(
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    bytes: &[u8],
+) -> bool {
+    if !bytes.is_empty() && tx.send(Ok(Bytes::copy_from_slice(bytes))).await.is_err() {
+        return false;
+    }
+    true
+}
+
+fn send_range_bytes_blocking(
     tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
     bytes: &[u8],
 ) -> bool {
@@ -811,47 +819,88 @@ fn render_with(
             }
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
             let svc = service.clone();
-            // M11 G-2:流式读是同步 io_uring(+ SSE 解密),不得占用 hyper
-            // worker,否则发送端阻塞时接收端无法 poll(ReadTimeout)。
-            // spawn_blocking 走 runtime 阻塞池,避免每请求 std::thread
-            // 创建把未加密 GET 吞吐打穿,同时仍不占用 worker。
-            tokio::task::spawn_blocking(move || {
-                let mut pos = 0u64;
-                let mut buf = vec![0u8; 4 * 1024 * 1024];
-                loop {
-                    let n = match svc.read_stream_chunk(
-                        &bucket,
-                        &key,
-                        version.as_ref(),
-                        versioning,
-                        offset,
-                        length,
-                        &mut pos,
-                        &mut buf,
-                        sse_key.as_ref(),
-                    ) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            let _ = tx.blocking_send(Err(std::io::Error::other(
-                                e.render_xml("", ""),
-                            )));
+            // M11 G-2:SSE 解密+同步 io_uring 若占 runtime worker,channel
+            // 反压时 hyper 无法 poll → 客户端 ReadTimeout。仅加密对象走
+            // spawn_blocking;未加密保持 v1.1 tokio::spawn + async send,
+            // 否则缓冲 GET(zipf 小对象、低于零拷贝阈值)吞吐回退约 30%。
+            if sse_key.is_some() {
+                tokio::task::spawn_blocking(move || {
+                    let mut pos = 0u64;
+                    let mut buf = vec![0u8; 4 * 1024 * 1024];
+                    loop {
+                        let n = match svc.read_stream_chunk(
+                            &bucket,
+                            &key,
+                            version.as_ref(),
+                            versioning,
+                            offset,
+                            length,
+                            &mut pos,
+                            &mut buf,
+                            sse_key.as_ref(),
+                        ) {
+                            Ok(n) => n,
+                            Err(e) => {
+                                let _ = tx.blocking_send(Err(std::io::Error::other(
+                                    e.render_xml("", ""),
+                                )));
+                                break;
+                            }
+                        };
+                        if n == 0 {
                             break;
                         }
-                    };
-                    if n == 0 {
-                        break;
+                        if tx
+                            .blocking_send(Ok(Bytes::copy_from_slice(&buf[..n])))
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
-                    if tx
-                        .blocking_send(Ok(Bytes::copy_from_slice(&buf[..n])))
-                        .is_err()
-                    {
-                        break;
+                    if let Some((a, n)) = &admit {
+                        a.release(*n);
                     }
-                }
-                if let Some((a, n)) = &admit {
-                    a.release(*n);
-                }
-            });
+                });
+            } else {
+                tokio::spawn(async move {
+                    let mut pos = 0u64;
+                    let mut buf = vec![0u8; 4 * 1024 * 1024];
+                    loop {
+                        let n = match svc.read_stream_chunk(
+                            &bucket,
+                            &key,
+                            version.as_ref(),
+                            versioning,
+                            offset,
+                            length,
+                            &mut pos,
+                            &mut buf,
+                            sse_key.as_ref(),
+                        ) {
+                            Ok(n) => n,
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Err(std::io::Error::other(e.render_xml("", ""))))
+                                    .await;
+                                break;
+                            }
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        if tx
+                            .send(Ok(Bytes::copy_from_slice(&buf[..n])))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    if let Some((a, n)) = &admit {
+                        a.release(*n);
+                    }
+                });
+            }
             // Frame 包装:StreamBody 需要 Stream<Item = Result<Frame<D>, E>>
             let stream = ReceiverStream::new(rx).map(|r| r.map(hyper::body::Frame::data));
             let body = StreamBody::new(stream).boxed();
@@ -891,57 +940,112 @@ fn render_with(
             };
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
             let svc = service.clone();
-            tokio::task::spawn_blocking(move || {
-                let mut buf = vec![0u8; 4 * 1024 * 1024];
-                for (s, e) in &ranges {
-                    let header = format!(
-                        "--{boundary}\r\nContent-Type: {part_content_type}\r\nContent-Range: bytes {s}-{e}/{total}\r\n\r\n"
-                    );
-                    if !send_range_bytes(&tx, header.as_bytes()) {
-                        break;
-                    }
-                    let len = e - s + 1;
-                    let mut pos = 0u64;
-                    loop {
-                        let n = match svc.read_stream_chunk(
-                            &bucket,
-                            &key,
-                            version.as_ref(),
-                            versioning,
-                            *s,
-                            len,
-                            &mut pos,
-                            &mut buf,
-                            sse_key.as_ref(),
-                        ) {
-                            Ok(n) => n,
-                            Err(err) => {
-                                let _ = tx.blocking_send(Err(std::io::Error::other(
-                                    err.render_xml("", ""),
-                                )));
+            if sse_key.is_some() {
+                tokio::task::spawn_blocking(move || {
+                    let mut buf = vec![0u8; 4 * 1024 * 1024];
+                    for (s, e) in &ranges {
+                        let header = format!(
+                            "--{boundary}\r\nContent-Type: {part_content_type}\r\nContent-Range: bytes {s}-{e}/{total}\r\n\r\n"
+                        );
+                        if !send_range_bytes_blocking(&tx, header.as_bytes()) {
+                            break;
+                        }
+                        let len = e - s + 1;
+                        let mut pos = 0u64;
+                        loop {
+                            let n = match svc.read_stream_chunk(
+                                &bucket,
+                                &key,
+                                version.as_ref(),
+                                versioning,
+                                *s,
+                                len,
+                                &mut pos,
+                                &mut buf,
+                                sse_key.as_ref(),
+                            ) {
+                                Ok(n) => n,
+                                Err(err) => {
+                                    let _ = tx.blocking_send(Err(std::io::Error::other(
+                                        err.render_xml("", ""),
+                                    )));
+                                    break;
+                                }
+                            };
+                            if n == 0 {
                                 break;
                             }
-                        };
-                        if n == 0 {
-                            break;
+                            if tx
+                                .blocking_send(Ok(Bytes::copy_from_slice(&buf[..n])))
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
-                        if tx
-                            .blocking_send(Ok(Bytes::copy_from_slice(&buf[..n])))
-                            .is_err()
-                        {
+                        if !send_range_bytes_blocking(&tx, b"\r\n") {
                             break;
                         }
                     }
-                    if !send_range_bytes(&tx, b"\r\n") {
-                        break;
+                    let tail = format!("--{boundary}--\r\n");
+                    let _ = send_range_bytes_blocking(&tx, tail.as_bytes());
+                    if let Some((a, n)) = &admit {
+                        a.release(*n);
                     }
-                }
-                let tail = format!("--{boundary}--\r\n");
-                let _ = send_range_bytes(&tx, tail.as_bytes());
-                if let Some((a, n)) = &admit {
-                    a.release(*n);
-                }
-            });
+                });
+            } else {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4 * 1024 * 1024];
+                    for (s, e) in &ranges {
+                        let header = format!(
+                            "--{boundary}\r\nContent-Type: {part_content_type}\r\nContent-Range: bytes {s}-{e}/{total}\r\n\r\n"
+                        );
+                        if !send_range_bytes(&tx, header.as_bytes()).await {
+                            break;
+                        }
+                        let len = e - s + 1;
+                        let mut pos = 0u64;
+                        loop {
+                            let n = match svc.read_stream_chunk(
+                                &bucket,
+                                &key,
+                                version.as_ref(),
+                                versioning,
+                                *s,
+                                len,
+                                &mut pos,
+                                &mut buf,
+                                sse_key.as_ref(),
+                            ) {
+                                Ok(n) => n,
+                                Err(err) => {
+                                    let _ = tx
+                                        .send(Err(std::io::Error::other(err.render_xml("", ""))))
+                                        .await;
+                                    break;
+                                }
+                            };
+                            if n == 0 {
+                                break;
+                            }
+                            if tx
+                                .send(Ok(Bytes::copy_from_slice(&buf[..n])))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        if !send_range_bytes(&tx, b"\r\n").await {
+                            break;
+                        }
+                    }
+                    let tail = format!("--{boundary}--\r\n");
+                    let _ = send_range_bytes(&tx, tail.as_bytes()).await;
+                    if let Some((a, n)) = &admit {
+                        a.release(*n);
+                    }
+                });
+            }
             let stream = ReceiverStream::new(rx).map(|r| r.map(hyper::body::Frame::data));
             let body = StreamBody::new(stream).boxed();
             builder.body(body)

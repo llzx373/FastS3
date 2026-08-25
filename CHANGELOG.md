@@ -5,23 +5,21 @@
 > 详细发布记录见 [RELEASES.md](./RELEASES.md);RC/GA 候选流程见
 > [docs/ga/rc-flow.md](./docs/ga/rc-flow.md)。
 
-## [Unreleased] — v1.2.0(季度 minor 轨道;M11 生命周期与加密,进行中)
+## [Unreleased] — v1.2.0(季度 minor 轨道;M11 生命周期与加密)
 
-实现项已在先前提交落盘;本条记录 G-2 干净复测闭环的正确性修复。workspace
-版本仍为 1.1.0,**perf 未加密回退与 llvm-cov 未勾选前不 bump、不打 tag**。
+M11 全部任务与门禁完成(TODO.md M11 全勾选);决策落盘 ADR-12(DESIGN.md §3.3)。
+workspace 版本 **1.2.0**。git tag / `tools/package/` 属执行期步骤(与 v1.1 同口径)。
 
-- **SSE GET 不再挂死**:ObjectStream / 多段 Range 生产者改 `tokio::task::spawn_blocking`
-  (同步 io_uring + GCM 不得占 hyper worker);SSE 对象在承诺 200/206+Content-Length
-  前探测 Range 起点 chunk,失败 → 500 InternalError XML。
-- **已提交打包密文不被重开覆写**:`abort_draft` 不回退开放 extent 水位;SSE
-  Complete 释放分片后补 `after_release`;`open_new_extent` 若刚分配的 extent
-  在对象/分片快照仍有活段,水位从 max_end 对齐上界起跳(误清位图后的安全网)。
-  空洞随最后活对象删除清位或压缩迁走,不是 `check` 意义上的泄漏。
-- **其它**:生命周期规则桶级缓存(GET/HEAD 的 x-amz-expiration 免反复 prefix
-  scan);s3-tests runner 固定 `TZ=UTC`。
-- **门禁(已测)**:加密崩溃 500 轮零泄漏零撕裂;s3-tests 两轮 457/94/287/0;
-  aws cli 默认 CRC64NVME PUT/GET;restic/duplicati 往返;cargo audit 0 漏洞。
-  未加密 perf <5% 与覆盖率重跑仍待勾选(TODO.md M11 实测段)。
+- **生命周期**:规则 CRUD、后台执行器(Expiration/非当前版本/中止 MPU/过期删除标记)、
+  DL4 午夜语义、`x-amz-expiration`、审计持久化(`who=system:lifecycle`)。
+- **SSE-C / SSE-S3**:分块 AES-256-GCM、桶默认加密、KEK/DEK;SSE-KMS 显式拒绝。
+  Complete 加密会话解密重加密;abort 不回退打包水位;`open_new_extent` 按活段垫高。
+- **checksum / GetObjectAttributes**:五族 header+trailer、复合/FULL_OBJECT、
+  aws cli 默认 CRC64NVME。
+- **G-2 正确性**:SSE GET 承诺长度前探测 chunk;仅加密流走 `spawn_blocking`,
+  未加密恢复 v1.1 `tokio::spawn`(见 docs/perf-M11.md)。
+- **门禁**:加密崩溃 500 轮零泄漏;s3-tests 两轮 457/94/287/0;未加密 perf
+  PUT −0.4%/GET −1.7%;覆盖率 84.80% 行;cargo audit 0 漏洞。
 
 ## [Unreleased] — v1.1.0(季度 minor 轨道;M10 版本控制 + 4 补全项)
 

@@ -23,7 +23,7 @@
 | --- | --- | --- | --- | --- |
 | [M9 协议卫生与正确性补丁](#m9-v10x-协议卫生与正确性补丁) | v1.0.x | ≈2 周 | §3.7 九项协议修复 + 头显式化 + 列表/边界收敛 | ✅ 完成(v1.0.1,2026-08-22) |
 | [M10 版本控制](#m10-v110-版本控制--4-补全项) | v1.1.0 | ≈7 周 | Versioning/删除标记/条件写 + 标签/CORS/桶策略/POST 表单 | ✅ 完成(v1.1.0,2026-08-23) |
-| [M11 生命周期与加密](#m11-v120-生命周期与加密) | v1.2.0 | ≈7 周 | Lifecycle/SSE-C/SSE-S3/checksum/GetObjectAttributes/审计持久化 | 🟡 实现+G-2/G-1 复测已过;perf/覆盖率/发版未勾 |
+| [M11 生命周期与加密](#m11-v120-生命周期与加密) | v1.2.0 | ≈7 周 | Lifecycle/SSE-C/SSE-S3/checksum/GetObjectAttributes/审计持久化 | ✅ 完成(v1.2.0,2026-08-25) |
 | [M12 Object Lock / WORM](#m12-v130-object-lock--worm) | v1.3.0 | ≈3 周 | 治理/合规保留 + 法定保留 + 可信时钟 | ⬜ 未开始 |
 | [M13 容量与底座](#m13-v140-容量与底座) | v1.4.0 | ≈6 周 | 多设备扩容/再平衡 + 元数据分区过渡 + zstd | ⬜ 未开始 |
 | [M14 集中纳管与生态](#m14-v200-集中纳管与生态) | v2.0.0 | ≈7 周 | agent 纳管/HTTP3/热缓存/Terraform·Operator 评估 | ⬜ 未开始 |
@@ -239,14 +239,14 @@
 - [x] AES-GCM/HKDF 官方 test vector 通过;崩溃(加密写读混载)≥500 轮——向量随 `cargo test -p fs3-core`;G-2 `run_crash_enc.sh 500 --fresh` PASS(kills=218,零泄漏/零撕裂/账目零漂移,elapsed=6694s,log=`tests/crash/run/crash-enc-last.log`)
 - [x] 审计持久化落地且生命周期删除可见——harness 断言 4(`who=system:lifecycle` 重启后可检索);G-2 500 轮覆盖
 - [x] 客户端矩阵回归(含 aws cli 新版默认 checksum 行为,S3-GAP §8.2 v1.2 档;restic/duplicati 复跑)——aws cli 2.36.28 默认 CRC64NVME PUT 回 `ChecksumCRC64NVME` 且 GET 往返;client_smoke(aws/boto3/mc/rclone)全过;restic 0.19.1 backup/restore/check 过;duplicati 2.3.0.4 备份/恢复过(`--dbpath` + restore `"*"`)
-- [ ] perf:SSE 开/关对照、checksum 开销对照;未加密负载回退 <5%——脚本 `tests/bench/perf-m11-compare.sh`;对照未达标前不发 v1.2.0(见下方实测)
-- [ ] 覆盖率 ≥80%;cargo audit 清零;发布 v1.2.0——`cargo audit` 0 漏洞(2 条 allowed 信息级:RUSTSEC-2023-0089/RUSTSEC-2025-0134,同 v1.1 集);llvm-cov 本轮未重跑;不 bump 版本/不打 tag
+- [x] perf:SSE 开/关对照、checksum 开销对照;未加密负载回退 <5%——脚本 `tests/bench/perf-m11-compare.sh`;报告 [docs/perf-M11.md](./docs/perf-M11.md)。G-2 曾把全部 ObjectStream 改 `spawn_blocking`,zipf GET −30%;改为仅 SSE 走阻塞池后复测 **PUT −0.4% / GET −1.7%**(细采样 p99 未变差)。SSE-S3 GET −75.7% 为 DE1 失零拷贝预期,不卡门禁,留给后续专项
+- [x] 覆盖率 ≥80%;cargo audit 清零;发布 v1.2.0——`cargo llvm-cov --workspace --summary-only --fail-under-lines 80`:**84.80% 行 / 79.00% 区域 / 85.08% 函数**(门禁口径=行;≥80%);`cargo audit` 0 漏洞(2 条 allowed 信息级:RUSTSEC-2023-0089/RUSTSEC-2025-0134,同 v1.1 集);workspace 版本 bump 1.2.0。不打 git tag、不跑 `tools/package/`(执行期同 v1.1)
 
-> **M11 G-2 干净复测记录(2026-08-24~25)**:
-> - 失败根因(不可先删现场盲跑 500):SSE 流式 GET 在 hyper worker 上同步 io_uring + `blocking_send` → 客户端 Raw ReadTimeout;Complete/abort 把开放 extent 水位回退或从 0 重开,覆写已提交打包密文 → GCM。修复:ObjectStream/`MultiRange` 走 `spawn_blocking`;SSE GET 在承诺 200/206 前探测起点 chunk;abort 不回退水位;Complete 加密臂 `after_release`;`open_new_extent` 按快照活段 max_end 垫高水位。回归见 fs3-engine/fs3-s3 单测(含 false-free 钩子)。
+> **M11 实测记录(2026-08-25,v1.2.0)**:
+> - 失败根因(不可先删现场盲跑 500):SSE 流式 GET 在 runtime worker 上同步 io_uring + `blocking_send` → 客户端 Raw ReadTimeout;Complete/abort 把开放 extent 水位回退或从 0 重开,覆写已提交打包密文 → GCM。修复:仅 SSE ObjectStream/`MultiRange` 走 `spawn_blocking`,未加密恢复 v1.1 `tokio::spawn`;SSE GET 在承诺 200/206 前探测起点 chunk;abort 不回退水位;Complete 加密臂 `after_release`;`open_new_extent` 按快照活段 max_end 垫高水位。
 > - 崩溃:`FASTS3D=target/release/fasts3d bash tests/crash/run_crash_enc.sh 30 19620 --fresh` PASS(kills=11,328s)后 `... 500 ... --fresh` PASS(kills=218,6694s);零泄漏零撕裂 stats drift=0;ssec_put=387 sses3_put=387 get_verify=115740 lc_deleted_sum=2551。
-> - G-1 复测:2GiB、`compaction_enabled=false`、`lifecycle_interval_secs=10`、`--allow-anonymous`、**TZ=UTC**(非 UTC 下 `test_lifecycle_expiration_header_tags_head` 用本地 naive now 减 UTC 午夜会把正确头判失败)。两轮 `passed=457 skipped=94 excluded_failures=287 unexpected_failures=0`。
-> - perf 未加密回退门禁未过:同机 A=v1.1 Off / B=当前 Off,loadgen GET 仍见约 -30% 吞吐回退(脚本见 `tests/bench/perf-m11-compare.sh`);生命周期规则桶级缓存与 spawn_blocking 已落地,对照需再跑才勾选。
+> - G-1 复测:2GiB、`compaction_enabled=false`、`lifecycle_interval_secs=10`、`--allow-anonymous`、**TZ=UTC**。两轮 `passed=457 skipped=94 excluded_failures=287 unexpected_failures=0`。
+> - perf:未加密 B vs A PUT −0.4%/GET −1.7%(见 docs/perf-M11.md);覆盖率 84.80% 行。
 > - 不打 git tag、不跑 `tools/package/`。
 
 ---

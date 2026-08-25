@@ -789,7 +789,11 @@ GET → 鉴权 → 查 o:{bucket}\0{key}(rocksdb 命中,微秒级)
 - Range / suffix-range / 多段 Range(单段为主,S3 语义)按需裁剪首尾 chunk;
 - CRC 校验:`verify_reads=false`(默认,信任介质 + TLS)时为纯裸读;**true 时并行读 chunk CRC 校验**,开销约 3~5% 吞吐;
 - 条件头 `If-Modified-Since/If-None-Match/If-Match` 在元数据层直接判定,零设备 I/O。
-- SSE 对象失去零拷贝(ADR-12 DE1):HTTP 层 ObjectStream / 多段 Range 在 `spawn_blocking` 上同步读+解密,避免占满 hyper worker 导致客户端 ReadTimeout;发 200/206 之前探测 Range 起点所在 GCM chunk,失败则 500 InternalError,不先承诺 Content-Length 再断流。
+- SSE 对象失去零拷贝(ADR-12 DE1):加密 ObjectStream / 多段 Range 在
+  `spawn_blocking` 上同步读+解密,避免占满 runtime worker 导致客户端
+  ReadTimeout;未加密流式 GET 仍走 v1.1 `tokio::spawn` + 异步 send。发
+  200/206 之前探测 Range 起点所在 GCM chunk,失败则 500 InternalError,
+  不先承诺 Content-Length 再断流。
 
 ### 4.7 Multipart 上传
 

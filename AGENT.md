@@ -8,11 +8,9 @@ FastS3 是一个**单机 S3 服务**,面向裸块设备 / 磁盘镜像文件的�
 
 - 数据面 + S3 协议:**Rust**(io_uring + thread-per-core + O_DIRECT)
 - 管理面 + Web 控制台:**Node.js**(Fastify + React/Vite),永不进入数据热路径
-- 当前状态:**v1.0.1 已交付**(M0~M8 GA 候选 + M9 协议卫生补丁全部完成):存储
-  引擎/S3 协议/admin API/Web 控制台/打包签名 SBOM/文档站齐备,构建·clippy·测试三绿、
-  s3-tests 全量 gate 绿(TODO.md M9 全勾选;REVIEW.md 为 M8 交付同步的只读一致
-  性审查报告);执行期门禁(外部审计、真 NVMe、rpm/ARM64 真机、Beta 窗口)按
-  checklist 如实标注,尚未正式打 tag 发布
+- 当前状态:**v1.2.0 已交付**(M0~M11:GA 候选 + 协议卫生 + 版本控制 + 生命周期/
+  加密)。门禁见 TODO.md M11;下一步 M12 Object Lock(v1.3.0)。git tag / 真 NVMe /
+  外部审计仍按 checklist 如实为执行期项
 
 ## 2. 权威文档(改动任何设计前必读)
 

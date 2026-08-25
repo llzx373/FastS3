@@ -79,6 +79,8 @@ FastS3 的对策:**不做底层已经做过的事**。工程力量全部投入�
 
 ✅ **M4 加固完成(v0.5)。** 崩溃 1000 轮 + 断电模拟零撕裂/零泄漏/账目零漂移;故障注入(掉盘只读降级 + 告警 / 磁盘满 507 / 时钟回拨监控);H3/H4 运维命令(热重载、WS 推送、每密钥限速、超时控制);TLS(rustls 1.2/1.3 + SNI + 热加载);`fasts3d doctor` 能力自检、s3-tests 支持子集 gate 全绿、覆盖率 80.05%、扩展性 6000 万+对象恒定。
 
+✅ **M11 生命周期与加密完成(v1.2.0)。** Lifecycle 执行器 + SSE-C/SSE-S3 + checksum 五族 + GetObjectAttributes + 审计持久化;门禁:s3-tests 457/94/287/0、加密崩溃 500 轮、未加密 perf PUT −0.4%/GET −1.7%、覆盖率 84.80% 行。报告 [docs/perf-M11.md](./docs/perf-M11.md)。下一步:M12 Object Lock(v1.3.0)。
+
 ✅ **M8 GA 发布(v1.0.0)。** 全量回归资产与本地实测(`tests/m8/regression.sh`:客户端 × OS × 内核 × 设备形态逐轴编排 + 汇总;CI 接入 regression.yml);RC1→RC2→GA 候选流程(`tests/m8/rc-gate.sh` + docs/ga/rc-flow.md + CHANGELOG.md);安全审计(自审 14 项全绿 + 外部审计范围,见 docs/ga/security-audit.md);发布流水线复核(签名 + SBOM 229 组件 + 供应链锁定,`tools/package/verify-release.sh` 实测 PASS,版本源统一为 Cargo.toml);官网与公告(文档站新增兼容矩阵/安全基线 CVE 响应/v1.0.0 公告页,mkdocs 0 警告);§1.1 开箱清单逐项证据表(docs/ga/checklist.md)+ 内置示例 `deploy/examples/backup-dir.sh`(实测);GA 检查单复核 → **v1.0.0 发布**(版本号全仓同步)。执行期门禁(真 NVMe §6.8 数值 / 外部审计执行 / rpm·ARM64 真机构建 / Beta 窗口)按 checklist.md 如实标注。RELEASES.md v1.0.0。
 
 ✅ **M7 文档与 Beta 完成(v0.8)。** 元数据快照体系(`fasts3d meta-export`/`meta-import` + 备份/恢复演练,与底层卷快照组合成完整备份);内嵌形态(`fasts3d serve --web-root <dist>` 数据面直托管控制台,SPA 回退 + S3 路径互不干扰)与 Node 管理面多实例无状态化验证(双实例演练实测通过);文档站完整(Admin Guide/调优/故障排查与 FAQ/备份恢复/迁移/API 参考/错误码速查);迁移脚本化(MinIO⇢FastS3 `mc mirror`、公有云⇢FastS3 `rclone`,双端点演练通过);Beta 反馈闭环就绪(Beta 计划/注册下载支持通道/评审清单/issue 模板)。**公开 Beta(v0.9)入口已就绪**:Beta 用户数与 P0/P1 清零为过程门禁,随公开 Beta 执行。RELEASES.md v0.8。
