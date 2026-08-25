@@ -276,7 +276,7 @@
 ### W4 交互面(≈1 pw)
 - [x] W4-1 生命周期/压缩/再平衡 worker 锁感知(跳过锁定对象 + skipped_locked 指标,接通 M11 L4-1)
 - [x] W4-2 `fasts3 check --fix` 锁感知(不得回收受保留版本的段)
-- [ ] W4-3 管理面:锁状态展示/保留编辑/审计过滤
+- [x] W4-3 管理面:锁状态展示/保留编辑/审计过滤
 
 ### W5 测试(≈1.5 pw)
 - [ ] W5-1 s3-tests object_lock/legal/retention/governance 族出排除集且 100%

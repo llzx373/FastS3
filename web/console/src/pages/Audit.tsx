@@ -50,6 +50,12 @@ const OP_OPTIONS = [
   "PutBucketOwnershipControls",
   "GetBucketOwnershipControls",
   "DeleteBucketOwnershipControls",
+  "PutObjectLockConfiguration",
+  "GetObjectLockConfiguration",
+  "PutObjectRetention",
+  "GetObjectRetention",
+  "PutObjectLegalHold",
+  "GetObjectLegalHold",
 ];
 
 /** 过滤行输入态(未应用;datetime-local 与数字输入原始字符串)。 */
@@ -61,6 +67,7 @@ interface DirtyFilters {
   status?: string;
   sinceRaw?: string;
   untilRaw?: string;
+  bypass?: "" | "true" | "false";
 }
 
 export default function Audit() {
@@ -102,6 +109,8 @@ export default function Audit() {
     if (dirty.key?.trim()) f.key = dirty.key.trim();
     if (dirty.who?.trim()) f.who = dirty.who.trim();
     if (dirty.status !== undefined && dirty.status !== "") f.status = Number(dirty.status);
+    if (dirty.bypass === "true") f.bypass = true;
+    if (dirty.bypass === "false") f.bypass = false;
     setFilters(f);
   };
 
@@ -176,6 +185,15 @@ export default function Audit() {
             }
             style={{ width: 100 }}
           />
+          <select
+            value={dirty.bypass ?? ""}
+            onChange={(e) => setDirty((d) => ({ ...d, bypass: e.target.value as "" | "true" | "false" }))}
+            style={{ width: 130 }}
+          >
+            <option value="">bypass(全部)</option>
+            <option value="true">仅 bypass</option>
+            <option value="false">非 bypass</option>
+          </select>
         </div>
         <div className="toolbar" style={{ marginBottom: 0 }}>
           <label style={{ margin: 0 }}>
@@ -217,6 +235,8 @@ export default function Audit() {
               <th>桶</th>
               <th>键</th>
               <th>结果</th>
+              <th>bypass</th>
+              <th>保留变更</th>
               <th>客户端</th>
             </tr>
           </thead>
@@ -240,6 +260,12 @@ export default function Audit() {
                     {a.status}
                   </span>
                 </td>
+                <td className="muted">{a.bypass ? "是" : "—"}</td>
+                <td className="muted" style={{ fontSize: 12 }}>
+                  {a.retain_until_before != null || a.retain_until_after != null
+                    ? `${a.retention_mode_before ?? "—"}/${a.retain_until_before ?? "—"} → ${a.retention_mode_after ?? "—"}/${a.retain_until_after ?? "—"}`
+                    : "—"}
+                </td>
                 <td className="muted mono" style={{ fontSize: 12 }}>
                   {a.peer}
                 </td>
@@ -247,7 +273,7 @@ export default function Audit() {
             ))}
             {audit.length === 0 && (
               <tr>
-                <td colSpan={7} className="muted">
+                <td colSpan={9} className="muted">
                   {activeCount > 0
                     ? "没有匹配该检索条件的审计记录"
                     : "暂无审计记录(有 S3 请求后出现)"}

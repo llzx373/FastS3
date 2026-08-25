@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, fmtBytes, type ListResult, type BucketInfo, type ObjectVersion, type S3Tag } from "../api";
+import { api, fmtBytes, type ListResult, type BucketInfo, type ObjectVersion, type S3Tag, type ObjectRetention } from "../api";
 
 const PART_SIZE = 8 * 1024 * 1024; // 8MiB/片(>5MiB 下限)
 
@@ -390,6 +390,7 @@ function ObjectMeta({
         {/* M10:版本列表(恢复/永久删除)与对象标签编辑 */}
         <VersionPanel bucket={bucket} objKey={key} />
         <TagPanel bucket={bucket} objKey={key} />
+        <LockPanel bucket={bucket} objKey={key} />
         <div className="actions">
           <button className="ghost" onClick={onClose}>
             关闭
@@ -586,6 +587,124 @@ function TagPanel({ bucket, objKey }: { bucket: string; objKey: string }) {
             <button className="small" onClick={save} disabled={saving}>
               {saving ? "保存中…" : "保存标签"}
             </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function toLocalInput(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/** M12:对象保留 / 法定保留(当前版本;桶未启用锁时提示去桶设置)。 */
+function LockPanel({ bucket, objKey }: { bucket: string; objKey: string }) {
+  const [enabled, setEnabled] = useState<boolean | null>(null);
+  const [retention, setRetention] = useState<ObjectRetention | null>(null);
+  const [hold, setHold] = useState<"ON" | "OFF">("OFF");
+  const [mode, setMode] = useState<"GOVERNANCE" | "COMPLIANCE">("GOVERNANCE");
+  const [untilLocal, setUntilLocal] = useState("");
+  const [bypass, setBypass] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const lock = await api.getObjectLock(bucket);
+      setEnabled(lock.ObjectLockEnabled);
+      if (!lock.ObjectLockEnabled) {
+        setRetention(null);
+        return;
+      }
+      const [r, h] = await Promise.all([
+        api.getObjectRetention(bucket, objKey),
+        api.getObjectLegalHold(bucket, objKey),
+      ]);
+      setRetention(r.Retention);
+      if (r.Retention) {
+        setMode(r.Retention.Mode);
+        setUntilLocal(toLocalInput(r.Retention.RetainUntilDate));
+      }
+      setHold(h.Status);
+      setError(null);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }, [bucket, objKey]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const saveRetention = async () => {
+    if (!untilLocal) {
+      setError("请填写保留到期时间");
+      return;
+    }
+    setSaving(true);
+    try {
+      await api.putObjectRetention(bucket, objKey, { Mode: mode, RetainUntilDate: new Date(untilLocal).toISOString() }, { bypass });
+      setSaved(true);
+      await load();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const saveHold = async (status: "ON" | "OFF") => {
+    setSaving(true);
+    try {
+      await api.putObjectLegalHold(bucket, objKey, status);
+      setSaved(true);
+      await load();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div style={{ marginTop: 16 }}>
+      <div className="title">对象锁</div>
+      {error && <div className="alert">{error}</div>}
+      {enabled === null && !error && <div className="muted">加载中…</div>}
+      {enabled === false && <div className="muted">桶未启用 Object Lock(在桶设置 → 对象锁 中启用)</div>}
+      {enabled && (
+        <>
+          <div className="form-row">
+            <label>保留模式</label>
+            <select value={mode} onChange={(e) => setMode(e.target.value as "GOVERNANCE" | "COMPLIANCE")}>
+              <option value="GOVERNANCE">GOVERNANCE</option>
+              <option value="COMPLIANCE">COMPLIANCE</option>
+            </select>
+          </div>
+          <div className="form-row">
+            <label>保留至</label>
+            <input type="datetime-local" value={untilLocal} onChange={(e) => setUntilLocal(e.target.value)} />
+          </div>
+          <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
+            当前:{retention ? `${retention.Mode} 至 ${new Date(retention.RetainUntilDate).toLocaleString()}` : "无保留"}
+          </div>
+          <label style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
+            <input type="checkbox" checked={bypass} onChange={(e) => setBypass(e.target.checked)} />
+            GOVERNANCE bypass(缩短/覆盖治理保留)
+          </label>
+          <div className="toolbar" style={{ marginTop: 0 }}>
+            <button className="small" onClick={saveRetention} disabled={saving}>
+              {saving ? "保存中…" : "保存保留"}
+            </button>
+            <button className="ghost small" disabled={saving} onClick={() => saveHold(hold === "ON" ? "OFF" : "ON")}>
+              法定保留:{hold === "ON" ? "ON → 关闭" : "OFF → 开启"}
+            </button>
+            {saved && <span style={{ color: "var(--green)", fontSize: 12 }}>✓ 已保存</span>}
           </div>
         </>
       )}

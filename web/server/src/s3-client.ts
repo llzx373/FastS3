@@ -14,6 +14,9 @@
  * M11:S3M10Client 再加生命周期/桶默认加密
  * (Get|Put|DeleteBucketLifecycleConfiguration / Get|Put|DeleteBucketEncryption,
  * 仅 SSE-S3 AES256)——同为小 XML 文档请求。
+ *
+ * M12:Object Lock 管理面(Get|PutObjectLockConfiguration /
+ * Get|PutObjectRetention / Get|PutObjectLegalHold)——小 XML,无字节流。
  */
 import { createHmac, createHash } from "node:crypto";
 import http from "node:http";
@@ -318,6 +321,90 @@ export interface BucketCorsRule {
 export interface S3Tag {
   key: string;
   value: string;
+}
+
+/** M12:桶 Object Lock 配置(Enabled 不可逆;默认保留可选)。 */
+export interface ObjectLockDefaultRetention {
+  Mode: "GOVERNANCE" | "COMPLIANCE";
+  Days?: number;
+  Years?: number;
+}
+
+export interface ObjectLockConfig {
+  ObjectLockEnabled: boolean;
+  DefaultRetention?: ObjectLockDefaultRetention;
+}
+
+export interface ObjectRetention {
+  Mode: "GOVERNANCE" | "COMPLIANCE";
+  RetainUntilDate: string;
+}
+
+export interface ObjectLegalHold {
+  Status: "ON" | "OFF";
+}
+
+const S3_XMLNS = "http://s3.amazonaws.com/doc/2006-03-01/";
+
+/** 解析 ObjectLockConfiguration(未启用的 404 由调用方处理,不经本函数)。 */
+export function parseObjectLockXml(xml: string): ObjectLockConfig {
+  const enabled = /<ObjectLockEnabled>\s*Enabled\s*<\/ObjectLockEnabled>/.test(xml);
+  const cfg: ObjectLockConfig = { ObjectLockEnabled: enabled };
+  const rule = /<DefaultRetention>([\s\S]*?)<\/DefaultRetention>/.exec(xml);
+  if (rule) {
+    const mode = /<Mode>(GOVERNANCE|COMPLIANCE)<\/Mode>/.exec(rule[1])?.[1] as
+      | "GOVERNANCE"
+      | "COMPLIANCE"
+      | undefined;
+    const days = /<Days>(\d+)<\/Days>/.exec(rule[1]);
+    const years = /<Years>(\d+)<\/Years>/.exec(rule[1]);
+    if (mode) {
+      cfg.DefaultRetention = { Mode: mode };
+      if (days) cfg.DefaultRetention.Days = Number(days[1]);
+      if (years) cfg.DefaultRetention.Years = Number(years[1]);
+    }
+  }
+  return cfg;
+}
+
+export function renderObjectLockXml(cfg: ObjectLockConfig): string {
+  let s = `<ObjectLockConfiguration xmlns="${S3_XMLNS}"><ObjectLockEnabled>Enabled</ObjectLockEnabled>`;
+  const d = cfg.DefaultRetention;
+  if (d) {
+    s += `<Rule><DefaultRetention><Mode>${d.Mode}</Mode>`;
+    if (d.Days !== undefined) s += `<Days>${d.Days}</Days>`;
+    if (d.Years !== undefined) s += `<Years>${d.Years}</Years>`;
+    s += "</DefaultRetention></Rule>";
+  }
+  return s + "</ObjectLockConfiguration>";
+}
+
+export function parseRetentionXml(xml: string): ObjectRetention {
+  const mode = /<Mode>(GOVERNANCE|COMPLIANCE)<\/Mode>/.exec(xml)?.[1] as
+    | "GOVERNANCE"
+    | "COMPLIANCE"
+    | undefined;
+  const until = /<RetainUntilDate>([^<]*)<\/RetainUntilDate>/.exec(xml)?.[1] ?? "";
+  if (!mode || !until) {
+    throw new Error("Retention XML missing Mode or RetainUntilDate");
+  }
+  return { Mode: mode, RetainUntilDate: unescapeXml(until) };
+}
+
+export function renderRetentionXml(r: ObjectRetention): string {
+  return (
+    `<Retention xmlns="${S3_XMLNS}"><Mode>${r.Mode}</Mode>` +
+    `<RetainUntilDate>${escapeXml(r.RetainUntilDate)}</RetainUntilDate></Retention>`
+  );
+}
+
+export function parseLegalHoldXml(xml: string): ObjectLegalHold {
+  const st = /<Status>(ON|OFF)<\/Status>/.exec(xml)?.[1] as "ON" | "OFF" | undefined;
+  return { Status: st === "ON" ? "ON" : "OFF" };
+}
+
+export function renderLegalHoldXml(status: "ON" | "OFF"): string {
+  return `<LegalHold xmlns="${S3_XMLNS}"><Status>${status}</Status></LegalHold>`;
 }
 
 function escapeXml(s: string): string {
@@ -775,5 +862,93 @@ export class S3M10Client {
   /** DeleteBucketEncryption(204;无配置亦幂等)。 */
   async deleteBucketEncryption(bucket: string): Promise<void> {
     await this.call("DELETE", `/${bucket}?encryption`);
+  }
+
+  // ── M12:Object Lock ──
+
+  /** GetObjectLockConfiguration;未启用(404 ObjectLockConfigurationNotFoundError)→ Enabled=false。 */
+  async getObjectLockConfiguration(bucket: string): Promise<ObjectLockConfig> {
+    const signed = signRequest(this.cfg, "GET", `/${bucket}?object-lock`, Buffer.alloc(0), {});
+    const res = await doRequest(this.cfg, signed);
+    if (res.status === 404 && res.body.includes("ObjectLockConfigurationNotFoundError")) {
+      return { ObjectLockEnabled: false };
+    }
+    if (res.status !== 200) {
+      throw new Error(
+        `GetObjectLockConfiguration ${bucket}: HTTP ${res.status} ${res.body.toString().slice(0, 300)}`
+      );
+    }
+    return parseObjectLockXml(res.body.toString("utf8"));
+  }
+
+  /** PutObjectLockConfiguration(Enabled 不可逆;可选默认保留)。 */
+  async putObjectLockConfiguration(bucket: string, cfg: ObjectLockConfig): Promise<void> {
+    await this.call("PUT", `/${bucket}?object-lock`, Buffer.from(renderObjectLockXml(cfg)), {
+      "content-type": "application/xml",
+    });
+  }
+
+  /** GetObjectRetention;无保留 → null(NoSuchObjectLockConfiguration)。 */
+  async getObjectRetention(
+    bucket: string,
+    key: string,
+    versionId?: string
+  ): Promise<ObjectRetention | null> {
+    const path = this.objectLockPath(bucket, key, "retention", versionId);
+    const signed = signRequest(this.cfg, "GET", path, Buffer.alloc(0), {});
+    const res = await doRequest(this.cfg, signed);
+    if (res.status === 404 && res.body.includes("NoSuchObjectLockConfiguration")) return null;
+    if (res.status !== 200) {
+      throw new Error(`GetObjectRetention ${bucket}/${key}: HTTP ${res.status} ${res.body.toString().slice(0, 300)}`);
+    }
+    return parseRetentionXml(res.body.toString("utf8"));
+  }
+
+  /** PutObjectRetention;GOVERNANCE 缩短须 bypass=true(隐式 s3:* 密钥即可)。 */
+  async putObjectRetention(
+    bucket: string,
+    key: string,
+    retention: ObjectRetention,
+    opts: { versionId?: string; bypass?: boolean } = {}
+  ): Promise<void> {
+    const headers: Record<string, string> = { "content-type": "application/xml" };
+    if (opts.bypass) headers["x-amz-bypass-governance-retention"] = "true";
+    await this.call(
+      "PUT",
+      this.objectLockPath(bucket, key, "retention", opts.versionId),
+      Buffer.from(renderRetentionXml(retention)),
+      headers
+    );
+  }
+
+  /** GetObjectLegalHold(桶未锁 → InvalidRequest,由调用方先查桶配置)。 */
+  async getObjectLegalHold(
+    bucket: string,
+    key: string,
+    versionId?: string
+  ): Promise<ObjectLegalHold> {
+    const res = await this.call("GET", this.objectLockPath(bucket, key, "legal-hold", versionId));
+    return parseLegalHoldXml(res.body.toString("utf8"));
+  }
+
+  /** PutObjectLegalHold。 */
+  async putObjectLegalHold(
+    bucket: string,
+    key: string,
+    status: "ON" | "OFF",
+    versionId?: string
+  ): Promise<void> {
+    await this.call(
+      "PUT",
+      this.objectLockPath(bucket, key, "legal-hold", versionId),
+      Buffer.from(renderLegalHoldXml(status)),
+      { "content-type": "application/xml" }
+    );
+  }
+
+  private objectLockPath(bucket: string, key: string, sub: string, versionId?: string): string {
+    let path = `/${bucket}/${this.encodeKey(key)}?${sub}`;
+    if (versionId) path += `&versionId=${encodeURIComponent(versionId)}`;
+    return path;
   }
 }

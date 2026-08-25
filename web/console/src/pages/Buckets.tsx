@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, fmtBytes, fmtTime, type BucketInfo, type BucketCorsRule, type LifecycleRule } from "../api";
+import { api, fmtBytes, fmtTime, type BucketInfo, type BucketCorsRule, type LifecycleRule, type ObjectLockConfig } from "../api";
 import { validatePolicy } from "./Keys";
 
 export default function Buckets() {
@@ -149,7 +149,7 @@ export default function Buckets() {
   );
 }
 
-type SettingsTab = "quota" | "versioning" | "cors" | "policy" | "lifecycle" | "encryption";
+type SettingsTab = "quota" | "versioning" | "cors" | "policy" | "lifecycle" | "encryption" | "lock";
 
 const TAB_LABELS: { id: SettingsTab; label: string }[] = [
   { id: "quota", label: "配额" },
@@ -158,6 +158,7 @@ const TAB_LABELS: { id: SettingsTab; label: string }[] = [
   { id: "policy", label: "桶策略" },
   { id: "lifecycle", label: "生命周期" },
   { id: "encryption", label: "加密" },
+  { id: "lock", label: "对象锁" },
 ];
 
 /** M10:桶设置弹窗(配额 / 版本化 / CORS / 桶策略;M11 加生命周期 / 加密 两个 Tab)。 */
@@ -192,6 +193,7 @@ function BucketSettings({
         {tab === "policy" && <PolicyPane bucket={bucket} />}
         {tab === "lifecycle" && <LifecyclePane bucket={bucket} />}
         {tab === "encryption" && <EncryptionPane bucket={bucket} />}
+        {tab === "lock" && <ObjectLockPane bucket={bucket} />}
         <div className="actions">
           <button className="ghost" onClick={onClose}>
             关闭
@@ -962,6 +964,131 @@ function EncryptionPane({ bucket }: { bucket: BucketInfo }) {
         <button onClick={save} disabled={saving || current === null || target === (current === "AES256" ? "AES256" : "")}>
           {saving ? "保存中…" : "保存"}
         </button>
+        {saved && <span style={{ color: "var(--green)", fontSize: 12 }}>✓ 已保存</span>}
+      </div>
+    </div>
+  );
+}
+
+/** M12:桶 Object Lock(启用不可逆,自动开版本化;可选默认保留 Days|Years)。 */
+function ObjectLockPane({ bucket }: { bucket: BucketInfo }) {
+  const [cfg, setCfg] = useState<ObjectLockConfig | null>(null);
+  const [mode, setMode] = useState<"GOVERNANCE" | "COMPLIANCE">("GOVERNANCE");
+  const [unit, setUnit] = useState<"none" | "Days" | "Years">("none");
+  const [n, setN] = useState("30");
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+
+  const applyCfg = (c: ObjectLockConfig) => {
+    setCfg(c);
+    const d = c.DefaultRetention;
+    if (d?.Days !== undefined) {
+      setMode(d.Mode);
+      setUnit("Days");
+      setN(String(d.Days));
+    } else if (d?.Years !== undefined) {
+      setMode(d.Mode);
+      setUnit("Years");
+      setN(String(d.Years));
+    } else {
+      setUnit("none");
+    }
+  };
+
+  const load = useCallback(async () => {
+    try {
+      applyCfg(await api.getObjectLock(bucket.name));
+      setError(null);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }, [bucket.name]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const body = (): ObjectLockConfig => {
+    const out: ObjectLockConfig = { ObjectLockEnabled: true };
+    if (unit !== "none") {
+      const v = Number(n);
+      out.DefaultRetention = { Mode: mode, [unit]: Number.isInteger(v) && v >= 1 ? v : 1 };
+    }
+    return out;
+  };
+
+  const enable = async () => {
+    if (!confirm(`启用 ${bucket.name} 的 Object Lock?\n启用后不可关闭,并将自动开启版本化。`)) {
+      return;
+    }
+    setSaving(true);
+    try {
+      applyCfg(await api.putObjectLock(bucket.name, body()));
+      setSaved(true);
+      setError(null);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const saveDefault = async () => {
+    setSaving(true);
+    try {
+      applyCfg(await api.putObjectLock(bucket.name, body()));
+      setSaved(true);
+      setError(null);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const enabled = cfg?.ObjectLockEnabled === true;
+  return (
+    <div>
+      {error && <div className="alert">{error}</div>}
+      <p className="muted" style={{ fontSize: 12, marginTop: 0 }}>
+        Object Lock(WORM):启用后不可关闭。新对象可继承默认保留;COMPLIANCE 仅可延长,GOVERNANCE 缩短需 bypass。
+      </p>
+      <div className="form-row">
+        <label>当前状态</label>
+        <input value={cfg === null ? "加载中…" : enabled ? "已启用(不可关闭)" : "未启用"} readOnly />
+      </div>
+      <div className="form-row">
+        <label>默认保留模式</label>
+        <select value={mode} onChange={(e) => setMode(e.target.value as "GOVERNANCE" | "COMPLIANCE")}>
+          <option value="GOVERNANCE">GOVERNANCE</option>
+          <option value="COMPLIANCE">COMPLIANCE</option>
+        </select>
+      </div>
+      <div className="form-row">
+        <label>默认保留时长</label>
+        <div style={{ display: "flex", gap: 8 }}>
+          <select value={unit} onChange={(e) => setUnit(e.target.value as "none" | "Days" | "Years")}>
+            <option value="none">无默认保留</option>
+            <option value="Days">天</option>
+            <option value="Years">年</option>
+          </select>
+          {unit !== "none" && (
+            <input type="number" min={1} value={n} onChange={(e) => setN(e.target.value)} style={{ width: 100 }} />
+          )}
+        </div>
+      </div>
+      <div className="toolbar">
+        {!enabled && (
+          <button onClick={enable} disabled={saving || cfg === null}>
+            {saving ? "启用中…" : "启用 Object Lock"}
+          </button>
+        )}
+        {enabled && (
+          <button onClick={saveDefault} disabled={saving}>
+            {saving ? "保存中…" : "保存默认保留"}
+          </button>
+        )}
         {saved && <span style={{ color: "var(--green)", fontSize: 12 }}>✓ 已保存</span>}
       </div>
     </div>

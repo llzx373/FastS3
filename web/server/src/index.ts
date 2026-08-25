@@ -15,10 +15,11 @@
  *   M10:GET/PUT /api/buckets/{name}/versioning;GET/PUT/DELETE .../cors;GET/PUT/DELETE .../policy
  *   M10:GET /api/buckets/{name}/object-tags;POST .../object-tags/action(put)
  *   M11:GET/PUT/DELETE /api/buckets/{name}/lifecycle;GET/PUT/DELETE .../encryption(仅 AES256)
+ *   M12:GET/PUT /api/buckets/{name}/object-lock;GET/PUT .../object-lock/{retention,legal-hold}
  *   GET/POST/DELETE /api/keys[/{id}]      密钥管理(代理)
  *   PUT  /api/keys/{access}/policy        密钥策略文档(代理 admin PATCH)
  *   GET  /api/uploads;POST /api/uploads/{id}/abort
- *   GET  /api/audit                       审计查询(limit/since/until/op/bucket/key/who/status 透传)
+ *   GET  /api/audit                       审计查询(limit/since/until/op/bucket/key/who/status/bypass 透传)
  *   GET/PATCH /api/config                 运行时配置读取/部分更新(代理 admin)
  *   POST /api/config/reload               热重载配置(代理 admin)
  *   POST /api/repair                      泄漏修复
@@ -35,7 +36,7 @@ import { loadConfig, listenHostPort, type WebConfig } from "./config.js";
 import { authPlugin, issueToken, requireRole, verifyJwt, type JwtClaims } from "./auth.js";
 import { AdminClient } from "./admin-client.js";
 import { AdminWsClient } from "./admin-ws.js";
-import { S3Client, S3M10Client, type BucketCorsRule, type LifecycleRule, type S3Tag } from "./s3-client.js";
+import { S3Client, S3M10Client, type BucketCorsRule, type LifecycleRule, type ObjectLockConfig, type S3Tag } from "./s3-client.js";
 import { presignUrl } from "./presign.js";
 import { buildDashboard, buildSnapshot, dashboardFromSnapshot } from "./dashboard.js";
 import { MetricsHistory } from "./metrics-history.js";
@@ -583,6 +584,158 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       }
     );
 
+    // M12:桶 Object Lock(Enabled 不可逆;可选默认保留)
+    app.get<{ Params: { name: string } }>("/api/buckets/:name/object-lock", async (req, reply) => {
+      try {
+        return await m10.getObjectLockConfiguration(req.params.name);
+      } catch (e) {
+        return m10Error(e, reply, req.params.name);
+      }
+    });
+
+    app.put<{
+      Params: { name: string };
+      Body: {
+        ObjectLockEnabled?: unknown;
+        DefaultRetention?: { Mode?: unknown; Days?: unknown; Years?: unknown };
+      };
+    }>(
+      "/api/buckets/:name/object-lock",
+      { preHandler: requireRole("admin") },
+      async (req, reply) => {
+        if (req.body?.ObjectLockEnabled !== true) {
+          return reply.code(400).send({
+            error: { code: "bad_request", message: "ObjectLockEnabled must be true (cannot be disabled)" },
+          });
+        }
+        const cfg: ObjectLockConfig = { ObjectLockEnabled: true };
+        const d = req.body.DefaultRetention;
+        if (d !== undefined) {
+          if (d.Mode !== "GOVERNANCE" && d.Mode !== "COMPLIANCE") {
+            return reply.code(400).send({
+              error: { code: "bad_request", message: "DefaultRetention.Mode must be GOVERNANCE or COMPLIANCE" },
+            });
+          }
+          const hasDays = typeof d.Days === "number" && Number.isInteger(d.Days) && d.Days >= 1;
+          const hasYears = typeof d.Years === "number" && Number.isInteger(d.Years) && d.Years >= 1;
+          if (hasDays === hasYears) {
+            return reply.code(400).send({
+              error: { code: "bad_request", message: "DefaultRetention needs exactly one of Days or Years (≥1)" },
+            });
+          }
+          cfg.DefaultRetention = { Mode: d.Mode };
+          if (hasDays) cfg.DefaultRetention.Days = d.Days as number;
+          if (hasYears) cfg.DefaultRetention.Years = d.Years as number;
+        }
+        try {
+          await m10.putObjectLockConfiguration(req.params.name, cfg);
+          return cfg;
+        } catch (e) {
+          return m10Error(e, reply, req.params.name);
+        }
+      }
+    );
+
+    app.get<{
+      Params: { name: string };
+      Querystring: { key?: string; versionId?: string };
+    }>("/api/buckets/:name/object-lock/retention", async (req, reply) => {
+      const key = req.query.key ?? "";
+      if (!key) {
+        return reply.code(400).send({ error: { code: "bad_request", message: "key is required" } });
+      }
+      try {
+        const r = await m10.getObjectRetention(req.params.name, key, req.query.versionId || undefined);
+        return { Retention: r };
+      } catch (e) {
+        return m10Error(e, reply, req.params.name);
+      }
+    });
+
+    app.put<{
+      Params: { name: string };
+      Body: {
+        key?: unknown;
+        versionId?: unknown;
+        Mode?: unknown;
+        RetainUntilDate?: unknown;
+        bypass?: unknown;
+      };
+    }>(
+      "/api/buckets/:name/object-lock/retention",
+      { preHandler: requireRole("admin") },
+      async (req, reply) => {
+        const key = typeof req.body?.key === "string" ? req.body.key : "";
+        if (!key) {
+          return reply.code(400).send({ error: { code: "bad_request", message: "key is required" } });
+        }
+        if (req.body?.Mode !== "GOVERNANCE" && req.body?.Mode !== "COMPLIANCE") {
+          return reply.code(400).send({
+            error: { code: "bad_request", message: "Mode must be GOVERNANCE or COMPLIANCE" },
+          });
+        }
+        const until = typeof req.body?.RetainUntilDate === "string" ? req.body.RetainUntilDate.trim() : "";
+        if (!until) {
+          return reply.code(400).send({
+            error: { code: "bad_request", message: "RetainUntilDate is required" },
+          });
+        }
+        const versionId = typeof req.body?.versionId === "string" && req.body.versionId ? req.body.versionId : undefined;
+        try {
+          await m10.putObjectRetention(
+            req.params.name,
+            key,
+            { Mode: req.body.Mode, RetainUntilDate: until },
+            { versionId, bypass: req.body?.bypass === true }
+          );
+          return { key, Mode: req.body.Mode, RetainUntilDate: until };
+        } catch (e) {
+          return m10Error(e, reply, req.params.name);
+        }
+      }
+    );
+
+    app.get<{
+      Params: { name: string };
+      Querystring: { key?: string; versionId?: string };
+    }>("/api/buckets/:name/object-lock/legal-hold", async (req, reply) => {
+      const key = req.query.key ?? "";
+      if (!key) {
+        return reply.code(400).send({ error: { code: "bad_request", message: "key is required" } });
+      }
+      try {
+        return await m10.getObjectLegalHold(req.params.name, key, req.query.versionId || undefined);
+      } catch (e) {
+        return m10Error(e, reply, req.params.name);
+      }
+    });
+
+    app.put<{
+      Params: { name: string };
+      Body: { key?: unknown; versionId?: unknown; Status?: unknown };
+    }>(
+      "/api/buckets/:name/object-lock/legal-hold",
+      { preHandler: requireRole("admin") },
+      async (req, reply) => {
+        const key = typeof req.body?.key === "string" ? req.body.key : "";
+        if (!key) {
+          return reply.code(400).send({ error: { code: "bad_request", message: "key is required" } });
+        }
+        if (req.body?.Status !== "ON" && req.body?.Status !== "OFF") {
+          return reply.code(400).send({
+            error: { code: "bad_request", message: "Status must be ON or OFF" },
+          });
+        }
+        const versionId = typeof req.body?.versionId === "string" && req.body.versionId ? req.body.versionId : undefined;
+        try {
+          await m10.putObjectLegalHold(req.params.name, key, req.body.Status, versionId);
+          return { key, Status: req.body.Status };
+        } catch (e) {
+          return m10Error(e, reply, req.params.name);
+        }
+      }
+    );
+
     // 对象标签读取(配合控制台标签编辑器)
     app.get<{ Params: { name: string }; Querystring: { key?: string } }>(
       "/api/buckets/:name/object-tags",
@@ -737,7 +890,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     }
   );
 
-  // ── 审计(J5:limit/since/until/op/bucket/key/who/status 全部透传) ──
+  // ── 审计(J5:limit/since/until/op/bucket/key/who/status/bypass 全部透传) ──
   app.get<{
     Querystring: {
       limit?: string;
@@ -748,6 +901,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       key?: string;
       who?: string;
       status?: string;
+      bypass?: string;
     };
   }>("/api/audit", async (req, reply) => {
     try {
@@ -768,6 +922,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       if (q.bucket) filt.bucket = q.bucket;
       if (q.key) filt.key = q.key;
       if (q.who) filt.who = q.who;
+      if (q.bypass === "true") filt.bypass = true;
+      if (q.bypass === "false") filt.bypass = false;
       return await admin.audit(filt);
     } catch (e) {
       return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });

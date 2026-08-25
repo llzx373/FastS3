@@ -164,6 +164,25 @@ test("GET /api/audit passes through all filters to admin", async () => {
   ]);
 });
 
+test("GET /api/audit: bypass=true|false 透传到 admin", async () => {
+  const fake = new FakeAdmin();
+  const app = makeApp(fake);
+  const token = await loginToken(app);
+  const r = await app.inject({
+    method: "GET",
+    url: "/api/audit?bypass=true",
+    headers: { authorization: `Bearer ${token}` },
+  });
+  assert.equal(r.statusCode, 200);
+  assert.deepEqual(fake.auditCalls, [{ limit: 200, bypass: true }]);
+  await app.inject({
+    method: "GET",
+    url: "/api/audit?bypass=false",
+    headers: { authorization: `Bearer ${token}` },
+  });
+  assert.equal(fake.auditCalls[1]?.bypass, false);
+});
+
 test("GET /api/audit: omitted/empty filters default limit=200 and skip others", async () => {
   const fake = new FakeAdmin();
   const app = makeApp(fake);

@@ -207,6 +207,23 @@ export interface LifecycleRule {
   AbortIncompleteMultipartUpload?: { DaysAfterInitiation?: number };
 }
 
+/** M12:桶 Object Lock 配置。 */
+export interface ObjectLockDefaultRetention {
+  Mode: "GOVERNANCE" | "COMPLIANCE";
+  Days?: number;
+  Years?: number;
+}
+
+export interface ObjectLockConfig {
+  ObjectLockEnabled: boolean;
+  DefaultRetention?: ObjectLockDefaultRetention;
+}
+
+export interface ObjectRetention {
+  Mode: "GOVERNANCE" | "COMPLIANCE";
+  RetainUntilDate: string;
+}
+
 export interface ListResult {
   objects: ListedObject[];
   prefixes: string[];
@@ -362,6 +379,46 @@ export const api = {
     }),
   deleteEncryption: (bucket: string) =>
     request<Record<string, unknown>>("DELETE", `/api/buckets/${encodeURIComponent(bucket)}/encryption`),
+
+  // ── M12:Object Lock ──
+  getObjectLock: (bucket: string) =>
+    request<ObjectLockConfig>("GET", `/api/buckets/${encodeURIComponent(bucket)}/object-lock`),
+  putObjectLock: (bucket: string, cfg: ObjectLockConfig) =>
+    request<ObjectLockConfig>("PUT", `/api/buckets/${encodeURIComponent(bucket)}/object-lock`, cfg),
+  getObjectRetention: (bucket: string, key: string, versionId?: string) => {
+    const q = new URLSearchParams({ key });
+    if (versionId) q.set("versionId", versionId);
+    return request<{ Retention: ObjectRetention | null }>(
+      "GET",
+      `/api/buckets/${encodeURIComponent(bucket)}/object-lock/retention?${q}`
+    );
+  },
+  putObjectRetention: (
+    bucket: string,
+    key: string,
+    retention: ObjectRetention,
+    opts: { versionId?: string; bypass?: boolean } = {}
+  ) =>
+    request<Record<string, unknown>>("PUT", `/api/buckets/${encodeURIComponent(bucket)}/object-lock/retention`, {
+      key,
+      ...retention,
+      versionId: opts.versionId,
+      bypass: opts.bypass,
+    }),
+  getObjectLegalHold: (bucket: string, key: string, versionId?: string) => {
+    const q = new URLSearchParams({ key });
+    if (versionId) q.set("versionId", versionId);
+    return request<{ Status: "ON" | "OFF" }>(
+      "GET",
+      `/api/buckets/${encodeURIComponent(bucket)}/object-lock/legal-hold?${q}`
+    );
+  },
+  putObjectLegalHold: (bucket: string, key: string, status: "ON" | "OFF", versionId?: string) =>
+    request<Record<string, unknown>>("PUT", `/api/buckets/${encodeURIComponent(bucket)}/object-lock/legal-hold`, {
+      key,
+      Status: status,
+      versionId,
+    }),
   getObjectTags: (bucket: string, key: string) =>
     request<{ tags: S3Tag[] }>(
       "GET",
