@@ -338,7 +338,7 @@
 - [x] M2-1 分配器多设备加权轮转(新盘倾斜)+ 每设备开放 extent(写锁域不变)
 - [x] M2-2 恢复/降级:各设备独立恢复 + 池清单 uuid 校验;缺盘 → 只读降级 + 告警(对齐 v0.5 掉盘语义)
 - [x] M3-1 `fasts3d device-add` 在线扩容(初始化 → 追加池清单 → 新分配倾斜;layout v3 + MULTI_DEVICE 特性位)
-- [ ] M3-2 `fasts3d device-remove` 离线 drain(迁空确认 → 尾部移除;禁止中间移除)
+- [x] M3-2 `fasts3d device-remove` 离线 drain(迁空确认 → 尾部移除;禁止中间移除)
 - [x] M3-3 layout v2→v3 单盘升级迁移(零数据搬迁)+ 回滚实测
 - [ ] M4-1 再平衡 worker(复用 Op::ObjectMigrate;候选=高水位盘,目标=低水位盘;节流/暂停;默认关)
 - [ ] M4-2 容量统一视图 + 单盘水位 >85% 告警

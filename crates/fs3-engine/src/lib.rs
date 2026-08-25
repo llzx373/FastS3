@@ -126,6 +126,16 @@ pub struct DeviceAddReport {
     pub total_devices: usize,
 }
 
+/// 离线移除结果(M13 M3-2)。
+#[derive(Debug, Clone)]
+pub struct DeviceRemoveReport {
+    pub uuid: [u8; 16],
+    pub path: String,
+    pub extent_count: u64,
+    pub base: u64,
+    pub total_devices: usize,
+}
+
 /// 只读摘要(check 命令)。
 #[derive(Debug, Default)]
 pub struct CheckReport {
@@ -925,6 +935,93 @@ impl Engine {
             base,
             total_devices: self.devices.len(),
         })
+    }
+
+    /// 离线移除(M13 M3-2,ADR-15 DM4):前置条件 = 尾部设备数据已全部迁空
+    /// (再平衡 worker 完成后;自由 extent 数 = 该设备全部 extent),然后
+    /// 尾部移除池清单 + 分配器收缩 + 内存表切换。**禁止中间移除**(防
+    /// 推导式映射错乱)。调用方须持引擎写锁(服务应先停;不支持在线移除)。
+    pub fn device_remove(&mut self, path: &std::path::Path) -> Result<DeviceRemoveReport> {
+        if self.read_only {
+            return Err(Error::Unsupported(
+                "device-remove requires a writable engine (degraded/read-only pool)".into(),
+            ));
+        }
+        let manifest = self.meta.load_pool()?.ok_or_else(|| {
+            Error::InvalidLayout("pool manifest missing; open the engine once first".into())
+        })?;
+        // 尾部检查:仅允许移除清单最后一个设备(推导式映射纪律)
+        let Some(entry) = manifest.devices.last() else {
+            return Err(Error::InvalidLayout("pool manifest is empty".into()));
+        };
+        if entry.path != path.display().to_string() {
+            return Err(Error::InvalidArgument(format!(
+                "only the LAST pool device can be removed (tail-remove rule, ADR-15 \
+                 DM4); the last device is {}",
+                entry.path
+            )));
+        }
+        let Some((_di, slot)) = self
+            .devices
+            .iter()
+            .enumerate()
+            .find(|(_, s)| s.dev.path() == path)
+        else {
+            return Err(Error::InvalidArgument(format!(
+                "device {} is not open in this engine",
+                path.display()
+            )));
+        };
+        // 迁空确认:该设备区间应全空(再平衡/删除完成后;锁感知释放后)
+        let allocated = slot.extent_count - self.alloc.free_in_range(slot.base, slot.extent_count);
+        if allocated > 0 {
+            return Err(Error::InvalidArgument(format!(
+                "device {} still holds {allocated} allocated extent(s); migrate the \
+                 data out first (rebalance worker, then device-remove)",
+                path.display()
+            )));
+        }
+        let report = DeviceRemoveReport {
+            uuid: slot.sb.uuid,
+            path: entry.path.clone(),
+            extent_count: slot.extent_count,
+            base: slot.base,
+            total_devices: self.devices.len() - 1,
+        };
+
+        // 独占期(同 device_add):停压缩 worker → 收缩 → 表切换 → 重建
+        let had_compactor = self.compactor.is_some();
+        if let Some(mut h) = self._compactor_thread.take() {
+            h.stop();
+            self._compactor_thread = None;
+        }
+        self.compactor = None;
+        let alloc_mut = Arc::get_mut(&mut self.alloc)
+            .ok_or_else(|| Error::InvalidArgument("allocator still referenced; retry".into()))?;
+        alloc_mut.shrink_tail(slot.extent_count);
+
+        let mut manifest = manifest;
+        manifest.devices.pop();
+        manifest.validate()?;
+        self.meta.save_pool(&manifest)?;
+
+        let mut slots: Vec<DeviceSlot> = self.devices.as_ref().clone();
+        slots.pop();
+        self.devices = Arc::new(slots);
+        self.open_extents.pop();
+        self.zc_fds.pop();
+        // 活动设备收敛(尾部即当前轮转落点;越界防御)
+        self.cur_device = self.cur_device.min(self.devices.len().saturating_sub(1));
+        self.restart_compactor(had_compactor);
+        tracing::info!(
+            "DEVICE REMOVED: {} (uuid {}, {} extents, base {}); pool now {} device(s)",
+            report.path,
+            Self::hex_uuid(&report.uuid),
+            report.extent_count,
+            report.base,
+            report.total_devices
+        );
+        Ok(report)
     }
 
     /// uuid 展示。

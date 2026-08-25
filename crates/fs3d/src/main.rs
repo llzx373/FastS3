@@ -155,6 +155,8 @@ enum Cmd {
     StressInsert(#[arg(name = "args", flatten)] stress::StressArgs),
     /// 池扩容(M13 M3-1):追加新数据设备(服务停止时;运行中走 admin API)
     DeviceAdd(pool_cmds::DeviceAddArgs),
+    /// 池移除(M13 M3-2):离线移除尾部设备(数据须已迁空;服务须停止)
+    DeviceRemove(pool_cmds::DeviceRemoveArgs),
     /// 启动 S3 数据面 HTTP 服务
     Serve {
         /// 监听地址(如 0.0.0.0:9000)
@@ -256,6 +258,14 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 None => cfg.storage.devices.clone(),
             };
             pool_cmds::run_device_add(&args, cli.config.as_deref(), None, &devs)
+        }
+        Cmd::DeviceRemove(args) => {
+            let cfg = load_config(cli.config.as_deref())?;
+            let devs: Vec<std::path::PathBuf> = match cli.device.clone() {
+                Some(d) => vec![d],
+                None => cfg.storage.devices.clone(),
+            };
+            pool_cmds::run_device_remove(&args, None, &devs)
         }
         Cmd::Upgrade(args) => upgrade::run_upgrade(
             &args,

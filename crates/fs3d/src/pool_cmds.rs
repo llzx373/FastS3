@@ -25,6 +25,90 @@ pub struct DeviceAddArgs {
     pub force: bool,
 }
 
+/// device-remove 命令参数(M13 M3-2;命名避开全局 --device)。
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeviceRemoveArgs {
+    /// 待移除设备路径(必须是池清单最后一个设备;数据须已迁空)
+    #[arg(long)]
+    pub remove_device: PathBuf,
+}
+
+/// 执行 device-remove(离线:引擎须已停止;不支持在线移除,ADR-15 DM4)。
+pub fn run_device_remove(
+    args: &DeviceRemoveArgs,
+    meta_dir_override: Option<PathBuf>,
+    devices: &[PathBuf],
+) -> Result<()> {
+    if devices.is_empty() {
+        return Err(Error::InvalidArgument(
+            "missing pool devices (--device or config storage.devices)".into(),
+        ));
+    }
+    let meta_dir = meta_dir_override.unwrap_or_else(|| {
+        devices[0]
+            .parent()
+            .map(|p| p.join("meta"))
+            .unwrap_or_else(|| PathBuf::from("meta"))
+    });
+    println!(
+        "fasts3d device-remove (binary v{})",
+        env!("CARGO_PKG_VERSION")
+    );
+    println!("  remove device: {}", args.remove_device.display());
+    println!("  meta_dir:      {}", meta_dir.display());
+
+    // 引擎占用预检(同 device-add)
+    {
+        let mut cfg = crate::engine_config_inner_multi(devices, &meta_dir)?;
+        cfg.read_only = true;
+        match fs3_engine::Engine::open(&cfg) {
+            Ok(e) => e.abort(),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("lock")
+                    || msg.contains("Resource temporarily unavailable")
+                    || msg.contains("in use")
+                    || msg.contains("No locks available")
+                {
+                    return Err(Error::InvalidArgument(format!(
+                        "engine is running — stop the service first (device-remove is \
+                         offline-only, ADR-15 DM4): {e}"
+                    )));
+                }
+                println!("  (preflight meta open: {e})");
+            }
+        }
+    }
+
+    let mut engine =
+        fs3_engine::Engine::open(&crate::engine_config_inner_multi(devices, &meta_dir)?)?;
+    match engine.device_remove(&args.remove_device) {
+        Ok(report) => {
+            println!(
+                "removed: {} (uuid {}) — {} extents, base {}; pool now {} device(s)",
+                report.path,
+                report
+                    .uuid
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+                report.extent_count,
+                report.base,
+                report.total_devices
+            );
+            println!("note: remove the device path from storage.devices before the next start");
+            engine.close()?;
+            println!("device-remove: ok");
+            Ok(())
+        }
+        Err(e) => {
+            // 关闭前保持一致性(移除失败不改变状态)
+            engine.abort();
+            Err(e)
+        }
+    }
+}
+
 /// 执行 device-add(引擎已停止的场景;服务运行中 → 引导 admin API)。
 pub fn run_device_add(
     args: &DeviceAddArgs,

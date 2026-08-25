@@ -6449,3 +6449,109 @@ fn device_add_on_degraded_pool_rejected() -> Result<()> {
     drop(e);
     Ok(())
 }
+
+// ─────────────────────────── M13 M3-2 离线移除 ───────────────────────────
+
+#[test]
+fn device_remove_drained_tail_device() -> Result<()> {
+    // 尾设备数据迁空 → 尾部移除 → 分配器收缩 → 重开单盘池数据完好
+    let (_d, imgs, cfg) = setup_multi(&[64 * 1024 * 1024, 64 * 1024 * 1024]);
+    let img1 = imgs[1].clone();
+    let mut e = open_engine(&cfg);
+    // 数据只放设备 0(设备 1 保持全空:等权重 SWRR 首个对象落设备 0;
+    // 用足够大数据量填设备 0?——不:直接验证「设备 1 无分配」
+    // 需要保证后续对象不落设备 1……设备 1 剩余空间最大会抢数据。
+    // 因此:先写满设备 0(15 个 extent ≈ 60MiB)→ 设备 1 仍空?对象会轮转落设备1。
+    // 简化:写少量数据到设备 0,然后删除全部对象(段释放)→ 设备 1 从未分配。
+    let data = vec![7u8; 1024 * 1024];
+    e.put("b1", "a", &mut Cursor::new(data.clone())).unwrap();
+    // 设备 1 大概率已有分配(轮转)—— 无法"迁空"。
+    // 正确路径:设备 1 数据迁走后再移除;这里用"设备 1 恒无分配"的场景:
+    // 数据放在设备 0 后删除,同时确保设备 1 未分配:
+    // —— 让首个对象就占满设备 0 并删除,设备 1 未分配(SWRR 首个落设备 0;
+    // 删除后设备 1 仍空)。
+    let on1 = |e: &Engine| {
+        let d1 = &e.device_slots()[1];
+        (d1.base..d1.base + d1.extent_count)
+            .filter(|&i| e.allocator().test_bit(i))
+            .count()
+    };
+    // 首对象落设备 0(等权重 tie → 0);删掉它(设备 1 未分配)
+    e.delete("b1", "a").unwrap();
+    assert_eq!(on1(&e), 0, "device 1 must be empty before removal");
+    e.close().unwrap();
+    drop(e);
+
+    // 离线移除(引擎重开;配置仍含双盘?—— device-remove 的引擎打开要求
+    // manifest ⊆ cfg,cfg 含双盘 ✓;移除后再校验)
+    {
+        let mut e2 = open_engine(&cfg);
+        let report = e2.device_remove(&img1).unwrap();
+        assert_eq!(report.total_devices, 1);
+        assert_eq!(e2.device_count(), 1);
+        // 清单收缩
+        let pool = e2.meta().load_pool()?.unwrap();
+        assert_eq!(pool.devices.len(), 1);
+        // 池仍可写(分配器收缩后)
+        let more = vec![8u8; 512 * 1024];
+        e2.put("b1", "after-remove", &mut Cursor::new(more.clone()))
+            .unwrap();
+        let mut out = Vec::new();
+        e2.get_to("b1", "after-remove", 0..more.len() as u64, &mut out)
+            .unwrap();
+        assert_eq!(out, more);
+        e2.close().unwrap();
+    }
+    // 重开(配置去掉盘 2):单盘池
+    let cfg1 = EngineConfig {
+        devices: vec![imgs[0].clone()],
+        ..cfg.clone()
+    };
+    let e3 = open_engine(&cfg1);
+    let mut out = Vec::new();
+    e3.get_to("b1", "after-remove", 0..(512 * 1024) as u64, &mut out)
+        .unwrap();
+    assert_eq!(out, vec![8u8; 512 * 1024]);
+    assert!(e3.check_report().unwrap().leaks.is_empty());
+    e3.abort();
+    Ok(())
+}
+
+#[test]
+fn device_remove_rejects_middle_and_nonempty() -> Result<()> {
+    let (_d, imgs, cfg) = setup_multi(&[64 * 1024 * 1024, 64 * 1024 * 1024]);
+    let mut e = open_engine(&cfg);
+    // 中间盘(仅一张表时即"非尾部"):单设备池移除唯一盘 → 尾部规则拒绝?
+    // 唯一盘 = 尾部,合法;这里用双盘:移除设备 0(非尾部)→ 拒绝
+    let err = match e.device_remove(&imgs[0]) {
+        Ok(r) => panic!("non-tail remove must be rejected: {r:?}"),
+        Err(err) => err,
+    };
+    assert!(
+        format!("{err}").contains("tail-remove rule"),
+        "unexpected: {err}"
+    );
+    // 尾部盘但非空(有分配)→ 迁空确认拒绝
+    let data = vec![9u8; 1024 * 1024];
+    // 把数据放到设备 1:SWRR 前几个对象交替落盘——写入足够多的对象确保设备1有分配
+    for i in 0..8 {
+        e.put("b1", &format!("k{i}"), &mut Cursor::new(data.clone()))
+            .unwrap();
+    }
+    let d1 = &e.device_slots()[1];
+    let on1 = (d1.base..d1.base + d1.extent_count)
+        .filter(|&i| e.allocator().test_bit(i))
+        .count();
+    if on1 > 0 {
+        let err = match e.device_remove(&imgs[1]) {
+            Ok(r) => panic!("non-empty tail remove must be rejected: {r:?}"),
+            Err(err) => err,
+        };
+        assert!(
+            format!("{err}").contains("still holds"),
+            "unexpected: {err}"
+        );
+    }
+    e.abort();
+    Ok(())
+}

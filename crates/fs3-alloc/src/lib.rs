@@ -209,6 +209,24 @@ impl Allocator {
         Ok(out)
     }
 
+    /// 截断尾部 `count` 个 extent(M13 M3-2 device-remove;调用方须先
+    /// 确认该区间全空——free_in_range == count;仅独占期调用)。
+    pub fn shrink_tail(&mut self, count: u64) {
+        assert!(count <= self.n, "shrink beyond size");
+        assert_eq!(
+            self.free_in_range(self.n - count, count),
+            count,
+            "refusing to shrink a non-empty device range"
+        );
+        self.bitmap.truncate(count);
+        self.refcounts.truncate((self.n - count) as usize);
+        self.generations.truncate((self.n - count) as usize);
+        self.live_bytes.truncate((self.n - count) as usize);
+        self.state.truncate((self.n - count) as usize);
+        self.n -= count;
+        self.total_free.fetch_sub(count, Ordering::Relaxed);
+    }
+
     /// 区间内空闲 extent 数(加权轮转权重口径:剩余空间;M13 M2-1 DM2)。
     pub fn free_in_range(&self, start: u64, count: u64) -> u64 {
         count - self.bitmap.count_ones_range(start, count)

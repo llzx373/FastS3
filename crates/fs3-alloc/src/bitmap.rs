@@ -269,6 +269,15 @@ impl Bitmap {
             .sum()
     }
 
+    /// 截断尾部 `count` 个位(M13 M3-2 device-remove;仅独占期调用,
+    /// 调用方须先确认这些位全空)。n 不得越界。
+    pub fn truncate(&mut self, count: u64) {
+        assert!(count <= self.n, "truncate beyond size");
+        self.n -= count;
+        let words = self.n.div_ceil(64) as usize;
+        self.words.truncate(words);
+    }
+
     /// 追加 `count` 个空闲位(M13 M3-1 在线扩容;新位恒 0)。
     /// 只能在**独占期**调用(引擎写锁 + 后台压缩 worker 已停并 join;
     /// 见 Engine::device_add)——Vec 重定位与并发读不兼容。
