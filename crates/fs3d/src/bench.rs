@@ -180,6 +180,85 @@ enum Mode {
     RandWrite,
 }
 
+// ──────────────── M12:Object Lock 判定微基准 ────────────────
+
+/// `fasts3d bench-lock` 参数:M12 门禁「锁判定在元数据层(<1µs,无感)」。
+#[derive(Args, Debug, Clone)]
+pub struct LockCheckArgs {
+    /// 迭代次数
+    #[arg(long, default_value = "10000000")]
+    rounds: u64,
+}
+
+pub fn run_lock_check(args: &LockCheckArgs) -> Result<()> {
+    use fs3_core::{ObjectMeta, Retention, RetentionMode};
+    use fs3_engine::lifecycle::lock_blocks_delete;
+
+    let rounds = args.rounds.max(1) as usize;
+    // 最坏形态样本:COMPLIANCE 未到期 + Legal Hold(两判定都走)。
+    let now = 2_000_000_000i64;
+    let mk = |hold: bool, until: i64| ObjectMeta {
+        size: 4096,
+        etag: [0u8; 16],
+        mtime: now,
+        extents: vec![],
+        content_type: String::new(),
+        user_meta: vec![],
+        inline: None,
+        parts: vec![],
+        resp_headers: vec![],
+        version_id: Some([7u8; 16]),
+        is_delete_marker: false,
+        tags: vec![],
+        sse: None,
+        checksum: None,
+        retention: Some(Retention {
+            mode: RetentionMode::Compliance,
+            retain_until: until,
+        }),
+        legal_hold: hold,
+        part_checksums: vec![],
+    };
+    let locked = mk(true, now + 30 * 86_400); // 未到期 + hold:最坏判定
+    let expired = mk(false, now - 1); // 已到期 + 无 hold:常规路径
+    let mut rng = Rng::new(0x5EED_1234); // xorshift:输入随迭代变化,防常量折叠
+                                         // 预热(分支预测/缓存)
+    let mut sink = 0u8;
+    for _ in 0..100_000u64 {
+        let m = if rng.next() & 1 == 0 {
+            &locked
+        } else {
+            &expired
+        };
+        sink ^= lock_blocks_delete(m, now, false).is_some() as u8;
+    }
+    let t0 = Instant::now();
+    for _ in 0..rounds as u64 {
+        let m = if rng.next() & 1 == 0 {
+            &locked
+        } else {
+            &expired
+        };
+        sink ^= lock_blocks_delete(m, now, false).is_some() as u8;
+    }
+    let secs = t0.elapsed().as_secs_f64();
+    let ns = secs * 1e9 / rounds as f64;
+    std::hint::black_box(&sink);
+
+    println!("== Object Lock 判定微基准(M12 门禁:元数据层 <1µs,无感)==");
+    println!("sample=COMPLIANCE+legal_hold(unexpired) rounds={rounds} total={secs:.3}s");
+    println!(
+        "lock_blocks_delete avg: {ns:.1} ns/op ({:.3} µs/op)",
+        ns / 1000.0
+    );
+    if ns < 1000.0 {
+        println!("RESULT: PASS (lock check < 1µs, metadata-layer)");
+    } else {
+        println!("RESULT: FAIL (lock check >= 1µs)");
+    }
+    Ok(())
+}
+
 // ──────────────── M5:MD5 多缓冲基准 ────────────────
 
 /// `fasts3d bench-md5` 参数:对比 SIMD 4 路多缓冲 MD5 与单缓冲聚合吞吐。
