@@ -6343,3 +6343,109 @@ fn degraded_uuid_mismatch_opens_readonly() -> Result<()> {
     e.abort();
     Ok(())
 }
+
+// ─────────────────────────── M13 M3-1 在线扩容 ───────────────────────────
+
+#[test]
+fn online_device_add_hot_swap() -> Result<()> {
+    // 在线加盘:初始化 → 追加池清单 → 内存热切换;新盘立即倾斜吃进新数据
+    let (_d, _imgs, cfg) = setup_multi(&[64 * 1024 * 1024]);
+    let mut e = open_engine(&cfg);
+    let data = vec![1u8; 1024 * 1024];
+    e.put("b1", "a", &mut Cursor::new(data.clone())).unwrap();
+
+    let img2 = _d.path().join("disk-new.img");
+    std::fs::File::create(&img2)
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    let report = e.device_add(&img2, false).unwrap();
+    assert_eq!(report.total_devices, 2);
+    assert_eq!(report.base, e.device_slots()[0].extent_count);
+    let pool = e.meta().load_pool()?.expect("manifest");
+    assert_eq!(pool.devices.len(), 2);
+    assert_eq!(pool.devices[1].uuid, report.uuid);
+
+    // 新盘剩余空间最大 → 加权轮转立即倾斜(无需重启)
+    let more = vec![2u8; 1024 * 1024];
+    e.put("b1", "b", &mut Cursor::new(more.clone())).unwrap();
+    let d1 = &e.device_slots()[1];
+    let on_d1 = (d1.base..d1.base + d1.extent_count)
+        .filter(|&i| e.allocator().test_bit(i))
+        .count();
+    assert!(
+        on_d1 >= 1,
+        "new device must receive allocations immediately"
+    );
+
+    e.checkpoint()?;
+    e.close().unwrap();
+    drop(e);
+
+    // 重开(配置含新盘)→ 双设备池数据完整零泄漏
+    let mut cfg2 = cfg.clone();
+    cfg2.devices.push(img2);
+    let e2 = open_engine(&cfg2);
+    let mut out = Vec::new();
+    e2.get_to("b1", "a", 0..data.len() as u64, &mut out)
+        .unwrap();
+    assert_eq!(out, data);
+    let mut out2 = Vec::new();
+    e2.get_to("b1", "b", 0..more.len() as u64, &mut out2)
+        .unwrap();
+    assert_eq!(out2, more);
+    assert!(e2.check_report().unwrap().leaks.is_empty());
+    e2.abort();
+    Ok(())
+}
+
+#[test]
+fn device_add_rejects_duplicate() -> Result<()> {
+    let (_d, _imgs, cfg) = setup_multi(&[64 * 1024 * 1024]);
+    let mut e = open_engine(&cfg);
+    let img2 = _d.path().join("disk-new.img");
+    std::fs::File::create(&img2)
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    e.device_add(&img2, false).unwrap();
+    // 幂等拒绝(已在清单)
+    let err = match e.device_add(&img2, false) {
+        Ok(r) => panic!("duplicate add must be rejected: {r:?}"),
+        Err(err) => err,
+    };
+    assert!(
+        format!("{err}").contains("already in the pool"),
+        "unexpected: {err}"
+    );
+    // 已在内存表中的盘也不能重复加
+    let err = match e.device_add(&cfg.devices[0], false) {
+        Ok(r) => panic!("in-table add must be rejected: {r:?}"),
+        Err(err) => err,
+    };
+    assert!(format!("{err}").contains("already in the pool"));
+    e.abort();
+    Ok(())
+}
+
+#[test]
+fn device_add_on_degraded_pool_rejected() -> Result<()> {
+    // 缺盘降级(只读)状态下拒绝加盘
+    let (_d, imgs, cfg) = setup_multi(&[64 * 1024 * 1024, 64 * 1024 * 1024]);
+    {
+        let mut e = open_engine(&cfg);
+        e.put("b1", "k", &mut Cursor::new(vec![1u8; 1024 * 1024]))
+            .unwrap();
+        e.close().unwrap();
+    }
+    std::fs::remove_file(&imgs[1]).unwrap();
+    let mut e = Engine::open(&cfg).unwrap();
+    assert!(e.degraded());
+    let err = match e.device_add(&imgs[0], false) {
+        Ok(_) => panic!("degraded engine must reject device-add"),
+        Err(err) => err,
+    };
+    assert!(format!("{err}").contains("writable"), "{err}");
+    drop(e);
+    Ok(())
+}

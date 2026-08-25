@@ -19,6 +19,7 @@ mod config;
 mod doctor;
 mod loadgen;
 mod meta;
+mod pool_cmds;
 mod rewrite;
 mod settings;
 mod signal;
@@ -152,6 +153,8 @@ enum Cmd {
     Loadgen(loadgen::LoadgenArgs),
     /// 批量对象压测(M4 门禁:1 亿对象,rockdb 扩展性 R5)
     StressInsert(#[arg(name = "args", flatten)] stress::StressArgs),
+    /// 池扩容(M13 M3-1):追加新数据设备(服务停止时;运行中走 admin API)
+    DeviceAdd(pool_cmds::DeviceAddArgs),
     /// 启动 S3 数据面 HTTP 服务
     Serve {
         /// 监听地址(如 0.0.0.0:9000)
@@ -245,6 +248,14 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
         Cmd::Init(args) => {
             let _ = wizard::run_wizard(&args, cli.config.as_deref())?;
             Ok(())
+        }
+        Cmd::DeviceAdd(args) => {
+            let cfg = load_config(cli.config.as_deref())?;
+            let devs: Vec<std::path::PathBuf> = match cli.device.clone() {
+                Some(d) => vec![d],
+                None => cfg.storage.devices.clone(),
+            };
+            pool_cmds::run_device_add(&args, cli.config.as_deref(), None, &devs)
         }
         Cmd::Upgrade(args) => upgrade::run_upgrade(
             &args,
@@ -832,8 +843,17 @@ pub(crate) fn engine_config_inner(
     device: &Path,
     meta_dir: &Path,
 ) -> fs3_core::Result<EngineConfig> {
+    engine_config_inner_multi(&[device.to_path_buf()], meta_dir)
+}
+
+/// 多设备简化引擎配置(M13 M3-1 device-add 等;全默认参数,
+/// 仅替换 devices 列表)。
+pub(crate) fn engine_config_inner_multi(
+    devices: &[PathBuf],
+    meta_dir: &Path,
+) -> fs3_core::Result<EngineConfig> {
     Ok(EngineConfig {
-        devices: vec![device.to_path_buf()],
+        devices: devices.to_vec(),
         meta_dir: meta_dir.to_path_buf(),
         debug_io: None,
         sync_mode: fs3_meta::SyncMode::Group,

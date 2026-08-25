@@ -118,6 +118,25 @@ impl Allocator {
         self.n
     }
 
+    /// 在线扩容(M13 M3-1 device-add):追加 `count` 个空闲 extent(位图/
+    /// 派生数组同步扩展;新位恒 0,计入 total_free)。只能在独占期调用
+    /// (引擎写锁 + 后台压缩 worker 已停并 join;见 Engine::device_add)。
+    pub fn extend(&mut self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.bitmap.extend(count);
+        self.refcounts.extend((0..count).map(|_| AtomicU32::new(0)));
+        self.generations
+            .extend((0..count).map(|_| AtomicU64::new(0)));
+        self.live_bytes
+            .extend((0..count).map(|_| AtomicU32::new(0)));
+        self.state
+            .extend((0..count).map(|_| AtomicU8::new(ExtentState::Free as u8)));
+        self.n += count;
+        self.total_free.fetch_add(count, Ordering::Relaxed);
+    }
+
     pub fn is_empty(&self) -> bool {
         self.n == 0
     }

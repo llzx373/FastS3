@@ -494,3 +494,66 @@ fn serve_network_and_loadgen_smoke() {
     );
     let _ = out;
 }
+
+/// M13 M3-1:CLI device-add(服务停止形态;初始化 → 追加清单 → 重开双盘)。
+#[test]
+fn device_add_cli_cycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta = dir.path().join("meta");
+    let img = init_img(dir.path(), "disk.img", "64MiB", &meta);
+    let cfg = dir.path().join("fasts3.toml");
+
+    let small = dir.path().join("small.bin");
+    std::fs::write(&small, vec![0x11u8; 4096]).unwrap();
+    let out = run(&[
+        "put",
+        "--config",
+        cfg.to_str().unwrap(),
+        "--bucket",
+        "bkt",
+        "k",
+        small.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // device-add 新盘
+    let img2 = dir.path().join("disk2.img");
+    std::fs::File::create(&img2)
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    let out = run(&[
+        "device-add",
+        "--config",
+        cfg.to_str().unwrap(),
+        "--new-device",
+        img2.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "device-add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("pool now 2 device(s)"), "{stdout}");
+
+    // 配置补新盘后重开:双盘池数据完好(devices 数组替换为双元素)
+    let conf = std::fs::read_to_string(&cfg).unwrap();
+    let mut conf_lines: Vec<String> = conf.lines().map(|l| l.to_string()).collect();
+    let di = conf_lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("devices = ["))
+        .expect("devices line");
+    conf_lines[di] = format!("devices = [\"{}\", \"{}\"]", img.display(), img2.display());
+    std::fs::write(&cfg, conf_lines.join("\n")).unwrap();
+    let out = run(&["check", "--config", cfg.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "check after device-add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

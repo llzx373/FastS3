@@ -113,6 +113,19 @@ struct CheckpointState {
     dirty: bool,
 }
 
+/// 在线扩容结果(M13 M3-1)。
+#[derive(Debug, Clone)]
+pub struct DeviceAddReport {
+    pub uuid: [u8; 16],
+    pub path: String,
+    /// 新盘容量字节(data_end)。
+    pub capacity: u64,
+    pub extent_count: u64,
+    /// 新盘全局 extent id 基址(推导式映射)。
+    pub base: u64,
+    pub total_devices: usize,
+}
+
 /// 只读摘要(check 命令)。
 #[derive(Debug, Default)]
 pub struct CheckReport {
@@ -138,9 +151,11 @@ pub struct CheckReport {
 /// 全局 extent id = `base + local`(base = Σ 前序设备 extent 数;仅尾部
 /// 增删)。每设备独立超块/位图/检查点在恢复与检查点路径按本表逐设备
 /// 装配。
+#[derive(Clone)]
 pub(crate) struct DeviceSlot {
-    /// 设备句柄(O_DIRECT;io_uring 直取 raw_fd)。
-    pub dev: Box<dyn BlockDevice>,
+    /// 设备句柄(O_DIRECT;io_uring 直取 raw_fd;Arc 使槽表可热克隆,
+    /// device-add 在线扩容时整表重建)。
+    pub dev: Arc<dyn BlockDevice>,
     /// 本设备超块(布局/容量口径;extent_size 全池一致,启动校验)。
     pub sb: fs3_core::SuperBlock,
     /// 全局 extent id 基址(推导式映射;见 fs3_core::pool)。
@@ -275,6 +290,8 @@ pub struct Engine {
     _checkpoint_thread: Option<std::thread::JoinHandle<()>>,
     /// Tier 2 压缩核心(前台 compact_once 与后台 worker 共用)。
     compactor: Option<Arc<Compactor>>,
+    /// 压缩配置存档(M13 M3-1 device-add 重建压缩器用;open 时快照)。
+    compaction_cfg: CompactionConfig,
     /// 后台 worker 句柄(ADR-12 DL2 通用抽象;压缩为首个实例)。
     _compactor_thread: Option<WorkerHandle>,
     /// 后台任务全局共享令牌桶(ADR-12 DL2:压缩与生命周期执行器
@@ -434,7 +451,7 @@ impl Engine {
                         ))
                     } else {
                         slots.push(DeviceSlot {
-                            dev,
+                            dev: Arc::from(dev),
                             sb,
                             base: 0, // 下方按清单序重算
                             extent_count: sb.extent_count(),
@@ -672,6 +689,7 @@ impl Engine {
             checkpoint_tick: std::sync::Mutex::new(rx),
             _checkpoint_thread: Some(thread),
             compactor,
+            compaction_cfg: cfg.compaction.clone(),
             _compactor_thread: compactor_thread,
             throttle,
             closed: false,
@@ -790,6 +808,137 @@ impl Engine {
         &self.alloc
     }
 
+    // ─────────────────────────── 在线扩容(M13 M3-1) ───────────────────────────
+
+    /// 在线扩容(ADR-15 DM4):初始化新盘 → 追加池清单 → 内存热切换设备表。
+    /// 新盘加入后剩余空间最大 → 加权轮转自然倾斜(DM2);旧数据不迁移
+    /// (再平衡 = M13 M4-1)。调用方须持引擎写锁(服务层/admin API 路径)。
+    ///
+    /// 崩溃安全:设备初始化先于清单落盘;两者之间崩溃 = 盘已格式化但未入
+    /// 池 —— 重跑本命令(已初始化盘直接采用,清单外 uuid)收敛;
+    /// 清单落盘后崩溃 = 池已含新盘,重跑报 AlreadyInitialized(幂等拒绝)。
+    ///
+    /// 限制(文档化):压缩器持有旧设备表 Arc,同步到新盘需重启或等待
+    /// M4-1 再平衡(fd/偏移读取新表);前台读写路径即刻可见。
+    pub fn device_add(&mut self, path: &std::path::Path, force: bool) -> Result<DeviceAddReport> {
+        if self.read_only {
+            return Err(Error::Unsupported(
+                "device-add requires a writable engine (degraded/read-only pool)".into(),
+            ));
+        }
+        if self.devices.iter().any(|s| s.dev.path() == path) {
+            return Err(Error::InvalidArgument(format!(
+                "device {} is already in the pool",
+                path.display()
+            )));
+        }
+        // 新盘形态:未初始化 → init(v3 + MULTI_DEVICE,extent_size = 池口径);
+        // 已初始化(压测/重试残留)→ 校验后采用
+        let probe = fs3_device::open_device(path, true)?;
+        let sb = match fs3_device::read_superblock(probe.as_ref()) {
+            Ok(sb) => sb,
+            Err(Error::NotInitialized) => {
+                fs3_device::init_device(path, self.main_sb.extent_size, 0, force)?
+            }
+            Err(e) => return Err(e),
+        };
+        if sb.layout_version != fs3_core::LAYOUT_VERSION {
+            return Err(Error::InvalidLayout(format!(
+                "new device layout v{} != pool layout v{}; upgrade the pool first \
+                 (fasts3d upgrade)",
+                sb.layout_version,
+                fs3_core::LAYOUT_VERSION
+            )));
+        }
+        if sb.extent_size != self.main_sb.extent_size {
+            return Err(Error::InvalidLayout(format!(
+                "new device extent_size {} != pool extent_size {}",
+                sb.extent_size, self.main_sb.extent_size
+            )));
+        }
+        let mut manifest = self.meta.load_pool()?.ok_or_else(|| {
+            Error::InvalidLayout("pool manifest missing; open the engine once first".into())
+        })?;
+        if manifest.devices.iter().any(|d| d.uuid == sb.uuid) {
+            return Err(Error::InvalidArgument(format!(
+                "device {} (uuid {}) is already in the pool manifest",
+                path.display(),
+                Self::hex_uuid(&sb.uuid)
+            )));
+        }
+        manifest.validate()?;
+        let extent_count = sb.extent_count();
+        let base: u64 = self.devices.iter().map(|s| s.extent_count).sum();
+        manifest.devices.push(fs3_core::pool::DeviceEntry {
+            uuid: sb.uuid,
+            path: path.display().to_string(),
+            capacity: sb.data_end,
+            extent_count,
+            weight: 1,
+            added_at: now_ts(),
+        });
+        manifest.validate()?;
+        // 清单落盘(单事务;崩溃于此 = 幂等重跑)
+        self.meta.save_pool(&manifest)?;
+        // 独占期:停压缩后台 worker 并 join(其共享 alloc/基础表;扩容期间
+        // Vec 重定位与并发访问不兼容;引擎写锁已排除其余引擎操作)
+        let had_compactor = self.compactor.is_some();
+        if let Some(mut h) = self._compactor_thread.take() {
+            h.stop();
+            self._compactor_thread = None;
+        }
+        // 释放压缩器对 alloc 的 Arc 引用(get_mut 独占扩展;前台 compact_once
+        // 也被写锁排除;扩完后 restart_compactor 重建)
+        self.compactor = None;
+        let alloc_mut = Arc::get_mut(&mut self.alloc).ok_or_else(|| {
+            Error::InvalidArgument(
+                "allocator still referenced by background components; retry".into(),
+            )
+        })?;
+        // 分配器在线扩容(新区间计入位图/派生数组;总容量对齐池清单)
+        alloc_mut.extend(extent_count);
+        // 内存热切换:整表重建(旧表 Arc 已无并发引用)
+        let mut slots: Vec<DeviceSlot> = self.devices.as_ref().clone();
+        slots.push(DeviceSlot {
+            dev: Arc::from(fs3_device::open_device(path, false)?),
+            sb,
+            base,
+            extent_count,
+            weight: 1,
+        });
+        self.devices = Arc::new(slots);
+        self.open_extents.push(None);
+        self.zc_fds.push(fs3_device::open_zerocopy_fd(path).ok());
+        // 压缩器重建(新设备表;原启停状态原样恢复)
+        self.restart_compactor(had_compactor);
+        tracing::info!(
+            "DEVICE ADDED: {} (uuid {}, {extent_count} extents, base {base}); \
+             weighted rotation will skew new allocations to it (ADR-15 DM2)",
+            path.display(),
+            Self::hex_uuid(&sb.uuid)
+        );
+        Ok(DeviceAddReport {
+            uuid: sb.uuid,
+            path: path.display().to_string(),
+            capacity: sb.data_end,
+            extent_count,
+            base,
+            total_devices: self.devices.len(),
+        })
+    }
+
+    /// uuid 展示。
+    fn hex_uuid(u: &[u8; 16]) -> String {
+        u.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// 池清单(管理面状态渲染用;M13 M4-2 容量视图扩展)。
+    pub fn pool_manifest(&self) -> Result<fs3_core::pool::PoolManifest> {
+        self.meta
+            .load_pool()?
+            .ok_or_else(|| Error::InvalidLayout("pool manifest missing".into()))
+    }
+
     /// M13 M2-1 测试钩子:各设备开放 extent 快照 (extent_id, watermark)。
     #[cfg(test)]
     pub(crate) fn open_extent_snapshot(&self) -> Vec<Option<(u32, u32)>> {
@@ -818,6 +967,33 @@ impl Engine {
 
     /// 前台执行一轮压缩(测试 / check --compact);返回本轮报告。
     /// 与后台 worker 共用同一全局令牌桶(ADR-12 DL2)。
+    /// (重)启后台压缩 worker(M13 M3-1 device-add 后重建;`had` = 原是否
+    /// 启用,失败路径也要恢复)。压缩器持有新设备表 Arc。
+    fn restart_compactor(&mut self, had: bool) {
+        if !had {
+            return;
+        }
+        let c = Arc::new(Compactor::new(
+            self.meta.clone(),
+            self.alloc.clone(),
+            self.io.clone(),
+            self.devices.clone(),
+            self.compaction_cfg.clone(),
+        ));
+        let h = if self.compaction_cfg.enabled {
+            Some(WorkerHandle::spawn(
+                "fs3-compactor",
+                c.clone(),
+                self.throttle.clone(),
+                std::time::Duration::from_millis(self.compaction_cfg.poll_interval_ms),
+            ))
+        } else {
+            None
+        };
+        self.compactor = Some(c);
+        self._compactor_thread = h;
+    }
+
     pub fn compact_once(&self) -> Result<CompactionReport> {
         if self.read_only {
             return Err(Error::Unsupported(

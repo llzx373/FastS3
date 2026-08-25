@@ -660,3 +660,62 @@ fn audit_lifecycle_visible_after_restart() {
     assert_eq!(entries[0]["status"].as_u64(), Some(204));
     let _ = handle;
 }
+
+/// M13 M3-1:POST /v1/admin/devices/add 在线扩容(不停服)。
+#[test]
+fn admin_device_add_online() {
+    let (_d, img) = setup();
+    let cfg = EngineConfig {
+        devices: vec![img.clone()],
+        meta_dir: img.parent().unwrap().join("meta"),
+        compaction: fs3_engine::CompactionConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let (sock, handle) = start_admin(&cfg, "sekret");
+    let sock = sock.trim_start_matches("unix://");
+
+    // 初始单盘
+    let (code, body) = http_unix(sock, "GET", "/v1/admin/status", None, "sekret");
+    assert_eq!(code, 200, "{body}");
+
+    // 在线加盘
+    let new_img = _d.path().join("disk2.img");
+    std::fs::File::create(&new_img)
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    let body_json = format!("{{\"path\": \"{}\"}}", new_img.display());
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/admin/devices/add",
+        Some(&body_json),
+        "sekret",
+    );
+    assert_eq!(code, 200, "device-add must succeed: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["total_devices"], 2);
+    assert_eq!(v["base"], v["extent_count"]);
+    assert!(!v["uuid"].as_str().unwrap().is_empty());
+
+    // 重复添加幂等拒绝
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/admin/devices/add",
+        Some(&body_json),
+        "sekret",
+    );
+    assert!(
+        code == 409 || code == 400,
+        "duplicate add must fail: {code} {body}"
+    );
+
+    // 缺 path → 400
+    let (code, _) = http_unix(sock, "POST", "/v1/admin/devices/add", Some("{}"), "sekret");
+    assert_eq!(code, 400);
+    drop(handle);
+}

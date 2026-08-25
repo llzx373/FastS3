@@ -435,6 +435,8 @@ impl AdminServer {
             ("GET", ["config"]) => self.handle_config_get(),
             ("PATCH", ["config"]) => self.handle_config_patch(body),
             ("POST", ["repair"]) => self.handle_repair(),
+            // M13 M3-1(ADR-15 DM4):在线扩容(初始化 → 追加池清单 → 热切换)
+            ("POST", ["devices", "add"]) => self.handle_device_add(body),
             ("POST", ["config", "reload"]) => self.handle_config_reload(),
             // M11 K1-1(ADR-12 DS1):SSE-S3 KEK 轮换与状态(零密钥材料:
             // 只暴露代数/时间戳/重包裹进度,红线)
@@ -1069,6 +1071,47 @@ impl AdminServer {
                 Ok(summary) => json::ok(serde_json::json!({"reloaded": true, "summary": summary})),
                 Err(e) => json::err(StatusCode::BAD_REQUEST, "reload_failed", &e),
             },
+        }
+    }
+
+    /// M13 M3-1:POST /v1/admin/devices/add `{"path": "...", "force": false}`
+    /// 在线扩容(不停服;新盘剩余空间最大 → 加权轮转自然倾斜)。
+    fn handle_device_add(&self, body: &[u8]) -> Response<String> {
+        let parsed: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(e) => {
+                return json::err(
+                    StatusCode::BAD_REQUEST,
+                    "bad_request",
+                    &format!("invalid json body: {e}"),
+                )
+            }
+        };
+        let path = match parsed.get("path").and_then(|p| p.as_str()) {
+            Some(p) if !p.is_empty() => p,
+            _ => {
+                return json::err(
+                    StatusCode::BAD_REQUEST,
+                    "bad_request",
+                    "\"path\" field required",
+                )
+            }
+        };
+        let force = parsed
+            .get("force")
+            .and_then(|f| f.as_bool())
+            .unwrap_or(false);
+        let mut engine = self.engine.write();
+        match engine.device_add(std::path::Path::new(path), force) {
+            Ok(rep) => json::ok(serde_json::json!({
+                "uuid": rep.uuid.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                "path": rep.path,
+                "capacity": rep.capacity,
+                "extent_count": rep.extent_count,
+                "base": rep.base,
+                "total_devices": rep.total_devices,
+            })),
+            Err(e) => json::err(StatusCode::CONFLICT, "device_add_failed", &e.to_string()),
         }
     }
 

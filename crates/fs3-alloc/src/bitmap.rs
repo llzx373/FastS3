@@ -268,6 +268,19 @@ impl Bitmap {
             .map(|w| w.load(Ordering::Acquire).count_ones() as u64)
             .sum()
     }
+
+    /// 追加 `count` 个空闲位(M13 M3-1 在线扩容;新位恒 0)。
+    /// 只能在**独占期**调用(引擎写锁 + 后台压缩 worker 已停并 join;
+    /// 见 Engine::device_add)——Vec 重定位与并发读不兼容。
+    pub fn extend(&mut self, count: u64) {
+        let old_words = self.words.len() as u64;
+        let new_n = self.n + count;
+        let new_words = new_n.div_ceil(64) as usize;
+        for _ in old_words as usize..new_words {
+            self.words.push(AtomicU64::new(0));
+        }
+        self.n = new_n;
+    }
 }
 
 #[cfg(test)]
