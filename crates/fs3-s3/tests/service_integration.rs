@@ -7455,6 +7455,101 @@ fn bucket_encryption_apis() {
     assert_eq!(err_code(&r), "MalformedXML", "{r:?}");
 }
 
+/// M12 W2-2:Put/GetObjectLockConfiguration + CreateBucket 锁头 + 锁桶不可 Suspend。
+#[test]
+fn bucket_object_lock_configuration_apis() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/olock", vec![]))), 200);
+    let q = &[("object-lock", "")];
+
+    // 未启用 Get → 404 AWS 码
+    let r = svc.handle(&req_q("GET", "/olock", q, vec![]));
+    assert_eq!(status(&r), 404, "{r:?}");
+    assert_eq!(err_code(&r), "ObjectLockConfigurationNotFoundError");
+
+    // PUT Enabled(无 Rule)→ 200;GET 回显 Enabled、无 Rule;连带版本化 Enabled
+    let enabled = b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>".to_vec();
+    let r = svc.handle(&req_q("PUT", "/olock", q, enabled));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let r = svc.handle(&req_q("GET", "/olock", q, vec![]));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let xml = body_str(&r.unwrap());
+    assert!(
+        xml.contains("<ObjectLockEnabled>Enabled</ObjectLockEnabled>"),
+        "{xml}"
+    );
+    assert!(!xml.contains("<Rule>"), "{xml}");
+    assert!(get_versioning(&svc, "olock").contains("<Status>Enabled</Status>"));
+
+    // PUT 默认保留 Days;GET 回显;再 PUT 去掉 Rule
+    let days = b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>7</Days></DefaultRetention></Rule></ObjectLockConfiguration>".to_vec();
+    let r = svc.handle(&req_q("PUT", "/olock", q, days));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let xml = body_str(&svc.handle(&req_q("GET", "/olock", q, vec![])).unwrap());
+    assert!(xml.contains("<Mode>GOVERNANCE</Mode>"), "{xml}");
+    assert!(xml.contains("<Days>7</Days>"), "{xml}");
+    let enabled = b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>".to_vec();
+    assert_eq!(
+        status(&svc.handle(&req_q("PUT", "/olock", q, enabled))),
+        200
+    );
+    let xml = body_str(&svc.handle(&req_q("GET", "/olock", q, vec![])).unwrap());
+    assert!(
+        xml.contains("<ObjectLockEnabled>Enabled</ObjectLockEnabled>"),
+        "{xml}"
+    );
+    assert!(!xml.contains("<Rule>"), "{xml}");
+
+    // 锁桶 Suspend 版本化 → 409 InvalidBucketState
+    let r = put_versioning(&svc, "olock", "Suspended");
+    assert_eq!(status(&r), 409, "{r:?}");
+    assert_eq!(err_code(&r), "InvalidBucketState");
+    assert!(get_versioning(&svc, "olock").contains("<Status>Enabled</Status>"));
+
+    // CreateBucket 头 true → 锁+版本化;GET lock 200
+    let r = svc.handle(&req_h(
+        "PUT",
+        "/olock-hdr",
+        &[("x-amz-bucket-object-lock-enabled", "true")],
+        vec![],
+    ));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let r = svc.handle(&req_q("GET", "/olock-hdr", q, vec![]));
+    assert_eq!(status(&r), 200, "{r:?}");
+    assert!(get_versioning(&svc, "olock-hdr").contains("<Status>Enabled</Status>"));
+    // 头 false = 不启用
+    assert_eq!(
+        status(&svc.handle(&req_h(
+            "PUT",
+            "/olock-off",
+            &[("x-amz-bucket-object-lock-enabled", "false")],
+            vec![],
+        ))),
+        200
+    );
+    assert_eq!(
+        err_code(&svc.handle(&req_q("GET", "/olock-off", q, vec![]))),
+        "ObjectLockConfigurationNotFoundError"
+    );
+    // 非法头值 → 400
+    let r = svc.handle(&req_h(
+        "PUT",
+        "/olock-bad",
+        &[("x-amz-bucket-object-lock-enabled", "yes")],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "InvalidArgument", "{r:?}");
+
+    // ObjectLockEnabled ≠ Enabled → 400;桶不存在 → NoSuchBucket
+    let dis = b"<ObjectLockConfiguration><ObjectLockEnabled>Disabled</ObjectLockEnabled></ObjectLockConfiguration>".to_vec();
+    let r = svc.handle(&req_q("PUT", "/olock", q, dis));
+    assert_eq!(err_code(&r), "InvalidArgument", "{r:?}");
+    let r = svc.handle(&req_q("PUT", "/ghost", q, b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>".to_vec()));
+    assert_eq!(err_code(&r), "NoSuchBucket", "{r:?}");
+    let r = svc.handle(&req_q("GET", "/ghost", q, vec![]));
+    assert_eq!(err_code(&r), "NoSuchBucket", "{r:?}");
+}
+
 /// K1-4:SSE-KMS 显式拒绝矩阵(钉住,不静默)——aws:kms 算法值全入口
 /// 400 InvalidEncryptionAlgorithmError;KMS 参数头族 501 NotImplemented;
 /// PutBucketEncryption 的 KMSKeyID/BucketKeyEnabled 元素 400

@@ -46,8 +46,8 @@ pub enum S3ErrorCode {
     InvalidAddressingHeader,
     InvalidArgument,
     InvalidBucketName,
-    /// 预留:无桶级状态机拒绝面(版本化非法转换另有
-    /// IllegalVersioningConfiguration)。
+    /// 桶状态不允许该操作(M12 W2-2:Object Lock 桶禁止 Suspend 版本化;
+    /// 409,与 AWS InvalidBucketState 同码)。
     InvalidBucketState,
     InvalidDigest,
     InvalidEncryptionAlgorithmError,
@@ -115,6 +115,8 @@ pub enum S3ErrorCode {
     NoSuchWebsiteConfiguration,
     /// 预留:条件写判定在引擎写锁内串行(check-then-act),无并发冲突面。
     OperationAborted,
+    /// 桶无 Object Lock 配置(M12 W2-2;GetObjectLockConfiguration 的 AWS 404 码)。
+    ObjectLockConfigurationNotFoundError,
     /// 桶无 OwnershipControls 配置(M10 S7;AWS 404)。
     OwnershipControlsNotFoundError,
     /// 桶无默认加密配置(M11 K1-2;GetBucketEncryption 的 AWS 404 码)。
@@ -226,6 +228,9 @@ impl S3ErrorCode {
             NotModified => "Not Modified",
             NoSuchWebsiteConfiguration => "The specified bucket does not have a website configuration",
             OperationAborted => "A conflicting conditional operation is currently in progress against this resource. Try again.",
+            ObjectLockConfigurationNotFoundError => {
+                "The bucket does not have Object Lock enabled."
+            }
             OwnershipControlsNotFoundError => {
                 "The bucket does not have ownership controls configured."
             }
@@ -271,7 +276,7 @@ impl S3ErrorCode {
             BucketAlreadyExists | BucketAlreadyOwnedByYou | BucketNotEmpty | OperationAborted => {
                 409
             }
-            IllegalVersioningConfiguration => 409,
+            IllegalVersioningConfiguration | InvalidBucketState => 409,
             InvalidRange => 416,
             PreconditionFailed => 412,
             NotModified => 304,
@@ -283,6 +288,7 @@ impl S3ErrorCode {
             | NoSuchCORSConfiguration
             | NoSuchLifecycleConfiguration
             | NoSuchTagSet
+            | ObjectLockConfigurationNotFoundError
             | OwnershipControlsNotFoundError
             | ServerSideEncryptionConfigurationNotFoundError => 404,
             MethodNotAllowed => 405,

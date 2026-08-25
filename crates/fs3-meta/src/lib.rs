@@ -313,6 +313,13 @@ pub enum Op {
         name: String,
         default: Option<fs3_core::SseAlgorithm>,
     },
+    /// 桶 Object Lock 配置(M12 W2-2,ADR-13):enabled 恒 true(不可关闭);
+    /// 开启时同时把 versioning 置 Enabled;只改这两处 + default_retention,
+    /// 其余字段原样保留;桶不存在 → NotFound。
+    BucketSetObjectLock {
+        name: String,
+        default_retention: Option<fs3_core::ObjectLockDefaultRetention>,
+    },
     /// D9 桶级配置文档写入(M10 S1/S2/S7;值 = 规范化 XML;覆盖语义)。
     /// 桶不存在 → NotFound(与 BucketSetVersioning 同事务内校验)。
     BucketConfPut {
@@ -1975,6 +1982,19 @@ impl MetaStore {
         }])
     }
 
+    /// 桶 Object Lock 启用 + 默认保留(单事务;开启连带 versioning=Enabled;
+    /// PutObjectLockConfiguration 落地路径)。
+    pub fn commit_bucket_set_object_lock(
+        &self,
+        name: &str,
+        default_retention: Option<fs3_core::ObjectLockDefaultRetention>,
+    ) -> Result<u64> {
+        self.commit(&[Op::BucketSetObjectLock {
+            name: name.to_string(),
+            default_retention,
+        }])
+    }
+
     // —— D9 桶级配置文档(M10 S1/S2/S7;ADR-11 D9) ——
 
     /// 读桶级配置文档(无配置 → None;值 = 规范化 XML 字节)。
@@ -2769,6 +2789,18 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
                 let cur = tget(tx, &k)?.ok_or_else(|| Error::NotFound(format!("bucket {name}")))?;
                 let mut meta = decode_bucket(&cur)?;
                 meta.default_encryption = *default;
+                tinsert(tx, k, meta.encode_value()?)?;
+            }
+            Op::BucketSetObjectLock {
+                name,
+                default_retention,
+            } => {
+                let k = bucket_key(name);
+                let cur = tget(tx, &k)?.ok_or_else(|| Error::NotFound(format!("bucket {name}")))?;
+                let mut meta = decode_bucket(&cur)?;
+                meta.object_lock = true;
+                meta.versioning = fs3_core::VersioningState::Enabled;
+                meta.default_retention = default_retention.clone();
                 tinsert(tx, k, meta.encode_value()?)?;
             }
             Op::BucketConfPut {
@@ -5634,6 +5666,31 @@ mod tests {
         );
         assert!(matches!(
             s.commit_bucket_set_versioning("nope", fs3_core::VersioningState::Enabled),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn bucket_set_object_lock_enables_versioning() {
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        let def = fs3_core::ObjectLockDefaultRetention {
+            mode: fs3_core::RetentionMode::Governance,
+            unit: fs3_core::RetentionPeriodUnit::Days,
+            n: 7,
+        };
+        s.commit_bucket_set_object_lock("b1", Some(def.clone()))
+            .unwrap();
+        let b = s.get_bucket("b1").unwrap().unwrap();
+        assert!(b.object_lock);
+        assert_eq!(b.versioning, fs3_core::VersioningState::Enabled);
+        assert_eq!(b.default_retention, Some(def));
+        s.commit_bucket_set_object_lock("b1", None).unwrap();
+        let b = s.get_bucket("b1").unwrap().unwrap();
+        assert!(b.object_lock, "Enabled 不可关闭");
+        assert_eq!(b.default_retention, None);
+        assert!(matches!(
+            s.commit_bucket_set_object_lock("nope", None),
             Err(Error::NotFound(_))
         ));
     }

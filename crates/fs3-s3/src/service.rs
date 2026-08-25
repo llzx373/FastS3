@@ -1086,6 +1086,14 @@ impl S3Service {
             Operation::DeleteBucketEncryption { bucket } => {
                 Ok(self.op_delete_bucket_encryption(&bucket)?)
             }
+            // —— M12 W2-2:桶 Object Lock(ADR-13;BucketMeta v2 字段) ——
+            Operation::PutObjectLockConfiguration {
+                bucket,
+                default_retention,
+            } => Ok(self.op_put_object_lock(&bucket, default_retention)?),
+            Operation::GetObjectLockConfiguration { bucket } => {
+                Ok(self.op_get_object_lock(&bucket)?)
+            }
             // —— M11 L1:桶生命周期(ADR-12 DL1;`r:` 键) ——
             Operation::PutBucketLifecycleConfiguration { bucket, rules } => {
                 Ok(self.op_put_bucket_lifecycle(&bucket, &rules)?)
@@ -1935,7 +1943,7 @@ impl S3Service {
         // M8/s3-tests:接受任意 LocationConstraint 并回显(RGW/MinIO 测试器
         // 语义;单机服务不做区域表)。无约束 = "" = us-east-1 默认语义。
         validate_canned_acl(req)?;
-        let meta = BucketMeta {
+        let mut meta = BucketMeta {
             created: now_ts(),
             owner: "fasts3".into(),
             stats: Default::default(),
@@ -1947,6 +1955,21 @@ impl S3Service {
             object_lock: false,
             default_retention: None,
         };
+        if let Some(raw) = header(req, "x-amz-bucket-object-lock-enabled") {
+            let on = raw.eq_ignore_ascii_case("true");
+            let off = raw.eq_ignore_ascii_case("false");
+            if !on && !off {
+                return Err(
+                    S3Error::new(S3ErrorCode::InvalidArgument).with_message(format!(
+                        "Invalid x-amz-bucket-object-lock-enabled header: {raw}"
+                    )),
+                );
+            }
+            if on {
+                meta.object_lock = true;
+                meta.versioning = fs3_core::VersioningState::Enabled;
+            }
+        }
         engine
             .meta()
             .commit_bucket_put_with_location(bucket, &meta, location.unwrap_or(""))
@@ -2094,6 +2117,11 @@ impl S3Service {
             return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
         };
         validate_versioning_transition(bkt.versioning, target)?;
+        if bkt.object_lock && target == fs3_core::VersioningState::Suspended {
+            return Err(S3Error::new(S3ErrorCode::InvalidBucketState).with_message(
+                "versioning cannot be suspended on a bucket with Object Lock enabled",
+            ));
+        }
         engine
             .meta()
             .commit_bucket_set_versioning(bucket, target)
@@ -2384,6 +2412,50 @@ impl S3Service {
             status: 204,
             headers: vec![],
             body: ResponseBody::Empty,
+        })
+    }
+
+    // ───────────────── M12 W2-2:桶 Object Lock(ADR-13) ─────────────────
+
+    fn op_put_object_lock(
+        &self,
+        bucket: &str,
+        default_retention: Option<fs3_core::ObjectLockDefaultRetention>,
+    ) -> Result<ServiceResponse, S3Error> {
+        let engine = self.engine.write();
+        engine
+            .meta()
+            .commit_bucket_set_object_lock(bucket, default_retention)
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        Ok(ServiceResponse {
+            status: 200,
+            headers: vec![],
+            body: ResponseBody::Empty,
+        })
+    }
+
+    fn op_get_object_lock(&self, bucket: &str) -> Result<ServiceResponse, S3Error> {
+        let engine = self.engine.read();
+        let bkt = engine
+            .meta()
+            .get_bucket(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?
+            .ok_or_else(|| {
+                S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket)
+            })?;
+        if !bkt.object_lock {
+            return Err(S3Error::new(
+                S3ErrorCode::ObjectLockConfigurationNotFoundError,
+            ));
+        }
+        let xml = xml::render_object_lock_configuration(bkt.default_retention.as_ref());
+        Ok(ServiceResponse {
+            status: 200,
+            headers: vec![
+                ("Content-Type".into(), "application/xml".into()),
+                ("Content-Length".into(), xml.len().to_string()),
+            ],
+            body: ResponseBody::Bytes(xml.into_bytes()),
         })
     }
 
@@ -5673,6 +5745,8 @@ fn route_op_bucket_key(req: &S3Request) -> (fs3_core::metrics::Op, String, Strin
         ("PUT", _, "") if has_q("lifecycle") => (Op::Other, "PutLifecycleConfiguration"),
         ("GET", _, "") if has_q("lifecycle") => (Op::Other, "GetLifecycleConfiguration"),
         ("DELETE", _, "") if has_q("lifecycle") => (Op::Other, "DeleteLifecycleConfiguration"),
+        ("PUT", _, "") if has_q("object-lock") => (Op::Other, "PutObjectLockConfiguration"),
+        ("GET", _, "") if has_q("object-lock") => (Op::Other, "GetObjectLockConfiguration"),
         // M10 V3:版本化子资源审计名
         ("PUT", _, "") if has_q("versioning") => (Op::Other, "PutBucketVersioning"),
         ("GET", _, "") if has_q("versioning") => (Op::Other, "GetBucketVersioning"),

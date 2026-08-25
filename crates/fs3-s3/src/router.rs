@@ -89,6 +89,14 @@ pub enum Operation {
     DeleteBucketEncryption {
         bucket: String,
     },
+    // —— 桶 Object Lock(M12 W2-2;ADR-13,BucketMeta v2 字段) ——
+    PutObjectLockConfiguration {
+        bucket: String,
+        default_retention: Option<fs3_core::ObjectLockDefaultRetention>,
+    },
+    GetObjectLockConfiguration {
+        bucket: String,
+    },
     // —— 桶生命周期(M11 L1;ADR-12 DL1,`r:{bucket}\0{rule_id}` 键) ——
     /// PUT ?lifecycle:规则集路由层已解析校验(v1.2 子集;Transition 族与
     /// ObjectSize* 过滤器显式 NotImplemented)。AWS 现名
@@ -590,6 +598,17 @@ impl Router {
                     _ => Err(S3Error::new(S3ErrorCode::MethodNotAllowed)),
                 };
             }
+            // M12 W2-2:桶 Object Lock(ADR-13;BucketMeta v2 字段,无独立键)
+            if has_q("object-lock") {
+                return match method {
+                    "PUT" => Ok(Operation::PutObjectLockConfiguration {
+                        bucket,
+                        default_retention: crate::xml::parse_object_lock_configuration(body)?,
+                    }),
+                    "GET" => Ok(Operation::GetObjectLockConfiguration { bucket }),
+                    _ => Err(S3Error::new(S3ErrorCode::MethodNotAllowed)),
+                };
+            }
             // M11 L1:桶生命周期(ADR-12 DL1;`r:` 键;XML body 路由层解析
             // 校验——v1.2 子集,Transition 族/ObjectSize* 显式 NotImplemented)
             if has_q("lifecycle") {
@@ -621,7 +640,7 @@ impl Router {
                 "partNumber",
                 "versions",
                 "versionId",
-                "object-lock",
+                // "object-lock" 自 M12 W2-2 起已实现(Put/GetObjectLockConfiguration)
                 "publicAccessBlock",
                 "accelerate",
                 "analytics",
@@ -1023,6 +1042,29 @@ mod tests {
             matches!(op, Operation::DeleteBucketLifecycleConfiguration { bucket } if bucket == "b1")
         );
         let err = r.route("POST", "localhost", "/b1", &q, b"").unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::MethodNotAllowed);
+        // M12 W2-2:?object-lock GET/PUT 分流
+        let q = vec![("object-lock".into(), "".into())];
+        let op = r.route("GET", "localhost", "/b1", &q, b"").unwrap();
+        assert!(matches!(op, Operation::GetObjectLockConfiguration { bucket } if bucket == "b1"));
+        let ol = br#"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>"#;
+        let op = r.route("PUT", "localhost", "/b1", &q, ol).unwrap();
+        assert!(
+            matches!(op, Operation::PutObjectLockConfiguration { bucket, default_retention: None } if bucket == "b1")
+        );
+        let ol = br#"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>7</Days></DefaultRetention></Rule></ObjectLockConfiguration>"#;
+        let op = r.route("PUT", "localhost", "/b1", &q, ol).unwrap();
+        assert!(matches!(
+            op,
+            Operation::PutObjectLockConfiguration {
+                bucket,
+                default_retention: Some(ref d)
+            } if bucket == "b1"
+                && d.mode == fs3_core::RetentionMode::Governance
+                && d.unit == fs3_core::RetentionPeriodUnit::Days
+                && d.n == 7
+        ));
+        let err = r.route("DELETE", "localhost", "/b1", &q, b"").unwrap_err();
         assert_eq!(err.code, S3ErrorCode::MethodNotAllowed);
         // M10 S3:?policy 三方法分流
         let q = vec![("policy".into(), "".into())];

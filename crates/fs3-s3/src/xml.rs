@@ -1805,6 +1805,164 @@ pub fn parse_bucket_encryption(body: &[u8]) -> Result<fs3_core::SseAlgorithm, S3
     algorithm.ok_or_else(|| malformed("Rule requires SSEAlgorithm".into()))
 }
 
+/// PutObjectLockConfiguration 请求体解析(M12 W2-2,ADR-13):
+/// `<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>
+/// <Rule><DefaultRetention><Mode>GOVERNANCE|COMPLIANCE</Mode>
+/// <Days>N</Days>|<Years>N</Years></DefaultRetention></Rule>
+/// </ObjectLockConfiguration>`。Rule 可缺省(仅启用、无默认保留)。
+///
+/// `ObjectLockEnabled` 必须为 `Enabled`(不可关闭);Days/Years 互斥且 n≥1。
+pub fn parse_object_lock_configuration(
+    body: &[u8],
+) -> Result<Option<fs3_core::ObjectLockDefaultRetention>, S3Error> {
+    use fs3_core::{ObjectLockDefaultRetention, RetentionMode, RetentionPeriodUnit};
+    let malformed = |m: String| S3Error::new(S3ErrorCode::MalformedXML).with_message(m);
+    if body.iter().all(|&b| b.is_ascii_whitespace()) {
+        return Err(malformed("ObjectLockConfiguration body is empty".into()));
+    }
+    let mut reader = quick_xml::Reader::from_reader(body);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut saw_root = false;
+    let mut enabled = false;
+    let mut mode: Option<RetentionMode> = None;
+    let mut days: Option<i32> = None;
+    let mut years: Option<i32> = None;
+    let mut saw_rule = false;
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(quick_xml::events::Event::Start(e)) => {
+                let name = e.local_name();
+                let local = name.as_ref().to_vec();
+                let text = |r: &mut quick_xml::Reader<&[u8]>| -> Result<String, S3Error> {
+                    let raw = r
+                        .read_text(e.name())
+                        .map_err(|err| malformed(format!("malformed XML: {err}")))?;
+                    unescape_text(raw.as_ref()).map_err(malformed)
+                };
+                match local.as_slice() {
+                    b"ObjectLockConfiguration" => saw_root = true,
+                    b"ObjectLockEnabled" => {
+                        let v = text(&mut reader)?;
+                        if v != "Enabled" {
+                            return Err(S3Error::new(S3ErrorCode::InvalidArgument).with_message(
+                                "ObjectLockEnabled must be Enabled (cannot be disabled)",
+                            ));
+                        }
+                        enabled = true;
+                    }
+                    b"Rule" => saw_rule = true,
+                    b"Mode" => {
+                        let v = text(&mut reader)?;
+                        mode = Some(match v.as_str() {
+                            "GOVERNANCE" => RetentionMode::Governance,
+                            "COMPLIANCE" => RetentionMode::Compliance,
+                            _ => {
+                                return Err(S3Error::new(S3ErrorCode::MalformedXML)
+                                    .with_message(format!("invalid Object Lock mode: {v}")))
+                            }
+                        });
+                    }
+                    b"Days" => {
+                        let v = text(&mut reader)?;
+                        let n: i32 = v.parse().map_err(|_| {
+                            S3Error::new(S3ErrorCode::InvalidArgument)
+                                .with_message("Days must be a positive integer")
+                        })?;
+                        if n < 1 {
+                            return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                                .with_message("Days must be >= 1"));
+                        }
+                        days = Some(n);
+                    }
+                    b"Years" => {
+                        let v = text(&mut reader)?;
+                        let n: i32 = v.parse().map_err(|_| {
+                            S3Error::new(S3ErrorCode::InvalidArgument)
+                                .with_message("Years must be a positive integer")
+                        })?;
+                        if n < 1 {
+                            return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                                .with_message("Years must be >= 1"));
+                        }
+                        years = Some(n);
+                    }
+                    _ => {}
+                }
+            }
+            Ok(quick_xml::events::Event::Empty(e)) => {
+                let name = e.local_name();
+                match name.as_ref() {
+                    b"ObjectLockConfiguration" => saw_root = true,
+                    b"Rule" => saw_rule = true,
+                    _ => {}
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Err(e) => return Err(malformed(format!("malformed XML: {e}"))),
+            _ => {}
+        }
+        buf.clear();
+    }
+    if !saw_root {
+        return Err(malformed("missing ObjectLockConfiguration root".into()));
+    }
+    if !enabled {
+        return Err(S3Error::new(S3ErrorCode::MalformedXML)
+            .with_message("ObjectLockEnabled is required and must be Enabled"));
+    }
+    match (mode, days, years, saw_rule) {
+        (None, None, None, false) => Ok(None),
+        (None, None, None, true) => Err(malformed("Rule requires DefaultRetention".into())),
+        (Some(mode), Some(n), None, _) => Ok(Some(ObjectLockDefaultRetention {
+            mode,
+            unit: RetentionPeriodUnit::Days,
+            n,
+        })),
+        (Some(mode), None, Some(n), _) => Ok(Some(ObjectLockDefaultRetention {
+            mode,
+            unit: RetentionPeriodUnit::Years,
+            n,
+        })),
+        (Some(_), Some(_), Some(_), _) => Err(malformed(
+            "DefaultRetention must specify Days or Years, not both".into(),
+        )),
+        (Some(_), None, None, _) => {
+            Err(malformed("DefaultRetention requires Days or Years".into()))
+        }
+        (None, _, _, _) => Err(malformed("DefaultRetention requires Mode".into())),
+    }
+}
+
+/// GetObjectLockConfiguration 响应(Enabled 恒回显;Rule 仅在有默认保留时)。
+pub fn render_object_lock_configuration(
+    default: Option<&fs3_core::ObjectLockDefaultRetention>,
+) -> String {
+    use fs3_core::{RetentionMode, RetentionPeriodUnit};
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ObjectLockConfiguration xmlns=\"{XMLNS}\"><ObjectLockEnabled>Enabled</ObjectLockEnabled>"
+    );
+    if let Some(d) = default {
+        let mode = match d.mode {
+            RetentionMode::Governance => "GOVERNANCE",
+            RetentionMode::Compliance => "COMPLIANCE",
+        };
+        xml.push_str("<Rule><DefaultRetention>");
+        let _ = write!(xml, "<Mode>{mode}</Mode>");
+        match d.unit {
+            RetentionPeriodUnit::Days => {
+                let _ = write!(xml, "<Days>{}</Days>", d.n);
+            }
+            RetentionPeriodUnit::Years => {
+                let _ = write!(xml, "<Years>{}</Years>", d.n);
+            }
+        }
+        xml.push_str("</DefaultRetention></Rule>");
+    }
+    xml.push_str("</ObjectLockConfiguration>");
+    xml
+}
+
 /// GetBucketEncryption 响应(规范化渲染;仅 AES256 单 Rule,与
 /// PutBucketEncryption 受理形态互逆)。
 pub fn render_bucket_encryption(alg: fs3_core::SseAlgorithm) -> String {
@@ -3843,5 +4001,69 @@ mod tests {
                 String::from_utf8_lossy(&body)
             );
         }
+    }
+
+    /// M12 W2-2:ObjectLockConfiguration 解析/渲染(Enabled 不可关;Rule 可缺)。
+    #[test]
+    fn object_lock_configuration_parse_render() {
+        let none = parse_object_lock_configuration(
+            b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>",
+        )
+        .unwrap();
+        assert!(none.is_none());
+        let xml = render_object_lock_configuration(None);
+        assert!(
+            xml.contains("<ObjectLockEnabled>Enabled</ObjectLockEnabled>"),
+            "{xml}"
+        );
+        assert!(!xml.contains("<Rule>"), "{xml}");
+        assert_eq!(
+            parse_object_lock_configuration(xml.as_bytes()).unwrap(),
+            None
+        );
+
+        let days = parse_object_lock_configuration(
+            b"<ObjectLockConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>COMPLIANCE</Mode><Days>30</Days></DefaultRetention></Rule></ObjectLockConfiguration>",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(days.mode, fs3_core::RetentionMode::Compliance);
+        assert_eq!(days.unit, fs3_core::RetentionPeriodUnit::Days);
+        assert_eq!(days.n, 30);
+        let xml = render_object_lock_configuration(Some(&days));
+        assert!(xml.contains("<Mode>COMPLIANCE</Mode>"), "{xml}");
+        assert!(xml.contains("<Days>30</Days>"), "{xml}");
+        assert_eq!(
+            parse_object_lock_configuration(xml.as_bytes()).unwrap(),
+            Some(days)
+        );
+
+        let years = parse_object_lock_configuration(
+            b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Years>2</Years></DefaultRetention></Rule></ObjectLockConfiguration>",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(years.unit, fs3_core::RetentionPeriodUnit::Years);
+        assert_eq!(years.n, 2);
+
+        let e = parse_object_lock_configuration(
+            b"<ObjectLockConfiguration><ObjectLockEnabled>Disabled</ObjectLockEnabled></ObjectLockConfiguration>",
+        )
+        .unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::InvalidArgument);
+        let e = parse_object_lock_configuration(b"<oops/>").unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::MalformedXML);
+        let e = parse_object_lock_configuration(
+            b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>1</Days><Years>1</Years></DefaultRetention></Rule></ObjectLockConfiguration>",
+        )
+        .unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::MalformedXML);
+        let e = parse_object_lock_configuration(
+            b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule/></ObjectLockConfiguration>",
+        )
+        .unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::MalformedXML);
+        let e = parse_object_lock_configuration(b"").unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::MalformedXML);
     }
 }
