@@ -435,9 +435,9 @@ impl S3Service {
         parsed
     }
 
-    /// 策略求值上下文(M10 S3 条件键):源 IP(连接对端,低精度——与审计同源)
-    /// + 列表 prefix/delimiter 查询参数。
-    fn policy_ctx(&self, req: &S3Request) -> crate::policy::EvalCtx {
+    /// 策略求值上下文(M10 S3 + M12 W3-1):源 IP、列表 prefix/delimiter、
+    /// bypass 头、目标对象剩余保留天数。
+    fn policy_ctx(&self, req: &S3Request, bucket: &str, key: &str) -> crate::policy::EvalCtx {
         let q = |name: &str| {
             req.query
                 .iter()
@@ -446,10 +446,24 @@ impl S3Service {
         };
         let peer = self.last_peer.lock().unwrap().clone();
         let source_ip = peer.parse::<std::net::SocketAddr>().ok().map(|a| a.ip());
+        let remaining_retention_days = if key.is_empty() {
+            None
+        } else {
+            let engine = self.engine.read();
+            engine
+                .head_version(bucket, key, None)
+                .ok()
+                .and_then(|m| m.retention)
+                .map(|r| {
+                    crate::object_lock::remaining_retention_days(r.retain_until, engine.lock_now())
+                })
+        };
         crate::policy::EvalCtx {
             source_ip,
             prefix: q("prefix"),
             delimiter: q("delimiter"),
+            bypass_governance: crate::object_lock::bypass_governance(&req.headers),
+            remaining_retention_days,
         }
     }
 
@@ -492,7 +506,7 @@ impl S3Service {
         use crate::policy::Decision;
         let resource = resource_arn(bucket, key);
         let action = s3_action_name(action, bucket, key);
-        let ctx = self.policy_ctx(req);
+        let ctx = self.policy_ctx(req, bucket, key);
         let denied = || {
             S3Error::new(S3ErrorCode::AccessDenied).with_message(format!(
                 "access key {} is not authorized for {action} on {resource}",
@@ -541,6 +555,26 @@ impl S3Service {
             // 匿名:显式 Deny 已在上方拒绝;Allow/NoMatch 交 require_auth 判定
             None => Ok(()),
         }
+    }
+
+    /// M12 W3-1:带 bypass 头的 GOVERNANCE 缩短/删除须再过
+    /// `s3:BypassGovernanceRetention`(无密钥策略 = 隐式 `s3:*` 放行;
+    /// 有策略则必须显式 Allow,ADR-13 DL7)。无头不走此检查。
+    fn authorize_bypass_if_requested(
+        &self,
+        access: Option<&str>,
+        name: &str,
+        bucket: &str,
+        key: &str,
+        req: &S3Request,
+    ) -> Result<(), S3Error> {
+        if !crate::object_lock::bypass_governance(&req.headers) {
+            return Ok(());
+        }
+        if !matches!(name, "PutObjectRetention" | "DeleteObject") {
+            return Ok(());
+        }
+        self.authorize(access, "BypassGovernanceRetention", bucket, key, req)
     }
 
     /// M4 D4 掉盘只读降级:写方法(PUT/POST/DELETE)在降级期一律拒绝,
@@ -635,6 +669,7 @@ impl S3Service {
         // op_post_object 解析后按真实键执行。
         if name != "PostObject" {
             self.authorize(access.as_deref(), &name, &bucket, &key, req)?;
+            self.authorize_bypass_if_requested(access.as_deref(), &name, &bucket, &key, req)?;
         }
         // M4 D4 掉盘只读降级:写方法在降级期拒绝(读不受影响)
         self.check_writable(req)?;
@@ -882,7 +917,7 @@ impl S3Service {
                         s3_action_name(&name, &bucket, &key),
                         &bucket,
                         &key,
-                        &self.policy_ctx(req),
+                        &self.policy_ctx(req, &bucket, &key),
                     )
                 {
                     return Ok(None);
@@ -1365,6 +1400,13 @@ impl S3Service {
         // 认证失败在此体现为 handle_inner 的 AccessDenied,策略判定对未认证
         // 请求仅施加桶策略显式 Deny)
         if let Err(e) = self.authorize(access.as_deref(), &name, &bucket, &key, req) {
+            self.metrics.record_error(&e.code_name());
+            self.audit_record(access.as_deref(), &name, &bucket, &key, e.status());
+            return Err(e);
+        }
+        if let Err(e) =
+            self.authorize_bypass_if_requested(access.as_deref(), &name, &bucket, &key, req)
+        {
             self.metrics.record_error(&e.code_name());
             self.audit_record(access.as_deref(), &name, &bucket, &key, e.status());
             return Err(e);
@@ -2667,7 +2709,12 @@ impl S3Service {
         match &identity {
             Some(ak) => self.authorize(Some(ak), "PutObject", bucket, &key, req)?,
             None => {
-                if !self.anonymous_bucket_grant("PutObject", bucket, &key, &self.policy_ctx(req)) {
+                if !self.anonymous_bucket_grant(
+                    "PutObject",
+                    bucket,
+                    &key,
+                    &self.policy_ctx(req, bucket, &key),
+                ) {
                     return Err(S3Error::new(S3ErrorCode::AccessDenied));
                 }
             }

@@ -270,7 +270,7 @@
 - [ ] W2-4 强制矩阵逐格实现(§5.4):受保留版本删除 → 403/409;COMPLIANCE 仅可延长;GOVERNANCE bypass 头;Legal Hold 最严优先;桶删除/版本化关闭拦截
 
 ### W3 授权与审计(≈1 pw)
-- [ ] W3-1 策略引擎 Condition 最小集(§5.3 DL7)+ `x-amz-bypass-governance-retention` 校验
+- [x] W3-1 策略引擎 Condition 最小集(§5.3 DL7)+ `x-amz-bypass-governance-retention` 校验
 - [ ] W3-2 bypass/保留变更强制审计(含保留前后值);审计检索扩展
 
 ### W4 交互面(≈1 pw)

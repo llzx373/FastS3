@@ -124,6 +124,16 @@ pub fn bypass_governance(headers: &[(String, String)]) -> bool {
     hdr(headers, HDR_BYPASS).is_some_and(|v| v.eq_ignore_ascii_case("true"))
 }
 
+/// 剩余保留整天数(`ceil((until − now) / 86400)`;已到期 = 0)。
+/// Condition 键 `s3:ObjectLockRemainingRetentionDays` 用此口径(ADR-13 DL7)。
+pub fn remaining_retention_days(until: i64, now: i64) -> i64 {
+    if until <= now {
+        0
+    } else {
+        (until - now + 86_399) / 86_400
+    }
+}
+
 /// GET/HEAD 回显(有保留才出 mode/until;legal-hold 仅 ON 时出)。
 pub fn response_headers(meta: &fs3_core::ObjectMeta) -> Vec<(String, String)> {
     let mut h = Vec::new();
@@ -374,6 +384,15 @@ mod tests {
             retain_until: 3_000,
         };
         assert!(check_retention_change(Some(&cur), &longer, 1_000, false).is_ok());
+    }
+
+    #[test]
+    fn remaining_days_ceil_and_expired_zero() {
+        assert_eq!(remaining_retention_days(1_000, 1_000), 0);
+        assert_eq!(remaining_retention_days(999, 1_000), 0);
+        assert_eq!(remaining_retention_days(1_000 + 1, 1_000), 1);
+        assert_eq!(remaining_retention_days(1_000 + 86_400, 1_000), 1);
+        assert_eq!(remaining_retention_days(1_000 + 86_401, 1_000), 2);
     }
 
     #[test]

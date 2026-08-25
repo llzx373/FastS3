@@ -22,9 +22,12 @@
 //!   **已认证**请求者(所有密钥同属一账号,无法进一步区分 IAM 身份),不
 //!   匹配匿名;`Service`/`Federated`/`CanonicalUser`/`NotPrincipal` →
 //!   解析错误(显式不支持,红线);缺省 = 密钥附加策略(principal 恒为持钥者);
-//! - `Condition`(M10 S3 最小集,超集一律解析错误):
+//! - `Condition`(M10 S3 最小集 + M12 W3-1,超集一律解析错误):
 //!   `IpAddress`/`NotIpAddress` × `s3:SourceIp`(CIDR 或单 IP,v4/v6);
-//!   `StringEquals`/`StringLike` × `s3:prefix`、`s3:delimiter`(列表请求上下文字段);
+//!   `StringEquals`/`StringLike` × `s3:prefix`、`s3:delimiter`;
+//!   `StringEquals`/`Bool` × `s3:BypassGovernanceRetention`;
+//!   `NumericEquals`/`NumericNotEquals`/`NumericLessThan`/`NumericLessThanEquals`/
+//!   `NumericGreaterThan`/`NumericGreaterThanEquals` × `s3:ObjectLockRemainingRetentionDays`;
 //! - `Sid` 接受并忽略;`NotAction`/`NotResource` → 解析错误(显式不支持);
 //! - 求值语义:显式 Deny 优先;存在匹配 Allow 才放行;无匹配 → NoMatch
 //!   (默认拒绝由调用方按层间语义决定,见 service.rs authorize);
@@ -66,7 +69,7 @@ impl Principal {
     }
 }
 
-/// 请求求值上下文(Condition 求值;M10 S3)。
+/// 请求求值上下文(Condition 求值;M10 S3 + M12 W3-1)。
 #[derive(Debug, Clone, Default)]
 pub struct EvalCtx {
     /// 客户端源 IP(s3:SourceIp;取自连接对端,低精度)。
@@ -75,6 +78,10 @@ pub struct EvalCtx {
     pub prefix: Option<String>,
     /// 列表请求 delimiter 参数(s3:delimiter)。
     pub delimiter: Option<String>,
+    /// 请求是否携带 `x-amz-bypass-governance-retention: true`。
+    pub bypass_governance: bool,
+    /// 目标对象剩余保留整天数(ceil;无保留 = None 键缺席;已到期 = Some(0))。
+    pub remaining_retention_days: Option<i64>,
 }
 
 /// IP 网段(CIDR 或单 IP;v4/v6)。
@@ -130,13 +137,55 @@ impl IpNet {
 enum StrKey {
     Prefix,
     Delimiter,
+    /// M12 W3-1:`s3:BypassGovernanceRetention`(StringEquals true/false)。
+    BypassGovernance,
 }
 
 impl StrKey {
-    fn value<'c>(&self, ctx: &'c EvalCtx) -> Option<&'c str> {
+    fn value(&self, ctx: &EvalCtx) -> Option<String> {
         match self {
-            StrKey::Prefix => ctx.prefix.as_deref(),
-            StrKey::Delimiter => ctx.delimiter.as_deref(),
+            StrKey::Prefix => ctx.prefix.clone(),
+            StrKey::Delimiter => ctx.delimiter.clone(),
+            StrKey::BypassGovernance => Some(if ctx.bypass_governance {
+                "true".into()
+            } else {
+                "false".into()
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NumericOp {
+    Eq,
+    Ne,
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+}
+
+impl NumericOp {
+    fn from_name(op: &str) -> Option<Self> {
+        Some(match op {
+            "NumericEquals" => NumericOp::Eq,
+            "NumericNotEquals" => NumericOp::Ne,
+            "NumericLessThan" => NumericOp::Lt,
+            "NumericLessThanEquals" => NumericOp::Lte,
+            "NumericGreaterThan" => NumericOp::Gt,
+            "NumericGreaterThanEquals" => NumericOp::Gte,
+            _ => return None,
+        })
+    }
+
+    fn cmp(self, have: i64, want: i64) -> bool {
+        match self {
+            NumericOp::Eq => have == want,
+            NumericOp::Ne => have != want,
+            NumericOp::Lt => have < want,
+            NumericOp::Lte => have <= want,
+            NumericOp::Gt => have > want,
+            NumericOp::Gte => have >= want,
         }
     }
 }
@@ -146,12 +195,17 @@ impl StrKey {
 enum Condition {
     /// IpAddress(negate=false)/ NotIpAddress(negate=true)× s3:SourceIp。
     Ip { negate: bool, nets: Vec<IpNet> },
-    /// StringEquals(like=false)/ StringLike(like=true)× s3:prefix/s3:delimiter。
+    /// StringEquals(like=false)/ StringLike(like=true)× s3:prefix/s3:delimiter;
+    /// StringEquals 另支持 s3:BypassGovernanceRetention。
     Str {
         like: bool,
         key: StrKey,
         values: Vec<String>,
     },
+    /// Bool × s3:BypassGovernanceRetention。
+    Bool { expected: bool },
+    /// Numeric* × s3:ObjectLockRemainingRetentionDays。
+    Numeric { op: NumericOp, values: Vec<i64> },
 }
 
 impl Condition {
@@ -171,7 +225,14 @@ impl Condition {
                 };
                 values
                     .iter()
-                    .any(|p| if *like { glob_match(p, v) } else { p == v })
+                    .any(|p| if *like { glob_match(p, &v) } else { p == &v })
+            }
+            Condition::Bool { expected } => ctx.bypass_governance == *expected,
+            Condition::Numeric { op, values } => {
+                let Some(have) = ctx.remaining_retention_days else {
+                    return false;
+                };
+                values.iter().any(|w| op.cmp(have, *w))
             }
         }
     }
@@ -345,9 +406,13 @@ fn parse_condition(v: &Value, idx: usize) -> Result<Vec<Condition>, PolicyError>
                     let skey = match key_l.as_str() {
                         "s3:prefix" => StrKey::Prefix,
                         "s3:delimiter" => StrKey::Delimiter,
+                        "s3:bypassgovernanceretention" if op == "StringEquals" => {
+                            StrKey::BypassGovernance
+                        }
                         _ => {
                             return Err(PolicyError(format!(
-                                "Statement[{idx}] {op} 仅支持 s3:prefix/s3:delimiter,got {key}"
+                                "Statement[{idx}] {op} 仅支持 s3:prefix/s3:delimiter\
+                                 (及 StringEquals × s3:BypassGovernanceRetention),got {key}"
                             )))
                         }
                     };
@@ -357,10 +422,54 @@ fn parse_condition(v: &Value, idx: usize) -> Result<Vec<Condition>, PolicyError>
                         values: parse_string_or_array(val, "Condition")?,
                     }
                 }
+                "Bool" => {
+                    if key_l != "s3:bypassgovernanceretention" {
+                        return Err(PolicyError(format!(
+                            "Statement[{idx}] Bool 仅支持 s3:BypassGovernanceRetention,got {key}"
+                        )));
+                    }
+                    let raw = parse_string_or_array(val, "Condition")?;
+                    if raw.len() != 1 {
+                        return Err(PolicyError(format!(
+                            "Statement[{idx}] Bool 条件需要恰好一个值"
+                        )));
+                    }
+                    let expected = match raw[0].as_str() {
+                        "true" => true,
+                        "false" => false,
+                        other => {
+                            return Err(PolicyError(format!(
+                                "Statement[{idx}] Bool 值必须为 true/false,got {other}"
+                            )))
+                        }
+                    };
+                    Condition::Bool { expected }
+                }
+                op_name if NumericOp::from_name(op_name).is_some() => {
+                    if key_l != "s3:objectlockremainingretentiondays" {
+                        return Err(PolicyError(format!(
+                            "Statement[{idx}] {op} 仅支持 s3:ObjectLockRemainingRetentionDays,got {key}"
+                        )));
+                    }
+                    let values = parse_string_or_array(val, "Condition")?
+                        .iter()
+                        .map(|s| {
+                            s.parse::<i64>().map_err(|_| {
+                                PolicyError(format!(
+                                    "Statement[{idx}] Numeric 条件值必须是整数,got {s}"
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Condition::Numeric {
+                        op: NumericOp::from_name(op_name).unwrap(),
+                        values,
+                    }
+                }
                 other => {
                     return Err(PolicyError(format!(
                         "Statement[{idx}] 不支持的 Condition 操作符 {other}\
-                         (最小集:IpAddress/NotIpAddress/StringEquals/StringLike)"
+                         (最小集:IpAddress/NotIpAddress/StringEquals/StringLike/Bool/Numeric*)"
                     )))
                 }
             };
@@ -856,6 +965,75 @@ mod tests {
         .is_err());
         assert!(Policy::parse(
             r#"{"Statement":[{"Effect":"Allow","Action":"s3:*","Resource":["*"],"Bogus":1}]}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn object_lock_condition_minset() {
+        let p = Policy::parse(
+            r#"{"Statement":[
+                {"Effect":"Allow","Action":"s3:BypassGovernanceRetention","Resource":["*"],
+                 "Condition":{"Bool":{"s3:BypassGovernanceRetention":"true"},
+                              "NumericLessThan":{"s3:ObjectLockRemainingRetentionDays":"30"}}}
+            ]}"#,
+        )
+        .unwrap();
+        let ok = EvalCtx {
+            bypass_governance: true,
+            remaining_retention_days: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(
+            p.decide("BypassGovernanceRetention", "arn:aws:s3:::b/k", true, &ok),
+            Decision::Allow
+        );
+        let no_bypass = EvalCtx {
+            bypass_governance: false,
+            remaining_retention_days: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(
+            p.decide(
+                "BypassGovernanceRetention",
+                "arn:aws:s3:::b/k",
+                true,
+                &no_bypass
+            ),
+            Decision::NoMatch
+        );
+        let too_long = EvalCtx {
+            bypass_governance: true,
+            remaining_retention_days: Some(90),
+            ..Default::default()
+        };
+        assert_eq!(
+            p.decide(
+                "BypassGovernanceRetention",
+                "arn:aws:s3:::b/k",
+                true,
+                &too_long
+            ),
+            Decision::NoMatch
+        );
+        let str_eq = Policy::parse(
+            r#"{"Statement":[{"Effect":"Allow","Action":"s3:*","Resource":["*"],
+                "Condition":{"StringEquals":{"s3:BypassGovernanceRetention":"true"}}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            str_eq.decide("PutObjectRetention", "arn:aws:s3:::b/k", true, &ok),
+            Decision::Allow
+        );
+        // 未知 Numeric 键 / 未知 Bool 键仍解析失败(红线)
+        assert!(Policy::parse(
+            r#"{"Statement":[{"Effect":"Allow","Action":"s3:*","Resource":["*"],
+                "Condition":{"NumericEquals":{"s3:foo":"1"}}}]}"#
+        )
+        .is_err());
+        assert!(Policy::parse(
+            r#"{"Statement":[{"Effect":"Allow","Action":"s3:*","Resource":["*"],
+                "Condition":{"Bool":{"aws:SecureTransport":"true"}}}]}"#
         )
         .is_err());
     }

@@ -7666,6 +7666,59 @@ fn object_lock_put_headers_and_retention_apis() {
     );
 }
 
+/// M12 W3-1:有密钥策略时 GOVERNANCE 缩短必须显式 Allow
+/// `s3:BypassGovernanceRetention`;无策略密钥携带 bypass 头仍隐式放行。
+#[test]
+fn object_lock_bypass_requires_policy_action() {
+    let (_d, svc) = setup();
+    let ol = &[("object-lock", "")];
+    let ret_q = &[("retention", "")];
+    assert_eq!(status(&svc.handle(&req("PUT", "/olk", vec![]))), 200);
+    let cfg = b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>7</Days></DefaultRetention></Rule></ObjectLockConfiguration>".to_vec();
+    assert_eq!(status(&svc.handle(&req_q("PUT", "/olk", ol, cfg))), 200);
+    assert_eq!(
+        status(&svc.handle(&req("PUT", "/olk/k", b"v".to_vec()))),
+        200
+    );
+
+    let shorten = b"<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>2020-01-01T00:00:00.000Z</RetainUntilDate></Retention>".to_vec();
+    let bypass = &[("x-amz-bypass-governance-retention", "true")];
+
+    // 仅 Allow PutObjectRetention、无 Bypass 动作 → 403
+    svc.set_key_policy(
+        "test",
+        Some(
+            r#"{"Statement":[{"Effect":"Allow","Action":["s3:PutObjectRetention","s3:GetObjectRetention"],"Resource":["*"]}]}"#
+                .into(),
+        ),
+    )
+    .unwrap();
+    let r = svc.handle(&req_qh("PUT", "/olk/k", ret_q, bypass, shorten.clone()));
+    assert_eq!(err_code(&r), "AccessDenied", "{r:?}");
+
+    // 显式 Allow Bypass → 200
+    svc.set_key_policy(
+        "test",
+        Some(
+            r#"{"Statement":[{"Effect":"Allow","Action":["s3:PutObjectRetention","s3:BypassGovernanceRetention"],"Resource":["*"]}]}"#
+                .into(),
+        ),
+    )
+    .unwrap();
+    let r = svc.handle(&req_qh("PUT", "/olk/k", ret_q, bypass, shorten.clone()));
+    assert_eq!(status(&r), 200, "{r:?}");
+
+    // 重新挂保留后:无密钥策略 + bypass 头 = 隐式 s3:* 放行
+    let restore = b"<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>2030-01-01T00:00:00.000Z</RetainUntilDate></Retention>".to_vec();
+    assert_eq!(
+        status(&svc.handle(&req_q("PUT", "/olk/k", ret_q, restore))),
+        200
+    );
+    svc.set_key_policy("test", None).unwrap();
+    let r = svc.handle(&req_qh("PUT", "/olk/k", ret_q, bypass, shorten));
+    assert_eq!(status(&r), 200, "{r:?}");
+}
+
 /// K1-4:SSE-KMS 显式拒绝矩阵(钉住,不静默)——aws:kms 算法值全入口
 /// 400 InvalidEncryptionAlgorithmError;KMS 参数头族 501 NotImplemented;
 /// PutBucketEncryption 的 KMSKeyID/BucketKeyEnabled 元素 400
