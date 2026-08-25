@@ -27,6 +27,38 @@ use rocksdb::WriteBatchWithTransaction;
 use crate::keys::{audit_entry_key, parse_audit_seq, PREFIX_AUDIT};
 use crate::{encode, rocks_err, scan_prefix, MetaStore, SyncMode};
 
+/// M12 W3-2 双读:新 `AuditEntry`(尾部 lock 字段)优先,失败回退 M11
+/// 七字段形态(bypass=false, until/mode 空)。
+fn decode_audit(v: &[u8]) -> Result<AuditEntry> {
+    match postcard::from_bytes::<AuditEntry>(v) {
+        Ok(e) => Ok(e),
+        Err(_) => {
+            #[derive(serde::Deserialize)]
+            struct AuditV11 {
+                ts: u64,
+                who: String,
+                op: String,
+                bucket: String,
+                key: String,
+                status: u16,
+                peer: String,
+            }
+            let old: AuditV11 =
+                postcard::from_bytes(v).map_err(|e| Error::Corrupt(format!("audit entry: {e}")))?;
+            Ok(AuditEntry {
+                ts: old.ts,
+                who: old.who,
+                op: old.op,
+                bucket: old.bucket,
+                key: old.key,
+                status: old.status,
+                peer: old.peer,
+                ..Default::default()
+            })
+        }
+    }
+}
+
 /// `s:audit` 持久化环形(语义见模块文档)。由 fs3d 在 serve 启动时
 /// 装配:`open` → `tail` 回放灌入内存环形 → 作为 [`AuditPersist`] 注入
 /// AuditRing。
@@ -82,7 +114,7 @@ impl AuditStore {
             if !k.starts_with(PREFIX_AUDIT) {
                 break;
             }
-            out.push(crate::decode(&v).map_err(|e| Error::Corrupt(format!("audit entry: {e}")))?);
+            out.push(decode_audit(&v)?);
             if out.len() >= limit {
                 break;
             }
@@ -177,6 +209,7 @@ mod tests {
             key: key.into(),
             status: 200,
             peer: "1.2.3.4:5".into(),
+            ..Default::default()
         }
     }
 
@@ -279,5 +312,33 @@ mod tests {
         let meta = Arc::new(MetaStore::open(dir.path(), &cfg).unwrap());
         let store = AuditStore::open(meta, 100).unwrap();
         assert_eq!(store.tail(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn audit_entry_v11_dual_read() {
+        #[derive(serde::Serialize)]
+        struct AuditV11 {
+            ts: u64,
+            who: String,
+            op: String,
+            bucket: String,
+            key: String,
+            status: u16,
+            peer: String,
+        }
+        let old = AuditV11 {
+            ts: 1,
+            who: "ak".into(),
+            op: "PutObject".into(),
+            bucket: "b".into(),
+            key: "legacy".into(),
+            status: 200,
+            peer: String::new(),
+        };
+        let bytes = postcard::to_allocvec(&old).unwrap();
+        let e = decode_audit(&bytes).unwrap();
+        assert_eq!(e.key, "legacy");
+        assert!(!e.bypass);
+        assert!(e.retain_until_before.is_none());
     }
 }

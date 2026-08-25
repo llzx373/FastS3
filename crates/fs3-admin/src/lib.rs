@@ -1011,6 +1011,11 @@ impl AdminServer {
             key_prefix: q("key").filter(|v| !v.is_empty()),
             who: q("who").filter(|v| !v.is_empty()),
             status: q("status").and_then(|v| v.parse::<u16>().ok()),
+            bypass: match q("bypass").as_deref() {
+                Some(v) if v.eq_ignore_ascii_case("true") => Some(true),
+                Some(v) if v.eq_ignore_ascii_case("false") => Some(false),
+                _ => None,
+            },
         };
         let entries = self.service.audit().search(&filter);
         json::ok(serde_json::json!({"audit": entries}))

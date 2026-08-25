@@ -271,7 +271,7 @@
 
 ### W3 授权与审计(≈1 pw)
 - [x] W3-1 策略引擎 Condition 最小集(§5.3 DL7)+ `x-amz-bypass-governance-retention` 校验
-- [ ] W3-2 bypass/保留变更强制审计(含保留前后值);审计检索扩展
+- [x] W3-2 bypass/保留变更强制审计(含保留前后值);审计检索扩展
 
 ### W4 交互面(≈1 pw)
 - [ ] W4-1 生命周期/压缩/再平衡 worker 锁感知(跳过锁定对象 + skipped_locked 指标,接通 M11 L4-1)

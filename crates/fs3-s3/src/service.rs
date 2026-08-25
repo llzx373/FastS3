@@ -128,6 +128,8 @@ pub struct S3Service {
     audit: Arc<fs3_core::audit::AuditRing>,
     /// 客户端地址(最近一次请求;审计用)。每请求更新,低精度可接受。
     last_peer: std::sync::Mutex<String>,
+    /// M12 W3-2:本请求 Object Lock 审计细节(handle 收割进 AuditEntry)。
+    last_lock_audit: std::sync::Mutex<Option<LockAuditNote>>,
     /// 每密钥限速(H4;rps=0 关闭)。热重载可动态调整。
     limiter: Arc<crate::ratelimit::KeyLimiter>,
     /// 上次请求时的墙钟秒(M4 D4 时钟回拨检测;0 = 未初始化)。
@@ -140,6 +142,15 @@ pub struct S3Service {
     /// 失效,CreateBucket/DeleteBucket 同步失效(防删桶重建后陈旧策略复活)。
     bucket_policies:
         std::sync::Mutex<std::collections::HashMap<String, Option<crate::policy::Policy>>>,
+}
+
+/// M12 W3-2:单请求 Object Lock 审计暂存(成功路径写入,handle 收割)。
+struct LockAuditNote {
+    bypass: bool,
+    retain_until_before: Option<i64>,
+    retain_until_after: Option<i64>,
+    retention_mode_before: Option<String>,
+    retention_mode_after: Option<String>,
 }
 
 fn header<'a>(req: &'a S3Request, name: &str) -> Option<&'a str> {
@@ -191,6 +202,7 @@ impl S3Service {
             metrics,
             audit,
             last_peer: std::sync::Mutex::new(String::new()),
+            last_lock_audit: std::sync::Mutex::new(None),
             limiter: Arc::new(crate::ratelimit::KeyLimiter::new()),
             policies: std::sync::Mutex::new(std::collections::HashMap::new()),
             bucket_policies: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -246,17 +258,47 @@ impl S3Service {
         &self.audit
     }
 
-    /// 记录审计条目(S3 操作 who/what/when/result)。
+    /// 记录审计条目(S3 操作 who/what/when/result;W3-2 收割 lock 前后值)。
     fn audit_record(&self, access: Option<&str>, op: &str, bucket: &str, key: &str, status: u16) {
         let peer = self.last_peer.lock().unwrap().clone();
-        self.audit.push(
-            access.unwrap_or("anonymous"),
-            op,
-            bucket,
-            key,
+        let lock = self.last_lock_audit.lock().unwrap().take();
+        let mut entry = fs3_core::audit::AuditEntry {
+            ts: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            who: access.unwrap_or("anonymous").to_string(),
+            op: op.to_string(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
             status,
-            &peer,
-        );
+            peer,
+            ..Default::default()
+        };
+        if let Some(n) = lock {
+            entry.bypass = n.bypass;
+            entry.retain_until_before = n.retain_until_before;
+            entry.retain_until_after = n.retain_until_after;
+            entry.retention_mode_before = n.retention_mode_before;
+            entry.retention_mode_after = n.retention_mode_after;
+        }
+        self.audit.push_entry(entry);
+    }
+
+    /// 成功路径记下 Object Lock 审计(handle 的 audit_record 收割)。
+    fn note_lock_audit(
+        &self,
+        before: Option<&fs3_core::Retention>,
+        after: Option<&fs3_core::Retention>,
+        bypass: bool,
+    ) {
+        *self.last_lock_audit.lock().unwrap() = Some(LockAuditNote {
+            bypass,
+            retain_until_before: before.map(|r| r.retain_until),
+            retain_until_after: after.map(|r| r.retain_until),
+            retention_mode_before: before.map(|r| crate::object_lock::mode_name(r.mode).into()),
+            retention_mode_after: after.map(|r| crate::object_lock::mode_name(r.mode).into()),
+        });
     }
 
     /// 设置客户端地址(HTTP 层每连接调用;审计用)。
@@ -3107,8 +3149,13 @@ impl S3Service {
             crate::object_lock::bypass_governance(&req.headers),
         )?;
         engine
-            .set_object_retention(bucket, key, vk.as_ref(), Some(retention))
+            .set_object_retention(bucket, key, vk.as_ref(), Some(retention.clone()))
             .map_err(|e| self.tagging_op_error(e, bucket, key, version_id))?;
+        self.note_lock_audit(
+            cur.retention.as_ref(),
+            Some(&retention),
+            crate::object_lock::bypass_governance(&req.headers),
+        );
         Ok(ServiceResponse {
             status: 200,
             headers: vec![],
@@ -5153,15 +5200,17 @@ impl S3Service {
             p.check_delete(target.as_ref())
                 .map_err(|e| map_engine_error(e, bucket, key))?;
         }
+        let bypass = crate::object_lock::bypass_governance(&req.headers);
         let deleted = engine
-            .delete_version_with_lock(
-                bucket,
-                key,
-                vk,
-                bkt.versioning,
-                crate::object_lock::bypass_governance(&req.headers),
-            )
+            .delete_version_with_lock(bucket, key, vk, bkt.versioning, bypass)
             .map_err(|e| map_engine_error(e, bucket, key))?;
+        if version_id.is_some() {
+            if let Some(m) = deleted.as_ref() {
+                if bypass || m.retention.is_some() {
+                    self.note_lock_audit(m.retention.as_ref(), None, bypass);
+                }
+            }
+        }
         let mut headers: Vec<(String, String)> = Vec::new();
         match (&version_id, &deleted) {
             // 版本定向删除:回显 VersionId;删掉的是删除标记 → 补
@@ -5316,6 +5365,14 @@ impl S3Service {
                 crate::object_lock::bypass_governance(&req.headers),
             ) {
                 Ok(d) => {
+                    let bypass = crate::object_lock::bypass_governance(&req.headers);
+                    if varg.is_some() {
+                        if let Some(m) = d.as_ref() {
+                            if bypass || m.retention.is_some() {
+                                self.note_lock_audit(m.retention.as_ref(), None, bypass);
+                            }
+                        }
+                    }
                     let mut de = xml::DeletedEntry {
                         key: key.to_string(),
                         version_id: entry.version_id.clone(),

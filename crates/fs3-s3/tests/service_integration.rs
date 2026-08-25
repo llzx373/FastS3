@@ -7860,6 +7860,85 @@ fn object_lock_enforcement_matrix() {
     assert_eq!(err_code(&r), "BucketNotEmpty", "{r:?}");
 }
 
+/// M12 W3-2:bypass 成功与保留变更必须落审计(until/mode 前后值);
+/// 403 不落成功审计字段。
+#[test]
+fn object_lock_audit_bypass_and_retention() {
+    let (_d, svc) = setup();
+    let ol = &[("object-lock", "")];
+    let ret_q = &[("retention", "")];
+    let bypass = &[("x-amz-bypass-governance-retention", "true")];
+    assert_eq!(status(&svc.handle(&req("PUT", "/olk", vec![]))), 200);
+    let cfg = b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>".to_vec();
+    assert_eq!(status(&svc.handle(&req_q("PUT", "/olk", ol, cfg))), 200);
+    let until = "2030-01-01T00:00:00.000Z";
+    let put = svc
+        .handle(&req_h(
+            "PUT",
+            "/olk/k",
+            &[
+                ("x-amz-object-lock-mode", "GOVERNANCE"),
+                ("x-amz-object-lock-retain-until-date", until),
+            ],
+            b"v".to_vec(),
+        ))
+        .unwrap();
+    let vid = hdr(&put, "x-amz-version-id").unwrap();
+
+    let longer = b"<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>2031-01-01T00:00:00.000Z</RetainUntilDate></Retention>".to_vec();
+    assert_eq!(
+        status(&svc.handle(&req_q("PUT", "/olk/k", ret_q, longer))),
+        200
+    );
+    let hits = svc.audit().search(&fs3_core::audit::AuditFilter {
+        op: Some("PutObjectRetention".into()),
+        status: Some(200),
+        ..Default::default()
+    });
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].retention_mode_before.as_deref(), Some("GOVERNANCE"));
+    assert_eq!(hits[0].retention_mode_after.as_deref(), Some("GOVERNANCE"));
+    assert!(hits[0].retain_until_before.is_some());
+    assert!(hits[0].retain_until_after.is_some());
+    assert!(
+        hits[0].retain_until_after.unwrap() > hits[0].retain_until_before.unwrap(),
+        "{hits:?}"
+    );
+    assert!(!hits[0].bypass);
+
+    let shorter = b"<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>2020-01-01T00:00:00.000Z</RetainUntilDate></Retention>".to_vec();
+    assert_eq!(
+        status(&svc.handle(&req_qh("PUT", "/olk/k", ret_q, bypass, shorter))),
+        200
+    );
+    let hits = svc.audit().search(&fs3_core::audit::AuditFilter {
+        op: Some("PutObjectRetention".into()),
+        bypass: Some(true),
+        ..Default::default()
+    });
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert!(hits[0].bypass);
+    assert!(hits[0].retain_until_after.unwrap() < hits[0].retain_until_before.unwrap());
+
+    let r = svc.handle(&req_qh(
+        "DELETE",
+        "/olk/k",
+        &[("versionId", vid.as_str())],
+        bypass,
+        vec![],
+    ));
+    assert_eq!(status(&r), 204, "{r:?}");
+    let hits = svc.audit().search(&fs3_core::audit::AuditFilter {
+        op: Some("DeleteObject".into()),
+        bypass: Some(true),
+        ..Default::default()
+    });
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].key, "k");
+    assert_eq!(hits[0].retention_mode_before.as_deref(), Some("GOVERNANCE"));
+    assert!(hits[0].retain_until_after.is_none());
+}
+
 /// K1-4:SSE-KMS 显式拒绝矩阵(钉住,不静默)——aws:kms 算法值全入口
 /// 400 InvalidEncryptionAlgorithmError;KMS 参数头族 501 NotImplemented;
 /// PutBucketEncryption 的 KMSKeyID/BucketKeyEnabled 元素 400

@@ -56,6 +56,11 @@ export interface AuditEntry {
   key: string;
   status: number;
   peer: string;
+  bypass?: boolean;
+  retain_until_before?: number | null;
+  retain_until_after?: number | null;
+  retention_mode_before?: string | null;
+  retention_mode_after?: string | null;
 }
 
 export interface UploadInfo {
@@ -117,6 +122,8 @@ export interface AuditFilters {
   key?: string;
   who?: string;
   status?: number;
+  /** M12 W3-2:仅 GOVERNANCE bypass 成功审计 */
+  bypass?: boolean;
 }
 
 export interface BootstrapInfo {
@@ -396,6 +403,8 @@ export const api = {
     if (opts.key) q.set("key", opts.key);
     if (opts.who) q.set("who", opts.who);
     if (opts.status !== undefined) q.set("status", String(Math.floor(opts.status)));
+    if (opts.bypass === true) q.set("bypass", "true");
+    if (opts.bypass === false) q.set("bypass", "false");
     return request<{ audit: AuditEntry[] }>("GET", `/api/audit?${q}`);
   },
 

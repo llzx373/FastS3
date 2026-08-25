@@ -21,7 +21,7 @@ use crate::Result;
 pub const DEFAULT_CAP: usize = 4096;
 
 /// 审计条目。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct AuditEntry {
     /// unix 秒(when)。
     pub ts: u64,
@@ -37,6 +37,19 @@ pub struct AuditEntry {
     pub status: u16,
     /// 客户端地址(ip:port;可空)。
     pub peer: String,
+    /// M12 W3-2:本条是否 GOVERNANCE bypass 成功路径。
+    #[serde(default)]
+    pub bypass: bool,
+    /// 变更前 retain-until(unix 秒;删除成功则 after 为空)。
+    #[serde(default)]
+    pub retain_until_before: Option<i64>,
+    #[serde(default)]
+    pub retain_until_after: Option<i64>,
+    /// 变更前/后保留模式(`GOVERNANCE` / `COMPLIANCE`)。
+    #[serde(default)]
+    pub retention_mode_before: Option<String>,
+    #[serde(default)]
+    pub retention_mode_after: Option<String>,
 }
 
 /// 审计持久化后端(M11 L3-1;ADR-12 DL5)。实现 = fs3-meta `s:audit` 环形
@@ -81,6 +94,8 @@ pub struct AuditFilter {
     pub who: Option<String>,
     /// HTTP 状态码精确匹配。
     pub status: Option<u16>,
+    /// M12 W3-2:仅 bypass 成功审计(`true`)或非 bypass 条目(`false`)。
+    pub bypass: Option<bool>,
 }
 
 impl AuditFilter {
@@ -118,6 +133,11 @@ impl AuditFilter {
         }
         if let Some(s) = self.status {
             if e.status != s {
+                return false;
+            }
+        }
+        if let Some(b) = self.bypass {
+            if e.bypass != b {
                 return false;
             }
         }
@@ -161,26 +181,29 @@ impl AuditRing {
     /// 小值,前台延迟无感——取舍写死:同步小写 + 批量截断,不批量刷盘,
     /// 换来「重启连续性无需刷盘排程」的最简实现)。
     pub fn push(&self, who: &str, op: &str, bucket: &str, key: &str, status: u16, peer: &str) {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let entry = AuditEntry {
-            ts,
+        self.push_entry(AuditEntry {
+            ts: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
             who: who.to_string(),
             op: op.to_string(),
             bucket: bucket.to_string(),
             key: key.to_string(),
             status,
             peer: peer.to_string(),
-        };
+            ..Default::default()
+        });
+    }
+
+    /// 追加完整条目(M12 W3-2:带 Object Lock 前后值)。
+    pub fn push_entry(&self, entry: AuditEntry) {
         let mut buf = self.buf.lock().unwrap();
         if buf.len() >= self.cap {
             buf.pop_front();
         }
         buf.push_back(entry);
         if let Some(p) = &self.persist {
-            // 红线:审计写失败不得让请求失败——warn 降级,内存环形不受影响
             if let Err(e) = p.append(buf.back().unwrap()) {
                 tracing::warn!("audit persist failed (entry kept in memory ring): {e}");
             }
@@ -252,6 +275,7 @@ mod tests {
             key: key.into(),
             status: 200,
             peer: String::new(),
+            ..Default::default()
         }
     }
 
@@ -325,6 +349,28 @@ mod tests {
             ..Default::default()
         };
         assert!(ring.search(&f).is_empty());
+        // M12 W3-2:bypass 过滤
+        ring.push_entry(AuditEntry {
+            ts: now as u64,
+            who: "ak1".into(),
+            op: "DeleteObject".into(),
+            bucket: "b1".into(),
+            key: "locked".into(),
+            status: 204,
+            peer: String::new(),
+            bypass: true,
+            retain_until_before: Some(1_800_000_000),
+            retain_until_after: None,
+            retention_mode_before: Some("GOVERNANCE".into()),
+            retention_mode_after: None,
+        });
+        let f = AuditFilter {
+            bypass: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(ring.search(&f).len(), 1);
+        assert_eq!(ring.search(&f)[0].key, "locked");
+        assert_eq!(ring.search(&f)[0].retain_until_before, Some(1_800_000_000));
     }
 
     // ── M11 L3-1:可选持久化 ──
