@@ -511,6 +511,12 @@ impl Allocator {
         self.total_free.load(Ordering::Relaxed)
     }
 
+    /// 区间位图并入(M13 M1-2 每设备检查点恢复:本地位 i ↔ 全局位 base+i;
+    /// 随后由 a: 重放补齐重放窗口内的位)。
+    pub fn absorb_range_bitmap(&self, bytes: &[u8], base: u64) {
+        self.bitmap.load_range(bytes, base);
+    }
+
     /// 恢复 total_alloc/total_free(来自检查点)。
     pub fn restore_stats(&self, total_alloc: u64, total_free: u64) {
         self.total_alloc.store(total_alloc, Ordering::Relaxed);
@@ -525,6 +531,19 @@ impl Allocator {
             total_alloc: self.total_alloc(),
             total_free: self.total_free(),
             bitmap: self.bitmap.serialize(),
+        }
+    }
+
+    /// 构造**区间**检查点数据(M13 M1-2 每设备检查点:ADR-15 DM3;位图
+    /// 只含 [start, start+count) 的位,统计为该区间内的置位数/空位数)。
+    pub fn checkpoint_data_range(&self, seq: u64, start: u64, count: u64) -> CheckpointData {
+        let allocated = self.bitmap.count_ones_range(start, count);
+        CheckpointData {
+            generation: 0,
+            seq,
+            total_alloc: allocated,
+            total_free: count - allocated,
+            bitmap: self.bitmap.serialize_range(start, count),
         }
     }
 

@@ -91,7 +91,7 @@ pub fn run(cfg: &fs3_engine::EngineConfig, args: BenchArgs) -> Result<()> {
         }
     };
     // 用已初始化设备的布局信息:数据区偏移
-    let dev = ImageFile::open(&cfg.device, false)?;
+    let dev = ImageFile::open(&cfg.devices[0], false)?;
     let sb = fs3_device::read_superblock(&dev)?;
     let data_start = sb.data_start;
     let data_len = sb.data_end - sb.data_start;
@@ -104,7 +104,7 @@ pub fn run(cfg: &fs3_engine::EngineConfig, args: BenchArgs) -> Result<()> {
         stop2.store(true, Ordering::SeqCst);
     });
 
-    let device_path = cfg.device.clone();
+    let device_path = cfg.devices[0].clone();
     let io_opts = fs3_engine::io::IoUringOptions {
         iopoll: args.iopoll,
         coop_taskrun: args.coop_taskrun,

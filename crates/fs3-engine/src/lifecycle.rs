@@ -959,7 +959,7 @@ mod tests {
             .unwrap();
         fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
         let cfg = crate::EngineConfig {
-            device: img,
+            devices: vec![img],
             meta_dir: dir.path().join("meta"),
             compaction: crate::CompactionConfig {
                 enabled: false,

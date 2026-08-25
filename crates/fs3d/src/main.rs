@@ -220,8 +220,12 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
     };
     let storage = cfg.storage.clone();
 
-    // 命令行覆盖配置
-    let device = cli.device.clone().or(storage.devices.first().cloned());
+    // 命令行覆盖配置:M13 M1-2 起支持多设备池(--device 单盘优先,
+    // 否则整表传入;池内设备序 = s:pool 清单序,见 Engine::open)
+    let devices: Vec<std::path::PathBuf> = match cli.device.clone() {
+        Some(d) => vec![d],
+        None => storage.devices.clone(),
+    };
     let meta_dir = cli.meta_dir.clone().or(storage.meta_dir);
     let sync_mode = match cli.sync_mode.as_deref().or(storage.sync_mode.as_deref()) {
         Some("group") | None => SyncMode::Group,
@@ -250,7 +254,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
         ),
         Cmd::MetaExport(args) => {
             let engine_cfg = engine_config(
-                device,
+                devices.clone(),
                 meta_dir,
                 sync_mode,
                 cli.group_commit_ms.or(storage.group_commit_ms),
@@ -259,11 +263,11 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 etag_mode,
                 clock_offset_secs,
             )?;
-            meta::run_meta_export(&engine_cfg.device, &engine_cfg.meta_dir, &args)
+            meta::run_meta_export(&engine_cfg.devices[0], &engine_cfg.meta_dir, &args)
         }
         Cmd::MetaImport(args) => {
             let engine_cfg = engine_config(
-                device,
+                devices.clone(),
                 meta_dir,
                 sync_mode,
                 cli.group_commit_ms.or(storage.group_commit_ms),
@@ -272,13 +276,13 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 etag_mode,
                 clock_offset_secs,
             )?;
-            meta::run_meta_import(&engine_cfg.device, &engine_cfg.meta_dir, &args)
+            meta::run_meta_import(&engine_cfg.devices[0], &engine_cfg.meta_dir, &args)
         }
         Cmd::RewriteValues(args) => {
             // 只触碰元数据(不读写设备数据区);--device 仍需解析以定位
             // meta_dir 默认值(与 meta-export 同一配置路径)
             let engine_cfg = engine_config(
-                device,
+                devices.clone(),
                 meta_dir,
                 sync_mode,
                 cli.group_commit_ms.or(storage.group_commit_ms),
@@ -307,7 +311,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
         }
         Cmd::Put { bucket, key, file } => {
             let engine_cfg = engine_config(
-                device,
+                devices.clone(),
                 meta_dir,
                 sync_mode,
                 cli.group_commit_ms.or(storage.group_commit_ms),
@@ -325,7 +329,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
             range,
         } => {
             let engine_cfg = engine_config(
-                device,
+                devices.clone(),
                 meta_dir,
                 sync_mode,
                 cli.group_commit_ms.or(storage.group_commit_ms),
@@ -338,7 +342,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
         }
         Cmd::Del { bucket, key } => {
             let engine_cfg = engine_config(
-                device,
+                devices.clone(),
                 meta_dir,
                 sync_mode,
                 cli.group_commit_ms.or(storage.group_commit_ms),
@@ -351,7 +355,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
         }
         Cmd::Ls { bucket, prefix } => {
             let engine_cfg = engine_config(
-                device,
+                devices.clone(),
                 meta_dir,
                 sync_mode,
                 cli.group_commit_ms.or(storage.group_commit_ms),
@@ -364,7 +368,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
         }
         Cmd::Check { fix } => {
             let engine_cfg = engine_config(
-                device,
+                devices.clone(),
                 meta_dir,
                 sync_mode,
                 cli.group_commit_ms.or(storage.group_commit_ms),
@@ -381,7 +385,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
         }
         Cmd::Compact { rounds } => {
             let engine_cfg = engine_config(
-                device,
+                devices.clone(),
                 meta_dir,
                 sync_mode,
                 cli.group_commit_ms.or(storage.group_commit_ms),
@@ -394,7 +398,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
         }
         Cmd::Checkpoint {} => {
             let engine_cfg = engine_config(
-                device,
+                devices.clone(),
                 meta_dir,
                 sync_mode,
                 cli.group_commit_ms.or(storage.group_commit_ms),
@@ -418,7 +422,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
         }
         Cmd::Bench(args) => {
             let engine_cfg = engine_config(
-                device,
+                devices.clone(),
                 meta_dir,
                 sync_mode,
                 cli.group_commit_ms.or(storage.group_commit_ms),
@@ -434,7 +438,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
         Cmd::Loadgen(args) => loadgen::run(&args),
         Cmd::StressInsert(args) => {
             let engine_cfg = engine_config(
-                device,
+                devices.clone(),
                 meta_dir,
                 sync_mode,
                 cli.group_commit_ms.or(storage.group_commit_ms),
@@ -457,7 +461,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
             drain_secs,
         } => {
             let engine_cfg = engine_config(
-                device,
+                devices.clone(),
                 meta_dir,
                 sync_mode,
                 cli.group_commit_ms.or(storage.group_commit_ms),
@@ -829,7 +833,7 @@ pub(crate) fn engine_config_inner(
     meta_dir: &Path,
 ) -> fs3_core::Result<EngineConfig> {
     Ok(EngineConfig {
-        device: device.to_path_buf(),
+        devices: vec![device.to_path_buf()],
         meta_dir: meta_dir.to_path_buf(),
         debug_io: None,
         sync_mode: fs3_meta::SyncMode::Group,
@@ -850,7 +854,7 @@ pub(crate) fn engine_config_inner(
 
 #[allow(clippy::too_many_arguments)] // 配置聚合函数;调用点逐一传 CLI/配置值
 fn engine_config(
-    device: Option<PathBuf>,
+    devices: Vec<PathBuf>,
     meta_dir: Option<PathBuf>,
     sync_mode: SyncMode,
     group_commit_ms: Option<u64>,
@@ -859,19 +863,19 @@ fn engine_config(
     etag_mode: fs3_core::EtagMode,
     clock_offset_secs: i64,
 ) -> fs3_core::Result<EngineConfig> {
-    let device = device.ok_or_else(|| {
+    let first_device = devices.first().ok_or_else(|| {
         fs3_core::Error::InvalidArgument(
             "missing device (--device or config storage.devices)".into(),
         )
     })?;
     let meta_dir = meta_dir.unwrap_or_else(|| {
-        device
+        first_device
             .parent()
             .map(|p| p.join("meta"))
             .unwrap_or_else(|| PathBuf::from("meta"))
     });
     Ok(EngineConfig {
-        device,
+        devices,
         meta_dir,
         debug_io: None,
         sync_mode,

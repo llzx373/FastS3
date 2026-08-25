@@ -532,7 +532,7 @@ mod tests {
         );
         // 设备仍可正常打开
         let cfg = fs3_engine::EngineConfig {
-            device: p.clone(),
+            devices: vec![p.clone()],
             meta_dir: meta.clone(),
             ..Default::default()
         };

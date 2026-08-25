@@ -111,7 +111,7 @@ fn http_unix(
 fn admin_status_metrics_and_auth() {
     let (_d, img) = setup();
     let cfg = EngineConfig {
-        device: img.clone(),
+        devices: vec![img.clone()],
         meta_dir: img.parent().unwrap().join("meta"),
         ..Default::default()
     };
@@ -171,7 +171,7 @@ fn admin_status_metrics_and_auth() {
 fn admin_buckets_crud_and_quota() {
     let (_d, img) = setup();
     let cfg = EngineConfig {
-        device: img.clone(),
+        devices: vec![img.clone()],
         meta_dir: img.parent().unwrap().join("meta"),
         ..Default::default()
     };
@@ -237,7 +237,7 @@ fn admin_buckets_crud_and_quota() {
 fn admin_keys_crud_secret_once() {
     let (_d, img) = setup();
     let cfg = EngineConfig {
-        device: img.clone(),
+        devices: vec![img.clone()],
         meta_dir: img.parent().unwrap().join("meta"),
         ..Default::default()
     };
@@ -285,7 +285,7 @@ fn admin_keys_crud_secret_once() {
 fn admin_repair_endpoint() {
     let (_d, img) = setup();
     let cfg = EngineConfig {
-        device: img.clone(),
+        devices: vec![img.clone()],
         meta_dir: img.parent().unwrap().join("meta"),
         ..Default::default()
     };
@@ -306,7 +306,7 @@ fn admin_repair_endpoint() {
 fn runtime_key_authenticates_s3() {
     let (_d, img) = setup();
     let cfg = EngineConfig {
-        device: img.clone(),
+        devices: vec![img.clone()],
         meta_dir: img.parent().unwrap().join("meta"),
         ..Default::default()
     };
@@ -351,7 +351,7 @@ fn runtime_key_authenticates_s3() {
 fn sse_rotate_and_status() {
     let (_d, img) = setup();
     let cfg = EngineConfig {
-        device: img.clone(),
+        devices: vec![img.clone()],
         meta_dir: img.parent().unwrap().join("meta"),
         ..Default::default()
     };
@@ -490,7 +490,7 @@ fn admin_metrics_lifecycle_counters() {
 
     let (_d, img) = setup();
     let cfg = EngineConfig {
-        device: img.clone(),
+        devices: vec![img.clone()],
         meta_dir: img.parent().unwrap().join("meta"),
         ..Default::default()
     };
@@ -569,7 +569,7 @@ fn audit_lifecycle_visible_after_restart() {
 
     let (_d, img) = setup();
     let cfg = EngineConfig {
-        device: img.clone(),
+        devices: vec![img.clone()],
         meta_dir: img.parent().unwrap().join("meta"),
         ..Default::default()
     };

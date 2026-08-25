@@ -430,7 +430,7 @@ fn serve_network_and_loadgen_smoke() {
     fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
     let engine = std::sync::Arc::new(parking_lot::RwLock::new(
         fs3_engine::Engine::open(&fs3_engine::EngineConfig {
-            device: img,
+            devices: vec![img],
             meta_dir: dir.path().join("m"),
             ..Default::default()
         })

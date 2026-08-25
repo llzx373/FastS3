@@ -122,9 +122,9 @@ impl PoolManifest {
                     "device {i} weight must be > 0"
                 )));
             }
-            total = total.checked_add(d.extent_count).ok_or_else(|| {
-                Error::InvalidArgument("pool extent count overflow".into())
-            })?;
+            total = total
+                .checked_add(d.extent_count)
+                .ok_or_else(|| Error::InvalidArgument("pool extent count overflow".into()))?;
         }
         if total > u32::MAX as u64 {
             return Err(Error::InvalidArgument(format!(

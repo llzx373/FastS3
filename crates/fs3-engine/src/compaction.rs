@@ -34,6 +34,7 @@ use fs3_meta::{AllocDraft, MetaStore};
 
 use crate::io::{read_exact, write_all, IoEngine};
 use crate::worker::{BackgroundWorker, BatchOutcome, Throttle};
+use crate::PoolDevices;
 
 /// 压缩配置(ADR-9 §6.4 节流;默认值按 §6.4)。
 #[derive(Debug, Clone)]
@@ -100,8 +101,8 @@ pub struct Compactor {
     meta: Arc<MetaStore>,
     alloc: Arc<Allocator>,
     io: Arc<Mutex<Box<dyn IoEngine>>>,
-    dev_fd: i32,
-    sb: fs3_core::SuperBlock,
+    /// 池设备表(M13 M1-2:源/目标段按全局 extent id 解析所属设备)。
+    devices: PoolDevices,
     cfg: CompactionConfig,
     /// 串行化批量执行(后台 worker 与前台 compact_once 互斥)。
     running: Mutex<()>,
@@ -111,21 +112,31 @@ pub struct Compactor {
     recent: Mutex<Vec<u64>>,
 }
 
+/// 全局 extent id → (设备序, 本地 id) 推导(ADR-15 DM1';与 Engine 同表)。
+fn resolve_extent(devices: &PoolDevices, extent_id: u64) -> (usize, u64) {
+    let mut base = 0u64;
+    for (di, slot) in devices.iter().enumerate() {
+        if extent_id < base + slot.extent_count {
+            return (di, extent_id - base);
+        }
+        base += slot.extent_count;
+    }
+    (devices.len() - 1, extent_id - base)
+}
+
 impl Compactor {
-    pub fn new(
+    pub(crate) fn new(
         meta: Arc<MetaStore>,
         alloc: Arc<Allocator>,
         io: Arc<Mutex<Box<dyn IoEngine>>>,
-        dev_fd: i32,
-        sb: fs3_core::SuperBlock,
+        devices: PoolDevices,
         cfg: CompactionConfig,
     ) -> Self {
         Compactor {
             meta,
             alloc,
             io,
-            dev_fd,
-            sb,
+            devices,
             cfg,
             running: Mutex::new(()),
             recent: Mutex::new(Vec::new()),
@@ -142,7 +153,7 @@ impl Compactor {
             Ok(g) => g,
             Err(_) => return Ok(CompactionReport::default()), // 已有批次在跑
         };
-        let capacity = self.sb.extent_capacity();
+        let capacity = self.devices[0].extent_capacity();
         let candidates = self
             .alloc
             .compaction_candidates(self.cfg.threshold, self.cfg.top_k, capacity)
@@ -377,11 +388,11 @@ impl Compactor {
     /// 拷贝一个活段到压缩 extent:`(eid, wm)` 处;返回新段(带 64KiB 网格 CRC,
     /// 网格对齐新段起点,ADR-9 §4.3)。
     fn copy_segment(&self, eid: u32, wm: &mut u32, old: &Segment) -> Result<Segment> {
-        let capacity = self.sb.extent_capacity();
-        let src_base = self.sb.data_start
-            + old.extent_id as u64 * self.sb.extent_size
-            + fs3_core::EXTENT_HEADER_SIZE
-            + old.offset as u64;
+        let capacity = self.devices[0].extent_capacity();
+        let (src_di, _) = resolve_extent(&self.devices, old.extent_id as u64);
+        let src_slot = &self.devices[src_di];
+        let src_base =
+            src_slot.data_offset(old.extent_id as u64 - src_slot.base) + old.offset as u64;
         let mut crcs: Vec<u32> = Vec::new();
         let mut partial: u32 = 0;
         let mut partial_len: usize = 0;
@@ -393,7 +404,12 @@ impl Compactor {
             let mut buf = AlignedBuffer::new(read_len)?;
             {
                 let mut io = self.io.lock().unwrap();
-                read_exact(&mut **io, self.dev_fd, buf.as_mut_slice(), src_base + done)?;
+                read_exact(
+                    &mut **io,
+                    src_slot.dev.raw_fd(),
+                    buf.as_mut_slice(),
+                    src_base + done,
+                )?;
             }
             let data = &buf.as_slice()[..chunk_len];
             partial = crc32c(data, partial);
@@ -407,14 +423,17 @@ impl Compactor {
             if read_len > chunk_len {
                 buf.as_mut_slice()[chunk_len..read_len].fill(0);
             }
-            let dst_off = self.sb.data_start
-                + eid as u64 * self.sb.extent_size
-                + fs3_core::EXTENT_HEADER_SIZE
-                + *wm as u64
-                + done;
+            let (dst_di, dst_local) = resolve_extent(&self.devices, eid as u64);
+            let dst_slot = &self.devices[dst_di];
+            let dst_off = dst_slot.data_offset(dst_local) + *wm as u64 + done;
             {
                 let mut io = self.io.lock().unwrap();
-                write_all(&mut **io, self.dev_fd, &buf.as_slice()[..read_len], dst_off)?;
+                write_all(
+                    &mut **io,
+                    dst_slot.dev.raw_fd(),
+                    &buf.as_slice()[..read_len],
+                    dst_off,
+                )?;
             }
             done += chunk_len as u64;
         }
@@ -441,9 +460,11 @@ impl Compactor {
         };
         let mut hbuf = AlignedBuffer::new(SECTOR_SIZE as usize)?;
         hbuf.as_mut_slice().copy_from_slice(&header.encode());
-        let off = self.sb.data_start + extent_id as u64 * self.sb.extent_size;
+        let (di, local) = resolve_extent(&self.devices, extent_id as u64);
+        let slot = &self.devices[di];
+        let off = slot.header_offset(local);
         let mut io = self.io.lock().unwrap();
-        write_all(&mut **io, self.dev_fd, hbuf.as_slice(), off)?;
+        write_all(&mut **io, slot.dev.raw_fd(), hbuf.as_slice(), off)?;
         Ok(())
     }
 }
@@ -496,7 +517,7 @@ mod tests {
             .unwrap();
         fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
         let cfg = crate::EngineConfig {
-            device: img,
+            devices: vec![img],
             meta_dir: dir.path().join("meta"),
             compaction: CompactionConfig {
                 enabled: false,
@@ -553,7 +574,7 @@ mod tests {
             .unwrap();
         fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
         let cfg = crate::EngineConfig {
-            device: img,
+            devices: vec![img],
             meta_dir: dir.path().join("meta"),
             compaction: CompactionConfig {
                 enabled: false,
@@ -596,7 +617,7 @@ mod tests {
             .unwrap();
         fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
         let cfg = crate::EngineConfig {
-            device: img,
+            devices: vec![img],
             meta_dir: dir.path().join("meta"),
             compaction: CompactionConfig {
                 enabled: false,
@@ -657,7 +678,7 @@ mod tests {
             .unwrap();
         fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
         let cfg = crate::EngineConfig {
-            device: img,
+            devices: vec![img],
             meta_dir: dir.path().join("meta"),
             compaction: CompactionConfig {
                 enabled: false,
@@ -701,7 +722,7 @@ mod tests {
             .unwrap();
         fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
         let cfg = crate::EngineConfig {
-            device: img,
+            devices: vec![img],
             meta_dir: dir.path().join("meta"),
             compaction: CompactionConfig {
                 enabled: false,
@@ -753,7 +774,7 @@ mod tests {
             .unwrap();
         fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
         let cfg = crate::EngineConfig {
-            device: img,
+            devices: vec![img],
             meta_dir: dir.path().join("meta"),
             compaction: CompactionConfig {
                 enabled: false,
@@ -799,7 +820,7 @@ mod tests {
             .unwrap();
         fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
         let cfg = crate::EngineConfig {
-            device: img,
+            devices: vec![img],
             meta_dir: dir.path().join("meta"),
             compaction: CompactionConfig {
                 enabled: false,
@@ -898,7 +919,7 @@ mod tests {
             .unwrap();
         fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
         let cfg = crate::EngineConfig {
-            device: img,
+            devices: vec![img],
             meta_dir: dir.path().join("meta"),
             compaction: CompactionConfig {
                 enabled: false,
@@ -921,7 +942,7 @@ mod tests {
             e.delete("b1", "k0").unwrap(); // seal-on-delete + 候选(活段 1MiB)
                                            // 手动阶段 2:分配压缩 extent + 拷贝分片数据,但不提交迁移事务
             let compactor = e.compactor().unwrap();
-            let capacity = compactor.sb.extent_capacity();
+            let capacity = compactor.devices[0].extent_capacity();
             let candidates = compactor.alloc.compaction_candidates(0.5, 64, capacity);
             assert_eq!(candidates, vec![0], "extent 0 必须是唯一候选");
             let mut rd = Staged::default();

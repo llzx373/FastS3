@@ -9,7 +9,7 @@ use std::path::Path;
 
 fn test_cfg(dev: &Path, meta_dir: &Path) -> EngineConfig {
     EngineConfig {
-        device: dev.to_path_buf(),
+        devices: vec![dev.to_path_buf()],
         meta_dir: meta_dir.to_path_buf(),
         // 单元测试默认关后台压缩(确定性);压缩专项测试自行开启/前台调用
         compaction: CompactionConfig {
@@ -36,6 +36,65 @@ fn open_engine(cfg: &EngineConfig) -> Engine {
     let mut e = Engine::open(cfg).unwrap();
     e.ensure_bucket("b1").unwrap();
     e
+}
+
+/// M13 M1-2:双设备池测试装置(两张不同规格的镜像;`sizes` 为各设备字节)。
+fn setup_multi(sizes: &[u64]) -> (tempfile::TempDir, Vec<std::path::PathBuf>, EngineConfig) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut imgs = Vec::new();
+    for (i, size) in sizes.iter().enumerate() {
+        let img = dir.path().join(format!("disk{i}.img"));
+        std::fs::File::create(&img).unwrap().set_len(*size).unwrap();
+        fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
+        imgs.push(img);
+    }
+    let meta_dir = dir.path().join("meta");
+    // 池清单预置(等价 device-add;引擎拒绝「改配置入池」)
+    seed_pool_manifest(&meta_dir, &imgs);
+    let cfg = EngineConfig {
+        devices: imgs.clone(),
+        meta_dir: meta_dir.clone(),
+        compaction: CompactionConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    (dir, imgs, cfg)
+}
+
+/// 按设备序写入池清单(ADR-15 DM1';uuid/容量取自各设备超块;等价
+/// `fasts3d device-add` 的持久化动作,M3-1 起由命令承担)。
+fn seed_pool_manifest(meta_dir: &std::path::Path, devices: &[std::path::PathBuf]) {
+    let store = fs3_meta::MetaStore::open(
+        meta_dir,
+        &fs3_meta::MetaConfig {
+            flush_every_ms: fs3_core::DEFAULT_GROUP_COMMIT_MS,
+            sync_mode: fs3_meta::SyncMode::Group,
+            cache_capacity: None,
+        },
+    )
+    .unwrap();
+    let entries = devices
+        .iter()
+        .map(|p| {
+            let dev = fs3_device::open_device(p, true).unwrap();
+            let sb = fs3_device::read_superblock(dev.as_ref()).unwrap();
+            fs3_core::pool::DeviceEntry {
+                uuid: sb.uuid,
+                path: p.display().to_string(),
+                capacity: sb.data_end,
+                extent_count: sb.extent_count(),
+                weight: 1,
+                added_at: 0,
+            }
+        })
+        .collect();
+    store
+        .save_pool(&fs3_core::pool::PoolManifest { devices: entries })
+        .unwrap();
+    store.flush().unwrap();
+    drop(store);
 }
 
 /// CompletePart 便捷构造(M11 C1-4;无逐分片 checksum 声明)。
@@ -451,7 +510,7 @@ fn recovery_without_close_resumes_open_extent() {
 fn verify_reads_detects_corruption() {
     let (_d, cfg) = setup();
     let data: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
-    let img_path = cfg.device.clone();
+    let img_path = cfg.devices[0].clone();
     {
         let mut e = open_engine(&cfg);
         e.put("b1", "k", &mut Cursor::new(data)).unwrap();
@@ -1948,7 +2007,7 @@ fn recovery_resumes_open_extent_and_overwrites_orphans() {
         e.put("b1", "a", &mut Cursor::new(d1.clone())).unwrap();
         e.meta().flush().unwrap();
         // 模拟"崩溃前数据已落盘但事务未提交":直接往开放 extent 尾部写孤儿数据
-        let dev = fs3_device::open_device(&cfg.device, false).unwrap();
+        let dev = fs3_device::open_device(&cfg.devices[0], false).unwrap();
         let mut buf = fs3_device::AlignedBuffer::new(4096).unwrap();
         buf.as_mut_slice().fill(0xEE);
         // extent 0 数据区 + 300KiB(已提交水位)处
@@ -1982,7 +2041,7 @@ fn recovery_seals_headerless_full_extent() {
         e.put("b1", "big", &mut Cursor::new(data.clone())).unwrap();
         e.meta().flush().unwrap();
         // 模拟"封口写头前崩溃":清掉 extent 0 的头
-        let dev = fs3_device::open_device(&cfg.device, false).unwrap();
+        let dev = fs3_device::open_device(&cfg.devices[0], false).unwrap();
         let mut zero = fs3_device::AlignedBuffer::new(4096).unwrap();
         zero.as_mut_slice().fill(0);
         let hdr_off = 1024 * 1024 + 2 * 4096; // extent 0 起点
@@ -2015,7 +2074,7 @@ fn recovery_seals_headerless_full_extent() {
 fn verify_reads_packed_segment_detects_corruption() {
     let (_d, cfg) = setup();
     let data = vec![5u8; 100_000];
-    let img = cfg.device.clone();
+    let img = cfg.devices[0].clone();
     {
         let mut e = open_engine(&cfg);
         e.put("b1", "k", &mut Cursor::new(data)).unwrap();
@@ -2198,7 +2257,7 @@ fn bench_read_path() {
         .unwrap();
     fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
     let cfg = EngineConfig {
-        device: img,
+        devices: vec![img],
         meta_dir: dir.path().join("meta"),
         compaction: CompactionConfig {
             enabled: false,
@@ -5897,10 +5956,17 @@ fn sse_c_corrupt_ciphertext_fails_fast() {
     let off = e.extent_data_offset(seg.extent_id as u64) + seg.offset as u64;
     let aligned = off - (off % SECTOR_SIZE);
     let mut buf = fs3_device::AlignedBuffer::new(SECTOR_SIZE as usize).unwrap();
-    e.device.pread_aligned(buf.as_mut_slice(), aligned).unwrap();
+    e.superblock();
+    e.device_slots()[0]
+        .dev
+        .pread_aligned(buf.as_mut_slice(), aligned)
+        .unwrap();
     let skip = (off - aligned) as usize;
     buf.as_mut_slice()[skip] ^= 0xff;
-    e.device.pwrite_aligned(buf.as_slice(), aligned).unwrap();
+    e.device_slots()[0]
+        .dev
+        .pwrite_aligned(buf.as_slice(), aligned)
+        .unwrap();
 
     let t0 = std::time::Instant::now();
     let mut out = vec![0u8; 1024];
@@ -5922,4 +5988,168 @@ fn sse_c_corrupt_ciphertext_fails_fast() {
     );
     assert!(matches!(err, Error::Corrupt(_)), "{err}");
     e.close().unwrap();
+}
+
+// ─────────────────────────── M13 M1-2 多设备池 ───────────────────────────
+
+#[test]
+fn multi_device_pool_put_get_checkpoint_roundtrip() -> Result<()> {
+    // 双设备(不同规格):自举清单 → 双设备分配 → 每设备检查点 → 重开一致
+    // 设备 0 仅 16MiB(≈3 个 extent):批量写入必然跨到设备 1
+    let (_d, _imgs, cfg) = setup_multi(&[16 * 1024 * 1024, 64 * 1024 * 1024]);
+    let mut e = open_engine(&cfg);
+
+    // 池清单:双元素 + uuid 与设备超块绑定
+    let pool = e.meta().load_pool()?.expect("pool manifest");
+    assert_eq!(pool.devices.len(), 2);
+    assert_eq!(pool.devices[0].uuid, e.device_slots()[0].sb.uuid);
+    assert_eq!(pool.devices[1].uuid, e.device_slots()[1].sb.uuid);
+    assert_eq!(
+        pool.devices[0].extent_count,
+        e.device_slots()[0].extent_count
+    );
+    assert_eq!(
+        pool.devices[1].extent_count,
+        e.device_slots()[1].extent_count
+    );
+    // 推导式映射基址
+    assert_eq!(e.device_slots()[1].base, e.device_slots()[0].extent_count);
+
+    // 写一批落 extent 的对象(1MiB > 32KiB 内联阈值;12MiB > 设备 0 容量)
+    let data = vec![7u8; 1024 * 1024];
+    for i in 0..12 {
+        e.put("b1", &format!("k{i}"), &mut Cursor::new(data.clone()))
+            .unwrap();
+    }
+    // 两设备都应有分配(池生效)
+    let d1 = &e.device_slots()[1];
+    let on_d1 = (d1.base..d1.base + d1.extent_count)
+        .filter(|&id| e.allocator().test_bit(id))
+        .count();
+    assert_eq!(on_d1, 1, "exactly one spare extent should land on device 1");
+    e.checkpoint()?;
+
+    // 读回一致
+    for i in 0..12 {
+        let mut out = Vec::new();
+        e.get_to("b1", &format!("k{i}"), 0..data.len() as u64, &mut out)
+            .unwrap();
+        assert_eq!(out, data);
+    }
+    e.close().unwrap();
+    drop(e);
+
+    // 重开:每设备检查点合并恢复 + 数据完好 + 零泄漏
+    let e2 = open_engine(&cfg);
+    for i in 0..12 {
+        let mut out = Vec::new();
+        e2.get_to("b1", &format!("k{i}"), 0..data.len() as u64, &mut out)
+            .unwrap();
+        assert_eq!(out, data);
+    }
+    {
+        let report = e2.check_report().unwrap();
+        if !report.leaks.is_empty() {
+            let bits: Vec<u64> = (0..18).filter(|&i| e2.allocator().test_bit(i)).collect();
+            panic!(
+                "leaks after multi-device reopen: {:?} (d1 base={}, count={}; allocated={:?}; live={})",
+                report.leaks,
+                e2.device_slots()[1].base,
+                e2.device_slots()[1].extent_count,
+                bits,
+                e2.allocator().live_bytes_total(),
+            );
+        }
+    }
+    e2.abort();
+    Ok(())
+}
+
+#[test]
+fn multi_device_crash_recovery() -> Result<()> {
+    // 崩溃(不 close)后重开:每设备开放 extent 续写 + a: 重放幂等
+    let (_d, _imgs, cfg) = setup_multi(&[64 * 1024 * 1024, 64 * 1024 * 1024]);
+    let mut e = open_engine(&cfg);
+    let data = vec![9u8; 300 * 1024];
+    for i in 0..6 {
+        e.put("b1", &format!("c{i}"), &mut Cursor::new(data.clone()))
+            .unwrap();
+    }
+    e.abort(); // 模拟 kill -9
+    let mut e2 = open_engine(&cfg);
+    for i in 0..6 {
+        let mut out = Vec::new();
+        e2.get_to("b1", &format!("c{i}"), 0..data.len() as u64, &mut out)
+            .unwrap();
+        assert_eq!(out, data);
+    }
+    assert!(e2.check_report().unwrap().leaks.is_empty());
+    // 崩溃后继续写入 + 正常关闭(续写路径走设备感知寻址)
+    let more = vec![5u8; 100 * 1024];
+    e2.put("b1", "after-crash", &mut Cursor::new(more.clone()))
+        .unwrap();
+    e2.close().unwrap();
+    drop(e2);
+    let e3 = open_engine(&cfg);
+    let mut out = Vec::new();
+    e3.get_to("b1", "after-crash", 0..more.len() as u64, &mut out)
+        .unwrap();
+    assert_eq!(out, more);
+    e3.abort();
+    Ok(())
+}
+
+#[test]
+fn multi_device_extra_disk_without_manifest_rejected() -> Result<()> {
+    // 已入池单盘 + 配置塞入「已初始化但未入池」的盘 → 拒绝(必须 device-add)
+    let (_d, mut imgs, cfg) = setup_multi(&[64 * 1024 * 1024]);
+    let mut e = open_engine(&cfg);
+    e.put("b1", "k", &mut Cursor::new(vec![1u8; 100])).unwrap();
+    e.close().unwrap();
+    drop(e);
+
+    let extra = _d.path().join("extra.img");
+    std::fs::File::create(&extra)
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    fs3_device::init_device(&extra, 4 * 1024 * 1024, 0, false).unwrap();
+    imgs.push(extra);
+    let bad_cfg = EngineConfig {
+        devices: imgs,
+        ..cfg.clone()
+    };
+    let err = match Engine::open(&bad_cfg) {
+        Ok(_) => panic!("open must reject an un-pooled disk in config"),
+        Err(e) => e,
+    };
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("not in the pool") || msg.contains("device-add"),
+        "unexpected error: {msg}"
+    );
+    Ok(())
+}
+
+#[test]
+fn multi_device_manifest_uuid_mismatch_rejected() -> Result<()> {
+    // 换盘(force 重建 = 新 uuid)→ 打开必须拒绝(清单 uuid 绑定)
+    let (_d, _imgs, cfg) = setup_multi(&[64 * 1024 * 1024, 64 * 1024 * 1024]);
+    let mut e = open_engine(&cfg);
+    e.put("b1", "k", &mut Cursor::new(vec![2u8; 100])).unwrap();
+    e.close().unwrap();
+    drop(e);
+
+    let dev1 = &cfg.devices[1];
+    fs3_device::init_device(dev1, 4 * 1024 * 1024, 0, true).unwrap(); // force 重建
+    let err = match Engine::open(&cfg) {
+        Ok(_) => panic!("open must reject uuid mismatch (wrong disk)"),
+        Err(e) => e,
+    };
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("uuid does not match") || msg.contains("InvalidLayout"),
+        "unexpected error: {msg}"
+    );
+    Ok(())
 }

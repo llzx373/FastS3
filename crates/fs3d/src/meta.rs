@@ -823,7 +823,7 @@ pub fn run_meta_import(
     // 8) 引擎打开:检查点加载 + 导入记录全量重放(seq > cp.seq)+
     //    段级可达性重建(引用计数/共享段表/泄漏报告)→ 收尾写新检查点
     let engine_cfg = fs3_engine::EngineConfig {
-        device: device.to_path_buf(),
+        devices: vec![device.to_path_buf()],
         meta_dir: meta_dir.to_path_buf(),
         ..Default::default()
     };
@@ -1023,7 +1023,7 @@ mod tests {
 
     fn engine_cfg(device: &Path, meta_dir: &Path) -> fs3_engine::EngineConfig {
         fs3_engine::EngineConfig {
-            device: device.to_path_buf(),
+            devices: vec![device.to_path_buf()],
             meta_dir: meta_dir.to_path_buf(),
             ..Default::default()
         }

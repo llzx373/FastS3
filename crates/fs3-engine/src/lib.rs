@@ -49,8 +49,9 @@ pub use crate::compaction::{CompactionConfig, CompactionReport};
 
 #[derive(Clone)]
 pub struct EngineConfig {
-    /// 数据设备路径(裸设备或镜像文件)。
-    pub device: std::path::PathBuf,
+    /// 数据设备路径列表(裸设备或镜像文件;M13 M1-2 起支持多设备池;
+    /// 池内设备序 = `s:pool` 清单序,配置序仅用于装载)。
+    pub devices: Vec<std::path::PathBuf>,
     /// 元数据目录(rocksdb)。
     pub meta_dir: std::path::PathBuf,
     pub sync_mode: SyncMode,
@@ -84,7 +85,7 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         EngineConfig {
-            device: std::path::PathBuf::new(),
+            devices: Vec::new(),
             meta_dir: std::path::PathBuf::new(),
             sync_mode: SyncMode::Group,
             group_commit_ms: fs3_core::DEFAULT_GROUP_COMMIT_MS,
@@ -131,7 +132,51 @@ pub struct CheckReport {
     pub last_seq: u64,
 }
 
-/// 开放 extent(ADR-9 §4.4/§5.1):当前正在被追加写入的 extent,每引擎一个。
+/// 池内单设备运行句柄(M13 M1-2,ADR-15 DM1'/DM3):设备句柄 + 超块 +
+/// 推导式映射基址。不可变(Engine 与 Compactor 后台线程共享同 Arc)。
+///
+/// 全局 extent id = `base + local`(base = Σ 前序设备 extent 数;仅尾部
+/// 增删)。每设备独立超块/位图/检查点在恢复与检查点路径按本表逐设备
+/// 装配。
+pub(crate) struct DeviceSlot {
+    /// 设备句柄(O_DIRECT;io_uring 直取 raw_fd)。
+    pub dev: Box<dyn BlockDevice>,
+    /// 本设备超块(布局/容量口径;extent_size 全池一致,启动校验)。
+    pub sb: fs3_core::SuperBlock,
+    /// 全局 extent id 基址(推导式映射;见 fs3_core::pool)。
+    pub base: u64,
+    /// 本设备 extent 数(= 超块布局反推值;启动与池清单校验)。
+    pub extent_count: u64,
+    /// 分配权重(M13 M2-1 加权轮转;device-add 时写入池清单)。
+    /// M1-2 装配期仅存储(M2-1 起参与选址)。
+    #[allow(dead_code)]
+    pub weight: u64,
+}
+
+impl DeviceSlot {
+    /// 本设备数据区起始偏移(extent 头之后)。
+    #[inline]
+    pub fn data_offset(&self, local_extent: u64) -> u64 {
+        self.sb.data_start + local_extent * self.sb.extent_size + EXTENT_HEADER_SIZE
+    }
+
+    /// 本设备 extent 头偏移。
+    #[inline]
+    pub fn header_offset(&self, local_extent: u64) -> u64 {
+        self.sb.data_start + local_extent * self.sb.extent_size
+    }
+
+    /// 本设备 extent 数据容量(字节)。
+    #[inline]
+    pub fn extent_capacity(&self) -> u64 {
+        self.sb.extent_capacity()
+    }
+}
+
+/// 池设备表(不可变共享视图;Engine 与 Compactor 同 Arc 借用)。
+pub(crate) type PoolDevices = Arc<Vec<DeviceSlot>>;
+
+/// 开放 extent(ADR-9 §4.4/§5.1):当前正在被追加写入的 extent,每设备一个。
 #[derive(Debug, Clone)]
 struct OpenExtent {
     extent_id: u32,
@@ -162,10 +207,13 @@ impl TrustedClockRt {
 }
 
 pub struct Engine {
-    device: Box<dyn BlockDevice>,
-    /// 零拷贝专用 fd(无 O_DIRECT;sendfile/splice 用;None = 不可用)。
-    zc_fd: Option<i32>,
-    sb: fs3_core::SuperBlock,
+    /// 池设备表(不可变;Compactor 等后台组件共享).
+    devices: Arc<Vec<DeviceSlot>>,
+    /// 零拷贝专用 fd(无 O_DIRECT;sendfile/splice 用;与 devices 平行,
+    /// None = 该设备不可用)。
+    zc_fds: Vec<Option<i32>>,
+    /// 主设备(0)超块副本(池口径:extent_size/布局版本全池一致,启动校验)。
+    main_sb: fs3_core::SuperBlock,
     alloc: Arc<Allocator>,
     meta: Arc<MetaStore>,
     /// Mutex 包装:使 Engine 满足 Sync(服务层 RwLock 共享;锁内无竞争,
@@ -176,8 +224,12 @@ pub struct Engine {
     read_only: bool,
     small_object_limit: usize,
     etag_mode: fs3_core::EtagMode,
-    /// 开放 extent(跨对象存活;写入路径唯一追加点)。
-    open_extent: Option<OpenExtent>,
+    /// 开放 extent(每设备一个;与 devices 平行;写路径当前活动设备 =
+    /// cur_device)。
+    open_extents: Vec<Option<OpenExtent>>,
+    /// 写路径当前活动设备(分配选址目标;M13 M1-2 装配期恒 0,M2-1 起
+    /// 剩余空间加权轮转)。
+    cur_device: usize,
     checkpoint: std::sync::Mutex<CheckpointState>,
     checkpoint_tick: std::sync::Mutex<Receiver<()>>,
     _checkpoint_thread: Option<std::thread::JoinHandle<()>>,
@@ -208,27 +260,49 @@ pub struct Engine {
 
 impl Engine {
     /// 打开引擎(含完整恢复流程);设备未初始化返回 NotInitialized。
+    ///
+    /// M13 M1-2(ADR-15 DM1'/DM3):按池清单序装配全部设备——每设备独立
+    /// 超块/位图/检查点;恢复 = 各设备「超块 → 检查点(代数最大)」→
+    /// 池清单一致性校验 → 全局 `a:` 重放(幂等,边界 = 各设备检查点
+    /// seq 最小值)→ 段级可达性扫描 → 各设备开放 extent 续写。
     pub fn open(cfg: &EngineConfig) -> Result<Self> {
-        let device = open_device(&cfg.device, cfg.read_only)?;
-        // 零拷贝 fd(尽力而为;失败则禁用零拷贝读路径)
-        let zc_fd = if cfg.read_only {
-            None
-        } else {
-            fs3_device::open_zerocopy_fd(&cfg.device).ok()
+        if cfg.devices.is_empty() {
+            return Err(Error::InvalidArgument(
+                "no data devices configured (storage.devices)".into(),
+            ));
+        }
+        // 0. 打开全部配置设备 + 读超块(先按配置序装载,随后按清单序重排)
+        let mut opened: Vec<(
+            std::path::PathBuf,
+            Box<dyn BlockDevice>,
+            fs3_core::SuperBlock,
+        )> = Vec::new();
+        for path in &cfg.devices {
+            let dev = open_device(path, cfg.read_only)?;
+            let sb = fs3_device::read_superblock(dev.as_ref())?;
+            opened.push((path.clone(), dev, sb));
+        }
+        // extent_size / layout_version 全池一致(主设备 0 为口径)
+        let (extent_size, layout_version) = {
+            let sb0 = &opened[0].2;
+            (sb0.extent_size, sb0.layout_version)
         };
-        let sb = fs3_device::read_superblock(device.as_ref())?;
+        for (_, _, sb) in &opened[1..] {
+            if sb.extent_size != extent_size {
+                return Err(Error::InvalidLayout(format!(
+                    "devices must share extent_size: found {} and {}",
+                    extent_size, sb.extent_size
+                )));
+            }
+            if sb.layout_version != layout_version {
+                return Err(Error::InvalidLayout(format!(
+                    "devices must share layout_version: found {} and {}",
+                    layout_version, sb.layout_version
+                )));
+            }
+        }
 
-        let alloc = Arc::new(Allocator::new(sb.extent_count()));
-
-        // 1. 加载检查点(有效且代数最大的槽)
-        let checkpointer = Checkpointer::new(device.as_ref(), &sb);
-        let cp = checkpointer
-            .load_latest()?
-            .ok_or_else(|| Error::Corrupt("no valid checkpoint found".into()))?;
-        alloc.restore_bitmap(&cp.bitmap);
-        alloc.restore_stats(cp.total_alloc, cp.total_free);
-
-        // 2. 打开 rocksdb(其自身 WAL 恢复)
+        // 逐一打开元数据(rocksdb,其自身 WAL 恢复)前的准备
         let meta_cfg = MetaConfig {
             flush_every_ms: cfg.group_commit_ms,
             sync_mode: cfg.sync_mode,
@@ -236,13 +310,152 @@ impl Engine {
         };
         let meta = Arc::new(MetaStore::open(&cfg.meta_dir, &meta_cfg)?);
 
-        // 3. 重放 seq > 检查点序号的 a: 记录 → 恢复位图
-        let recs = meta.list_alloc_records(cp.seq)?;
+        // 1. 池清单:加载 / 自举 / 校验(ADR-15 DM1';s:pool)
+        //    缺席 = 单设备 v2 存量 → 初始化为单元素(零数据搬迁,升级路径);
+        //    多设备配置缺清单 → 拒绝(必须走 device-add,不得改配置入池)。
+        let manifest = match meta.load_pool()? {
+            Some(m) => {
+                m.validate()?;
+                m
+            }
+            None => {
+                if cfg.devices.len() != 1 {
+                    return Err(Error::InvalidLayout(
+                        "pool manifest missing for a multi-device config; run \
+                         `fasts3d device-add` to expand the pool (never edit \
+                         config to add devices)"
+                            .into(),
+                    ));
+                }
+                if opened.len() != 1 {
+                    return Err(Error::InvalidLayout("device open mismatch".into()));
+                }
+                let (path, _, sb) = &opened[0];
+                let m = fs3_core::pool::PoolManifest {
+                    devices: vec![fs3_core::pool::DeviceEntry {
+                        uuid: sb.uuid,
+                        path: path.display().to_string(),
+                        capacity: sb.data_end,
+                        extent_count: sb.extent_count(),
+                        weight: 1,
+                        added_at: now_ts(),
+                    }],
+                };
+                m.validate()?;
+                if !cfg.read_only {
+                    meta.save_pool(&m)?;
+                }
+                m
+            }
+        };
+
+        // 2. 按清单序装配设备表(配置序仅用于装载;清单序 = 推导映射序)
+        let mut slots: Vec<DeviceSlot> = Vec::with_capacity(manifest.devices.len());
+        for entry in &manifest.devices {
+            let idx = opened
+                .iter()
+                .position(|(p, _, _)| p.as_path() == std::path::Path::new(&entry.path))
+                .ok_or_else(|| {
+                    Error::InvalidLayout(format!(
+                        "pool device {} is not listed in config; add it to \
+                         storage.devices (device-add 后配置须包含新盘)",
+                        entry.path
+                    ))
+                })?;
+            let (_, dev, sb) = opened.remove(idx);
+            // 一致性校验:清单 uuid 绑定(ADR-15 DM3;错误盘 → 硬拒绝,
+            // M13 M2-2 扩展为缺盘只读降级路径)+ 冗余 extent_count/capacity
+            if sb.uuid != entry.uuid {
+                return Err(Error::InvalidLayout(format!(
+                    "device {} uuid does not match pool manifest (uuid mismatch: \
+                     wrong disk attached?); run `fasts3d device-remove` after \
+                     migrating data if this device was replaced",
+                    entry.path
+                )));
+            }
+            let ec = sb.extent_count();
+            if ec != entry.extent_count || sb.data_end != entry.capacity {
+                return Err(Error::InvalidLayout(format!(
+                    "device {} layout mismatch vs pool manifest: superblock \
+                     extent_count={ec} capacity={} vs manifest {} / {}",
+                    entry.path, sb.data_end, entry.extent_count, entry.capacity
+                )));
+            }
+            slots.push(DeviceSlot {
+                dev,
+                sb,
+                base: 0, // 下方按清单序重算
+                extent_count: ec,
+                weight: entry.weight,
+            });
+        }
+        // 配置里不属于清单的设备 → 拒绝(未入池设备必须走 device-add 初始化)
+        if !opened.is_empty() {
+            return Err(Error::InvalidLayout(format!(
+                "config lists {} device(s) not in the pool (first: {}); run \
+                 `fasts3d device-add` to add them",
+                opened.len(),
+                opened[0].0.display()
+            )));
+        }
+        // 推导式映射基址:Σ 前序设备 extent 数(ADR-15 DM1')
+        {
+            let mut base = 0u64;
+            for slot in slots.iter_mut() {
+                slot.base = base;
+                base += slot.extent_count;
+            }
+            if base > u32::MAX as u64 {
+                return Err(Error::InvalidLayout(format!(
+                    "pool exceeds u32 extent id space ({base} extents)"
+                )));
+            }
+        }
+        let total_extents: u64 = slots.iter().map(|s| s.extent_count).sum();
+        let devices = Arc::new(slots);
+        let main_sb = devices[0].sb;
+
+        // 3. 每设备独立检查点加载 + 位级并入(ADR-5/ADR-15 DM3;设备基址
+        //    不要求字节对齐,并入按「本地位 i ↔ 全局位 base+i」逐位置位)
+        let alloc = Arc::new(Allocator::new(total_extents));
+        let mut checkpoint_seq_min = u64::MAX;
+        let mut total_alloc_sum = 0u64;
+        let mut total_free_sum = 0u64;
+        for (di, slot) in devices.iter().enumerate() {
+            let checkpointer = Checkpointer::new(slot.dev.as_ref(), &slot.sb);
+            let cp = checkpointer.load_latest()?.ok_or_else(|| {
+                Error::Corrupt(format!(
+                    "no valid checkpoint on device {di} (uuid {})",
+                    slot.sb
+                        .uuid
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>()
+                ))
+            })?;
+            // 位图字节数必须与设备 extent 数一致
+            let expect_bytes = slot.extent_count.div_ceil(8) as usize;
+            if cp.bitmap.len() != expect_bytes {
+                return Err(Error::Corrupt(format!(
+                    "device {di} checkpoint bitmap {} bytes, expected {expect_bytes}",
+                    cp.bitmap.len()
+                )));
+            }
+            alloc.absorb_range_bitmap(&cp.bitmap, slot.base);
+            checkpoint_seq_min = checkpoint_seq_min.min(cp.seq);
+            total_alloc_sum += cp.total_alloc;
+            total_free_sum += cp.total_free;
+        }
+        alloc.restore_stats(total_alloc_sum, total_free_sum);
+
+        // 4. 重放 seq > 各设备检查点最小序号的 a: 记录 → 恢复位图
+        //    (apply_record 幂等:alloc/ref_dec 均以位图状态守卫,ADR-5)
+        let recs = meta.list_alloc_records(checkpoint_seq_min)?;
         if !recs.is_empty() {
             tracing::info!(
                 "replaying {} alloc records after checkpoint seq {}",
                 recs.len(),
-                cp.seq
+                checkpoint_seq_min
             );
         }
         for rec in &recs {
@@ -286,13 +499,25 @@ impl Engine {
             }
         }
 
-        // 5. 开放 extent 识别与续写(ADR-9 §5.7):有活段、无有效头(或代数
-        //    陈旧)的 extent = 崩溃时的开放 extent;watermark = 活段最大 end,
-        //    跨会话孤儿区由新追加自然覆盖
-        let open_extent = if cfg.read_only {
-            None
+        // 5. 开放 extent 识别与续写(ADR-9 §5.7):每设备独立——有活段、
+        //    无有效头(或代数陈旧)的 extent = 崩溃时的开放 extent;
+        //    watermark = 活段最大 end,跨会话孤儿区由新追加自然覆盖
+        let open_extents = if cfg.read_only {
+            devices.iter().map(|_| None).collect()
         } else {
-            resume_open_extent(alloc.as_ref(), device.as_ref(), &sb, &max_end)?
+            devices
+                .iter()
+                .map(|slot| {
+                    resume_open_extent(
+                        alloc.as_ref(),
+                        slot.dev.as_ref(),
+                        &slot.sb,
+                        slot.base,
+                        slot.extent_count,
+                        &max_end,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?
         };
 
         // 6. 检查点定时线程(时间触发策略)
@@ -317,8 +542,7 @@ impl Engine {
                 meta.clone(),
                 alloc.clone(),
                 io.clone(),
-                device.raw_fd(),
-                sb,
+                devices.clone(),
                 cfg.compaction.clone(),
             ));
             let h = if cfg.compaction.enabled {
@@ -344,10 +568,19 @@ impl Engine {
         if !cfg.read_only {
             meta.put_trusted_clock(&clock_state)?;
         }
+        // 零拷贝 fd(尽力而为;失败则禁用零拷贝读路径;每设备一个)
+        let zc_fds = if cfg.read_only {
+            devices.iter().map(|_| None).collect::<Vec<Option<i32>>>()
+        } else {
+            devices
+                .iter()
+                .map(|slot| fs3_device::open_zerocopy_fd(slot.dev.path()).ok())
+                .collect::<Vec<Option<i32>>>()
+        };
         let e = Engine {
-            zc_fd,
-            device,
-            sb,
+            devices,
+            zc_fds,
+            main_sb,
             alloc,
             meta,
             io,
@@ -356,9 +589,10 @@ impl Engine {
             read_only: cfg.read_only,
             small_object_limit: cfg.small_object_limit,
             etag_mode: cfg.etag_mode,
-            open_extent,
+            open_extents,
+            cur_device: 0,
             checkpoint: std::sync::Mutex::new(CheckpointState {
-                seq: cp.seq.max(last_seq),
+                seq: checkpoint_seq_min.max(last_seq),
                 alloc_since: 0,
                 dirty: false,
             }),
@@ -384,7 +618,67 @@ impl Engine {
     }
 
     pub fn superblock(&self) -> &fs3_core::SuperBlock {
-        &self.sb
+        &self.main_sb
+    }
+
+    /// 池设备表(只读;内部测试用)。
+    #[cfg(test)]
+    pub(crate) fn device_slots(&self) -> &[DeviceSlot] {
+        &self.devices
+    }
+
+    /// 池内设备数(M13 M1-2)。
+    pub fn device_count(&self) -> usize {
+        self.devices.len()
+    }
+
+    /// 全局 extent id → (设备序, 本地 id)(ADR-15 DM1' 推导式映射)。
+    fn resolve_extent(&self, extent_id: u64) -> (usize, u64) {
+        let mut base = 0u64;
+        for (di, slot) in self.devices.iter().enumerate() {
+            if extent_id < base + slot.extent_count {
+                return (di, extent_id - base);
+            }
+            base += slot.extent_count;
+        }
+        // 越界:调用方保证合法(Segment 均出自分配器);防御性取末设备
+        (self.devices.len() - 1, extent_id - base)
+    }
+
+    /// 全局 extent id 所属设备的 raw fd。
+    fn device_fd_of(&self, extent_id: u64) -> i32 {
+        let (di, _) = self.resolve_extent(extent_id);
+        self.devices[di].dev.raw_fd()
+    }
+
+    /// extent 数据区在所属设备上的绝对偏移(含 extent 头)。
+    fn extent_data_offset(&self, extent_id: u64) -> u64 {
+        let (di, local) = self.resolve_extent(extent_id);
+        self.devices[di].data_offset(local)
+    }
+
+    /// extent 头在所属设备上的绝对偏移。
+    fn extent_header_offset(&self, extent_id: u64) -> u64 {
+        let (di, local) = self.resolve_extent(extent_id);
+        self.devices[di].header_offset(local)
+    }
+
+    /// 当前活动设备(写路径追加目标)。
+    fn cur_slot(&self) -> (usize, &DeviceSlot) {
+        (self.cur_device, &self.devices[self.cur_device])
+    }
+
+    /// 当前活动开放 extent(写路径唯一追加点;None = 待分配)。
+    fn cur_open(&self) -> Option<&OpenExtent> {
+        self.open_extents
+            .get(self.cur_device)
+            .and_then(|o| o.as_ref())
+    }
+
+    fn cur_open_mut(&mut self) -> Option<&mut OpenExtent> {
+        self.open_extents
+            .get_mut(self.cur_device)
+            .and_then(|o| o.as_mut())
     }
 
     pub fn meta(&self) -> &MetaStore {
@@ -413,7 +707,9 @@ impl Engine {
     pub(crate) fn debug_false_free_segments(&mut self, segs: &[Segment]) {
         let mut draft = Staged::default();
         self.alloc.release_object(&mut draft, segs);
-        self.open_extent = None;
+        for oe in self.open_extents.iter_mut() {
+            *oe = None;
+        }
     }
 
     pub fn io_engine_name(&self) -> &'static str {
@@ -452,7 +748,7 @@ impl Engine {
     /// 成功提交后记录开放 extent 已提交水位(诊断/与 watermark 对齐;
     /// abort_draft 不再回退水位,见该函数注释)。
     fn mark_open_committed(&mut self) {
-        if let Some(oe) = &mut self.open_extent {
+        if let Some(oe) = self.cur_open_mut() {
             oe.committed_end = oe.watermark;
         }
     }
@@ -463,7 +759,7 @@ impl Engine {
         let due = {
             let mut st = self.checkpoint.lock().unwrap();
             let tick = matches!(self.checkpoint_tick.lock().unwrap().try_recv(), Ok(()));
-            let delta = st.alloc_since * self.sb.extent_size >= CHECKPOINT_ALLOC_DELTA;
+            let delta = st.alloc_since * self.main_sb.extent_size >= CHECKPOINT_ALLOC_DELTA;
             let timed = tick && st.dirty;
             if delta || timed {
                 st.alloc_since = 0;
@@ -485,20 +781,24 @@ impl Engine {
         st.dirty = true;
     }
 
-    /// 立即写检查点(位图 + 统计 + seq)。
+    /// 立即写检查点(每设备独立:位图区间 + 统计,ADR-15 DM3)。
     pub fn checkpoint(&mut self) -> Result<()> {
         if self.read_only {
             return Ok(());
         }
         let seq = self.meta.last_seq()?;
-        let cp = self.alloc.checkpoint_data(seq);
-        let checkpointer = Checkpointer::new(self.device.as_ref(), &self.sb);
-        let gen = checkpointer.save(&cp)?;
+        for (di, slot) in self.devices.iter().enumerate() {
+            let cp = self
+                .alloc
+                .checkpoint_data_range(seq, slot.base, slot.extent_count);
+            let checkpointer = Checkpointer::new(slot.dev.as_ref(), &slot.sb);
+            let gen = checkpointer.save(&cp)?;
+            tracing::debug!("checkpoint saved: device {di} gen {gen}, seq {seq}");
+        }
         let mut st = self.checkpoint.lock().unwrap();
         st.seq = seq;
         st.alloc_since = 0;
         st.dirty = false;
-        tracing::debug!("checkpoint saved: gen {gen}, seq {seq}");
         self.refresh_trusted_clock()?;
         Ok(())
     }
@@ -585,7 +885,7 @@ impl Engine {
         }
     }
 
-    /// 优雅关闭:停压缩 → 封口开放 extent → 最终检查点 + 元数据 flush。
+    /// 优雅关闭:停压缩 → 封口全部开放 extent → 最终检查点 + 元数据 flush。
     pub fn close(&mut self) -> Result<()> {
         if self.closed {
             return Ok(());
@@ -594,11 +894,17 @@ impl Engine {
         if let Some(mut h) = self._compactor_thread.take() {
             h.stop();
         }
-        if let Some(fd) = self.zc_fd.take() {
-            // SAFETY: fd 由 open_zerocopy_fd 打开。
-            unsafe { libc::close(fd) };
+        // 先关零拷贝 fd(独立借用域)
+        for fd in self.zc_fds.iter_mut() {
+            if let Some(fd) = fd.take() {
+                // SAFETY: fd 由 open_zerocopy_fd 打开。
+                unsafe { libc::close(fd) };
+            }
         }
-        self.seal_open_extent()?;
+        // 再逐设备封口开放 extent(有头才封;无头 = 无活段可续)
+        for di in 0..self.devices.len() {
+            self.seal_open_extent_at(di)?;
+        }
         self.checkpoint()?;
         self.meta.flush()?;
         Ok(())
@@ -1288,23 +1594,26 @@ impl Engine {
         writer.finish(self, draft)
     }
 
-    // ──────── 开放 extent 管理(ADR-9 §5.1/§5.2/§5.4) ────────
+    // ──────── 开放 extent 管理(ADR-9 §5.1/§5.2/§5.4;M13 M1-2 每设备) ────────
 
-    /// 对象起点封口判定(b):剩余空间 < 32KiB(装不下任何非内联对象)
-    /// → 封口,下个对象使用新 extent。
+    /// 对象起点封口判定(b):当前活动设备开放 extent 剩余空间 < 32KiB
+    /// (装不下任何非内联对象)→ 封口,下个对象使用新 extent。
     fn rotate_for_new_object(&mut self) -> Result<()> {
+        let (di, capacity) = {
+            let (di, slot) = self.cur_slot();
+            (di, slot.extent_capacity())
+        };
         let should_seal = self
-            .open_extent
-            .as_ref()
+            .open_extents
+            .get(di)
+            .and_then(|o| o.as_ref())
             .map(|oe| {
-                let remaining = self.sb.extent_capacity() - oe.watermark as u64;
-                remaining < self.small_object_limit as u64
-                    || oe.watermark as u64 >= self.sb.extent_capacity()
+                let remaining = capacity - oe.watermark as u64;
+                remaining < self.small_object_limit as u64 || oe.watermark as u64 >= capacity
             })
             .unwrap_or(false);
         if should_seal {
-            self.seal_open_extent()?;
-            self.open_extent = None;
+            self.seal_open_extent_at(di)?;
         }
         Ok(())
     }
@@ -1315,39 +1624,115 @@ impl Engine {
     /// 重分配),水位从活段 max_end 的 4KiB 对齐上界起跳,避免从 0 覆写
     /// 已提交打包密文(M11 G-2 SSE GCM)。已写满的误释放 extent 封口后
     /// 换下一个 id。
+    ///
+    /// M13 M1-2:开放 extent 落位 = 分配的全局 id 所属设备(`open_open_extent`
+    /// 同步 cur_device);M2-1 起在该函数内做加权设备选址。
     fn open_new_extent(&mut self, draft: &mut Staged) -> Result<()> {
-        let capacity = self.sb.extent_capacity();
-        let n = self.sb.extent_count();
-        for _ in 0..n {
+        let capacity = self.main_sb.extent_capacity();
+        // 全池 extent 数(单设备 = 原语义;多设备 = Σ)
+        let total: u64 = self.devices.iter().map(|d| d.extent_count).sum();
+        for _ in 0..total {
             let id = self.alloc.allocate(draft, 1)?.remove(0);
             self.note_alloc(1);
             let (max_end, live_sum, holders) = self.live_extent_occupancy(id as u32)?;
             if max_end == 0 {
                 self.alloc.mark_open(id);
-                self.open_extent = Some(OpenExtent {
-                    extent_id: id as u32,
-                    watermark: 0,
-                    committed_end: 0,
-                    participants: 1,
-                });
+                self.open_open_extent(id, 0, 0, 1);
                 return Ok(());
             }
             self.alloc.restore_occupancy(id, live_sum, holders.max(1));
             let wm = align_up(max_end as u64, SECTOR_SIZE);
             if wm < capacity {
                 self.alloc.mark_open(id);
-                self.open_extent = Some(OpenExtent {
-                    extent_id: id as u32,
-                    watermark: wm as u32,
-                    committed_end: wm as u32,
-                    // 快照仍有持有者:封口必须走打包头,不得判独占
-                    participants: holders.max(2),
-                });
+                // 快照仍有持有者:封口必须走打包头,不得判独占
+                self.open_open_extent(id, wm as u32, wm as u32, holders.max(2));
                 return Ok(());
             }
             self.alloc.mark_sealed(id);
         }
         Err(Error::NoSpace)
+    }
+
+    /// 设置某设备的开放 extent(每设备一个;`cur_device` 跟随落位)。
+    fn open_open_extent(&mut self, id: u64, watermark: u32, committed: u32, participants: u32) {
+        let (di, _) = self.resolve_extent(id);
+        self.cur_device = di;
+        self.open_extents[di] = Some(OpenExtent {
+            extent_id: id as u32,
+            watermark,
+            committed_end: committed,
+            participants,
+        });
+    }
+
+    /// 封口某设备的开放 extent(写头 + 状态 Sealed;数据之后写,防撕裂)。
+    ///
+    /// 封口类型(ADR-9 §5.2):仅 1 个对象且写满 → 独占(头带完整 CRC 表);
+    /// 其余 → 打包(空 CRC 表)。正常流程中"写满"由 end_segment 即时封口,
+    /// 此处防御性重算 CRC(仅封口判定 b / seal-on-delete / 优雅关闭)。
+    fn seal_open_extent_at(&mut self, di: usize) -> Result<()> {
+        let Some(oe) = self.open_extents[di].take() else {
+            return Ok(());
+        };
+        let capacity = self.devices[di].extent_capacity();
+        let full = oe.watermark as u64 >= capacity;
+        let exclusive = oe.participants == 1 && full;
+        if exclusive {
+            let crcs = self.compute_extent_crcs(oe.extent_id as u64, capacity)?;
+            self.write_extent_header(oe.extent_id, false, &crcs)?;
+        } else {
+            self.write_extent_header(oe.extent_id, true, &[])?;
+        }
+        self.alloc.mark_sealed(oe.extent_id as u64);
+        Ok(())
+    }
+
+    /// 写 extent 头(ADR-9 §4.2;M13 M1-2:经全局 id 推导所属设备)。
+    fn write_extent_header(
+        &mut self,
+        extent_id: u32,
+        packed: bool,
+        chunk_crcs: &[u32],
+    ) -> Result<()> {
+        let header = ExtentHeader {
+            generation: self.alloc.generation(extent_id as u64),
+            flags: if packed { EXTENT_FLAG_PACKED } else { 0 },
+            chunk_size: if packed { 0 } else { self.chunk_size as u32 },
+            chunk_crcs: if packed {
+                Vec::new()
+            } else {
+                chunk_crcs.to_vec()
+            },
+        };
+        let mut hbuf = fs3_device::AlignedBuffer::new(SECTOR_SIZE as usize)?;
+        hbuf.as_mut_slice().copy_from_slice(&header.encode());
+        let (di, _) = self.resolve_extent(extent_id as u64);
+        let off = self.extent_header_offset(extent_id as u64);
+        write_all(
+            &mut **self.io.lock().unwrap(),
+            self.devices[di].dev.raw_fd(),
+            hbuf.as_slice(),
+            off,
+        )?;
+        Ok(())
+    }
+
+    /// 读 extent 头;无头/撕裂头(CRC 不匹配)返回 None(恢复用;代数陈旧
+    /// 由调用方与分配器代数比较判定)。
+    fn read_extent_header(&self, extent_id: u64) -> Result<Option<ExtentHeader>> {
+        let mut hbuf = fs3_device::AlignedBuffer::new(SECTOR_SIZE as usize)?;
+        let (di, _) = self.resolve_extent(extent_id);
+        let off = self.extent_header_offset(extent_id);
+        read_exact(
+            &mut **self.io.lock().unwrap(),
+            self.devices[di].dev.raw_fd(),
+            hbuf.as_mut_slice(),
+            off,
+        )?;
+        match ExtentHeader::decode(hbuf.as_slice()) {
+            Ok(h) => Ok(Some(h)),
+            Err(_) => Ok(None),
+        }
     }
 
     /// 对象 + 未完成分片快照中 `extent_id` 的占用:(max_end, live_sum, holders)。
@@ -1392,71 +1777,9 @@ impl Engine {
     /// 封口类型(ADR-9 §5.2):仅 1 个对象且写满 → 独占(头带完整 CRC 表);
     /// 其余 → 打包(空 CRC 表)。正常流程中"写满"由 end_segment 即时封口,
     /// 此处防御性重算 CRC(仅封口判定 b / seal-on-delete / 优雅关闭)。
-    fn seal_open_extent(&mut self) -> Result<()> {
-        let Some(oe) = self.open_extent.take() else {
-            return Ok(());
-        };
-        let capacity = self.sb.extent_capacity();
-        let full = oe.watermark as u64 >= capacity;
-        let exclusive = oe.participants == 1 && full;
-        if exclusive {
-            let crcs = self.compute_extent_crcs(oe.extent_id as u64, capacity)?;
-            self.write_extent_header(oe.extent_id, false, &crcs)?;
-        } else {
-            self.write_extent_header(oe.extent_id, true, &[])?;
-        }
-        self.alloc.mark_sealed(oe.extent_id as u64);
-        Ok(())
-    }
-
-    /// 写 extent 头(ADR-9 §4.2)。
-    fn write_extent_header(
-        &mut self,
-        extent_id: u32,
-        packed: bool,
-        chunk_crcs: &[u32],
-    ) -> Result<()> {
-        let header = ExtentHeader {
-            generation: self.alloc.generation(extent_id as u64),
-            flags: if packed { EXTENT_FLAG_PACKED } else { 0 },
-            chunk_size: if packed { 0 } else { self.chunk_size as u32 },
-            chunk_crcs: if packed {
-                Vec::new()
-            } else {
-                chunk_crcs.to_vec()
-            },
-        };
-        let mut hbuf = fs3_device::AlignedBuffer::new(SECTOR_SIZE as usize)?;
-        hbuf.as_mut_slice().copy_from_slice(&header.encode());
-        let off = self.sb.data_start + extent_id as u64 * self.sb.extent_size;
-        write_all(
-            &mut **self.io.lock().unwrap(),
-            self.device.raw_fd(),
-            hbuf.as_slice(),
-            off,
-        )?;
-        Ok(())
-    }
-
-    /// 读 extent 头;无头/撕裂头(CRC 不匹配)返回 None(恢复用;代数陈旧
-    /// 由调用方与分配器代数比较判定)。
-    fn read_extent_header(&self, extent_id: u64) -> Result<Option<ExtentHeader>> {
-        let mut hbuf = fs3_device::AlignedBuffer::new(SECTOR_SIZE as usize)?;
-        let off = self.sb.data_start + extent_id * self.sb.extent_size;
-        read_exact(
-            &mut **self.io.lock().unwrap(),
-            self.device.raw_fd(),
-            hbuf.as_mut_slice(),
-            off,
-        )?;
-        match ExtentHeader::decode(hbuf.as_slice()) {
-            Ok(h) => Ok(Some(h)),
-            Err(_) => Ok(None),
-        }
-    }
-
     /// 重算 extent 数据区全部 64KiB 网格 CRC(恢复期补写独占头用)。
     fn compute_extent_crcs(&self, extent_id: u64, capacity: u64) -> Result<Vec<u32>> {
+        let (di, _) = self.resolve_extent(extent_id);
         let base = self.extent_data_offset(extent_id);
         let mut crcs = Vec::new();
         let mut off = 0u64;
@@ -1466,7 +1789,7 @@ impl Engine {
             let mut buf = fs3_device::AlignedBuffer::new(read_len)?;
             read_exact(
                 &mut **self.io.lock().unwrap(),
-                self.device.raw_fd(),
+                self.devices[di].dev.raw_fd(),
                 buf.as_mut_slice(),
                 base + off,
             )?;
@@ -1482,9 +1805,12 @@ impl Engine {
     /// (M11 G-2 SSE GCM 失败)。
     fn abort_draft(&mut self, draft: &Staged) {
         self.alloc.rollback(draft);
-        if let Some(oe) = &self.open_extent {
-            if !self.alloc.test_bit(oe.extent_id as u64) {
-                self.open_extent = None;
+        for oe in self.open_extents.iter_mut() {
+            let drop_oe = oe
+                .as_ref()
+                .is_some_and(|o| !self.alloc.test_bit(o.extent_id as u64));
+            if drop_oe {
+                *oe = None;
             }
         }
     }
@@ -1492,31 +1818,29 @@ impl Engine {
     /// release_object 后调用(所有释放段路径):开放 extent 内部出现死段 →
     /// 封口(seal-on-delete,ADR-9 §5.4);若活段全部消亡(位图已清)则丢弃,
     /// 防止后续写入落到已释放 extent(内联覆盖等路径必须调用)。
+    /// M13 M1-2:遍历全部设备的开放 extent(released 段可能落在任一设备)。
     fn after_release(&mut self, released: &[Segment]) -> Result<()> {
-        let hit_open = self
-            .open_extent
-            .as_ref()
-            .map(|oe| released.iter().any(|s| s.extent_id == oe.extent_id))
-            .unwrap_or(false);
-        if !hit_open {
-            return Ok(());
-        }
-        let still_allocated = self
-            .open_extent
-            .as_ref()
-            .map(|oe| self.alloc.test_bit(oe.extent_id as u64))
-            .unwrap_or(false);
-        if still_allocated {
-            self.seal_open_extent()?;
-        } else {
-            self.open_extent = None;
+        // 先收集受影响的 (设备序, extent id),避免迭代中 &mut 冲突
+        let affected: Vec<(usize, u32)> = self
+            .open_extents
+            .iter()
+            .enumerate()
+            .filter_map(|(di, oe)| {
+                let oe = oe.as_ref()?;
+                released
+                    .iter()
+                    .any(|s| s.extent_id == oe.extent_id)
+                    .then_some((di, oe.extent_id))
+            })
+            .collect();
+        for (di, extent_id) in affected {
+            if self.alloc.test_bit(extent_id as u64) {
+                self.seal_open_extent_at(di)?;
+            } else {
+                self.open_extents[di] = None;
+            }
         }
         Ok(())
-    }
-
-    /// extent 数据区在设备上的偏移。
-    fn extent_data_offset(&self, extent_id: u64) -> u64 {
-        self.sb.data_start + extent_id * self.sb.extent_size + EXTENT_HEADER_SIZE
     }
 
     /// 批量读设备区间 `[dev_off, dev_off+len)`:4KiB 对齐裁剪,每批 ≤16×64KiB
@@ -1527,6 +1851,7 @@ impl Engine {
     /// 读范围与逐块路径逐字节一致(末块对齐补读)。
     fn read_batched_blocks(
         &self,
+        fd: i32,
         dev_off: u64,
         len: usize,
         mut emit: impl FnMut(&[u8]) -> Result<()>,
@@ -1555,7 +1880,7 @@ impl Engine {
                 }
                 {
                     let mut io = self.io.lock().unwrap();
-                    read_exact_batch(&mut **io, self.device.raw_fd(), blocks)?;
+                    read_exact_batch(&mut **io, fd, blocks)?;
                 }
                 for i in 0..n_blocks {
                     let off = block_off + (i as u64) * chunk as u64;
@@ -1702,7 +2027,8 @@ impl Engine {
                 // 批量读:整段 ≤16×64KiB 一批,一次 submit(调用栈优化)
                 let dev_off =
                     self.extent_data_offset(seg.extent_id as u64) + seg.offset as u64 + payload_off;
-                written += self.read_batched_blocks(dev_off, len, |data| {
+                let fd = self.device_fd_of(seg.extent_id as u64);
+                written += self.read_batched_blocks(fd, dev_off, len, |data| {
                     out.write_all(data)?;
                     Ok(())
                 })? as u64;
@@ -1751,7 +2077,7 @@ impl Engine {
                 let dev_off = self.extent_data_offset(seg.extent_id as u64) + chunk_start;
                 read_exact(
                     &mut **self.io.lock().unwrap(),
-                    self.device.raw_fd(),
+                    self.device_fd_of(seg.extent_id as u64),
                     cbuf.as_mut_slice(),
                     dev_off,
                 )?;
@@ -1783,7 +2109,7 @@ impl Engine {
                     self.extent_data_offset(seg.extent_id as u64) + seg.offset as u64 + chunk_start;
                 read_exact(
                     &mut **self.io.lock().unwrap(),
-                    self.device.raw_fd(),
+                    self.device_fd_of(seg.extent_id as u64),
                     cbuf.as_mut_slice(),
                     dev_off,
                 )?;
@@ -1942,7 +2268,8 @@ impl Engine {
             let dev_base =
                 self.extent_data_offset(seg.extent_id as u64) + seg.offset as u64 + in_seg;
             // 批量读(调用栈优化:一次 submit,无每块堆分配)
-            let n = self.read_batched_blocks(dev_base, take, |data| {
+            let fd = self.device_fd_of(seg.extent_id as u64);
+            let n = self.read_batched_blocks(fd, dev_base, take, |data| {
                 buf[done..done + data.len()].copy_from_slice(data);
                 done += data.len();
                 Ok(())
@@ -3491,7 +3818,7 @@ impl Engine {
                 let mut rbuf = fs3_device::AlignedBuffer::new(block_len)?;
                 read_exact(
                     &mut **self.io.lock().unwrap(),
-                    self.device.raw_fd(),
+                    self.device_fd_of(seg.extent_id as u64),
                     rbuf.as_mut_slice(),
                     block_off,
                 )?;
@@ -4216,18 +4543,24 @@ impl Engine {
         Ok(Some(segs))
     }
 
-    /// 设备 fd(零拷贝 sendfile/splice 用)。
+    /// 设备 fd 列表(零拷贝 sendfile/splice 用;M13 M1-2:每设备一个)。
+    pub fn device_fds(&self) -> Vec<i32> {
+        self.devices.iter().map(|s| s.dev.raw_fd()).collect()
+    }
+
+    /// 主设备(0)fd(单设备池兼容;零拷贝收信白名单注册用)。
     pub fn device_fd(&self) -> i32 {
-        self.device.raw_fd()
+        self.devices[0].dev.raw_fd()
     }
 
     /// 就绪探针(M6 / K2):无副作用写回超级块扇区(pread → pwrite 同内容),
-    /// 验证设备当前真实可写。设备只读/掉盘/IO 故障 → Err → /ready 503。
+    /// 验证当前活动设备真实可写。设备只读/掉盘/IO 故障 → Err → /ready 503。
     /// 不改变任何字节:写回的是刚读出的同一内容,崩溃安全。
     pub fn probe_writable(&self) -> fs3_core::Result<()> {
         let mut buf = fs3_device::AlignedBuffer::new(fs3_core::SUPERBLOCK_SIZE as usize)?;
-        self.device.pread_aligned(buf.as_mut_slice(), 0)?;
-        self.device.pwrite_aligned(buf.as_slice(), 0)?;
+        let dev = &self.devices[0].dev;
+        dev.pread_aligned(buf.as_mut_slice(), 0)?;
+        dev.pwrite_aligned(buf.as_slice(), 0)?;
         Ok(())
     }
 
@@ -4254,9 +4587,14 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// 零拷贝 fd(sendfile/splice;None = 不可用)。
+    /// 当前活动设备的零拷贝 fd(sendfile/splice;None = 不可用)。
     pub fn zc_fd(&self) -> Option<i32> {
-        self.zc_fd
+        self.zc_fds[self.cur_device]
+    }
+
+    /// 全部设备的零拷贝 fd(M13 M1-2;http 层收信白名单注册用)。
+    pub fn zc_fds(&self) -> Vec<Option<i32>> {
+        self.zc_fds.clone()
     }
 
     /// 设备降级标志(M4 D4):掉盘/连续 IO 故障 → true;粘性,重启清除。
@@ -4314,9 +4652,10 @@ impl Engine {
         Ok(())
     }
 
-    /// 设备是否为普通文件(决定 sendfile vs splice)。
+    /// 设备是否为普通文件(决定 sendfile vs splice;主设备口径,M13 M4-2
+    /// 起逐设备视图)。
     pub fn device_is_file(&self) -> bool {
-        self.device.is_file()
+        self.devices[0].dev.is_file()
     }
 
     // ─────────────────────────── CHECK ───────────────────────────
@@ -4335,11 +4674,12 @@ impl Engine {
         }
         let last_seq = self.meta.last_seq()?;
         let cp_seq = self.checkpoint.lock().unwrap().seq;
+        let main = &self.devices[0];
         Ok(CheckReport {
-            device: self.device.path().display().to_string(),
-            device_capacity: self.device.capacity(),
-            extent_size: self.sb.extent_size,
-            extent_count: self.sb.extent_count(),
+            device: main.dev.path().display().to_string(),
+            device_capacity: main.sb.data_end,
+            extent_size: main.sb.extent_size,
+            extent_count: self.alloc.len(),
             allocated_extents: self.alloc.allocated_count(),
             buckets: buckets.len(),
             objects,
@@ -4385,10 +4725,10 @@ impl Engine {
             }
         }
         let report = LeakRepairReport {
-            scanned: self.sb.extent_count(),
+            scanned: self.alloc.len(),
             leaks_found: leaks.len() as u64,
             freed_extents: freed,
-            bytes_reclaimed: freed * self.sb.extent_size,
+            bytes_reclaimed: freed * self.main_sb.extent_size,
             skipped_locked,
         };
         if freed == 0 {
@@ -5036,7 +5376,7 @@ impl ExtentWriter {
 
     /// 开始新段:记录段起点(当前 watermark),重置段 CRC 网格。
     fn begin_segment(&mut self, engine: &Engine) {
-        let oe = engine.open_extent.as_ref().expect("open extent");
+        let oe = engine.cur_open().expect("open extent");
         self.seg_offset = oe.watermark;
         self.seg_partial = 0;
         self.seg_fill = 0;
@@ -5088,7 +5428,7 @@ impl ExtentWriter {
     /// 段 CRC/全对象 crc_acc/MD5 均落密文,DE2)。
     fn feed_bytes(&mut self, engine: &mut Engine, draft: &mut Staged, data: &[u8]) -> Result<()> {
         if self.capacity == 0 {
-            self.capacity = engine.sb.extent_capacity();
+            self.capacity = engine.main_sb.extent_capacity();
         }
         let chunk_size = self.chunk_size;
         let capacity = self.capacity;
@@ -5099,31 +5439,31 @@ impl ExtentWriter {
                 self.started = true;
                 // 封口判定 b:剩余空间 < 32KiB → 封口,下个对象用新 extent
                 engine.rotate_for_new_object()?;
-                if let Some(oe) = engine.open_extent.as_mut() {
+                if let Some(oe) = engine.cur_open_mut() {
                     // 对象首字节写入既有开放 extent:参与者 +1
                     oe.participants += 1;
                     self.begin_segment(engine);
                 }
             }
-            if engine.open_extent.is_none() {
+            if engine.cur_open().is_none() {
                 engine.open_new_extent(draft)?;
                 self.begin_segment(engine);
             }
             // 攒批 flush:acc 满 64KiB,或 extent 将满
             let need_flush = {
-                let oe = engine.open_extent.as_ref().unwrap();
+                let oe = engine.cur_open().unwrap();
                 self.fill == chunk_size || oe.watermark as u64 + self.fill as u64 >= capacity
             };
             if need_flush {
                 engine.flush_acc(self)?;
                 // extent 写满 → 段结束 + 封口(对象尾部跨界续写,ADR-9 D2)
-                if engine.open_extent.as_ref().unwrap().watermark as u64 >= capacity {
+                if engine.cur_open().unwrap().watermark as u64 >= capacity {
                     engine.end_segment(self)?;
                 }
                 continue;
             }
             let space = {
-                let oe = engine.open_extent.as_ref().unwrap();
+                let oe = engine.cur_open().unwrap();
                 (capacity - oe.watermark as u64 - self.fill as u64) as usize
             };
             let take = (n - off).min(space).min(chunk_size - self.fill);
@@ -5150,14 +5490,13 @@ impl ExtentWriter {
         }
         // 输入恰好把 extent 写满:走正常封口判定(独占 vs 打包)
         let full = engine
-            .open_extent
-            .as_ref()
-            .map(|oe| oe.watermark as u64 >= engine.sb.extent_capacity())
+            .cur_open()
+            .map(|oe| oe.watermark as u64 >= engine.main_sb.extent_capacity())
             .unwrap_or(false);
         if full {
             engine.end_segment(&mut self)?;
         }
-        if let Some(oe) = engine.open_extent.as_ref() {
+        if let Some(oe) = engine.cur_open() {
             // 当前段收尾(未写满 → 打包:段 CRC 随元数据)
             if self.seg_fill > 0 {
                 self.seg_crcs.push(self.seg_partial);
@@ -5175,9 +5514,10 @@ impl ExtentWriter {
                 crcs: std::mem::take(&mut self.seg_crcs),
             });
         }
-        // sync_mode=full:数据 fsync 后再提交元数据
+        // sync_mode=full:数据 fsync 后再提交元数据(当前活动设备)
         if engine.meta.sync_mode() == SyncMode::Full {
-            fsync(&mut **engine.io.lock().unwrap(), engine.device.raw_fd())?;
+            let fd = engine.cur_slot().1.dev.raw_fd();
+            fsync(&mut **engine.io.lock().unwrap(), fd)?;
         }
         let etag: [u8; 16] = match self.hasher.take() {
             Some(h) => h.finalize().into(),
@@ -5357,35 +5697,42 @@ fn write_extent_header_raw(
     Ok(())
 }
 
-/// 开放 extent 识别与续写(ADR-9 §5.7 第 5 步):
+/// 开放 extent 识别与续写(ADR-9 §5.7 第 5 步;M13 M1-2 每设备独立执行):
 /// - 候选 = 已分配、有活段、头缺失或代数陈旧(崩溃时未封口);
 /// - 写满候选(watermark == 容量)→ 立即补写头(独占重算 CRC / 打包);
 /// - 其余候选:取 watermark(活段最大 end)最大者续写为开放 extent,
 ///   多余的补打包头(压缩 worker 崩溃残留等);
 /// - 跨崩溃会话孤儿区 [旧 watermark, 旧 written_end) 无活段,新追加自然覆盖。
+///
+/// `base/count` = 本设备在池中的全局 id 区间;头读写用本地 id,位图/水位
+/// 用全局 id(max_end 键 = 全局 id)。
 fn resume_open_extent(
     alloc: &Allocator,
     dev: &dyn BlockDevice,
     sb: &fs3_core::SuperBlock,
+    base: u64,
+    count: u64,
     max_end: &HashMap<u64, u32>,
 ) -> Result<Option<OpenExtent>> {
     let capacity = sb.extent_capacity();
-    let mut candidates: Vec<u64> = Vec::new();
-    for id in 0..alloc.len() {
+    let mut candidates: Vec<u64> = Vec::new(); // 本地 id
+    for local in 0..count {
+        let id = base + local;
         if !alloc.test_bit(id) || alloc.live_bytes_of(id) == 0 {
             continue;
         }
-        let header = read_extent_header_raw(dev, sb, id)?;
+        let header = read_extent_header_raw(dev, sb, local)?;
         let valid = header
             .as_ref()
             .map(|h| h.generation == alloc.generation(id))
             .unwrap_or(false);
         if !valid {
-            candidates.push(id);
+            candidates.push(local);
         }
     }
-    let mut resumed: Option<(u64, u32)> = None;
-    for &id in &candidates {
+    let mut resumed: Option<(u64, u32)> = None; // 全局 id
+    for &local in &candidates {
+        let id = base + local;
         // 物理水位 = 逻辑段端点的 4KiB 对齐上界:段长记实际字节而 flush_acc
         // 按 align_up(尾块) 推进 watermark(尾垫补零),恢复必须重建同一物理
         // 水位——否则崩溃后首个追加落在非 4KiB 对齐偏移,O_DIRECT 在
@@ -5393,15 +5740,16 @@ fn resume_open_extent(
         let me = align_up(max_end.get(&id).copied().unwrap_or(0) as u64, SECTOR_SIZE) as u32;
         if me as u64 >= capacity {
             // 写满未封口:补写头(独占:重算 CRC;打包:空表)
-            seal_at_recovery(alloc, dev, sb, id)?;
+            seal_at_recovery(alloc, dev, sb, local)?;
         } else if resumed.is_none_or(|(_, wm)| me > wm) {
             resumed = Some((id, me));
         }
     }
-    for &id in &candidates {
+    for &local in &candidates {
+        let id = base + local;
         let me = align_up(max_end.get(&id).copied().unwrap_or(0) as u64, SECTOR_SIZE) as u32;
         if (me as u64) < capacity && resumed != Some((id, me)) {
-            seal_at_recovery(alloc, dev, sb, id)?;
+            seal_at_recovery(alloc, dev, sb, local)?;
         }
     }
     Ok(resumed.map(|(id, wm)| OpenExtent {
@@ -5454,20 +5802,21 @@ impl Engine {
         // 全对象 CRC32C(etag=fast 出 ETag;始终累积,零额外成本)
         w.crc_acc = crc32c(data, w.crc_acc);
         let (extent_id, watermark) = {
-            let oe = self.open_extent.as_mut().expect("open extent");
+            let oe = self.cur_open_mut().expect("open extent");
             (oe.extent_id, oe.watermark)
         };
         let dev_off = self.extent_data_offset(extent_id as u64) + watermark as u64;
+        let (di, _) = self.resolve_extent(extent_id as u64);
         write_all(
             &mut **self.io.lock().unwrap(),
-            self.device.raw_fd(),
+            self.devices[di].dev.raw_fd(),
             &w.acc.as_slice()[..write_len],
             dev_off,
         )?;
         // watermark 按 4KiB 对齐推进(段起点恒对齐,O_DIRECT 写安全);
         // 段长按实际数据字节(与 v1 CRC 语义逐字节一致)。对齐间隙 = 死区,
         // 浪费 ≤ 4KiB/对象(ADR-9 D1)。
-        self.open_extent.as_mut().unwrap().watermark += write_len as u32;
+        self.cur_open_mut().unwrap().watermark += write_len as u32;
         w.seg_written += fill as u32;
         if let Some(h) = w.hasher.as_mut() {
             h.update(data);
@@ -5485,8 +5834,9 @@ impl Engine {
             w.seg_partial = 0;
             w.seg_fill = 0;
         }
-        let oe = self.open_extent.take().expect("open extent");
-        let capacity = self.sb.extent_capacity();
+        let di = self.cur_device;
+        let oe = self.open_extents[di].take().expect("open extent");
+        let capacity = self.devices[di].extent_capacity();
         debug_assert_eq!(
             oe.watermark as u64, capacity,
             "end_segment requires full extent"

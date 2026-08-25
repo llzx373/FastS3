@@ -17,7 +17,7 @@ fn setup() -> (tempfile::TempDir, Arc<S3Service>) {
         .unwrap();
     fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
     let cfg = fs3_engine::EngineConfig {
-        device: img,
+        devices: vec![img],
         meta_dir: dir.path().join("meta"),
         ..Default::default()
     };

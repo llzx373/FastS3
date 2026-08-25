@@ -2041,9 +2041,7 @@ impl MetaStore {
     /// 写池清单(直写 + fsync,同 trusted_clock 先例;调用方持引擎写锁/
     /// 设备变更单点——device-add/remove 必须全量替换后落盘)。
     pub fn save_pool(&self, m: &fs3_core::pool::PoolManifest) -> Result<()> {
-        self.db
-            .put(SYS_POOL, encode(m)?)
-            .map_err(rocks_err)?;
+        self.db.put(SYS_POOL, encode(m)?).map_err(rocks_err)?;
         self.db.flush_wal(true).map_err(rocks_err)
     }
 
