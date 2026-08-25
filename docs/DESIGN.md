@@ -673,6 +673,112 @@ nonce 同明文 ⇒ 密文逐字节相同(零新信息泄漏)⇒ ETag 稳定(幂
   元素 → InvalidArgument,测试矩阵钉住不静默。
 ---
 
+#### ADR-13(M12 立项决策):Object Lock / WORM 与可信时钟
+
+**背景**:M12「Object Lock / WORM」(v1.3.0;TODO M12)立项。本 ADR 按推荐
+方案落盘 DESIGN-FUTURE §5.3/§11 决策清单的 DL6~DL8,并裁决实施期发现的
+设计空档(字段不重排、时钟重启重基线、bypass 授权与 Condition 键形态)。
+详细论证见 [DESIGN-FUTURE.md](./DESIGN-FUTURE.md) §5。
+
+**DL6(可信时钟)**:方案 a——**持久化 wall+mono 对 + 单调推导 + 回拨取下界**。
+否决 b(外部 NTP/TPM 时间源:单机产品不引入外部依赖)与 c(墙钟 + 强化告警:
+窗口期仍可提前解除保留)。
+
+持久化键 `s:trusted_clock`(既有 `s:` 前缀下的新系统键,不新增前缀,故
+keys.rs 前缀表 / meta-export DTO / check 可达性扫描三处联动不适用)。值 =
+postcard `TrustedClockState{last_wall: i64(unix 秒), last_mono_ns: i64
+(CLOCK_MONOTONIC 纳秒)}`。引擎启动与每次检查点刷新。
+
+采样与公式(秒级,与 `Retention.retain_until` 同单位):
+
+- `trusted_now = last_wall + (mono_now_ns − last_mono_ns) / 1e9`
+- 保留到期判定:`until ≤ max(wall_now, trusted_now)` 时到期
+- 刷新/重基线:`last_wall' = max(wall_now, trusted_now)`,`last_mono_ns' = mono_now_ns`
+  (墙钟前跳则追上墙钟;回拨则沿用单调推导,回拨不缩短任何剩余保留)
+- 首次启动(键缺席):以当前墙钟+单调时钟为初值落盘
+
+**重启重基线(实施期补遗)**:`CLOCK_MONOTONIC` 在开机后从 0 起算,跨停机的
+`last_mono_ns` 无意义。启动时**丢弃旧 mono、保留 `last_wall` 高水位**:
+`last_wall' = max(wall_now, persisted.last_wall)`,`last_mono_ns' = 本进程
+当前 CLOCK_MONOTONIC`。因此跨停机的墙钟回拨仍以持久化 `last_wall` 为下界;
+停机期间墙钟前跳则启动时追上。
+
+**承诺边界(文档化,不可静默扩大)**:FastS3 保证**运行期内**时钟单调
+(防回拨解除保留);**跨停机的时间篡改**依赖部署 NTP/chrony 基线——初次
+启动前或冷启动时把墙钟拨到未来再拨回,持久化下界只能防「低于 last_wall」
+的回拨,不能证明停机窗外的墙钟未被拨快。该边界写入运维文档与 ADR,不
+作为「防物理接触攻击」承诺。
+
+测试钩子:引擎暴露墙钟/单调时钟注入(仅测试构建),供 W5-2 回拨 1h/1d
+自动化断言 COMPLIANCE 保留不可缩短。
+
+**DL7(治理 bypass 授权)**:策略引擎扩展最小集,超集仍解析错误(红线:
+静默忽略未知 Condition = 拒绝合入)。
+
+1. **动作** `s3:BypassGovernanceRetention`:带
+   `x-amz-bypass-governance-retention: true` 头的 GOVERNANCE 缩短/删除
+   必须通过该动作授权;无头则 GOVERNANCE 删除/缩短一律 403,与策略无关。
+2. **Condition 键**(两个):
+   - `s3:ObjectLockRemainingRetentionDays`(NumericEquals/NumericLessThan/
+     NumericGreaterThan 及 *Equals 变体):值为剩余整天数
+     (`ceil((until − lock_now) / 86400)`,已到期 = 0);
+   - `s3:BypassGovernanceRetention`(Bool/`StringEquals` true/false):请求
+     是否携带 bypass 头。
+3. **无密钥策略 = 隐式 `s3:*`**(既有并集语义):无策略密钥携带 bypass 头
+   即视为拥有 BypassGovernanceRetention;有策略则必须显式 Allow 该动作
+   (及 Condition 命中),否则 403。
+4. **强制审计**:bypass 成功与保留 until/mode 变更必须落审计(who/op/
+   bucket/key/until 前后值);缺审计字段 = 实现缺陷。违反授权即 403,
+   不落「成功」审计。
+
+**DL8(生命周期 × 锁)**:沿用 M11 L4-1 `lifecycle::is_locked`(retention
+未到期或 legal_hold)。执行器删除动作以可信时钟 `lock_now` 判定,跳过
+锁定对象并计 `LifecycleStats::skipped_locked` / Prometheus
+`fasts3_lifecycle_skipped_locked_total`。ExpiredObjectDeleteMarker 豁免
+(删除标记本身不受保留约束)。压缩/再平衡**可搬数据、不可删**锁定版本
+(§5.1 ③);再平衡属 M13,本里程碑只保证压缩 worker 不把锁定版本当泄漏
+回收。
+
+**字段不重排(实施期补遗,ADR-11 D0 纪律)**:DESIGN-FUTURE §5.2 行文
+`BucketMeta.object_lock: Option<ObjectLockConfig>` 会把已落盘的 `bool`
+改成嵌套结构,破坏存量 v2 解码。裁决:
+
+- 保持 ADR-11 预留的 `object_lock: bool`(启用后不可关闭);
+- **尾部追加** `default_retention: Option<ObjectLockDefaultRetention
+  {mode, Days|Years, n}>`;解码先新结构、失败回退无该字段的 v2 形态
+  (与 `created_with_acl` 双读同模式),**不 bump** `BUCKET_META_VERSION`;
+- `ObjectMeta.retention` / `legal_hold` 已由 D0 预留,本里程碑只填充不
+  改版;保留按版本存,覆盖写产生的新版本不继承旧版本保留(未带头时继承
+  **桶默认**保留,AWS 语义)。
+
+**协议面口径(以 AWS + s3-tests 为裁决,实施期对照)**:
+
+- 开启:CreateBucket 头 `x-amz-bucket-object-lock-enabled: true`,或对已有
+  桶 `PutObjectLockConfiguration`(`ObjectLockEnabled=Enabled`);Enabled
+  **不可逆**;开启**自动开启版本化且此后不可关**(PutBucketVersioning
+  Enabled→Off / Suspended 在锁桶上均拒绝);桶含锁定对象不可删。
+- 对象级:PUT 头 `x-amz-object-lock-mode` /
+  `x-amz-object-lock-retain-until-date` / `x-amz-object-lock-legal-hold`;
+  `Put/GetObjectRetention`(?retention)、`Put/GetObjectLegalHold`
+  (?legal-hold);未锁桶上这些头/API → 显式错误(不静默)。
+- 强制矩阵见 DESIGN-FUTURE §5.4:受保留版本 DELETE ?versionId → 403
+  AccessDenied;COMPLIANCE 仅可延长 until;GOVERNANCE + bypass 头 + 授权
+  可缩短/删除并强制审计;Legal Hold 与保留同时生效(取更严);PUT 覆盖 =
+  新版本,天然不改写旧版本。
+- 错误码对齐 AWS(Get 无配置 → `ObjectLockConfigurationNotFoundError` /
+  `NoSuchObjectLockConfiguration` 等),以 s3-tests 失败信息为最终裁决,
+  实施期补录不另开 ADR。
+
+**check --fix 锁感知(W4-2)**:泄漏回收仅释放「位图已分配且元数据不可达」
+的 extent。可达性扫描已含全部版本条目(`snapshot_all_objects`);锁定版本
+在元数据内 ⇒ 其段不是泄漏。防御性:sweep 前若某候选泄漏 extent 仍被任一
+未到期 retention / legal_hold 版本引用,拒绝释放并告警(实现缺陷信号,
+不得以 --fix 绕过 WORM)。
+
+**perf 口径**:锁判定在元数据层(读 `retention`/`legal_hold` + 一次
+`max(wall, trusted)` 比较),热路径无额外 I/O,目标 <1µs、无感。
+---
+
 ## 4. 存储引擎设计(Rust)
 
 ### 4.1 设备抽象

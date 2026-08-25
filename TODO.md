@@ -24,7 +24,7 @@
 | [M9 协议卫生与正确性补丁](#m9-v10x-协议卫生与正确性补丁) | v1.0.x | ≈2 周 | §3.7 九项协议修复 + 头显式化 + 列表/边界收敛 | ✅ 完成(v1.0.1,2026-08-22) |
 | [M10 版本控制](#m10-v110-版本控制--4-补全项) | v1.1.0 | ≈7 周 | Versioning/删除标记/条件写 + 标签/CORS/桶策略/POST 表单 | ✅ 完成(v1.1.0,2026-08-23) |
 | [M11 生命周期与加密](#m11-v120-生命周期与加密) | v1.2.0 | ≈7 周 | Lifecycle/SSE-C/SSE-S3/checksum/GetObjectAttributes/审计持久化 | ✅ 完成(v1.2.0,2026-08-25) |
-| [M12 Object Lock / WORM](#m12-v130-object-lock--worm) | v1.3.0 | ≈3 周 | 治理/合规保留 + 法定保留 + 可信时钟 | ⬜ 未开始 |
+| [M12 Object Lock / WORM](#m12-v130-object-lock--worm) | v1.3.0 | ≈3 周 | 治理/合规保留 + 法定保留 + 可信时钟 | 🔄 进行中 |
 | [M13 容量与底座](#m13-v140-容量与底座) | v1.4.0 | ≈6 周 | 多设备扩容/再平衡 + 元数据分区过渡 + zstd | ⬜ 未开始 |
 | [M14 集中纳管与生态](#m14-v200-集中纳管与生态) | v2.0.0 | ≈7 周 | agent 纳管/HTTP3/热缓存/Terraform·Operator 评估 | ⬜ 未开始 |
 | [远期 v2.x(方向性)](#远期-v2x方向性立项后再拆) | — | 立项后拆 | Select/通知/STS·LDAP/复制/Inventory | ⬜ 未开始 |
@@ -257,7 +257,7 @@
 > 首条任务 = ADR-13(可信时钟 + bypass 授权)。
 
 ### A0 决策落盘
-- [ ] A0-1 ADR-13 写入 DESIGN.md §3.3:DL6(可信时钟:持久化 wall+mono 对 + 单调推导 + 回拨取下界;停机期边界文档化)、DL7(策略 Condition 最小集:s3:BypassGovernanceRetention、s3:ObjectLockRemainingRetentionDays + bypass 强制审计)、DL8(生命周期跳过锁定对象)
+- [x] A0-1 ADR-13 写入 DESIGN.md §3.3:DL6(可信时钟:持久化 wall+mono 对 + 单调推导 + 回拨取下界;停机期边界文档化)、DL7(策略 Condition 最小集:s3:BypassGovernanceRetention、s3:ObjectLockRemainingRetentionDays + bypass 强制审计)、DL8(生命周期跳过锁定对象)
 
 ### W1 可信时钟(≈1 pw)
 - [ ] W1-1 持久化 `s:trusted_clock{last_wall,last_mono}` + CLOCK_MONOTONIC 推导;保留到期判定 = `until ≤ max(wall_now, trusted_now)`;回拨不缩短剩余保留
