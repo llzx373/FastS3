@@ -1068,17 +1068,27 @@ impl S3Service {
             return Err(S3Error::new(S3ErrorCode::InvalidArgument)
                 .with_message("SSE-S3 header is not accepted for this operation."));
         }
-        // M12 W2-3:对象级 Object Lock 头受理范围——PutObject /
-        // CreateMultipartUpload / CopyObject 写路径;PutObjectRetention
-        // 另受理 bypass 头。其余 op 携带 → 400(不静默)。
-        if !matches!(
+        // M12 W2-3/W2-4:对象级 Object Lock 头——写路径受理 mode/until/hold;
+        // PutObjectRetention / DELETE / DeleteObjects 仅受理 bypass。
+        // 其余 op 携带 → 400(不静默)。
+        let allow_lock_write = matches!(
             op,
             Operation::PutObject { .. }
                 | Operation::CreateMultipartUpload { .. }
                 | Operation::CopyObject { .. }
-                | Operation::PutObjectRetention { .. }
-        ) && crate::object_lock::has_object_lock_headers(&req.headers)
-        {
+        );
+        let allow_lock_bypass = allow_lock_write
+            || matches!(
+                op,
+                Operation::PutObjectRetention { .. }
+                    | Operation::DeleteObject { .. }
+                    | Operation::DeleteObjects { .. }
+            );
+        if crate::object_lock::has_disallowed_object_lock_headers(
+            &req.headers,
+            allow_lock_write,
+            allow_lock_bypass,
+        ) {
             return Err(S3Error::new(S3ErrorCode::InvalidArgument)
                 .with_message("Object Lock headers are not accepted for this operation."));
         }
@@ -1367,7 +1377,7 @@ impl S3Service {
                 bucket,
                 quiet,
                 keys,
-            } => Ok(self.op_delete_objects(&bucket, quiet, &keys)?),
+            } => Ok(self.op_delete_objects(req, &bucket, quiet, &keys)?),
         };
         // 统一补头
         let mut resp = resp?;
@@ -2103,7 +2113,8 @@ impl S3Service {
             return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
         }
         let objects = engine
-            .list_objects(bucket, "")
+            .meta()
+            .list_object_entries(bucket)
             .map_err(|e| map_engine_error(e, bucket, ""))?;
         if !objects.is_empty() {
             return Err(S3Error::new(S3ErrorCode::BucketNotEmpty));
@@ -5143,7 +5154,13 @@ impl S3Service {
                 .map_err(|e| map_engine_error(e, bucket, key))?;
         }
         let deleted = engine
-            .delete_version_for(bucket, key, vk, bkt.versioning)
+            .delete_version_with_lock(
+                bucket,
+                key,
+                vk,
+                bkt.versioning,
+                crate::object_lock::bypass_governance(&req.headers),
+            )
             .map_err(|e| map_engine_error(e, bucket, key))?;
         let mut headers: Vec<(String, String)> = Vec::new();
         match (&version_id, &deleted) {
@@ -5179,6 +5196,7 @@ impl S3Service {
     /// → 该条 PreconditionFailed 错误项。
     fn op_delete_objects(
         &self,
+        req: &S3Request,
         bucket: &str,
         quiet: bool,
         keys: &[xml::DeleteObjectEntry],
@@ -5290,7 +5308,13 @@ impl S3Service {
                     }
                 }
             }
-            match engine.delete_version_for(bucket, key, vk, bkt.versioning) {
+            match engine.delete_version_with_lock(
+                bucket,
+                key,
+                vk,
+                bkt.versioning,
+                crate::object_lock::bypass_governance(&req.headers),
+            ) {
                 Ok(d) => {
                     let mut de = xml::DeletedEntry {
                         key: key.to_string(),
@@ -5313,6 +5337,9 @@ impl S3Service {
                         _ => {}
                     }
                     deleted.push(de);
+                }
+                Err(CoreError::AccessDenied(_)) => {
+                    errors.push((key.to_string(), "AccessDenied", "Access Denied"))
                 }
                 Err(_) => errors.push((
                     key.to_string(),
@@ -5792,12 +5819,12 @@ fn rollback_put_version(
 ) {
     let r = match (versioning, meta.version_id) {
         (fs3_core::VersioningState::Enabled, Some(vk)) => {
-            engine.delete_version(bucket, key, Some(vk))
+            engine.delete_version_unlocked(bucket, key, Some(vk), versioning)
         }
         (fs3_core::VersioningState::Suspended, _) => {
-            engine.delete_version(bucket, key, Some(fs3_meta::keys::VK_NULL))
+            engine.delete_version_unlocked(bucket, key, Some(fs3_meta::keys::VK_NULL), versioning)
         }
-        _ => engine.delete(bucket, key),
+        _ => engine.delete_version_unlocked(bucket, key, None, versioning),
     };
     let _ = r;
 }
@@ -6072,6 +6099,7 @@ fn map_engine_error(e: CoreError, bucket: &str, key: &str) -> S3Error {
         CoreError::BadDigest(m) => S3Error::new(S3ErrorCode::BadDigest).with_message(m),
         // 复合无法合成等请求语义非法(M11 C1-4)→ 400 InvalidRequest
         CoreError::InvalidRequest(m) => S3Error::new(S3ErrorCode::InvalidRequest).with_message(m),
+        CoreError::AccessDenied(m) => S3Error::new(S3ErrorCode::AccessDenied).with_message(m),
         // 删除标记命中(未走显式判定的兜底路径;§3.4.3:无 versionId = 404)
         CoreError::DeleteMarker(_) => S3Error::new(S3ErrorCode::NoSuchKey)
             .with_extra("Key", key)
@@ -6573,7 +6601,8 @@ mod tests {
                 size: None,
             })
             .collect();
-        let r1000 = service.op_delete_objects("b1", true, &keys1000);
+        let empty = headers_req(&[]);
+        let r1000 = service.op_delete_objects(&empty, "b1", true, &keys1000);
         assert!(r1000.is_ok());
         let keys1001: Vec<xml::DeleteObjectEntry> = (0..1001)
             .map(|i| xml::DeleteObjectEntry {
@@ -6585,7 +6614,7 @@ mod tests {
             })
             .collect();
         let err = service
-            .op_delete_objects("b1", true, &keys1001)
+            .op_delete_objects(&empty, "b1", true, &keys1001)
             .unwrap_err();
         assert_eq!(err.code, S3ErrorCode::MalformedXML);
         assert_eq!(err.status(), 400);

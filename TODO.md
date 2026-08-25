@@ -267,7 +267,7 @@
 - [x] W2-1 ObjectMeta v3 retention/legal_hold 字段 + BucketMeta v2 object_lock 配置
 - [x] W2-2 Put/GetObjectLockConfiguration(Enabled 不可逆;**自动开启版本化且此后不可关**)+ 默认保留继承
 - [x] W2-3 对象级:PUT 头 `x-amz-object-lock-mode/retain-until-date/legal-hold`;Put/GetObjectRetention、Put/GetObjectLegalHold
-- [ ] W2-4 强制矩阵逐格实现(§5.4):受保留版本删除 → 403/409;COMPLIANCE 仅可延长;GOVERNANCE bypass 头;Legal Hold 最严优先;桶删除/版本化关闭拦截
+- [x] W2-4 强制矩阵逐格实现(§5.4):受保留版本删除 → 403/409;COMPLIANCE 仅可延长;GOVERNANCE bypass 头;Legal Hold 最严优先;桶删除/版本化关闭拦截
 
 ### W3 授权与审计(≈1 pw)
 - [x] W3-1 策略引擎 Condition 最小集(§5.3 DL7)+ `x-amz-bypass-governance-retention` 校验

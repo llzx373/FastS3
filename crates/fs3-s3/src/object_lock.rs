@@ -27,6 +27,25 @@ pub fn has_object_lock_headers(headers: &[(String, String)]) -> bool {
         .any(|n| hdr(headers, n).is_some())
 }
 
+/// 写路径(PUT/CreateMultipart/Copy)之外,仅 bypass 头合法
+/// (PutObjectRetention / DELETE / DeleteObjects)。
+pub fn has_disallowed_object_lock_headers(
+    headers: &[(String, String)],
+    allow_write: bool,
+    allow_bypass: bool,
+) -> bool {
+    if allow_write {
+        return false;
+    }
+    if [HDR_MODE, HDR_UNTIL, HDR_HOLD]
+        .iter()
+        .any(|n| hdr(headers, n).is_some())
+    {
+        return true;
+    }
+    !allow_bypass && hdr(headers, HDR_BYPASS).is_some()
+}
+
 pub fn parse_retention_mode(v: &str) -> Result<RetentionMode, S3Error> {
     match v {
         "GOVERNANCE" => Ok(RetentionMode::Governance),

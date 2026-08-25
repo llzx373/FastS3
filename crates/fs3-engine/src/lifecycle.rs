@@ -62,7 +62,8 @@ use std::time::{Duration, Instant};
 
 use fs3_core::audit::AuditRing;
 use fs3_core::{
-    Error, LifecycleFilter, LifecycleRule, LifecycleStatus, ObjectMeta, Result, VersioningState,
+    Error, LifecycleFilter, LifecycleRule, LifecycleStatus, ObjectMeta, Result, RetentionMode,
+    VersioningState,
 };
 use fs3_meta::keys::VK_NULL;
 use fs3_meta::{MetaStore, MultipartSession};
@@ -363,17 +364,40 @@ pub fn eval_session_abort(session: &MultipartSession, rules: &[LifecycleRule], n
         .any(|a| now >= days_deadline(session.created, a.days_after_initiation))
 }
 
-/// Object Lock 交互占位(M11 L4-1;DESIGN-FUTURE §5.4 强制矩阵接通点):
-/// 保留未到期(retain_until > now)或 legal_hold ⇒ 锁定。M12 才在写路径
-/// 填值,现状全量对象两字段恒 None/false ⇒ 恒 false;接口与检查点先行
-/// 落地,执行器逐删除动作调用(ExpiredObjectDeleteMarker 豁免——删除标记
-/// 清理不受锁影响)。
+/// Object Lock 删除拦截(M12 W2-4,DESIGN-FUTURE §5.4):Legal Hold 最严
+/// (bypass 无效);COMPLIANCE 未到期一律拒绝;GOVERNANCE 未到期仅在
+/// `bypass_governance` 时放行。删除标记不受保留约束。到期判定与
+/// [`is_locked`] 同口径(`now < retain_until`)。
+pub fn lock_blocks_delete(
+    meta: &ObjectMeta,
+    now: i64,
+    bypass_governance: bool,
+) -> Option<&'static str> {
+    if meta.is_delete_marker {
+        return None;
+    }
+    if meta.legal_hold {
+        return Some("object is under a legal hold and cannot be deleted");
+    }
+    let r = meta.retention.as_ref()?;
+    if now >= r.retain_until {
+        return None;
+    }
+    match r.mode {
+        RetentionMode::Compliance => {
+            Some("object is protected by Object Lock COMPLIANCE retention")
+        }
+        RetentionMode::Governance if bypass_governance => None,
+        RetentionMode::Governance => {
+            Some("object is protected by Object Lock GOVERNANCE retention")
+        }
+    }
+}
+
+/// 保留未到期或 legal_hold ⇒ 锁定(生命周期跳过 / 压缩防御)。删除标记
+/// 豁免。`bypass` 不进入此判定——生命周期不得绕过 GOVERNANCE。
 pub fn is_locked(meta: &ObjectMeta, now: i64) -> bool {
-    meta.legal_hold
-        || meta
-            .retention
-            .as_ref()
-            .is_some_and(|r| now < r.retain_until)
+    lock_blocks_delete(meta, now, false).is_some()
 }
 
 // ─────────────────────────── 执行器 ───────────────────────────
@@ -1301,6 +1325,21 @@ mod tests {
         m.retention = None;
         m.legal_hold = true;
         assert!(is_locked(&m, i64::MAX));
+        m.is_delete_marker = true;
+        assert!(!is_locked(&m, i64::MAX), "删除标记不受锁约束");
+        m.is_delete_marker = false;
+        m.legal_hold = false;
+        m.retention = Some(Retention {
+            mode: RetentionMode::Governance,
+            retain_until: 1000,
+        });
+        assert!(lock_blocks_delete(&m, 999, false).is_some());
+        assert!(lock_blocks_delete(&m, 999, true).is_none());
+        m.retention.as_mut().unwrap().mode = RetentionMode::Compliance;
+        assert!(
+            lock_blocks_delete(&m, 999, true).is_some(),
+            "COMPLIANCE 不可 bypass"
+        );
     }
 
     // ── 执行器集成(引擎级,手动触发一轮) ──

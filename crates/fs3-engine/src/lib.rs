@@ -498,6 +498,24 @@ impl Engine {
         clk.state.lock_now(wall, mono)
     }
 
+    /// 物理删除前的 WORM 门闩(M12 W2-4):`skip_lock` 仅 PUT 校验失败回滚。
+    fn deny_if_locked(
+        &self,
+        meta: &ObjectMeta,
+        bypass_governance: bool,
+        skip_lock: bool,
+    ) -> Result<()> {
+        if skip_lock {
+            return Ok(());
+        }
+        if let Some(msg) =
+            crate::lifecycle::lock_blocks_delete(meta, self.lock_now(), bypass_governance)
+        {
+            return Err(Error::AccessDenied(msg.into()));
+        }
+        Ok(())
+    }
+
     /// 当前可信时钟状态(测试/管理面)。
     pub fn trusted_clock_state(&self) -> TrustedClockState {
         self.trusted_clock.lock().unwrap().state
@@ -2133,7 +2151,58 @@ impl Engine {
             .get_bucket(bucket)?
             .map(|b| b.versioning)
             .unwrap_or_default();
-        self.delete_version_for(bucket, key, version, versioning)
+        self.delete_version_inner(bucket, key, version, versioning, false, false)
+    }
+
+    /// delete_version_for 的 GOVERNANCE bypass 形态(M12 W2-4):S3
+    /// `x-amz-bypass-governance-retention` 通过授权后传入 true。Legal Hold
+    /// / COMPLIANCE 仍拒绝。
+    pub fn delete_version_with_lock(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version: Option<[u8; 16]>,
+        versioning: VersioningState,
+        bypass_governance: bool,
+    ) -> Result<Option<ObjectMeta>> {
+        self.delete_version_inner(bucket, key, version, versioning, bypass_governance, false)
+    }
+
+    /// PUT 写后校验失败回滚:跳过 Object Lock(客户端从未看见成功)。
+    pub fn delete_version_unlocked(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version: Option<[u8; 16]>,
+        versioning: VersioningState,
+    ) -> Result<Option<ObjectMeta>> {
+        self.delete_version_inner(bucket, key, version, versioning, false, true)
+    }
+
+    fn delete_version_inner(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version: Option<[u8; 16]>,
+        versioning: VersioningState,
+        bypass_governance: bool,
+        skip_lock: bool,
+    ) -> Result<Option<ObjectMeta>> {
+        match (versioning, version) {
+            (VersioningState::Off, None) => {
+                self.delete_plain(bucket, key, bypass_governance, skip_lock)
+            }
+            (VersioningState::Off, Some(vk)) if vk == VK_NULL => {
+                self.delete_plain(bucket, key, bypass_governance, skip_lock)
+            }
+            (VersioningState::Off, Some(_)) => Err(Error::InvalidArgument(format!(
+                "version id specified for unversioned bucket {bucket}"
+            ))),
+            (_, None) => self.delete_current_marker(bucket, key, versioning),
+            (_, Some(vk)) => {
+                self.delete_object_version(bucket, key, &vk, bypass_governance, skip_lock)
+            }
+        }
     }
 
     /// delete_version 的桶状态感知形态(F-1 配套,V2 +1 次桶点读合并):
@@ -2147,17 +2216,7 @@ impl Engine {
         version: Option<[u8; 16]>,
         versioning: VersioningState,
     ) -> Result<Option<ObjectMeta>> {
-        match (versioning, version) {
-            (VersioningState::Off, None) => self.delete_plain(bucket, key),
-            // ?versionId=null 于 Off 桶 = 物理删未版本化单键(AWS:未版本化
-            // 对象的 VersionId 即 "null")
-            (VersioningState::Off, Some(vk)) if vk == VK_NULL => self.delete_plain(bucket, key),
-            (VersioningState::Off, Some(_)) => Err(Error::InvalidArgument(format!(
-                "version id specified for unversioned bucket {bucket}"
-            ))),
-            (_, None) => self.delete_current_marker(bucket, key, versioning),
-            (_, Some(vk)) => self.delete_object_version(bucket, key, &vk),
-        }
+        self.delete_version_inner(bucket, key, version, versioning, false, false)
     }
 
     /// 未版本化物理删除(旧路径原样):元数据 + 释放记录同事务;live_bytes
@@ -2166,11 +2225,18 @@ impl Engine {
     ///
     /// 兼作 `?versionId=null` 的遗留单键/null 族删除通道(D1a-4):条目为
     /// 删除标记时零 delta(标记本未入账;Off 桶不存在标记,旧口径不变)。
-    fn delete_plain(&mut self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>> {
+    fn delete_plain(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        bypass_governance: bool,
+        skip_lock: bool,
+    ) -> Result<Option<ObjectMeta>> {
         let meta = match self.meta.get_object(bucket, key)? {
             Some(m) => m,
             None => return Ok(None),
         };
+        self.deny_if_locked(&meta, bypass_governance, skip_lock)?;
         let mut draft = Staged::default();
         self.alloc.release_object(&mut draft, &meta.extents);
         // seal-on-delete:开放 extent 内出现死段 → 封口(保持"开放 extent 无洞")
@@ -2268,13 +2334,16 @@ impl Engine {
         bucket: &str,
         key: &str,
         vk: &[u8; 16],
+        bypass_governance: bool,
+        skip_lock: bool,
     ) -> Result<Option<ObjectMeta>> {
         if *vk == VK_NULL && self.meta.get_object(bucket, key)?.is_some() {
-            return self.delete_plain(bucket, key);
+            return self.delete_plain(bucket, key, bypass_governance, skip_lock);
         }
         let Some(meta) = self.meta.get_object_version(bucket, key, vk)? else {
             return Ok(None);
         };
+        self.deny_if_locked(&meta, bypass_governance, skip_lock)?;
         let mut draft = Staged::default();
         let mut delta = StatsDelta::default();
         if !meta.is_delete_marker {
@@ -2311,6 +2380,16 @@ impl Engine {
             return Err(Error::InvalidArgument(format!(
                 "bucket {name} not empty ({} objects)",
                 entries.len()
+            )));
+        }
+        // M12 W2-4:force 也不得回收锁定版本(WORM 红线;管理面/测试同口径)。
+        let now = self.lock_now();
+        if let Some((key, _, _)) = entries
+            .iter()
+            .find(|(_, _, m)| crate::lifecycle::lock_blocks_delete(m, now, false).is_some())
+        {
+            return Err(Error::AccessDenied(format!(
+                "bucket {name} contains Object Locked object {key}"
             )));
         }
         for (key, vk, meta) in entries {

@@ -3374,6 +3374,57 @@ fn delete_bucket_force_releases_all_versions() {
 }
 
 #[test]
+fn object_lock_blocks_version_delete_and_force_bucket() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    set_versioning(&e, VersioningState::Enabled);
+    let meta = e.put("b1", "k", &mut Cursor::new(vec![1u8; 32])).unwrap();
+    let vk = meta.version_id.unwrap();
+    e.set_object_retention(
+        "b1",
+        "k",
+        Some(&vk),
+        Some(fs3_core::Retention {
+            mode: fs3_core::RetentionMode::Governance,
+            retain_until: e.lock_now() + 86_400,
+        }),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            e.delete_version("b1", "k", Some(vk)),
+            Err(Error::AccessDenied(_))
+        ),
+        "GOVERNANCE 无 bypass 拒绝"
+    );
+    assert!(e
+        .delete_version_with_lock("b1", "k", Some(vk), VersioningState::Enabled, true)
+        .unwrap()
+        .is_some());
+    let meta = e.put("b1", "c", &mut Cursor::new(vec![2u8; 16])).unwrap();
+    let vk = meta.version_id.unwrap();
+    e.set_object_retention(
+        "b1",
+        "c",
+        Some(&vk),
+        Some(fs3_core::Retention {
+            mode: fs3_core::RetentionMode::Compliance,
+            retain_until: e.lock_now() + 86_400,
+        }),
+    )
+    .unwrap();
+    assert!(matches!(
+        e.delete_version_with_lock("b1", "c", Some(vk), VersioningState::Enabled, true),
+        Err(Error::AccessDenied(_))
+    ));
+    assert!(matches!(
+        e.delete_bucket("b1", true),
+        Err(Error::AccessDenied(_))
+    ));
+    e.close().unwrap();
+}
+
+#[test]
 fn unversioned_bucket_paths_untouched() {
     // D1 硬承诺:Off 桶路径零改动——无版本键残留、version_id 恒 None、
     // 带 versionId 删除被拒绝、DELETE 幂等。

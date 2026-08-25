@@ -82,6 +82,10 @@ pub enum Error {
     /// checksum 或算法不一致;S3 层映射 400 InvalidRequest)。
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+
+    /// Object Lock 阻止删除(M12 W2-4;S3 层映射 403 AccessDenied)。
+    #[error("access denied: {0}")]
+    AccessDenied(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

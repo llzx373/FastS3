@@ -7719,6 +7719,147 @@ fn object_lock_bypass_requires_policy_action() {
     assert_eq!(status(&r), 200, "{r:?}");
 }
 
+/// M12 W2-4:强制矩阵——DELETE ?versionId、Legal Hold、覆盖写、桶删除。
+#[test]
+fn object_lock_enforcement_matrix() {
+    let (_d, svc) = setup();
+    let ol = &[("object-lock", "")];
+    let hold_q = &[("legal-hold", "")];
+    let bypass = &[("x-amz-bypass-governance-retention", "true")];
+    assert_eq!(status(&svc.handle(&req("PUT", "/olk", vec![]))), 200);
+    let cfg = b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>".to_vec();
+    assert_eq!(status(&svc.handle(&req_q("PUT", "/olk", ol, cfg))), 200);
+
+    // 空锁桶可删
+    assert_eq!(status(&svc.handle(&req("PUT", "/empty-ol", vec![]))), 200);
+    assert_eq!(
+        status(&svc.handle(&req_q(
+            "PUT",
+            "/empty-ol",
+            ol,
+            b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>".to_vec()
+        ))),
+        200
+    );
+    assert_eq!(
+        status(&svc.handle(&req("DELETE", "/empty-ol", vec![]))),
+        204
+    );
+
+    let until = "2030-01-01T00:00:00.000Z";
+    let put_g = svc
+        .handle(&req_h(
+            "PUT",
+            "/olk/g",
+            &[
+                ("x-amz-object-lock-mode", "GOVERNANCE"),
+                ("x-amz-object-lock-retain-until-date", until),
+            ],
+            b"g".to_vec(),
+        ))
+        .unwrap();
+    let vid_g = hdr(&put_g, "x-amz-version-id").expect("version id");
+
+    // 无 versionId = 插删除标记,不删锁定版本
+    let r = svc.handle(&req("DELETE", "/olk/g", vec![]));
+    assert_eq!(status(&r), 204, "{r:?}");
+    assert_eq!(
+        hdr(&r.unwrap(), "x-amz-delete-marker").as_deref(),
+        Some("true")
+    );
+
+    // 覆盖写 = 新版本,200
+    let r = svc.handle(&req("PUT", "/olk/g", b"g2".to_vec()));
+    assert_eq!(status(&r), 200, "{r:?}");
+
+    // GOVERNANCE 定向删无 bypass → 403;带 bypass → 204
+    let r = svc.handle(&req_q(
+        "DELETE",
+        "/olk/g",
+        &[("versionId", vid_g.as_str())],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "AccessDenied", "{r:?}");
+    let r = svc.handle(&req_qh(
+        "DELETE",
+        "/olk/g",
+        &[("versionId", vid_g.as_str())],
+        bypass,
+        vec![],
+    ));
+    assert_eq!(status(&r), 204, "{r:?}");
+
+    // COMPLIANCE + bypass 仍 403
+    let put_c = svc
+        .handle(&req_h(
+            "PUT",
+            "/olk/c",
+            &[
+                ("x-amz-object-lock-mode", "COMPLIANCE"),
+                ("x-amz-object-lock-retain-until-date", until),
+            ],
+            b"c".to_vec(),
+        ))
+        .unwrap();
+    let vid_c = hdr(&put_c, "x-amz-version-id").unwrap();
+    let r = svc.handle(&req_qh(
+        "DELETE",
+        "/olk/c",
+        &[("versionId", vid_c.as_str())],
+        bypass,
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "AccessDenied", "{r:?}");
+
+    // Legal Hold 最严:bypass 不能删;OFF 后可删
+    let put_h = svc
+        .handle(&req_h(
+            "PUT",
+            "/olk/h",
+            &[("x-amz-object-lock-legal-hold", "ON")],
+            b"h".to_vec(),
+        ))
+        .unwrap();
+    let vid_h = hdr(&put_h, "x-amz-version-id").unwrap();
+    let r = svc.handle(&req_qh(
+        "DELETE",
+        "/olk/h",
+        &[("versionId", vid_h.as_str())],
+        bypass,
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "AccessDenied", "{r:?}");
+    assert_eq!(
+        status(&svc.handle(&req_q(
+            "PUT",
+            "/olk/h",
+            hold_q,
+            b"<LegalHold><Status>OFF</Status></LegalHold>".to_vec()
+        ))),
+        200
+    );
+    let r = svc.handle(&req_q(
+        "DELETE",
+        "/olk/h",
+        &[("versionId", vid_h.as_str())],
+        vec![],
+    ));
+    assert_eq!(status(&r), 204, "{r:?}");
+
+    // DeleteObjects 锁定版本 → 条目 AccessDenied
+    let body =
+        format!("<Delete><Object><Key>c</Key><VersionId>{vid_c}</VersionId></Object></Delete>");
+    let r = svc
+        .handle(&req_q("POST", "/olk", &[("delete", "")], body.into_bytes()))
+        .unwrap();
+    let xml = body_str(&r);
+    assert!(xml.contains("<Code>AccessDenied</Code>"), "{xml}");
+
+    // 桶含锁定对象不可删
+    let r = svc.handle(&req("DELETE", "/olk", vec![]));
+    assert_eq!(err_code(&r), "BucketNotEmpty", "{r:?}");
+}
+
 /// K1-4:SSE-KMS 显式拒绝矩阵(钉住,不静默)——aws:kms 算法值全入口
 /// 400 InvalidEncryptionAlgorithmError;KMS 参数头族 501 NotImplemented;
 /// PutBucketEncryption 的 KMSKeyID/BucketKeyEnabled 元素 400
