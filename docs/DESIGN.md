@@ -790,10 +790,11 @@ v1.4.0(多设备)/ v1.4.1(设备内元数据)/ v1.4.2(zstd)三个 minor 发布�
 **DM1(extent 地址空间)+ DM1'(映射形态)**:方案 a——**全局 extent id +
 推导式映射**。`extent_id` 保持全局单调编号(池内跨设备唯一),
 `Segment` **零改动**(对外仍是 u32 全局 id),对象元数据/COW/迁移事务
-全部不动。映射**不落额外账本**(原则 2:能派生的不持久化):由
-`设备序(= 池清单数组序)× 每设备 extent 数 + 本地序` 确定性推导;每设备
-extent 数取自该设备超块的 `data_start/data_end/extent_size`
-(`compute_layout` 反推),池清单 `s:pool` 仅持久化设备序与元信息
+全部不动。映射**不落额外账本**(原则 2:能派生的不持久化):按池清单
+数组序把各设备 extent 空间**连续拼接**——设备 i 的本地 extent `l` 的全局
+id = `Σ(设备 0..i−1 的 extent 数) + l`(设备序 = 池清单数组序;每设备
+extent 数取自该设备超块的 `data_start/data_end/extent_size`,
+`compute_layout` 反推),池清单 `s:pool` 仅持久化设备序与元信息
 (`{devices: Vec<DeviceEntry{uuid, path, capacity, extent_count(冗余,
  启动校验), weight, added_at}>}`,postcard)。**扩容只追加、移除只允许
 尾部**(防 id 推导错乱)。上限:全局 2^32 extents ≈ 16PiB 池容量(单机
@@ -1013,8 +1014,9 @@ GET → 鉴权 → 查 o:{bucket}\0{key}(rocksdb 命中,微秒级)
 ### 4.11 多设备池(ADR-15,M13 起)
 
 - 配置多个设备时组成一个**池**:extent 地址空间为**全局 id + 推导式映射**
-  (设备序 × 每设备 extent 数 + 本地序;仅尾部增删,D3 迁移纪律见 §3.3
-  ADR-15 DM1/DM1'),`Segment` 零改动、对象元数据/COW/迁移事务不动;
+  (按池清单数组序连续拼接各设备 extent 空间:设备 i 的本地 extent l 的
+  全局 id = Σ(设备 0..i−1 的 extent 数) + l;仅尾部增删,D3 迁移纪律见
+  §3.3 ADR-15 DM1/DM1'),`Segment` 零改动、对象元数据/COW/迁移事务不动;
 - 池清单 = 系统键 `s:pool`(postcard `{devices: Vec<DeviceEntry{uuid,
   path, capacity, extent_count, weight, added_at}>}`),设备序即推导序;
 - 分配器:每设备一份位图/检查点/超块,写路径按**剩余空间加权轮转**跨设备

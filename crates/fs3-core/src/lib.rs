@@ -12,6 +12,7 @@ pub mod crc64nvme;
 pub mod error;
 pub mod md5x4;
 pub mod metrics;
+pub mod pool;
 pub mod ssec;
 pub mod types;
 pub mod util;

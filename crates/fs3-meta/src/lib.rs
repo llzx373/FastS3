@@ -2028,6 +2028,25 @@ impl MetaStore {
         self.db.flush_wal(true).map_err(rocks_err)
     }
 
+    // —— 池清单(M13 M1-1,ADR-15 DM1/DM1';键 s:pool) ——
+
+    /// 读池清单(键缺席 → None;缺席 = 单设备 v2 存量,引擎打开时自举)。
+    pub fn load_pool(&self) -> Result<Option<fs3_core::pool::PoolManifest>> {
+        match self.db.get(SYS_POOL).map_err(rocks_err)? {
+            Some(v) => decode(&v).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// 写池清单(直写 + fsync,同 trusted_clock 先例;调用方持引擎写锁/
+    /// 设备变更单点——device-add/remove 必须全量替换后落盘)。
+    pub fn save_pool(&self, m: &fs3_core::pool::PoolManifest) -> Result<()> {
+        self.db
+            .put(SYS_POOL, encode(m)?)
+            .map_err(rocks_err)?;
+        self.db.flush_wal(true).map_err(rocks_err)
+    }
+
     /// 桶版本化状态更新(单事务读改写;l: location 等其余字段不动;
     /// V3 PutBucketVersioning 落地路径)。
     pub fn commit_bucket_set_versioning(

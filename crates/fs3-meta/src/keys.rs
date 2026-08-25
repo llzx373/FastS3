@@ -84,6 +84,11 @@ pub const SYS_SSE_KEK_GEN: &[u8] = b"s:sse_kek_gen";
 /// 故 meta-export DTO 与 check 可达性扫描无需联动(同
 /// SYS_KEY_VALUE_REWRITE_V3_DONE 注释口径)。
 pub const SYS_TRUSTED_CLOCK: &[u8] = b"s:trusted_clock";
+/// 池清单(M13 M1-1,ADR-15 DM1/DM1';值 = postcard(fs3_core::pool::PoolManifest),
+/// 设备序 = 数组序,仅尾部增删)。s: 既有前缀下的新系统键,不新增前缀,
+/// 故 meta-export DTO 与 check 可达性扫描无需联动(同
+/// SYS_KEY_VALUE_REWRITE_V3_DONE 注释口径)。
+pub const SYS_POOL: &[u8] = b"s:pool";
 /// 审计环形条目前缀(M11 L3-1;ADR-12 DL5):`s:audit\0{seq be64}` →
 /// postcard(fs3_core::audit::AuditEntry),每条目一键;be64 字典序 =
 /// 写入序(回放取尾、截断删头的扫描边界)。s: 既有前缀下的系统键族,

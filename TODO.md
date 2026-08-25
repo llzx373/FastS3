@@ -333,7 +333,7 @@
 - [x] A0-1 ADR:DM1/DM1'(全局 extent id + 推导式映射,Segment 零改动)、DM2(剩余空间加权轮转)、DM3(每设备独立检查点/恢复 + 池清单校验)、DM4(在线 add/离线 drain 后尾部 remove)、DM5(B 路线 BlueFS spike + C 同盘分区过渡)、DM6(设备内元数据为权威)、DZ1(zstd 范围与顺序)按推荐写入 DESIGN.md §3.3
 
 ### M. 多设备扩容与再平衡(§6.1)
-- [ ] M1-1 池清单 `s:pool` + 全局 extent id 推导式映射(设备序×每设备 extent 数;仅尾部增删)
+- [x] M1-1 池清单 `s:pool` + 全局 extent id 推导式映射(设备序×每设备 extent 数;仅尾部增删)
 - [ ] M1-2 Engine 持 Vec<Device> 装配 + 每设备独立超块/位图/检查点
 - [ ] M2-1 分配器多设备加权轮转(新盘倾斜)+ 每设备开放 extent(写锁域不变)
 - [ ] M2-2 恢复/降级:各设备独立恢复 + 池清单 uuid 校验;缺盘 → 只读降级 + 告警(对齐 v0.5 掉盘语义)
