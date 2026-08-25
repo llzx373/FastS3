@@ -275,6 +275,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.no_uring,
                 etag_mode,
                 clock_offset_secs,
+                false,
             )?;
             cmd_rebalance(&engine_cfg, rounds)
         }
@@ -302,6 +303,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.no_uring,
                 etag_mode,
                 clock_offset_secs,
+                false,
             )?;
             meta::run_meta_export(&engine_cfg.devices[0], &engine_cfg.meta_dir, &args)
         }
@@ -315,6 +317,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.no_uring,
                 etag_mode,
                 clock_offset_secs,
+                false,
             )?;
             meta::run_meta_import(&engine_cfg.devices[0], &engine_cfg.meta_dir, &args)
         }
@@ -330,6 +333,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.no_uring,
                 etag_mode,
                 clock_offset_secs,
+                false,
             )?;
             if args.count_only {
                 let (v2, v3) = rewrite::count_value_versions(&engine_cfg.meta_dir)?;
@@ -359,6 +363,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.no_uring,
                 etag_mode,
                 clock_offset_secs,
+                false,
             )?;
             cmd_put(&engine_cfg, &bucket, &key, &file)
         }
@@ -377,6 +382,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.no_uring,
                 etag_mode,
                 clock_offset_secs,
+                false,
             )?;
             cmd_get(&engine_cfg, &bucket, &key, &out, range.as_deref())
         }
@@ -390,6 +396,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.no_uring,
                 etag_mode,
                 clock_offset_secs,
+                false,
             )?;
             cmd_del(&engine_cfg, &bucket, &key)
         }
@@ -403,6 +410,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.no_uring,
                 etag_mode,
                 clock_offset_secs,
+                false,
             )?;
             cmd_ls(&engine_cfg, bucket.as_deref(), &prefix)
         }
@@ -416,6 +424,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.no_uring,
                 etag_mode,
                 clock_offset_secs,
+                false,
             )?;
             if fix {
                 cmd_check_fix(&engine_cfg)
@@ -433,6 +442,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.no_uring,
                 etag_mode,
                 clock_offset_secs,
+                false,
             )?;
             cmd_compact(&engine_cfg, rounds)
         }
@@ -446,6 +456,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.no_uring,
                 etag_mode,
                 clock_offset_secs,
+                false,
             )?;
             let mut e = Engine::open(&engine_cfg)?;
             e.checkpoint()?;
@@ -470,6 +481,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.no_uring,
                 etag_mode,
                 clock_offset_secs,
+                false,
             )?;
             bench::run(&engine_cfg, args)
         }
@@ -486,6 +498,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.no_uring,
                 etag_mode,
                 clock_offset_secs,
+                false,
             )?;
             stress::run(&args, &engine_cfg)
         }
@@ -509,6 +522,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.no_uring,
                 etag_mode,
                 clock_offset_secs,
+                storage.verify_reads.unwrap_or(false),
             )?;
             engine_cfg.rebalance.enabled = storage.rebalance_enabled.unwrap_or(false);
             engine_cfg.compression = fs3_core::CompressionConfig {
@@ -919,6 +933,7 @@ fn engine_config(
     no_uring: bool,
     etag_mode: fs3_core::EtagMode,
     clock_offset_secs: i64,
+    verify_reads: bool,
 ) -> fs3_core::Result<EngineConfig> {
     let first_device = devices.first().ok_or_else(|| {
         fs3_core::Error::InvalidArgument(
@@ -939,7 +954,7 @@ fn engine_config(
         group_commit_ms: group_commit_ms.unwrap_or(fs3_core::DEFAULT_GROUP_COMMIT_MS),
         checkpoint_interval_secs: checkpoint_interval
             .unwrap_or(fs3_core::DEFAULT_CHECKPOINT_INTERVAL_SECS),
-        verify_reads: false,
+        verify_reads,
         io_uring: !no_uring,
         read_only: false,
         small_object_limit: fs3_core::SMALL_OBJECT_LIMIT,

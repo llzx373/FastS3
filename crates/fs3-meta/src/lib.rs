@@ -59,19 +59,10 @@ impl Default for MetaConfig {
     }
 }
 
-/// 分配器变更草稿(随事务写入 a:/t: 记录)。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AllocDraft {
-    pub alloc: Vec<(u64, u64)>,
-    pub ref_inc: Vec<u64>,
-    pub ref_dec: Vec<u64>,
-}
-
-impl AllocDraft {
-    pub fn is_empty(&self) -> bool {
-        self.alloc.is_empty() && self.ref_inc.is_empty() && self.ref_dec.is_empty()
-    }
-}
+/// 分配器变更草稿(随事务写入 a:/t: 记录;M13 起类型本体移至 fs3_core,
+/// 此处保留定义以兼容既有导入)。
+#[doc(inline)]
+pub use fs3_core::AllocDraft;
 
 /// 桶统计增量。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

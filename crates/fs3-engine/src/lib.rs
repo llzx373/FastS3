@@ -2005,7 +2005,8 @@ impl Engine {
             };
             let mut draft = Staged::default();
             if !old.segments.is_empty() {
-                self.alloc.release_object(&mut draft, &old.segments);
+                let old_no_overlap = release_non_overlapping(&old.segments, &meta.extents);
+                self.alloc.release_object(&mut draft, &old_no_overlap);
                 self.after_release(&old.segments)?;
             }
             let delta = StatsDelta {
@@ -2019,7 +2020,7 @@ impl Engine {
                 key,
                 target,
                 &meta,
-                to_alloc_draft(&draft),
+                self.alloc.to_alloc_draft(&draft),
                 delta,
             ) {
                 Ok(_) => {
@@ -2149,7 +2150,9 @@ impl Engine {
         // 而新段随后才入账(同一 extent 的位图被错误清除)。
         self.alloc.add_object(&mut draft, &meta.extents);
         if !old_segments.is_empty() {
-            self.alloc.release_object(&mut draft, &old_segments);
+            // M13 修复:仅释放与新段不重合的旧段(见 release_non_overlapping)
+            let old_no_overlap = release_non_overlapping(&old_segments, &meta.extents);
+            self.alloc.release_object(&mut draft, &old_no_overlap);
         }
         // 统计(D5):Off = 旧数据版本覆盖 objects 不变;Enabled 纯追加
         // 恒 +1/+size;Suspended 覆盖 null 槽 = 先扣旧 null 数据版本再加新。
@@ -2163,7 +2166,14 @@ impl Engine {
             self.abort_draft(&draft);
             return Err(e);
         }
-        match self.commit_put_plan(bucket, key, target, &meta, to_alloc_draft(&draft), delta) {
+        match self.commit_put_plan(
+            bucket,
+            key,
+            target,
+            &meta,
+            self.alloc.to_alloc_draft(&draft),
+            delta,
+        ) {
             Ok(_) => {
                 self.mark_open_committed();
                 Ok(meta)
@@ -2662,9 +2672,18 @@ impl Engine {
                         sse.chunk_tags.len()
                     ))
                 })?;
-                let pt = cipher.decrypt_chunk(cno, &ct, tag).map_err(|_| {
+                let pt = cipher.decrypt_chunk(cno, &ct, tag).map_err(|e| {
+                    // DBG M13:打印损坏现场(临时)
+                    eprintln!(
+                        "DBG sse auth fail: cno={cno} ct_len={} tag={:02x?} ct_head={:02x?} segs={:?} size={}",
+                        ct.len(),
+                        &tag[..4],
+                        &ct.as_slice()[..ct.len().min(16)],
+                        meta.extents.iter().map(|sg| (sg.extent_id, sg.offset, sg.len, sg.crcs.len())).collect::<Vec<_>>(),
+                        meta.size,
+                    );
                     Error::Corrupt(format!(
-                        "sse-c chunk {cno} authentication failed (corrupt data or wrong customer key)"
+                        "sse-c chunk {cno} authentication failed (corrupt data or wrong customer key): {e}"
                     ))
                 })?;
                 self.sse_decrypt_bytes
@@ -3413,7 +3432,7 @@ impl Engine {
         };
         match self
             .meta
-            .commit_object_delete(bucket, key, to_alloc_draft(&draft), delta)
+            .commit_object_delete(bucket, key, self.alloc.to_alloc_draft(&draft), delta)
         {
             Ok(_) => {
                 self.maybe_checkpoint()?;
@@ -3473,7 +3492,7 @@ impl Engine {
             key,
             target_vk.as_ref(),
             &marker,
-            to_alloc_draft(&draft),
+            self.alloc.to_alloc_draft(&draft),
             delta,
         ) {
             Ok(_) => {
@@ -3516,10 +3535,13 @@ impl Engine {
                 bytes: -(meta.size as i64),
             };
         }
-        match self
-            .meta
-            .commit_object_delete_version(bucket, key, vk, to_alloc_draft(&draft), delta)
-        {
+        match self.meta.commit_object_delete_version(
+            bucket,
+            key,
+            vk,
+            self.alloc.to_alloc_draft(&draft),
+            delta,
+        ) {
             Ok(_) => {
                 self.maybe_checkpoint()?;
                 Ok(Some(meta))
@@ -3568,14 +3590,17 @@ impl Engine {
                 }
             };
             let r = match vk {
-                None => self
-                    .meta
-                    .commit_object_delete(name, &key, to_alloc_draft(&draft), delta),
+                None => self.meta.commit_object_delete(
+                    name,
+                    &key,
+                    self.alloc.to_alloc_draft(&draft),
+                    delta,
+                ),
                 Some(vk) => self.meta.commit_object_delete_version(
                     name,
                     &key,
                     &vk,
-                    to_alloc_draft(&draft),
+                    self.alloc.to_alloc_draft(&draft),
                     delta,
                 ),
             };
@@ -3852,9 +3877,9 @@ impl Engine {
                 sse,
             };
             // 分片重传会清 completed 标记(reactivate;resend_first_finishes_last)
-            let seq = self
-                .meta
-                .put_part(upload_id, part_no, &part, to_alloc_draft(&draft));
+            let seq =
+                self.meta
+                    .put_part(upload_id, part_no, &part, self.alloc.to_alloc_draft(&draft));
             return match seq {
                 Ok(_) => {
                     // 分片元数据已提交:此后不得 abort_draft(否则 live_bytes
@@ -3881,7 +3906,7 @@ impl Engine {
             upload_id,
             part_no,
             &part,
-            to_alloc_draft(&Staged::default()),
+            self.alloc.to_alloc_draft(&Staged::default()),
         );
         match seq {
             Ok(_) => {
@@ -4008,7 +4033,7 @@ impl Engine {
                 sse,
             };
             self.meta
-                .put_part(upload_id, part_no, &part, to_alloc_draft(&draft))?;
+                .put_part(upload_id, part_no, &part, self.alloc.to_alloc_draft(&draft))?;
             Ok(part)
         })();
         match result {
@@ -4550,7 +4575,8 @@ impl Engine {
             // 释放(旧版本段由旧版本元数据继续持有);Suspended 覆盖 null 槽 =
             // 旧 null 数据版本走既有 release(同事务)。
             if !old.segments.is_empty() {
-                self.alloc.release_object(&mut draft, &old.segments);
+                let old_no_overlap = release_non_overlapping(&old.segments, &meta.extents);
+                self.alloc.release_object(&mut draft, &old_no_overlap);
                 self.after_release(&old.segments)?;
             }
             let part_keys: Vec<Vec<u8>> = stored
@@ -4588,7 +4614,7 @@ impl Engine {
                 target.version_key().as_ref(),
                 &meta,
                 &part_keys,
-                to_alloc_draft(&draft),
+                self.alloc.to_alloc_draft(&draft),
                 delta,
             )?;
             Ok(meta)
@@ -4626,7 +4652,7 @@ impl Engine {
             .collect();
         match self
             .meta
-            .abort_multipart(upload_id, &part_keys, to_alloc_draft(&draft))
+            .abort_multipart(upload_id, &part_keys, self.alloc.to_alloc_draft(&draft))
         {
             Ok(_) => {
                 self.maybe_checkpoint()?;
@@ -5185,7 +5211,7 @@ impl Engine {
                 dst_key,
                 target.version_key().as_ref(),
                 &meta,
-                to_alloc_draft(&draft),
+                self.alloc.to_alloc_draft(&draft),
                 delta,
             )
         } else {
@@ -5194,7 +5220,7 @@ impl Engine {
                 dst_key,
                 target,
                 &meta,
-                to_alloc_draft(&draft),
+                self.alloc.to_alloc_draft(&draft),
                 delta,
             )
         };
@@ -5637,7 +5663,7 @@ impl Engine {
             return Ok(report);
         }
         // 修复记录以独立事务落盘(与检查点无关;重放时按 t: 标记生效)
-        let alloc_draft = to_alloc_draft(&draft);
+        let alloc_draft = self.alloc.to_alloc_draft(&draft);
         match self.meta.commit(&[Op::Alloc { draft: alloc_draft }]) {
             Ok(_) => {
                 // 修复后立即写检查点,固化位图(避免重放窗口内重复修复)
@@ -6582,6 +6608,31 @@ impl ExtentWriter {
 }
 
 /// 读取至多 buf.len() 字节(处理 Read 短读)。
+/// M13 已修复缺陷(覆盖写同范围释放):旧段与新段(同 draft 提交)在
+/// (extent_id, offset, len) 上**完全重合**时,释放记账会把同一范围的
+/// live 归零(先加后释 = 净零),extent 被误判空闲并在**本次写入进行中**
+/// 被分配器复用于后续段(典型:8MiB 对象的尾段落到首段所在 extent 的
+/// offset 0)→ 物理覆写首段头 8KiB(chunk0 型持久损坏,SSE-C 读取必现
+/// "sse-c chunk 0 authentication failed")。修复:覆盖释放仅释放不与
+/// 新段完全重合的旧段(重合范围由新版本持有,无需释放)。
+fn release_non_overlapping(old: &[Segment], new: &[Segment]) -> Vec<Segment> {
+    // 跳过:(a) 完全重合(同 extent/offset/len);(b) 被任一新段**包含**
+    //     (同 extent,新段范围 ⊇ 旧段范围)——该范围由新版本持有,释放
+    //     记账会把它所在的 extent live 归零(先加后释时序下),位图被清
+    //     后分配器在本次写入进行中复用该 extent(开放 extent 预留也被
+    //     清零)→ 物理覆写新段(chunk0 型持久损坏,SSE-C 读取必现)。
+    old.iter()
+        .filter(|o| {
+            !new.iter().any(|n| {
+                n.extent_id == o.extent_id
+                    && n.offset <= o.offset
+                    && o.offset.saturating_add(o.len) <= n.offset.saturating_add(n.len)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 fn read_up_to(r: &mut dyn Read, buf: &mut [u8]) -> Result<usize> {
     let mut total = 0usize;
     while total < buf.len() {
@@ -6624,14 +6675,6 @@ fn monotonic_ns() -> i64 {
         .saturating_add(ts.tv_nsec)
 }
 
-fn to_alloc_draft(staged: &Staged) -> AllocDraft {
-    AllocDraft {
-        alloc: staged.alloc.clone(),
-        ref_inc: staged.ref_inc.clone(),
-        ref_dec: staged.ref_dec.clone(),
-    }
-}
-
 // ─────────────────────────── 恢复(ADR-9 §5.7) ───────────────────────────
 
 /// 段级可达性扫描:重建 live_bytes/引用计数/共享段表;返回
@@ -6665,6 +6708,15 @@ fn rebuild_segment_state(
         lists.push(p.extents);
     }
     alloc.rebuild_derived(lists);
+    // M13 修复(自愈):有活段但位图未置位(历史 ref_dec 误清感染)→ 置位;
+    // 否则这些 extent 会被分配器视为空闲并在写入中被复用,覆写存活数据
+    // (chunk0 型持久损坏)。元数据为权威(DM6),位图仅速查。
+    let healed = alloc.heal_bitmap();
+    if healed > 0 {
+        tracing::warn!(
+            "recovery healed {healed} extent(s) with live data but clear bitmap (overwrite-free bug residue)"
+        );
+    }
     let leaks = alloc.leaks();
     Ok((leaks, max_end))
 }

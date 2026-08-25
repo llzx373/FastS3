@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
 
+use fs3_core::AllocDraft;
 use fs3_core::{AllocRecord, CheckpointData, Error, Result, Segment};
 
 // 每核私有分配 hint(无锁近似:各核从自己的游标出发,减少争用)。
@@ -375,18 +376,43 @@ impl Allocator {
             draft.live_dec.push((id, len));
             return;
         }
-        // 末段消亡 → 位图清位 + ref_dec 记录
+        // M13 修复(覆盖写误清位):归零事件的**位图清位延迟到事务提交**
+        // (to_alloc_draft 收口)——覆盖写同事务时旧段释放与新段入账同 draft,
+        // 若立即清位,写入进行中的 open-extent 预留失效,分配器会把 extent
+        // 复用于本对象的后续段 → 物理覆写新段(chunk0 型持久损坏)。提交时
+        // 同 draft 含 alloc/ref_inc 的 extent 跳过清位(净留)。
         self.live_bytes[id as usize].store(0, Ordering::Release);
-        if self.bitmap.test(id) {
-            self.bitmap.clear_bit(id);
-            self.total_free.fetch_add(1, Ordering::Relaxed);
-            draft.cleared.push(id);
-        }
-        self.state[id as usize].store(ExtentState::Free as u8, Ordering::Release);
+        draft.cleared.push(id);
         // 注意:不在此处置零 refcount——由 release_object 的 fetch_sub 递减并
         // 记入 draft.refcount_dec(回滚时 +1 恢复;此处置零会吞掉回滚信息)
         draft.ref_dec.push(id);
         draft.live_dec.push((id, len));
+    }
+
+    /// M13 修复:提交期收口——应用本 draft 的待清位(pending clears),
+    /// **跳过同 draft 有新段(alloc/ref_inc)的 extent**(净留);随后返回
+    /// 标准 AllocDraft(全引擎提交点共用,单点收口,与 `a:` 记录重放
+    /// 口径一致)。
+    pub fn to_alloc_draft(&self, staged: &Staged) -> AllocDraft {
+        // 归零判定以「提交时刻的 live」为准(比同 draft 位图交集更精确):
+        // 覆盖写(新段已入账 → live > 0)→ 跳过清位(净留,防写入中途
+        // 复用);真删除(无活段 → live = 0)→ 清位。dec_live 已即时把
+        // live 置零,此处只补位图/状态的最终裁决。
+        for &id in &staged.cleared {
+            if self.live_bytes[id as usize].load(Ordering::Acquire) > 0 {
+                continue;
+            }
+            if self.bitmap.test(id) {
+                self.bitmap.clear_bit(id);
+                self.total_free.fetch_add(1, Ordering::Relaxed);
+            }
+            self.state[id as usize].store(ExtentState::Free as u8, Ordering::Release);
+        }
+        AllocDraft {
+            alloc: staged.alloc.clone(),
+            ref_inc: staged.ref_inc.clone(),
+            ref_dec: staged.ref_dec.clone(),
+        }
     }
 
     /// 事务失败:精确逆转 draft 中的全部变更。
@@ -453,8 +479,15 @@ impl Allocator {
     /// 重放一条分配记录(恢复/检查点之后);防御性处理异常输入。
     ///
     /// ADR-9 §4.5 触发语义:`alloc` = 位图置位;`ref_dec` = 位图清位
-    /// (live_bytes 归零,无条件)。refcount/live_bytes 等段状态随后由
-    /// 可达性扫描重建,此处不维护。
+    /// (live_bytes 归零)。refcount/live_bytes 等段状态随后由可达性
+    /// 扫描重建,此处不维护。
+    ///
+    /// M13 修复(覆盖写误自由):同一记录内既有 `ref_inc/alloc` 又含
+    /// `ref_dec` 且指向**同一 extent** 时(覆盖写:新段入账 + 旧段释放
+    /// 同事务同盘),若仍无条件清位会把这个 extent 误判空闲——恢复后
+    /// 分配器立即把它/后续段复用 → 物理覆写尚存活的新段(chunk0 型
+    /// 持久损坏,SSE-C 读取必现)。裁决:**同事务内先加后释 = 净留**,
+    /// 该 extent 的 ref_dec 不得清位(引用计数由之后的可达性扫描重建)。
     pub fn apply_record(&self, rec: &AllocRecord) {
         for &(start, count) in &rec.alloc {
             for id in start..start + count {
@@ -470,7 +503,20 @@ impl Allocator {
                 self.refcounts[id as usize].fetch_add(1, Ordering::AcqRel);
             }
         }
+        // M13 修复:同事务净留(同上注释)——ref_dec 撞 alloc/ref_inc 的
+        // extent 不清位(该 extent 由同事务的新段持有;位图状态随后由
+        // 可达性扫描核对)。注意 alloc 是 (start, count) 段,需展开查。
+        let mut same_txn_retained: Vec<u64> = Vec::new();
+        for &(start, count) in &rec.alloc {
+            for id in start..start + count {
+                same_txn_retained.push(id);
+            }
+        }
+        same_txn_retained.extend_from_slice(&rec.ref_inc);
         for &id in &rec.ref_dec {
+            if same_txn_retained.contains(&id) {
+                continue; // 净留:新段同事务入账,不释放
+            }
             if self.bitmap.test(id) {
                 self.bitmap.clear_bit(id);
                 self.refcounts[id as usize].fetch_add(1, Ordering::Relaxed);
@@ -631,6 +677,21 @@ impl Allocator {
             .collect()
     }
 
+    /// 位图自愈(M13 修复:覆盖写 ref_dec 误清位图的历史感染):重建派生
+    /// 账目后,有活段(元数据可达)但位图未置位的 extent → 置位并计账。
+    /// 元数据是权威(ADR-15 DM6),位图仅为分配速查;返回自愈数量。
+    pub fn heal_bitmap(&self) -> u64 {
+        let mut healed = 0u64;
+        for id in 0..self.n {
+            if self.live_bytes_of(id) > 0 && !self.bitmap.test(id) {
+                self.bitmap.set_bit(id);
+                self.total_alloc.fetch_add(1, Ordering::Relaxed);
+                healed += 1;
+            }
+        }
+        healed
+    }
+
     /// 释放一个泄漏 extent(C4 修复):位图清位 + 记账,记入 draft
     /// (ref_dec → 随事务写 `a:` 记录,崩溃重放幂等)。
     ///
@@ -723,6 +784,8 @@ mod tests {
             assert_eq!(a.live_bytes_of(id), 4096);
         }
         a.release_object(&mut d, &segs);
+        // M13:清位延迟到提交收口(to_alloc_draft)——提交后视角度量
+        let _ = a.to_alloc_draft(&d);
         assert!(ids.iter().all(|&id| !a.test_bit(id)));
         assert_eq!(a.allocated_count(), 0);
         assert_eq!(a.live_bytes_total(), 0);
@@ -798,12 +861,14 @@ mod tests {
         // 释放对象 1:extent 仍有活段,不发 ref_dec
         let n_before = d.ref_dec.len();
         a.release_object(&mut d, &[s1]);
+        let _ = a.to_alloc_draft(&d); // M13 清位收口
         assert_eq!(a.live_bytes_of(id), 50 * 4096);
         assert_eq!(d.ref_dec.len(), n_before, "未归零不发 ref_dec");
         assert!(a.test_bit(id));
-        // 释放对象 2:归零 → 清位 + ref_dec
+        // 释放对象 2:归零 → 清位 + ref_dec(提交收口后生效)
         a.release_object(&mut d, &[s2]);
         assert_eq!(a.live_bytes_of(id), 0);
+        let _ = a.to_alloc_draft(&d);
         assert!(!a.test_bit(id));
         assert_eq!(d.ref_dec.len(), n_before + 1);
         assert_eq!(a.state_of(id), ExtentState::Free);
@@ -828,6 +893,7 @@ mod tests {
         let mut d2 = Staged::default();
         a.release_object(&mut d2, std::slice::from_ref(&s1));
         assert_eq!(a.live_bytes_of(id), 0);
+        let _ = a.to_alloc_draft(&d2); // M13 提交收口生效清位
         assert!(!a.test_bit(id));
         // 过期重放同段:不 panic、账目零变化、无新账簿记录
         let mut d3 = Staged::default();
@@ -862,11 +928,13 @@ mod tests {
         assert_eq!(a.refcount(id), 2);
         // 删除一个持有者:共享段减一,extent 仍在
         a.release_object(&mut d, std::slice::from_ref(&s));
+        let _ = a.to_alloc_draft(&d); // M13 清位收口
         assert_eq!(a.live_bytes_of(id), 1024 * 1024);
         assert!(a.test_bit(id));
         assert_eq!(a.refcount(id), 1);
-        // 最后一个持有者删除:live_bytes 归零 → 清位
+        // 最后一个持有者删除:live_bytes 归零 → 清位(提交收口)
         a.release_object(&mut d, &[s]);
+        let _ = a.to_alloc_draft(&d);
         assert_eq!(a.live_bytes_of(id), 0);
         assert!(!a.test_bit(id));
         Ok(())
@@ -894,14 +962,16 @@ mod tests {
         // 删除 A:s1/s2 共享减一(2 持有者 → 1),extent 保持
         let n = d.ref_dec.len();
         a.release_object(&mut d, &[s1.clone(), s2.clone()]);
+        let _ = a.to_alloc_draft(&d); // M13 清位收口
         assert_eq!(a.live_bytes_of(id), 3 * 4096, "A 的段仍被 C 持有");
         assert_eq!(d.ref_dec.len(), n, "extent 未归零");
         // 删除 X:s3 消亡;extent 仍活(C 持有 s1/s2)
         a.release_object(&mut d, &[s3]);
         assert_eq!(a.live_bytes_of(id), 2 * 4096);
         assert_eq!(d.ref_dec.len(), n, "extent 未归零");
-        // 删除 C:全部消亡 → live_bytes 0 → ref_dec
+        // 删除 C:全部消亡 → live_bytes 0 → ref_dec(提交收口)
         a.release_object(&mut d, &[s2, s1]);
+        let _ = a.to_alloc_draft(&d);
         assert_eq!(a.live_bytes_of(id), 0);
         assert_eq!(d.ref_dec.len(), n + 1);
         assert!(!a.test_bit(id));
@@ -1154,5 +1224,49 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod m13_fix_tests {
+    use super::*;
+    use fs3_core::AllocRecord;
+
+    #[test]
+    fn replay_overwrite_same_txn_retains_extent() {
+        // M13 回归:同事务 alloc+ref_dec 同 extent → 重放不清位(保留);
+        // 纯 ref_dec(真释放)仍清位。
+        let a = Allocator::new(8);
+        // 占有 extent 1(模拟检查点后已有)
+        a.bitmap.set_bit(1);
+        a.total_free.store(7, Ordering::Relaxed);
+        a.total_alloc.store(1, Ordering::Relaxed);
+        // 覆盖写:新段 alloc extent 1 + 旧段 ref_dec extent 1(同事务)
+        let rec = AllocRecord {
+            seq: 1,
+            txn: 1,
+            alloc: vec![(1, 1)],
+            ref_inc: vec![1],
+            ref_dec: vec![1],
+        };
+        a.apply_record(&rec);
+        assert!(
+            a.bitmap.test(1),
+            "same-txn inc+dec must retain the extent (overwrite)"
+        );
+        a.state[1].store(ExtentState::Sealed as u8, Ordering::Release); // 预置已分配态
+                                                                        // 纯释放(另一 extent)仍清位
+        a.bitmap.set_bit(2);
+        a.total_free.store(6, Ordering::Relaxed);
+        a.total_alloc.store(2, Ordering::Relaxed);
+        let rec2 = AllocRecord {
+            seq: 2,
+            txn: 2,
+            alloc: vec![],
+            ref_inc: vec![],
+            ref_dec: vec![2],
+        };
+        a.apply_record(&rec2);
+        assert!(!a.bitmap.test(2), "pure ref_dec still frees");
     }
 }

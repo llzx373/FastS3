@@ -103,6 +103,9 @@ pub struct StorageConfig {
     pub etag_mode: Option<String>,
     /// 内联小对象阈值(REVIEW §4.7:默认 32KiB;CLI 可经此暴露配置)。
     pub small_object_limit: Option<usize>,
+    /// 读校验开关(M1 D3;默认 false 关;true = 逐段 CRC 网格校验,
+    /// 开销约 3~5%)。
+    pub verify_reads: Option<bool>,
     /// 后台惰性压缩开关(ADR-9 §6;默认 true)。false = 不启动压缩 worker
     /// (前台 `compact` 仍可用)。M10 S5:协议一致性 gate 用例确定性需要——
     /// 压缩迁移与大对象流式读存在已跟踪并发竞态(见 tests/s3-tests/README.md

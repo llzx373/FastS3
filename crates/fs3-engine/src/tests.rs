@@ -6862,3 +6862,99 @@ fn multipart_rejected_when_compression_enabled() -> Result<()> {
     e.abort();
     Ok(())
 }
+
+#[test]
+fn dbg_sse_c_copy_part_8mib_roundtrip() -> Result<()> {
+    // 复现 s3-tests test_copy_part_enc:SSE-C 源 + SSE-C 目标 UploadPartCopy
+    // 8MiB → Complete → GET 全量(对比引擎矩阵用例尺寸放大)
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let key = sse_test_key();
+    let wk = fs3_core::SseWriteKey::SseC(&key);
+    let data = rnd(8 * 1024 * 1024, 77);
+    e.put_with_meta(
+        "b1",
+        "src",
+        &mut Cursor::new(data.clone()),
+        None,
+        vec![],
+        vec![],
+        vec![],
+        None,
+        None,
+        Some(&wk),
+    )
+    .unwrap();
+    let key_md5_hex = hex::encode(key.key_md5());
+    let uid = e
+        .create_multipart(
+            "b1",
+            "dst",
+            Some("application/octet-stream"),
+            vec![],
+            vec![],
+            vec![],
+            None,
+            Some(key_md5_hex.clone()),
+            None,
+        )
+        .unwrap();
+    let part = e
+        .upload_part_copy(
+            &uid,
+            1,
+            "b1",
+            "src",
+            0..5 * 1024 * 1024,
+            Some(&key),
+            Some(&key),
+        )
+        .unwrap();
+    let part2 = e
+        .upload_part_copy(
+            &uid,
+            2,
+            "b1",
+            "src",
+            5 * 1024 * 1024..8 * 1024 * 1024,
+            Some(&key),
+            Some(&key),
+        )
+        .unwrap();
+    let m = e
+        .complete_multipart(
+            "b1",
+            "dst",
+            &uid,
+            &[cp(1, part.etag_hex()), cp(2, part2.etag_hex())],
+            None,
+            Some(&key),
+        )
+        .unwrap();
+    assert_eq!(m.size, data.len() as u64);
+    let mut out = Vec::new();
+    e.get_to_meta(&m, 0..data.len() as u64, &mut out, Some(&key))
+        .unwrap();
+    assert_eq!(out, data, "SSE-C copy-part 8MiB must roundtrip");
+    e.abort();
+    Ok(())
+}
+
+#[test]
+fn overwrite_same_geometry_keeps_segments_intact() -> Result<()> {
+    // M13 回归:同一尺寸对象反复覆盖写(同 extent/offset/len 几何),
+    // 每次写后读回校验——修复前旧段"加+释"把 extent 误判空闲并在
+    // 写入中途复用 → 首段前 8KiB 被尾段覆写(chunk0 型持久损坏)。
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let data = rnd(8 * 1024 * 1024 + 503_808, 42); // 2 整 extent + 尾段几何
+    for i in 0..60 {
+        e.put("b1", "ov", &mut Cursor::new(data.clone())).unwrap();
+        let mut out = Vec::new();
+        e.get_to("b1", "ov", 0..data.len() as u64, &mut out)
+            .unwrap();
+        assert_eq!(out, data, "iteration {i}: overwrite must read back intact");
+    }
+    e.abort();
+    Ok(())
+}

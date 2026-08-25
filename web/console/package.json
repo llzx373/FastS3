@@ -1,7 +1,7 @@
 {
   "name": "@fasts3/console",
   "private": true,
-  "version": "1.3.0",
+  "version": "1.4.0",
   "type": "module",
   "description": "FastS3 Web 控制台(React + Vite + uPlot)",
   "scripts": {

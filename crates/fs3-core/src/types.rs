@@ -150,6 +150,22 @@ pub struct CompressionInfo {
     pub compressed_size: u64,
 }
 
+/// 分配草稿(ADR-9 §4.5 / ADR-15 DM3):随事务写入 `a:` 记录的形态;
+/// 自 M13 起由 fs3-alloc 提交收口(engine 侧)生成,三方(meta/engine/
+/// alloc)共享类型。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AllocDraft {
+    pub alloc: Vec<(u64, u64)>,
+    pub ref_inc: Vec<u64>,
+    pub ref_dec: Vec<u64>,
+}
+
+impl AllocDraft {
+    pub fn is_empty(&self) -> bool {
+        self.alloc.is_empty() && self.ref_inc.is_empty() && self.ref_dec.is_empty()
+    }
+}
+
 /// SSE 类型判别(M11 E1,ADR-12 D-E1。变体序 = postcard 编码序,只允许
 /// 尾部追加)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

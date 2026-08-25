@@ -30,7 +30,7 @@ use fs3_alloc::{Allocator, Staged};
 use fs3_core::crc32c::crc32c;
 use fs3_core::{align_up, Error, Result, Segment, SECTOR_SIZE, SEGMENT_CRC_GRID};
 use fs3_device::AlignedBuffer;
-use fs3_meta::{AllocDraft, MetaStore};
+use fs3_meta::MetaStore;
 
 use crate::io::{read_exact, write_all, IoEngine};
 use crate::worker::{BackgroundWorker, BatchOutcome, Throttle};
@@ -445,14 +445,14 @@ impl Compactor {
                     key,
                     &item.old_segments,
                     &item.new_segments,
-                    to_alloc_draft(&d),
+                    self.alloc.to_alloc_draft(&d),
                 ),
                 PlanTarget::Part { upload_id, part_no } => self.meta.commit_part_migrate(
                     upload_id,
                     *part_no,
                     &item.old_segments,
                     &item.new_segments,
-                    to_alloc_draft(&d),
+                    self.alloc.to_alloc_draft(&d),
                 ),
             };
             match migrate {
@@ -587,14 +587,6 @@ impl Compactor {
         let mut io = self.io.lock().unwrap();
         write_all(&mut **io, slot.dev.raw_fd(), hbuf.as_slice(), off)?;
         Ok(())
-    }
-}
-
-fn to_alloc_draft(staged: &Staged) -> AllocDraft {
-    AllocDraft {
-        alloc: staged.alloc.clone(),
-        ref_inc: staged.ref_inc.clone(),
-        ref_dec: staged.ref_dec.clone(),
     }
 }
 
