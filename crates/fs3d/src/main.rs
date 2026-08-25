@@ -157,6 +157,12 @@ enum Cmd {
     DeviceAdd(pool_cmds::DeviceAddArgs),
     /// 池移除(M13 M3-2):离线移除尾部设备(数据须已迁空;服务须停止)
     DeviceRemove(pool_cmds::DeviceRemoveArgs),
+    /// 前台执行一轮或多轮再平衡(M13 M4-1;rounds=0 循环至收敛)
+    Rebalance {
+        /// 轮数(0 = 循环至水位差收敛)
+        #[arg(long, default_value_t = 0)]
+        rounds: u32,
+    },
     /// 启动 S3 数据面 HTTP 服务
     Serve {
         /// 监听地址(如 0.0.0.0:9000)
@@ -258,6 +264,19 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 None => cfg.storage.devices.clone(),
             };
             pool_cmds::run_device_add(&args, cli.config.as_deref(), None, &devs)
+        }
+        Cmd::Rebalance { rounds } => {
+            let engine_cfg = engine_config(
+                devices.clone(),
+                meta_dir,
+                sync_mode,
+                cli.group_commit_ms.or(storage.group_commit_ms),
+                cli.checkpoint_interval.or(storage.checkpoint_interval),
+                cli.no_uring,
+                etag_mode,
+                clock_offset_secs,
+            )?;
+            cmd_rebalance(&engine_cfg, rounds)
         }
         Cmd::DeviceRemove(args) => {
             let cfg = load_config(cli.config.as_deref())?;
@@ -1053,6 +1072,37 @@ fn cmd_ls(cfg: &EngineConfig, bucket: Option<&str>, prefix: &str) -> fs3_core::R
 }
 
 /// 前台惰性压缩(ADR-9 §6.7 离线档):高预算逐轮运行,输出迁移报告。
+/// 前台再平衡(rounds=0 → 循环至收敛;上限 1000 轮防死循环)。
+fn cmd_rebalance(cfg: &EngineConfig, rounds: u32) -> fs3_core::Result<()> {
+    // 前台命令强制装配再平衡器实例(配置开关默认关,不影响服务行为)
+    let mut cfg = cfg.clone();
+    cfg.rebalance.enabled = true;
+    let mut engine = fs3_engine::Engine::open(&cfg)?;
+    let mut n = 0u32;
+    loop {
+        let r = engine.rebalance_once()?;
+        n += 1;
+        println!(
+            "rebalance round {n}: candidates={} migrated={} bytes={} freed={}",
+            r.candidates,
+            r.migrated_objects + r.migrated_parts,
+            r.copied_bytes,
+            r.freed_extents
+        );
+        if rounds > 0 && n >= rounds {
+            break;
+        }
+        if rounds == 0 && r.candidates == 0 && r.copied_bytes == 0 {
+            break;
+        }
+        if n > 1000 {
+            return Err(fs3_core::Error::Meta("rebalance did not converge".into()));
+        }
+    }
+    engine.close()?;
+    Ok(())
+}
+
 fn cmd_compact(cfg: &EngineConfig, rounds: u32) -> fs3_core::Result<()> {
     let mut e = Engine::open(cfg)?;
     let mut total = fs3_engine::CompactionReport::default();

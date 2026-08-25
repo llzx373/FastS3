@@ -75,6 +75,14 @@ jobs:
         run: tests/crash/run_crash_m4.sh 60 --full --no-uring
       - name: power-loss sim (no-uring, 20 rounds)
         run: tests/crash/powerloss_sim.sh 20
+      # M13 M5-1 门禁:双盘/三盘崩溃 500 轮(CI 冒烟 60 轮;发布前整跑
+      # 500 轮见 TODO M13 门禁)+ 缺盘/扩容/再平衡演练
+      - name: multi-device crash harness (2 devices, 60 rounds)
+        run: tests/crash/run_crash_multi.sh 60 --devices 2 --no-uring
+      - name: multi-device crash harness (3 devices, 60 rounds)
+        run: tests/crash/run_crash_multi.sh 60 --devices 3 --no-uring
+      - name: M13 drills (degraded / add-remove / rebalance convergence)
+        run: tests/crash/m13_drills.sh --skip-p99
       - name: doctor smoke (uninitialized device → fatal, exit 1)
         run: |
           truncate -s 64M /tmp/ci-doctor.img
