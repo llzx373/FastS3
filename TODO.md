@@ -371,7 +371,7 @@
 > 红线(§7.5):agent 关闭零差异、拔中心单机独立运行、无 mTLS 不合入。
 
 ### A0 决策落盘
-- [ ] A0-1 ADR:DV1(agent 出站 mTLS;中心=配置源,引擎=裁决权威)、DV2(HTTP/3 实验 feature 开关默认关,6 个月评估期)按推荐写入 DESIGN.md §3.3
+- [x] A0-1 ADR:DV1(agent 出站 mTLS;中心=配置源,引擎=裁决权威)、DV2(HTTP/3 实验 feature 开关默认关,6 个月评估期)按推荐写入 DESIGN.md §3.3(ADR-17 落盘:出站双向 mTLS + 每节点凭证、per-node 版本号 + 断线重连全量对账、secret 仅生成时明文一次(默认中心不存 secret)、quinn 依赖审批登记、0-RTT 仅幂等 GET/HEAD;同步 DESIGN-FUTURE §11 决策清单 DV1/DV2 → ADR-17 与 §9.3 quinn 行)
 
 ### G. 多节点纳管(§7.1)
 - [ ] G1-1 agent 模块(fasts3d 内,feature-gate 默认关):出站 mTLS、心跳、指标/审计流式上报(复用 WS/批量)、下发接收
