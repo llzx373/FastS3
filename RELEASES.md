@@ -1,4 +1,34 @@
 # FastS3 发布记录
+## v1.3.0 — M12 Object Lock / WORM(季度 minor 轨道)(2026-08-25)
+
+> 发布状态:与 M12 交付同步;git tag/发布流水线属执行期步骤(与 v1.2.x 同口径,
+> 尚未正式打 tag)。决策记录:ADR-13(docs/DESIGN.md §3.3);性能报告
+> [docs/perf-M12.md](./docs/perf-M12.md)。
+
+### 变更(TODO M12 全项:A0/W1~W5 + 门禁)
+
+- **Object Lock**:CreateBucket 锁头(自动版本化不可关);Put/GetObjectLockConfiguration;
+  对象级锁头 + Retention/LegalHold API;桶默认保留;强制矩阵逐格(§5.4)。
+- **可信时钟(ADR-13 DL6)**:wall+mono 持久化 + 单调推导;回拨不缩短剩余保留;
+  回拨注入测试(1h/1d,协议层 + daemon 级 tests/m12_clock_rollback.sh)。
+- **授权与审计**:BypassGovernanceRetention 策略 Condition;bypass/保留变更强制审计。
+- **交互面**:生命周期/压缩/check --fix 锁感知(`skipped_locked` 指标);管理面
+  锁状态/保留编辑/审计过滤。
+- **协议对齐**:object_lock 族 39/39 出集;InvalidRetentionPeriod/MalformedXML/
+  DeleteObjects `<VersionId>` 回显/Off·Suspended 桶 409 InvalidBucketState。
+
+### 验证(门禁,实测记录见 TODO.md M12 段)
+
+- `cargo test --workspace` 596 passed / clippy / fmt;覆盖率 **84.84% 行**(llvm-cov
+  workspace,≥80%;区域 78.82% 如实记录);cargo audit 0 漏洞。
+- s3-tests 全量 gate:**494 passed / 94 skipped / 250 excluded / 0 unexpected
+  (TZ=UTC)**。
+- 崩溃 500 轮锁+删除混载(kills 见 TODO 实测记录)零撕裂/零泄漏/账目零漂移;
+  锁定版本重启后锁状态驻留(GetObjectRetention/GetObjectLegalHold 逐版本复核)。
+- perf(perf-M12.md):锁判定最坏形态 **1.6 ns/op**(<1µs 门禁,两轮一致);数据面零改动。
+- 生命周期跳过锁定对象可见:`fasts3_lifecycle_skipped_locked_total > 0`
+  (tests/m12_lock_lifecycle_skip.sh)。
+
 ## v1.2.0 — M11 生命周期与加密(季度 minor 轨道)(2026-08-25)
 
 > 发布状态:与 M11 交付同步;git tag/发布流水线属执行期步骤(与 v1.1.x 同口径,

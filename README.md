@@ -79,7 +79,9 @@ FastS3 的对策:**不做底层已经做过的事**。工程力量全部投入�
 
 ✅ **M4 加固完成(v0.5)。** 崩溃 1000 轮 + 断电模拟零撕裂/零泄漏/账目零漂移;故障注入(掉盘只读降级 + 告警 / 磁盘满 507 / 时钟回拨监控);H3/H4 运维命令(热重载、WS 推送、每密钥限速、超时控制);TLS(rustls 1.2/1.3 + SNI + 热加载);`fasts3d doctor` 能力自检、s3-tests 支持子集 gate 全绿、覆盖率 80.05%、扩展性 6000 万+对象恒定。
 
-✅ **M11 生命周期与加密完成(v1.2.0)。** Lifecycle 执行器 + SSE-C/SSE-S3 + checksum 五族 + GetObjectAttributes + 审计持久化;门禁:s3-tests 457/94/287/0、加密崩溃 500 轮、未加密 perf PUT −0.4%/GET −1.7%、覆盖率 84.80% 行。报告 [docs/perf-M11.md](./docs/perf-M11.md)。下一步:M12 Object Lock(v1.3.0)。
+✅ **M11 生命周期与加密完成(v1.2.0)。** Lifecycle 执行器 + SSE-C/SSE-S3 + checksum 五族 + GetObjectAttributes + 审计持久化;门禁:s3-tests 457/94/287/0、加密崩溃 500 轮、未加密 perf PUT −0.4%/GET −1.7%、覆盖率 84.80% 行。报告 [docs/perf-M11.md](./docs/perf-M11.md)。
+
+✅ **M12 Object Lock / WORM 完成(v1.3.0)。** 治理/合规/法定保留(强制矩阵逐格)+ 可信时钟(回拨不缩短剩余保留,ADR-13)+ bypass 策略 Condition 与强制审计 + 生命周期/压缩/check 锁感知 + 管理面锁状态;门禁:s3-tests 494/94/250/0(含 object_lock 族 39/39 出集)、锁+删除混载崩溃 500 轮、锁判定 1.6 ns/op、覆盖率 84.84% 行。报告 [docs/perf-M12.md](./docs/perf-M12.md)。下一步:M13 容量与底座(v1.4.0)。
 
 ✅ **M8 GA 发布(v1.0.0)。** 全量回归资产与本地实测(`tests/m8/regression.sh`:客户端 × OS × 内核 × 设备形态逐轴编排 + 汇总;CI 接入 regression.yml);RC1→RC2→GA 候选流程(`tests/m8/rc-gate.sh` + docs/ga/rc-flow.md + CHANGELOG.md);安全审计(自审 14 项全绿 + 外部审计范围,见 docs/ga/security-audit.md);发布流水线复核(签名 + SBOM 229 组件 + 供应链锁定,`tools/package/verify-release.sh` 实测 PASS,版本源统一为 Cargo.toml);官网与公告(文档站新增兼容矩阵/安全基线 CVE 响应/v1.0.0 公告页,mkdocs 0 警告);§1.1 开箱清单逐项证据表(docs/ga/checklist.md)+ 内置示例 `deploy/examples/backup-dir.sh`(实测);GA 检查单复核 → **v1.0.0 发布**(版本号全仓同步)。执行期门禁(真 NVMe §6.8 数值 / 外部审计执行 / rpm·ARM64 真机构建 / Beta 窗口)按 checklist.md 如实标注。RELEASES.md v1.0.0。
 

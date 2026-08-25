@@ -288,7 +288,39 @@
 - [x] 回拨注入测试通过;强制矩阵逐格测试通过
 - [x] 审计含 bypass 与保留变更前后值;生命周期跳过锁定对象可见
 - [x] perf:锁判定在元数据层(<1µs,无感);覆盖率 ≥80%;cargo audit 清零
-- [ ] 发布 v1.3.0
+- [x] 发布 v1.3.0
+
+> **M12 实测记录(2026-08-25,v1.3.0)**:
+> - s3-tests 全量 gate:**494 passed / 94 skipped / 250 excluded / 0 意外失败
+>   (RESULT: PASS,TZ=UTC)**;object_lock/legal/retention/governance 族 39/39 出集
+>   (token 已移除);出集配套协议修复:Off/Suspended 桶 PutObjectLockConfiguration →
+>   409 InvalidBucketState、Days/Years<1 → InvalidRetentionPeriod、非法
+>   Mode/Status/Disabled → MalformedXML、DeleteObjects 错误条目回显 `<VersionId>`、
+>   web 控制台 PUT object-lock 前自动开版本化。
+> - 崩溃:500 轮锁+删除混载(SIGKILL 207 次 + SIGTERM 混合)**零撕裂/零泄漏/
+>   账目零漂移**;锁定版本重启后 GetObjectRetention/GetObjectLegalHold 逐版本
+>   复核一致(`tests/crash/run/crash-lock-last.log`,elapsed=6051s);
+>   tests/crash/run_crash_lock.sh 25 轮冒烟先行。
+> - 回拨注入:协议层集成测试注入 1h/1d(DELETE ?versionId 403 / 缩短 403
+>   (bypass 亦 403) / 延长 200 / GetObjectRetention 原值不变 / 本已到期
+>   GOVERNANCE 不回活);daemon 级 `tests/m12_clock_rollback.sh`(偏移 +86400
+>   起高水位 → 清偏移重启 = 系统时钟回拨 1 天)PASS;引擎单测
+>   trusted_clock_persists_high_water_across_reopen / rollback_does_not_unexpire
+>   同口径(回拨 1h/1d)。
+> - 强制矩阵逐格(§5.4):object_lock_enforcement_matrix 全格——无锁版本删 ✓、
+>   GOVERNANCE 403→bypass 204、COMPLIANCE 403(仅可延长)、Legal Hold 最严
+>   (bypass 无效,OFF 后可删)、覆盖写=新版本 200(含 COMPLIANCE/LegalHold)、
+>   DeleteObjects 条目 AccessDenied、桶含锁对象不可删、锁桶 Suspend 版本化 409。
+> - 生命周期跳过锁定对象可见:`tests/m12_lock_lifecycle_skip.sh` PASS——锁定
+>   对象保留(head 200)、普通对象删除,`fasts3_lifecycle_skipped_locked_total=4`
+>   (admin /metrics)。
+> - perf:锁判定最坏形态 **1.6 ns/op**(两轮一致,20M 迭代;<1µs 门禁,
+>   docs/perf-M12.md);数据面零改动,未加密回退门禁沿用 M11 口径。
+> - 覆盖率与 cargo audit:覆盖率 **84.84% 行 / 78.82% 区域 / 85.28% 函数**
+>   (llvm-cov workspace 同口径,≥80% 达标;M11 基线 84.80%);`cargo audit` **0
+>   漏洞**(2 条 allowed 信息级同 v1.2 集);web 单测 45 过/1 skip 0 失败。
+> - 发布:v1.3.0 版本 bump(Cargo.toml/workspace 1.3.0 + web 三件套);不打 git
+>   tag、不跑 `tools/package/`(执行期同 v1.2)。
 
 ---
 

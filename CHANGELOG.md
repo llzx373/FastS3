@@ -5,6 +5,30 @@
 > 详细发布记录见 [RELEASES.md](./RELEASES.md);RC/GA 候选流程见
 > [docs/ga/rc-flow.md](./docs/ga/rc-flow.md)。
 
+## [Unreleased] — v1.3.0(季度 minor 轨道;M12 Object Lock / WORM)
+
+M12 全部任务与门禁完成(TODO.md M12 全勾选);决策落盘 ADR-13(DESIGN.md §3.3)。
+workspace 版本 **1.3.0**。git tag / `tools/package/` 属执行期步骤(与 v1.2 同口径)。
+
+- **Object Lock(W1/W2)**:CreateBucket 锁头 `x-amz-bucket-object-lock-enabled` 自动开
+  版本化(此后不可关);Put/GetObjectLockConfiguration(Off/Suspended 桶启用 →
+  409 InvalidBucketState,与 AWS 一致);对象级 PUT 头 + Put/GetObjectRetention +
+  Put/GetObjectLegalHold;桶默认保留继承;强制矩阵逐格(§5.4):GOVERNANCE 403 →
+  bypass 放行、COMPLIANCE 仅可延长、Legal Hold 最严、桶含锁定对象不可删。
+- **可信时钟(W1, ADR-13 DL6)**:`s:trusted_clock` 持久化 wall+mono 对 + 单调推导,
+  到期判定 `until ≤ max(wall, trusted)`;回拨不缩短剩余保留(时钟回拨注入测试
+  tests/m12_clock_rollback.sh);`trusted_clock_divergence` 指标 + 告警。
+- **授权与审计(W3)**:策略 Condition 最小集 `s3:BypassGovernanceRetention` /
+  `s3:ObjectLockRemainingRetentionDays`;bypass/保留变更(until/mode 前后值)强制审计。
+- **交互面(W4)**:生命周期/压缩/`check --fix` 锁感知(跳过锁定对象 +
+  `fasts3_lifecycle_skipped_locked_total`,L4-1 接通);管理面锁状态/保留编辑/审计过滤。
+- **协议对齐(W5-1)**:s3-tests object_lock/legal/retention/governance 族 39/39 出集;
+  Days/Years<1 → InvalidRetentionPeriod;非法 Mode/Status → MalformedXML;
+  DeleteObjects 错误条目回显 `<VersionId>`。
+- **门禁**:全量 s3-tests **494 passed / 94 skipped / 250 excluded / 0 unexpected**;
+  锁+删除混载崩溃 500 轮零撕裂/零泄漏/漂移 0;锁判定 1.6 ns/op(<1µs);覆盖率
+  **84.84% 行**;cargo audit 0 漏洞;perf 报告 [docs/perf-M12.md](./docs/perf-M12.md)。
+
 ## [Unreleased] — v1.2.0(季度 minor 轨道;M11 生命周期与加密)
 
 M11 全部任务与门禁完成(TODO.md M11 全勾选);决策落盘 ADR-12(DESIGN.md §3.3)。
