@@ -7786,6 +7786,25 @@ fn object_lock_enforcement_matrix() {
     let r = svc.handle(&req("PUT", "/olk/g", b"g2".to_vec()));
     assert_eq!(status(&r), 200, "{r:?}");
 
+    // §5.4 矩阵逐格补测:COMPLIANCE / Legal Hold 对象覆盖写 = 新版本 200
+    // (锁定仅约束删除与保留改写,不约束新版本写入)
+    let r = svc.handle(&req("PUT", "/olk/c", b"c2".to_vec()));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let r = svc.handle(&req("PUT", "/olk/h", b"h2".to_vec()));
+    assert_eq!(status(&r), 200, "{r:?}");
+
+    // 无锁版本 DELETE ?versionId → 204(c 的覆盖新版本未继承保留)
+    let put_u = svc.handle(&req("PUT", "/olk/c", b"c3".to_vec()));
+    assert_eq!(status(&put_u), 200, "{put_u:?}");
+    let vid_u = hdr(put_u.as_ref().unwrap(), "x-amz-version-id").expect("version id");
+    let r = svc.handle(&req_q(
+        "DELETE",
+        "/olk/c",
+        &[("versionId", vid_u.as_str())],
+        vec![],
+    ));
+    assert_eq!(status(&r), 204, "无锁版本删除:{r:?}");
+
     // GOVERNANCE 定向删无 bypass → 403;带 bypass → 204
     let r = svc.handle(&req_q(
         "DELETE",
