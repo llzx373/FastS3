@@ -111,18 +111,44 @@ pub struct ObjectMeta {
     /// 索引与 `parts` 对齐(空 = 非 multipart 或全部分片无 checksum;非空
     /// 时长度恒等于 `parts.len()`);v3/v2 双读补空表。
     pub part_checksums: Vec<Option<ChecksumInfo>>,
+    /// M13 Z1(ADR-15 DZ1):数据压缩信息(compression,区别于 Tier2 的
+    /// compaction);None = 未压缩。v4 存量解码回退 None。
+    pub compressed: Option<CompressionInfo>,
 }
 
-/// 对象元数据值格式版本(ADR-11 D0 + ADR-12 D-E3:
-/// `[version: u8 = 4] + postcard(ObjectMeta)`;v2/v3/v4 三读、写入恒 v4;
+/// 对象元数据值格式版本(ADR-11 D0 + ADR-12 D-E3 + M13 Z1:
+/// `[version: u8 = 5] + postcard(ObjectMeta)`;v2/v3/v4/v5 四读、写入恒 v5;
 /// 无版本字节的旧值放弃前置兼容,直接拒绝)。
-pub const OBJECT_META_VERSION: u8 = 4;
+pub const OBJECT_META_VERSION: u8 = 5;
+
+/// v4 值格式版本(M13 Z1:无 compressed 尾部字段;四读回退格式)。
+pub const OBJECT_META_VERSION_V4: u8 = 4;
 
 /// v3 值格式版本(ADR-11 D0;M11 起为三读回退格式,见 decode_value)。
 pub const OBJECT_META_VERSION_V3: u8 = 3;
 
 /// v2 值格式版本(ADR-9 §13;M10 起为双读回退格式,见 decode_value)。
 const OBJECT_META_VERSION_V2: u8 = 2;
+
+/// 数据压缩算法(M13 Z1;变体序 = postcard 编码序,只允许尾部追加)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum CompressionAlgorithm {
+    Zstd = 0,
+}
+
+/// 数据压缩信息(M13 Z1,ADR-15 DZ1):压缩对象 = 元数据标记;CRC/ETag 在
+/// 压缩流上(存储侧完整性),客户端 MD5 仍为明文(上传时先算)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompressionInfo {
+    pub algorithm: CompressionAlgorithm,
+    /// zstd 档位 1~3(CPU/压缩率折中;写时档位,解码与档位无关)。
+    pub level: u32,
+    /// 压缩前原始字节数。
+    pub original_size: u64,
+    /// 压缩后字节数(落盘流长度;不含 4KiB 对齐填充)。
+    pub compressed_size: u64,
+}
 
 /// SSE 类型判别(M11 E1,ADR-12 D-E1。变体序 = postcard 编码序,只允许
 /// 尾部追加)。
@@ -449,6 +475,10 @@ impl ObjectMeta {
         match ver {
             OBJECT_META_VERSION => postcard::from_bytes(&buf[1..])
                 .map_err(|e| Error::Corrupt(format!("postcard decode object meta: {e}"))),
+            // v4 双读回退(M13 Z1:无 compressed 尾部字段 → None)
+            OBJECT_META_VERSION_V4 => postcard::from_bytes::<ObjectMetaV4>(&buf[1..])
+                .map(Into::into)
+                .map_err(|e| Error::Corrupt(format!("postcard decode object meta: {e}"))),
             OBJECT_META_VERSION_V3 => postcard::from_bytes::<ObjectMetaV3>(&buf[1..])
                 .map(Into::into)
                 .map_err(|e| Error::Corrupt(format!("postcard decode object meta: {e}"))),
@@ -509,6 +539,54 @@ impl From<ObjectMetaV3> for ObjectMeta {
             retention: l.retention,
             legal_hold: l.legal_hold,
             part_checksums: Vec::new(),
+            compressed: None,
+        }
+    }
+}
+
+/// v4 值格式(v1.3.0;无 compressed 尾部字段;M13 Z1 双读回退用)。
+#[derive(Serialize, Deserialize)]
+struct ObjectMetaV4 {
+    size: u64,
+    etag: [u8; 16],
+    mtime: i64,
+    extents: Vec<Segment>,
+    content_type: String,
+    user_meta: Vec<(String, String)>,
+    inline: Option<Vec<u8>>,
+    parts: Vec<u64>,
+    resp_headers: Vec<(String, String)>,
+    version_id: Option<[u8; 16]>,
+    is_delete_marker: bool,
+    tags: Vec<(String, String)>,
+    sse: Option<SseInfo>,
+    checksum: Option<ChecksumInfo>,
+    retention: Option<Retention>,
+    legal_hold: bool,
+    part_checksums: Vec<Option<ChecksumInfo>>,
+}
+
+impl From<ObjectMetaV4> for ObjectMeta {
+    fn from(l: ObjectMetaV4) -> Self {
+        ObjectMeta {
+            size: l.size,
+            etag: l.etag,
+            mtime: l.mtime,
+            extents: l.extents,
+            content_type: l.content_type,
+            user_meta: l.user_meta,
+            inline: l.inline,
+            parts: l.parts,
+            resp_headers: l.resp_headers,
+            version_id: l.version_id,
+            is_delete_marker: l.is_delete_marker,
+            tags: l.tags,
+            sse: l.sse,
+            checksum: l.checksum,
+            retention: l.retention,
+            legal_hold: l.legal_hold,
+            part_checksums: l.part_checksums,
+            compressed: None,
         }
     }
 }
@@ -547,6 +625,7 @@ impl From<ObjectMetaV2> for ObjectMeta {
             retention: None,
             legal_hold: false,
             part_checksums: Vec::new(),
+            compressed: None,
         }
     }
 }
@@ -584,6 +663,7 @@ impl From<LegacyObjectMeta> for ObjectMeta {
             retention: None,
             legal_hold: false,
             part_checksums: Vec::new(),
+            compressed: None,
         }
     }
 }
@@ -1563,16 +1643,17 @@ mod tests {
                 }),
                 None,
             ],
+            compressed: None,
         };
         let v = m.encode_value().unwrap();
         assert_eq!(v[0], OBJECT_META_VERSION);
-        assert_eq!(v[0], 4, "M11 起写入恒 v4");
+        assert_eq!(v[0], 5, "M13 Z1 起写入恒 v5");
         assert_eq!(ObjectMeta::decode_value(&v).unwrap(), m);
         // 无版本字节(旧布局值)→ 拒绝
         let legacy = postcard::to_allocvec(&m).unwrap();
         assert!(ObjectMeta::decode_value(&legacy).is_err());
-        // 版本字节不符 → 拒绝(2/3 为回退格式,不在此列)
-        for bad_ver in [0u8, 1, 5, 0xFF] {
+        // 版本字节不符 → 拒绝(2/3/4 为回退格式,不在此列)
+        for bad_ver in [0u8, 1, 6, 0xFF] {
             let mut bad = v.clone();
             bad[0] = bad_ver;
             assert!(ObjectMeta::decode_value(&bad).is_err());
@@ -1937,5 +2018,37 @@ mod tests {
         let dec: KeyRecord = postcard::from_bytes(&enc).unwrap();
         assert_eq!(rec, dec);
         assert_eq!(dec.decrypt_secret(seed).unwrap(), "s3cr3t-value");
+    }
+}
+
+/// M13 Z1 数据压缩配置(DZ1;compression = 数据压缩,区别于 Tier2 的
+/// compaction = 空间压缩)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompressionConfig {
+    /// 写时压缩开关(默认关)。
+    pub enabled: bool,
+    /// zstd 档位 1~3(CPU/压缩率折中;默认 1)。
+    pub level: u32,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        CompressionConfig {
+            enabled: false,
+            level: 1,
+        }
+    }
+}
+
+impl CompressionConfig {
+    /// 档位校验(非法 → InvalidArgument)。
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=3).contains(&self.level) {
+            return Err(Error::InvalidArgument(format!(
+                "compression level {} out of range 1..=3",
+                self.level
+            )));
+        }
+        Ok(())
     }
 }

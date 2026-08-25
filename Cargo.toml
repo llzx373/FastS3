@@ -47,6 +47,9 @@ sha2 = "0.10"
 sha1 = "0.10"
 hex = "0.4"
 base64 = "0.22"
+# zstd:M13 Z1 数据压缩(写时压缩,默认关;zstd crate = 官方 rust 绑定,
+# C 后端捆绑编译,零外部依赖;档位 1~3)。
+zstd = "0.13"
 serde_json = "1.0"
 rcgen = "0.13"
 clap = { version = "4.5", features = ["derive"] }

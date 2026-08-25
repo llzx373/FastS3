@@ -4228,6 +4228,7 @@ fn object_meta_for_precond(size: u64, mtime: i64) -> ObjectMeta {
         retention: None,
         legal_hold: false,
         part_checksums: Vec::new(),
+        compressed: None,
     }
 }
 

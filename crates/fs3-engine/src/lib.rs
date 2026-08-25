@@ -72,6 +72,9 @@ pub struct EngineConfig {
     pub compaction: CompactionConfig,
     /// M13 M4-1 跨盘再平衡配置(默认关;候选 = 高水位盘,目标 = 低水位盘)。
     pub rebalance: RebalanceConfig,
+    /// M13 Z1 数据压缩配置(默认关;zstd 档位 1~3;compression = 数据压缩,
+    /// 区别于 Tier2 的 compaction = 空间压缩)。
+    pub compression: fs3_core::CompressionConfig,
     /// 测试/故障注入覆盖:I/O 引擎替换(默认 None = 正常打开)。
     /// 掉盘模拟用:注入一个会在 N 次写后失败的 IoEngine。
     #[doc(hidden)]
@@ -99,6 +102,7 @@ impl Default for EngineConfig {
             etag_mode: fs3_core::EtagMode::Md5,
             compaction: CompactionConfig::default(),
             rebalance: RebalanceConfig::default(),
+            compression: fs3_core::CompressionConfig::default(),
             debug_io: None,
             clock_offset_secs: 0,
         }
@@ -1951,6 +1955,7 @@ impl Engine {
                 retention: lock.retention.clone(),
                 legal_hold: lock.legal_hold,
                 part_checksums: Vec::new(),
+                compressed: None,
             };
             let mut draft = Staged::default();
             if !old.segments.is_empty() {
@@ -2077,6 +2082,7 @@ impl Engine {
             retention: lock.retention.clone(),
             legal_hold: lock.legal_hold,
             part_checksums: Vec::new(),
+            compressed: None,
         };
 
         // 覆盖语义(ADR-9 §5.4):新段记账必须在旧段释放**之前**——开放 extent
@@ -4140,6 +4146,7 @@ impl Engine {
                         retention: lock.retention.clone(),
                         legal_hold: lock.legal_hold,
                         part_checksums: part_checksums.clone(),
+                        compressed: None,
                     }
                 } else {
                     // extent:逐 part 解密直灌 SSE 写上下文(单一对象网格;
@@ -4179,6 +4186,7 @@ impl Engine {
                         retention: lock.retention.clone(),
                         legal_hold: lock.legal_hold,
                         part_checksums: part_checksums.clone(),
+                        compressed: None,
                     }
                 }
             } else if all_inline && total_size <= self.small_object_limit as u64 {
@@ -4207,6 +4215,7 @@ impl Engine {
                     retention: lock.retention.clone(),
                     legal_hold: lock.legal_hold,
                     part_checksums: part_checksums.clone(),
+                    compressed: None,
                 }
             } else if all_extent {
                 // 零数据搬运:段列表按序拼接(所有权从分片转移给对象;
@@ -4233,6 +4242,7 @@ impl Engine {
                     retention: lock.retention.clone(),
                     legal_hold: lock.legal_hold,
                     part_checksums: part_checksums.clone(),
+                    compressed: None,
                 }
             } else {
                 // 混合(小分片 + 大分片):数据路径组合(仅请求子集,REVIEW §4.12)
@@ -4274,6 +4284,7 @@ impl Engine {
                     retention: lock.retention.clone(),
                     legal_hold: lock.legal_hold,
                     part_checksums: part_checksums.clone(),
+                    compressed: None,
                 }
             };
 
@@ -5633,6 +5644,7 @@ fn delete_marker_meta(vid: Option<[u8; 16]>) -> ObjectMeta {
         retention: None,
         legal_hold: false,
         part_checksums: Vec::new(),
+        compressed: None,
     }
 }
 

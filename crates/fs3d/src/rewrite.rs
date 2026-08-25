@@ -200,6 +200,7 @@ mod tests {
             retention: None,
             legal_hold: false,
             part_checksums: Vec::new(),
+            compressed: None,
         }
     }
 

@@ -112,6 +112,10 @@ pub struct StorageConfig {
     /// 低水位盘;与压缩共用节流;watermark 档位取默认 0.85/0.5,
     /// 收敛目标 = 水位差 <10%)。
     pub rebalance_enabled: Option<bool>,
+    /// M13 Z1 数据压缩开关(默认 false 关;zstd 档位 `compression_level`)。
+    pub compression_enabled: Option<bool>,
+    /// M13 Z1 zstd 档位 1~3(默认 1)。
+    pub compression_level: Option<u32>,
     /// 生命周期执行器开关(M11 L2-2;默认 true)。周期扫描有生命周期规则的
     /// 桶执行过期删除/会话中止;无规则桶零动作(现状不变)。
     pub lifecycle_enabled: Option<bool>,

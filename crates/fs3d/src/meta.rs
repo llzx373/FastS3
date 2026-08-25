@@ -216,6 +216,7 @@ impl ObjectDto {
                 retention: self.retention.clone(),
                 legal_hold: self.legal_hold,
                 part_checksums: self.part_checksums.clone(),
+                compressed: None,
             },
         ))
     }

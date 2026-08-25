@@ -351,7 +351,7 @@
 - [ ] (待立项)N3 设备内 mini-FS + rocksdb 挂载(5~7 pw,spike 通过后拆细)
 
 ### Z. zstd 数据压缩(§6.3,可选默认关)
-- [ ] Z1-1 写时压缩(桶/全局开关,默认关;zstd 档位 1~3;术语区分 compaction/compression)
+- [x] Z1-1 写时压缩(桶/全局开关,默认关;zstd 档位 1~3;术语区分 compaction/compression)(全局开关 v1.4;桶级覆盖留作增强)
 - [ ] Z1-2 流水线顺序:明文 → 加密 → zstd → CRC(压缩流);读路径解压缓冲;元数据 CompressionInfo
 - [ ] Z1-3 内联交互(压缩后 ≤32KiB 才内联);etag=fast 一致性;perf 对照 + 压缩率基准
 
