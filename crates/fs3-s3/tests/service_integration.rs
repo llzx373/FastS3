@@ -7874,6 +7874,134 @@ fn object_lock_enforcement_matrix() {
     assert_eq!(err_code(&r), "BucketNotEmpty", "{r:?}");
 }
 
+/// M12 W5-2:时钟回拨注入(回拨 1h/1d)→ COMPLIANCE 保留不可缩短(自动化断言)。
+///
+/// 注入 = 下调可信时钟采样的墙钟(保留 CLOCK_MONOTONIC 高水位,ADR-13 DL6);
+/// 断言:① lock_now 不回退到回拨前高水位之下 ② DELETE ?versionId 仍 403
+/// (bypass 亦 403) ③ PutObjectRetention 缩短 403 / 延长 200
+/// ④ GetObjectRetention 原值不被回拨改写 ⑤ 本已到期 GOVERNANCE 回拨不复活。
+#[test]
+fn object_lock_clock_rollback_does_not_shorten_compliance() {
+    let (_d, svc) = setup();
+    let ol = &[("object-lock", "")];
+    let ret_q = &[("retention", "")];
+    let bypass = &[("x-amz-bypass-governance-retention", "true")];
+    create_lock_bucket(&svc, "olk");
+    let cfg = b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>".to_vec();
+    assert_eq!(status(&svc.handle(&req_q("PUT", "/olk", ol, cfg))), 200);
+
+    // 基线高水位 = lock_now(墙钟/单调推导取大);到期日 = 基线 + 30 天
+    let base = svc.engine().read().lock_now();
+    let until = fs3_s3::xml::ts_to_rfc3339(base + 30 * 86400);
+    let put = svc.handle(&req_h(
+        "PUT",
+        "/olk/comp",
+        &[
+            ("x-amz-object-lock-mode", "COMPLIANCE"),
+            ("x-amz-object-lock-retain-until-date", &until),
+        ],
+        b"c".to_vec(),
+    ));
+    assert_eq!(status(&put), 200, "{put:?}");
+    let vid = hdr(put.as_ref().unwrap(), "x-amz-version-id").expect("version id");
+
+    for (label, rollback) in [("1h", 3600i64), ("1d", 86400i64)] {
+        // 注入前抓当前保留原值(前一迭代若已延长则取延长后值)
+        let expected = body_str(
+            &svc.handle(&req_q("GET", "/olk/comp", ret_q, vec![]))
+                .unwrap(),
+        );
+
+        // 注入回拨:墙钟退后 rollback 秒,monotonic 取同一采样值 → refresh 落高水位
+        let eng = svc.engine().write();
+        let st = eng.trusted_clock_state();
+        let wall = st.last_wall.saturating_sub(rollback);
+        eng.debug_inject_clock(wall, st.last_mono_ns);
+        eng.debug_refresh_trusted_clock().unwrap();
+        let now_after = eng.lock_now();
+        assert!(
+            now_after >= st.last_wall,
+            "回拨{label}:lock_now {now_after} < 回拨前高水位 {} —— 剩余保留被缩短",
+            st.last_wall
+        );
+        drop(eng);
+
+        // ② DELETE ?versionId 仍 403(COMPLIANCE;绕过头亦 403)
+        let r = svc.handle(&req_q(
+            "DELETE",
+            "/olk/comp",
+            &[("versionId", vid.as_str())],
+            vec![],
+        ));
+        assert_eq!(err_code(&r), "AccessDenied", "回拨{label}:{r:?}");
+        let r = svc.handle(&req_qh(
+            "DELETE",
+            "/olk/comp",
+            &[("versionId", vid.as_str())],
+            bypass,
+            vec![],
+        ));
+        assert_eq!(err_code(&r), "AccessDenied", "回拨{label} bypass:{r:?}");
+
+        // ④ GetObjectRetention 原值不变(回拨不落盘改写)
+        let xml_body = body_str(
+            &svc.handle(&req_q("GET", "/olk/comp", ret_q, vec![]))
+                .unwrap(),
+        );
+        assert_eq!(xml_body, expected, "回拨{label}:原值被改写");
+
+        // ③ 缩短仍 403(带 bypass 亦 403);延长 200(COMPLIANCE 仅可延长)
+        let shorter = format!(
+            "<Retention><Mode>COMPLIANCE</Mode><RetainUntilDate>{}</RetainUntilDate></Retention>",
+            fs3_s3::xml::ts_to_rfc3339(base + 20 * 86400)
+        );
+        let r = svc.handle(&req_qh(
+            "PUT",
+            "/olk/comp",
+            ret_q,
+            bypass,
+            shorter.into_bytes(),
+        ));
+        assert_eq!(err_code(&r), "AccessDenied", "回拨{label}:{r:?}");
+        let longer = format!(
+            "<Retention><Mode>COMPLIANCE</Mode><RetainUntilDate>{}</RetainUntilDate></Retention>",
+            fs3_s3::xml::ts_to_rfc3339(base + 40 * 86400)
+        );
+        let r = svc.handle(&req_q("PUT", "/olk/comp", ret_q, longer.into_bytes()));
+        assert_eq!(status(&r), 200, "回拨{label} 延长:{r:?}");
+        let xml_body = body_str(
+            &svc.handle(&req_q("GET", "/olk/comp", ret_q, vec![]))
+                .unwrap(),
+        );
+        assert!(
+            xml_body.contains(&fs3_s3::xml::ts_to_rfc3339(base + 40 * 86400)),
+            "回拨{label} 延长未生效:{xml_body}"
+        );
+
+        // ⑤ 本已到期 GOVERNANCE(until=基线−1s)回拨后仍可删:不回活
+        let k = format!("exp{label}");
+        let past = fs3_s3::xml::ts_to_rfc3339(base - 1);
+        let put_g = svc.handle(&req_h(
+            "PUT",
+            &format!("/olk/{k}"),
+            &[
+                ("x-amz-object-lock-mode", "GOVERNANCE"),
+                ("x-amz-object-lock-retain-until-date", &past),
+            ],
+            b"e".to_vec(),
+        ));
+        assert_eq!(status(&put_g), 200, "回拨{label}:{put_g:?}");
+        let vid_g = hdr(put_g.as_ref().unwrap(), "x-amz-version-id").expect("version id");
+        let r = svc.handle(&req_q(
+            "DELETE",
+            &format!("/olk/{k}"),
+            &[("versionId", vid_g.as_str())],
+            vec![],
+        ));
+        assert_eq!(status(&r), 204, "回拨{label} 不回活:{r:?}");
+    }
+}
+
 /// M12 W3-2:bypass 成功与保留变更必须落审计(until/mode 前后值);
 /// 403 不落成功审计字段。
 #[test]

@@ -114,6 +114,12 @@ pub struct StorageConfig {
     /// 生命周期执行周期秒数(M11 L2-2;默认 86400 = 24h,ADR-12 DL3 全量
     /// 扫描口径;可配小周期供测试/演练)。
     pub lifecycle_interval_secs: Option<u64>,
+    /// 可信时钟墙钟偏移秒数(M12 W5-2 测试钩子;默认 0)。仅作用于可信时钟
+    /// 采样(`s:trusted_clock` / Object Lock 到期判定),不改对象
+    /// LastModified 等其它时间戳。回拨注入:首轮正偏移起高水位,次轮清偏移
+    /// 模拟系统时钟回拨,断言 COMPLIANCE 保留不可缩短(tests/m12_clock_rollback.sh)。
+    #[allow(dead_code)] // 经 cli.storage.clock_offset_secs 透传
+    pub clock_offset_secs: Option<i64>,
 }
 
 pub fn load_config(path: Option<&Path>) -> Result<RootConfig> {

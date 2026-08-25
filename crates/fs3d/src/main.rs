@@ -146,6 +146,8 @@ enum Cmd {
     Bench(bench::BenchArgs),
     /// M5:MD5 多缓冲吞吐对比(单缓冲 vs SIMD 4 路)
     BenchMd5(bench::Md5BenchArgs),
+    /// M12:Object Lock 判定微基准(门禁:元数据层 <1µs,无感)
+    BenchLock(bench::LockCheckArgs),
     /// 协议层负载生成器(A4)
     Loadgen(loadgen::LoadgenArgs),
     /// 批量对象压测(M4 门禁:1 亿对象,rockdb 扩展性 R5)
@@ -232,6 +234,8 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
         }
     };
     let etag_mode = parse_etag_mode(cli.etag_mode.as_deref().or(storage.etag_mode.as_deref()))?;
+    // M12 W5-2:可信时钟墙钟偏移(测试钩子;仅可信时钟采样,见 engine_config)。
+    let clock_offset_secs = storage.clock_offset_secs.unwrap_or(0);
 
     match cli.cmd {
         Cmd::Init(args) => {
@@ -253,6 +257,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.checkpoint_interval.or(storage.checkpoint_interval),
                 cli.no_uring,
                 etag_mode,
+                clock_offset_secs,
             )?;
             meta::run_meta_export(&engine_cfg.device, &engine_cfg.meta_dir, &args)
         }
@@ -265,6 +270,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.checkpoint_interval.or(storage.checkpoint_interval),
                 cli.no_uring,
                 etag_mode,
+                clock_offset_secs,
             )?;
             meta::run_meta_import(&engine_cfg.device, &engine_cfg.meta_dir, &args)
         }
@@ -279,6 +285,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.checkpoint_interval.or(storage.checkpoint_interval),
                 cli.no_uring,
                 etag_mode,
+                clock_offset_secs,
             )?;
             if args.count_only {
                 let (v2, v3) = rewrite::count_value_versions(&engine_cfg.meta_dir)?;
@@ -307,6 +314,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.checkpoint_interval.or(storage.checkpoint_interval),
                 cli.no_uring,
                 etag_mode,
+                clock_offset_secs,
             )?;
             cmd_put(&engine_cfg, &bucket, &key, &file)
         }
@@ -324,6 +332,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.checkpoint_interval.or(storage.checkpoint_interval),
                 cli.no_uring,
                 etag_mode,
+                clock_offset_secs,
             )?;
             cmd_get(&engine_cfg, &bucket, &key, &out, range.as_deref())
         }
@@ -336,6 +345,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.checkpoint_interval.or(storage.checkpoint_interval),
                 cli.no_uring,
                 etag_mode,
+                clock_offset_secs,
             )?;
             cmd_del(&engine_cfg, &bucket, &key)
         }
@@ -348,6 +358,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.checkpoint_interval.or(storage.checkpoint_interval),
                 cli.no_uring,
                 etag_mode,
+                clock_offset_secs,
             )?;
             cmd_ls(&engine_cfg, bucket.as_deref(), &prefix)
         }
@@ -360,6 +371,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.checkpoint_interval.or(storage.checkpoint_interval),
                 cli.no_uring,
                 etag_mode,
+                clock_offset_secs,
             )?;
             if fix {
                 cmd_check_fix(&engine_cfg)
@@ -376,6 +388,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.checkpoint_interval.or(storage.checkpoint_interval),
                 cli.no_uring,
                 etag_mode,
+                clock_offset_secs,
             )?;
             cmd_compact(&engine_cfg, rounds)
         }
@@ -388,6 +401,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.checkpoint_interval.or(storage.checkpoint_interval),
                 cli.no_uring,
                 etag_mode,
+                clock_offset_secs,
             )?;
             let mut e = Engine::open(&engine_cfg)?;
             e.checkpoint()?;
@@ -411,10 +425,12 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.checkpoint_interval.or(storage.checkpoint_interval),
                 cli.no_uring,
                 etag_mode,
+                clock_offset_secs,
             )?;
             bench::run(&engine_cfg, args)
         }
         Cmd::BenchMd5(args) => bench::run_md5(&args),
+        Cmd::BenchLock(args) => bench::run_lock_check(&args),
         Cmd::Loadgen(args) => loadgen::run(&args),
         Cmd::StressInsert(args) => {
             let engine_cfg = engine_config(
@@ -425,6 +441,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.checkpoint_interval.or(storage.checkpoint_interval),
                 cli.no_uring,
                 etag_mode,
+                clock_offset_secs,
             )?;
             stress::run(&args, &engine_cfg)
         }
@@ -447,6 +464,7 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cli.checkpoint_interval.or(storage.checkpoint_interval),
                 cli.no_uring,
                 etag_mode,
+                clock_offset_secs,
             )?;
             cmd_serve(
                 cli.config.clone(),
@@ -826,9 +844,11 @@ pub(crate) fn engine_config_inner(
             enabled: false,
             ..Default::default()
         },
+        clock_offset_secs: 0,
     })
 }
 
+#[allow(clippy::too_many_arguments)] // 配置聚合函数;调用点逐一传 CLI/配置值
 fn engine_config(
     device: Option<PathBuf>,
     meta_dir: Option<PathBuf>,
@@ -837,6 +857,7 @@ fn engine_config(
     checkpoint_interval: Option<u64>,
     no_uring: bool,
     etag_mode: fs3_core::EtagMode,
+    clock_offset_secs: i64,
 ) -> fs3_core::Result<EngineConfig> {
     let device = device.ok_or_else(|| {
         fs3_core::Error::InvalidArgument(
@@ -867,6 +888,7 @@ fn engine_config(
             enabled: false,
             ..Default::default()
         },
+        clock_offset_secs,
     })
 }
 

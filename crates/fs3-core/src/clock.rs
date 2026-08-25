@@ -125,10 +125,10 @@ mod tests {
         assert_eq!(s.last_wall, 10_500);
         assert_eq!(s.last_mono_ns, 3 * NS);
         // 墙钟回拨到 2000:保留 last_wall=10000
-        let s = TrustedClockState::rebaseline_on_boot(Some(persisted), 2_000, 1 * NS);
+        let s = TrustedClockState::rebaseline_on_boot(Some(persisted), 2_000, NS);
         assert_eq!(s.last_wall, 10_000);
-        assert_eq!(s.last_mono_ns, 1 * NS);
-        assert_eq!(s.lock_now(2_000, 1 * NS), 10_000);
+        assert_eq!(s.last_mono_ns, NS);
+        assert_eq!(s.lock_now(2_000, NS), 10_000);
         // 无持久化 = 以当前为初值
         let s = TrustedClockState::rebaseline_on_boot(None, 42, 7);
         assert_eq!(s, TrustedClockState::new(42, 7));

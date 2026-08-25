@@ -73,6 +73,12 @@ pub struct EngineConfig {
     /// 掉盘模拟用:注入一个会在 N 次写后失败的 IoEngine。
     #[doc(hidden)]
     pub debug_io: Option<Arc<Mutex<Box<dyn IoEngine>>>>,
+    /// 可信时钟墙钟偏移秒数(M12 W5-2 测试钩子;默认 0)。
+    /// 仅作用于可信时钟采样(`s:trusted_clock` / lock_now 判定),不改对象
+    /// LastModified 等其它时间戳。用于时钟回拨注入:E2E 首轮正偏移起高水位,
+    /// 次轮清偏移模拟系统时钟回拨,断言 COMPLIANCE 保留不可缩短。
+    #[doc(hidden)]
+    pub clock_offset_secs: i64,
 }
 
 impl Default for EngineConfig {
@@ -90,6 +96,7 @@ impl Default for EngineConfig {
             etag_mode: fs3_core::EtagMode::Md5,
             compaction: CompactionConfig::default(),
             debug_io: None,
+            clock_offset_secs: 0,
         }
     }
 }
@@ -141,13 +148,15 @@ struct TrustedClockRt {
     state: TrustedClockState,
     /// 测试注入 `(wall_secs, mono_ns)`;None = 采样真实时钟。
     inject: Option<(i64, i64)>,
+    /// 墙钟偏移秒数(仅可信时钟采样;W5-2 回拨注入)。
+    offset_secs: i64,
 }
 
 impl TrustedClockRt {
     fn sample(&self) -> (i64, i64) {
         match self.inject {
             Some(p) => p,
-            None => (now_ts(), monotonic_ns()),
+            None => (now_ts() + self.offset_secs, monotonic_ns()),
         }
     }
 }
@@ -326,7 +335,9 @@ impl Engine {
         };
 
         let last_seq = meta.last_seq()?;
-        let wall = now_ts();
+        // W5-2 回拨注入:偏移仅作用于可信时钟采样;首个墙钟初值同偏移,
+        // 次轮清偏移即模拟系统时钟回拨(高水位由 rebaseline_on_boot 保持)。
+        let wall = now_ts() + cfg.clock_offset_secs;
         let mono = monotonic_ns();
         let clock_state =
             TrustedClockState::rebaseline_on_boot(meta.load_trusted_clock()?, wall, mono);
@@ -363,6 +374,7 @@ impl Engine {
             trusted_clock: std::sync::Mutex::new(TrustedClockRt {
                 state: clock_state,
                 inject: None,
+                offset_secs: cfg.clock_offset_secs,
             }),
             trusted_clock_divergence: std::sync::atomic::AtomicU64::new(0),
             trusted_clock_divergence_events: std::sync::atomic::AtomicU64::new(0),
