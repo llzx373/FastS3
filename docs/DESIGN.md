@@ -1203,6 +1203,99 @@ s3-tests 出排除集且 100%(transition/restore/storage-class);崩溃 ≥500
 基准进发布报告;非归档负载零回退(<5%);覆盖率 ≥80%;cargo audit
 清零;发布 v2.2.0 记档。
 
+#### ADR-20(M16 立项决策):复制策略化落地形态 / 同步任务模型 / 调度与账本 / 执行器选择 / 对账视图
+
+**背景**:M16「归档与复制」(v2.2.0;TODO M16)主力组 R = 复制策略化
+(≈2 pw)。立项依据:DESIGN-FUTURE §8「桶级/站点复制 **慎重,不内置;
+策略化落地 = M16 v2.2 候选**」(中心纳管调度 mc/rclone 同步任务 +
+健康/对账视图);企业 DR 诉求由 S3-GAP 场景表引导到纳管平台统一调度
+更务实,与「单机语义层」定位一致。前置已全部就绪:M14 中心纳管
+(ADR-17 DV1:中心 = 配置源、节点 agent 本地裁决执行、desired_ops
+7 类 ops 账本)、M15 健康/对账视图。本 ADR 按 TODO M16/R1-1 决策点
+**DR1~DR5** 落盘(DESIGN-FUTURE §11 决策清单同步登记)。实现偏离推荐
+方案必须走 ADR 流程,不得静默偏离(AGENT §5)。
+
+**DR1(同步任务模型:中心 = 配置源,节点本地执行 = 裁决权威)**:
+
+1. **复制不内置,策略化落地**:不在数据面实现 AWS `?replication`
+   语义(无复制规则/复制事件/跨区域复制/同步删除/复制删除标记/
+   版本化复制)。数据面维持单机语义层定位;复制 = 纳管面策略任务,
+   与 ADR-17 DV1 同构:中心只持有**任务配置**(desired state),
+   节点本地 agent **执行并上报结果**(实际状态),中心对账。
+2. **任务模型**(`sync_tasks`,中心 SQLite 持久化):
+   `{id, name, source_node, source_bucket, dest_node, dest_bucket,
+   mode: mirror|incremental, schedule_secs, enabled, 凭据(源/目标
+   endpoint+key+secret), last_run_at, last_result, last_error,
+   last_transferred, created_at}`。mode 语义:mirror = 目标与源一致
+   (含删除传播);incremental = 只复制新增/变更,不删目标。
+3. **凭据存中心 SQLite(管理面配置)**:G1-3 仅约束数据面密钥
+   (k: 表 secret 仅生成时一次明文回显);同步凭据属于管理面运维
+   配置,中心持久化、控制台可维护,**文档化于 compat/sync 文档**。
+4. **不实现 S3 复制 API**:`PUT Bucket replication` → 501 显式
+   NotImplemented(compat 声明);控制台/API 层面用 sync 任务表达。
+5. **冲突口径 = 单写者**:同一目标桶仅允许一个启用任务(CRUD 校验);
+   源桶可被多任务读取;目标桶被外部并发写不设数据面锁——文档化
+   为运维责任(对账视图暴露 last_transferred/lag,偏差可见)。
+
+**DR2(调度与账本:中心周期下发,节点执行,结果回传结算)**:
+
+1. **调度器在中心**(web server 内,周期 tick 扫描):
+   任务 enabled 且 `now - last_run_at >= schedule_secs` → 追加
+   **desired_ops 第 8 类 `sync.run`**(ops 白名单 7 类 → 8 类扩展),
+   payload 自描述:task_id + 源/目标 endpoint/桶/凭据 + mode。
+   每个任务同一时刻至多一个未结算 sync.run(去重,防积压)。
+2. **账本结算复用既有通道**:agent 执行后 POST /v2/center/results
+   (ok/rejected + error);中心按 seq 结算 desired_ops 的同时,
+   若 payload 含 task_id → 更新 sync_tasks.last_run_at/last_result/
+   last_transferred/last_error。**对账口径**:desired_ops acked =
+   任务已执行;任务状态 = 最近一次执行结果。
+3. **中心不可达 = 安全停止**:sync.run 全部由中心下发;agent 拉不到
+   新 op → 任务自然暂停(不执行、不误删),中心恢复后按计划继续;
+   与 ADR-17 DV1「引擎 = 裁决权威」一致——同步执行永远在节点侧,
+   节点无中心也能完成已领取任务(执行不依赖中心在线)。
+4. **至少一次 + 幂等**:sync.run 未 acked 会在 agent 重连后重发;
+   执行器语义幂等(mirror 收敛、incremental 只增),重放安全。
+
+**DR3(执行器选择:mc mirror / rclone copy,节点本地 spawn)**:
+
+1. **执行器**:mode=mirror → `mc mirror --overwrite --insecure
+   <src> <dst>`(含删除传播);mode=incremental → `rclone copy
+   <src> <dst>`(只增不删)。二进制由部署方预装,节点 `PATH`
+   可见;缺失/非零退出 → rejected + last_error 落账 + 控制台可见。
+2. **编排入口**:agent 收到 sync.run → 经本地 admin 编排(复用
+   apply.rs 现有 plan/apply 框架,新增 SyncRun 动作),子进程
+   运行、节流(单任务串行、全局并发上限可配)、超时后 kill 并
+   上报失败;结果(ok/transferred/error)原样回传中心。
+3. **校验**:CRUD 时中心校验节点已注册、桶名合法;执行前 agent
+   校验 endpoint 可达;校验失败 → rejected 显式上报(不静默跳过)。
+
+**DR4(健康/对账视图 + 告警)**:
+
+1. **控制台同步任务页**:任务列表(启用/暂停、mode、调度、最近
+   执行、transferred、错误)+ 新建/编辑/启停/删除 + 节点健康
+   联动(目标/源节点 offline 置灰)。
+2. **stalled 判定**:任务 enabled 且 `now - last_run_at >
+   2 × schedule_secs` → 视图告警态 + 告警规则
+   `FastS3SyncTaskStalled`(grafana alerts.yml,中心指标/视图
+   条件化);last_error 非空 → 错误态展示,不再重复调度
+   (错误任务保持 last_run_at 更新,避免误报 stalled,错误本身
+   即告警条件)。
+
+**DR5(范围与后置)**:
+
+1. **v2.2 交付范围**:中心 sync 任务 CRUD + 调度 + 账本;节点
+   mc/rclone 执行;控制台任务页;双节点互备 drill(R1-5)。
+2. **后置(不进 v2.2,无立项证据不动)**:双向同步/故障转移/
+   replication 事件/复制删除标记/版本化复制/S3 Batch Operations
+   联动;S3-GAP Top20 对照同步更新(「跨桶复制」行标注策略化
+   落地)。
+
+**门禁口径同步**(TODO M16 门禁):ADR-20 与实现无偏离;R 组
+s3-tests 无新增 API(无 ?replication,501 显式);drill 实测双节点
+互备(mc/rclone 恰同步一次、断线重连幂等、拔中心安全停止/继续);
+控制台任务页 + 告警规则落盘;崩溃/覆盖率/audit 门禁沿用 M16 总
+口径。
+
 ---
 
 ## 4. 存储引擎设计(Rust)

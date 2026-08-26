@@ -910,6 +910,11 @@ v1.0 基线 <256MiB 空载。远期特性开启态的常驻增量:多设备位�
 | DA3 | NEXT-ROUND §6 | Transition 目标类 | 限定 GLACIER/GLACIER_IR/DEEP_ARCHIVE;INTELLIGENT_TIERING 映射 STANDARD 不迁移 | ADR-19(M16) |
 | DA4 | NEXT-ROUND §6 | ObjectMeta v7 | storage_class + restore_state 字段,v6 双读回退;transition 同版本(vk 不变)原子换数据 | ADR-19(M16) |
 | DA5 | NEXT-ROUND §6 | 归档 Copy/统计口径 | 同存储类复制豁免 COW;逻辑口径按类分账;锁定对象跳过 transition | ADR-19(M16) |
+| DR1 | NEXT-ROUND §8 | 同步任务模型 | 中心 = 配置源,节点本地执行 = 裁决权威;不内置 ?replication;单写者冲突口径;凭据存中心 SQLite(管理面配置) | ADR-20(M16) |
+| DR2 | NEXT-ROUND §8 | 调度与账本 | 中心周期下发 sync.run(ops 白名单 8 类);结果回传结算任务状态;中心不可达 = 安全停止;至少一次 + 幂等重放 | ADR-20(M16) |
+| DR3 | NEXT-ROUND §8 | 执行器选择 | mirror = mc mirror(含删除传播);incremental = rclone copy(只增不删);节点本地 spawn,失败 rejected 显式上报 | ADR-20(M16) |
+| DR4 | NEXT-ROUND §8 | 对账视图 | 控制台同步任务页 + stalled 判定(2×schedule)+ FastS3SyncTaskStalled 告警 | ADR-20(M16) |
+| DR5 | NEXT-ROUND §8 | 范围与后置 | v2.2 只做任务化同步 + drill;双向/故障转移/replication 事件后置,无证据不动 | ADR-20(M16) |
 
 ---
 
