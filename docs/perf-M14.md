@@ -60,3 +60,25 @@
 
 - 默认全关二进制空载内存 ≤256MiB(门禁;M14 门禁实测记录中给出
   /usr/bin/time -v 数据);agent 开启态增量 <16MiB 预算(指标缓冲)。
+## 5. 热缓存对照(H1-2;默认关;§4.12)
+
+脚本:`tests/bench/m14-cache-bench.sh`(64KiB 对象 × 500 全量 GET,
+keep-alive;写路径经引擎 CLI 预写,读路径匿名;开 = 512MiB 额度)。
+
+| 配置 | ops/s | 命中率(admin 指标) |
+| --- | --- | --- |
+| 缓存关(默认) | ~1037 | —(指标组缺席) |
+| 缓存开 | ~1328(**1.28×**) | 99.8%(hits=499/misses=1) |
+
+说明:
+
+- 命中路径免引擎读取(元数据 + 设备 I/O),Range 请求按命中整对象裁剪
+  (高频 Range 头场景收益更高);64KiB 对象在此基准机上引擎读本身已快,
+  提速 28% 为保守口径。
+- 命中率可观测:admin `/v1/admin/metrics` 导出 `fasts3_cache_hits_total /
+  misses_total / inserted_total / evicted_total / cached_bytes /
+  served_bytes_total`(未启用 = 指标组缺席,与生命周期指标同口径)。
+- **SSE 对象不入缓存**(解密字节与客户密钥作用域绑定红线);超
+  `max_object_size` 对象不进入缓存路径(计数器不变)。
+- 开启 = 主动扩大内存预算(与默认 ≤256MiB 空载基线冲突的明示,
+  §9.2)。

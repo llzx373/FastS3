@@ -685,7 +685,7 @@ fn cmd_serve(
             }
         }
     };
-    let service = Arc::new(fs3_s3::S3Service::with_observability(
+    let mut service_raw = fs3_s3::S3Service::with_observability(
         engine.clone(),
         keys,
         region,
@@ -693,7 +693,33 @@ fn cmd_serve(
         metrics,
         // M11 L2-2:生命周期执行器共用同一 AuditRing(who=system:lifecycle)
         audit.clone(),
-    ));
+    );
+    // M14 H1-2(§4.12):热对象缓存(默认关;内存额度与 ≤256MiB 基线冲突的
+    // 明示 —— 开启即主动扩大内存预算)
+    if cfg.cache.enabled.unwrap_or(false) {
+        let parse = |v: &Option<String>, def: &str| -> u64 {
+            match v {
+                Some(s) => config::parse_size(s).unwrap_or_else(|_| {
+                    tracing::warn!("[cache] 非法大小值 {s};使用默认 {def}");
+                    config::parse_size(def).unwrap()
+                }),
+                None => config::parse_size(def).unwrap(),
+            }
+        };
+        let cache_cfg = fs3_core::cache::CacheConfig {
+            enabled: true,
+            max_bytes: parse(&cfg.cache.max_bytes, "256MiB"),
+            max_object_size: parse(&cfg.cache.max_object_size, "2MiB"),
+        };
+        let cache_arc = fs3_core::cache::ObjectCache::new(cache_cfg);
+        tracing::info!(
+            max_bytes = cache_cfg.max_bytes,
+            max_object_size = cache_cfg.max_object_size,
+            "hot object cache enabled (default off; H1-2)"
+        );
+        service_raw = service_raw.with_cache(Some(cache_arc));
+    }
+    let service = Arc::new(service_raw);
     // 从 meta 恢复运行时密钥(M3 密钥 CRUD;配置密钥优先,同 access 不覆盖)
     match service.restore_keys_from_meta() {
         Ok(n) => {

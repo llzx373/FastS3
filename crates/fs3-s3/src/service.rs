@@ -5,6 +5,7 @@
 //! `read_stream_chunk` 逐块拉取(每块上锁,见 fs3-http)。
 
 use std::io::Read;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use fs3_core::{BucketMeta, Error as CoreError};
@@ -134,6 +135,8 @@ pub struct S3Service {
     limiter: Arc<crate::ratelimit::KeyLimiter>,
     /// 上次请求时的墙钟秒(M4 D4 时钟回拨检测;0 = 未初始化)。
     last_clock_secs: std::sync::atomic::AtomicI64,
+    /// M14 H1-2(§4.12):用户态热对象缓存(默认关;None = 未启用)。
+    cache: Option<Arc<fs3_core::cache::ObjectCache>>,
     /// 密钥策略缓存(J4:access → Policy;None = 无策略 = 放行)。
     /// 与 meta 中 KeyRecord.policy 保持同步(启动恢复/写入时更新)。
     policies: std::sync::Mutex<std::collections::HashMap<String, Option<crate::policy::Policy>>>,
@@ -204,10 +207,22 @@ impl S3Service {
             last_peer: std::sync::Mutex::new(String::new()),
             last_lock_audit: std::sync::Mutex::new(None),
             limiter: Arc::new(crate::ratelimit::KeyLimiter::new()),
+            cache: None,
             policies: std::sync::Mutex::new(std::collections::HashMap::new()),
             bucket_policies: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_clock_secs: std::sync::atomic::AtomicI64::new(unix_now() as i64),
         }
+    }
+
+    /// M14 H1-2:装配热对象缓存(默认关;开关在 fs3_core::cache::CacheConfig)。
+    pub fn with_cache(mut self, cache: Option<Arc<fs3_core::cache::ObjectCache>>) -> Self {
+        self.cache = cache;
+        self
+    }
+
+    /// 缓存指标快照(admin /metrics;未启用 = None)。
+    pub fn cache_metrics(&self) -> Option<fs3_core::cache::CacheMetricsSnapshot> {
+        self.cache.as_ref().map(|c| c.metrics.snapshot())
     }
 
     /// M4 D4 时钟回拨检测:每次请求采样墙钟,若比上次回拨 > 阈值(5s)
@@ -3999,6 +4014,53 @@ impl S3Service {
                     ssec.as_ref().map(|s| &s.key),
                 )
                 .map_err(|e| map_engine_error(e, bucket, key))?;
+        }
+
+        // M14 H1-2(§4.12):热对象缓存(默认关)—— 小对象整对象字节 LRU;
+        // 命中(含高频 Range 头)直接按区间裁剪返回,免设备 I/O;miss 时
+        // 整读一次并填充。**SSE 对象不入缓存**(解密字节与客户密钥作用域
+        // 绑定;加密对象的解密/解压 CPU 由 §9.1 预算覆盖)。读失败 → 走
+        // 下方标准流路径(不降级为错误)。
+        if !head_only && meta.sse.is_none() {
+            if let Some(cache) = &self.cache {
+                if cache.eligible(meta.size) && content_length > 0 {
+                    let full = match cache.get(bucket, key, vk.as_ref(), meta.size) {
+                        Some(bytes) => {
+                            cache.metrics.hits.fetch_add(1, Ordering::Relaxed);
+                            // served_bytes 仅统计命中输出(缓存收益口径)
+                            cache
+                                .metrics
+                                .served_bytes
+                                .fetch_add(content_length, Ordering::Relaxed);
+                            bytes
+                        }
+                        None => {
+                            let mut bytes = Vec::with_capacity(meta.size as usize);
+                            let ok = engine
+                                .get_to_version(bucket, key, vk.as_ref(), 0..meta.size, &mut bytes)
+                                .is_ok()
+                                && bytes.len() as u64 == meta.size;
+                            if ok {
+                                cache.metrics.misses.fetch_add(1, Ordering::Relaxed);
+                                // 复制一份填充缓存(响应取用原缓冲,免二次拷贝)
+                                let fill = bytes.clone();
+                                cache.insert(bucket, key, vk.as_ref(), fill);
+                                bytes
+                            } else {
+                                Vec::new()
+                            }
+                        }
+                    };
+                    if !full.is_empty() {
+                        let slice = &full[start as usize..(start + content_length) as usize];
+                        return Ok(ServiceResponse {
+                            status: if is_range { 206 } else { 200 },
+                            headers,
+                            body: ResponseBody::Bytes(slice.to_vec()),
+                        });
+                    }
+                }
+            }
         }
 
         // 零拷贝段(同一锁内算好,避免 HTTP 层重复取锁;版本寻址形态)

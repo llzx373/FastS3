@@ -383,7 +383,7 @@
 
 ### H. HTTP/3 与热缓存(§7.2/§7.3)
 - [x] H1-1 HTTP/3 quinn 实验开关(默认关):fs3-http `http3` feature + quinn/h3(hyperium) 栈,每核 SO_REUSEPORT UDP + 独立 Endpoint(`[server] http3_listen` 接线,fs3d `http3` feature 构建);0-RTT 门:仅幂等 GET/HEAD 放行,非幂等 425 Too Early(RFC 8470),判定语义确定性(1-RTT 请求不可能先于握手可见);集成测试 h3_roundtrip(全握手 200 / 0-RTT PUT 425 或已验证后管线 4xx(回环握手同数据报完成)/ 0-RTT GET 200 / 常规 PUT 非 425)+ 门禁决策单测 + 吞吐基准(顺序 167 ops/s、并发 16×8 130 ops/s,每请求新连接保守口径;h1/h2 对照 1894 ops/s keep-alive);弱网对照(netem)评估期待办;文档 docs/perf-M14.md(含 0-RTT 防重放实验边界声明)
-- [ ] H1-2 缓存:用户态 LRU(小对象 + 高频 Range 头;默认关;内存额度用户配置;命中率指标)
+- [x] H1-2 缓存:用户态 LRU(fs3-core::cache,HashMap+VecDeque 惰性淘汰;`[cache]` 配置默认关/内存额度/上限对象大小);命中含高频 Range 头(整对象缓存按区间裁剪);SSE 对象不入缓存(密钥作用域红线);fs3-s3 GET 单段路径接线(miss 整读填充,失败降级标准流路径);admin /metrics 命中率指标组;集成测试 cache_behavior(开关/命中/miss/Range/超限/SSE 排除/served_bytes 口径);开/关对照基准 1.28× + 命中率 99.8%(docs/perf-M14.md §5)
 
 ### T. 生态评估(§7.4)
 - [ ] T1-1 Terraform provider 评估(需求投票 ≥10 则立项;admin API 桶/密钥 CRUD 已具备)

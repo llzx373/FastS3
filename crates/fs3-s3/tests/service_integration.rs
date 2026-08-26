@@ -9564,3 +9564,129 @@ fn h1_1_metadata_too_large() {
     ));
     assert_eq!(status(&r), 200, "GET 不判元数据尺寸: {r:?}");
 }
+
+// ───────────────────────── M14 H1-2 热对象缓存 ─────────────────────────
+
+/// 热对象缓存:默认关 = 未装配;开启后 miss→hit、Range 裁剪、超上限
+/// 不入缓存;SSE-C 对象不入缓存(解密字节与客户密钥作用域绑定红线)。
+#[test]
+fn cache_behavior() {
+    use fs3_core::cache::{CacheConfig, ObjectCache};
+
+    let (dir, svc) = setup();
+    drop(dir);
+    // 默认:S3Service 无缓存 → cache_metrics None
+    assert!(svc.cache_metrics().is_none(), "默认关 = 未装配");
+
+    let cache_arc = ObjectCache::new(CacheConfig {
+        enabled: true,
+        max_bytes: 256 * 1024,
+        max_object_size: 4 * 1024,
+    });
+    let svc = svc.with_cache(Some(cache_arc.clone()));
+
+    // 建桶 + 两对象(3KiB 可缓存;8KiB 超上限)
+    assert!(svc.handle(&req("PUT", "/cachebkt", vec![])).unwrap().status == 200);
+    let small = vec![0xabu8; 3 * 1024];
+    let big = vec![0x42u8; 8 * 1024];
+    assert!(
+        svc.handle(&req("PUT", "/cachebkt/small.bin", small.clone()))
+            .unwrap()
+            .status
+            == 200
+    );
+    assert!(
+        svc.handle(&req("PUT", "/cachebkt/big.bin", big.clone()))
+            .unwrap()
+            .status
+            == 200
+    );
+
+    // 1) 首 GET → miss;次 GET → hit;内容一致
+    let r1 = svc
+        .handle(&req("GET", "/cachebkt/small.bin", vec![]))
+        .unwrap();
+    assert_eq!(r1.status, 200);
+    let body1 = match r1.body {
+        ResponseBody::Bytes(b) => b,
+        _ => panic!("small GET 应走缓存 Bytes 路径"),
+    };
+    assert_eq!(body1, small);
+    let (h1, m1, ..) = cache_arc.metrics.snapshot();
+    assert_eq!((h1, m1), (0, 1), "首 GET = miss");
+    let r2 = svc
+        .handle(&req("GET", "/cachebkt/small.bin", vec![]))
+        .unwrap();
+    let body2 = match r2.body {
+        ResponseBody::Bytes(b) => b,
+        _ => panic!("命中应走 Bytes 路径"),
+    };
+    assert_eq!(body2, small);
+    let (h2, m2, ..) = cache_arc.metrics.snapshot();
+    assert_eq!((h2, m2), (1, 1), "次 GET = hit");
+
+    // 2) Range 命中:从缓存整对象裁剪
+    let r3 = svc
+        .handle(&req_h(
+            "GET",
+            "/cachebkt/small.bin",
+            &[("range", "bytes=0-9")],
+            vec![],
+        ))
+        .unwrap();
+    assert_eq!(r3.status, 206);
+    let body3 = match r3.body {
+        ResponseBody::Bytes(b) => b,
+        _ => panic!("Range 命中应走 Bytes 路径"),
+    };
+    assert_eq!(body3, small[..10].to_vec());
+
+    // 3) 超上限对象:不入缓存(miss 持续++)且走标准 ObjectStream
+    let r4 = svc
+        .handle(&req("GET", "/cachebkt/big.bin", vec![]))
+        .unwrap();
+    assert_eq!(r4.status, 200);
+    assert!(
+        matches!(r4.body, ResponseBody::ObjectStream { .. }),
+        "超上限对象应走 ObjectStream(不缓存)"
+    );
+    let r5 = svc
+        .handle(&req("GET", "/cachebkt/big.bin", vec![]))
+        .unwrap();
+    assert!(matches!(r5.body, ResponseBody::ObjectStream { .. }));
+    // 超上限对象不进入缓存路径(eligible=false → 计数器不变)
+    let (h3, m3, ..) = cache_arc.metrics.snapshot();
+    assert_eq!((h3, m3), (2, 1), "大对象不触发计数(不进入缓存路径)");
+
+    // 4) SSE-C 对象:不入缓存(红线)
+    let key = ssec_key();
+    let h = ssec_headers(&key);
+    let put = ssec_req_q(
+        "PUT",
+        "/cachebkt/enc.bin",
+        &[],
+        &ssec_refs(&h),
+        vec![b'x'; 512],
+    );
+    assert!(svc.handle(&put).unwrap().status == 200);
+    let r6 = svc
+        .handle(&ssec_req_q(
+            "GET",
+            "/cachebkt/enc.bin",
+            &[],
+            &ssec_refs(&h),
+            vec![],
+        ))
+        .unwrap();
+    assert_eq!(r6.status, 200);
+    assert!(
+        matches!(r6.body, ResponseBody::ObjectStream { .. }),
+        "SSE 对象绝不入缓存(解密字节与客户密钥作用域绑定)"
+    );
+    let (h4, m4, ..) = cache_arc.metrics.snapshot();
+    assert_eq!((h4, m4), (2, 1), "SSE 对象不进入缓存路径(红线:不缓存)");
+
+    // served_bytes 口径:命中时裁剪输出 3KiB + 10B(Range)
+    let (.., served) = cache_arc.metrics.snapshot();
+    assert_eq!(served, (3 * 1024 + 10) as u64);
+}

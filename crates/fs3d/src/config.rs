@@ -20,6 +20,19 @@ pub struct RootConfig {
     /// M14 G1-1(ADR-17 DV1):纳管 agent(默认关;feature-gate 之外的第二道闸)。
     #[serde(default)]
     pub agent: AgentConfig,
+    /// M14 H1-2(§4.12):热对象缓存(默认关)。
+    #[serde(default)]
+    pub cache: CacheConfig,
+}
+
+/// M14 H1-2:`[cache]` 段(用户态 LRU;默认关;内存额度=允许的基线冲突明示)。
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+pub struct CacheConfig {
+    pub enabled: Option<bool>,
+    /// 内存额度上限(字节或大小字符串,如 "256MiB";默认 256MiB)。
+    pub max_bytes: Option<String>,
+    /// 仅缓存 ≤ 该大小的对象(默认 2MiB)。
+    pub max_object_size: Option<String>,
 }
 
 /// M14 G1-1(ADR-17 DV1):`[agent]` 段。enabled=false(默认)不启动 agent。

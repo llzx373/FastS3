@@ -3,6 +3,7 @@
 //! 本 crate 不依赖任何外部存储/IO 库,是所有上层 crate 的公共底座。
 
 pub mod audit;
+pub mod cache;
 pub mod checksum;
 pub mod clock;
 pub mod consts;

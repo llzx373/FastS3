@@ -666,6 +666,30 @@ impl AdminServer {
                 (pool.pool_usage * 10000.0).round() / 10000.0
             ));
         }
+        // M14 H1-2(§4.12):热对象缓存命中率可观测(未启用 = 指标组缺席,
+        // 与生命周期指标同口径)
+        if let Some((hits, misses, inserted, evicted, cached_bytes, served_bytes)) =
+            self.service.cache_metrics()
+        {
+            text.push_str("# HELP fasts3_cache_hits_total Hot object cache hits\n");
+            text.push_str("# TYPE fasts3_cache_hits_total counter\n");
+            text.push_str(&format!("fasts3_cache_hits_total {hits}\n"));
+            text.push_str("# HELP fasts3_cache_misses_total Hot object cache misses\n");
+            text.push_str("# TYPE fasts3_cache_misses_total counter\n");
+            text.push_str(&format!("fasts3_cache_misses_total {misses}\n"));
+            text.push_str("# HELP fasts3_cache_inserted_total Cache insertions\n");
+            text.push_str("# TYPE fasts3_cache_inserted_total counter\n");
+            text.push_str(&format!("fasts3_cache_inserted_total {inserted}\n"));
+            text.push_str("# HELP fasts3_cache_evicted_total Cache evictions\n");
+            text.push_str("# TYPE fasts3_cache_evicted_total counter\n");
+            text.push_str(&format!("fasts3_cache_evicted_total {evicted}\n"));
+            text.push_str("# HELP fasts3_cache_cached_bytes Bytes currently cached\n");
+            text.push_str("# TYPE fasts3_cache_cached_bytes gauge\n");
+            text.push_str(&format!("fasts3_cache_cached_bytes {cached_bytes}\n"));
+            text.push_str("# HELP fasts3_cache_served_bytes_total Bytes served from cache\n");
+            text.push_str("# TYPE fasts3_cache_served_bytes_total counter\n");
+            text.push_str(&format!("fasts3_cache_served_bytes_total {served_bytes}\n"));
+        }
         text.push_str("# HELP fasts3_device_degraded Device degraded (read-only); 1 = degraded\n");
         text.push_str("# TYPE fasts3_device_degraded gauge\n");
         text.push_str(&format!(
