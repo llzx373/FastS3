@@ -157,6 +157,7 @@ export function registerCenterRoutes(app: FastifyInstance, opts: CenterRouteOpti
   app.get("/v2/center/nodes", async (req, reply) => {
     const cn = getClientCn(req);
     if (!cn) return reply.code(401).send(BAD("unauthorized", "missing client certificate", 401));
+    const nowSec = Date.now() / 1000;
     const nodes = store.listNodes().map((n) => ({
       node_id: n.node_id,
       hostname: n.hostname,
@@ -165,10 +166,136 @@ export function registerCenterRoutes(app: FastifyInstance, opts: CenterRouteOpti
       health: safeJson(n.health),
       registered_at: n.registered_at,
       first_seen: n.first_seen,
-      offline: n.last_seen > 0 && Date.now() / 1000 - n.last_seen > 60,
+      offline: nowSec - n.last_seen > 60,
       secrets_pending: store.secretsPending(n.node_id),
     }));
     return reply.send({ nodes, total: nodes.length });
+  });
+
+  // ── G2-1 管理面(拓扑/健康聚合 + 下发 API + 对账视图)──
+
+  /** 节点详情:健康/状态快照/指标文本/对账状态 */
+  app.get("/v2/center/nodes/:nodeId", async (req, reply) => {
+    const cn = getClientCn(req);
+    if (!cn) return reply.code(401).send(BAD("unauthorized", "missing client certificate", 401));
+    const params = req.params as { nodeId: string };
+    const n = store.getNode(params.nodeId);
+    if (!n) return reply.code(404).send(BAD("no_such_node", `node ${params.nodeId}`, 404));
+    const nowSec = Date.now() / 1000;
+    return reply.send({
+      node_id: n.node_id,
+      hostname: n.hostname,
+      version: n.version,
+      last_seen: n.last_seen,
+      offline: nowSec - n.last_seen > 60,
+      health: safeJson(n.health),
+      status_snapshot: safeJson(n.status_snapshot),
+      metrics_text: n.metrics_text,
+      registered_at: n.registered_at,
+      first_seen: n.first_seen,
+      apply_state: store.applyState(n.node_id),
+      secrets_pending: store.secretsPending(n.node_id),
+    });
+  });
+
+  /** 审计按节点检索(聚合检索的后端;G3-1 控制台复用) */
+  app.get("/v2/center/nodes/:nodeId/audit", async (req, reply) => {
+    const cn = getClientCn(req);
+    if (!cn) return reply.code(401).send(BAD("unauthorized", "missing client certificate", 401));
+    const params = req.params as { nodeId: string };
+    const q = req.query as Record<string, string>;
+    const rows = store.searchAudit({
+      nodeId: params.nodeId,
+      limit: Number(q.limit ?? "200") || 200,
+      since: q.since ? Number(q.since) : undefined,
+      until: q.until ? Number(q.until) : undefined,
+      op: q.op || undefined,
+      bucket: q.bucket || undefined,
+    });
+    return reply.send({ node_id: params.nodeId, total: rows.length, audit: rows });
+  });
+
+  /** 全节点审计聚合检索(跨节点;管理面) */
+  app.get("/v2/center/audit", async (req, reply) => {
+    const cn = getClientCn(req);
+    if (!cn) return reply.code(401).send(BAD("unauthorized", "missing client certificate", 401));
+    const q = req.query as Record<string, string>;
+    const rows = store.searchAudit({
+      nodeId: q.node_id || undefined,
+      limit: Number(q.limit ?? "200") || 200,
+      since: q.since ? Number(q.since) : undefined,
+      until: q.until ? Number(q.until) : undefined,
+      op: q.op || undefined,
+      bucket: q.bucket || undefined,
+    });
+    return reply.send({ total: rows.length, audit: rows });
+  });
+
+  /** 下发账本视图(管理面) */
+  app.get("/v2/center/ops", async (req, reply) => {
+    const cn = getClientCn(req);
+    if (!cn) return reply.code(401).send(BAD("unauthorized", "missing client certificate", 401));
+    const q = req.query as Record<string, string>;
+    const nodeId = String(q.node_id ?? "");
+    if (!nodeId) return reply.code(400).send(BAD("bad_request", "node_id required", 400));
+    const ops = store.listOps(nodeId).map((o) => ({
+      seq: o.seq,
+      kind: o.kind,
+      payload: safeJson(o.payload),
+      acked: o.acked,
+      rejected: (o.rejected as unknown as number) === 1,
+      error: o.error,
+      created_at: o.created_at,
+      applied_at: o.applied_at,
+    }));
+    return reply.send({ node_id: nodeId, ops, apply_state: store.applyState(nodeId) });
+  });
+
+  /**
+   * 下发入账(管理面):`{node_id, kind, payload}` → 新 seq 条目。
+   * kind 白名单:config.patch / key.create / key.patch / key.delete /
+   * bucket.create / bucket.patch / bucket.delete(对应 agent 本地裁决执行)。
+   */
+  app.post("/v2/center/ops", async (req, reply) => {
+    const cn = getClientCn(req);
+    if (!cn) return reply.code(401).send(BAD("unauthorized", "missing client certificate", 401));
+    const body = req.body as Record<string, unknown>;
+    const nodeId = String(body?.node_id ?? "");
+    const kind = String(body?.kind ?? "");
+    const KINDS = new Set([
+      "config.patch",
+      "key.create",
+      "key.patch",
+      "key.delete",
+      "bucket.create",
+      "bucket.patch",
+      "bucket.delete",
+    ]);
+    if (!nodeId || !KINDS.has(kind)) {
+      return reply
+        .code(400)
+        .send(BAD("bad_request", `node_id + kind(∈ 白名单) required, got kind=${kind}`, 400));
+    }
+    const payload = (body?.payload as Record<string, unknown>) ?? {};
+    if (!store.getNode(nodeId)) {
+      return reply.code(404).send(BAD("no_such_node", `node ${nodeId} not registered`, 404));
+    }
+    const op = store.addOp(nodeId, kind, payload);
+    return reply.send({
+      seq: op.seq,
+      desired_version: store.applyState(nodeId).desired_version,
+      ok: true,
+    });
+  });
+
+  /** 对账状态视图(管理面):desired/acked/pending/rejected */
+  app.get("/v2/center/state", async (req, reply) => {
+    const cn = getClientCn(req);
+    if (!cn) return reply.code(401).send(BAD("unauthorized", "missing client certificate", 401));
+    const q = req.query as Record<string, string>;
+    const nodeId = String(q.node_id ?? "");
+    if (!nodeId) return reply.code(400).send(BAD("bad_request", "node_id required", 400));
+    return reply.send({ node_id: nodeId, apply_state: store.applyState(nodeId) });
   });
 }
 

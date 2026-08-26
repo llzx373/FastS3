@@ -377,7 +377,7 @@
 - [x] G1-1 agent 模块(crates/fs3-agent,fs3d `agent` feature-gate 默认关)**:出站 mTLS(rustls 双向 TLS,无客户端证书被中心拒绝的集成测试)、心跳/健康上报、指标/审计批量流式上报(本地 admin 通道取数,"远程化"复用)、下发接收与本地裁决执行(经本地 admin 端点,本机引擎权威;key.create 幂等预检);中心最小 mTLS 接收端(web/server `/v2/center/*`:register/heartbeat/streams/desired/results/secrets/nodes + SQLite 存储 nodes/desired_ops/audit/meta,audit UNIQUE 去重;CN==node_id 强制校验 401/403;secret 仅内存一次回显 G1-3);附带修复 web test:unit 通配符(引号包裹,node 原生 glob)使既有 51 项测试实际执行(此前静默只跑嵌套目录);ADR-17 补遗(SQLite 中心存储偏离 Node 无状态纪律的记录)
 - [x] G1-2 下发权威性:中心下发 = 配置源、执行与裁决在本机引擎(ADR-17 DV1-2;agent 经本地 admin 通道执行,失败条目显式上报 rejected 记入中心账本)**,per-node seq 乐观并发 + 断线重连全量对账(`mode=full`;acked/rejected 跳过,幂等预检防重复创建);集成测试 `reconcile_reconnect`(断网期间下发缓存 → 重连后收敛,无重复创建/secret 仅一次回显);证书登记脚本 `tests/center/m14-center-enroll.sh` + 协议契约文档 `docs/m14-center-contract.md`
 - [x] G1-3 密钥下发语义:secret 仅生成时明文一次(节点本地生成,回执仅一次携带;中心只存 access 元数据);中心留存策略文档化(默认不存——仅内存 pendingSecrets 一次回显,进程重启即失;留存 = 运维责任,红线外选项,ADR-17 DV1-4);新增落盘证明测试(secret 字符串绝不出现在 sqlite 主库与 WAL 文件字节中,center.test.ts「G1-3」)
-- [ ] G2-1 中心:节点注册/拓扑/健康聚合 + 下发 API + 对账(Node 同栈扩展,不引入新语言)
+- [x] G2-1 中心:节点注册/拓扑/健康聚合(G1-1 接收端 + 本步管理面:节点列表/详情含 apply_state、按节点与跨节点审计聚合检索)+ 下发 API(ops 入账白名单 7 类、账本视图、对账状态视图)+ 对账(SQLite 账本权威、acked_seq/pending/rejected);管理面端点契约入 docs/m14-center-contract.md §3.1
 - [ ] G3-1 中心控制台:节点仪表盘、批量桶/密钥/策略管理(模板化下发)、审计聚合检索
 - [ ] G4-1 演练:3 节点(2 边缘 + 1 云)纳管 + 断网重连对账一致 + **拔中心单机功能完整**(红线实测)
 

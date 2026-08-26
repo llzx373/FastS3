@@ -37,6 +37,17 @@
 | `GET /v2/center/secrets?node_id` | 管理面 | key.create 的 secret 一次性取回(取后即清;**仅内存,不落库**,G1-3) |
 | `GET /v2/center/nodes` | 管理面 | 节点注册/拓扑/健康聚合(offline = last_seen > 60s) |
 
+### 3.1 管理面(G2-1;同 mTLS 域,管理证书 CN 任意已签发身份)
+
+| 端点 | 语义 |
+| --- | --- |
+| `GET /v2/center/nodes/{nodeId}` | 节点详情:health/status_snapshot/metrics_text/apply_state |
+| `GET /v2/center/nodes/{nodeId}/audit` | 按节点审计检索(since/until/op/bucket/limit) |
+| `GET /v2/center/audit` | 跨节点审计聚合检索 |
+| `GET /v2/center/ops?node_id=` | 下发账本视图(逐条 acked/rejected/error/时间) |
+| `POST /v2/center/ops` | 下发入账 `{node_id, kind, payload}` → 新 seq;kinds 白名单:config.patch / key.create / key.patch / key.delete / bucket.create / bucket.patch / bucket.delete |
+| `GET /v2/center/state?node_id=` | 对账状态:desired_version / acked_seq / pending / rejected |
+
 ## 4. 对账与重连语义(G1-2)
 
 - 每次 agent 启动与**每次断线重连**:重新 register → `mode=full` 全量对账

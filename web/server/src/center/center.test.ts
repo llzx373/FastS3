@@ -231,3 +231,82 @@ test("G1-3: secret 绝不落库(仅内存一次回显)", async (t) => {
     /* 无 WAL 文件也通过 */
   }
 });
+
+test("G2-1: 管理面 —— ops 入账/视图、state、节点详情、审计聚合", async (t) => {
+  const { app, store, setCn } = makeApp("node-a");
+  t.after(() => {
+    app.close();
+    store.close();
+  });
+  // 节点身份(CN=node-a)注册 + 上报
+  await app.inject({ method: "POST", url: "/v2/center/register", payload: { node_id: "node-a" } });
+  await app.inject({
+    method: "POST",
+    url: "/v2/center/streams",
+    payload: {
+      node_id: "node-a",
+      status_snapshot: { buckets: 1, objects: 3 },
+      metrics_text: "fasts3_requests_total 7\n",
+      audit: [{ ts: 500, who: "ak", op: "PutObject", bucket: "b", key: "k", status: 200, detail: "" }],
+    },
+  });
+  // 管理面身份(CN=center-admin)执行下发/查看
+  setCn("center-admin");
+
+  // ops 入账(白名单校验)
+  let r = await app.inject({
+    method: "POST",
+    url: "/v2/center/ops",
+    payload: { node_id: "node-a", kind: "key.create", payload: { access_key: "ak1" } },
+  });
+  assert.equal(J(r.json())["seq"], 1);
+  // 非法 kind → 400
+  r = await app.inject({
+    method: "POST",
+    url: "/v2/center/ops",
+    payload: { node_id: "node-a", kind: "evil.kind", payload: {} },
+  });
+  assert.equal(r.statusCode, 400);
+  // 未注册节点 → 404
+  r = await app.inject({
+    method: "POST",
+    url: "/v2/center/ops",
+    payload: { node_id: "ghost", kind: "key.create", payload: {} },
+  });
+  assert.equal(r.statusCode, 404);
+
+  // 账本视图
+  r = await app.inject({ method: "GET", url: "/v2/center/ops?node_id=node-a" });
+  const ops = J(r.json());
+  assert.equal((ops["ops"] as unknown[]).length, 1);
+  assert.equal(J(ops["ops"] as unknown[])[0]["kind"], "key.create");
+  assert.equal(J(ops["apply_state"])["desired_version"], 1);
+
+  // 节点详情(含 apply_state / metrics_text / status_snapshot)
+  r = await app.inject({ method: "GET", url: "/v2/center/nodes/node-a" });
+  assert.equal(r.statusCode, 200);
+  const detail = J(r.json());
+  assert.equal(J(detail["status_snapshot"])["buckets"], 1);
+  assert.equal(detail["metrics_text"], "fasts3_requests_total 7\n");
+  assert.equal(J(detail["apply_state"])["desired_version"], 1);
+
+  // 审计聚合:按节点 / 跨节点
+  r = await app.inject({ method: "GET", url: "/v2/center/nodes/node-a/audit" });
+  assert.equal(J(r.json())["total"], 1);
+  r = await app.inject({ method: "GET", url: "/v2/center/audit?limit=10" });
+  assert.equal(J(r.json())["total"], 1);
+
+  // 对账状态视图
+  r = await app.inject({ method: "GET", url: "/v2/center/state?node_id=node-a" });
+  const st = J(r.json())["apply_state"] as Record<string, unknown>;
+  assert.equal(st["pending"], 1);
+  assert.equal(st["acked_seq"], 0);
+
+  // 管理端点无证书 → 401
+  r = await app.inject({ method: "GET", url: "/v2/center/state?node_id=node-a" });
+  // makeApp 的 CN 桩为 center-admin,此处直接验证 getClientCn 空时 401:
+  const app2 = buildCenter({ store: openStore(":memory:"), getClientCn: () => "" });
+  r = await app2.inject({ method: "GET", url: "/v2/center/nodes" });
+  assert.equal(r.statusCode, 401);
+  await app2.close();
+});

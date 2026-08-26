@@ -79,6 +79,8 @@ export interface CenterStore {
   addOp(node_id: string, kind: string, payload: Record<string, unknown>): DesiredOpRow;
   listOpsAfter(node_id: string, seq: number): DesiredOpRow[];
   listOpsFull(node_id: string): FullOpRow[];
+  /** 账本全量视图(管理面/G2-1) */
+  listOps(node_id: string): FullOpRow[];
   ackedSeq(node_id: string): number;
   markAcked(node_id: string, seqs: number[]): void;
   markRejected(node_id: string, seq: number, error: string): void;
@@ -261,6 +263,13 @@ export function openStore(dbPath: string): CenterStore {
     return rows.map(rowToOp);
   };
 
+  const listOps = (node_id: string): FullOpRow[] => {
+    const rows = db
+      .prepare("SELECT * FROM desired_ops WHERE node_id = ? ORDER BY seq")
+      .all(node_id) as Record<string, unknown>[];
+    return rows.map((r) => ({ ...rowToOp(r), acked: (r.acked as number) === 1 }));
+  };
+
   const listOpsFull = (node_id: string): FullOpRow[] => {
     const rows = db
       .prepare("SELECT * FROM desired_ops WHERE node_id = ? ORDER BY seq")
@@ -401,6 +410,7 @@ export function openStore(dbPath: string): CenterStore {
     addOp,
     listOpsAfter,
     listOpsFull,
+    listOps,
     ackedSeq,
     markAcked,
     markRejected,
