@@ -124,6 +124,11 @@ pub struct ObjectDto {
     /// parts 对齐;旧导出无此字段 → 空表)。
     #[serde(default)]
     pub part_checksums: Vec<Option<fs3_core::ChecksumInfo>>,
+    /// M15 C1(ADR-18 D-E3):请求的存储类(接受矩阵 8 值 → 统一落
+    /// STANDARD;admin 面可见请求类,导出/导入随对象元数据往返)。
+    /// 旧导出无此字段 → None。
+    #[serde(default)]
+    pub requested_storage_class: Option<String>,
 }
 
 /// 键形态 vk → 导出 DTO 的版本串(None = 单键;"null" = null 槽;hex = 真实 vk)。
@@ -179,6 +184,7 @@ impl ObjectDto {
             retention: m.retention.clone(),
             legal_hold: m.legal_hold,
             part_checksums: m.part_checksums.clone(),
+            requested_storage_class: m.requested_storage_class.clone(),
         }
     }
 
@@ -217,6 +223,7 @@ impl ObjectDto {
                 legal_hold: self.legal_hold,
                 part_checksums: self.part_checksums.clone(),
                 compressed: None,
+                requested_storage_class: self.requested_storage_class.clone(),
             },
         ))
     }
@@ -313,6 +320,10 @@ pub struct UploadDto {
     /// 是元数据迁移通道,不是加密数据备份通道(备份走卷快照)。
     #[serde(default)]
     pub sse_s3: Option<SseS3SessionDto>,
+    /// M15 C1(ADR-18 D-E3):Create 时请求的存储类(随会话导出/导入;
+    /// 旧导出无此字段 → None)。
+    #[serde(default)]
+    pub requested_storage_class: Option<String>,
     pub created: i64,
     pub completed: bool,
     pub final_etag_hex: String,
@@ -346,6 +357,7 @@ impl UploadDto {
             final_etag_hex: s.final_etag.iter().map(|b| format!("{b:02x}")).collect(),
             final_size: s.final_size,
             final_mtime: s.final_mtime,
+            requested_storage_class: s.requested_storage_class.clone(),
             parts: parts
                 .iter()
                 .map(|(no, p)| PartDto::from_part(*no, p))
@@ -880,6 +892,7 @@ pub fn run_meta_import(
             },
             retention: None,
             legal_hold: None,
+            requested_storage_class: u.requested_storage_class.clone(),
         };
         store.create_multipart(&u.upload_id, &session)?;
         for p in &u.parts {

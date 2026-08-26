@@ -147,6 +147,10 @@ pub struct MultipartSession {
     pub retention: Option<fs3_core::Retention>,
     /// Create 时法定保留(None = 未指定 / OFF;Some(true) = ON)。
     pub legal_hold: Option<bool>,
+    /// M15 C1(ADR-18 D-E3):Create 时 x-amz-storage-class 请求类(接受
+    /// 矩阵 8 值 → 统一落 STANDARD;Complete 时随对象元数据记录请求类)。
+    /// 序列化尾部追加,decode_session 八读回退,存量会话按 None。
+    pub requested_storage_class: Option<String>,
 }
 
 /// 当前 Unix 秒(会话时间戳用)。
@@ -169,6 +173,7 @@ impl MultipartSession {
         checksum_alg: Option<fs3_core::ChecksumAlgorithm>,
         sse_key_md5: Option<String>,
         sse_s3: Option<SessionSseS3>,
+        requested_storage_class: Option<String>,
     ) -> Self {
         MultipartSession {
             bucket: bucket.to_string(),
@@ -187,6 +192,7 @@ impl MultipartSession {
             sse_s3,
             retention: None,
             legal_hold: None,
+            requested_storage_class,
         }
     }
 
@@ -887,6 +893,7 @@ fn decode_session(v: &[u8]) -> Result<MultipartSession> {
             sse_s3: None,
             retention: None,
             legal_hold: None,
+            requested_storage_class: None,
         }
     }
     /// M12 前会话格式(含 sse_s3,无 object lock;W2-3 回退用)。
@@ -927,6 +934,7 @@ fn decode_session(v: &[u8]) -> Result<MultipartSession> {
                 sse_s3: s.sse_s3,
                 retention: None,
                 legal_hold: None,
+                requested_storage_class: None,
             }),
             Err(_) => match postcard::from_bytes::<SessionV12c>(v) {
                 Ok(s) => Ok(into_session(
@@ -3938,6 +3946,7 @@ mod tests {
             legal_hold: false,
             part_checksums: Vec::new(),
             compressed: None,
+            requested_storage_class: None,
         }
     }
 
@@ -5075,6 +5084,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             ),
         )
         .unwrap();
@@ -5119,6 +5129,7 @@ mod tests {
                 vec![],
                 vec![],
                 vec![],
+                None,
                 None,
                 None,
                 None,
@@ -5193,6 +5204,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             ),
         )
         .unwrap();
@@ -5255,6 +5267,7 @@ mod tests {
             vec![],
             None,
             Some("1B2M2Y8AsgTpgAmY7PhCfg==".to_string()),
+            None,
             None,
         );
         s.create_multipart("up-1", &sess).unwrap();
@@ -5816,6 +5829,7 @@ mod tests {
                 vec![],
                 vec![],
                 vec![],
+                None,
                 None,
                 None,
                 None,
@@ -6430,6 +6444,7 @@ mod tests {
                     vec![],
                     vec![],
                     vec![],
+                    None,
                     None,
                     None,
                     None,

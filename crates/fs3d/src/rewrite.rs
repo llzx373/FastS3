@@ -201,6 +201,8 @@ mod tests {
             legal_hold: false,
             part_checksums: Vec::new(),
             compressed: None,
+
+            ..Default::default()
         }
     }
 

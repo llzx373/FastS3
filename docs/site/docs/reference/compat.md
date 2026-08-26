@@ -31,11 +31,18 @@ s3-tests 排除集方法论见 `tests/s3-tests/README.md`。
 
 ## 存储类
 
-当前仅接受 `x-amz-storage-class: STANDARD`,其它值 → 400 InvalidStorageClass
-(显式报错,不静默)。v2.1(M15)起接受 STANDARD_IA / ONEZONE_IA /
-REDUCED_REDUNDANCY / INTELLIGENT_TIERING / GLACIER / GLACIER_IR /
-DEEP_ARCHIVE 并**显式映射到 STANDARD**(元数据记录请求类、响应回显实际类、
-admin 可见);归档真语义(Transition/RestoreObject)规划于 v2.2(M16)。
+v2.1(M15/C1,ADR-18 D-E3)接受矩阵(大小写不敏感):
+
+| 请求值 | 落盘 | HEAD/GET/GetObjectAttributes 回显 |
+| --- | --- | --- |
+| `STANDARD` / `STANDARD_IA` / `ONEZONE_IA` / `REDUCED_REDUNDANCY` / `INTELLIGENT_TIERING` / `GLACIER` / `GLACIER_IR` / `DEEP_ARCHIVE` | 统一 **STANDARD**(单机单存储层) | `x-amz-storage-class: STANDARD` + GetObjectAttributes `<StorageClass>STANDARD</StorageClass>` |
+| `EXPRESS_ONEZONE`(目录桶类) | 显式拒绝 | 400 InvalidStorageClass(点名目录桶语义) |
+| 其它值 | 显式拒绝 | 400 InvalidStorageClass(与 AWS 同码,不静默) |
+
+请求类**记录于对象元数据**(`requested_storage_class`;PUT/CopyObject/Create
+MultipartUpload 落,multipart 随会话;Copy 未带头继承源请求类),admin 面与
+meta-export/import 可见并可往返;实际类恒 STANDARD。归档真语义
+(Transition/RestoreObject)规划于 v2.2(M16)。
 
 ## 事件通知(v2.1 M15 起)
 

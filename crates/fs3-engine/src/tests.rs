@@ -4229,6 +4229,8 @@ fn object_meta_for_precond(size: u64, mtime: i64) -> ObjectMeta {
         legal_hold: false,
         part_checksums: Vec::new(),
         compressed: None,
+
+        ..Default::default()
     }
 }
 
@@ -6999,6 +7001,7 @@ fn notification_event_same_txn_enqueue() -> Result<()> {
             draft(fs3_core::EventDraftKind::ObjectCreated(
                 "s3:ObjectCreated:Put",
             )),
+            None,
         )
         .unwrap();
     let recs = e.meta().pending_events(10, None)?;
@@ -7041,6 +7044,7 @@ fn notification_event_same_txn_enqueue() -> Result<()> {
         draft(fs3_core::EventDraftKind::ObjectCreated(
             "s3:ObjectCreated:Put",
         )),
+        None,
     );
     assert!(
         matches!(
@@ -7140,6 +7144,7 @@ fn notification_event_complete_and_copy() -> Result<()> {
             key: "copy-of-mp".into(),
             kind: EventDraftKind::ObjectCreated("s3:ObjectCreated:Copy"),
         }),
+        None,
     )?;
     let recs = e.meta().pending_events(10, None)?;
     assert_eq!(recs.len(), 2);
@@ -7284,4 +7289,154 @@ fn inventory_worker_generates_csv_and_manifest() {
     assert!(snap.generated_bytes > 0);
     assert!(snap.last_run_at > 0);
     e.abort();
+}
+
+/// M15 C1(ADR-18 D-E3):写路径记录请求存储类、读路径回显一致——
+/// ① put_with_lock_ev 携带请求类 → 元数据落字段,引擎读回一致;
+/// ② 未携带 → None(等价 STANDARD);
+/// ③ copy 未带头 → 继承源请求类;带头 → 覆盖记录;
+/// ④ complete_multipart_ev:Create 会话请求类随对象落盘。
+#[test]
+fn storage_class_requested_recorded() -> Result<()> {
+    use std::io::Cursor;
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    e.put("b1", "__seed", &mut Cursor::new(b"x".to_vec()))?;
+
+    // ① PUT 携带 STANDARD_IA → 记录
+    let m = e.put_with_lock_ev(
+        "b1",
+        "k1",
+        &mut Cursor::new(b"data".to_vec()),
+        None,
+        vec![],
+        vec![],
+        vec![],
+        None,
+        None,
+        None,
+        ObjectLockWrite::default(),
+        None,
+        Some("STANDARD_IA".into()),
+    )?;
+    assert_eq!(m.requested_storage_class.as_deref(), Some("STANDARD_IA"));
+    let read = e.meta().get_object("b1", "k1")?.unwrap();
+    assert_eq!(
+        read.requested_storage_class.as_deref(),
+        Some("STANDARD_IA"),
+        "落盘元数据记录请求类"
+    );
+
+    // ② 未携带 → None
+    let m2 = e.put_with_lock_ev(
+        "b1",
+        "k2",
+        &mut Cursor::new(b"x".to_vec()),
+        None,
+        vec![],
+        vec![],
+        vec![],
+        None,
+        None,
+        None,
+        ObjectLockWrite::default(),
+        None,
+        None,
+    )?;
+    assert_eq!(m2.requested_storage_class, None);
+
+    // ③ copy:未带头 → 继承源;带头 → 覆盖
+    let c1 = e.copy_object_with_lock_ev(
+        "b1",
+        "k1",
+        None,
+        "b1",
+        "k3",
+        None,
+        None,
+        None,
+        None,
+        VersioningState::Off,
+        None,
+        None,
+        ObjectLockWrite::default(),
+        None,
+        None,
+    )?;
+    assert_eq!(
+        c1.requested_storage_class.as_deref(),
+        Some("STANDARD_IA"),
+        "copy 未带头继承源请求类(AWS 语义)"
+    );
+    let c2 = e.copy_object_with_lock_ev(
+        "b1",
+        "k1",
+        None,
+        "b1",
+        "k4",
+        None,
+        None,
+        None,
+        None,
+        VersioningState::Off,
+        None,
+        None,
+        ObjectLockWrite::default(),
+        None,
+        Some("GLACIER".into()),
+    )?;
+    assert_eq!(
+        c2.requested_storage_class.as_deref(),
+        Some("GLACIER"),
+        "copy 带头覆盖源请求类"
+    );
+
+    // ④ multipart:Create 会话请求类随 Complete 落对象
+    let uid = e.create_multipart_lock(
+        "b1",
+        "mp1",
+        None,
+        vec![],
+        vec![],
+        vec![],
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("ONEZONE_IA".into()),
+    )?;
+    e.upload_part(
+        &uid,
+        1,
+        &mut Cursor::new(vec![b'a'; 6 * 1024 * 1024]),
+        None,
+        None,
+    )?;
+    let part_etag = e
+        .meta()
+        .list_parts(&uid)?
+        .iter()
+        .find(|(no, _)| *no == 1)
+        .map(|(_, p)| p.etag_hex())
+        .unwrap();
+    let m3 = e.complete_multipart(
+        "b1",
+        "mp1",
+        &uid,
+        &[fs3_core::CompletePart {
+            part_number: 1,
+            etag_hex: part_etag,
+            checksum: None,
+        }],
+        None,
+        None,
+    )?;
+    assert_eq!(
+        m3.requested_storage_class.as_deref(),
+        Some("ONEZONE_IA"),
+        "multipart 对象记录 Create 时请求类"
+    );
+    e.abort();
+    Ok(())
 }

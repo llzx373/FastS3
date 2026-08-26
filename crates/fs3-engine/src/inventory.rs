@@ -420,6 +420,8 @@ mod tests {
             legal_hold: false,
             part_checksums: vec![],
             compressed: None,
+
+            ..Default::default()
         };
         let row = csv_row(
             "bkt",

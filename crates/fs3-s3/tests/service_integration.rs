@@ -9381,9 +9381,10 @@ fn sse_s3_bucket_default_checksum_matrix() {
 // ─────────────────────────── M11 H1-1:错误码触发路径补全 ───────────────────────────
 
 /// H1-1:InvalidStorageClass 三写入口(PutObject/CopyObject/
-/// CreateMultipartUpload)——x-amz-storage-class 非 STANDARD → 400
-/// InvalidStorageClass(与 AWS 同码;check_unimplemented_headers 统一判定);
-/// STANDARD(大小写不敏感)放行对照;错误 XML Code 元素断言。
+/// CreateMultipartUpload)——M15 C1(ADR-18 D-E3)接受矩阵:8 值放行(统一
+/// 落 STANDARD,HEAD/GET 回显实际类);EXPRESS_ONEZONE(目录桶类)与未知值
+/// → 400 InvalidStorageClass(与 AWS 同码;check_unimplemented_headers 统一
+/// 判定);错误 XML Code 元素断言。
 #[test]
 fn h1_1_invalid_storage_class_all_entries() {
     let (_d, svc) = setup();
@@ -9392,11 +9393,71 @@ fn h1_1_invalid_storage_class_all_entries() {
         status(&svc.handle(&req("PUT", "/scl/src", b"x".to_vec()))),
         200
     );
-    for class in ["GLACIER", "STANDARD_IA", "DEEP_ARCHIVE"] {
+    // 接受矩阵:8 值(含大小写变体)三写入口全放行,PUT 后 HEAD 回显
+    // x-amz-storage-class: STANDARD(统一落实际类)
+    for class in [
+        "STANDARD",
+        "STANDARD_IA",
+        "ONEZONE_IA",
+        "REDUCED_REDUNDANCY",
+        "INTELLIGENT_TIERING",
+        "GLACIER",
+        "GLACIER_IR",
+        "DEEP_ARCHIVE",
+        "glacier",
+    ] {
         // PutObject
         let r = svc.handle(&req_h(
             "PUT",
             "/scl/o",
+            &[("x-amz-storage-class", class)],
+            b"x".to_vec(),
+        ));
+        assert_eq!(status(&r), 200, "PUT {class}: {r:?}");
+        // CopyObject
+        let r = svc.handle(&req_h(
+            "PUT",
+            "/scl/dst",
+            &[
+                ("x-amz-copy-source", "/scl/src"),
+                ("x-amz-storage-class", class),
+            ],
+            vec![],
+        ));
+        assert_eq!(status(&r), 200, "CopyObject {class}: {r:?}");
+        // CreateMultipartUpload
+        let r = svc.handle(&req_qh(
+            "POST",
+            "/scl/mp",
+            &[("uploads", "")],
+            &[("x-amz-storage-class", class)],
+            vec![],
+        ));
+        assert_eq!(status(&r), 200, "CreateMultipart {class}: {r:?}");
+    }
+    // 回显:PUT(STANDARD_IA)→ HEAD/GET 恒 x-amz-storage-class: STANDARD
+    svc.handle(&req_h(
+        "PUT",
+        "/scl/echo",
+        &[("x-amz-storage-class", "STANDARD_IA")],
+        b"echo".to_vec(),
+    ))
+    .unwrap();
+    for method in ["HEAD", "GET"] {
+        let r = svc.handle(&req(method, "/scl/echo", vec![]));
+        let resp = r.unwrap();
+        let sc = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("x-amz-storage-class"))
+            .map(|(_, v)| v.clone());
+        assert_eq!(sc.as_deref(), Some("STANDARD"), "{method}: {resp:?}");
+    }
+    // 拒绝:EXPRESS_ONEZONE(目录桶类,点名消息)+ 未知值
+    for class in ["EXPRESS_ONEZONE", "BOGUS_CLASS"] {
+        let r = svc.handle(&req_h(
+            "PUT",
+            "/scl/bad",
             &[("x-amz-storage-class", class)],
             b"x".to_vec(),
         ));
@@ -9407,50 +9468,134 @@ fn h1_1_invalid_storage_class_all_entries() {
             xml.contains("<Code>InvalidStorageClass</Code>"),
             "PUT {class}: {xml}"
         );
-        // CopyObject(目标侧头即判,无需源存在性参与)
-        let r = svc.handle(&req_h(
-            "PUT",
-            "/scl/dst",
-            &[
-                ("x-amz-copy-source", "/scl/src"),
-                ("x-amz-storage-class", class),
-            ],
-            vec![],
-        ));
+    }
+    let ex = svc.handle(&req_h(
+        "PUT",
+        "/scl/ex",
+        &[("x-amz-storage-class", "EXPRESS_ONEZONE")],
+        b"x".to_vec(),
+    ));
+    let msg = ex.unwrap_err().message_override.unwrap_or_default();
+    assert!(
+        msg.contains("directory buckets"),
+        "EXPRESS_ONEZONE 消息点名目录桶语义:{msg}"
+    );
+}
+
+/// M15 C1(ADR-18 D-E3):请求类落盘记录——PUT(STANDARD_IA)→ 引擎元数据
+/// requested_storage_class = Some("STANDARD_IA");CopyObject 未带头继承源;
+/// CreateMultipartUpload 会话请求类随 Complete 落对象;admin DTO 往返。
+#[test]
+fn c1_storage_class_requested_recorded_end_to_end() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/scr", vec![]))), 200);
+    // PUT 携带 STANDARD_IA → 落盘记录
+    svc.handle(&req_h(
+        "PUT",
+        "/scr/o1",
+        &[("x-amz-storage-class", "STANDARD_IA")],
+        b"x".to_vec(),
+    ))
+    .unwrap();
+    {
+        let e = svc.engine().read();
+        let m = e.meta().get_object("scr", "o1").unwrap().unwrap();
+        assert_eq!(m.requested_storage_class.as_deref(), Some("STANDARD_IA"));
+    }
+    // 未携带 → None(等价 STANDARD)
+    svc.handle(&req("PUT", "/scr/o2", b"y".to_vec())).unwrap();
+    {
+        let e = svc.engine().read();
+        let m = e.meta().get_object("scr", "o2").unwrap().unwrap();
+        assert_eq!(m.requested_storage_class, None);
+    }
+    // CopyObject 未带头 → 继承源请求类
+    svc.handle(&req_h(
+        "PUT",
+        "/scr/o3",
+        &[("x-amz-copy-source", "/scr/o1")],
+        vec![],
+    ))
+    .unwrap();
+    {
+        let e = svc.engine().read();
+        let m = e.meta().get_object("scr", "o3").unwrap().unwrap();
+        assert_eq!(m.requested_storage_class.as_deref(), Some("STANDARD_IA"));
+    }
+    // CopyObject 带头 → 覆盖记录(显式头优先)
+    svc.handle(&req_h(
+        "PUT",
+        "/scr/o4",
+        &[
+            ("x-amz-copy-source", "/scr/o1"),
+            ("x-amz-storage-class", "GLACIER"),
+        ],
+        vec![],
+    ))
+    .unwrap();
+    {
+        let e = svc.engine().read();
+        let m = e.meta().get_object("scr", "o4").unwrap().unwrap();
+        assert_eq!(m.requested_storage_class.as_deref(), Some("GLACIER"));
+    }
+    // HEAD 回显实际类 STANDARD(PUT 落 STANDARD_IA 后)
+    let r = svc.handle(&req("HEAD", "/scr/o1", vec![]));
+    let sc = r
+        .unwrap()
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-amz-storage-class"))
+        .map(|(_, v)| v.clone());
+    assert_eq!(sc.as_deref(), Some("STANDARD"));
+    // CreateMultipartUpload 会话请求类 → Complete 落对象
+    let up = svc.handle(&req_qh(
+        "POST",
+        "/scr/mp",
+        &[("uploads", "")],
+        &[("x-amz-storage-class", "ONEZONE_IA")],
+        vec![],
+    ));
+    let up_xml = std::str::from_utf8(&match up.unwrap().body {
+        ResponseBody::Bytes(b) => b,
+        _ => panic!("init must return bytes"),
+    })
+    .unwrap()
+    .to_string();
+    let uid = extract(&up_xml, "UploadId");
+    let part = svc.handle(&req_qh(
+        "PUT",
+        "/scr/mp",
+        &[("partNumber", "1"), ("uploadId", &uid)],
+        &[],
+        vec![b'z'; 6 * 1024 * 1024],
+    ));
+    let etag = part
+        .unwrap()
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("etag"))
+        .map(|(_, v)| v.clone())
+        .unwrap();
+    let cp_body = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+        etag
+    );
+    svc.handle(&req_q(
+        "POST",
+        "/scr/mp",
+        &[("uploadId", &uid)],
+        cp_body.into_bytes(),
+    ))
+    .unwrap();
+    {
+        let e = svc.engine().read();
+        let m = e.meta().get_object("scr", "mp").unwrap().unwrap();
         assert_eq!(
-            err_code(&r),
-            "InvalidStorageClass",
-            "CopyObject {class}: {r:?}"
-        );
-        // CreateMultipartUpload
-        let r = svc.handle(&req_qh(
-            "POST",
-            "/scl/mp",
-            &[("uploads", "")],
-            &[("x-amz-storage-class", class)],
-            vec![],
-        ));
-        assert_eq!(
-            err_code(&r),
-            "InvalidStorageClass",
-            "CreateMultipart {class}: {r:?}"
+            m.requested_storage_class.as_deref(),
+            Some("ONEZONE_IA"),
+            "multipart 对象记录 Create 请求类"
         );
     }
-    // 对照:STANDARD(大小写不敏感)放行
-    let r = svc.handle(&req_h(
-        "PUT",
-        "/scl/ok",
-        &[("x-amz-storage-class", "STANDARD")],
-        b"x".to_vec(),
-    ));
-    assert_eq!(status(&r), 200, "STANDARD 放行: {r:?}");
-    let r = svc.handle(&req_h(
-        "PUT",
-        "/scl/ok2",
-        &[("x-amz-storage-class", "Standard")],
-        b"x".to_vec(),
-    ));
-    assert_eq!(status(&r), 200, "大小写不敏感放行: {r:?}");
 }
 
 /// H1-1:KeyTooLongError 触发路径——键 UTF-8 字节长 >1024 → 400

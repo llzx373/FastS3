@@ -3775,6 +3775,8 @@ mod tests {
             legal_hold: false,
             part_checksums: vec![Some(info.clone()), Some(info.clone())],
             compressed: None,
+
+            ..Default::default()
         };
         let xml = render_get_object_attributes(&meta, &a_all(), ObjectPartsPage::default());
         // LastModified/VersionId 为响应头(AWS 模型),不在 body
@@ -3995,6 +3997,8 @@ mod tests {
             legal_hold: false,
             part_checksums: vec![],
             compressed: None,
+
+            ..Default::default()
         };
         // fetch-owner=true → Contents 带 Owner
         let xml = render_list_objects_v2(
@@ -4099,6 +4103,8 @@ mod tests {
             legal_hold: false,
             part_checksums: vec![],
             compressed: None,
+
+            ..Default::default()
         };
         let xml = render_list_objects_v2(
             "o",
@@ -4151,6 +4157,8 @@ mod tests {
                     legal_hold: false,
                     part_checksums: vec![],
                     compressed: None,
+
+                    ..Default::default()
                 },
             )],
             &[],
@@ -4198,6 +4206,8 @@ mod tests {
                 legal_hold: false,
                 part_checksums: vec![],
                 compressed: None,
+
+                ..Default::default()
             },
         };
         let page_of =

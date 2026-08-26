@@ -72,7 +72,7 @@ impl AllocRecord {
 /// > M11 E1 说明(ADR-12 D-E1):`SseInfo` 在 v4 内重排版(追加
 /// > kind/chunk_tags)不 bump 版本——`sse` 字段自 v3 起全落盘点恒为
 /// > None,`Some` 编码路径无任何存量值可读(理由详见 SseInfo 注释)。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ObjectMeta {
     pub size: u64,
     /// ETag = MD5 摘要(与 AWS 对齐)。
@@ -114,12 +114,19 @@ pub struct ObjectMeta {
     /// M13 Z1(ADR-15 DZ1):数据压缩信息(compression,区别于 Tier2 的
     /// compaction);None = 未压缩。v4 存量解码回退 None。
     pub compressed: Option<CompressionInfo>,
+    /// M15 C1(ADR-18 D-E3):客户端请求的存储类(接受矩阵 8 值 → 统一落
+    /// STANDARD,此处记录请求类;HEAD/GET 回显实际类恒 STANDARD,admin
+    /// 面可见请求类)。None = 未携带头(等价 STANDARD)。
+    pub requested_storage_class: Option<String>,
 }
 
-/// 对象元数据值格式版本(ADR-11 D0 + ADR-12 D-E3 + M13 Z1:
-/// `[version: u8 = 5] + postcard(ObjectMeta)`;v2/v3/v4/v5 四读、写入恒 v5;
+/// 对象元数据值格式版本(ADR-11 D0 + ADR-12 D-E3 + M13 Z1 + M15 C1:
+/// `[version: u8 = 6] + postcard(ObjectMeta)`;v3/v4/v5/v6 五读、写入恒 v6;
 /// 无版本字节的旧值放弃前置兼容,直接拒绝)。
-pub const OBJECT_META_VERSION: u8 = 5;
+pub const OBJECT_META_VERSION: u8 = 6;
+
+/// v5 值格式(M15 C1:无 requested_storage_class 尾部字段;六读回退格式)。
+pub const OBJECT_META_VERSION_V5: u8 = 5;
 
 /// v4 值格式版本(M13 Z1:无 compressed 尾部字段;四读回退格式)。
 pub const OBJECT_META_VERSION_V4: u8 = 4;
@@ -491,6 +498,10 @@ impl ObjectMeta {
         match ver {
             OBJECT_META_VERSION => postcard::from_bytes(&buf[1..])
                 .map_err(|e| Error::Corrupt(format!("postcard decode object meta: {e}"))),
+            // v5 双读回退(M15 C1:无 requested_storage_class 尾部字段 → None)
+            OBJECT_META_VERSION_V5 => postcard::from_bytes::<ObjectMetaV5>(&buf[1..])
+                .map(Into::into)
+                .map_err(|e| Error::Corrupt(format!("postcard decode object meta: {e}"))),
             // v4 双读回退(M13 Z1:无 compressed 尾部字段 → None)
             OBJECT_META_VERSION_V4 => postcard::from_bytes::<ObjectMetaV4>(&buf[1..])
                 .map(Into::into)
@@ -556,6 +567,7 @@ impl From<ObjectMetaV3> for ObjectMeta {
             legal_hold: l.legal_hold,
             part_checksums: Vec::new(),
             compressed: None,
+            requested_storage_class: None,
         }
     }
 }
@@ -603,6 +615,57 @@ impl From<ObjectMetaV4> for ObjectMeta {
             legal_hold: l.legal_hold,
             part_checksums: l.part_checksums,
             compressed: None,
+            requested_storage_class: None,
+        }
+    }
+}
+
+/// v5 值格式(v2.1.0-M15 C1 前;无 requested_storage_class 尾部字段;
+/// M15 C1 双读回退用)。
+#[derive(Serialize, Deserialize)]
+struct ObjectMetaV5 {
+    size: u64,
+    etag: [u8; 16],
+    mtime: i64,
+    extents: Vec<Segment>,
+    content_type: String,
+    user_meta: Vec<(String, String)>,
+    inline: Option<Vec<u8>>,
+    parts: Vec<u64>,
+    resp_headers: Vec<(String, String)>,
+    version_id: Option<[u8; 16]>,
+    is_delete_marker: bool,
+    tags: Vec<(String, String)>,
+    sse: Option<SseInfo>,
+    checksum: Option<ChecksumInfo>,
+    retention: Option<Retention>,
+    legal_hold: bool,
+    part_checksums: Vec<Option<ChecksumInfo>>,
+    compressed: Option<CompressionInfo>,
+}
+
+impl From<ObjectMetaV5> for ObjectMeta {
+    fn from(l: ObjectMetaV5) -> Self {
+        ObjectMeta {
+            size: l.size,
+            etag: l.etag,
+            mtime: l.mtime,
+            extents: l.extents,
+            content_type: l.content_type,
+            user_meta: l.user_meta,
+            inline: l.inline,
+            parts: l.parts,
+            resp_headers: l.resp_headers,
+            version_id: l.version_id,
+            is_delete_marker: l.is_delete_marker,
+            tags: l.tags,
+            sse: l.sse,
+            checksum: l.checksum,
+            retention: l.retention,
+            legal_hold: l.legal_hold,
+            part_checksums: l.part_checksums,
+            compressed: l.compressed,
+            requested_storage_class: None,
         }
     }
 }
@@ -642,6 +705,7 @@ impl From<ObjectMetaV2> for ObjectMeta {
             legal_hold: false,
             part_checksums: Vec::new(),
             compressed: None,
+            requested_storage_class: None,
         }
     }
 }
@@ -680,6 +744,7 @@ impl From<LegacyObjectMeta> for ObjectMeta {
             legal_hold: false,
             part_checksums: Vec::new(),
             compressed: None,
+            requested_storage_class: None,
         }
     }
 }
@@ -1943,16 +2008,17 @@ mod tests {
                 None,
             ],
             compressed: None,
+            requested_storage_class: Some("STANDARD_IA".into()),
         };
         let v = m.encode_value().unwrap();
         assert_eq!(v[0], OBJECT_META_VERSION);
-        assert_eq!(v[0], 5, "M13 Z1 起写入恒 v5");
+        assert_eq!(v[0], 6, "M15 C1 起写入恒 v6");
         assert_eq!(ObjectMeta::decode_value(&v).unwrap(), m);
         // 无版本字节(旧布局值)→ 拒绝
         let legacy = postcard::to_allocvec(&m).unwrap();
         assert!(ObjectMeta::decode_value(&legacy).is_err());
-        // 版本字节不符 → 拒绝(2/3/4 为回退格式,不在此列)
-        for bad_ver in [0u8, 1, 6, 0xFF] {
+        // 版本字节不符 → 拒绝(2/3/4/5 为回退格式,不在此列)
+        for bad_ver in [0u8, 1, 7, 0xFF] {
             let mut bad = v.clone();
             bad[0] = bad_ver;
             assert!(ObjectMeta::decode_value(&bad).is_err());
@@ -1975,7 +2041,7 @@ mod tests {
                 tags: m.tags.clone(),
                 sse: m.sse.clone(),
                 checksum: m.checksum.clone(),
-                retention: m.retention,
+                retention: m.retention.clone(),
                 legal_hold: m.legal_hold,
             };
             b.extend_from_slice(&postcard::to_allocvec(&m3).unwrap());
@@ -2067,6 +2133,39 @@ mod tests {
         assert_eq!(dec.size, m.size);
         assert_eq!(dec.version_id, None);
         assert!(!dec.is_delete_marker && !dec.legal_hold);
+        // M15 C1 双读:v5 值(M15 C1 前格式,无 requested_storage_class
+        // 尾部字段)回退补 None
+        let v5_value = {
+            let mut b = vec![5u8];
+            let m5 = ObjectMetaV5 {
+                size: m.size,
+                etag: m.etag,
+                mtime: m.mtime,
+                extents: m.extents.clone(),
+                content_type: m.content_type.clone(),
+                user_meta: m.user_meta.clone(),
+                inline: m.inline.clone(),
+                parts: m.parts.clone(),
+                resp_headers: vec![("x".into(), "y".into())],
+                version_id: m.version_id,
+                is_delete_marker: m.is_delete_marker,
+                tags: m.tags.clone(),
+                sse: m.sse.clone(),
+                checksum: m.checksum.clone(),
+                retention: m.retention.clone(),
+                legal_hold: m.legal_hold,
+                part_checksums: m.part_checksums.clone(),
+                compressed: m.compressed.clone(),
+            };
+            b.extend_from_slice(&postcard::to_allocvec(&m5).unwrap());
+            b
+        };
+        let dec = ObjectMeta::decode_value(&v5_value).unwrap();
+        assert_eq!(dec.size, m.size, "v5 值原样保留");
+        assert_eq!(dec.resp_headers, vec![("x".to_string(), "y".to_string())]);
+        assert_eq!(dec.version_id, m.version_id);
+        assert_eq!(dec.requested_storage_class, None, "v5 值无该字段,补 None");
+        assert_eq!(dec.compressed, m.compressed);
         // v2 值损坏(截断)→ 两种回退格式都失败 → Corrupt
         let truncated = &v2_value[..v2_value.len() / 2];
         assert!(matches!(

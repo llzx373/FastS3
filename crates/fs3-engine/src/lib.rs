@@ -1917,6 +1917,7 @@ impl Engine {
             sse_key,
             lock,
             None,
+            None,
         )
     }
 
@@ -1939,6 +1940,7 @@ impl Engine {
         sse_key: Option<&fs3_core::SseWriteKey>,
         lock: ObjectLockWrite,
         event: Option<fs3_core::EventDraft>,
+        requested_storage_class: Option<String>,
     ) -> Result<ObjectMeta> {
         let Some(bkt) = self.meta.get_bucket(bucket)? else {
             return Err(Error::NotFound(format!("bucket {bucket}")));
@@ -2068,6 +2070,7 @@ impl Engine {
                 legal_hold: lock.legal_hold,
                 part_checksums: Vec::new(),
                 compressed: compression_info,
+                requested_storage_class: requested_storage_class.clone(),
             };
             let mut draft = Staged::default();
             if !old.segments.is_empty() {
@@ -2121,6 +2124,7 @@ impl Engine {
             checksum_out: &checksum_out,
             lock,
             event,
+            requested_storage_class,
         });
         match result {
             Ok(meta) => {
@@ -2161,6 +2165,7 @@ impl Engine {
             checksum_out,
             lock,
             event,
+            requested_storage_class,
         } = ctx;
         let old_size = old.size;
         let old_segments = old.segments;
@@ -2212,6 +2217,7 @@ impl Engine {
             legal_hold: lock.legal_hold,
             part_checksums: Vec::new(),
             compressed,
+            requested_storage_class,
         };
 
         // 覆盖语义(ADR-9 §5.4):新段记账必须在旧段释放**之前**——开放 extent
@@ -3831,6 +3837,7 @@ impl Engine {
             sse_s3,
             None,
             None,
+            None,
         )
     }
 
@@ -3849,6 +3856,7 @@ impl Engine {
         sse_s3: Option<fs3_meta::SessionSseS3>,
         retention: Option<fs3_core::Retention>,
         legal_hold: Option<bool>,
+        requested_storage_class: Option<String>,
     ) -> Result<String> {
         if self.meta.get_bucket(bucket)?.is_none() {
             return Err(Error::NotFound(format!("bucket {bucket}")));
@@ -3870,6 +3878,7 @@ impl Engine {
             checksum_alg,
             sse_key_md5,
             sse_s3,
+            requested_storage_class,
         )
         .with_object_lock(retention, legal_hold);
         self.meta.create_multipart(&upload_id, &session)?;
@@ -4604,6 +4613,8 @@ impl Engine {
                         legal_hold: lock.legal_hold,
                         part_checksums: part_checksums.clone(),
                         compressed: None,
+
+                        requested_storage_class: session.requested_storage_class.clone(),
                     }
                 } else {
                     // extent:逐 part 解密直灌 SSE 写上下文(单一对象网格;
@@ -4657,6 +4668,8 @@ impl Engine {
                         legal_hold: lock.legal_hold,
                         part_checksums: part_checksums.clone(),
                         compressed: None,
+
+                        requested_storage_class: session.requested_storage_class.clone(),
                     }
                 }
             } else if all_inline && total_size <= self.small_object_limit as u64 {
@@ -4686,6 +4699,8 @@ impl Engine {
                     legal_hold: lock.legal_hold,
                     part_checksums: part_checksums.clone(),
                     compressed: None,
+
+                    requested_storage_class: session.requested_storage_class.clone(),
                 }
             } else if all_extent {
                 // 零数据搬运:段列表按序拼接(所有权从分片转移给对象;
@@ -4713,6 +4728,8 @@ impl Engine {
                     legal_hold: lock.legal_hold,
                     part_checksums: part_checksums.clone(),
                     compressed: None,
+
+                    requested_storage_class: session.requested_storage_class.clone(),
                 }
             } else {
                 // 混合(小分片 + 大分片):数据路径组合(仅请求子集,REVIEW §4.12)
@@ -4769,6 +4786,8 @@ impl Engine {
                     legal_hold: lock.legal_hold,
                     part_checksums: part_checksums.clone(),
                     compressed,
+
+                    requested_storage_class: session.requested_storage_class.clone(),
                 }
             };
 
@@ -5230,6 +5249,7 @@ impl Engine {
             sse_dst_key,
             lock,
             None,
+            None,
         )
     }
 
@@ -5252,6 +5272,7 @@ impl Engine {
         sse_dst_key: Option<&fs3_core::SseWriteKey>,
         lock: ObjectLockWrite,
         event: Option<fs3_core::EventDraft>,
+        requested_storage_class: Option<String>,
     ) -> Result<ObjectMeta> {
         let src = self.resolve_object_entry(src_bucket, src_key, src_version, None)?;
         let (target, old) = self.plan_object_write(dst_bucket, dst_key, dst_versioning)?;
@@ -5275,6 +5296,9 @@ impl Engine {
         // M12 W2-3:覆盖写/复制 = 新版本,不继承源保留;协议层传入头或桶默认。
         meta.retention = lock.retention;
         meta.legal_hold = lock.legal_hold;
+        // M15 C1(ADR-18 D-E3):x-amz-storage-class 头 → 记录请求类;
+        // 未携带 → 继承源请求类(AWS:复制目标默认继承源存储类)。
+        meta.requested_storage_class = requested_storage_class.or(meta.requested_storage_class);
         meta.version_id = target.meta_version_id();
         if src.is_delete_marker && target == WriteTarget::Unversioned {
             return Err(Error::InvalidArgument(format!(
@@ -6137,6 +6161,8 @@ struct PutCtx<'a> {
     lock: ObjectLockWrite,
     /// M15 N2(ADR-18 D-E1):事件入队草案(同事务;None = 无事件路径)。
     event: Option<fs3_core::EventDraft>,
+    /// M15 C1(ADR-18 D-E3):请求的存储类(统一落 STANDARD,元数据记录)。
+    requested_storage_class: Option<String>,
 }
 
 /// 版本化写入目标(ADR-11 §3.4.2;put/copy/complete 共用分叉)。
@@ -6225,6 +6251,7 @@ fn delete_marker_meta(vid: Option<[u8; 16]>) -> ObjectMeta {
         legal_hold: false,
         part_checksums: Vec::new(),
         compressed: None,
+        requested_storage_class: None,
     }
 }
 

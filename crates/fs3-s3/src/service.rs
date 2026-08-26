@@ -1234,7 +1234,12 @@ impl S3Service {
     /// - SSE-S3 头(x-amz-server-side-encryption)自 M11 K1-2 起**出表实现**:
     ///   PutObject/CreateMultipartUpload/CopyObject 受理(仅 AES256);
     ///   其余 op 携带 → handle_inner 门控显式 501;
-    /// - `x-amz-storage-class` 非 STANDARD → 400 InvalidStorageClass(与 AWS 同码);
+    /// - `x-amz-storage-class` 接受矩阵(ADR-18 D-E3,8 值大小写不敏感):
+    ///   STANDARD/STANDARD_IA/ONEZONE_IA/REDUCED_REDUNDANCY/
+    ///   INTELLIGENT_TIERING/GLACIER/GLACIER_IR/DEEP_ARCHIVE → 接受,
+    ///   统一落 STANDARD(元数据记录请求类,HEAD/GET 回显实际类);
+    ///   EXPRESS_ONEZONE(目录桶类)显式拒绝;其余未知值 → 400
+    ///   InvalidStorageClass(与 AWS 同码);
     /// - ACL 家族在对象创建路径上**接受但不生效**(单账号私有默认;值合法性
     ///   单独校验,M9/C5 在 op_create_bucket/op_put_object_buffered 声明),
     ///   不在此拒绝(兼容 s3-tests 建桶/传对象携带 ACL 的合法调用);
@@ -1261,12 +1266,38 @@ impl S3Service {
             }
         }
         if let Some(sc) = header(req, "x-amz-storage-class") {
-            if !sc.eq_ignore_ascii_case("STANDARD") {
-                return Err(S3Error::new(S3ErrorCode::InvalidStorageClass)
-                    .with_message("The storage class you specified is not valid."));
+            if !Self::storage_class_accepted(sc) {
+                let msg = if sc.eq_ignore_ascii_case("EXPRESS_ONEZONE") {
+                    "The storage class EXPRESS_ONEZONE is only valid for directory buckets."
+                } else {
+                    "The storage class you specified is not valid."
+                };
+                return Err(S3Error::new(S3ErrorCode::InvalidStorageClass).with_message(msg));
             }
         }
         Ok(())
+    }
+
+    /// M15 C1(ADR-18 D-E3)存储类接受矩阵:8 值大小写不敏感接受,其余拒绝。
+    pub fn storage_class_accepted(sc: &str) -> bool {
+        const ACCEPTED: &[&str] = &[
+            "STANDARD",
+            "STANDARD_IA",
+            "ONEZONE_IA",
+            "REDUCED_REDUNDANCY",
+            "INTELLIGENT_TIERING",
+            "GLACIER",
+            "GLACIER_IR",
+            "DEEP_ARCHIVE",
+        ];
+        ACCEPTED.iter().any(|a| a.eq_ignore_ascii_case(sc))
+    }
+
+    /// M15 C1:请求头携带的存储类(已过接受矩阵校验)的规范大写形态;
+    /// 未携带 → None。写路径(PutObject/CopyObject/CreateMultipartUpload)
+    /// 记录到对象元数据;统一落 STANDARD 的语义在 HEAD/GET 回显侧。
+    fn requested_storage_class(&self, req: &S3Request) -> Option<String> {
+        header(req, "x-amz-storage-class").map(|s| s.to_ascii_uppercase())
     }
 
     fn require_auth(&self, req: &S3Request) -> Result<Option<String>, S3Error> {
@@ -2083,6 +2114,7 @@ impl S3Service {
                             write_key.as_ref(),
                             lock,
                             event,
+                            self.requested_storage_class(req),
                         )
                         .map(|m| (m.etag, Some(m), None))
                         .map_err(|e| map_engine_error(e, bucket, key))
@@ -3517,6 +3549,7 @@ impl S3Service {
                 post_wk.as_ref(),
                 post_lock,
                 event,
+                self.requested_storage_class(req),
             )
             .map_err(|e| map_engine_error(e, bucket, &key))?;
         // M11 门禁:checksum 写后比对(不符回滚 + BadDigest,同 PUT 口径)
@@ -4208,6 +4241,7 @@ impl S3Service {
                 write_key.as_ref(),
                 lock,
                 event,
+                self.requested_storage_class(req),
             )
             .map_err(|e| map_engine_error(e, bucket, key))?;
         if md5_ok == Some(false) {
@@ -4385,6 +4419,9 @@ impl S3Service {
                     ("ETag".into(), format!("\"{}\"", meta.etag_full())),
                     ("Last-Modified".into(), xml::http_date(meta.mtime)),
                     ("Accept-Ranges".into(), "bytes".into()),
+                    // M15 C1(ADR-18 D-E3):存储类回显(统一落 STANDARD,
+                    // 恒回显实际类;请求类见 admin 面)
+                    ("x-amz-storage-class".into(), "STANDARD".into()),
                     ("Content-Length".into(), "0".into()),
                 ];
                 if let Some(v) = &resp_version_id {
@@ -4491,6 +4528,9 @@ impl S3Service {
         headers.push(("ETag".into(), format!("\"{}\"", meta.etag_full())));
         headers.push(("Last-Modified".into(), xml::http_date(meta.mtime)));
         headers.push(("Accept-Ranges".into(), "bytes".into()));
+        // M15 C1(ADR-18 D-E3):存储类回显(统一落 STANDARD,恒回显实际类;
+        // 请求类见 admin 面)
+        headers.push(("x-amz-storage-class".into(), "STANDARD".into()));
         headers.push(("Content-Length".into(), content_length.to_string()));
         if let Some(v) = &resp_version_id {
             headers.push(("x-amz-version-id".into(), v.clone()));
@@ -4858,6 +4898,7 @@ impl S3Service {
                 sess_s3,
                 lock_ret,
                 lock_hold,
+                self.requested_storage_class(req),
             )
             .map_err(|e| map_engine_error(e, bucket, key))?;
         let xml = xml::render_initiate_multipart(bucket, key, &uid);
@@ -5782,6 +5823,7 @@ impl S3Service {
                 dst_wk.as_ref(),
                 lock,
                 event,
+                self.requested_storage_class(req),
             )
             .map_err(|e| map_engine_error(e, &copy_source.bucket, &copy_source.key))?;
         let xml = xml::render_copy_object(&meta.etag_full(), &xml::ts_to_rfc3339(meta.mtime));
@@ -7268,15 +7310,41 @@ mod tests {
         // M10 S1:x-amz-tagging 不再 501(由写路径解析落 ObjectMeta.tags)
         let tagged = headers_req(&[("x-amz-tagging", "k=v")]);
         assert!(service.check_unimplemented_headers(&tagged).is_ok());
-        // storage-class:STANDARD 接受(显式 no-op);其它 → InvalidStorageClass
-        let ok = headers_req(&[("x-amz-storage-class", "STANDARD")]);
-        assert!(service.check_unimplemented_headers(&ok).is_ok());
-        for v in ["STANDARD_IA", "GLACIER", "REDUCED_REDUNDANCY", "bogus"] {
+        // M15 C1(ADR-18 D-E3):接受矩阵 8 值(大小写不敏感)全接受,
+        // 统一落 STANDARD(语义在写路径/回显侧);EXPRESS_ONEZONE 与
+        // 未知值 → 400 InvalidStorageClass
+        for v in [
+            "STANDARD",
+            "standard",
+            "STANDARD_IA",
+            "ONEZONE_IA",
+            "REDUCED_REDUNDANCY",
+            "INTELLIGENT_TIERING",
+            "GLACIER",
+            "GLACIER_IR",
+            "DEEP_ARCHIVE",
+            "deep_archive",
+        ] {
+            let req = headers_req(&[("x-amz-storage-class", v)]);
+            assert!(
+                service.check_unimplemented_headers(&req).is_ok(),
+                "class {v} 应被接受矩阵放行"
+            );
+        }
+        for v in ["EXPRESS_ONEZONE", "bogus", "GLACIER_IR2"] {
             let req = headers_req(&[("x-amz-storage-class", v)]);
             let err = service.check_unimplemented_headers(&req).unwrap_err();
             assert_eq!(err.code, S3ErrorCode::InvalidStorageClass, "class {v}");
             assert_eq!(err.status(), 400, "class {v}");
         }
+        // EXPRESS_ONEZONE 显式消息(目录桶类)
+        let ex = headers_req(&[("x-amz-storage-class", "EXPRESS_ONEZONE")]);
+        let err = service.check_unimplemented_headers(&ex).unwrap_err();
+        let msg = err.message_override.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("directory buckets"),
+            "EXPRESS_ONEZONE 拒绝消息应点名目录桶语义:{msg}"
+        );
         // 无未实现头 → 放行
         let plain = headers_req(&[
             ("content-type", "text/plain"),

@@ -219,6 +219,8 @@ pub fn run_lock_check(args: &LockCheckArgs) -> Result<()> {
         legal_hold: hold,
         part_checksums: vec![],
         compressed: None,
+
+        ..Default::default()
     };
     let locked = mk(true, now + 30 * 86_400); // 未到期 + hold:最坏判定
     let expired = mk(false, now - 1); // 已到期 + 无 hold:常规路径

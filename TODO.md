@@ -59,7 +59,7 @@
 - [x] I3 集成测试(配置→生成→清单内容对账;版本化桶含删除标记口径)+ 迁移对账演示(mc/rclone 迁移后以清单逐项 md5 对账)
 
 ### C. 存储类头矩阵 + 协议补完(NEXT-ROUND §5 C1~C3,≈1.5 pw)
-- [ ] C1 存储类头接受矩阵(ADR-18 D-E3):接受 STANDARD/STANDARD_IA/ONEZONE_IA/REDUCED_REDUNDANCY/INTELLIGENT_TIERING/GLACIER/GLACIER_IR/DEEP_ARCHIVE → 统一落 STANDARD + 元数据记录请求类;HEAD/GET/GetObjectAttributes 回显实际 STANDARD + admin 可见请求类;响应 `x-amz-storage-class`;EXPRESS_ONEZONE(目录桶类)显式拒绝;compat.md 文档化映射
+- [x] C1 存储类头接受矩阵(ADR-18 D-E3):接受 STANDARD/STANDARD_IA/ONEZONE_IA/REDUCED_REDUNDANCY/INTELLIGENT_TIERING/GLACIER/GLACIER_IR/DEEP_ARCHIVE → 统一落 STANDARD + 元数据记录请求类;HEAD/GET/GetObjectAttributes 回显实际 STANDARD + admin 可见请求类;响应 `x-amz-storage-class`;EXPRESS_ONEZONE(目录桶类)显式拒绝;compat.md 文档化映射
 - [ ] C2 UploadPartCopy 源 `?versionId` 寻址(闭合 s3-tests README 唯一残留 501 红线 token `multipart_copy_versioned`)+ 协议补完:密钥状态语义(禁用 vs 不存在在 admin/审计面可区分,S3-GAP §3.7 #7;协议错误码维持 AWS 同义)、`x-amz-expected-bucket-owner`(= 自身 → 放行,≠ 自身 → 403 显式,单账号模型语义)
 - [ ] C3 逐项 s3-tests/自有集成测试 + 排除正则收敛(`multipart_copy_versioned` 移除;`expected_bucket_owner`/`tenant` 按结论出集或保留并逐名记录理由)
 

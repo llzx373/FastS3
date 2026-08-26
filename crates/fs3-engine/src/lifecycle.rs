@@ -921,6 +921,8 @@ mod tests {
             legal_hold: false,
             part_checksums: vec![],
             compressed: None,
+
+            ..Default::default()
         }
     }
 
@@ -1283,6 +1285,7 @@ mod tests {
                 vec![],
                 vec![],
                 tags,
+                None,
                 None,
                 None,
                 None,
