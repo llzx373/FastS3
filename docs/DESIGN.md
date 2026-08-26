@@ -950,6 +950,99 @@ secret 永不落库(仅在内存 pendingSecrets 暂存一次,取后即清,进程
 安全自审与 GA 自审同标准;HTTP/3 0-RTT 重放防护测试(PUT 无 0-RTT);
 缓存开/关对照 + 命中率可观测;覆盖率 ≥80%;cargo audit 清零;发布 v2.0.0。
 
+#### ADR-18(M15 立项决策):事件通知一致性 / STS 会话模型 / 存储类头矩阵 / 通知目标范围
+
+**背景**:M15「迁移即插即用」(v2.1.0;TODO M15)立项,首条任务 = 本 ADR 按
+NEXT-ROUND §5.6 决策点 **D-E1~D-E4** 的推荐方案落盘(DESIGN-FUTURE §11 决策
+清单已有登记)。实现偏离推荐方案必须走 ADR 流程,不得静默偏离(AGENT §5)。
+
+**D-E1(事件队列一致性语义:入队与数据事务边界、崩溃零漂移)**:
+
+1. **入队事务边界 = 与数据操作同事务提交**:对象写/删/生命周期过期删除等
+   产生事件的操作,其事件条目与数据元数据**同一条 rocksdb 事务**提交
+   (`e:` 键随数据提交原子落盘)。裁决理由:通知不得要求数据面请求额外
+   fsync(会侵蚀热路径;数据事务本就有组提交落盘),而事件与数据同事务
+   保证「已应答对象必有事件、未应答对象必无事件」——崩溃零漂移定义:
+   应答后 kill -9,事件必须已持久化(与数据同事务,天然成立);未应答前
+   kill,不得出现「数据没有但事件有」的幽灵事件。
+2. **队列 = 持久化有界环形(复用审计环形底座模式,ADR-12 DL5)**:事件键
+   `e:` 前缀 + be64 seq(事务号,字典序 = 写入序);批量截断删最旧
+   (上限可配,默认 10 万条;防投递停滞时无限堆积);截断只删已投递/
+   已死信条目,不删未投递(未投递事件是「至少一次」交付承诺的一部分)。
+3. **投递与入队解耦**:投递 worker 消费队列头(队首 seq 游标,重启后从
+   最旧未投递续投),投递失败只影响该事件重试状态,**绝不影响数据面
+   请求语义**;队满截断、投递背压均有指标与告警,不静默。
+4. **交付语义 = at-least-once(与 AWS S3 通知一致)**:同一事件可能因
+   崩溃/重试被投递多次;载荷含 `eventId`(seq)供目标做幂等;不承诺
+   exactly-once(与 AWS 官方语义对齐)。
+5. **事件集起步** = ObjectCreated:*(Put/Copy/Post/CompleteMultipartUpload)、
+   ObjectRemoved:*(Delete/DeleteMarker 保留)、RestoreComment/Lifecycle 族
+   事件注册表预留(Restore 语义 M16 真归档后启用,Lifecycle 事件随
+   生命周期执行器已有操作点补入);未订阅事件不产生任何开销。
+
+**D-E2(STS 会话模型:会话 = 基密钥 + 会话策略求交,无角色派生)**:
+
+1. **会话 = 基密钥 + 会话策略求交,无角色派生**:STS 签发的会话绑定一个
+   既有密钥(`k:` 记录),最终权限 = 密钥自身权限 ∩ 会话策略(会话策略
+   显式 Deny 优先,EffectiveDeny 沿 AWS 语义);**不引入角色实体、不做
+   跨账号/跨密钥冒充**——单账号模型下角色 = 密钥 + 策略的表达,范围
+   声明进 compat.md(防止「AssumeRole = 提权」误读)。
+2. **secret 仅签发时一次回显,不落盘(沿用 G1-3 语义)**:会话 secret 由
+   签发端(管理面)一次性生成并回显,调用方立即取用;服务端仅存
+   **哈希比对子**:`s:session\0{session_id}` 键存 {基密钥引用、会话策略、
+   TTL 过期时刻、secret 哈希、签发时间/签发者/会话 id};明文 secret 零
+   落盘、零日志(与密钥种子红线同档)。
+3. **Token 语义**:`x-amz-security-token` = 会话 id(SigV4 请求携带);
+   数据面按 token 解析会话 → 基密钥鉴权 + 会话策略求交 + 过期判定;
+   TTL 上限对齐 AWS(默认 1h,上限 36h,过期后 InvalidToken 显式错误)。
+4. **签发面 = Node 管理面(永不进数据热路径)**:Query API 最小集
+   GetSessionToken/AssumeRole;AssumeRole 在不引入角色的前提下接受
+   RoleArn 参数但裁为「按会话策略签发」语义(文档化);会话 id 与密钥
+   元数据入审计(签发/过期/使用六维检索扩展)。
+5. **匿名路径不受影响**:无凭证请求维持现状;会话失效不影响基密钥本身。
+
+**D-E3(存储类头接受矩阵:统一映射 + 记录 + 回显,文档化非静默)**:
+
+1. **接受矩阵**:`x-amz-storage-class` 接受 STANDARD / STANDARD_IA /
+   ONEZONE_IA / REDUCED_REDUNDANCY / INTELLIGENT_TIERING / GLACIER /
+   GLACIER_IR / DEEP_ARCHIVE → **统一落 STANDARD**(单机单类模型,无
+   分层语义;真归档留 M16)。EXPRESS_ONEZONE(目录桶类)显式拒绝
+   (InvalidStorageClass,不静默)。
+2. **元数据记录请求类**:ObjectMeta 记 `requested_storage_class`(值格式
+   演进纪律:新字段走值版本字节,双读单写;见演进纪律
+   DESIGN-FUTURE §2);HEAD/GET/GetObjectAttributes 响应 `x-amz-storage-class`
+   回显 **实际类 STANDARD**;admin/审计面可见请求类(可观测「客户声明了
+   什么」)。
+3. **文档化映射而非静默忽略**:compat.md 存储类章节同步矩阵
+   (接受值 → 落 STANDARD → 回显 STANDARD;请求类仅记录),发布报告
+   明确「接受 = 迁移兼容,不代表真分层」(防合规/成本误判,对应
+   NEXT-ROUND R3)。
+4. **任何未列入矩阵的类**(EXPRESS_ONEZONE 及未来新增)→ 400 显式
+   报错,绝不静默忽略(红线:静默忽略客户端头 = 拒绝合入)。
+
+**D-E4(通知目标范围:Webhook 起步,SQS/SNS/EventBridge 后置评估)**:
+
+1. **M15 仅实现 Webhook 目标**:HTTP POST + HMAC-SHA256 签名(密钥由
+   配置指定,签名头固定,防伪造与篡改);SQS/SNS/EventBridge 目标形态
+   **后置评估**,不进入本里程碑(范围防蔓延,NEXT-ROUND R5)。
+2. **通知配置键 `n:{bucket}\0{id}`**(两段式桶级键,同 `r:` 先例):
+   值 = postcard 规范化配置(id、事件集、目标 URL、HMAC 密钥、启用态);
+   Put/Get/DeleteBucketNotificationConfiguration 三方法 +
+   `?notification`(新旧参数名兼容);非法目标/事件 →
+   MalformedXML/InvalidArgument 显式报错。
+3. **新键前缀三处同步**(演进纪律 DESIGN-FUTURE §2.2):`e:` 事件队列与
+   `n:` 通知配置登记 keys.rs 前缀表、meta-export/import DTO、check
+   可达性扫描;`n:` 为两段式桶级键入删桶清理。
+4. **关闭态零开销**:无配置桶零注册零扫描(PUT 经配置存在性快查,
+   miss 无事件路径);通知/STS/存储类全部关闭态 perf 零回退 <5% 门禁
+   (TODO M15 G)。
+
+**门禁口径同步**(TODO M15 门禁):ADR-18 与实现无偏离;`notification`
+族出 s3-tests 排除集且 100%;崩溃 ≥500 轮(事件队列写入/投递/删除混载)
+零撕裂/零泄漏/账目零漂移;关闭态 perf 零回退、开启态增量进发布报告
+(DESIGN-FUTURE §9.1 预算表口径);覆盖率 ≥80%;cargo audit 清零;
+发布 v2.1.0 记档。
+
 ---
 
 ## 4. 存储引擎设计(Rust)

@@ -39,7 +39,7 @@
 > 首条任务 = ADR-18 落盘(NEXT-ROUND §5.6:D-E1~D-E4)。
 
 ### A0 决策落盘
-- [ ] A0-1 ADR-18 写入 DESIGN.md §3.3:D-E1(事件队列一致性语义:入队与数据事务边界、崩溃零漂移)、D-E2(STS 会话模型:会话 = 基密钥 + 会话策略求交,无角色派生;secret 仅签发时一次回显)、D-E3(存储类头接受矩阵:GLACIER*/IA/IT/RRS 统一映射 STANDARD + 元数据记录请求类 + 响应回显实际类,文档化非静默)、D-E4(通知目标范围:Webhook 起步,SQS/SNS/EventBridge 后置评估)
+- [x] A0-1 ADR-18 写入 DESIGN.md §3.3:D-E1(事件队列一致性语义:入队与数据事务边界、崩溃零漂移)、D-E2(STS 会话模型:会话 = 基密钥 + 会话策略求交,无角色派生;secret 仅签发时一次回显)、D-E3(存储类头接受矩阵:GLACIER*/IA/IT/RRS 统一映射 STANDARD + 元数据记录请求类 + 响应回显实际类,文档化非静默)、D-E4(通知目标范围:Webhook 起步,SQS/SNS/EventBridge 后置评估)
 
 ### N. 事件通知(Webhook 起步;NEXT-ROUND §5 N1~N5,≈4 pw)
 - [ ] N1 `n:{bucket}\0{id}` 配置键 + Put/Get/DeleteBucketNotificationConfiguration(?notification 新旧参数兼容;XML 校验,非法目标/事件 → MalformedXML/InvalidArgument 显式报错)
