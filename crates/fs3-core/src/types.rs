@@ -134,6 +134,24 @@ pub struct ObjectMeta {
     pub restore_state: Option<RestoreState>,
 }
 
+/// 归档对象恢复作业(M16 A2,ADR-19 DA2.3;键 `x:{seq be64}` → postcard
+/// 本结构;be64 字典序 = 入队序,restore worker 消费队列头,崩溃续跑)。
+/// 入队与 `restore_state` 挂起标记(restored_until=0)同事务提交——
+/// 崩溃零漂移(挂起必在队、作业必可重放,至少一次语义,作业幂等)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreJob {
+    pub bucket: String,
+    pub key: String,
+    /// 寻址版本(None = 当前版本;?versionId 恢复按版本)。
+    pub vk: Option<[u8; 16]>,
+    /// 入队时刻(unix 秒;挂起标记 restored_at 同值)。
+    pub enqueued_at: i64,
+    /// 恢复天数(1..=365;到期 = enqueued_at + days*86400)。
+    pub days: u32,
+    /// 请求 Tier(Expedited/Standard/Bulk;本机三档同一快速取回,仅记录)。
+    pub tier: String,
+}
+
 /// 归档对象恢复状态(M16 A2,ADR-19 DA2/DA4;ObjectMeta v7 尾部字段)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreState {
@@ -1274,6 +1292,10 @@ pub enum EventDraftKind {
     /// LifecycleExpiration 族(N2 起生命周期执行器删除时入队;由删除
     /// 漏斗按结果裁决 Delete / DeleteMarkerCreated,AWS 同口径)。
     LifecycleExpiration,
+    /// ObjectRestore 族(M16 A2;ADR-19 DA2.6,M15 N2 预留兑现):
+    /// Post(POST ?restore 受理)/ Completed(恢复副本落盘)/
+    /// Delete(恢复副本过期 GC)。
+    Restore(&'static str),
 }
 
 /// 事件入队草案(见 [`EventDraftKind`])。

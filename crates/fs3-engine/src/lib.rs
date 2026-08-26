@@ -17,6 +17,7 @@ pub mod compaction;
 pub mod inventory;
 pub mod io;
 pub mod lifecycle;
+pub mod restore;
 pub mod worker;
 
 #[cfg(test)]
@@ -1720,6 +1721,9 @@ impl Engine {
                 }
                 fs3_core::EventDraftKind::LifecycleExpiration => {
                     unreachable!("LifecycleExpiration 草案不落 put 提交路径")
+                }
+                fs3_core::EventDraftKind::Restore(_) => {
+                    unreachable!("Restore 草案不落 put 提交路径")
                 }
             };
             fs3_core::EventRecord {
@@ -3625,6 +3629,7 @@ impl Engine {
                     "s3:LifecycleExpiration:Delete"
                 }
             }
+            fs3_core::EventDraftKind::Restore(name) => name,
             fs3_core::EventDraftKind::ObjectCreated(_) => {
                 unreachable!("ObjectCreated 草案不落删除提交路径")
             }

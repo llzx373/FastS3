@@ -10080,6 +10080,139 @@ fn a2_1_unrestored_archive_read_gate() {
     );
 }
 
+/// M16 A2-2/A2-3(ADR-19 DA2):POST ?restore 端到端——XML 校验(Days 越界/
+/// Tier 非法/DEEP_ARCHIVE×Expedited/STANDARD 对象)→ 引擎状态机(入队 +
+/// ongoing 回显)→ worker 物化 → GET 明文往返 + expiry-date 回显;重复
+/// restore 幂等延长;错误 XML → MalformedXML。
+#[test]
+fn a2_2_restore_object_end_to_end() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/arr", vec![]))), 200);
+    let data = b"hello archived world".to_vec();
+    svc.handle(&req_h(
+        "PUT",
+        "/arr/g1",
+        &[("x-amz-storage-class", "GLACIER")],
+        data.clone(),
+    ))
+    .unwrap();
+    // ① POST ?restore(Standard/3d)→ 200;HEAD x-amz-restore ongoing
+    let r = svc.handle(&req_q(
+        "POST",
+        "/arr/g1",
+        &[("restore", "")],
+        br#"<RestoreRequest><Days>3</Days><Tier>Standard</Tier></RestoreRequest>"#.to_vec(),
+    ));
+    assert_eq!(status(&r), 200, "{:?}", r);
+    let h = svc.handle(&req("HEAD", "/arr/g1", vec![])).unwrap();
+    assert_eq!(
+        hdr(&h, "x-amz-restore").as_deref(),
+        Some("ongoing-request=\"true\""),
+        "恢复进行中回显"
+    );
+    // ② worker 物化(测试直驱引擎 tick;生产 = fs3-restore 线程)
+    let now = {
+        let e = svc.engine().write();
+        e.lock_now()
+    };
+    {
+        let mut e = svc.engine().write();
+        let (done, _) = e.restore_worker_tick(now + 1, 8).unwrap();
+        assert_eq!(done, 1, "作业物化");
+    }
+    // ③ GET 明文往返 + expiry-date 回显
+    let g = svc.handle(&req("GET", "/arr/g1", vec![])).unwrap();
+    assert_eq!(g.status, 200);
+    match &g.body {
+        ResponseBody::Bytes(b) => assert_eq!(b, &data, "恢复后明文读"),
+        ResponseBody::ObjectStream { .. } => {
+            assert_stream_eq(&svc, &g, &data, "恢复后明文读(流式)")
+        }
+        _ => panic!("unexpected body"),
+    }
+    let rh = hdr(&g, "x-amz-restore").unwrap();
+    assert!(
+        rh.starts_with("ongoing-request=\"false\", expiry-date=\""),
+        "completed 回显: {rh}"
+    );
+    // ④ 重复 restore = 幂等延长(仍是 200;到期日延后)
+    let r2 = svc.handle(&req_q(
+        "POST",
+        "/arr/g1",
+        &[("restore", "")],
+        br#"<RestoreRequest><Days>7</Days><Tier>Expedited</Tier></RestoreRequest>"#.to_vec(),
+    ));
+    assert_eq!(status(&r2), 200);
+    let m = svc
+        .engine()
+        .read()
+        .meta()
+        .get_object("arr", "g1")
+        .unwrap()
+        .unwrap();
+    assert!(m.restore_valid(now + 1), "延长后仍有效");
+    assert!(
+        m.restore_state.as_ref().unwrap().restored_until >= now + 7 * 86_400,
+        "延长 7 天"
+    );
+    // ⑤ 校验矩阵
+    // Days 越界
+    let r = svc.handle(&req_q(
+        "POST",
+        "/arr/g1",
+        &[("restore", "")],
+        br#"<RestoreRequest><Days>0</Days></RestoreRequest>"#.to_vec(),
+    ));
+    assert_eq!(err_code(&r), "MalformedXML");
+    let r = svc.handle(&req_q(
+        "POST",
+        "/arr/g1",
+        &[("restore", "")],
+        br#"<RestoreRequest><Days>366</Days></RestoreRequest>"#.to_vec(),
+    ));
+    assert_eq!(err_code(&r), "MalformedXML");
+    // Tier 非法
+    let r = svc.handle(&req_q(
+        "POST",
+        "/arr/g1",
+        &[("restore", "")],
+        br#"<RestoreRequest><Days>1</Days><Tier>Instant</Tier></RestoreRequest>"#.to_vec(),
+    ));
+    assert_eq!(err_code(&r), "MalformedXML");
+    // STANDARD 对象 → InvalidObjectState
+    svc.handle(&req("PUT", "/arr/s1", b"std".to_vec())).unwrap();
+    let r = svc.handle(&req_q(
+        "POST",
+        "/arr/s1",
+        &[("restore", "")],
+        br#"<RestoreRequest><Days>1</Days></RestoreRequest>"#.to_vec(),
+    ));
+    assert_eq!(err_code(&r), "InvalidObjectState");
+    // DEEP_ARCHIVE × Expedited → InvalidArgument
+    svc.handle(&req_h(
+        "PUT",
+        "/arr/d1",
+        &[("x-amz-storage-class", "DEEP_ARCHIVE")],
+        b"deep".to_vec(),
+    ))
+    .unwrap();
+    let r = svc.handle(&req_q(
+        "POST",
+        "/arr/d1",
+        &[("restore", "")],
+        br#"<RestoreRequest><Days>1</Days><Tier>Expedited</Tier></RestoreRequest>"#.to_vec(),
+    ));
+    assert_eq!(err_code(&r), "InvalidArgument");
+    // 缺 Days → MalformedXML
+    let r = svc.handle(&req_q(
+        "POST",
+        "/arr/d1",
+        &[("restore", "")],
+        br#"<RestoreRequest><Tier>Standard</Tier></RestoreRequest>"#.to_vec(),
+    ));
+    assert_eq!(err_code(&r), "MalformedXML");
+}
+
 /// H1-1:KeyTooLongError 触发路径——键 UTF-8 字节长 >1024 → 400
 /// KeyTooLongError(PUT/GET/CreateMultipart 路径键 + CopyObject 的
 /// copy-source 键);恰好 1024 字节放行对照(AWS 上限口径)。

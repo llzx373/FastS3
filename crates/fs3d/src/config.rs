@@ -216,6 +216,14 @@ pub struct StorageConfig {
     /// 模拟系统时钟回拨,断言 COMPLIANCE 保留不可缩短(tests/m12_clock_rollback.sh)。
     #[allow(dead_code)] // 经 cli.storage.clock_offset_secs 透传
     pub clock_offset_secs: Option<i64>,
+    /// M16 A2(ADR-19 DA2.3):归档恢复 worker 开关(默认 true;关 = 作业
+    /// 堆积不物化,恢复请求仍入队,恢复后打开续跑)。
+    pub restore_enabled: Option<bool>,
+    /// 恢复作业轮询周期秒数(默认 1;恢复 = 秒级~分钟级取回)。
+    pub restore_poll_secs: Option<f64>,
+    /// 过期恢复副本 GC 扫描周期秒数(默认 3600 = 1h;读语义不受 GC
+    /// 滞后影响——到期判定在请求路径)。
+    pub restore_gc_secs: Option<u64>,
 }
 
 pub fn load_config(path: Option<&Path>) -> Result<RootConfig> {

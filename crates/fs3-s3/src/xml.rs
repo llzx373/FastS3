@@ -13,6 +13,74 @@ pub const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
 // ─────────────────────────── 请求解析 ───────────────────────────
 
+/// M16 A2-2(ADR-19 DA2):RestoreRequest 解析——
+/// `<RestoreRequest><Days>N</Days><Tier>Standard</Tier></RestoreRequest>`;
+/// Days 必填且 1..=365;Tier ∈ {Expedited, Standard, Bulk}(缺省 Standard);
+/// SelectParameters/OutputLocation(Select 取回)不支持 → 显式
+/// InvalidArgument。返回 (days, tier)。
+pub fn parse_restore_request(body: &[u8]) -> Result<(u32, String), String> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_reader(body);
+    reader.config_mut().trim_text(true);
+    let mut days: Option<u32> = None;
+    let mut tier: Option<String> = None;
+    let mut depth = 0usize;
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                if name == "RestoreRequest" {
+                    depth = 1;
+                } else if depth == 1 && name == "Days" {
+                    let raw = reader
+                        .read_text(e.name())
+                        .map_err(|e| format!("Days: {e}"))?;
+                    let txt = String::from_utf8_lossy(raw.as_ref()).into_owned();
+                    days = Some(
+                        txt.trim()
+                            .parse::<u32>()
+                            .map_err(|_| format!("Days must be an integer, got {txt:?}"))?,
+                    );
+                } else if depth == 1 && name == "Tier" {
+                    let raw = reader
+                        .read_text(e.name())
+                        .map_err(|e| format!("Tier: {e}"))?;
+                    let txt = String::from_utf8_lossy(raw.as_ref()).into_owned();
+                    tier = Some(txt.trim().to_string());
+                } else if depth == 1 && (name == "SelectParameters" || name == "OutputLocation") {
+                    return Err(
+                        "Select-based restore (SelectParameters/OutputLocation) is not supported"
+                            .into(),
+                    );
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                if name == "RestoreRequest" {
+                    depth = 0;
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(format!("restore request XML: {e}")),
+            _ => {}
+        }
+        buf.clear();
+    }
+    let days = days.ok_or_else(|| "RestoreRequest must include <Days>".to_string())?;
+    if !(1..=365).contains(&days) {
+        return Err(format!("Days must be between 1 and 365, got {days}"));
+    }
+    let tier = tier.unwrap_or_else(|| "Standard".to_string());
+    let tier_ok = matches!(tier.as_str(), "Expedited" | "Standard" | "Bulk");
+    if !tier_ok {
+        return Err(format!(
+            "Tier must be one of Expedited/Standard/Bulk, got {tier:?}"
+        ));
+    }
+    Ok((days, tier))
+}
+
 /// 解析 CreateBucketConfiguration:<LocationConstraint>region</LocationConstraint>。
 pub fn parse_create_bucket_configuration(body: &[u8]) -> Result<Option<String>, String> {
     if body.iter().all(|&b| b.is_ascii_whitespace()) {

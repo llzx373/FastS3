@@ -92,6 +92,9 @@ pub struct AdminServer {
     /// S3 Inventory 生成指标(M15 I2;worker 启用时由 fs3d 注入;None =
     /// 未启用,/metrics 相应指标组缺席)。
     inventory_stats: Option<Arc<fs3_engine::inventory::InventoryStats>>,
+    /// 归档恢复指标(M16 A2;worker 启用时由 fs3d 注入;None = 未启用,
+    /// /metrics 相应指标组缺席)。
+    restore_stats: Option<Arc<fs3_engine::restore::RestoreStats>>,
 }
 
 impl AdminServer {
@@ -106,6 +109,7 @@ impl AdminServer {
             lifecycle_stats: None,
             notification_stats: None,
             inventory_stats: None,
+            restore_stats: None,
         }
     }
 
@@ -139,6 +143,15 @@ impl AdminServer {
         stats: Option<Arc<fs3_engine::inventory::InventoryStats>>,
     ) -> Self {
         self.inventory_stats = stats;
+        self
+    }
+
+    /// 注入归档恢复指标(M16 A2;/metrics 渲染 fasts3_restore_*)。
+    pub fn with_restore_stats(
+        mut self,
+        stats: Option<Arc<fs3_engine::restore::RestoreStats>>,
+    ) -> Self {
+        self.restore_stats = stats;
         self
     }
 
@@ -227,6 +240,7 @@ impl AdminServer {
             lifecycle_stats: self.lifecycle_stats.clone(),
             notification_stats: self.notification_stats.clone(),
             inventory_stats: self.inventory_stats.clone(),
+            restore_stats: self.restore_stats.clone(),
         })
     }
 
@@ -848,6 +862,52 @@ impl AdminServer {
                 "fasts3_inventory_last_run_timestamp {}\n",
                 s.last_run_at
             ));
+        }
+        // M16 A2:归档恢复指标组(worker 未启用 = 缺席;A3-3 补告警规则)
+        if let Some(stats) = &self.restore_stats {
+            let s = stats.snapshot();
+            text.push_str(
+                "# HELP fasts3_restore_completed_total Restore materializations completed
+",
+            );
+            text.push_str(
+                "# TYPE fasts3_restore_completed_total counter
+",
+            );
+            text.push_str(&format!("fasts3_restore_completed_total {}\n", s.completed));
+            text.push_str(
+                "# HELP fasts3_restore_failed_total Restore jobs that failed (retried next tick)
+",
+            );
+            text.push_str(
+                "# TYPE fasts3_restore_failed_total counter
+",
+            );
+            text.push_str(&format!("fasts3_restore_failed_total {}\n", s.failed));
+            text.push_str(
+                "# HELP fasts3_restore_extended_total Idempotent restore extensions
+",
+            );
+            text.push_str(
+                "# TYPE fasts3_restore_extended_total counter
+",
+            );
+            text.push_str(&format!("fasts3_restore_extended_total {}\n", s.extended));
+            text.push_str(
+                "# HELP fasts3_restore_gc_cleared_total Expired restore copies cleared by GC
+",
+            );
+            text.push_str(
+                "# TYPE fasts3_restore_gc_cleared_total counter
+",
+            );
+            text.push_str(&format!(
+                "fasts3_restore_gc_cleared_total {}\n",
+                s.gc_cleared
+            ));
+            text.push_str("# HELP fasts3_restore_queue_depth Pending restore jobs\n");
+            text.push_str("# TYPE fasts3_restore_queue_depth gauge\n");
+            text.push_str(&format!("fasts3_restore_queue_depth {}\n", s.queue));
         }
         Response::builder()
             .status(StatusCode::OK)

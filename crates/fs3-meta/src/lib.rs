@@ -422,6 +422,17 @@ pub enum Op {
     EventDelete {
         seq: u64,
     },
+    /// 归档恢复作业入队(M16 A2,ADR-19 DA2.3;键 `x:{seq be64}` →
+    /// postcard RestoreJob;seq 由 apply_ops 填充为当前事务 seq——与
+    /// EventEnqueue 同口径,入队与挂起标记同事务,崩溃零漂移)。
+    RestoreJobPut {
+        job: fs3_core::RestoreJob,
+    },
+    /// 归档恢复作业删除(恢复副本落盘同事务;投递完成 = 键删除,
+    /// 重启续跑 at-least-once,作业幂等)。
+    RestoreJobDelete {
+        seq: u64,
+    },
     /// STS 会话写入(M15 T1;ADR-18 D-E2;覆盖语义;`s:session\0{id}` 键)。
     SessionPut {
         record: fs3_core::SessionRecord,
@@ -2499,6 +2510,52 @@ impl MetaStore {
         Ok(n)
     }
 
+    /// 归档恢复作业队列读取(M16 A2,ADR-19 DA2.3):从 `after_seq` 之后
+    /// 起取至多 `limit` 条(队首续跑;None = 从头)。
+    pub fn restore_jobs(
+        &self,
+        after_seq: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<(u64, fs3_core::RestoreJob)>> {
+        let mut out = Vec::new();
+        let start = match after_seq {
+            Some(s) => restore_job_key(s + 1),
+            None => PREFIX_RESTORE_JOB.to_vec(),
+        };
+        for item in self
+            .db
+            .iterator(IteratorMode::From(&start, Direction::Forward))
+        {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(PREFIX_RESTORE_JOB) {
+                break;
+            }
+            if out.len() >= limit {
+                break;
+            }
+            let seq = parse_restore_job_seq(&k)?;
+            let job: fs3_core::RestoreJob = decode(&v)?;
+            out.push((seq, job));
+        }
+        Ok(out)
+    }
+
+    /// 归档恢复作业队列条数(队列深度指标)。
+    pub fn restore_job_count(&self) -> Result<usize> {
+        let mut n = 0usize;
+        for item in self
+            .db
+            .iterator(IteratorMode::From(PREFIX_RESTORE_JOB, Direction::Forward))
+        {
+            let (k, _v) = item.map_err(rocks_err)?;
+            if !k.starts_with(PREFIX_RESTORE_JOB) {
+                break;
+            }
+            n += 1;
+        }
+        Ok(n)
+    }
+
     /// 事件队列批量截断(M15 N2;ADR-18 D-E1 有界环形):条数超
     /// `max + slack` 时单 WriteBatch 删最旧回 `max`(slack 批量摊销,
     /// 同 AuditStore 口径);**只删最旧终态条目(死信/已投递已删键外的最
@@ -3661,6 +3718,14 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
             }
             Op::EventDelete { seq } => {
                 tremove(tx, &event_key(*seq))?;
+            }
+            Op::RestoreJobPut { job } => {
+                // M16 A2(ADR-19 DA2.3):作业键 seq = 当前事务 seq(与
+                // 事件同口径;入队与挂起标记同事务,崩溃零漂移)
+                tinsert(tx, restore_job_key(seq), encode(job)?)?;
+            }
+            Op::RestoreJobDelete { seq } => {
+                tremove(tx, &restore_job_key(*seq))?;
             }
             Op::SessionPut { record } => {
                 // s: 系统键族,无桶锚定;与既有会话同 id 覆盖(重签语义)

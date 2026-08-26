@@ -81,6 +81,13 @@ pub const PREFIX_EVENT: &[u8] = b"e:";
 /// 前缀表 + meta-export/import DTO + check 可达性扫描登记);两段式
 /// 桶级键入删桶清理(同 `r:`/`n:` 先例)。
 pub const PREFIX_INVENTORY: &[u8] = b"iv:";
+/// 归档恢复作业队列(M16 A2;ADR-19 DA2.3:`x:{seq be64}` → postcard
+/// RestoreJob;be64 字典序 = 入队序;入队与数据操作同事务提交——崩溃
+/// 零漂移(挂起标记必在队、作业必可重放)。新一级前缀:三处同步——
+/// keys.rs 前缀表(本处)、meta-export/import DTO(不导出:瞬态队列,同
+/// `e:` 事件队列口径)、check 可达性扫描(只读 `o:`/`p:` 段引用键,对
+/// `x:` 天然安全,登记于注释)。
+pub const PREFIX_RESTORE_JOB: &[u8] = b"x:";
 
 /// 系统单调计数器(每个事务 +1,单点序列化;ADR-5)。
 pub const SYS_SEQ: &[u8] = b"s:seq";
@@ -491,6 +498,14 @@ pub fn parse_inventory_config_key(raw: &[u8]) -> Result<(String, String)> {
 }
 
 /// 事件队列条目键:`e:{seq be64}`(M15 N2;ADR-18 D-E1)。
+/// 归档恢复作业键(`x:{seq be64}`;be64 字典序 = 数值序 = 入队序)。
+pub fn restore_job_key(seq: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(PREFIX_RESTORE_JOB.len() + 8);
+    k.extend_from_slice(PREFIX_RESTORE_JOB);
+    k.extend_from_slice(&seq.to_be_bytes());
+    k
+}
+
 pub fn event_key(seq: u64) -> Vec<u8> {
     let mut k = Vec::with_capacity(PREFIX_EVENT.len() + 8);
     k.extend_from_slice(PREFIX_EVENT);
@@ -499,6 +514,17 @@ pub fn event_key(seq: u64) -> Vec<u8> {
 }
 
 /// 解析 `e:` 键中的 seq(队首游标/截断边界用)。
+/// 解析 `x:` 键中的 seq(队首游标用)。
+pub fn parse_restore_job_seq(raw: &[u8]) -> Result<u64> {
+    let body = raw
+        .strip_prefix(PREFIX_RESTORE_JOB)
+        .ok_or_else(|| Error::Corrupt("restore job key missing prefix".into()))?;
+    if body.len() != 8 {
+        return Err(Error::Corrupt("restore job key malformed".into()));
+    }
+    Ok(u64::from_be_bytes(body.try_into().unwrap()))
+}
+
 pub fn parse_event_seq(raw: &[u8]) -> Result<u64> {
     let body = raw
         .strip_prefix(PREFIX_EVENT)

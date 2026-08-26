@@ -1368,6 +1368,23 @@ impl S3Service {
         header(req, "x-amz-storage-class").map(|s| s.to_ascii_uppercase())
     }
 
+    /// M16 A2-3(ADR-19 DA2.5):`x-amz-restore` 响应头值(None = 无该头):
+    /// 进行中 = `ongoing-request="true"`;已完成 = `ongoing-request="false",
+    /// expiry-date="<RFC1123>"`。到期后回落无头(读路径已 403)。
+    fn restore_header_value(&self, meta: &fs3_core::ObjectMeta, now: i64) -> Option<String> {
+        let st = meta.restore_state.as_ref()?;
+        if st.restored_until == 0 {
+            return Some("ongoing-request=\"true\"".to_string());
+        }
+        if now >= st.restored_until {
+            return None;
+        }
+        Some(format!(
+            "ongoing-request=\"false\", expiry-date=\"{}\"",
+            xml::http_date(st.restored_until)
+        ))
+    }
+
     /// M16 A1(ADR-19 DA4):写路径存储类成对透传 —— (请求类, 真实类)。
     /// 真实类 = 请求类 ∈ 归档三值(GLACIER_IR/GLACIER/DEEP_ARCHIVE)时
     /// 升格,其余 None(= STANDARD);引擎按真实类裁决压缩档位并落
@@ -1672,6 +1689,12 @@ impl S3Service {
             } => Ok(self.op_list_inventory_configs(&bucket, continuation_token.as_deref())?),
             // —— M10 S4:POST 表单上传 ——
             Operation::PostObject { bucket } => self.op_post_object(req, &bucket),
+            // —— M16 A2-2:POST ?restore ——
+            Operation::RestoreObject {
+                bucket,
+                key,
+                version_id,
+            } => self.op_restore_object(req, &bucket, &key, version_id),
             Operation::ListObjectVersions {
                 bucket,
                 prefix,
@@ -4423,20 +4446,28 @@ impl S3Service {
         // 响应携带所读版本的 x-amz-version-id(版本化桶;Off 无头)
         let resp_version_id = version_id_response_header(bkt.versioning, &meta);
 
-        // M16 A2-1(ADR-19 DA1/DA2):未恢复的 GLACIER/DEEP_ARCHIVE 对象
-        // GET/HEAD → 403 InvalidObjectState(标准错误 XML + 响应头
-        // x-amz-storage-class 回显真实类;GLACIER_IR 在线可读不在此列;
-        // restore 进行中/有效 → 放行)。到期判定在请求路径(与 GC 时序
-        // 无关,DA2.4)。
-        if meta.archive_needs_restore() && !meta.restore_valid(engine.lock_now()) {
+        // M16 A2-1/A2-3(ADR-19 DA1/DA2):未恢复的 GLACIER/DEEP_ARCHIVE
+        // 对象读取门——403 InvalidObjectState(标准错误 XML + 响应头
+        // x-amz-storage-class 回显真实类;GLACIER_IR 在线可读不在此列)。
+        // 恢复**进行中**:HEAD 放行(元数据访问,回显 ongoing-request=
+        // "true");GET 仍 403(数据未就绪)且错误响应携带 ongoing 回显。
+        // 到期判定在请求路径(与 GC 时序无关,DA2.4)。
+        let now = engine.lock_now();
+        if meta.archive_needs_restore() && !meta.restore_valid(now) {
             let class = meta.storage_class_name().to_string();
-            return Err(
-                S3Error::new(S3ErrorCode::InvalidObjectState)
+            if head_only && meta.restore_ongoing() {
+                // 放行:继续下方响应构造,headers 回显 ongoing
+            } else {
+                let mut err = S3Error::new(S3ErrorCode::InvalidObjectState)
                     .with_resp_header("x-amz-storage-class", &class)
                     .with_message(format!(
                         "The operation is not valid for the object's storage class ({class});                          restore the object first (POST ?restore)"
-                    )),
-            );
+                    ));
+                if meta.restore_ongoing() {
+                    err = err.with_resp_header("x-amz-restore", "ongoing-request=\"true\"");
+                }
+                return Err(err);
+            }
         }
 
         // M11 E1-2/E1-3 + D-E5(SSE-C)/ K1-2(SSE-S3):按 SseInfo.kind 分派——
@@ -4545,6 +4576,10 @@ impl S3Service {
                     ),
                     ("Content-Length".into(), "0".into()),
                 ];
+                // M16 A2-3:x-amz-restore 回显(有 restore_state 才带)
+                if let Some(v) = self.restore_header_value(&meta, engine.lock_now()) {
+                    headers.push(("x-amz-restore".into(), v));
+                }
                 if let Some(v) = &resp_version_id {
                     headers.push(("x-amz-version-id".into(), v.clone()));
                 }
@@ -4655,6 +4690,10 @@ impl S3Service {
             "x-amz-storage-class".into(),
             meta.storage_class_name().into(),
         ));
+        // M16 A2-3(ADR-19 DA2.5):x-amz-restore 回显(无 restore_state → 无头)
+        if let Some(v) = self.restore_header_value(&meta, engine.lock_now()) {
+            headers.push(("x-amz-restore".into(), v));
+        }
         headers.push(("Content-Length".into(), content_length.to_string()));
         if let Some(v) = &resp_version_id {
             headers.push(("x-amz-version-id".into(), v.clone()));
@@ -4923,6 +4962,61 @@ impl S3Service {
     }
 
     /// GetObjectAcl(M1:对象私有默认 ACL,owner 全权)。
+    /// M16 A2-2(ADR-19 DA2):POST ?restore——XML 校验(Days 1..=365、
+    /// Tier 三档、DEEP_ARCHIVE 拒 Expedited)→ 引擎状态机(入队/幂等
+    /// 延长)→ 200 空响应(ongoing 回显由 GET/HEAD x-amz-restore 头
+    /// 承载)。SSE-C 归档对象恢复显式拒绝(引擎同判)。
+    fn op_restore_object(
+        &self,
+        req: &S3Request,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionIdArg>,
+    ) -> Result<ServiceResponse, S3Error> {
+        let (days, tier) = crate::xml::parse_restore_request(&req.body)
+            .map_err(|msg| S3Error::new(S3ErrorCode::MalformedXML).with_message(msg))?;
+        let mut engine = self.engine.write();
+        let bkt = engine
+            .meta()
+            .get_bucket(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?
+            .ok_or_else(|| {
+                S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket)
+            })?;
+        let meta = engine
+            .head_version_for(
+                bucket,
+                key,
+                version_id.as_ref().map(|v| v.vk()).as_ref(),
+                bkt.versioning,
+            )
+            .map_err(|e| map_engine_error(e, bucket, key))?;
+        // 存储类前置:仅归档类可 restore(AWS:STANDARD 对象 → 403
+        // InvalidObjectState);GLACIER_IR 可 restore(临时标准副本)
+        if !meta.is_archive() {
+            return Err(S3Error::new(S3ErrorCode::InvalidObjectState).with_message(
+                "Restore is only valid for archive storage classes (GLACIER_IR/GLACIER/DEEP_ARCHIVE)",
+            ));
+        }
+        if meta.storage_class_name() == "DEEP_ARCHIVE" && tier == "Expedited" {
+            return Err(S3Error::new(S3ErrorCode::InvalidArgument).with_message(
+                "Expedited retrieval is not supported for DEEP_ARCHIVE objects; use Standard or Bulk",
+            ));
+        }
+        let vk = version_id.map(|v| v.vk());
+        engine
+            .restore_enqueue(bucket, key, vk.as_ref(), days, &tier)
+            .map_err(|e| map_engine_error(e, bucket, key))?;
+        Ok(ServiceResponse {
+            status: 200,
+            headers: vec![
+                ("Content-Type".into(), "application/xml".into()),
+                ("Content-Length".into(), "0".into()),
+            ],
+            body: ResponseBody::Empty,
+        })
+    }
+
     fn op_get_object_acl(&self, bucket: &str, key: &str) -> Result<ServiceResponse, S3Error> {
         let engine = self.engine.read();
         if engine

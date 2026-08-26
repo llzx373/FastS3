@@ -825,6 +825,32 @@ fn cmd_serve(
     };
     let inventory_stats = inventory_worker.as_ref().map(|(_, _, s)| s.clone());
 
+    // M16 A2(ADR-19 DA2.3):归档恢复 worker(默认启用;关 = 作业堆积,
+    // 恢复请求仍入队;只读引擎不启动——物化需写设备)。stats Arc 注入
+    // admin /metrics 渲染 fasts3_restore_* 指标(A3-3)。
+    let restore_worker = if !engine_cfg.read_only && cfg.storage.restore_enabled.unwrap_or(true) {
+        let rpoll = Duration::from_secs_f64(cfg.storage.restore_poll_secs.unwrap_or(1.0).max(0.1));
+        let gc_every = ((cfg.storage.restore_gc_secs.unwrap_or(3600).max(1) as f64
+            / rpoll.as_secs_f64().max(0.1))
+        .round()
+        .max(1.0)) as u64;
+        let (meta, throttle) = {
+            let e = engine.read();
+            (e.meta_arc(), e.throttle())
+        };
+        let worker = fs3_engine::restore::RestoreWorker::new(
+            SharedEngine(engine.clone()),
+            meta,
+            rpoll,
+            fs3_engine::restore::DEFAULT_BATCH,
+            gc_every,
+        );
+        Some((worker, throttle, rpoll))
+    } else {
+        None
+    };
+    let restore_stats = restore_worker.as_ref().map(|(w, _, _)| w.stats());
+
     // M6 / K4:优雅停机标志(SIGTERM/SIGINT → 排空 → 引擎收尾)。
     // 提前创建供 admin/agent 等后台模块注入(agent 循环每周期观测)。
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -867,7 +893,8 @@ fn cmd_serve(
             .with_reload(reload)
             .with_lifecycle_stats(lifecycle_stats)
             .with_notification_stats(notification_stats.clone())
-            .with_inventory_stats(inventory_stats.clone());
+            .with_inventory_stats(inventory_stats.clone())
+            .with_restore_stats(restore_stats.clone());
         // M6 / J5:设置页供应器(admin GET/PATCH /v1/admin/config)
         let provider = Arc::new(settings::SettingsProvider::new(
             config_path.clone(),
@@ -950,6 +977,12 @@ fn cmd_serve(
             throttle,
             Duration::from_secs(1),
         )
+    });
+
+    // M16 A2:归档恢复 worker 启动(独立线程 + 全局共享令牌桶;作业轮询
+    // 周期 = restore_poll_secs;过期 GC 由 worker 内部周期触发)
+    let mut restore_worker = restore_worker.map(|(worker, throttle, poll)| {
+        fs3_engine::worker::WorkerHandle::spawn("fs3-restore", worker, throttle, poll)
     });
 
     let addr: std::net::SocketAddr = listen
@@ -1088,6 +1121,9 @@ fn cmd_serve(
         h.stop();
     }
     if let Some(mut h) = inventory_worker.take() {
+        h.stop();
+    }
+    if let Some(mut h) = restore_worker.take() {
         h.stop();
     }
     tracing::info!("http workers drained; finalizing engine (checkpoint + meta close)");

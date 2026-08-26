@@ -152,6 +152,13 @@ pub enum Operation {
     PostObject {
         bucket: String,
     },
+    /// POST ?restore(M16 A2;ADR-19 DA2):归档对象恢复(后台解压临时标准
+    /// 副本);?versionId 按版本寻址。
+    RestoreObject {
+        bucket: String,
+        key: String,
+        version_id: Option<VersionIdArg>,
+    },
     /// GET ?acl(对象级;M1 返回私有默认 ACL)。
     GetObjectAcl {
         bucket: String,
@@ -935,6 +942,12 @@ impl Router {
                 version_id: parse_version_id_param(get_q("versionId").as_deref())?,
             }),
             "DELETE" => Ok(Operation::DeleteObject {
+                bucket,
+                key,
+                version_id: parse_version_id_param(get_q("versionId").as_deref())?,
+            }),
+            // M16 A2-2(ADR-19 DA2):POST ?restore(对象级;?versionId 合法)
+            "POST" if has_q("restore") => Ok(Operation::RestoreObject {
                 bucket,
                 key,
                 version_id: parse_version_id_param(get_q("versionId").as_deref())?,
