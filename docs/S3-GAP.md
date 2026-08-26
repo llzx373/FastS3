@@ -295,4 +295,17 @@
 
 ---
 
+## 9. 已知问题与规避(2026-08-27 登记)
+
+1. **mc mirror 高并发触发引擎死锁(并发 PUT/List 混载竞态)**:M16 R1-5
+   演练实测——mc mirror 默认 `--max-workers autodetect`(多并发)对 FastS3
+   复制时,复制阶段后偶发整节点 S3 端口挂死(全线程 futex 等待,含
+   fs3-http worker;匿名探测也超时),崩溃门禁(500 轮)未覆盖此路径
+   (门禁用 aws-cli/python 客户端,非 mc 高并发)。规避:同步执行器
+   mc 侧固定 `--max-workers 1`、rclone 侧 `--transfers 1`(串行节流档,
+   ADR-20 DR3 已落盘);修复 = 引擎并发锁序调查(io_uring 完成回调 ×
+   meta 锁),待专项立项。
+
+---
+
 *附:主要来源。AWS S3 用户指南([checksum](https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html)、[条件写入](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)、[Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html)、[事件通知](https://docs.aws.amazon.com/AmazonS3/latest/userguide/EventNotifications.html)、[复制](https://docs.aws.amazon.com/AmazonS3/latest/userguide/replication.html)、[目录桶](https://docs.aws.amazon.com/AmazonS3/latest/userguide/directory-buckets-overview.html)、[S3 Express 设计模式](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-express-optimizing-performance-design-patterns.html));[MinIO 站点复制](https://min.io/docs/minio/linux/operations/replication.html)与订阅公告;[Ceph RGW 文档](https://docs.ceph.com/en/latest/radosgw/)与[多站点系列](https://www.ceph.io/en/news/blog/2025/rgw-multisite-replication_part1/);[Hadoop S3A Committers](https://hadoop.apache.org/docs/stable/hadoop-aws/tools/hadoop-aws/committers.html);本仓库 [s3-protocol-inventory.md](./s3-protocol-inventory.md) 与 `tests/s3-tests/README.md`。*

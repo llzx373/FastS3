@@ -1259,10 +1259,14 @@ s3-tests 出排除集且 100%(transition/restore/storage-class);崩溃 ≥500
 
 **DR3(执行器选择:mc mirror / rclone copy,节点本地 spawn)**:
 
-1. **执行器**:mode=mirror → `mc mirror --overwrite --insecure
-   <src> <dst>`(含删除传播);mode=incremental → `rclone copy
-   <src> <dst>`(只增不删)。二进制由部署方预装,节点 `PATH`
-   可见;缺失/非零退出 → rejected + last_error 落账 + 控制台可见。
+1. **执行器**:mode=mirror → `mc mirror --overwrite`(含删除传播);
+   mode=incremental → `rclone copy`(只增不删)。二进制由部署方预装,
+   节点 `PATH` 可见;缺失/非零退出 → rejected + last_error 落账 +
+   控制台可见。**串行节流档**:mc 固定 `--max-workers 1`、rclone 固定
+   `--transfers 1`(单对象顺序复制)——mc 默认高并发对 FastS3 的
+   并发 PUT/List 混载曾触发引擎级死锁(已登记 S3-GAP §9,引擎并发
+   修复后放开);快速失败:mc `--retry` 不可控内部重试,失败以 JSON
+   error 行判定(exit code 不可靠),rclone `--retries 1`。
 2. **编排入口**:agent 收到 sync.run → 经本地 admin 编排(复用
    apply.rs 现有 plan/apply 框架,新增 SyncRun 动作),子进程
    运行、节流(单任务串行、全局并发上限可配)、超时后 kill 并

@@ -9,7 +9,9 @@
 //!   覆盖(测试注入桩;生产不建议)。
 //! - 每次执行使用独立临时配置目录(MC_CONFIG_DIR / RCLONE_CONFIG),互不
 //!   污染;凭据经命令行传递(管理面配置,ADR-20 DR1-3 文档化)。
-//! - 超时 kill(大镜像长时间无产出);transferred 为执行器 JSON 输出解析的
+//! - 快速失败:mc 带 `--retry 0`、rclone 带 `--retries 1`(目标不可达立即
+//!   失败上报,不长时间占用 agent 执行槽;调度器按计划重跑 = 至少一次);
+//!   整体仍有 1800s 超时 kill。transferred 为执行器 JSON 输出解析的
 //!   近似对象数(对账展示用,非精确计量)。
 
 use std::env;
@@ -69,7 +71,10 @@ pub async fn run_sync(spec: &SyncRunSpec) -> SyncOutcome {
     }
 }
 
-/// mc mirror:配置临时 alias → mirror --overwrite --json(含删除传播)。
+/// mc mirror:手写 MC_CONFIG_DIR/config.json(免 alias set 端点探测——
+/// mc alias set 会带 20s+ 内部重试,死目标拖死执行槽)→
+/// mirror --overwrite --json(含删除传播)。mc 对远端故障 exit code
+/// 恒 0(内部重试后打印 error JSON 行),故以 JSON error 行判定失败。
 async fn run_mc_mirror(spec: &SyncRunSpec) -> SyncOutcome {
     let bin = env::var("FS3_SYNC_MC_BIN").unwrap_or_else(|_| "mc".into());
     if !binary_available(&bin).await {
@@ -82,74 +87,44 @@ async fn run_mc_mirror(spec: &SyncRunSpec) -> SyncOutcome {
         };
     }
     let cfg_dir = temp_dir(format!("fs3-mc-{}", spec.task_id));
-    let cfg_ok = std::fs::create_dir_all(&cfg_dir).is_ok();
-    if !cfg_ok {
+    if let Err(e) = std::fs::create_dir_all(&cfg_dir) {
         return SyncOutcome {
             ok: false,
             transferred: 0,
-            error: Some(format!("cannot create MC_CONFIG_DIR {}", cfg_dir.display())),
+            error: Some(format!(
+                "cannot create MC_CONFIG_DIR {}: {e}",
+                cfg_dir.display()
+            )),
         };
     }
-    // alias 建好后 mirror;--insecure 允许 http/自签(内网纳管常态)
-    let alias_src = Command::new(&bin)
-        .arg("alias")
-        .arg("set")
-        .arg("FS3SRC")
-        .arg(&spec.source_endpoint)
-        .arg(&spec.source_key)
-        .arg(&spec.source_secret)
-        .arg("--insecure")
-        .env("MC_CONFIG_DIR", &cfg_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-    match alias_src {
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&cfg_dir);
-            return SyncOutcome {
-                ok: false,
-                transferred: 0,
-                error: Some(format!("mc alias set (src) failed: {e}")),
-            };
-        }
-        Ok(st) if !st.success() => {
-            let _ = std::fs::remove_dir_all(&cfg_dir);
-            return SyncOutcome {
-                ok: false,
-                transferred: 0,
-                error: Some(format!(
-                    "mc alias set (src) exit {}",
-                    st.code().unwrap_or(-1)
-                )),
-            };
-        }
-        Ok(_) => {}
-    }
-    let alias_dst = Command::new(&bin)
-        .arg("alias")
-        .arg("set")
-        .arg("FS3DST")
-        .arg(&spec.dest_endpoint)
-        .arg(&spec.dest_key)
-        .arg(&spec.dest_secret)
-        .arg("--insecure")
-        .env("MC_CONFIG_DIR", &cfg_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-    if let Err(e) = alias_dst {
+    let esc = |x: &str| x.replace('\\', "\\\\").replace('"', "\\\"");
+    let cfg_json = format!(
+        r#"{{"version":"10","aliases":{{"FS3SRC":{{"url":"{src_ep}","accessKey":"{src_k}","secretKey":"{src_s}","api":"S3v4","path":"auto"}},"FS3DST":{{"url":"{dst_ep}","accessKey":"{dst_k}","secretKey":"{dst_s}","api":"S3v4","path":"auto"}}}}}}"#,
+        src_ep = esc(&spec.source_endpoint),
+        src_k = esc(&spec.source_key),
+        src_s = esc(&spec.source_secret),
+        dst_ep = esc(&spec.dest_endpoint),
+        dst_k = esc(&spec.dest_key),
+        dst_s = esc(&spec.dest_secret),
+    );
+    if let Err(e) = std::fs::write(cfg_dir.join("config.json"), cfg_json) {
         let _ = std::fs::remove_dir_all(&cfg_dir);
         return SyncOutcome {
             ok: false,
             transferred: 0,
-            error: Some(format!("mc alias set (dst) failed: {e}")),
+            error: Some(format!("cannot write mc config.json: {e}")),
         };
     }
     let child = Command::new(&bin)
         .arg("mirror")
         .arg("--overwrite")
+        // --remove:删除目标端多余对象(删除传播,mirror 语义核心;
+        // 不带 --remove 时 mc mirror 不删任何目标对象)
+        .arg("--remove")
+        // 串行节流档(--max-workers 1):并发 PUT/List 曾触发 fasts3d 引擎级
+        // 死锁(mc 默认 autodetect 高并发;已知问题见 S3-GAP,修复后放开)
+        .arg("--max-workers")
+        .arg("1")
         .arg("--json")
         .arg(format!("FS3SRC/{bucket}", bucket = spec.source_bucket))
         .arg(format!("FS3DST/{bucket}", bucket = spec.dest_bucket))
@@ -168,7 +143,9 @@ async fn run_mc_mirror(spec: &SyncRunSpec) -> SyncOutcome {
             };
         }
     };
-    let res = wait_json(&mut child, &bin, "mirror").await;
+    // mc:每对象一行 {"status":"success","source":...};失败/重试行
+    // {"status":"error","error":{"message":...}}
+    let res = wait_mc_json(&mut child, &bin).await;
     let _ = std::fs::remove_dir_all(&cfg_dir);
     res
 }
@@ -265,8 +242,12 @@ async fn run_rclone_copy(spec: &SyncRunSpec) -> SyncOutcome {
     }
     let child = Command::new(&bin)
         .arg("copy")
-        .arg("--json")
+        .arg("--retries")
+        .arg("1")
+        .arg("--transfers")
+        .arg("1")
         .arg("--fast-list")
+        // rclone copy 无 --json;transferred 从 stderr stats 行解析(wait_json)
         .arg(format!("FS3SRC:{bucket}", bucket = spec.source_bucket))
         .arg(format!("FS3DST:{bucket}", bucket = spec.dest_bucket))
         .env("RCLONE_CONFIG", &cfg_file)
@@ -284,9 +265,48 @@ async fn run_rclone_copy(spec: &SyncRunSpec) -> SyncOutcome {
             };
         }
     };
+    // rclone 非 TTY 不输出 stats(实测 v1.75 空输出);transferred 用
+    // 目标桶 lsjson 前后计数差值(近似;并发写目标会高估,文档化)
+    let before = rclone_count(&bin, &cfg_file, "FS3DST", &spec.dest_bucket).await;
     let res = wait_json(&mut child, &bin, "copy").await;
+    let after = rclone_count(&bin, &cfg_file, "FS3DST", &spec.dest_bucket).await;
     let _ = std::fs::remove_file(&cfg_file);
-    res
+    let mut out = res;
+    if out.ok {
+        if let (Some(b), Some(a)) = (before, after) {
+            out.transferred = a.saturating_sub(b);
+        }
+    }
+    out
+}
+
+/// rclone lsjson --files-only 对象计数(输出为 JSON 数组,逐行含
+/// "IsDir":false;桶不存在/失败 → None)。
+async fn rclone_count(
+    bin: &str,
+    cfg_file: &std::path::Path,
+    remote: &str,
+    bucket: &str,
+) -> Option<u64> {
+    let out = Command::new(bin)
+        .arg("lsjson")
+        .arg("--files-only")
+        .arg(format!("{remote}:{bucket}"))
+        .env("RCLONE_CONFIG", cfg_file)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    Some(
+        text.lines()
+            .filter(|l| l.contains("\"IsDir\":false"))
+            .count() as u64,
+    )
 }
 
 async fn binary_available(bin: &str) -> bool {
@@ -316,12 +336,10 @@ async fn wait_json(child: &mut Child, bin: &str, action: &str) -> SyncOutcome {
                     continue;
                 }
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                    // mc:{"status":"success",...};rclone:{"size":N,...}(按文件行)
-                    let status = v.get("status").and_then(|x| x.as_str()).unwrap_or("");
-                    if status == "success"
-                        || v.get("size")
-                            .map(|s| s.as_u64().unwrap_or(0) > 0)
-                            .unwrap_or(false)
+                    // rclone:按文件行 {"name":..,"size":N>0} 计数
+                    if v.get("size")
+                        .map(|s| s.as_u64().unwrap_or(0) > 0)
+                        .unwrap_or(false)
                     {
                         n += 1;
                     }
@@ -347,11 +365,29 @@ async fn wait_json(child: &mut Child, bin: &str, action: &str) -> SyncOutcome {
     }
     if let Some(err) = stderr {
         let mut lines = BufReader::new(err).lines();
+        let mut from_stats: Option<u64> = None;
         while let Ok(Some(line)) = lines.next_line().await {
+            // rclone stats 行:"Transferred: 2 / 2, 100%, ..."(千分位逗号)
+            if from_stats.is_none() {
+                if let Some(rest) = line.trim().strip_prefix("Transferred:") {
+                    let digits: String = rest
+                        .trim()
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit() || *c == ',')
+                        .filter(|c| *c != ',')
+                        .collect();
+                    if !digits.is_empty() {
+                        from_stats = digits.parse::<u64>().ok();
+                    }
+                }
+            }
             if tail.len() >= 5 {
                 tail.remove(0);
             }
             tail.push(line);
+        }
+        if let Some(n) = from_stats {
+            transferred = n;
         }
     }
     let status = match timeout(SYNC_TIMEOUT, child.wait()).await {
@@ -396,6 +432,109 @@ async fn wait_json(child: &mut Child, bin: &str, action: &str) -> SyncOutcome {
     }
 }
 
+/// mc 专用:--json 输出中 status=="error" 行 = 远端故障(mc 对网络错误
+/// exit code 恒 0,必须以 JSON 判定);计数按逐对象行(source 字段)。
+async fn wait_mc_json(child: &mut Child, bin: &str) -> SyncOutcome {
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let mut transferred: u64 = 0;
+    let mut first_err: Option<String> = None;
+    let mut tail = Vec::new();
+    if let Some(out) = stdout {
+        let mut lines = BufReader::new(out).lines();
+        let res = timeout(SYNC_TIMEOUT, async {
+            let mut n: u64 = 0;
+            let mut err: Option<String> = None;
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if v.get("status").and_then(|x| x.as_str()) == Some("error") {
+                        let msg = v
+                            .get("error")
+                            .and_then(|e| e.get("message"))
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("mc error");
+                        if err.is_none() {
+                            err = Some(msg.to_string());
+                        }
+                        continue;
+                    }
+                    if v.get("source").is_some()
+                        && v.get("status").and_then(|x| x.as_str()) == Some("success")
+                    {
+                        n += 1;
+                    }
+                }
+            }
+            (n, err)
+        })
+        .await;
+        match res {
+            Ok((n, err)) => {
+                transferred = n;
+                first_err = err;
+            }
+            Err(_) => {
+                let _ = child.kill().await;
+                return SyncOutcome {
+                    ok: false,
+                    transferred: 0,
+                    error: Some(format!(
+                        "{bin} mirror timed out (>{}s) and was killed",
+                        SYNC_TIMEOUT.as_secs()
+                    )),
+                };
+            }
+        }
+    }
+    if let Some(err) = stderr {
+        let mut lines = BufReader::new(err).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if tail.len() >= 5 {
+                tail.remove(0);
+            }
+            tail.push(line);
+        }
+    }
+    let status = match timeout(SYNC_TIMEOUT, child.wait()).await {
+        Ok(Ok(st)) => st,
+        Ok(Err(e)) => {
+            return SyncOutcome {
+                ok: false,
+                transferred: 0,
+                error: Some(format!("{bin} mirror wait failed: {e}")),
+            };
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            return SyncOutcome {
+                ok: false,
+                transferred: 0,
+                error: Some(format!(
+                    "{bin} mirror timed out (>{}s) and was killed",
+                    SYNC_TIMEOUT.as_secs()
+                )),
+            };
+        }
+    };
+    let _ = status; // mc exit code 不可靠(网络错误也 exit 0);以 JSON 判定
+    if let Some(e) = first_err {
+        SyncOutcome {
+            ok: false,
+            transferred: 0,
+            error: Some(format!("{bin} mirror failed: {e}")),
+        }
+    } else {
+        SyncOutcome {
+            ok: true,
+            transferred,
+            error: None,
+        }
+    }
+}
+
 fn temp_dir(tag: String) -> std::path::PathBuf {
     let mut d = env::temp_dir();
     d.push(format!("{tag}-{pid}", pid = std::process::id()));
@@ -427,15 +566,20 @@ mod tests {
 
     fn stub_script(tag: &str, body: &str, exit: i32) -> std::path::PathBuf {
         // 桩:--version/alias/config(配置子命令)恒成功;mirror/copy 输出 body
-        // 到 stdout、一段话到 stderr,按 exit 退出。每测试独立文件(防并行竞争)。
+        // 到 stdout、一段话到 stderr,按 exit 退出;lsjson 状态化(首次空、
+        // 其后两个 IsDir:false 对象,rclone transferred 前后计数差值=2)。
+        // 每测试独立文件 + 独立计数器(防并行竞争)。
         let p = std::env::temp_dir().join(format!(
             "fs3-sync-stub-{tag}-{pid}-{exit}.sh",
             pid = std::process::id()
         ));
+        let cnt = std::env::temp_dir().join(format!("fs3-sync-rc-count-{tag}"));
+        let _ = std::fs::remove_file(&cnt);
+        let cnt = cnt.display().to_string();
         std::fs::write(
             &p,
             format!(
-                "#!/bin/sh\ncase \"$1\" in --version|alias|config) exit 0;; esac\ncat <<'EOF'\n{body}\nEOF\necho 'stub stderr {exit}' >&2\nexit {exit}\n"
+                "#!/bin/sh\ncase \"$1\" in --retry) shift 2;; esac\ncase \"$1\" in\n  --version|alias|config) exit 0;;\n  lsjson)\n    C=$(cat \"{cnt}\" 2>/dev/null || echo 0)\n    echo $((C+1)) > \"{cnt}\"\n    if [ \"$C\" = \"0\" ]; then echo '[]'; else echo '[{{\"Path\":\"a\",\"IsDir\":false}},'; echo '{{\"Path\":\"b\",\"IsDir\":false}}]'; fi\n    exit 0;;\nesac\ncat <<'EOF'\n{body}\nEOF\ncat <<'EOF' >&2\n{body}\nEOF\necho 'stub stderr {exit}' >&2\nexit {exit}\n"
             ),
         )
         .unwrap();
@@ -466,7 +610,7 @@ mod tests {
     async fn rclone_incremental_success_counts_size_lines() {
         let stub = stub_script(
             "rc-ok",
-            "{\"name\":\"a\",\"size\":42}\n{\"name\":\"b\",\"size\":7}\n{\"bytes\":100}\n",
+            "Transferred: 2 / 2, 100%\n{\"name\":\"a\",\"size\":42}\n",
             0,
         );
         let _g = ENV_LOCK.lock().await;
@@ -496,7 +640,12 @@ mod tests {
 
     #[tokio::test]
     async fn failure_carries_stderr_tail() {
-        let stub = stub_script("mc-fail", "", 1);
+        // mc 网络失败 = exit 0 + JSON error 行(必须以 JSON 判定失败)
+        let stub = stub_script(
+            "mc-fail",
+            "{\"status\":\"error\",\"error\":{\"message\":\"stub stderr 1\"}}\n",
+            0,
+        );
         let _g = ENV_LOCK.lock().await;
         env::set_var("FS3_SYNC_MC_BIN", &stub);
         let out = run_sync(&spec()).await;
