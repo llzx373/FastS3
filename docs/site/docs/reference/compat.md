@@ -12,14 +12,30 @@
 | mc(MinIO Client) | ★★★ | mirror 同步、mb/cp/cat/ls/rm | 同上 |
 | rclone | ★★★ | 分片上传、check 对账、迁移 | 同上 + `tests/m7/migrate-drill.sh` |
 | s3cmd | ★★ | SigV2 场景可选开启(SigV2 未实现,默认等价关闭) | — |
-| Hadoop S3A / Spark | ★★ | 依赖 multipart + 列表一致性 | 规划 |
+| Hadoop S3A / Spark | ★★ | 依赖 multipart + 列表一致性(条件写 v1.1 已解锁) | 规划(v2.1 D3 环境补齐后实测) |
 | 浏览器 SDK(aws-sdk-js) | ★★★ | 控制台直传路径(预签名直连) | 控制台实测 |
 | Cyberduck / Mountain Duck | ★★ | 桌面客户端 | 规划 |
-| DVC / restic / duplicati | ★★ | 备份场景回归 | 规划 |
+| DVC | ★★ | ML 数据版本管理场景 | 规划 |
+| restic / duplicati | ★★ | 备份往返实测(0.19.1 / 2.3.0.4:backup/restore/check) | M10/M11 门禁记录 |
+| Veeam / Commvault | ★★ | 企业备份平台 + Object Lock 不可变仓库形态 | 规划(v2.1 D3;Veeam 优先) |
 
-**明确不支持(标准报错而非静默)**:S3 Select、Object Lock、版本控制
-(标准"未启用"语义)、SSE-KMS。s3-tests 排除集方法论见
-`tests/s3-tests/README.md`。
+**停售特性(不列入开发管线,显式报错而非静默;依据 NEXT-ROUND.md §3.2)**:
+S3 Select / Glacier Select(AWS 2024-07-25 起不对新客户提供)、
+S3 Object Lambda(AWS 2025-11-07 起仅存量客户 + APN)、Torrent(AWS 已移除)、
+ACL 全矩阵(2023-04 起新桶默认禁用 ACL;维持 GetObjectAcl 私有桩 +
+Put*Acl 显式 501)。
+**定位性不做(AWS 仍在提供)**:Website / Logging / RequesterPays、Transfer
+Acceleration、Access Points、Directory Buckets / S3 Express、SigV2、
+SSE-KMS / DSSE(无 KMS 托管,参数显式拒绝)。
+s3-tests 排除集方法论见 `tests/s3-tests/README.md`。
+
+## 存储类
+
+当前仅接受 `x-amz-storage-class: STANDARD`,其它值 → 400 InvalidStorageClass
+(显式报错,不静默)。v2.1(M15)起接受 STANDARD_IA / ONEZONE_IA /
+REDUCED_REDUNDANCY / INTELLIGENT_TIERING / GLACIER / GLACIER_IR /
+DEEP_ARCHIVE 并**显式映射到 STANDARD**(元数据记录请求类、响应回显实际类、
+admin 可见);归档真语义(Transition/RestoreObject)规划于 v2.2(M16)。
 
 ## OS / 打包形态
 

@@ -21,58 +21,59 @@
 
 ## 1. 全景总表
 
-> 状态图例:✅ 完整 · 🟡 部分 · ⛔ 缺失 · 🔜 已排期(标注版本)· ❌ 明确不做
+> 状态图例:✅ 完整 · 🟡 部分 · ⛔ 缺失 · 🔜 已排期(标注版本)· ❌ 明确不做 · 🚫 停售排除(不列入管线)
 > 优先级:P0 = 缺失即被采购否决;P1 = 缺失即某类工作流失败;P2 = 增强。
+> 更新(2026-08-26):对照 v2.0.0 交付状态与 v2.1/v2.2 排期(NEXT-ROUND.md §3/§5)。
 
 | 域 | 特性 | 现状 | 优先级 | 路线归属 |
 | --- | --- | --- | --- | --- |
 | 对象 API | PUT/GET/HEAD/DELETE、Range 单段、条件 GET、x-amz-meta-*、Content-MD5/SHA256 | ✅ | P0 | — |
 | 对象 API | Multipart 全流程(init/part/complete/abort/list/幂等) | ✅ | P0 | — |
-| 对象 API | CopyObject COW / UploadPartCopy / 条件复制 | ✅ | P0 | — |
-| 对象 API | DeleteObjects(Quiet/Verbose) | 🟡 无 1000 键上限 | P1 | v1.0.x |
-| 对象 API | **条件写入 PUT(If-Match / If-None-Match: \*)** | ⛔ | P0 | 🔜 v1.1 |
-| 对象 API | **checksum 家族(CRC32/32C/SHA1/256/CRC64NVME + trailer)** | ⛔(服务端 CRC32C 已有,协议面缺) | P0 | 🔜 v1.2 |
-| 对象 API | **GetObjectAttributes** | ⛔ | P1 | 🔜 v1.2 |
-| 对象 API | 多段 Range(206 multipart/byteranges) | 🟡 静默回整对象 | P1 | v1.0.x |
-| 对象 API | multipart 复合 ETag 精确对齐(二进制拼接) | 🟡 现为 hex 拼接 MD5,与 AWS 不一致 | P1 | v1.0.x |
+| 对象 API | CopyObject COW / UploadPartCopy / 条件复制 | 🟡 UploadPartCopy 源 ?versionId 未实现(唯一残留 501 红线) | P0 | 🔜 v2.1(M15 C2) |
+| 对象 API | DeleteObjects(Quiet/Verbose) | ✅(1000 键上限 v1.0.1) | P1 | — |
+| 对象 API | **条件写入 PUT(If-Match / If-None-Match: \*)** | ✅ v1.1 | P0 | — |
+| 对象 API | **checksum 家族(CRC32/32C/SHA1/256/CRC64NVME + trailer)** | ✅ v1.2 | P0 | — |
+| 对象 API | **GetObjectAttributes** | ✅ v1.2 | P1 | — |
+| 对象 API | 多段 Range(206 multipart/byteranges) | ✅ v1.0.1 | P1 | — |
+| 对象 API | multipart 复合 ETag 精确对齐(二进制拼接) | ✅ v1.0.1 | P1 | — |
 | 对象 API | GET ?partNumber / HEAD ?partNumber | ✅ | — | — |
-| 对象 API | POST 对象表单上传(browser-based POST policy) | ⛔ | P1 | 建议增补(v1.2~v1.3) |
-| 对象 API | S3 Select | ⛔ | P2 | v2.x 有条件做 |
-| 对象 API | RestoreObject / 存储类分层 / 归档 | ⛔ | P1 | v2.x 评估 |
-| 对象 API | 对象标签(x-amz-tagging / ?tagging) | ⛔(头静默忽略) | P1 | **建议增补(v1.2,生命周期/复制过滤依赖)** |
-| 对象 API | x-amz-storage-class | ⛔(静默忽略,恒 STANDARD) | P2 | v1.0.x 显式化 |
+| 对象 API | POST 对象表单上传(browser-based POST policy) | ✅ v1.1 | P1 | — |
+| 对象 API | S3 Select | 🚫 AWS 2024-07-25 起不对新客户提供(Glacier Select 同) | —(原 P2) | 不做(停售排除,NEXT-ROUND §3.2) |
+| 对象 API | RestoreObject / 存储类分层 / 归档 | ⛔ | P1 | 🔜 v2.2(M16) |
+| 对象 API | 对象标签(x-amz-tagging / ?tagging) | ✅ v1.1 | P1 | — |
+| 对象 API | x-amz-storage-class | 🟡 仅 STANDARD;其余 400 InvalidStorageClass(显式) | P1 | 🔜 v2.1 接受矩阵(M15 C1) |
 | 桶配置 | 桶 CRUD / Location / ListBuckets 分页 | ✅ | P0 | — |
-| 桶配置 | ListObjectsV1/V2(游标/delimiter/StartAfter) | ✅(fetch-owner/encoding-type 缺) | P0 | v1.0.x 补 encoding-type |
-| 桶配置 | **版本控制(真实多版本)** | 🟡 仅"未启用"语义 | P0 | 🔜 v1.1 |
-| 桶配置 | **Object Lock / WORM** | ⛔ | P0 | 🔜 v1.3 |
-| 桶配置 | **桶默认加密 + SSE-S3/SSE-C** | ⛔(SSE 头静默忽略) | P0 | 🔜 v1.2 |
-| 桶配置 | **桶策略(IAM 语法 + 条件键)** | ⛔(仅密钥级策略子集) | P0 | **建议增补(v1.2,复用密钥策略引擎)** |
-| 桶配置 | ACL 全家(桶/对象 ACL、canned、grant 头) | 🟡 仅 GetObjectAcl 私有桩 | P2 | 远期(建议维持最小实现) |
-| 桶配置 | **CORS(含预检)** | ⛔ | P1 | **建议增补(v1.2,浏览器直传刚需)** |
-| 桶配置 | Lifecycle(过期/非当前版本/MPU 中止) | ⛔ | P1 | 🔜 v1.2 |
-| 桶配置 | Replication(CRR/SRR) | ⛔ | P1(容灾场景) | 策略:底层 HA + 迁移工具;v2.x 评估 |
-| 桶配置 | Notification(EventBridge/SQS/SNS/Webhook) | ⛔ | P1 | v2.x 倾向做(Webhook 起步) |
-| 桶配置 | Website 静态托管 | ⛔ | P2 | 远期(建议不做,nginx 可替代) |
-| 桶配置 | Logging / Metrics / Analytics / Inventory | ⛔ | P2 | Inventory 低成本可评估 |
-| 桶配置 | Accelerate / RequestPayment / OwnershipControls / PublicAccessBlock | ⛔ | P2/P1(多租户 BPA) | 远期;PublicAccessBlock 随桶策略评估 |
+| 桶配置 | ListObjectsV1/V2(游标/delimiter/StartAfter) | ✅(fetch-owner/encoding-type v1.0.1) | P0 | — |
+| 桶配置 | **版本控制(真实多版本)** | ✅ v1.1 | P0 | — |
+| 桶配置 | **Object Lock / WORM** | ✅ v1.3 | P0 | — |
+| 桶配置 | **桶默认加密 + SSE-S3/SSE-C** | ✅ v1.2(SSE-KMS 显式拒绝) | P0 | — |
+| 桶配置 | **桶策略(IAM 语法 + 条件键)** | ✅ v1.1(桶级 + 最小 Condition 键集) | P0 | — |
+| 桶配置 | ACL 全家(桶/对象 ACL、canned、grant 头) | 🚫 最小桩 + 显式 501;AWS 2023-04 起新桶默认禁用 ACL(BucketOwnerEnforced) | P2 | 不做(方向性排除) |
+| 桶配置 | **CORS(含预检)** | ✅ v1.1 | P1 | — |
+| 桶配置 | Lifecycle(过期/非当前版本/MPU 中止) | ✅ v1.2;Transition 显式不支持 | P1 | Transition → 🔜 v2.2(M16) |
+| 桶配置 | Replication(CRR/SRR) | ⛔ 内置不做 | P1(容灾场景) | 策略化:v2.2 候选(中心调度同步) |
+| 桶配置 | Notification(EventBridge/SQS/SNS/Webhook) | ⛔ | P1 | 🔜 v2.1(M15 N) |
+| 桶配置 | Website 静态托管 | ⛔ | P2 | 不做(nginx 可替代) |
+| 桶配置 | Logging / Metrics / Analytics / Inventory | 🟡 审计持久化 ✅ v1.2;Inventory ⛔;Logging/Analytics 不做 | P2 | Inventory 🔜 v2.1(M15 I) |
+| 桶配置 | Accelerate / RequestPayment / OwnershipControls / PublicAccessBlock | 🟡 OwnershipControls 配置族 ✅ v1.1;Accelerate/RequestPayment 不做;PublicAccessBlock 远期 | P2/P1(多租户 BPA) | 远期(BPA 随桶策略评估) |
 | 认证安全 | SigV4 header + query 预签名 + aws-chunked | ✅ | P0 | — |
 | 认证安全 | SigV2 | ⛔ | P2 | 明确不做(默认关闭等价) |
-| 认证安全 | POST 表单签名 | ⛔ | P1 | 随 POST 表单增补 |
-| 认证安全 | STS 临时凭证 / Session Policy | ⛔ | P1(多租户) | v2.x(管理面集成) |
-| 认证安全 | LDAP / OpenID / IAM 联邦 | ⛔ | P1(企业 AD 集成) | v2.x 评估 |
+| 认证安全 | POST 表单签名 | ✅ v1.1 | P1 | — |
+| 认证安全 | STS 临时凭证 / Session Policy | ⛔ | P1(多租户) | 🔜 v2.1(M15 T) |
+| 认证安全 | LDAP / OpenID / IAM 联邦 | ⛔ | P1(企业 AD 集成) | v2.2 候选 |
 | 认证安全 | SSE-KMS / DSSE-KMS | ⛔ | P2 | ❌ 不做(无 KMS 托管;参数显式拒绝) |
-| 认证安全 | 密钥级 IAM 策略子集 | 🟡 无 Condition/Principal | P1 | 扩展计划见 §7 |
+| 认证安全 | 密钥级 IAM 策略子集 | 🟡 已补最小 Condition 集(ipAddress/prefix/bypass 键);超集显式 400 | P1 | 超集远期 |
 | 数据保护 | 强一致 read-after-write | ✅(比 S3 官方更强) | P0 | — |
 | 数据保护 | 崩溃/断电一致性、账目收敛 | ✅(1000 轮 + 断电模拟) | P0 | — |
-| 数据保护 | 审计流水 | 🟡 内存环形 4096 条,不持久化 | P1(合规) | 🔜 v1.2 持久化 |
-| 数据保护 | 备份集成(restic/duplicati 等) | 🟡 未回归实测 | P1 | 客户端矩阵扩展 |
+| 数据保护 | 审计流水 | ✅ v1.2 持久化(环形,重启可检索) | P1(合规) | — |
+| 数据保护 | 备份集成(restic/duplicati 等) | 🟡 restic/duplicati ✅ 实测;Veeam/Commvault 未实测 | P1 | 🔜 v2.1(M15 D3) |
 | 生态集成 | aws cli / boto3 / mc / rclone | ✅(冒烟 + 迁移演练) | P0 | — |
-| 生态集成 | Hadoop S3A / Spark / Trino / 湖仓 | 🟡 未实测(依赖已具备) | P0(数据湖场景) | 回归矩阵补测;条件写 v1.1 后解锁 |
-| 生态集成 | Terraform provider / K8s Operator | ⛔ | P2 | 🔜 v2.0 评估 |
-| 生态集成 | 事件通知 Kafka/AMQP | ⛔ | P2 | v2.x 评估 |
-| 性能规模 | HTTP/3 | ⛔ | P2 | 🔜 v2.0(实验) |
-| 性能规模 | 热对象缓存 | ⛔ | P2 | 🔜 v2.0 |
-| 性能规模 | 多设备池 / 在线扩容 | ⛔ | P1 | 🔜 v1.4 |
+| 生态集成 | Hadoop S3A / Spark / Trino / 湖仓 | 🟡 未实测(依赖已具备;条件写 v1.1 已解锁) | P0(数据湖场景) | 🔜 v2.1(M15 D3) |
+| 生态集成 | Terraform provider / K8s Operator | 🟡 评估完成,暂不立项(持有,投票 ≥10) | P2 | 持有(m14-ecosystem-eval) |
+| 生态集成 | 事件通知 Kafka/AMQP | ⛔ | P2 | 后置评估(Webhook 起步 v2.1) |
+| 性能规模 | HTTP/3 | ✅ v2.0(实验开关默认关) | P2 | — |
+| 性能规模 | 热对象缓存 | ✅ v2.0(默认关) | P2 | — |
+| 性能规模 | 多设备池 / 在线扩容 | ✅ v1.4 | P1 | — |
 | 性能规模 | 目录桶 / Express 对标 | ❌(单机形态即对标 Express) | — | 文档化定位 |
 
 ## 2. 现状已支持面(v1.0 能力基线)
@@ -89,6 +90,9 @@
 - **质量**:s3-tests 支持子集 100%(排除集门禁)、崩溃 1000 轮 + 断电、覆盖率 80.05%、6000 万+对象扩展性验证、audit 零漏洞。
 
 ## 3. 差距详述(分域)
+
+> 本节「现状/路线」列 = v1.0 盘点时点快照(代码证据仍有效);**当前交付状态与
+> 路线归属见 §1 全景总表与 §5 硬门槛对照**(随版本更新;停售排除见 NEXT-ROUND §3.2)。
 
 ### 3.1 对象 API 域
 
@@ -184,24 +188,29 @@
 
 ## 4. 企业场景需求映射
 
-> 每场景:所需特性 → FastS3 现状 → 卡点。这是 §5 分级与 §7 排期的需求侧依据。
+> 每场景:所需特性 → 交付状态 → 剩余卡点。这是 §5 分级与 §7 排期的需求侧依据。
+> 更新(2026-08-26):对照 v2.0.0 交付状态与 M15(v2.1)/M16(v2.2)排期。
 
-| 场景 | 依赖的关键特性 | 现状 | 卡点与解锁 |
+| 场景 | 依赖的关键特性(交付状态) | 现状判定 | 剩余不满足项 |
 | --- | --- | --- | --- |
-| **数据湖 / 湖仓**(Spark/Trino/Hudi/Iceberg/Delta) | 强一致(✓)、multipart(✓)、404 确定性(✓)、**条件写入(⛔)**、**checksum(⛔)**、multipart ETag 对齐(🟡)、低成本 Copy(✓)、S3A Committer 语义 | 主体可用;S3A 未实测 | 条件写 v1.1 后 S3A Committer 可验收;ETag 修复 v1.0.x |
-| **备份与恢复**(restic/Duplicati/Veeam/Commvault) | multipart(✓)、ListObjectVersions(🟡桩)、**版本控制(⛔)**、**Object Lock(⛔)**、Copy(✓)、checksum(⛔) | 基础备份可用;不可变/版本恢复不可用 | v1.1 + v1.3 后完整;客户端矩阵补测 |
-| **合规 / WORM**(金融/医疗/制造边缘) | **Object Lock(⛔)**、审计持久化(🟡)、**SSE(⛔)**、可信时钟(🟡)、版本(⛔) | 均缺 | v1.2 + v1.3 闭环;审计持久化前置 v1.2 |
-| **ML / 训练** | 高 IOPS(✓ 单机优势)、高吞吐(✓)、多设备聚合(⛔)、checkpoint 条件写(⛔)、缓存(⛔) | 单盘形态已强;规模受限 | v1.4 多设备、v1.1 条件写 |
-| **多租户 SaaS** | 桶级隔离(✓ 桶即租户)、**桶策略 + 条件授权(⛔)**、配额(✓)、限速(✓)、**STS/每会话凭证(⛔)**、审计(🟡)、计量(Metrics/Inventory ⛔) | 隔离/配额/限速可用;授权模型只到"密钥级" | 桶策略(v1.2 建议)+ STS(v2.x);密钥级策略可表达多数单租户诉求 |
-| **媒体工作流** | multipart + Range(✓)、**通知触发转码(⛔)**、大对象吞吐(✓)、归档(⛔) | 上传下载可用;编排靠外部轮询 | v2.x 通知;归档评估 |
-| **IoT 接入** | chunked 流式(✓)、小对象高扇入(✓ 内联)、生命周期归档(⛔)、**通知(⛔)**、前缀时间分片(✓) | 接入可用 | v1.2 生命周期 + v2.x 通知 |
-| **DevOps / CI** | 小对象低延迟(✓)、预签名(✓)、**POST 表单(⛔)**、版本 + 生命周期(⛔)、标签(⛔) | 产物仓库形态可用 | 版本 v1.1、POST 表单建议增补 |
-| **浏览器应用** | 预签名直传(✓)、**CORS(⛔)**、Website(⛔)、SDK(✓) | 预签名路径可用(控制台即此形态);跨域受限 | CORS 建议增补 v1.2 |
-| **边缘 / 远程办公** | 轻量资源(✓)、**站点复制(⛔)**、缓存(⛔)、纳管(⛔) | 单机形态天然适配;多节点管理缺 | v2.0 纳管;复制策略化(底层 HA + mc/rclone 同步) |
+| **数据湖 / 湖仓**(Spark/Trino/Hudi/Iceberg/Delta) | 强一致 ✅、multipart ✅、404 确定性 ✅、条件写入 ✅ v1.1、checksum ✅ v1.2、ETag 对齐 ✅ v1.0.1、Copy COW ✅、S3A Committer 语义(未实测) | 🟡 基本满足 | ① Hadoop S3A/Spark/Trino 实测(M15 D3,环境补齐后);② 存储类头(部分工具带 IA/IT → 现 400,M15 C1 接受矩阵) |
+| **备份与恢复**(restic/Duplicati/Veeam/Commvault) | multipart ✅、ListObjectVersions ✅ v1.1、版本 ✅ v1.1、Object Lock ✅ v1.3、checksum ✅ v1.2;restic 0.19.1 / duplicati 2.3.0.4 ✅ 实测 | 🟡 基本满足 | Veeam(优先)/Commvault 实测(M15 D3);不可变仓库功能面已齐 |
+| **合规 / WORM**(金融/医疗/制造边缘) | Object Lock ✅ v1.3、审计持久化 ✅ v1.2、SSE ✅ v1.2、可信时钟 ✅ v1.3、版本 ✅ v1.1 | ✅ 满足 | 无功能缺口(v2.0 外部审计执行期项不影响) |
+| **ML / 训练** | 高 IOPS/吞吐 ✅、多设备 ✅ v1.4、checkpoint 条件写 ✅ v1.1、缓存 ✅ v2.0 | ✅ 满足 | — |
+| **多租户 SaaS** | 桶隔离 ✅、桶策略+最小 Condition ✅ v1.1、配额 ✅、限速 ✅、审计 ✅ v1.2、STS ⛔、计量 Inventory ⛔ | 🟡 部分满足 | STS(M15 T)、Inventory 计量(M15 I)、expected-bucket-owner 显式语义(M15 C2);Condition 超集/tenant 族(远期) |
+| **媒体工作流** | multipart+Range ✅、大对象吞吐 ✅、通知 ⛔、归档 ⛔ | 🟡 部分满足 | 事件通知(M15 N);归档/RestoreObject(M16) |
+| **IoT 接入** | chunked ✅、小对象扇入 ✅、生命周期过期 ✅ v1.2、前缀分片 ✅、通知 ⛔、Transition 归档 ⛔(显式拒绝) | 🟡 部分满足 | 事件通知(M15 N);生命周期 Transition(M16) |
+| **DevOps / CI** | 小对象低延迟 ✅、预签名 ✅、POST 表单 ✅ v1.1、版本+生命周期 ✅、标签 ✅ v1.1 | ✅ 满足 | — |
+| **浏览器应用** | 预签名直传 ✅、CORS ✅ v1.1、SDK ✅;Website(定位性不做,nginx 替代) | ✅ 满足 | Website 属排除清单(如需 S3 Website API) |
+| **边缘 / 远程办公** | 轻量 ✅、缓存 ✅ v2.0、纳管 ✅ v2.0、站点复制(策略化,不内置) | 🟡 部分满足 | 复制策略化落地(M16 候选:中心调度同步 + 对账视图) |
+
+> **收口节奏**:M15(v2.1)交付后 8/10 场景闭环;残余 = 归档(媒体/IoT)+ 复制
+> 策略化(边缘)落 M16,Condition 超集/tenant 族维持远期。
 
 ## 5. 企业硬门槛 Top 20 与 FastS3 对照
 
 > 分级依据:企业采购/生产评审(调研结论,来源见文末)。「缺失即被否决」= A 档;「缺失即某类工作流失败」= B 档;「锦上添花」= C 档。
+> 更新(2026-08-26):对照 v2.0.0 交付状态与 v2.1/v2.2 排期。
 
 ### A 档:缺失即被否决(10 项)
 
@@ -209,10 +218,10 @@
 | --- | --- | --- | --- |
 | 1 | 对象 API 核心语义 + ETag 正确性 | ✅ 达标(v1.0.1 已修复合 ETag) | — |
 | 2 | Multipart 完整生命周期 + ETag 契约 | ✅ 达标(v1.0.1) | — |
-| 3 | Object Lock / WORM | ⛔ | 🔜 v1.3 |
+| 3 | Object Lock / WORM | ✅ v1.3 达标(39/39 出集 + 回拨注入 + 强制矩阵逐格) | — |
 | 4 | 版本控制 + 删除标记 + ListObjectVersions | ✅ v1.1 达标 | — |
 | 5 | 条件写入(If-None-Match: * 等) | ✅ v1.1 达标 | — |
-| 6 | Range + 条件头(含 304) | ✅ 达标(v1.0.1 多段 Range 已实现;v1.1 条件写出集) | — |
+| 6 | Range + 条件头(含 304) | ✅ 达标(v1.0.1 多段 Range;v1.1 条件写出集) | — |
 | 7 | Checksum 家族 + 复合校验 | ✅ v1.2 达标 | — |
 | 8 | 强读后写一致 + Head/404 确定性 | ✅ 达标(强于 AWS) | — |
 | 9 | 桶策略 + 条件授权 | ✅ v1.1 达标(桶级 + 最小 Condition 键集) | — |
@@ -222,12 +231,12 @@
 
 | # | 门槛 | FastS3 现状 | 差距动作 |
 | --- | --- | --- | --- |
-| 11 | Lifecycle(过期/非当前版本/过滤) | ✅ v1.2 达标(时间墙 15 逐名残余见 s3-tests README) | — |
-| 12 | 事件通知(≥Webhook/SQS 形态) | ⛔ | v2.x 倾向做 |
-| 13 | 复制/DR | ⛔ 内置;策略 = 底层 HA + 迁移脚本(mc mirror/rclone 已演练) | 文档化定位;v2.x 评估 |
-| 14 | 预签名 + STS/Session Policy | 🟡 预签名 ✓;STS ⛔ | STS → v2.x |
-| 15 | 多租户隔离 + 配额/计量 | 🟡 隔离(桶)/配额 ✓;计量 ⛔ | Inventory 评估 |
-| 16 | RestoreObject + 归档层 | ⛔ | v2.x 评估 |
+| 11 | Lifecycle(过期/非当前版本/过滤) | ✅ v1.2 达标(Transition 显式不支持 → v2.2) | M16 归档联动 |
+| 12 | 事件通知(≥Webhook/SQS 形态) | ⛔ | 🔜 v2.1(M15 N1~N5,Webhook 起步) |
+| 13 | 复制/DR | ⛔ 内置;策略 = 底层 HA + 迁移脚本(mc mirror/rclone 已演练) | v2.2 候选(中心调度同步);compat 声明 |
+| 14 | 预签名 + STS/Session Policy | 🟡 预签名 ✓;STS ⛔ | STS → v2.1(M15 T1~T3) |
+| 15 | 多租户隔离 + 配额/计量 | 🟡 隔离(桶)/配额 ✓;计量 ⛔ | Inventory → v2.1(M15 I1~I3) |
+| 16 | RestoreObject + 归档层 | ⛔ | 🔜 v2.2(M16;前置已全部就绪) |
 | 17 | CORS + 预检 | ✅ v1.1 达标 | — |
 | 18 | 访问日志 + 审计面 | ✅ v1.2 审计持久化(访问日志仍不做) | — |
 
@@ -235,21 +244,23 @@
 
 | # | 门槛 | FastS3 现状 | 差距动作 |
 | --- | --- | --- | --- |
-| 19 | S3 Select / Inventory / Batch Operations | ⛔ | Select v2.x 有条件;Inventory 低成本评估 |
-| 20 | 目录桶/Express / Accelerate / Object Lambda / S3 Tables / DSSE-KMS | ❌ 明确不做(Express 定位 = FastS3 单机本体;Accelerate/Lambda/Tables 与定位冲突;DSSE 无 KMS) | 文档化定位声明 |
+| 19 | S3 Select / Inventory / Batch Operations | 🚫 Select 停售排除(2024-07-25 起不对新客户);Inventory ⛔;Batch Operations ⛔ | 不做 Select;Inventory → v2.1;Batch 后置(依赖通知) |
+| 20 | 目录桶/Express / Accelerate / Object Lambda / S3 Tables / DSSE-KMS | ❌ 明确不做(Express 定位 = FastS3 单机本体;Accelerate/Tables 与定位冲突;Object Lambda 叠加停售 2025-11-07;DSSE 无 KMS) | 文档化定位声明 |
 
 ## 6. 差距 → 路线图收敛映射
 
 | 缺口 | 归属版本 | 状态 |
 | --- | --- | --- |
-| 版本控制、条件写入、?versionId 寻址、ListObjectVersions | v1.1(DESIGN-FUTURE §3) | 已入路线 |
-| Lifecycle、SSE-C/SSE-S3、桶默认加密、checksum 家族、GetObjectAttributes、审计持久化 | v1.2(§4) | **M11 已交付**(v1.2.0,2026-08-25) |
-| Object Lock、可信时钟、治理 bypass | v1.3(§5) | 已入路线 |
-| 多设备扩容/再平衡、设备内元数据、zstd | v1.4(§6) | 已入路线 |
-| 纳管 agent、HTTP/3、热缓存、Terraform/Operator 评估 | v2.0(§7) | 已入路线 |
-| 桶策略(桶级)、CORS、对象标签、POST 表单 | v1.1(§7 建议 1 已采纳) | **M10 已交付**(S1~S4;s3-tests 对应族已出排除集) |
-| S3 Select、事件通知、STS/LDAP、复制、Inventory | v2.x 方向性(§8) | 已入长期视野 |
-| 协议正确性 12 项、encoding-type、DeleteObjects 上限 | v1.0.x 补丁轨道 | 建议立项 |
+| 版本控制、条件写入、?versionId 寻址、ListObjectVersions | v1.1(DESIGN-FUTURE §3) | ✅ 已交付(v1.1.0,2026-08-23) |
+| Lifecycle、SSE-C/SSE-S3、桶默认加密、checksum 家族、GetObjectAttributes、审计持久化 | v1.2(§4) | ✅ 已交付(v1.2.0,2026-08-25) |
+| Object Lock、可信时钟、治理 bypass | v1.3(§5) | ✅ 已交付(v1.3.0,2026-08-25) |
+| 多设备扩容/再平衡、设备内元数据、zstd | v1.4(§6) | ✅ 已交付(v1.4.0,2026-08-26;BlueFS N3 持有) |
+| 纳管 agent、HTTP/3、热缓存、Terraform/Operator 评估 | v2.0(§7) | ✅ 已交付(v2.0.0,2026-08-26) |
+| 桶策略(桶级)、CORS、对象标签、POST 表单 | v1.1(§7 建议 1 已采纳) | ✅ 已交付(M10 S1~S4) |
+| 事件通知(Webhook 起步)、STS 临时凭证、Inventory、存储类头矩阵、UploadPartCopy 源版本寻址 | v2.1(NEXT-ROUND §5) | 🔜 M15(TODO.md) |
+| 归档存储类 + RestoreObject、复制策略化、LDAP/OpenID | v2.2(NEXT-ROUND §6) | 🔜 M16 候选(立项后拆) |
+| S3 Select / Glacier Select、Object Lambda、Torrent、ACL 全矩阵 | — | 🚫 停售排除(NEXT-ROUND §3.2,不列入管线) |
+| 协议正确性残余(密钥状态语义、expected-bucket-owner 显式语义) | v2.1(NEXT-ROUND §5 C) | 🔜 M15 C2/C3 |
 
 ## 7. 路线图增补与优先级建议
 
@@ -257,11 +268,21 @@
 
 **建议 1(高置信,低成本):v1.1 立项时同步纳入 4 个"协议补全"小项**——对象标签、CORS、桶策略(桶级)、POST 表单。理由:①标签是 v1.2 生命周期 Filter 与复制过滤的硬依赖,早晚要做,早做成本最低(元数据字段 + 2 个 API + 1 个头,≈1 pw);②CORS 是浏览器场景 B 档门槛,实现 ≈0.5 pw;③桶策略 = 复用 policy.rs 引擎扩展到桶级 + 最小条件键集(ipAddress/prefix),≈1.5 pw,直接把 A 档第 9 项清零;④POST 表单 ≈1 pw。合计 ≈4 pw,可与 v1.1(9.5 pw)并行,不拖版本节奏。**建议放入 v1.1.x 或与 v1.1 同期 minor。**
 
+> ✅ **已采纳并交付**(v1.1.0 M10 S1~S4,2026-08-23;s3-tests tagging/cors/bucket_policy/post_object 族出排除集)。
+
 **建议 2(中置信):v1.0.x 补丁轨道立项**——§3.7 的 12 项协议正确性修复中,至少 #1(静默忽略→显式报错)、#3(multipart ETag)、#4(XAmzContentSHA256Mismatch)、#5(actual-object-size 头)、#6(DeleteObjects 上限)五项优先,合计 ≈1 pw。理由:静默忽略是合规风险,ETag 与错误码是对账/重试的正确性契约,都是"半成品功能"而非"缺功能"。
+
+> ✅ **已采纳并交付**(v1.0.1 M9 A~D,2026-08-22)。
 
 **建议 3(定位声明,文档化):复制与 DR 的策略化**——单机产品的容灾 = 底层 HA 卷 + `mc mirror`/`rclone`(已有演练资产)+ v2.0 纳管平台的同步调度。**不承诺内置桶级复制**;若企业 DR 诉求强烈(站点复制),以 v2.x 立项评估(依赖通知/审计队列底座)。此结论写入 compat.md 与销售/评审材料,避免采购评审误预期。
 
+> 维持有效;复制策略化落地(中心调度同步任务 + 对账视图)已列入 M16 候选(NEXT-ROUND §6)。
+
 **建议 4(定位对标,文档化):FastS3 单机 = S3 Express 对标物**——AWS 目录桶/Express 的卖点(单 AZ、毫秒级、高 IOPS)恰是 FastS3 本体定位;在文档与 benchmark 中直接对标 Express(而非标准 S3 多 AZ),这是营销与评审叙事的关键。目录桶的 API 差异(s3express:*、目录桶语义)明确不做。
+
+> 维持有效。
+
+**建议 5(停售排除,2026-08-26):AWS 已停止对新客户提供的特性移出管线**——S3 Select / Glacier Select(2024-07-24 公告,2024-07-25 起对新客户关闭)、Object Lambda(2025-11-07 起仅存量客户 + APN)、Torrent(2021 弃用,已移除)、ACL 全矩阵(2023-04 起新桶默认禁用 ACL)。理由:对"无变更迁移"目标无增量价值,且与 AWS 新客户实际可用面脱节;协议面维持显式报错不静默。核查证据见 [NEXT-ROUND.md](./NEXT-ROUND.md) §3。
 
 ## 8. 差距收敛的验证方法
 

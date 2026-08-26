@@ -10,7 +10,10 @@ FastS3 是一个**单机 S3 服务**,面向裸块设备 / 磁盘镜像文件的�
 - 管理面 + Web 控制台:**Node.js**(Fastify + React/Vite),永不进入数据热路径
 - 当前状态:**v2.0.0 已交付**(M0~M14:GA 候选 + 协议卫生 + 版本控制 + 生命周期/
   加密 + Object Lock + 容量与底座 + 集中纳管与生态;M14 另含 HTTP/3 实验开关
-  与热缓存,M13 起版本弧线 v1.4→v2.0)。门禁见 TODO.md M14。
+  与热缓存,M13 起版本弧线 v1.4→v2.0)。M9~M14 门禁见
+  [docs/archive/TODO-v2.0.0.md](./docs/archive/TODO-v2.0.0.md)(已归档);
+  下一里程碑 **M15 v2.1.0 迁移即插即用**(任务与门禁见 TODO.md,规划见
+  [docs/NEXT-ROUND.md](./docs/NEXT-ROUND.md))。
   git tag / 真 NVMe / v2.0 外部审计(已立项)仍按 checklist 如实为执行期项
 
 ## 2. 权威文档(改动任何设计前必读)
@@ -21,7 +24,7 @@ FastS3 是一个**单机 S3 服务**,面向裸块设备 / 磁盘镜像文件的�
 | [docs/DESIGN-FUTURE.md](./docs/DESIGN-FUTURE.md) | 远期规划(v1.1~v2.0)详细设计与实现:§11 决策点清单、键空间/值格式演进纪律、每特性 WBS 与门禁 |
 | [docs/S3-GAP.md](./docs/S3-GAP.md) | 企业级 S3 特性差距分析:现状/缺口/优先级/路线归属;差距收敛标尺 = s3-tests 排除集收敛 |
 | [docs/ROADMAP.md](./docs/ROADMAP.md) | 规划:WBS 工作分解、里程碑与门禁、开箱即用验收标准 |
-| [TODO.md](./TODO.md) | 执行清单:远期里程碑(M9 v1.0.x → M14 v2.0)逐条任务 + 门禁,进度跟踪(见 §4) |
+| [TODO.md](./TODO.md) | 执行清单:M15 v2.1.0「迁移即插即用」逐条任务 + 门禁,进度跟踪(见 §4);M9~M14 已归档 docs/archive/TODO-v2.0.0.md |
 
 **规则:实现行为与 DESIGN.md 冲突时,以 DESIGN.md 为准,并走 ADR 流程修正文档(见 §5),不得静默偏离。**
 

@@ -771,19 +771,20 @@ admin 通道已完备:unix/TCP + Bearer、keys/buckets/config(GET-PATCH,热字�
 ## 8. 长期视野(v2.0+,方向性评估)
 
 > ROADMAP §6.4 的方向性条目,本文档给出**评估结论与理由**,不承诺排期;正式立项需回到 §11 决策流程。
+> 更新(2026-08-26):AWS 停售核查与 M15/M16 立项结论见 [NEXT-ROUND.md](./NEXT-ROUND.md) §3/§5;下表结论已按之同步。
 
 | 特性 | 评估结论 | 理由(要点) |
 | --- | --- | --- |
-| S3 Select(下推查询) | **有条件做**:仅 CSV/JSON 未压缩对象 + 基础 SQL 子集(SELECT/WHERE/LIMIT) | 湖仓下推价值真实(减少传输);但 Parquet/压缩/嵌套类型成本高;单机下"下推 vs 客户端算"收益弱于分布式;若做 = 独立模块 + 严格范围声明 |
-| 事件通知(Webhook/SQS/AMQP/Kafka) | **倾向做(Webhook 起步)**:企业事件驱动管道是 B 档硬需求(S3-GAP) | 依赖可靠投递(持久化事件队列 = 新键前缀 + 重试/死信)——工程量中等(3~4 pw);与审计持久化(v1.2)共用队列基础设施;Kafka/AMQP 客户端集成后置 |
-| 桶级/站点复制 | **慎重,单机定位下建议不做内置,交付方案化**:rclone/mc 同步已有演练资产 + 底层 HA 卷承担灾备 | 复制 = 异步队列 + 冲突语义 + 双向/故障转移,是分布式系统问题,与"单机语义层"定位冲突;企业 DR 诉求由 S3-GAP 场景表引导到 v2.0 纳管平台(统一调度同步任务)更务实 |
-| IAM/STS/LDAP/OpenID 集成 | **做(管理面,按需立项)**:企业多租户与 AD 集成的硬门槛(S3-GAP B 档) | 数据面只认 access key 的现状可保留;集成放 Node 管理面(签发/校验临时凭证、LDAP 同步),密钥仍落 k: 表;SSO 价值高 |
+| S3 Select(下推查询) | **不做(停售排除)**:AWS 2024-07-25 起不对新客户提供(Glacier Select 同),官方引导 Athena/Trino/Parquet 化替代 | 停售特性不列入开发管线(NEXT-ROUND §3.2);特定客户合同硬需求 → 独立定制评估,不进主版本;湖仓下推由 Trino/Spark 承担 |
+| 事件通知(Webhook/SQS/AMQP/Kafka) | **已立项 M15 v2.1(Webhook 起步)**(TODO M15 N1~N5,≈4 pw):企业事件驱动管道是 B 档硬需求(S3-GAP) | 依赖可靠投递(持久化事件队列 = 新键前缀 `e:` + 重试/死信);与审计持久化(v1.2)共用队列底座;SQS/SNS/EventBridge 目标后置评估(D-E4);Kafka/AMQP 客户端集成后置 |
+| 桶级/站点复制 | **慎重,不内置;策略化落地 = M16 v2.2 候选**:v2.0 中心纳管调度 mc/rclone 同步任务 + 健康/对账视图;底层 HA 卷承担灾备 | 复制 = 异步队列 + 冲突语义 + 双向/故障转移,是分布式系统问题,与"单机语义层"定位冲突;企业 DR 诉求由 S3-GAP 场景表引导到纳管平台统一调度更务实 |
+| IAM/STS/LDAP/OpenID 集成 | **STS 已立项 M15 v2.1**(TODO M15 T1~T3);LDAP/OpenID = M16 v2.2 候选 | 数据面只认 access key 的现状可保留(会话 = 基密钥 + 会话策略求交,D-E2);集成放 Node 管理面(签发/校验临时凭证、LDAP 同步),密钥仍落 k: 表;SSO 价值高 |
 | Access Points / Multi-Region Access Points | **不做**:多权限视图在单机产品中可用"多密钥 + 策略"表达;多区域入口与单机定位冲突 | 明确文档化 |
 | Directory Buckets / S3 Express One Zone | **不做**:单 AZ 高性能定位恰是 FastS3 本体(单机即 Express);目录桶的扁平键空间与 S3 语义差异大 | 文档化:FastS3 单机形态的延迟/IOPS 目标即对标 Express |
-| Object Lambda | **不做** | 可被"读代理/预签名 + 应用层"替代 |
+| Object Lambda | **不做(停售排除)**:AWS 2025-11-07 起仅存量客户 + APN 可用,官方不再引入新能力 | 停售特性不列入管线;单机下可被"读代理/预签名 + 应用层"替代 |
 | Transfer Acceleration | **不做**:单机定位无边缘加速网络;加速由客户端就近部署/网关层承担 | 文档化 |
-| 归档存储类 / Glacier 分层 / RestoreObject | **评估**:若企业冷数据成本诉求强烈,以"zstd 压缩(v1.4)+ 生命周期(v1.2)"组合近似;真正的介质分层(HDD 层)依赖多设备(v1.4)作为底座 | 列入 v2.x 评估清单 |
-| S3 Batch Operations / Inventory | **评估**:Inventory(CSV 清单导出)复用 ListObjects 即可低成本实现(0.5~1 pw),Batch Operations 依赖通知/复制底座,后置 | Inventory 可作为 v1.x 运维增值 |
+| 归档存储类 / Glacier 分层 / RestoreObject | **已列入 M16 v2.2 候选**(NEXT-ROUND §6,≈4~5 pw):GLACIER*/DEEP_ARCHIVE → zstd 压缩档 + 生命周期 Transition + RestoreObject 状态机 | 前置(v1.2 生命周期 + v1.4 zstd/多设备)已全部交付;M15 C1 存储类头矩阵铺路;立项条件 = 冷数据成本诉求 |
+| S3 Batch Operations / Inventory | **Inventory 已立项 M15 v2.1**(TODO M15 I1~I3,CSV,≈1 pw);Batch Operations 依赖通知/复制底座,后置评估(≈2~3 pw,M15 通知交付后复核) | Inventory = 迁移对账/计量运维增值;Batch 立项条件 = 批量运维诉求 |
 
 ---
 
@@ -896,6 +897,10 @@ v1.0 基线 <256MiB 空载。远期特性开启态的常驻增量:多设备位�
 | DZ1 | §6.3 | zstd 范围与顺序 | 仅写时压缩默认关;加密→压缩→CRC;术语区分 | — |
 | DV1 | §7.1 | agent 连接方向/权威性 | 出站 mTLS;中心=配置源,引擎=裁决权威 | ADR-17 |
 | DV2 | §7.2 | HTTP/3 | 实验 feature 开关默认关,6 个月评估期 | ADR-17 |
+| D-E1 | NEXT-ROUND §5.6 | 事件队列一致性语义 | 入队与数据事务边界明确,崩溃零漂移(复用审计环形底座模式) | ADR-18(M15) |
+| D-E2 | NEXT-ROUND §5.6 | STS 会话模型 | 会话 = 基密钥 + 会话策略求交,无角色派生;secret 仅签发时一次回显 | ADR-18(M15) |
+| D-E3 | NEXT-ROUND §5.6 | 存储类头接受矩阵 | GLACIER*/IA/IT/RRS 统一映射 STANDARD + 元数据记录请求类 + 响应回显实际类,文档化非静默 | ADR-18(M15) |
+| D-E4 | NEXT-ROUND §5.6 | 通知目标范围 | Webhook 起步;SQS/SNS/EventBridge 后置评估 | ADR-18(M15) |
 
 ---
 

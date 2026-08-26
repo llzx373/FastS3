@@ -95,7 +95,7 @@ FastS3 的对策:**不做底层已经做过的事**。工程力量全部投入�
 | --- | --- |
 | [docs/DESIGN.md](./docs/DESIGN.md) | 总体架构、存储引擎、S3 协议、性能方案、管理面设计(含 ADR-1~5) |
 | [docs/ROADMAP.md](./docs/ROADMAP.md) | 实现规划、WBS 工作分解、里程碑计划、开箱即用验收标准 |
-| [TODO.md](./TODO.md) | 执行清单:M0~M8 逐条任务与门禁,勾选跟踪实现进度 |
+| [TODO.md](./TODO.md) | 执行清单:M15 v2.1.0「迁移即插即用」逐条任务与门禁,勾选跟踪实现进度(M9~M14 已归档 docs/archive/TODO-v2.0.0.md) |
 
 路线图:9 个里程碑(M0~M8,合计约 7 个月)→ v1.0 GA;v0.1 起逐版本发布(引擎 PoC → S3 核心 → 高级语义 → 管理面 → 加固 → 性能冲刺 → 打包开箱 → 文档与 Beta → GA)。
 
@@ -135,7 +135,7 @@ aws --endpoint-url http://127.0.0.1:9000 s3 cp s3://b1/data.bin out.bin
 target/release/fasts3d check --device disk.img --meta-dir meta
 ```
 
-验证回路:单元测试 `cargo test --workspace`;协议冒烟 `tests/smoke/`;崩溃 harness `tests/crash/`;CEPH s3-tests 见 `TODO.md` M1 门禁。
+验证回路:单元测试 `cargo test --workspace`;协议冒烟 `tests/smoke/`;崩溃 harness `tests/crash/`;CEPH s3-tests 排除矩阵见 [tests/s3-tests/README.md](./tests/s3-tests/README.md)(M1 门禁已归档 docs/archive/TODO-v1.0.0.md)。
 
 ```bash
 cargo build --release -p fs3d
