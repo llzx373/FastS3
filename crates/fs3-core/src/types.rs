@@ -2661,6 +2661,50 @@ pub struct CompressionConfig {
     pub level: u32,
 }
 
+/// M16 A1(ADR-19 DA1):GLACIER/DEEP_ARCHIVE 高压缩档(归档读写低频,
+/// 压缩率优先;zstd level 9 写路径 CPU 成本文档化入发布报告)。
+pub const ARCHIVE_DEEP_COMPRESSION_LEVEL: u32 = 9;
+
+/// M16 A1(ADR-19 DA4):真实存储类升格——请求类 ∈ 归档三值
+/// (GLACIER_IR/GLACIER/DEEP_ARCHIVE)→ Some(规范大写),其余 → None
+/// (STANDARD 系统一落 None)。协议层写路径调用,结果落 ObjectMeta
+/// v7 `storage_class`;请求类本身仍记录于 `requested_storage_class`。
+pub fn promote_storage_class(requested: Option<&str>) -> Option<String> {
+    requested
+        .filter(|c| is_archive_class(c))
+        .map(|c| c.to_ascii_uppercase())
+}
+
+/// M16 A1(ADR-19 DA1):写路径压缩档位裁决——
+///
+/// - GLACIER/DEEP_ARCHIVE → `ARCHIVE_DEEP_COMPRESSION_LEVEL`(9,强制);
+/// - GLACIER_IR → 全局压缩开启时用全局档位,关闭时用标准档 1(强制
+///   压缩,在线可读);
+/// - 非归档 → 全局压缩配置原样(0 = 关闭,维持 M13 语义)。
+///
+/// 归档类强制压缩与全局 compression 配置正交(DA1.4)。
+pub fn archive_compression_level(class: Option<&str>, cfg_enabled: bool, cfg_level: u32) -> u32 {
+    match class {
+        Some(c) if c.eq_ignore_ascii_case("GLACIER") || c.eq_ignore_ascii_case("DEEP_ARCHIVE") => {
+            ARCHIVE_DEEP_COMPRESSION_LEVEL
+        }
+        Some(c) if c.eq_ignore_ascii_case("GLACIER_IR") => {
+            if cfg_enabled && cfg_level > 0 {
+                cfg_level
+            } else {
+                1
+            }
+        }
+        _ => {
+            if cfg_enabled {
+                cfg_level
+            } else {
+                0
+            }
+        }
+    }
+}
+
 impl Default for CompressionConfig {
     fn default() -> Self {
         CompressionConfig {

@@ -1368,6 +1368,16 @@ impl S3Service {
         header(req, "x-amz-storage-class").map(|s| s.to_ascii_uppercase())
     }
 
+    /// M16 A1(ADR-19 DA4):写路径存储类成对透传 —— (请求类, 真实类)。
+    /// 真实类 = 请求类 ∈ 归档三值(GLACIER_IR/GLACIER/DEEP_ARCHIVE)时
+    /// 升格,其余 None(= STANDARD);引擎按真实类裁决压缩档位并落
+    /// ObjectMeta v7 storage_class。
+    fn storage_classes(&self, req: &S3Request) -> (Option<String>, Option<String>) {
+        let rsc = self.requested_storage_class(req);
+        let psc = fs3_core::promote_storage_class(rsc.as_deref());
+        (rsc, psc)
+    }
+
     fn require_auth(&self, req: &S3Request) -> Result<Option<String>, S3Error> {
         let auth = self.authenticate_full(req)?;
         let access: Option<String> = auth.map(|a| a.who);
@@ -2180,6 +2190,7 @@ impl S3Service {
                         fs3_core::EventDraftKind::ObjectCreated("s3:ObjectCreated:Put"),
                         "s3:ObjectCreated:Put",
                     );
+                    let (rsc, psc) = self.storage_classes(req);
                     engine
                         .put_with_lock_ev(
                             bucket,
@@ -2200,7 +2211,8 @@ impl S3Service {
                             write_key.as_ref(),
                             lock,
                             event,
-                            self.requested_storage_class(req),
+                            rsc,
+                            psc,
                         )
                         .map(|m| (m.etag, Some(m), None))
                         .map_err(|e| map_engine_error(e, bucket, key))
@@ -3617,6 +3629,7 @@ impl S3Service {
             fs3_core::EventDraftKind::ObjectCreated("s3:ObjectCreated:Post"),
             "s3:ObjectCreated:Post",
         );
+        let (rsc, psc) = self.storage_classes(req);
         let meta = engine
             .put_with_lock_ev(
                 bucket,
@@ -3635,7 +3648,8 @@ impl S3Service {
                 post_wk.as_ref(),
                 post_lock,
                 event,
-                self.requested_storage_class(req),
+                rsc,
+                psc,
             )
             .map_err(|e| map_engine_error(e, bucket, &key))?;
         // M11 门禁:checksum 写后比对(不符回滚 + BadDigest,同 PUT 口径)
@@ -4302,6 +4316,7 @@ impl S3Service {
         )?;
         // M15 N2(ADR-18 D-E1):桶有 ObjectCreated:Put 通知规则 → 事件草案
         // (零配置 None;与数据同事务入队)
+        let (rsc, psc) = self.storage_classes(req);
         let event = notification_draft(
             engine.meta(),
             bucket,
@@ -4327,7 +4342,8 @@ impl S3Service {
                 write_key.as_ref(),
                 lock,
                 event,
-                self.requested_storage_class(req),
+                rsc,
+                psc,
             )
             .map_err(|e| map_engine_error(e, bucket, key))?;
         if md5_ok == Some(false) {
@@ -4505,9 +4521,12 @@ impl S3Service {
                     ("ETag".into(), format!("\"{}\"", meta.etag_full())),
                     ("Last-Modified".into(), xml::http_date(meta.mtime)),
                     ("Accept-Ranges".into(), "bytes".into()),
-                    // M15 C1(ADR-18 D-E3):存储类回显(统一落 STANDARD,
-                    // 恒回显实际类;请求类见 admin 面)
-                    ("x-amz-storage-class".into(), "STANDARD".into()),
+                    // M16 A1(ADR-19 DA1):存储类回显真实类(归档三值
+                    // 按 ObjectMeta v7 storage_class;STANDARD = None)
+                    (
+                        "x-amz-storage-class".into(),
+                        meta.storage_class_name().into(),
+                    ),
                     ("Content-Length".into(), "0".into()),
                 ];
                 if let Some(v) = &resp_version_id {
@@ -4614,9 +4633,12 @@ impl S3Service {
         headers.push(("ETag".into(), format!("\"{}\"", meta.etag_full())));
         headers.push(("Last-Modified".into(), xml::http_date(meta.mtime)));
         headers.push(("Accept-Ranges".into(), "bytes".into()));
-        // M15 C1(ADR-18 D-E3):存储类回显(统一落 STANDARD,恒回显实际类;
-        // 请求类见 admin 面)
-        headers.push(("x-amz-storage-class".into(), "STANDARD".into()));
+        // M16 A1(ADR-19 DA1):存储类回显真实类(归档三值按 ObjectMeta
+        // v7 storage_class;STANDARD = None)
+        headers.push((
+            "x-amz-storage-class".into(),
+            meta.storage_class_name().into(),
+        ));
         headers.push(("Content-Length".into(), content_length.to_string()));
         if let Some(v) = &resp_version_id {
             headers.push(("x-amz-version-id".into(), v.clone()));
@@ -5429,9 +5451,15 @@ impl S3Service {
         } else {
             (None, None)
         };
-        let items: Vec<(String, String, i64)> = uploads
+        // M16 A1(ADR-19 DA1):会话存储类回显(归档会话 = 请求类升格;
+        // STANDARD = None)
+        let items: Vec<(String, String, i64, String)> = uploads
             .into_iter()
-            .map(|(uid, s)| (s.key, uid, s.created))
+            .map(|(uid, s)| {
+                let class = fs3_core::promote_storage_class(s.requested_storage_class.as_deref())
+                    .unwrap_or_else(|| "STANDARD".to_string());
+                (s.key, uid, s.created, class)
+            })
             .collect();
         let xml = xml::render_list_multipart_uploads(
             bucket,
@@ -5917,6 +5945,7 @@ impl S3Service {
             fs3_core::EventDraftKind::ObjectCreated("s3:ObjectCreated:Copy"),
             "s3:ObjectCreated:Copy",
         );
+        let (rsc, psc) = self.storage_classes(req);
         let meta = engine
             .copy_object_with_lock_ev(
                 &copy_source.bucket,
@@ -5934,7 +5963,8 @@ impl S3Service {
                 dst_wk.as_ref(),
                 lock,
                 event,
-                self.requested_storage_class(req),
+                rsc,
+                psc,
             )
             .map_err(|e| map_engine_error(e, &copy_source.bucket, &copy_source.key))?;
         let xml = xml::render_copy_object(&meta.etag_full(), &xml::ts_to_rfc3339(meta.mtime));

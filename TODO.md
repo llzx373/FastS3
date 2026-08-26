@@ -97,7 +97,7 @@
 
 #### A1 元数据与写路径(≈1.5 pw)
 - [x] A1-1 ObjectMeta v7(值版本字节,v6 双读单写):storage_class(真实)+ restore_state{restored_until,restored_size};meta-export/import DTO 同步;升级工具 v6→v7 在线重写(复用值格式重写框架,自动回滚)
-- [ ] A1-2 PUT 存储类落地:GLACIER_IR → zstd 标准档在线可读;GLACIER/DEEP_ARCHIVE → zstd 高压缩档;HEAD/GET/GetObjectAttributes/List 回显真实存储类;CreateMultipart 会话类沿用 C1 模式
+- [x] A1-2 PUT 存储类落地:GLACIER_IR → zstd 标准档在线可读;GLACIER/DEEP_ARCHIVE → zstd 高压缩档;HEAD/GET/GetObjectAttributes/List 回显真实存储类;CreateMultipart 会话类沿用 C1 模式
 - [ ] A1-3 统计按存储类分账(五路径 + transition/restore 口径,DA5)+ admin 存储类视图
 
 #### A2 读取与 RestoreObject(≈1.5 pw)

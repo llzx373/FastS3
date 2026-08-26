@@ -1919,6 +1919,7 @@ impl Engine {
             lock,
             None,
             None,
+            None,
         )
     }
 
@@ -1942,6 +1943,7 @@ impl Engine {
         lock: ObjectLockWrite,
         event: Option<fs3_core::EventDraft>,
         requested_storage_class: Option<String>,
+        storage_class: Option<String>,
     ) -> Result<ObjectMeta> {
         let Some(bkt) = self.meta.get_bucket(bucket)? else {
             return Err(Error::NotFound(format!("bucket {bucket}")));
@@ -1958,6 +1960,13 @@ impl Engine {
             }
         }
         let (target, old) = self.plan_object_write(bucket, key, bkt.versioning)?;
+        // M16 A1(ADR-19 DA1):写路径压缩档位裁决(归档类强制压缩,与全局
+        // compression 配置正交;STANDARD 维持全局配置原样)
+        let compression_level = fs3_core::archive_compression_level(
+            storage_class.as_deref(),
+            self.compression_cfg.enabled,
+            self.compression_cfg.level,
+        );
 
         // M11 C1-2:声明 checksum 算法时套 tee 边读边算(未声明 = 纯透传);
         // EOF 共享出口供 extent 臂(put_stream)在提交前取回落值
@@ -1991,14 +2000,13 @@ impl Engine {
             // 读尽,extent 臂用同一 prefixed reader 重放,零重读)。
             let mut compression_info: Option<fs3_core::CompressionInfo> = None;
             let mut inline_buf: Option<Vec<u8>> = None; // 压缩流(明文)
-            if self.compression_cfg.enabled && !prefix.is_empty() {
-                let compressed_bytes =
-                    zstd::bulk::compress(&prefix, self.compression_cfg.level as i32)
-                        .map_err(|e| Error::Meta(format!("zstd inline compress: {e}")))?;
+            if compression_level > 0 && !prefix.is_empty() {
+                let compressed_bytes = zstd::bulk::compress(&prefix, compression_level as i32)
+                    .map_err(|e| Error::Meta(format!("zstd inline compress: {e}")))?;
                 if compressed_bytes.len() <= limit {
                     compression_info = Some(fs3_core::CompressionInfo {
                         algorithm: fs3_core::CompressionAlgorithm::Zstd,
-                        level: self.compression_cfg.level,
+                        level: compression_level,
                         original_size: size,
                         compressed_size: compressed_bytes.len() as u64,
                     });
@@ -2072,8 +2080,8 @@ impl Engine {
                 part_checksums: Vec::new(),
                 compressed: compression_info,
                 requested_storage_class: requested_storage_class.clone(),
-                // M16 A1:真实存储类/恢复状态(ADR-19 DA4;写路径按请求类升格)
-                storage_class: None,
+                // M16 A1:真实存储类/恢复状态(ADR-19 DA4;A1-2 写路径升格)
+                storage_class: storage_class.clone(),
                 restore_state: None,
             };
             let mut draft = Staged::default();
@@ -2129,6 +2137,8 @@ impl Engine {
             lock,
             event,
             requested_storage_class,
+            storage_class,
+            compression_level,
         });
         match result {
             Ok(meta) => {
@@ -2170,18 +2180,21 @@ impl Engine {
             lock,
             event,
             requested_storage_class,
+            storage_class,
+            compression_level,
         } = ctx;
         let old_size = old.size;
         let old_segments = old.segments;
         let mut draft = Staged::default();
-        let outcome = match self.stream_to_extents(reader, &mut draft, sse_key, None) {
-            Ok(v) => v,
-            Err(e) => {
-                // 流中断(客户端断连):回滚已暂存分配 + 开放 extent 水位
-                self.abort_draft(&draft);
-                return Err(e);
-            }
-        };
+        let outcome =
+            match self.stream_to_extents(reader, &mut draft, sse_key, None, compression_level) {
+                Ok(v) => v,
+                Err(e) => {
+                    // 流中断(客户端断连):回滚已暂存分配 + 开放 extent 水位
+                    self.abort_draft(&draft);
+                    return Err(e);
+                }
+            };
         let StreamWriteOutcome {
             segments,
             size,
@@ -2192,7 +2205,7 @@ impl Engine {
         // M13 Z1:压缩对象落压缩信息(算法/档位/明文与压缩字节数)
         let compressed = compressed_size.map(|compressed_size| fs3_core::CompressionInfo {
             algorithm: fs3_core::CompressionAlgorithm::Zstd,
-            level: self.compression_cfg.level,
+            level: compression_level,
             original_size: size,
             compressed_size,
         });
@@ -2222,8 +2235,8 @@ impl Engine {
             part_checksums: Vec::new(),
             compressed,
             requested_storage_class,
-            // M16 A1:真实存储类/恢复状态(ADR-19 DA4;A1-2 写路径按请求类升格)
-            storage_class: None,
+            // M16 A1:真实存储类/恢复状态(ADR-19 DA4;A1-2 写路径升格)
+            storage_class,
             restore_state: None,
         };
 
@@ -2281,6 +2294,7 @@ impl Engine {
         draft: &mut Staged,
         sse_key: Option<&fs3_core::SseWriteKey>,
         sse_nonce_base: Option<[u8; 12]>,
+        compression_level: u32,
     ) -> Result<StreamWriteOutcome> {
         // M13 M2-2(对齐 v0.5 掉盘语义):降级/只读引擎拒绝设备写;
         // 内联路径(纯元数据)不经过此处,由服务层 read_only 门闩兜底。
@@ -2289,11 +2303,6 @@ impl Engine {
                 "engine is read-only (degraded pool or tool mode); extent writes rejected".into(),
             ));
         }
-        let compression_level = if self.compression_cfg.enabled {
-            self.compression_cfg.level
-        } else {
-            0
-        };
 
         let mut writer = ExtentWriter::new(
             self.chunk_size,
@@ -3148,7 +3157,23 @@ impl Engine {
             return Ok(0);
         }
         let want = ((meta.size - offset) as usize).min(buf.len());
-
+        // M13 Z1 补遗(M16 A1 实测暴露):压缩对象流式读必须走解压路径
+        // ——此前 read_at_meta 直读存储流(压缩帧)原样输出,流式 GET
+        // (ObjectStream/read_stream_chunk)对压缩对象会向客户端吐出
+        // 压缩字节(元数据声称明文大小);补丁 = 窗口化解压读,与
+        // get_to_meta 同语义(zstd 帧无随机访问,每次窗口 = 全量解压后
+        // 裁剪,成本已文档化)。零拷贝路径对压缩对象已禁(object_segments
+        // 返回 None),此处为缓冲路径唯一缺口。
+        if meta.compressed.is_some() {
+            return self
+                .read_compressed_meta(
+                    meta,
+                    offset..offset + want as u64,
+                    &mut &mut buf[..want],
+                    sse_key,
+                )
+                .map(|n| n as usize);
+        }
         match &meta.sse {
             None => self.read_raw_at_meta(meta, offset, &mut buf[..want]),
             // M11 E1-3:读出密文后按 64KiB chunk 网格解密验 tag
@@ -3872,6 +3897,18 @@ impl Engine {
             !(sse_key_md5.is_some() && sse_s3.is_some()),
             "SSE-C 与 SSE-S3 会话互斥(协议层二选一)"
         );
+        // M16 A1(ADR-19 DA1.5):SSE + 归档 + multipart 组合显式拒绝
+        // (分片独立帧 × SSE 重加密组合面不开放;协议层 Create 先行,
+        // 此处防御纵深)
+        if (sse_key_md5.is_some() || sse_s3.is_some())
+            && requested_storage_class
+                .as_deref()
+                .is_some_and(fs3_core::is_archive_class)
+        {
+            return Err(Error::InvalidRequest(
+                "SSE combined with archive storage classes is not supported for multipart uploads (ADR-19 DA1); use single-object PUT".into(),
+            ));
+        }
         let mut raw = [0u8; 16];
         random_bytes(&mut raw)?;
         let upload_id = hex::encode(raw);
@@ -3944,15 +3981,30 @@ impl Engine {
         let Some(session) = self.meta.get_multipart(upload_id)? else {
             return Err(Error::NoSuchUpload(upload_id.to_string()));
         };
-        // M13 Z1:v1.4 压缩开启时 multipart 分片明确不支持(分片独立帧 +
-        // Complete 混拼 + SSE 重加密的组合面暂不开放;门禁组合由单对象
-        // PUT 路径覆盖)。默认关 → 零影响。
-        if self.compression_cfg.enabled {
-            return Err(Error::Unsupported(
-                "data compression (zstd) is not supported for multipart uploads in                  v1.4; disable compression or use single PUT (ADR-15 DZ1)"
-                    .into(),
+        // M16 A1(ADR-19 DA1/DA4):归档类会话 = 分片级压缩(每分片独立
+        // zstd 帧,Complete 零搬运拼接;压缩档位按类裁决)。非归档会话:
+        // 维持 M13 Z1 v1.4 限制(全局压缩开启时 multipart 明确不支持)。
+        // SSE + 归档 + multipart 组合显式拒绝(DA1.5;协议层 Create 已
+        // 先行拦截,此处防御纵深)。
+        let session_class = session.requested_storage_class.clone();
+        let archive_session = session_class
+            .as_deref()
+            .is_some_and(fs3_core::is_archive_class);
+        if archive_session && (session.sse_key_md5.is_some() || session.sse_s3.is_some()) {
+            return Err(Error::InvalidRequest(
+                "SSE combined with archive storage classes is not supported for multipart uploads (ADR-19 DA1); use single-object PUT or a plaintext session".into(),
             ));
         }
+        if self.compression_cfg.enabled && !archive_session {
+            return Err(Error::Unsupported(
+                "data compression (zstd) is not supported for multipart uploads when                  compression is globally enabled and the session is not an archive storage class;                  disable compression or use single PUT (ADR-15 DZ1 / ADR-19 DA1)".into(),
+            ));
+        }
+        let part_level = fs3_core::archive_compression_level(
+            session_class.as_deref(),
+            self.compression_cfg.enabled,
+            self.compression_cfg.level,
+        );
         // E1-4 会话一致性(防御纵深;协议层已先行按 key-MD5 比对)
         if session.sse_key_md5.is_some() != sse_key.is_some() {
             return Err(Error::InvalidRequest(
@@ -3999,7 +4051,16 @@ impl Engine {
             // 内联恒单 chunk;同 put_with_meta 内联臂先例),ETag = 密文摘要;
             // nonce_base = D-E6 确定性派生(重传幂等);K1-1:有效写密钥
             // (SSE-C 请求密钥 / SSE-S3 会话 DEK),SseInfo 静态字段随类型分派
-            let (inline_data, sse) = match &write_key {
+            // M16 A1:归档会话小分片 = 内联压缩帧(明文→zstd;SSE 会话
+            // 已在入口拒绝,此处仅明文压缩臂)
+            let compressed_inline: Option<Vec<u8>> = if part_level > 0 {
+                zstd::bulk::compress(&prefix, part_level as i32)
+                    .map_err(|e| Error::Meta(format!("zstd part inline compress: {e}")))
+                    .ok()
+            } else {
+                None
+            };
+            let (inline_data, sse, part_compressed_size) = match &write_key {
                 Some(k) => {
                     let nonce_base = part_nonce_base.expect("sse part has derived nonce_base");
                     let mut cipher = fs3_core::ChunkedGcm::new(k.data_key(), nonce_base);
@@ -4010,9 +4071,16 @@ impl Engine {
                         ct.extend_from_slice(&c);
                         tags.push(tag);
                     }
-                    (ct, Some(k.build_sse_info(nonce_base, tags)))
+                    (ct, Some(k.build_sse_info(nonce_base, tags)), None)
                 }
-                None => (prefix, None),
+                None => (
+                    match &compressed_inline {
+                        Some(c) => c.clone(),
+                        None => prefix,
+                    },
+                    None,
+                    compressed_inline.map(|c| c.len() as u64),
+                ),
             };
             let etag = self.compute_etag(&inline_data);
             PartMeta {
@@ -4023,6 +4091,7 @@ impl Engine {
                 inline: Some(inline_data),
                 checksum: tee.finish(),
                 sse,
+                compressed_size: part_compressed_size,
             }
         } else {
             let mut prefixed = PrefixedReader {
@@ -4038,6 +4107,7 @@ impl Engine {
                 &mut draft,
                 write_key.as_ref(),
                 part_nonce_base,
+                part_level,
             ) {
                 Ok(v) => v,
                 Err(e) => {
@@ -4052,11 +4122,12 @@ impl Engine {
                 sse,
                 compressed_size,
             } = outcome;
-            // M13 Z1:压缩开启时 multipart 分片不受支持(见上传入口拒绝),
-            // 此处压缩输出恒 None;防御性拒绝(防未来漏网)
+            // M13 Z1:非归档会话压缩开启时 multipart 分片不受支持(见上传
+            // 入口拒绝);M16 A1:归档会话分片 = 压缩帧(part_level > 0)。
+            // 防御性断言:压缩输出只允许出现在归档会话
             debug_assert!(
-                compressed_size.is_none(),
-                "multipart part compression is unsupported in v1.4 (Z1)"
+                compressed_size.is_none() || part_level > 0,
+                "multipart part compression requires an archive-class session (ADR-19 DA1)"
             );
             debug_assert_eq!(sse.is_some(), write_key.is_some());
             self.alloc.add_object(&mut draft, &extents);
@@ -4068,6 +4139,7 @@ impl Engine {
                 inline: None,
                 checksum: tee.finish(),
                 sse,
+                compressed_size,
             };
             // 分片重传会清 completed 标记(reactivate;resend_first_finishes_last)
             let seq =
@@ -4155,6 +4227,23 @@ impl Engine {
                 "upload part SSE-C headers must not be present on an SSE-S3 multipart upload session".into(),
             ));
         }
+        // M16 A1(ADR-19 DA1):归档类会话分片 = 压缩帧(UploadPartCopy 同
+        // upload_part 口径:源明文读入 → 目标压缩帧;SSE+归档+multipart
+        // 组合显式拒绝,防御纵深)
+        let session_class = session.requested_storage_class.clone();
+        let archive_session = session_class
+            .as_deref()
+            .is_some_and(fs3_core::is_archive_class);
+        if archive_session && (session.sse_key_md5.is_some() || session.sse_s3.is_some()) {
+            return Err(Error::InvalidRequest(
+                "SSE combined with archive storage classes is not supported for multipart uploads (ADR-19 DA1)".into(),
+            ));
+        }
+        let part_level = fs3_core::archive_compression_level(
+            session_class.as_deref(),
+            self.compression_cfg.enabled,
+            self.compression_cfg.level,
+        );
         // M15 C2:源版本寻址(ADR-11 §3.4.5 对齐 CopyObject)——None = 当前
         // 版本(D1a 裁决);Some = 精确版本/null 槽;删除标记无数据面,作为
         // 复制源显式拒绝(NoSuchKey 由协议层映射)
@@ -4206,9 +4295,15 @@ impl Engine {
                 self.etag_mode,
                 write_key.as_ref(),
                 part_nonce_base,
-                0, // Copy/Complete 重加密臂不做数据压缩(M13 Z1)
+                part_level, // M16 A1:归档会话分片压缩档位(非归档 = 0)
             )?;
-            self.feed_object_plain(&mut writer, &mut draft, &src, start..end, src_sse_key)?;
+            if part_level > 0 {
+                // M16 A1:归档目标分片 = 明文流重压缩(压缩源流式解压,
+                // 避免压缩流再压缩;范围窗口按 range 裁剪)
+                self.feed_object_plaintext(&mut writer, &mut draft, &src, start..end, src_sse_key)?;
+            } else {
+                self.feed_object_plain(&mut writer, &mut draft, &src, start..end, src_sse_key)?;
+            }
             let outcome = writer.finish(self, &mut draft)?;
             let StreamWriteOutcome {
                 segments: extents,
@@ -4218,7 +4313,9 @@ impl Engine {
                 compressed_size,
             } = outcome;
             debug_assert_eq!(size, len);
-            debug_assert!(compressed_size.is_none() || self.compression_cfg.enabled);
+            debug_assert!(
+                compressed_size.is_none() || self.compression_cfg.enabled || part_level > 0
+            );
             debug_assert_eq!(sse.is_some(), write_key.is_some());
             self.alloc.add_object(&mut draft, &extents);
             let part = PartMeta {
@@ -4230,6 +4327,7 @@ impl Engine {
                 // UploadPartCopy 无请求体、无 checksum 头语义(AWS),不落值
                 checksum: None,
                 sse,
+                compressed_size,
             };
             self.meta
                 .put_part(upload_id, part_no, &part, self.alloc.to_alloc_draft(&draft))?;
@@ -4338,6 +4436,25 @@ impl Engine {
                     .into(),
             ));
         }
+        // M16 A1(ADR-19 DA1/DA4):归档会话 = 分片级压缩帧拼接(Complete
+        // 零搬运或重压缩两种组装路径,见下);SSE+归档+multipart 组合在
+        // Create/upload_part 已拒绝,此处防御纵深。真实存储类 = 会话
+        // 请求类升格(落 ObjectMeta v7 storage_class)。
+        let session_class = session.requested_storage_class.clone();
+        let archive_session = session_class
+            .as_deref()
+            .is_some_and(fs3_core::is_archive_class);
+        if archive_session && (session.sse_key_md5.is_some() || session.sse_s3.is_some()) {
+            return Err(Error::InvalidRequest(
+                "SSE combined with archive storage classes is not supported for multipart uploads (ADR-19 DA1)".into(),
+            ));
+        }
+        let archive_level = fs3_core::archive_compression_level(
+            session_class.as_deref(),
+            self.compression_cfg.enabled,
+            self.compression_cfg.level,
+        );
+        let promoted_class = fs3_core::promote_storage_class(session_class.as_deref());
         // K1-1:part 解密密钥统一视图——SSE-C 会话 = 请求客户密钥;
         // SSE-S3 会话 = 会话级 DEK 现解(内存持有,臂末擦除)
         let s3_part_key = self.session_s3_write_key(&session)?;
@@ -4479,7 +4596,9 @@ impl Engine {
                     // SSE-C 请求密钥 / SSE-S3 会话 DEK(part_data_key)
                     let mut hasher = ChecksumHasher::new(alg);
                     for (_, p) in &combined {
-                        self.read_part_plain_to(
+                        // M16 A1:归档会话分片为压缩帧,按**明文**重算
+                        // (与 GET 输出一致;非归档分片无压缩,路径等价)
+                        self.read_part_logical_to(
                             p,
                             &mut HasherSink(&mut hasher),
                             part_data_key.as_ref(),
@@ -4566,6 +4685,120 @@ impl Engine {
                     }
                 }
             }
+            // ── M16 A1(ADR-19 DA1/DA4):归档会话组装 ——
+            // a) 全 extent 且全分片压缩帧 → 零搬运拼接(段列表按序拼接,
+            //    压缩信息 = Σ 分片压缩字节;所有权从分片转移给对象);
+            // b) 其余(全内联/混合/防御性含未压缩分片)→ 逐分片解压为
+            //    明文 → 整对象按归档档位重压缩落新段(正确性优先,该
+            //    子集为小对象或异常路径)。
+            let archive_meta = if archive_session {
+                let all_extent = combined.iter().all(|(_, p)| p.inline.is_none());
+                let all_compressed = combined.iter().all(|(_, p)| p.compressed_size.is_some());
+                if all_extent && all_compressed {
+                    // 零搬运:段列表按序拼接,所有权从分片转移给对象
+                    // (无分配器变更——段仍是同一批活段,同非归档 all_extent
+                    // 路径先例;分片记录随 Complete 删除)
+                    let mut extents: Vec<Segment> = Vec::new();
+                    let mut compressed_bytes: u64 = 0;
+                    for (_, p) in &combined {
+                        extents.extend_from_slice(&p.extents);
+                        compressed_bytes += p.compressed_size.unwrap_or(0);
+                    }
+                    Some(ObjectMeta {
+                        size: total_size,
+                        etag,
+                        mtime,
+                        extents,
+                        content_type: session.content_type.clone(),
+                        user_meta: session.user_meta.clone(),
+                        inline: None,
+                        parts: part_sizes.clone(),
+                        resp_headers: session.resp_headers.clone(),
+                        version_id: target.meta_version_id(),
+                        is_delete_marker: false,
+                        tags: session.tags.clone(),
+                        sse: None,
+                        checksum: object_checksum.clone(),
+                        retention: lock.retention.clone(),
+                        legal_hold: lock.legal_hold,
+                        part_checksums: part_checksums.clone(),
+                        compressed: Some(fs3_core::CompressionInfo {
+                            algorithm: fs3_core::CompressionAlgorithm::Zstd,
+                            level: archive_level,
+                            original_size: total_size,
+                            compressed_size: compressed_bytes,
+                        }),
+                        requested_storage_class: session.requested_storage_class.clone(),
+                        storage_class: promoted_class.clone(),
+                        restore_state: None,
+                    })
+                } else {
+                    // 逐分片解压 → 整对象重压缩(明文流;SSE 会话已拒绝;
+                    // 分片逐段解压直灌 writer,无整对象内存缓冲)
+                    let mut writer = ExtentWriter::new(
+                        self.chunk_size,
+                        self.etag_mode,
+                        None,
+                        None,
+                        archive_level,
+                    )?;
+                    for (no, p) in &combined {
+                        let mut frame = Vec::with_capacity(p.compressed_size.unwrap_or(0) as usize);
+                        self.read_part_to(p, &mut frame)?;
+                        let pt = zstd::bulk::decompress(&frame, p.size as usize).map_err(|e| {
+                            Error::Meta(format!("zstd part decompress (part {no}): {e}"))
+                        })?;
+                        writer.feed(self, &mut draft, &pt)?;
+                    }
+                    let outcome = writer.finish(self, &mut draft)?;
+                    let StreamWriteOutcome {
+                        segments: extents,
+                        size,
+                        etag: _,
+                        sse,
+                        compressed_size,
+                    } = outcome;
+                    debug_assert_eq!(size, total_size);
+                    debug_assert!(sse.is_none());
+                    self.alloc.add_object(&mut draft, &extents);
+                    let mut part_segments: Vec<Segment> = Vec::new();
+                    for (_, p) in &combined {
+                        part_segments.extend(p.extents.iter().cloned());
+                    }
+                    self.alloc.release_object(&mut draft, &part_segments);
+                    self.after_release(&part_segments)?;
+                    Some(ObjectMeta {
+                        size: total_size,
+                        etag,
+                        mtime,
+                        extents,
+                        content_type: session.content_type.clone(),
+                        user_meta: session.user_meta.clone(),
+                        inline: None,
+                        parts: part_sizes.clone(),
+                        resp_headers: session.resp_headers.clone(),
+                        version_id: target.meta_version_id(),
+                        is_delete_marker: false,
+                        tags: session.tags.clone(),
+                        sse: None,
+                        checksum: object_checksum.clone(),
+                        retention: lock.retention.clone(),
+                        legal_hold: lock.legal_hold,
+                        part_checksums: part_checksums.clone(),
+                        compressed: compressed_size.map(|cs| fs3_core::CompressionInfo {
+                            algorithm: fs3_core::CompressionAlgorithm::Zstd,
+                            level: archive_level,
+                            original_size: size,
+                            compressed_size: cs,
+                        }),
+                        requested_storage_class: session.requested_storage_class.clone(),
+                        storage_class: promoted_class.clone(),
+                        restore_state: None,
+                    })
+                }
+            } else {
+                None
+            };
             // K1-1:对象级写密钥——SSE-C 会话 = 请求密钥(D-E4 同一密钥
             // 解密+重加密);SSE-S3 会话 = **新签发对象级 DEK**(当前代包裹;
             // part 解密用会话 DEK——part_data_key,两臂分离)
@@ -4579,7 +4812,9 @@ impl Engine {
                 (None, None) => None,
                 (Some(_), Some(_)) => unreachable!("SSE-C/SSE-S3 会话互斥已在上方判定"),
             };
-            let meta = if let Some(wkey) = &obj_write_key {
+            let meta = if let Some(m) = archive_meta {
+                m
+            } else if let Some(wkey) = &obj_write_key {
                 let part_dk = part_data_key
                     .as_ref()
                     .expect("encrypted session has part data key");
@@ -4656,7 +4891,11 @@ impl Engine {
                         compressed_size,
                     } = outcome;
                     debug_assert_eq!(size, total_size);
-                    debug_assert!(compressed_size.is_none() || self.compression_cfg.enabled);
+                    debug_assert!(
+                        compressed_size.is_none()
+                            || self.compression_cfg.enabled
+                            || archive_level > 0
+                    );
                     // 新段记账 + 分片旧段释放(同事务;仅请求子集)
                     let mut part_segments: Vec<Segment> = Vec::new();
                     for (_, p) in &combined {
@@ -4768,6 +5007,7 @@ impl Engine {
                     &mut draft,
                     None,
                     None,
+                    archive_level,
                 )?;
                 let StreamWriteOutcome {
                     segments: extents,
@@ -5069,6 +5309,29 @@ impl Engine {
         Ok(())
     }
 
+    /// M16 A1(ADR-19 DA1):分片**逻辑字节流**(明文语义)读入 sink——
+    /// 归档会话分片为压缩帧,解压为明文后输出;非压缩分片 = 明文直读
+    /// (SSE 解密面沿用 read_part_plain_to;归档+SSE+multipart 已在入口
+    /// 拒绝,压缩分片无解密面)。checksum FullObject 重算与归档重组装
+    /// 共用。
+    fn read_part_logical_to(
+        &mut self,
+        part: &PartMeta,
+        out: &mut dyn Write,
+        part_data_key: Option<&[u8; 32]>,
+    ) -> Result<()> {
+        if part.compressed_size.is_some() {
+            let mut frame = Vec::with_capacity(part.compressed_size.unwrap_or(0) as usize);
+            self.read_part_to(part, &mut frame)?;
+            let pt = zstd::bulk::decompress(&frame, part.size as usize)
+                .map_err(|e| Error::Meta(format!("zstd part decompress: {e}")))?;
+            out.write_all(&pt)?;
+            Ok(())
+        } else {
+            self.read_part_plain_to(part, out, part_data_key)
+        }
+    }
+
     /// 对象区间明文直灌 ExtentWriter(M11 E1-5 数据路径共用:
     /// UploadPartCopy / CopyObject 重加密臂)。源 SSE-C 加密时按对象全局
     /// 64KiB 网格逐窗验 tag 解密(read_sse_at_meta;错密钥 → Corrupt,
@@ -5099,6 +5362,139 @@ impl Engine {
             pos += n as u64;
         }
         debug_assert_eq!(pos, range.end, "feed_object_plain 窗口必须灌满区间");
+        Ok(())
+    }
+
+    /// M16 A1(ADR-19 DA1):源对象**明文流**直灌写上下文(复制/UploadPartCopy
+    /// 归档目标重压缩臂)——未压缩源 = feed_object_plain(等价);压缩源 =
+    /// 存储流(内联/逐段,SSE 按 64KiB 压缩流网格验 tag 解密)→ zstd 流式
+    /// 解压 → 明文直灌 writer(与 read_compressed_meta 同构的 sink/flush
+    /// 结构,输出目标为 writer 而非窗口;多帧流 = multipart 归档对象亦
+    /// 正确解码)。
+    fn feed_object_plaintext(
+        &mut self,
+        writer: &mut ExtentWriter,
+        draft: &mut Staged,
+        meta: &ObjectMeta,
+        range: std::ops::Range<u64>,
+        src_sse_key: Option<&fs3_core::SseCKey>,
+    ) -> Result<()> {
+        if meta.compressed.is_none() {
+            return self.feed_object_plain(writer, draft, meta, range, src_sse_key);
+        }
+        // 压缩源:存储流(解密后)→ 流式解压 → 明文窗口 [range) 直灌 writer
+        // (zstd 帧无随机访问,全量解压后按窗口裁剪——与 read_compressed_meta
+        // 同口径;窗口外解压字节丢弃)
+        let start = range.start.min(meta.size);
+        let end = range.end.min(meta.size);
+        if start >= end {
+            return Ok(());
+        }
+        let sink = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut dec = zstd::stream::write::Decoder::new(ZstdSink(sink.clone()))
+            .map_err(|e| Error::Meta(format!("zstd decoder: {e}")))?;
+        let mut window_pos = 0u64;
+        let mut feed = |this: &mut Self,
+                        writer: &mut ExtentWriter,
+                        draft: &mut Staged,
+                        buf: &[u8],
+                        window_pos: &mut u64|
+         -> fs3_core::Result<()> {
+            dec.write_all(buf)
+                .map_err(|e| Error::Meta(format!("zstd decode feed: {e}")))?;
+            let pt = std::mem::take(&mut *sink.borrow_mut());
+            if pt.is_empty() {
+                return Ok(());
+            }
+            let lo = start.max(*window_pos);
+            let hi = end.min(*window_pos + pt.len() as u64);
+            if lo < hi {
+                let s = (lo - *window_pos) as usize;
+                let e = (hi - *window_pos) as usize;
+                writer.feed(this, draft, &pt[s..e])?;
+            }
+            *window_pos += pt.len() as u64;
+            Ok(())
+        };
+        // —— 压缩流来源:内联或逐段原始字节(SSE 时按压缩流 64KiB 网格
+        // 解密,同 read_compressed_meta 口径)——
+        if let Some(inline) = &meta.inline {
+            let stored: Vec<u8> = match &meta.sse {
+                Some(sse) => {
+                    let data_key = self.sse_read_data_key(sse, src_sse_key)?;
+                    let cipher = fs3_core::ChunkedGcm::new(data_key, sse.nonce_base);
+                    let tag = sse.chunk_tags.first().ok_or_else(|| {
+                        Error::Corrupt("sse inline compressed object missing chunk tag".into())
+                    })?;
+                    let pt = cipher.decrypt_chunk(0, inline, tag).map_err(|_| {
+                        Error::Corrupt("sse inline compressed chunk authentication failed".into())
+                    })?;
+                    self.sse_decrypt_bytes
+                        .fetch_add(pt.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    pt
+                }
+                None => inline.clone(),
+            };
+            feed(self, writer, draft, &stored, &mut window_pos)?;
+        } else {
+            let mut stream_pos = 0u64;
+            for seg in &meta.extents {
+                let raw = self.read_segment_raw(seg)?;
+                let raw_len = raw.len() as u64;
+                let stored: Vec<u8> = match &meta.sse {
+                    Some(sse) => {
+                        let data_key = self.sse_read_data_key(sse, src_sse_key)?;
+                        let cipher = fs3_core::ChunkedGcm::new(data_key, sse.nonce_base);
+                        let grid = fs3_core::SSE_CHUNK_SIZE as u64;
+                        let mut off = 0usize;
+                        let mut pt = Vec::with_capacity(raw.len());
+                        while off < raw.len() {
+                            let cno = (stream_pos + off as u64) / grid;
+                            let chunk_start_in_stream = cno * grid;
+                            let in_seg = chunk_start_in_stream.saturating_sub(stream_pos) as usize;
+                            let take = grid
+                                .min(stream_pos + raw.len() as u64 - chunk_start_in_stream)
+                                as usize;
+                            let tag = sse.chunk_tags.get(cno as usize).ok_or_else(|| {
+                                Error::Corrupt(format!(
+                                    "sse chunk_tags too short ({} entries, need chunk {cno})",
+                                    sse.chunk_tags.len()
+                                ))
+                            })?;
+                            let d = cipher
+                                .decrypt_chunk(cno, &raw[in_seg..in_seg + take], tag)
+                                .map_err(|_| {
+                                    Error::Corrupt(
+                                        "sse compressed chunk authentication failed".into(),
+                                    )
+                                })?;
+                            self.sse_decrypt_bytes
+                                .fetch_add(d.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                            pt.extend_from_slice(&d);
+                            off += take;
+                        }
+                        pt
+                    }
+                    None => raw,
+                };
+                stream_pos += raw_len;
+                feed(self, writer, draft, &stored, &mut window_pos)?;
+            }
+        }
+        // 冲刷解压尾部(write::Decoder 无 finish;flush 把全部解压输出
+        // 推入 sink)
+        dec.flush()
+            .map_err(|e| Error::Meta(format!("zstd decode flush: {e}")))?;
+        let tail = std::mem::take(&mut *sink.borrow_mut());
+        if !tail.is_empty() {
+            let lo = start.max(window_pos);
+            let hi = end.min(window_pos + tail.len() as u64);
+            if lo < hi {
+                let s = (lo - window_pos) as usize;
+                let e = (hi - window_pos) as usize;
+                writer.feed(self, draft, &tail[s..e])?;
+            }
+        }
         Ok(())
     }
 
@@ -5278,6 +5674,7 @@ impl Engine {
             lock,
             None,
             None,
+            None,
         )
     }
 
@@ -5301,9 +5698,24 @@ impl Engine {
         lock: ObjectLockWrite,
         event: Option<fs3_core::EventDraft>,
         requested_storage_class: Option<String>,
+        storage_class: Option<String>,
     ) -> Result<ObjectMeta> {
         let src = self.resolve_object_entry(src_bucket, src_key, src_version, None)?;
         let (target, old) = self.plan_object_write(dst_bucket, dst_key, dst_versioning)?;
+        // M16 A1(ADR-19 DA1/DA4):复制目标真实类 = 请求头升格(显式
+        // STANDARD 头 → None),**未携带头** → 继承源真实类(AWS:复制目标
+        // 默认继承源存储类);归档目标须压缩(同存储类复制 = 源已压缩,
+        // COW 豁免;跨类 = 数据路径重压缩)。
+        let target_class = if requested_storage_class.is_some() {
+            storage_class.clone()
+        } else {
+            src.storage_class.clone()
+        };
+        let copy_level = fs3_core::archive_compression_level(
+            target_class.as_deref(),
+            self.compression_cfg.enabled,
+            self.compression_cfg.level,
+        );
 
         let mut meta = src.clone();
         meta.mtime = now_ts();
@@ -5327,6 +5739,9 @@ impl Engine {
         // M15 C1(ADR-18 D-E3):x-amz-storage-class 头 → 记录请求类;
         // 未携带 → 继承源请求类(AWS:复制目标默认继承源存储类)。
         meta.requested_storage_class = requested_storage_class.or(meta.requested_storage_class);
+        // M16 A1:真实类(请求升格或继承源;覆盖源类——复制目标类语义
+        // 由本写路径裁决,COW 共享段不改变数据形态)
+        meta.storage_class = target_class.clone();
         meta.version_id = target.meta_version_id();
         if src.is_delete_marker && target == WriteTarget::Unversioned {
             return Err(Error::InvalidArgument(format!(
@@ -5336,6 +5751,11 @@ impl Engine {
         // M11 E1-5/K1-1(DE3/DS1,矩阵见函数文档):true = 解密/加密数据
         // 路径;false = COW 直灌(段共享/内联拷贝,SseInfo 随 meta 克隆
         // 继承;SSE-S3 异代另做元数据级重包裹,见下)。
+        // M16 A1:归档目标且源非「同存储类已压缩」→ 强制数据路径
+        // (跨类/标准源须重压缩;同存储类复制豁免 = COW,DA5)。
+        let same_class_cow =
+            copy_level > 0 && src.storage_class == target_class && src.compressed.is_some();
+        let force_data_path = copy_level > 0 && !same_class_cow;
         let data_path = if src.is_delete_marker {
             false
         } else {
@@ -5373,64 +5793,116 @@ impl Engine {
                     (fs3_core::SseKind::SseS3, fs3_core::SseWriteKey::SseC(_)) => true,
                 },
             }
-        };
+        } || force_data_path;
         let mut draft = Staged::default();
         if data_path {
             // 数据路径:读源明文(源加密则逐窗验 tag 解密,密钥按 kind
             // 分派)→ 目标加密写;失败回滚已暂存分配(同 put 先例)
             let r = (|| -> Result<()> {
-                let k = sse_dst_key.expect("data path implies destination sse key");
-                if src.size <= self.small_object_limit as u64 {
-                    // 小对象内联臂:读全文明文后整体加密(同一 64KiB 网格,
+                let k = sse_dst_key;
+                // M16 A1:归档目标 + SSE 的小对象内联臂走 extent 臂
+                // (压缩×SSE 内联网格统一规则,同 put 内联路径先例)
+                let inline_arm =
+                    src.size <= self.small_object_limit as u64 && !(copy_level > 0 && k.is_some());
+                if inline_arm {
+                    // 小对象内联臂:读全文明文(get_to_meta 含解压/解密)
+                    // → (归档:压缩)→ (SSE:整体加密,同一 64KiB 网格,
                     // 内联恒单 chunk;等长,inline 容量语义不变)
                     let mut pt = Vec::with_capacity(src.size as usize);
                     self.get_to_meta(&src, 0..u64::MAX, &mut pt, sse_src_key)?;
                     debug_assert_eq!(pt.len() as u64, src.size);
-                    let mut nonce_base = [0u8; 12];
-                    random_bytes(&mut nonce_base)?;
-                    let mut cipher = fs3_core::ChunkedGcm::new(k.data_key(), nonce_base);
-                    let mut ct = Vec::with_capacity(pt.len());
-                    let mut tags = Vec::new();
-                    for (no, chunk) in pt.chunks(fs3_core::SSE_CHUNK_SIZE).enumerate() {
-                        let (c, tag) = cipher.encrypt_chunk(no as u64, chunk);
-                        ct.extend_from_slice(&c);
-                        tags.push(tag);
-                    }
-                    meta.etag = self.compute_etag(&ct);
+                    let mut compressed_info: Option<fs3_core::CompressionInfo> = None;
+                    let payload: Vec<u8> = if copy_level > 0 {
+                        let cb = zstd::bulk::compress(&pt, copy_level as i32)
+                            .map_err(|e| Error::Meta(format!("zstd copy inline compress: {e}")))?;
+                        compressed_info = Some(fs3_core::CompressionInfo {
+                            algorithm: fs3_core::CompressionAlgorithm::Zstd,
+                            level: copy_level,
+                            original_size: src.size,
+                            compressed_size: cb.len() as u64,
+                        });
+                        cb
+                    } else {
+                        pt
+                    };
+                    let (inline_data, sse) = match k {
+                        Some(k) => {
+                            let mut nonce_base = [0u8; 12];
+                            random_bytes(&mut nonce_base)?;
+                            let mut cipher = fs3_core::ChunkedGcm::new(k.data_key(), nonce_base);
+                            let mut ct = Vec::with_capacity(payload.len());
+                            let mut tags = Vec::new();
+                            for (no, chunk) in payload.chunks(fs3_core::SSE_CHUNK_SIZE).enumerate()
+                            {
+                                let (c, tag) = cipher.encrypt_chunk(no as u64, chunk);
+                                ct.extend_from_slice(&c);
+                                tags.push(tag);
+                            }
+                            (ct, Some(k.build_sse_info(nonce_base, tags)))
+                        }
+                        None => (payload, None),
+                    };
+                    meta.etag = self.compute_etag(&inline_data);
                     meta.extents = Vec::new();
-                    meta.inline = Some(ct);
-                    meta.sse = Some(k.build_sse_info(nonce_base, tags));
+                    meta.inline = Some(inline_data);
+                    meta.sse = sse;
+                    // M16 A1:数据形态已改写(明文/压缩明文/密文),压缩
+                    // 标记按实际落——修复压缩源经内联臂复制后元数据
+                    // 失真隐患(源 compressed 克隆残留)
+                    meta.compressed = compressed_info;
                 } else {
-                    // extent 臂:源明文窗口化直灌 SSE 写上下文(对象级
-                    // nonce_base 随机,None = 由 writer 自行生成)
-                    let mut writer = ExtentWriter::new(
-                        self.chunk_size,
-                        self.etag_mode,
-                        Some(k),
-                        None,
-                        0, // 重加密臂不做数据压缩(M13 Z1)
-                    )?;
-                    self.feed_object_plain(
-                        &mut writer,
-                        &mut draft,
-                        &src,
-                        0..src.size,
-                        sse_src_key,
-                    )?;
+                    // extent 臂:源明文窗口化直灌写上下文(对象级
+                    // nonce_base 随机,None = 由 writer 自行生成)。
+                    // M16 A1:归档目标(跨类)时明文流重压缩(压缩源
+                    // 流式解压);SSE 目标 + 压缩同时生效时按 DZ1 顺序
+                    // (明文 → zstd → 加密)由 ExtentWriter 统一执行。
+                    let mut writer =
+                        ExtentWriter::new(self.chunk_size, self.etag_mode, k, None, copy_level)?;
+                    if copy_level > 0 {
+                        self.feed_object_plaintext(
+                            &mut writer,
+                            &mut draft,
+                            &src,
+                            0..src.size,
+                            sse_src_key,
+                        )?;
+                    } else {
+                        self.feed_object_plain(
+                            &mut writer,
+                            &mut draft,
+                            &src,
+                            0..src.size,
+                            sse_src_key,
+                        )?;
+                    }
                     let outcome = writer.finish(self, &mut draft)?;
                     let StreamWriteOutcome {
                         segments: extents,
                         size,
                         etag,
                         sse,
-                        compressed_size: _, // 拷贝/重加密臂不做压缩(Z1)
+                        compressed_size,
                     } = outcome;
                     debug_assert_eq!(size, src.size);
+                    debug_assert!(
+                        compressed_size.is_none() || copy_level > 0,
+                        "copy extent arm compression requires an archive target (ADR-19 DA1)"
+                    );
                     self.alloc.add_object(&mut draft, &extents);
                     meta.etag = etag;
                     meta.extents = extents;
                     meta.inline = None;
                     meta.sse = sse;
+                    // M16 A1:压缩标记按实际落(重压缩臂 = 新压缩信息;
+                    // 非压缩臂 = 源压缩流原样直灌,克隆值天然保留)
+                    if copy_level > 0 {
+                        meta.compressed = compressed_size.map(|cs| fs3_core::CompressionInfo {
+                            algorithm: fs3_core::CompressionAlgorithm::Zstd,
+                            level: copy_level,
+                            original_size: size,
+                            compressed_size: cs,
+                        });
+                    }
                 }
                 Ok(())
             })();
@@ -6191,6 +6663,12 @@ struct PutCtx<'a> {
     event: Option<fs3_core::EventDraft>,
     /// M15 C1(ADR-18 D-E3):请求的存储类(统一落 STANDARD,元数据记录)。
     requested_storage_class: Option<String>,
+    /// M16 A1(ADR-19 DA4):真实存储类(协议层升格;归档三值压缩档位
+    /// 裁决依据,落 ObjectMeta v7 storage_class)。
+    storage_class: Option<String>,
+    /// M16 A1(ADR-19 DA1):本写路径压缩档位(0 = 不压缩;归档类强制,
+    /// STANDARD 随全局配置)。
+    compression_level: u32,
 }
 
 /// 版本化写入目标(ADR-11 §3.4.2;put/copy/complete 共用分叉)。

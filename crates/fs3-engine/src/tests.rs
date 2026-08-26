@@ -7022,6 +7022,7 @@ fn notification_event_same_txn_enqueue() -> Result<()> {
                 "s3:ObjectCreated:Put",
             )),
             None,
+            None,
         )
         .unwrap();
     let recs = e.meta().pending_events(10, None)?;
@@ -7064,6 +7065,7 @@ fn notification_event_same_txn_enqueue() -> Result<()> {
         draft(fs3_core::EventDraftKind::ObjectCreated(
             "s3:ObjectCreated:Put",
         )),
+        None,
         None,
     );
     assert!(
@@ -7164,6 +7166,7 @@ fn notification_event_complete_and_copy() -> Result<()> {
             key: "copy-of-mp".into(),
             kind: EventDraftKind::ObjectCreated("s3:ObjectCreated:Copy"),
         }),
+        None,
         None,
     )?;
     let recs = e.meta().pending_events(10, None)?;
@@ -7338,6 +7341,7 @@ fn storage_class_requested_recorded() -> Result<()> {
         ObjectLockWrite::default(),
         None,
         Some("STANDARD_IA".into()),
+        None,
     )?;
     assert_eq!(m.requested_storage_class.as_deref(), Some("STANDARD_IA"));
     let read = e.meta().get_object("b1", "k1")?.unwrap();
@@ -7362,6 +7366,7 @@ fn storage_class_requested_recorded() -> Result<()> {
         ObjectLockWrite::default(),
         None,
         None,
+        None,
     )?;
     assert_eq!(m2.requested_storage_class, None);
 
@@ -7380,6 +7385,7 @@ fn storage_class_requested_recorded() -> Result<()> {
         None,
         None,
         ObjectLockWrite::default(),
+        None,
         None,
         None,
     )?;
@@ -7404,6 +7410,7 @@ fn storage_class_requested_recorded() -> Result<()> {
         ObjectLockWrite::default(),
         None,
         Some("GLACIER".into()),
+        None,
     )?;
     assert_eq!(
         c2.requested_storage_class.as_deref(),

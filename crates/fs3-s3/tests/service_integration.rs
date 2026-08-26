@@ -2113,6 +2113,47 @@ fn req_qh(
     }
 }
 
+/// 流式 GET 响应体与期望字节比对(大对象 = ObjectStream,逐窗拉取)。
+fn assert_stream_eq(svc: &S3Service, r: &ServiceResponse, expect: &[u8], msg: &str) {
+    match &r.body {
+        ResponseBody::Bytes(b) => assert_eq!(b, expect, "{msg}"),
+        ResponseBody::ObjectStream {
+            bucket,
+            key,
+            version,
+            offset,
+            length,
+            ..
+        } => {
+            assert_eq!(*length, expect.len() as u64, "{msg} length");
+            let mut pos = *offset;
+            let mut got = Vec::new();
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let n = svc
+                    .read_stream_chunk(
+                        bucket,
+                        key,
+                        version.as_ref(),
+                        fs3_core::VersioningState::Off,
+                        0,
+                        expect.len() as u64,
+                        &mut pos,
+                        &mut buf,
+                        None,
+                    )
+                    .unwrap();
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(got, expect, "{msg}");
+        }
+        _ => panic!("{msg}: unexpected body"),
+    }
+}
+
 fn hdr(r: &ServiceResponse, name: &str) -> Option<String> {
     r.headers
         .iter()
@@ -9685,6 +9726,262 @@ fn c1_storage_class_requested_recorded_end_to_end() {
             "multipart 对象记录 Create 请求类"
         );
     }
+}
+
+/// M16 A1(ADR-19 DA1/DA4):PUT 存储类落地端到端——GLACIER/DEEP_ARCHIVE =
+/// zstd 高压缩档(强制压缩,与全局 compression 配置正交),GLACIER_IR =
+/// 标准档在线可读;STANDARD 系请求类不升格真实类;HEAD/GET 回显真实类;
+/// Copy 目标类语义(请求覆盖/继承源/同存储类 COW 豁免/跨类数据路径
+/// 重压缩);归档 multipart(分片压缩帧 + Complete 拼接 + 明文可读);
+/// SSE+归档+multipart 显式 400;List/Attributes 回显。
+#[test]
+fn a1_2_storage_class_landing_end_to_end() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/arc", vec![]))), 200);
+    // ① PUT GLACIER:真实类升格 + 强制高压缩档(数据可压缩)
+    let big = vec![b'A'; 2 * 1024 * 1024];
+    svc.handle(&req_h(
+        "PUT",
+        "/arc/g1",
+        &[("x-amz-storage-class", "GLACIER")],
+        big.clone(),
+    ))
+    .unwrap();
+    {
+        let e = svc.engine().read();
+        let m = e.meta().get_object("arc", "g1").unwrap().unwrap();
+        assert_eq!(m.storage_class.as_deref(), Some("GLACIER"), "真实类升格");
+        assert_eq!(m.requested_storage_class.as_deref(), Some("GLACIER"));
+        let c = m.compressed.as_ref().expect("归档对象必须压缩(DA1.4)");
+        assert_eq!(
+            c.level,
+            fs3_core::ARCHIVE_DEEP_COMPRESSION_LEVEL,
+            "GLACIER = 高压缩档"
+        );
+        assert!(c.compressed_size < m.size, "可压缩数据压缩率 > 0");
+    }
+    // HEAD/GET 回显真实类 + 数据一致(压缩对象解压读)
+    let r = svc.handle(&req("HEAD", "/arc/g1", vec![])).unwrap();
+    assert_eq!(hdr(&r, "x-amz-storage-class").as_deref(), Some("GLACIER"));
+    let g = svc.handle(&req("GET", "/arc/g1", vec![])).unwrap();
+    assert_eq!(hdr(&g, "x-amz-storage-class").as_deref(), Some("GLACIER"));
+    assert_stream_eq(&svc, &g, &big, "GLACIER GET 明文一致");
+
+    // ② PUT GLACIER_IR:标准档在线可读
+    svc.handle(&req_h(
+        "PUT",
+        "/arc/ir1",
+        &[("x-amz-storage-class", "GLACIER_IR")],
+        b"ir-data".to_vec(),
+    ))
+    .unwrap();
+    {
+        let e = svc.engine().read();
+        let m = e.meta().get_object("arc", "ir1").unwrap().unwrap();
+        assert_eq!(m.storage_class.as_deref(), Some("GLACIER_IR"));
+        let c = m.compressed.as_ref().expect("GLACIER_IR 必须压缩");
+        assert_eq!(c.level, 1, "GLACIER_IR = 标准档(全局压缩关时取 1)");
+    }
+    let r = svc.handle(&req("HEAD", "/arc/ir1", vec![])).unwrap();
+    assert_eq!(
+        hdr(&r, "x-amz-storage-class").as_deref(),
+        Some("GLACIER_IR")
+    );
+
+    // ③ STANDARD 系请求类不升格:真实类 None,回显 STANDARD
+    svc.handle(&req_h(
+        "PUT",
+        "/arc/ia1",
+        &[("x-amz-storage-class", "STANDARD_IA")],
+        b"ia".to_vec(),
+    ))
+    .unwrap();
+    {
+        let e = svc.engine().read();
+        let m = e.meta().get_object("arc", "ia1").unwrap().unwrap();
+        assert_eq!(m.storage_class, None, "STANDARD 系不升格");
+        assert_eq!(m.compressed, None, "全局压缩关 → 标准对象不压缩");
+    }
+    let r = svc.handle(&req("HEAD", "/arc/ia1", vec![])).unwrap();
+    assert_eq!(hdr(&r, "x-amz-storage-class").as_deref(), Some("STANDARD"));
+
+    // ④ Copy:STANDARD → GLACIER(请求覆盖)→ 数据路径重压缩
+    svc.handle(&req_h(
+        "PUT",
+        "/arc/c1",
+        &[
+            ("x-amz-copy-source", "/arc/ia1"),
+            ("x-amz-storage-class", "GLACIER"),
+        ],
+        vec![],
+    ))
+    .unwrap();
+    {
+        let e = svc.engine().read();
+        let m = e.meta().get_object("arc", "c1").unwrap().unwrap();
+        assert_eq!(m.storage_class.as_deref(), Some("GLACIER"));
+        let c = m.compressed.as_ref().expect("归档复制目标必须压缩");
+        assert_eq!(c.level, fs3_core::ARCHIVE_DEEP_COMPRESSION_LEVEL);
+    }
+
+    // ⑤ Copy:GLACIER → GLACIER(同存储类豁免)= COW 段共享(零解压重压缩)
+    svc.handle(&req_h(
+        "PUT",
+        "/arc/c2",
+        &[("x-amz-copy-source", "/arc/g1")],
+        vec![],
+    ))
+    .unwrap();
+    {
+        let e = svc.engine().read();
+        let (m, src) = (
+            e.meta().get_object("arc", "c2").unwrap().unwrap(),
+            e.meta().get_object("arc", "g1").unwrap().unwrap(),
+        );
+        assert_eq!(m.storage_class.as_deref(), Some("GLACIER"), "继承源类");
+        assert_eq!(m.extents, src.extents, "同存储类复制 = 段共享(COW)");
+        assert_eq!(m.compressed, src.compressed, "压缩信息继承");
+    }
+
+    // ⑥ Copy:GLACIER → STANDARD(请求覆盖)→ 真实类 None,压缩流保留
+    svc.handle(&req_h(
+        "PUT",
+        "/arc/c3",
+        &[
+            ("x-amz-copy-source", "/arc/g1"),
+            ("x-amz-storage-class", "STANDARD"),
+        ],
+        vec![],
+    ))
+    .unwrap();
+    {
+        let e = svc.engine().read();
+        let m = e.meta().get_object("arc", "c3").unwrap().unwrap();
+        assert_eq!(m.storage_class, None, "目标 STANDARD 不保留归档类");
+        assert!(m.compressed.is_some(), "压缩流原样继承(压缩标准对象)");
+        let g = svc.handle(&req("GET", "/arc/c3", vec![])).unwrap();
+        assert_stream_eq(&svc, &g, &big, "压缩标准对象可读");
+    }
+
+    // ⑦ 归档 multipart:Create(GLACIER)+ UploadPart(压缩帧)+ Complete
+    //    零搬运拼接;GET 明文往返
+    let up = svc.handle(&req_qh(
+        "POST",
+        "/arc/mp",
+        &[("uploads", "")],
+        &[("x-amz-storage-class", "GLACIER")],
+        vec![],
+    ));
+    let up_xml = std::str::from_utf8(&match up.unwrap().body {
+        ResponseBody::Bytes(b) => b,
+        _ => panic!("init must return bytes"),
+    })
+    .unwrap()
+    .to_string();
+    let uid = extract(&up_xml, "UploadId");
+    let mut etags = Vec::new();
+    for n in 1..=2u32 {
+        let part_data = vec![b'B'; 6 * 1024 * 1024];
+        let part = svc
+            .handle(&req_qh(
+                "PUT",
+                "/arc/mp",
+                &[("partNumber", &n.to_string()), ("uploadId", &uid)],
+                &[],
+                part_data.clone(),
+            ))
+            .unwrap();
+        let etag = hdr(&part, "etag").unwrap();
+        etags.push((n, etag, part_data));
+    }
+    // Complete 前取分片压缩字节(零搬运拼接的 Σ 断言输入)
+    let part_compressed: u64 = {
+        let e = svc.engine().read();
+        e.meta()
+            .list_parts(&uid)
+            .unwrap()
+            .iter()
+            .map(|(_, p)| p.compressed_size.unwrap_or(0))
+            .sum()
+    };
+    assert!(part_compressed > 0, "归档分片必须压缩帧");
+    let cp_body = format!(
+        "<CompleteMultipartUpload>{}</CompleteMultipartUpload>",
+        etags
+            .iter()
+            .map(|(n, e, _)| format!("<Part><PartNumber>{n}</PartNumber><ETag>{e}</ETag></Part>"))
+            .collect::<String>()
+    );
+    svc.handle(&req_q(
+        "POST",
+        "/arc/mp",
+        &[("uploadId", &uid)],
+        cp_body.into_bytes(),
+    ))
+    .unwrap();
+    {
+        let e = svc.engine().read();
+        let m = e.meta().get_object("arc", "mp").unwrap().unwrap();
+        assert_eq!(m.storage_class.as_deref(), Some("GLACIER"));
+        let c = m.compressed.as_ref().expect("归档 multipart 必须压缩");
+        assert_eq!(c.level, fs3_core::ARCHIVE_DEEP_COMPRESSION_LEVEL);
+        assert_eq!(c.original_size, 12 * 1024 * 1024);
+        // 压缩帧拼接:Σ 分片压缩字节 == 对象压缩字节(零搬运路径)
+        assert_eq!(c.compressed_size, part_compressed);
+    }
+    let expect_all: Vec<u8> = etags.iter().flat_map(|(_, _, d)| d.clone()).collect();
+    let g = svc.handle(&req("GET", "/arc/mp", vec![])).unwrap();
+    assert_stream_eq(&svc, &g, &expect_all, "multipart 归档明文往返");
+
+    // ⑧ SSE-C + 归档 + multipart → 显式 400(DA1.5)
+    let up2 = svc.handle(&req_qh(
+        "POST",
+        "/arc/mp2",
+        &[("uploads", "")],
+        &[
+            ("x-amz-storage-class", "GLACIER"),
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            (
+                "x-amz-server-side-encryption-customer-key",
+                "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+            ),
+            (
+                "x-amz-server-side-encryption-customer-key-MD5",
+                "4R7sE7cWq4I6QxJ7mHlzOw==",
+            ),
+        ],
+        vec![],
+    ));
+    assert_eq!(status(&up2), 400, "SSE+归档+multipart 显式拒绝");
+
+    // ⑨ ListObjectsV2 + GetObjectAttributes 回显真实类
+    let l = svc
+        .handle(&req_q("GET", "/arc", &[("list-type", "2")], vec![]))
+        .unwrap();
+    let lx = std::str::from_utf8(&match &l.body {
+        ResponseBody::Bytes(b) => b.clone(),
+        _ => panic!("list must return bytes"),
+    })
+    .unwrap()
+    .to_string();
+    assert!(lx.contains("<StorageClass>GLACIER</StorageClass>"), "{lx}");
+    assert!(lx.contains("<StorageClass>STANDARD</StorageClass>"), "{lx}");
+    let attrs = svc
+        .handle(&req_qh(
+            "GET",
+            "/arc/g1",
+            &[("attributes", "")],
+            &[("x-amz-object-attributes", "StorageClass")],
+            vec![],
+        ))
+        .unwrap();
+    let ax = std::str::from_utf8(&match &attrs.body {
+        ResponseBody::Bytes(b) => b.clone(),
+        _ => panic!("attrs must return bytes"),
+    })
+    .unwrap()
+    .to_string();
+    assert!(ax.contains("<StorageClass>GLACIER</StorageClass>"), "{ax}");
 }
 
 /// H1-1:KeyTooLongError 触发路径——键 UTF-8 字节长 >1024 → 400

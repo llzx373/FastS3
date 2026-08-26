@@ -313,6 +313,10 @@ pub struct PartDto {
     /// 校验子(D-E5),无密钥材料;旧导出无此字段 → None)。
     #[serde(default)]
     pub sse: Option<fs3_core::SseInfo>,
+    /// M16 A1(ADR-19 DA1):分片压缩后字节数(归档会话分片 = 压缩帧;
+    /// 旧导出无此字段 → None)。
+    #[serde(default)]
+    pub compressed_size: Option<u64>,
 }
 
 impl PartDto {
@@ -329,6 +333,7 @@ impl PartDto {
                 .map(|d| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, d)),
             checksum: p.checksum.clone(),
             sse: p.sse.clone(),
+            compressed_size: p.compressed_size,
         }
     }
 
@@ -348,6 +353,7 @@ impl PartDto {
             },
             checksum: self.checksum.clone(),
             sse: self.sse.clone(),
+            compressed_size: self.compressed_size,
         })
     }
 }

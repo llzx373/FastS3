@@ -254,6 +254,10 @@ pub struct PartMeta {
     /// None = 未加密分片)。客户密钥零落盘——此处只有 nonce/tag/key_md5
     /// 校验子(D-E5),无密钥材料。
     pub sse: Option<fs3_core::SseInfo>,
+    /// M16 A1(ADR-19 DA1):分片压缩后字节数(归档类会话分片 = 压缩帧,
+    /// Complete 零搬运拼接时需 Σ 各分片压缩字节数;None = 未压缩分片)。
+    /// 尾部追加字段,decode_part 四层回退,存量分片按 None。
+    pub compressed_size: Option<u64>,
 }
 
 impl PartMeta {
@@ -1060,6 +1064,8 @@ fn decode_session(v: &[u8]) -> Result<MultipartSession> {
 /// 不会误判;照 decode_session / ObjectMeta v2→v3 先例)。
 /// M11 E1-4(ADR-12 D-E4):尾部再追加 `sse` 字段,回退链扩为三层(含
 /// checksum 无 sse 的格式 → sse None = 未加密分片)。
+/// M16 A1(ADR-19 DA1):尾部再追加 `compressed_size` 字段,回退链扩为
+/// 四层(含 checksum+sse 无 compressed_size 的格式 → None = 未压缩分片)。
 fn decode_part(v: &[u8]) -> Result<PartMeta> {
     /// 旧格式(v1.1.0;无 checksum/sse 尾部字段;双读回退用)。
     #[derive(serde::Serialize, serde::Deserialize)]
@@ -1080,9 +1086,21 @@ fn decode_part(v: &[u8]) -> Result<PartMeta> {
         inline: Option<Vec<u8>>,
         checksum: Option<fs3_core::ChecksumInfo>,
     }
+    /// M16 A1 前分片格式(含 checksum + sse,无 compressed_size;A1-2
+    /// 回退用)。
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct PartMetaV15 {
+        size: u64,
+        etag: [u8; 16],
+        mtime: i64,
+        extents: Vec<Segment>,
+        inline: Option<Vec<u8>>,
+        checksum: Option<fs3_core::ChecksumInfo>,
+        sse: Option<fs3_core::SseInfo>,
+    }
     match postcard::from_bytes::<PartMeta>(v) {
         Ok(p) => Ok(p),
-        Err(_) => match postcard::from_bytes::<PartMetaV12>(v) {
+        Err(_) => match postcard::from_bytes::<PartMetaV15>(v) {
             Ok(p) => Ok(PartMeta {
                 size: p.size,
                 etag: p.etag,
@@ -1090,21 +1108,35 @@ fn decode_part(v: &[u8]) -> Result<PartMeta> {
                 extents: p.extents,
                 inline: p.inline,
                 checksum: p.checksum,
-                sse: None,
+                sse: p.sse,
+                compressed_size: None,
             }),
-            Err(_) => {
-                let l: LegacyPartMeta = postcard::from_bytes(v)
-                    .map_err(|e| Error::Corrupt(format!("postcard decode part meta: {e}")))?;
-                Ok(PartMeta {
-                    size: l.size,
-                    etag: l.etag,
-                    mtime: l.mtime,
-                    extents: l.extents,
-                    inline: l.inline,
-                    checksum: None,
+            Err(_) => match postcard::from_bytes::<PartMetaV12>(v) {
+                Ok(p) => Ok(PartMeta {
+                    size: p.size,
+                    etag: p.etag,
+                    mtime: p.mtime,
+                    extents: p.extents,
+                    inline: p.inline,
+                    checksum: p.checksum,
                     sse: None,
-                })
-            }
+                    compressed_size: None,
+                }),
+                Err(_) => {
+                    let l: LegacyPartMeta = postcard::from_bytes(v)
+                        .map_err(|e| Error::Corrupt(format!("postcard decode part meta: {e}")))?;
+                    Ok(PartMeta {
+                        size: l.size,
+                        etag: l.etag,
+                        mtime: l.mtime,
+                        extents: l.extents,
+                        inline: l.inline,
+                        checksum: None,
+                        sse: None,
+                        compressed_size: None,
+                    })
+                }
+            },
         },
     }
 }
@@ -5152,6 +5184,7 @@ mod tests {
             inline: None,
             checksum: None,
             sse: None,
+            compressed_size: None,
         };
         s.put_part(uid, 1, &part, AllocDraft::default()).unwrap();
         let objs = s.snapshot_all_objects().unwrap();
@@ -5199,6 +5232,7 @@ mod tests {
             inline: Some(vec![1u8; 5]),
             checksum: Some(ck.clone()),
             sse: None,
+            compressed_size: None,
         };
         s.put_part(uid, 1, &part, AllocDraft::default()).unwrap();
         // 新格式往返(checksum 原样)
@@ -5268,6 +5302,7 @@ mod tests {
             inline: Some(vec![1u8; 5]),
             checksum: None,
             sse: Some(sse.clone()),
+            compressed_size: None,
         };
         s.put_part(uid, 1, &part, AllocDraft::default()).unwrap();
         // 新格式往返(sse 原样)
@@ -5895,6 +5930,7 @@ mod tests {
             inline: Some(vec![0u8; 200]),
             checksum: None,
             sse: None,
+            compressed_size: None,
         };
         s.put_part(uid, 1, &part, AllocDraft::default()).unwrap();
         let mut mm = object_meta(200);
@@ -6510,6 +6546,7 @@ mod tests {
                 inline: Some(vec![0u8; 5]),
                 checksum: None,
                 sse: None,
+                compressed_size: None,
             };
             s.put_part(uid, 1, &part, AllocDraft::default()).unwrap();
             part

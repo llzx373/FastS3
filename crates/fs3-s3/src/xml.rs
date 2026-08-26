@@ -638,7 +638,12 @@ pub fn render_get_object_attributes(
         let _ = write!(xml, "<ObjectSize>{}</ObjectSize>", meta.size);
     }
     if attrs.storage_class {
-        let _ = write!(xml, "<StorageClass>STANDARD</StorageClass>");
+        // M16 A1(ADR-19 DA1):真实存储类(归档三值;STANDARD = None 缺省)
+        let _ = write!(
+            xml,
+            "<StorageClass>{}</StorageClass>",
+            meta.storage_class_name()
+        );
     }
     let _ = write!(xml, "</GetObjectAttributesOutput>");
     xml
@@ -733,7 +738,7 @@ pub fn render_list_multipart_uploads(
     upload_id_marker: Option<&str>,
     max_uploads: u32,
     owner: &str,
-    uploads: &[(String, String, i64)],
+    uploads: &[(String, String, i64, String)],
     is_truncated: bool,
     next_key_marker: Option<&str>,
     next_upload_id_marker: Option<&str>,
@@ -756,7 +761,7 @@ pub fn render_list_multipart_uploads(
     xml.push_str(if is_truncated { "true" } else { "false" });
     xml.push_str("</IsTruncated>");
     let _ = write!(xml, "<Prefix>{}</Prefix>", escape_xml(prefix));
-    for (key, uid, created) in uploads {
+    for (key, uid, created, class) in uploads {
         let _ = write!(
             xml,
             "<Upload><Key>{}</Key><UploadId>{}</UploadId>",
@@ -777,7 +782,8 @@ pub fn render_list_multipart_uploads(
         );
         let _ = write!(
             xml,
-            "<StorageClass>STANDARD</StorageClass><Initiated>{}</Initiated></Upload>",
+            "<StorageClass>{}</StorageClass><Initiated>{}</Initiated></Upload>",
+            class,
             ts_to_rfc3339(*created)
         );
     }
@@ -978,11 +984,12 @@ fn render_contents(
     let _ = write!(
         xml,
         "<Contents><Key>{}</Key><LastModified>{}</LastModified><ETag>&quot;{}&quot;</ETag>\
-         <Size>{}</Size><StorageClass>STANDARD</StorageClass>",
+         <Size>{}</Size><StorageClass>{}</StorageClass>",
         escape_xml(key),
         ts_to_rfc3339(meta.mtime),
         meta.etag_full(),
-        meta.size
+        meta.size,
+        meta.storage_class_name()
     );
     if include_owner {
         let _ = write!(
@@ -1236,7 +1243,7 @@ pub fn render_list_object_versions(
                 xml,
                 "<Version><Key>{}</Key><VersionId>{}</VersionId><IsLatest>{}</IsLatest>\
                  <LastModified>{}</LastModified><ETag>&quot;{}&quot;</ETag><Size>{}</Size>\
-                 <StorageClass>STANDARD</StorageClass>\
+                 <StorageClass>{}</StorageClass>\
                  <Owner><ID>{}</ID><DisplayName>{}</DisplayName></Owner></Version>",
                 escape_xml(&key),
                 vid(&e.vk),
@@ -1244,6 +1251,7 @@ pub fn render_list_object_versions(
                 ts_to_rfc3339(e.meta.mtime),
                 e.meta.etag_full(),
                 e.meta.size,
+                e.meta.storage_class_name(),
                 escape_xml(owner),
                 escape_xml(owner)
             );
