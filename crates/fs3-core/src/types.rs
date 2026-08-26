@@ -805,6 +805,92 @@ pub struct LifecycleRule {
     pub legacy_prefix: bool,
 }
 
+/// 通知目标容器形态(AWS 三形态;M15 N1,ADR-18 D-E4)。
+///
+/// AWS PutBucketNotificationConfiguration 的目标容器有三种:
+/// `TopicConfiguration`(SNS)/ `QueueConfiguration`(SQS)/
+/// `CloudFunctionConfiguration`(Lambda)。FastS3 v2.1 为 Webhook 起步 —
+/// 三种容器全部接受,语义统一映射为 Webhook 目标(URL 元素内为
+/// http/https 端点);容器形态原样存储以便 GET 回渲染(AWS 按原始
+/// 文档形态往返)。SQS/SNS/Lambda ARN 目标 = 显式拒绝(InvalidArgument,
+/// 非静默;SNS/SQS/EventBridge 目标形态后置评估)。
+/// 变体序 = postcard 编码序,只允许尾部追加(演进纪律)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotificationTargetKind {
+    Topic,
+    Queue,
+    CloudFunction,
+}
+
+/// 通知键过滤(AWS Filter/S3Key/FilterRule;M15 N1)。
+/// 两规则上限:prefix 与 suffix 各至多一条(AWS 语义;重叠前缀/后缀
+/// 不支持——协议层显式拒绝)。`None` 字段 = 未过滤。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationKeyFilter {
+    /// 键前缀(如 "images/";≤1024 字符 AWS 上限)。
+    pub prefix: Option<String>,
+    /// 键后缀(如 ".jpg";≤1024 字符 AWS 上限)。
+    pub suffix: Option<String>,
+}
+
+impl NotificationKeyFilter {
+    /// 事件键是否命中过滤(空过滤器 = 全键命中)。
+    pub fn matches(&self, key: &str) -> bool {
+        if let Some(p) = &self.prefix {
+            if !key.starts_with(p.as_str()) {
+                return false;
+            }
+        }
+        if let Some(s) = &self.suffix {
+            if !key.ends_with(s.as_str()) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// 事件通知规则(M15 N1;ADR-18 D-E1/D-E4;每条规则一键
+/// `n:{bucket}\0{rule_id}`,值 = postcard(NotificationRule);规则变更 =
+/// 单事务整体替换(读旧写新,同 DL1 先例)。事件集 = ObjectCreated:* /
+/// ObjectRemoved:* / Restore* / Lifecycle* 起步(N2 入队口径)。
+/// 演进纪律:结构只许尾部追加字段/变体(postcard 序)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationRule {
+    /// 规则 ID(桶内唯一,非空,≤ 255 字符;AWS 为可选——缺省时协议层
+    /// 自动生成随机 ID,键按 rule_id 寻址不变)。
+    pub id: String,
+    /// 订阅事件集(AWS 事件名,如 "s3:ObjectCreated:*";协议层白名单
+    /// 校验,非法事件 → InvalidArgument)。
+    pub events: Vec<String>,
+    /// 目标容器形态(回渲染用)。
+    pub kind: NotificationTargetKind,
+    /// Webhook 目标 URL(http/https;协议层校验)。
+    pub url: String,
+    /// Webhook HMAC-SHA256 签名密钥(可选;空 = 不签名。FastS3 扩展
+    /// 元素 `<FastS3WebhookSecretKey>` 指定;仅入配置值,零日志/零审计)。
+    pub hmac_key: Option<String>,
+    /// 启用态(ADR-18 D-E4 存储口径;XML 无此字段,AWS 语义 = 配置即
+    /// 启用,恒 true 落盘;为后续管理面暂停/恢复预留)。
+    pub enabled: bool,
+    /// 键过滤(AWS Filter;不配置 = 全键)。
+    pub filter: NotificationKeyFilter,
+}
+
+impl NotificationRule {
+    /// 事件是否命中订阅(通配符语义:AWS 事件名 "s3:ObjectCreated:*"
+    /// 的 `*` 匹配任意子事件;精确名全等匹配)。
+    pub fn event_match(&self, event: &str) -> bool {
+        self.events.iter().any(|e| {
+            if let Some(prefix) = e.strip_suffix('*') {
+                event.starts_with(prefix)
+            } else {
+                e == event
+            }
+        })
+    }
+}
+
 impl BucketMeta {
     /// 编码为值格式:`[version: u8] + postcard(Self)`(M10 起写入恒 v2)。
     pub fn encode_value(&self) -> Result<Vec<u8>> {

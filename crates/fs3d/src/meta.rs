@@ -407,6 +407,17 @@ pub struct BucketDto {
     /// 规则逐条重写。旧导出无此字段 → None = 无配置)。
     #[serde(default)]
     pub lifecycle: Option<String>,
+    /// 事件通知规则集(M15 N1;ADR-18 D-E4 `n:` 两段式键;**规范化 XML
+    /// 字符串**,同 lifecycle 先例;导入时重新解析为规则逐条重写。
+    /// 旧导出无此字段 → None = 无配置)。
+    ///
+    /// 演进纪律三处联动(DESIGN-FUTURE §2.2):`n:`/`e:` 新一级前缀登记于
+    /// fs3-meta keys.rs 前缀表(一处);本 DTO 承载 `n:` 配置文档、`e:` 事件
+    /// 队列**不入导出**(瞬态投递态,同 s:audit 口径——重启后续投,迁移
+    /// 属运维操作,任务态不跨迁移保真)(二处);check 可达性扫描只读
+    /// `o:`/`p:` 段引用键,对 `n:`/`e:` 天然安全(三处,keys.rs 注释登记)。
+    #[serde(default)]
+    pub notification: Option<String>,
 }
 
 /// 导出文件顶层结构。
@@ -494,6 +505,13 @@ pub fn run_meta_export(
                 .ok()
                 .filter(|rules| !rules.is_empty())
                 .map(|rules| fs3_s3::xml::render_lifecycle_configuration(&rules));
+            // M15 N1(ADR-18 D-E4):事件通知规则集 → 规范化 XML
+            // (n: 两段式键;无规则 → None;同 lifecycle 先例)
+            let notification = store
+                .get_notification_rules(&name)
+                .ok()
+                .filter(|rules| !rules.is_empty())
+                .map(|rules| fs3_s3::xml::render_notification_configuration(&rules));
             BucketDto {
                 name: name.clone(),
                 created: m.created,
@@ -512,6 +530,7 @@ pub fn run_meta_export(
                 ownership_controls: conf(fs3_meta::BucketConf::Ownership),
                 policy: conf(fs3_meta::BucketConf::Policy),
                 lifecycle,
+                notification,
             }
         })
         .collect();
@@ -696,6 +715,18 @@ pub fn run_meta_import(
                     ))
                 })?;
             store.put_lifecycle_rules(&b.name, &rules)?;
+        }
+        // M15 N1(ADR-18 D-E4):事件通知规则集恢复——规范化 XML 重新解析
+        // (协议层同一份校验)后整体写入;无配置 → 保持无规则
+        if let Some(doc) = &b.notification {
+            let rules =
+                fs3_s3::xml::parse_notification_configuration(doc.as_bytes()).map_err(|e| {
+                    fs3_core::Error::InvalidArgument(format!(
+                        "bucket {} notification document invalid: {e}",
+                        b.name
+                    ))
+                })?;
+            store.put_notification_rules(&b.name, &rules)?;
         }
     }
 
@@ -1376,6 +1407,12 @@ mod tests {
             )
             .unwrap();
             m.put_lifecycle_rules("b1", &rules).unwrap();
+            // M15 N1:事件通知规则(Webhook + Filter + 扩展密钥,三形态)
+            let nrules = fs3_s3::xml::parse_notification_configuration(
+                br#"<NotificationConfiguration><TopicConfiguration><Id>nt1</Id><Event>s3:ObjectCreated:*</Event><Topic>http://127.0.0.1:8080/hook</Topic><FastS3WebhookSecretKey>k1</FastS3WebhookSecretKey></TopicConfiguration><QueueConfiguration><Id>nt2</Id><Event>s3:ObjectRemoved:Delete</Event><Queue>http://127.0.0.1:8081/q</Queue><Filter><S3Key><FilterRule><Name>prefix</Name><Value>logs/</Value></FilterRule></S3Key></Filter></QueueConfiguration></NotificationConfiguration>"#,
+            )
+            .unwrap();
+            m.put_notification_rules("b1", &nrules).unwrap();
             e.close().unwrap();
         }
         let export = dir.path().join("export.json");
@@ -1399,6 +1436,21 @@ mod tests {
         assert!(
             lc.contains("<ID>r1</ID>") && lc.contains("<ID>r2</ID>"),
             "{lc}"
+        );
+        // 事件通知:规范化 XML 导出(含扩展密钥与 Filter 回渲染)
+        let nc = b["notification"].as_str().expect("notification 字段应导出");
+        assert!(
+            nc.contains("<Id>nt1</Id>") && nc.contains("<Id>nt2</Id>"),
+            "{nc}"
+        );
+        assert!(nc.contains("http://127.0.0.1:8080/hook"), "{nc}");
+        assert!(
+            nc.contains("<FastS3WebhookSecretKey>k1</FastS3WebhookSecretKey>"),
+            "{nc}"
+        );
+        assert!(
+            nc.contains("<Name>prefix</Name><Value>logs/</Value>"),
+            "{nc}"
         );
 
         std::fs::copy(&img1, &img2).unwrap();
@@ -1436,6 +1488,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(e2.meta().get_lifecycle_rules("b1").unwrap(), rules);
+        // 事件通知规则集导入后与导出前逐字段相等
+        let nrules = fs3_s3::xml::parse_notification_configuration(
+            br#"<NotificationConfiguration><TopicConfiguration><Id>nt1</Id><Event>s3:ObjectCreated:*</Event><Topic>http://127.0.0.1:8080/hook</Topic><FastS3WebhookSecretKey>k1</FastS3WebhookSecretKey></TopicConfiguration><QueueConfiguration><Id>nt2</Id><Event>s3:ObjectRemoved:Delete</Event><Queue>http://127.0.0.1:8081/q</Queue><Filter><S3Key><FilterRule><Name>prefix</Name><Value>logs/</Value></FilterRule></S3Key></Filter></QueueConfiguration></NotificationConfiguration>"#,
+        )
+        .unwrap();
+        assert_eq!(e2.meta().get_notification_rules("b1").unwrap(), nrules);
         e2.abort();
     }
 

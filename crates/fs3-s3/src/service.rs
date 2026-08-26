@@ -1220,6 +1220,16 @@ impl S3Service {
             Operation::DeleteBucketLifecycleConfiguration { bucket } => {
                 Ok(self.op_delete_bucket_lifecycle(&bucket)?)
             }
+            // —— M15 N1:桶事件通知(ADR-18 D-E4;`n:` 键) ——
+            Operation::PutBucketNotificationConfiguration { bucket, rules } => {
+                Ok(self.op_put_bucket_notification(&bucket, &rules)?)
+            }
+            Operation::GetBucketNotificationConfiguration { bucket } => {
+                Ok(self.op_get_bucket_notification(&bucket)?)
+            }
+            Operation::DeleteBucketNotificationConfiguration { bucket } => {
+                Ok(self.op_delete_bucket_notification(&bucket)?)
+            }
             // —— M10 S4:POST 表单上传 ——
             Operation::PostObject { bucket } => self.op_post_object(req, &bucket),
             Operation::ListObjectVersions {
@@ -2690,6 +2700,66 @@ impl S3Service {
         engine
             .meta()
             .delete_lifecycle_rules(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        Ok(ServiceResponse {
+            status: 204,
+            headers: vec![],
+            body: ResponseBody::Empty,
+        })
+    }
+
+    // ───────────────── M15 N1:桶事件通知(ADR-18 D-E4;`n:{bucket}\0{rule_id}` 键) ─────────────────
+
+    /// PutBucketNotificationConfiguration:规则集路由层已解析校验
+    /// (Webhook 起步),单事务整体替换落 `n:` 键(同 DL1 先例)。
+    /// AWS 返回 200(空 body);桶不存在 → NoSuchBucket。
+    fn op_put_bucket_notification(
+        &self,
+        bucket: &str,
+        rules: &[fs3_core::NotificationRule],
+    ) -> Result<ServiceResponse, S3Error> {
+        let engine = self.engine.write();
+        engine
+            .meta()
+            .put_notification_rules(bucket, rules)
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        Ok(ServiceResponse {
+            status: 200,
+            headers: vec![],
+            body: ResponseBody::Empty,
+        })
+    }
+
+    /// GetBucketNotificationConfiguration:无配置 → 200 + 空
+    /// NotificationConfiguration 根(AWS 现状口径,botocore 模型无
+    /// NoSuchNotificationConfiguration 错误);桶不存在 → NoSuchBucket。
+    /// 响应 = 规范化 XML(规则序 = rule_id 字典序)。
+    fn op_get_bucket_notification(&self, bucket: &str) -> Result<ServiceResponse, S3Error> {
+        let engine = self.engine.read();
+        if engine
+            .meta()
+            .get_bucket(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?
+            .is_none()
+        {
+            return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
+        }
+        let rules = engine
+            .meta()
+            .get_notification_rules(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        Ok(Self::xml_response(xml::render_notification_configuration(
+            &rules,
+        )))
+    }
+
+    /// DeleteBucketNotificationConfiguration:AWS 幂等口径——无配置同样
+    /// 204(AWS 语义:删除通知配置);桶不存在 → NoSuchBucket。
+    fn op_delete_bucket_notification(&self, bucket: &str) -> Result<ServiceResponse, S3Error> {
+        let engine = self.engine.write();
+        engine
+            .meta()
+            .delete_notification_rules(bucket)
             .map_err(|e| map_engine_error(e, bucket, ""))?;
         Ok(ServiceResponse {
             status: 204,
@@ -6166,6 +6236,17 @@ fn route_op_bucket_key(req: &S3Request) -> (fs3_core::metrics::Op, String, Strin
         ("PUT", _, "") if has_q("lifecycle") => (Op::Other, "PutLifecycleConfiguration"),
         ("GET", _, "") if has_q("lifecycle") => (Op::Other, "GetLifecycleConfiguration"),
         ("DELETE", _, "") if has_q("lifecycle") => (Op::Other, "DeleteLifecycleConfiguration"),
+        // M15 N1:事件通知子资源审计名(AWS IAM 动作名
+        // s3:{Put,Get,Delete}BucketNotificationConfiguration)
+        ("PUT", _, "") if has_q("notification") => {
+            (Op::Other, "PutBucketNotificationConfiguration")
+        }
+        ("GET", _, "") if has_q("notification") => {
+            (Op::Other, "GetBucketNotificationConfiguration")
+        }
+        ("DELETE", _, "") if has_q("notification") => {
+            (Op::Other, "DeleteBucketNotificationConfiguration")
+        }
         ("PUT", _, "") if has_q("object-lock") => (Op::Other, "PutObjectLockConfiguration"),
         ("GET", _, "") if has_q("object-lock") => (Op::Other, "GetObjectLockConfiguration"),
         // M10 V3:版本化子资源审计名

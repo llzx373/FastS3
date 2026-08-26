@@ -112,6 +112,21 @@ pub enum Operation {
     DeleteBucketLifecycleConfiguration {
         bucket: String,
     },
+    // —— 桶事件通知(M15 N1;ADR-18 D-E4,`n:{bucket}\0{rule_id}` 键) ——
+    /// PUT ?notification:规则集路由层已解析校验(Webhook 起步;非法目标/
+    /// 事件 → InvalidArgument/MalformedXML 显式报错)。AWS 现名
+    /// PutBucketNotificationConfiguration,旧名 PutBucketNotification
+    /// 同线格式同语义,单路由承载。
+    PutBucketNotificationConfiguration {
+        bucket: String,
+        rules: Vec<fs3_core::NotificationRule>,
+    },
+    GetBucketNotificationConfiguration {
+        bucket: String,
+    },
+    DeleteBucketNotificationConfiguration {
+        bucket: String,
+    },
     /// POST 表单上传(M10 S4;浏览器 POST policy)。仅 multipart/form-data
     /// 在服务层受理;其他 Content-Type 维持原 MethodNotAllowed。
     PostObject {
@@ -645,6 +660,21 @@ impl Router {
                     _ => Err(S3Error::new(S3ErrorCode::MethodNotAllowed)),
                 };
             }
+            // M15 N1:桶事件通知(ADR-18 D-E4;`n:` 键;XML body 路由层解析
+            // 校验——Webhook 起步,非法目标/事件显式报错;?notification
+            // 新旧参数名同线格式同语义,单路由承载(PutBucketNotification 旧名
+            // 与 PutBucketNotificationConfiguration 新名共用 query param))
+            if has_q("notification") {
+                return match method {
+                    "PUT" => Ok(Operation::PutBucketNotificationConfiguration {
+                        bucket,
+                        rules: crate::xml::parse_notification_configuration(body)?,
+                    }),
+                    "GET" => Ok(Operation::GetBucketNotificationConfiguration { bucket }),
+                    "DELETE" => Ok(Operation::DeleteBucketNotificationConfiguration { bucket }),
+                    _ => Err(S3Error::new(S3ErrorCode::MethodNotAllowed)),
+                };
+            }
             // 不支持/未实现的子资源
             for unsupported in [
                 "acl",
@@ -654,7 +684,8 @@ impl Router {
                 // "lifecycle" 自 M11 L1 起已实现(Put/Get/DeleteBucketLifecycle-
                 // Configuration),出表接线
                 "website",
-                "notification",
+                // "notification" 自 M15 N1 起已实现(Put/Get/DeleteBucketNotifica-
+                // tionConfiguration),出表接线
                 "replication",
                 "requestPayment",
                 "logging",

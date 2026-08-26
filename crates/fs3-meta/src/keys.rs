@@ -15,6 +15,11 @@
 //! - `bp:{bucket}` 桶策略文档(M10 S3;ADR-11 D9,值 = 原始 JSON 文本)
 //! - `r:{bucket}\0{rule_id}` 生命周期规则(M11 L1;ADR-12 DL1,值 =
 //!   postcard LifecycleRule;单事务整体替换;两段式同 `m:` 先例)
+//! - `n:{bucket}\0{rule_id}` 事件通知规则(M15 N1;ADR-18 D-E4,值 =
+//!   postcard NotificationRule;单事务整体替换;两段式同 `r:` 先例)
+//! - `e:{seq be64}` 事件队列条目(M15 N2;ADR-18 D-E1;值 = postcard
+//!   EventRecord;be64 字典序 = 写入序;有界环形批量截断;入队与数据
+//!   操作同事务——崩溃零漂移)
 //!
 //! s: 前缀下的系统键:`s:seq`(单调计数器)、`s:key_seed_salt`(M3)、
 //! `s:value_rewrite_v3_done`(M10 V5-3 值格式重写完成标记)、
@@ -60,6 +65,17 @@ pub const PREFIX_KEY: &[u8] = b"k:";
 /// LifecycleRule;每条规则一键,规则变更 = 单事务整体替换;删桶事务前缀
 /// 扫描清理——两段式桶级键,故不在 BucketConf::ALL 单段式清理列表)。
 pub const PREFIX_LIFECYCLE_RULE: &[u8] = b"r:";
+/// 事件通知规则(M15 N1;ADR-18 D-E4:`n:{bucket}\0{rule_id}` → postcard
+/// NotificationRule;每条规则一键,规则变更 = 单事务整体替换;删桶事务
+/// 前缀扫描清理——两段式桶级键,同 `r:` 先例)。
+pub const PREFIX_NOTIFICATION: &[u8] = b"n:";
+/// 事件队列条目(M15 N2;ADR-18 D-E1:`e:{seq be64}` → postcard
+/// EventRecord)。新一级前缀(非 `s:` 系统键):须三处同步——keys.rs
+/// 前缀表(本处)、meta-export/import DTO(fs3d/meta.rs)、check 可达性
+/// 扫描(只读 `o:`/`p:` 段引用键,对 `e:` 天然安全,登记于注释)。
+/// be64 字典序 = 数值序 = 写入序;有界环形(上限可配),批量截断最旧;
+/// 入队与触发它的数据操作同事务提交(崩溃零漂移,ADR-18 D-E1)。
+pub const PREFIX_EVENT: &[u8] = b"e:";
 
 /// 系统单调计数器(每个事务 +1,单点序列化;ADR-5)。
 pub const SYS_SEQ: &[u8] = b"s:seq";
@@ -371,6 +387,61 @@ pub fn lifecycle_rules_prefix(bucket: &str) -> Vec<u8> {
     k
 }
 
+/// 事件通知规则键:`n:{bucket}\0{rule_id}`(M15 N1;ADR-18 D-E4)。
+pub fn notification_rule_key(bucket: &str, rule_id: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(PREFIX_NOTIFICATION.len() + bucket.len() + 1 + rule_id.len());
+    k.extend_from_slice(PREFIX_NOTIFICATION);
+    k.extend_from_slice(bucket.as_bytes());
+    k.push(0x00);
+    k.extend_from_slice(rule_id.as_bytes());
+    k
+}
+
+/// 桶级通知规则前缀:`n:{bucket}\0`(规则整体替换/删桶清理的扫描
+/// 边界;桶间天然隔离)。
+pub fn notification_rules_prefix(bucket: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(PREFIX_NOTIFICATION.len() + bucket.len() + 1);
+    k.extend_from_slice(PREFIX_NOTIFICATION);
+    k.extend_from_slice(bucket.as_bytes());
+    k.push(0x00);
+    k
+}
+
+/// 解析 `n:` 键 → (bucket, rule_id)。
+pub fn parse_notification_rule_key(raw: &[u8]) -> Result<(String, String)> {
+    let body = raw
+        .strip_prefix(PREFIX_NOTIFICATION)
+        .ok_or_else(|| Error::Corrupt("notification key missing prefix".into()))?;
+    let sep = body
+        .iter()
+        .position(|&b| b == 0x00)
+        .ok_or_else(|| Error::Corrupt("notification key missing separator".into()))?;
+    let bucket = String::from_utf8(body[..sep].to_vec())
+        .map_err(|_| Error::Corrupt("bucket name not utf8".into()))?;
+    let rid = String::from_utf8(body[sep + 1..].to_vec())
+        .map_err(|_| Error::Corrupt("rule id not utf8".into()))?;
+    Ok((bucket, rid))
+}
+
+/// 事件队列条目键:`e:{seq be64}`(M15 N2;ADR-18 D-E1)。
+pub fn event_key(seq: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(PREFIX_EVENT.len() + 8);
+    k.extend_from_slice(PREFIX_EVENT);
+    k.extend_from_slice(&seq.to_be_bytes());
+    k
+}
+
+/// 解析 `e:` 键中的 seq(队首游标/截断边界用)。
+pub fn parse_event_seq(raw: &[u8]) -> Result<u64> {
+    let body = raw
+        .strip_prefix(PREFIX_EVENT)
+        .ok_or_else(|| Error::Corrupt("event key missing prefix".into()))?;
+    if body.len() != 8 {
+        return Err(Error::Corrupt("event key malformed".into()));
+    }
+    Ok(u64::from_be_bytes(body.try_into().unwrap()))
+}
+
 /// 分片键:`p:{uploadId}\0{part_no be32}`。
 pub fn part_key(upload_id: &str, part_no: u32) -> Vec<u8> {
     let mut k = Vec::with_capacity(PREFIX_PART.len() + upload_id.len() + 1 + 4);
@@ -605,6 +676,51 @@ mod tests {
         // 与既有前缀域不相交(r: 独立前缀)
         assert!(!lifecycle_rule_key("b1", "r1").starts_with(PREFIX_OBJECT));
         assert!(!object_key("b1", "k").starts_with(&lifecycle_rules_prefix("b1")));
+    }
+
+    #[test]
+    fn notification_rule_key_byte_level_and_prefix_isolation() {
+        // M15 N1(ADR-18 D-E4):`n:{bucket}\0{rule_id}` 两段式形态
+        assert_eq!(notification_rule_key("b1", "n1"), b"n:b1\x00n1".as_slice());
+        assert_eq!(notification_rules_prefix("b1"), b"n:b1\x00".as_slice());
+        // 规则键恒落在本桶前缀内;不串桶(含同头桶名 b1/b12)
+        assert!(notification_rule_key("b1", "n1").starts_with(&notification_rules_prefix("b1")));
+        assert!(!notification_rule_key("b12", "n1").starts_with(&notification_rules_prefix("b1")));
+        assert!(!notification_rule_key("b1", "n1").starts_with(&notification_rules_prefix("b12")));
+        // 解析往返
+        assert_eq!(
+            parse_notification_rule_key(&notification_rule_key("b1", "n1")).unwrap(),
+            ("b1".to_string(), "n1".to_string())
+        );
+        assert!(parse_notification_rule_key(b"o:b1\x00k").is_err());
+        assert!(parse_notification_rule_key(b"n:b1").is_err());
+        // 与既有前缀域不相交(n: 独立前缀;r: 生命周期、o: 对象均不相交)
+        assert!(!notification_rule_key("b1", "n1").starts_with(PREFIX_OBJECT));
+        assert!(!notification_rule_key("b1", "n1").starts_with(PREFIX_LIFECYCLE_RULE));
+        assert!(!lifecycle_rule_key("b1", "r1").starts_with(PREFIX_NOTIFICATION));
+        assert!(!object_key("b1", "k").starts_with(&notification_rules_prefix("b1")));
+    }
+
+    #[test]
+    fn event_key_byte_level_and_ordering() {
+        // M15 N2(ADR-18 D-E1):`e:{seq be64}` be64 字典序 == 数值序
+        assert_eq!(
+            event_key(1),
+            b"e:\x00\x00\x00\x00\x00\x00\x00\x01".as_slice()
+        );
+        let (k1, k9, k10) = (event_key(1), event_key(9), event_key(10));
+        assert!(k1 < k9 && k9 < k10, "be64 字典序 == 数值序");
+        assert_eq!(parse_event_seq(&k10).unwrap(), 10);
+        for k in [&k1, &k9, &k10] {
+            assert!(k.starts_with(PREFIX_EVENT));
+        }
+        // 与既有前缀域不相交(独立一级前缀 e:)
+        assert!(!SYS_SEQ.starts_with(PREFIX_EVENT));
+        assert!(!PREFIX_AUDIT.starts_with(PREFIX_EVENT));
+        assert!(!event_key(1).starts_with(PREFIX_OBJECT));
+        assert!(!object_key("b1", "k").starts_with(PREFIX_EVENT));
+        assert!(parse_event_seq(b"e:\x01").is_err());
+        assert!(parse_event_seq(SYS_SEQ).is_err());
     }
 
     proptest::proptest! {

@@ -9690,3 +9690,184 @@ fn cache_behavior() {
     let (.., served) = cache_arc.metrics.snapshot();
     assert_eq!(served, (3 * 1024 + 10) as u64);
 }
+
+// ───────────────────── M15 N1:桶事件通知(ADR-18 D-E4)─────────────────────
+
+/// Put/Get/DeleteBucketNotificationConfiguration 全流程:三容器形态 +
+/// 事件集 + Filter + FastS3 扩展密钥往返;无配置 → 200 空根(AWS 现状);
+/// DELETE 幂等;整体替换语义;桶不存在 → NoSuchBucket。
+#[test]
+fn bucket_notification_flow() {
+    let (_d, svc) = setup();
+    svc.handle(&req("PUT", "/bkt1", vec![])).unwrap();
+    let q = &[("notification", "")];
+
+    // 无配置 → 200 + 空 NotificationConfiguration 根(botocore 模型无
+    // NoSuchNotificationConfiguration 错误;AWS 现状口径 200 空根)
+    let r = svc.handle(&req_q("GET", "/bkt1", q, vec![]));
+    assert_eq!(status(&r), 200, "{r:?}");
+    assert!(body_str(&r.unwrap()).contains("<NotificationConfiguration"));
+
+    // 多规则 PUT(Topic+Webhook+扩展密钥 / Queue+Filter / CloudFunction
+    // 无 Id 自动生成)→ 200
+    let body = br#"<NotificationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+      <TopicConfiguration><Id>t1</Id><Event>s3:ObjectCreated:*</Event>
+        <Topic>http://127.0.0.1:8080/hook-a</Topic>
+        <FastS3WebhookSecretKey>k-secret</FastS3WebhookSecretKey></TopicConfiguration>
+      <QueueConfiguration><Id>q1</Id><Event>s3:ObjectRemoved:Delete</Event>
+        <Event>s3:ObjectRemoved:DeleteMarkerCreated</Event>
+        <Queue>https://hooks.example.com/q</Queue>
+        <Filter><S3Key><FilterRule><Name>prefix</Name><Value>logs/</Value></FilterRule>
+        <FilterRule><Name>suffix</Name><Value>.gz</Value></FilterRule></S3Key></Filter>
+      </QueueConfiguration>
+      <CloudFunctionConfiguration><Event>s3:ObjectCreated:Put</Event>
+        <CloudFunction>http://127.0.0.1:9090/cfn</CloudFunction></CloudFunctionConfiguration>
+    </NotificationConfiguration>"#
+        .to_vec();
+    let r = svc.handle(&req_q("PUT", "/bkt1", q, body));
+    assert_eq!(status(&r), 200, "{r:?}");
+
+    // GET 往返:容器形态原样回渲染、事件/Filter/密钥保真、自动 Id 稳定
+    let x = body_str(&svc.handle(&req_q("GET", "/bkt1", q, vec![])).unwrap());
+    for frag in [
+        "<TopicConfiguration>",
+        "<Id>t1</Id>",
+        "<Event>s3:ObjectCreated:*</Event>",
+        "<Topic>http://127.0.0.1:8080/hook-a</Topic>",
+        "<FastS3WebhookSecretKey>k-secret</FastS3WebhookSecretKey>",
+        "<QueueConfiguration>",
+        "<Id>q1</Id>",
+        "<Event>s3:ObjectRemoved:Delete</Event>",
+        "<Event>s3:ObjectRemoved:DeleteMarkerCreated</Event>",
+        "<Queue>https://hooks.example.com/q</Queue>",
+        "<Name>prefix</Name><Value>logs/</Value>",
+        "<Name>suffix</Name><Value>.gz</Value>",
+        "<CloudFunctionConfiguration>",
+        "<Id>id-3</Id>",
+        "<CloudFunction>http://127.0.0.1:9090/cfn</CloudFunction>",
+    ] {
+        assert!(x.contains(frag), "missing {frag} in {x}");
+    }
+
+    // 整体替换:仅一条 → 旧三条全灭
+    let body2 = br#"<NotificationConfiguration><QueueConfiguration><Id>only</Id>
+        <Event>s3:ObjectCreated:Put</Event>
+        <Queue>http://127.0.0.1:8080/only</Queue></QueueConfiguration></NotificationConfiguration>"#
+        .to_vec();
+    let r = svc.handle(&req_q("PUT", "/bkt1", q, body2));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let x = body_str(&svc.handle(&req_q("GET", "/bkt1", q, vec![])).unwrap());
+    assert!(x.contains("<Id>only</Id>") && !x.contains("t1"), "{x}");
+
+    // DELETE → 204;再 DELETE → 204(幂等);再 GET → 200 空根
+    let r = svc.handle(&req_q("DELETE", "/bkt1", q, vec![]));
+    assert_eq!(status(&r), 204, "{r:?}");
+    let r = svc.handle(&req_q("DELETE", "/bkt1", q, vec![]));
+    assert_eq!(status(&r), 204, "Delete 幂等:无配置同样 204");
+    let x = body_str(&svc.handle(&req_q("GET", "/bkt1", q, vec![])).unwrap());
+    assert!(
+        x.contains("<NotificationConfiguration") && !x.contains("<Id>"),
+        "{x}"
+    );
+
+    // 桶不存在 → NoSuchBucket(三方法同口径)
+    for m in ["GET", "PUT", "DELETE"] {
+        let body = if m == "PUT" {
+            br#"<NotificationConfiguration><QueueConfiguration><Id>r</Id><Event>s3:ObjectCreated:*</Event><Queue>http://h/x</Queue></QueueConfiguration></NotificationConfiguration>"#.to_vec()
+        } else {
+            vec![]
+        };
+        let r = svc.handle(&req_q(m, "/ghost", q, body));
+        assert_eq!(err_code(&r), "NoSuchBucket", "{m}");
+    }
+}
+
+/// 非法配置显式拒绝(Webhook 起步非静默):SQS ARN 目标 / 未知事件 /
+/// 重复 Id / Filter 违例 → InvalidArgument/MalformedXML 显式报错,
+/// 配置不落库(GET 仍 200 空根)。
+#[test]
+fn bucket_notification_rejects() {
+    let (_d, svc) = setup();
+    svc.handle(&req("PUT", "/bkt1", vec![])).unwrap();
+    let q = &[("notification", "")];
+    // SQS ARN 目标(显式拒绝,Webhook 起步语义)
+    let body = br#"<NotificationConfiguration><QueueConfiguration><Id>a</Id>
+        <Event>s3:ObjectCreated:*</Event>
+        <Queue>arn:aws:sqs:us-east-1:1:q</Queue></QueueConfiguration></NotificationConfiguration>"#
+        .to_vec();
+    let r = svc.handle(&req_q("PUT", "/bkt1", q, body));
+    assert_eq!(err_code(&r), "InvalidArgument", "{r:?}");
+    // 未知事件
+    let body = br#"<NotificationConfiguration><QueueConfiguration><Id>a</Id>
+        <Event>s3:ObjectCreated:Upsert</Event>
+        <Queue>http://h/x</Queue></QueueConfiguration></NotificationConfiguration>"#
+        .to_vec();
+    let r = svc.handle(&req_q("PUT", "/bkt1", q, body));
+    assert_eq!(err_code(&r), "InvalidArgument", "{r:?}");
+    // 重复 Id
+    let body = br#"<NotificationConfiguration>
+        <QueueConfiguration><Id>a</Id><Event>s3:ObjectCreated:*</Event><Queue>http://h/x</Queue></QueueConfiguration>
+        <QueueConfiguration><Id>a</Id><Event>s3:ObjectCreated:*</Event><Queue>http://h/y</Queue></QueueConfiguration>
+        </NotificationConfiguration>"#
+        .to_vec();
+    let r = svc.handle(&req_q("PUT", "/bkt1", q, body));
+    assert_eq!(err_code(&r), "InvalidArgument", "{r:?}");
+    // 缺 Event → MalformedXML
+    let body = br#"<NotificationConfiguration><QueueConfiguration><Id>a</Id>
+        <Queue>http://h/x</Queue></QueueConfiguration></NotificationConfiguration>"#
+        .to_vec();
+    let r = svc.handle(&req_q("PUT", "/bkt1", q, body));
+    assert_eq!(err_code(&r), "MalformedXML", "{r:?}");
+    // 坏 XML → MalformedXML
+    let r = svc.handle(&req_q(
+        "PUT",
+        "/bkt1",
+        q,
+        b"<NotificationConfiguration><QueueConfiguration>".to_vec(),
+    ));
+    assert_eq!(err_code(&r), "MalformedXML", "{r:?}");
+    // 全部被拒 → 配置不落库(GET 仍 200 空根,无任何规则回显)
+    let x = body_str(&svc.handle(&req_q("GET", "/bkt1", q, vec![])).unwrap());
+    assert!(
+        x.contains("<NotificationConfiguration") && !x.contains("<Id>"),
+        "{x}"
+    );
+}
+
+/// 删桶清理 + 两桶隔离(n: 键随桶删除;前缀互不串扰)。
+#[test]
+fn bucket_notification_delete_cleanup_and_isolation() {
+    let (_d, svc) = setup();
+    svc.handle(&req("PUT", "/bkt1", vec![])).unwrap();
+    svc.handle(&req("PUT", "/bkt2", vec![])).unwrap();
+    let q = &[("notification", "")];
+    let body = |id: &str, url: &str| {
+        format!(
+            r#"<NotificationConfiguration><QueueConfiguration><Id>{id}</Id><Event>s3:ObjectCreated:*</Event><Queue>{url}</Queue></QueueConfiguration></NotificationConfiguration>"#
+        )
+        .into_bytes()
+    };
+    svc.handle(&req_q("PUT", "/bkt1", q, body("n-one", "http://a/x")))
+        .unwrap();
+    svc.handle(&req_q("PUT", "/bkt2", q, body("n-two", "http://b/y")))
+        .unwrap();
+    // 两桶隔离
+    let x1 = body_str(&svc.handle(&req_q("GET", "/bkt1", q, vec![])).unwrap());
+    let x2 = body_str(&svc.handle(&req_q("GET", "/bkt2", q, vec![])).unwrap());
+    assert!(x1.contains("n-one") && !x1.contains("n-two"), "{x1}");
+    assert!(x2.contains("n-two") && !x2.contains("n-one"), "{x2}");
+    // b1 替换不影响 b2
+    svc.handle(&req_q("PUT", "/bkt1", q, body("n-new", "http://c/z")))
+        .unwrap();
+    let x2 = body_str(&svc.handle(&req_q("GET", "/bkt2", q, vec![])).unwrap());
+    assert!(x2.contains("n-two") && !x2.contains("n-new"), "{x2}");
+    // 删 b1 → 规则随桶清理;重建同名桶无残留
+    svc.handle(&req("DELETE", "/bkt1", vec![])).unwrap();
+    svc.handle(&req("PUT", "/bkt1", vec![])).unwrap();
+    let x1 = body_str(&svc.handle(&req_q("GET", "/bkt1", q, vec![])).unwrap());
+    assert!(
+        x1.contains("<NotificationConfiguration") && !x1.contains("<Id>"),
+        "删桶后通知规则必须随桶清理:{x1}"
+    );
+    assert!(x2.contains("n-two"), "b2 通知规则不受 b1 删桶影响:{x2}");
+}

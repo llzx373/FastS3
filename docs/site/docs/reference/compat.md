@@ -37,6 +37,18 @@ REDUCED_REDUNDANCY / INTELLIGENT_TIERING / GLACIER / GLACIER_IR /
 DEEP_ARCHIVE 并**显式映射到 STANDARD**(元数据记录请求类、响应回显实际类、
 admin 可见);归档真语义(Transition/RestoreObject)规划于 v2.2(M16)。
 
+## 事件通知(v2.1 M15 起)
+
+| 项 | 说明 |
+| --- | --- |
+| 配置 API | `Put/Get/DeleteBucketNotificationConfiguration`(`?notification`;旧名 `PutBucketNotification` 同线格式同语义,单路由承载) |
+| 目标形态 | **Webhook 起步(ADR-18 D-E4)**:`TopicConfiguration` / `QueueConfiguration` / `CloudFunctionConfiguration` 三种容器全部接受,`<Topic>/<Queue>/<CloudFunction>` 内直接携带 **http/https Webhook URL**;容器形态原样回渲染。**SQS/SNS/Lambda ARN 目标显式拒绝**(InvalidArgument)——目标形态后置评估,SNS/SQS/EventBridge 不在 v2.1 |
+| 事件集 | `s3:ObjectCreated:*`(Put/Post/Copy/CompleteMultipartUpload)、`s3:ObjectRemoved:*`(Delete/DeleteMarkerCreated)、`s3:ObjectRestore:*`(注册,M16 后启用投递)、`s3:LifecycleExpiration:*`、`s3:LifecycleTransition:*`;白名单外事件 → InvalidArgument 显式报错 |
+| 过滤 | AWS `Filter/S3Key/FilterRule`(prefix/suffix 各至多一条;值 ≤1024 字符);不配置 = 全键命中 |
+| 签名 | FastS3 扩展元素 `<FastS3WebhookSecretKey>`(可选):配置即投递时对载荷计算 **HMAC-SHA256 签名**(请求头 `X-FastS3-Signature`);密钥仅存 `n:` 配置值(零日志/零审计)。s3-tests/S3 客户端只发标准 AWS XML 时,投递不带签名头 |
+| 队列语义 | 事件入队与数据操作**同事务提交**(崩溃零漂移,ADR-18 D-E1);有界持久化环形(上限可配),投递 at-least-once,重试指数退避 + 死信留存;投递失败不影响数据面请求语义 |
+| 幂等 | 载荷含 `eventId`(= 事件 seq,单调),目标端可依此去重 |
+
 ## OS / 打包形态
 
 | 平台 | 包 | 构建 | 状态 |

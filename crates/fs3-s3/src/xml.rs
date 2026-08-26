@@ -2753,6 +2753,465 @@ pub fn render_lifecycle_configuration(rules: &[fs3_core::LifecycleRule]) -> Stri
     xml
 }
 
+// ───────────────────── 事件通知配置(M15 N1;ADR-18 D-E4)─────────────────────
+
+/// AWS 事件白名单(M15 N2 入队口径:ObjectCreated*/ObjectRemoved*/
+/// Restore*/Lifecycle* 起步;其余事件 → InvalidArgument 显式拒绝)。
+/// 通配名(带 `:*`)按前缀匹配子事件;精确名全等匹配。
+const NOTIFICATION_EVENTS: &[&str] = &[
+    // ObjectCreated 族(Put/Post/Copy/CompleteMultipartUpload)
+    "s3:ObjectCreated:*",
+    "s3:ObjectCreated:Put",
+    "s3:ObjectCreated:Post",
+    "s3:ObjectCreated:Copy",
+    "s3:ObjectCreated:CompleteMultipartUpload",
+    // ObjectRemoved 族(Delete/DeleteMarkerCreated)
+    "s3:ObjectRemoved:*",
+    "s3:ObjectRemoved:Delete",
+    "s3:ObjectRemoved:DeleteMarkerCreated",
+    // Restore 族(注册;M16 真归档后启用投递)
+    "s3:ObjectRestore:*",
+    "s3:ObjectRestore:Post",
+    "s3:ObjectRestore:Completed",
+    // Lifecycle 族(过期/转换;生命周期执行器操作点补入)
+    "s3:LifecycleExpiration:*",
+    "s3:LifecycleExpiration:Expiration",
+    "s3:LifecycleExpiration:DeleteMarker",
+    "s3:LifecycleTransition:*",
+    "s3:LifecycleTransition:Transition",
+];
+
+/// 事件是否在 AWS 白名单内(通配名允许,精确名全等)。
+fn notification_event_valid(name: &str) -> bool {
+    NOTIFICATION_EVENTS.contains(&name)
+}
+
+/// 事件名 ↔ 通配名匹配由 fs3_core::NotificationRule::event_match 承担
+/// (s3:ObjectCreated:* 命中任意子事件;N2 入队判定用)。
+///
+/// 解析 PutBucketNotificationConfiguration 请求体。
+///
+/// AWS 形态:<NotificationConfiguration> 根;子元素为
+/// <TopicConfiguration>/<QueueConfiguration>/<CloudFunctionConfiguration>
+/// 三形态之一(单桶通知配置可混用)。FastS3 v2.1 为 Webhook 起步
+/// (ADR-18 D-E4):三种容器全部接受,<Topic>/<Queue>/<CloudFunction>
+/// 内直接携带 Webhook 端点 http/https URL;容器形态原样存储回渲染。
+/// SQS/SNS/Lambda ARN 目标 = InvalidArgument 显式拒绝(非静默;后置
+/// 评估)。可选 <Id>(缺省自动生成 id-{n}),一个以上 <Event>(白名单
+/// 校验),可选 <Filter>(S3Key/FilterRule prefix|suffix,AWS 语义)。
+/// FastS3 扩展元素 <FastS3WebhookSecretKey>(可选;HMAC-SHA256 密钥)。
+///
+/// 错误口径(AWS 同属 400 族):结构/XML 损坏、缺根、未知容器/子元素、
+/// Filter 多直下子元素、FilterRule Name 非法、缺 Event / 缺目标元素 →
+/// MalformedXML;事件不在白名单、目标非 http/https URL、重复 Id、
+/// 规则数超限(100)→ InvalidArgument。
+pub fn parse_notification_configuration(
+    body: &[u8],
+) -> Result<Vec<fs3_core::NotificationRule>, S3Error> {
+    let malformed = |m: String| S3Error::new(S3ErrorCode::MalformedXML).with_message(m);
+    let invalid = |m: String| S3Error::new(S3ErrorCode::InvalidArgument).with_message(m);
+    if body.iter().all(|&b| b.is_ascii_whitespace()) {
+        return Err(malformed("NotificationConfiguration body is empty".into()));
+    }
+    const MAX_RULES: usize = 100; // AWS 上限
+    const MAX_ID_LEN: usize = 255;
+    const MAX_EVENT_CNT: usize = 100;
+
+    #[derive(Default)]
+    struct RuleAcc {
+        id: Option<String>,
+        events: Vec<String>,
+        kind: Option<fs3_core::NotificationTargetKind>,
+        target: Option<String>,
+        hmac_key: Option<String>,
+        saw_filter: bool,
+        filter_prefix: Option<String>,
+        filter_suffix: Option<String>,
+        // FilterRule 瞬态(单条 rule 内:Name/Value 各至多一,闭合时提交)
+        fr_name: Option<String>,
+        fr_value: Option<String>,
+    }
+
+    let mut reader = quick_xml::Reader::from_reader(body);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut saw_root = false;
+    let mut rules: Vec<fs3_core::NotificationRule> = Vec::new();
+    let mut cur: Option<RuleAcc> = None;
+    let mut stack: Vec<Vec<u8>> = Vec::new();
+    fn stack_top(stack: &[Vec<u8>]) -> Option<&[u8]> {
+        stack.last().map(|v| v.as_slice())
+    }
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(quick_xml::events::Event::Start(e)) => {
+                let name = e.name().as_ref().to_vec();
+                let text = |r: &mut quick_xml::Reader<&[u8]>| -> Result<String, S3Error> {
+                    let raw = r
+                        .read_text(e.name())
+                        .map_err(|err| malformed(format!("malformed XML: {err}")))?;
+                    unescape_text(raw.as_ref()).map_err(malformed)
+                };
+                let ctx = stack_top(&stack);
+                match name.as_slice() {
+                    b"NotificationConfiguration" => {
+                        saw_root = true;
+                        stack.push(name.clone());
+                    }
+                    b"TopicConfiguration"
+                    | b"QueueConfiguration"
+                    | b"CloudFunctionConfiguration" => {
+                        if ctx != Some(b"NotificationConfiguration") {
+                            return Err(malformed(
+                                "configuration container outside NotificationConfiguration".into(),
+                            ));
+                        }
+                        if cur.is_some() {
+                            return Err(malformed("nested configuration element".into()));
+                        }
+                        let kind = match name.as_slice() {
+                            b"TopicConfiguration" => fs3_core::NotificationTargetKind::Topic,
+                            b"QueueConfiguration" => fs3_core::NotificationTargetKind::Queue,
+                            _ => fs3_core::NotificationTargetKind::CloudFunction,
+                        };
+                        cur = Some(RuleAcc {
+                            kind: Some(kind),
+                            ..Default::default()
+                        });
+                        stack.push(name.clone());
+                    }
+                    b"Id"
+                    | b"Event"
+                    | b"Topic"
+                    | b"Queue"
+                    | b"CloudFunction"
+                    | b"FastS3WebhookSecretKey" => {
+                        let v = text(&mut reader)?;
+                        match name.as_slice() {
+                            b"Id" => {
+                                if let Some(r) = cur.as_mut() {
+                                    r.id = Some(v);
+                                }
+                            }
+                            b"Event" => {
+                                if let Some(r) = cur.as_mut() {
+                                    r.events.push(v);
+                                }
+                            }
+                            b"Topic" | b"Queue" | b"CloudFunction" => {
+                                if let Some(r) = cur.as_mut() {
+                                    if ctx == Some(b"TopicConfiguration")
+                                        || ctx == Some(b"QueueConfiguration")
+                                        || ctx == Some(b"CloudFunctionConfiguration")
+                                    {
+                                        r.target = Some(v);
+                                    }
+                                }
+                            }
+                            _ => {
+                                if let Some(r) = cur.as_mut() {
+                                    if ctx == Some(b"TopicConfiguration")
+                                        || ctx == Some(b"QueueConfiguration")
+                                        || ctx == Some(b"CloudFunctionConfiguration")
+                                    {
+                                        r.hmac_key = Some(v);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    b"Filter" => {
+                        if ctx == Some(b"TopicConfiguration")
+                            || ctx == Some(b"QueueConfiguration")
+                            || ctx == Some(b"CloudFunctionConfiguration")
+                        {
+                            if let Some(r) = cur.as_mut() {
+                                r.saw_filter = true;
+                            }
+                        }
+                        stack.push(name.clone());
+                    }
+                    b"S3Key" => {
+                        stack.push(name.clone());
+                    }
+                    b"FilterRule" => {
+                        // 新 FilterRule:重置瞬态(Name/Value 各至多一)
+                        if let Some(r) = cur.as_mut() {
+                            r.fr_name = None;
+                            r.fr_value = None;
+                        }
+                        stack.push(name.clone());
+                    }
+                    b"Name" | b"Value" => {
+                        let v = text(&mut reader)?;
+                        // Name/Value 为 FilterRule 的叶子子元素:父 = 栈顶
+                        let frctx = stack_top(&stack);
+                        if frctx == Some(b"FilterRule") {
+                            if let Some(r) = cur.as_mut() {
+                                match name.as_slice() {
+                                    b"Name" => {
+                                        if r.fr_name.is_some() {
+                                            return Err(malformed(
+                                                "duplicate Name inside FilterRule".into(),
+                                            ));
+                                        }
+                                        match v.as_str() {
+                                            "prefix" | "suffix" => r.fr_name = Some(v),
+                                            other => {
+                                                return Err(malformed(format!(
+                                                    "invalid FilterRule Name: {other}"
+                                                )))
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        if r.fr_value.is_some() {
+                                            return Err(malformed(
+                                                "duplicate Value inside FilterRule".into(),
+                                            ));
+                                        }
+                                        r.fr_value = Some(v);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(malformed(format!(
+                            "unexpected element <{}>",
+                            String::from_utf8_lossy(&name)
+                        )))
+                    }
+                }
+            }
+            Ok(quick_xml::events::Event::Empty(e)) => {
+                let name = e.name().as_ref().to_vec();
+                let ctx = stack_top(&stack);
+                match name.as_slice() {
+                    b"NotificationConfiguration" => saw_root = true,
+                    b"Filter" => {
+                        if ctx == Some(b"TopicConfiguration")
+                            || ctx == Some(b"QueueConfiguration")
+                            || ctx == Some(b"CloudFunctionConfiguration")
+                        {
+                            if let Some(r) = cur.as_mut() {
+                                r.saw_filter = true;
+                            }
+                        }
+                    }
+                    b"S3Key" | b"FilterRule" => {} // 自闭合滤镜容器
+                    _ => {
+                        return Err(malformed(format!(
+                            "unexpected element <{}>",
+                            String::from_utf8_lossy(&name)
+                        )))
+                    }
+                }
+            }
+            Ok(quick_xml::events::Event::End(e)) => {
+                let name = e.name().as_ref().to_vec();
+                match name.as_slice() {
+                    b"NotificationConfiguration" => {}
+                    b"TopicConfiguration"
+                    | b"QueueConfiguration"
+                    | b"CloudFunctionConfiguration" => {
+                        let acc = cur
+                            .take()
+                            .ok_or_else(|| malformed("configuration close without open".into()))?;
+                        if acc.fr_name.is_some() || acc.fr_value.is_some() {
+                            return Err(malformed(
+                                "unclosed FilterRule inside configuration".into(),
+                            ));
+                        }
+                        let events = acc.events;
+                        if events.is_empty() {
+                            return Err(malformed(
+                                "configuration requires at least one <Event>".into(),
+                            ));
+                        }
+                        if events.len() > MAX_EVENT_CNT {
+                            return Err(invalid(format!(
+                                "too many events: {} (max {MAX_EVENT_CNT})",
+                                events.len()
+                            )));
+                        }
+                        for ev in &events {
+                            if !notification_event_valid(ev) {
+                                return Err(invalid(format!(
+                                    "unsupported event {ev}; supported: \
+                                     ObjectCreated*/ObjectRemoved*/ObjectRestore*/Lifecycle*"
+                                )));
+                            }
+                        }
+                        let target = acc.target.ok_or_else(|| {
+                            malformed("configuration missing target element".into())
+                        })?;
+                        if !(target.starts_with("http://") || target.starts_with("https://")) {
+                            return Err(invalid(
+                                "unsupported notification target; FastS3 v2.1 supports \
+                                 webhook targets only (http/https URL); SQS/SNS/Lambda ARN \
+                                 targets are not implemented"
+                                    .into(),
+                            ));
+                        }
+                        let mut id = acc.id.unwrap_or_default();
+                        if id.is_empty() {
+                            id = format!("id-{}", rules.len() + 1);
+                        }
+                        if id.len() > MAX_ID_LEN {
+                            return Err(invalid(format!(
+                                "rule Id too long: {} (max {MAX_ID_LEN} chars)",
+                                id.len()
+                            )));
+                        }
+                        if rules.iter().any(|r| r.id == id) {
+                            return Err(invalid(format!("duplicate rule Id: {id}")));
+                        }
+                        let filter = fs3_core::NotificationKeyFilter {
+                            prefix: acc.filter_prefix,
+                            suffix: acc.filter_suffix,
+                        };
+                        rules.push(fs3_core::NotificationRule {
+                            id,
+                            events,
+                            kind: acc.kind.unwrap_or(fs3_core::NotificationTargetKind::Topic),
+                            url: target,
+                            hmac_key: acc.hmac_key,
+                            enabled: true,
+                            filter,
+                        });
+                    }
+                    b"Filter" => {
+                        if let Some(r) = cur.as_mut() {
+                            // 空 Filter = 全键命中;prefix/suffix 各至多一条已
+                            // 在 FilterRule 瞬态提交时保证(重复 Name → 拒绝)
+                            let _ = r;
+                        }
+                    }
+                    b"S3Key" => {}
+                    b"FilterRule" => {
+                        // FilterRule 闭合:提交瞬态(Name/Value 配对校验)
+                        if let Some(r) = cur.as_mut() {
+                            let rname = r.fr_name.take();
+                            let rval = r.fr_value.take();
+                            let (n, v) = match (rname, rval) {
+                                (Some(n), Some(v)) => (n, v),
+                                (Some(_), None) => {
+                                    return Err(malformed("FilterRule missing <Value>".into()))
+                                }
+                                _ => return Err(malformed("FilterRule missing <Name>".into())),
+                            };
+                            match n.as_str() {
+                                "prefix" => {
+                                    if r.filter_prefix.is_some() {
+                                        return Err(malformed(
+                                            "duplicate prefix FilterRule".into(),
+                                        ));
+                                    }
+                                    if v.len() > 1024 {
+                                        return Err(malformed(
+                                            "prefix FilterRule value too long (max 1024)".into(),
+                                        ));
+                                    }
+                                    r.filter_prefix = Some(v);
+                                }
+                                _ => {
+                                    if r.filter_suffix.is_some() {
+                                        return Err(malformed(
+                                            "duplicate suffix FilterRule".into(),
+                                        ));
+                                    }
+                                    if v.len() > 1024 {
+                                        return Err(malformed(
+                                            "suffix FilterRule value too long (max 1024)".into(),
+                                        ));
+                                    }
+                                    r.filter_suffix = Some(v);
+                                }
+                            }
+                        }
+                    }
+                    b"Name" | b"Value" => {}
+                    // 根/容器闭合已知;其余元素闭合已由 Start 拒绝,
+                    // 此处宽容(不重复报错)
+                    _ => {}
+                }
+                if stack.last().map(|s| s.as_slice()) == Some(name.as_slice()) {
+                    stack.pop();
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Err(e) => {
+                return Err(malformed(format!("malformed XML: {e}")));
+            }
+            _ => {}
+        }
+    }
+    if !saw_root {
+        return Err(malformed("missing NotificationConfiguration root".into()));
+    }
+    if cur.is_some() {
+        return Err(malformed("unclosed configuration element".into()));
+    }
+    if rules.len() > MAX_RULES {
+        return Err(invalid(format!(
+            "too many notification rules: {} (max {MAX_RULES})",
+            rules.len()
+        )));
+    }
+    Ok(rules)
+}
+
+/// 渲染 GetBucketNotificationConfiguration 响应(规则序 = rule_id 字典序,
+/// 同生命周期;容器形态按规则存储的 kind 回渲染;无规则 → 空根)。
+pub fn render_notification_configuration(rules: &[fs3_core::NotificationRule]) -> String {
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<NotificationConfiguration xmlns=\"{XMLNS}\">"
+    );
+    for r in rules {
+        let container = match r.kind {
+            fs3_core::NotificationTargetKind::Topic => "TopicConfiguration",
+            fs3_core::NotificationTargetKind::Queue => "QueueConfiguration",
+            fs3_core::NotificationTargetKind::CloudFunction => "CloudFunctionConfiguration",
+        };
+        let dest = match r.kind {
+            fs3_core::NotificationTargetKind::Topic => "Topic",
+            fs3_core::NotificationTargetKind::Queue => "Queue",
+            fs3_core::NotificationTargetKind::CloudFunction => "CloudFunction",
+        };
+        xml.push_str(&format!("<{container}>"));
+        let _ = write!(xml, "<Id>{}</Id>", escape_xml(&r.id));
+        for ev in &r.events {
+            let _ = write!(xml, "<Event>{}</Event>", escape_xml(ev));
+        }
+        let _ = write!(xml, "<{dest}>{}</{dest}>", escape_xml(&r.url));
+        if let Some(k) = &r.hmac_key {
+            let _ = write!(xml, "<FastS3WebhookSecretKey>{k}</FastS3WebhookSecretKey>");
+        }
+        if r.filter.prefix.is_some() || r.filter.suffix.is_some() {
+            xml.push_str("<Filter><S3Key>");
+            if let Some(p) = &r.filter.prefix {
+                let _ = write!(
+                    xml,
+                    "<FilterRule><Name>prefix</Name><Value>{}</Value></FilterRule>",
+                    escape_xml(p)
+                );
+            }
+            if let Some(s) = &r.filter.suffix {
+                let _ = write!(
+                    xml,
+                    "<FilterRule><Name>suffix</Name><Value>{}</Value></FilterRule>",
+                    escape_xml(s)
+                );
+            }
+            xml.push_str("</S3Key></Filter>");
+        }
+        xml.push_str(&format!("</{container}>"));
+    }
+    xml.push_str("</NotificationConfiguration>");
+    xml
+}
+
 // ───────────────────── Ownership Controls(M10 S7) ─────────────────────
 
 /// ObjectOwnership 取值(AWS 三值)。M10 S7 裁决:FastS3 单账号私有默认
@@ -4088,5 +4547,184 @@ mod tests {
         assert_eq!(e.code, S3ErrorCode::MalformedXML);
         let e = parse_object_lock_configuration(b"").unwrap_err();
         assert_eq!(e.code, S3ErrorCode::MalformedXML);
+    }
+
+    // ───────────────────── M15 N1:事件通知配置(ADR-18 D-E4)─────────────────────
+
+    /// 三容器形态 × 事件 × Filter × FastS3 扩展密钥:解析 → 渲染往返。
+    #[test]
+    fn notification_configuration_roundtrip() {
+        use fs3_core::{NotificationKeyFilter, NotificationRule, NotificationTargetKind as K};
+        let body = concat!(
+            r#"<NotificationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
+            "<TopicConfiguration><Id>topic-1</Id>",
+            "<Event>s3:ObjectCreated:*</Event>",
+            "<Topic>http://127.0.0.1:8080/hook-a</Topic>",
+            "<FastS3WebhookSecretKey>k-secret-a</FastS3WebhookSecretKey></TopicConfiguration>",
+            "<QueueConfiguration><Id>queue-1</Id>",
+            "<Event>s3:ObjectRemoved:Delete</Event><Event>s3:ObjectRemoved:DeleteMarkerCreated</Event>",
+            "<Queue>https://hooks.example.com/q</Queue>",
+            "<Filter><S3Key><FilterRule><Name>prefix</Name><Value>logs/</Value></FilterRule>",
+            "<FilterRule><Name>suffix</Name><Value>.gz</Value></FilterRule></S3Key></Filter>",
+            "</QueueConfiguration>",
+            "<CloudFunctionConfiguration>",
+            "<Event>s3:ObjectCreated:Put</Event>",
+            "<CloudFunction>http://127.0.0.1:9090/cfn</CloudFunction></CloudFunctionConfiguration>",
+            "</NotificationConfiguration>"
+        );
+        let rules = parse_notification_configuration(body.as_bytes()).unwrap();
+        assert_eq!(rules.len(), 3);
+        assert_eq!(rules[0].id, "topic-1");
+        assert_eq!(rules[0].kind, K::Topic);
+        assert_eq!(rules[0].events, vec!["s3:ObjectCreated:*"]);
+        assert_eq!(rules[0].url, "http://127.0.0.1:8080/hook-a");
+        assert_eq!(rules[0].hmac_key.as_deref(), Some("k-secret-a"));
+        assert!(rules[0].enabled);
+        assert_eq!(rules[0].filter, NotificationKeyFilter::default());
+        // Queue 形态 + Filter(prefix/suffix)
+        assert_eq!(rules[1].kind, K::Queue);
+        assert_eq!(
+            rules[1].events,
+            vec![
+                "s3:ObjectRemoved:Delete",
+                "s3:ObjectRemoved:DeleteMarkerCreated"
+            ]
+        );
+        assert_eq!(rules[1].filter.prefix.as_deref(), Some("logs/"));
+        assert_eq!(rules[1].filter.suffix.as_deref(), Some(".gz"));
+        // CloudFunction 无 Id → 自动生成 id-3(序号)
+        assert_eq!(rules[2].kind, K::CloudFunction);
+        assert_eq!(rules[2].id, "id-3");
+        assert_eq!(rules[2].url, "http://127.0.0.1:9090/cfn");
+        // 事件匹配语义(通配 / 精确)
+        let r0 = &rules[0];
+        assert!(r0.event_match("s3:ObjectCreated:Put"));
+        assert!(r0.event_match("s3:ObjectCreated:CompleteMultipartUpload"));
+        assert!(!r0.event_match("s3:ObjectRemoved:Delete"));
+        assert!(rules[1].event_match("s3:ObjectRemoved:Delete"));
+        assert!(!rules[1].event_match("s3:ObjectCreated:Put"));
+        // 过滤器命中语义
+        assert!(rules[1].filter.matches("logs/app.log.gz"));
+        assert!(!rules[1].filter.matches("app.log.gz"));
+        assert!(!rules[1].filter.matches("logs/app.log"));
+        assert!(rules[0].filter.matches("anything"));
+        // 渲染 → 重新解析 → 逐字段相等(往返;自动 Id 稳定)
+        let rendered = render_notification_configuration(&rules);
+        let rules2 = parse_notification_configuration(rendered.as_bytes()).unwrap();
+        assert_eq!(rules2, rules);
+        // 空配置渲染(AWS 200 空根形态)
+        let empty = render_notification_configuration(&[]);
+        assert!(empty.contains("<NotificationConfiguration"));
+        assert!(parse_notification_configuration(empty.as_bytes())
+            .unwrap()
+            .is_empty());
+    }
+
+    /// 显式报错矩阵(非法目标/事件/结构 → MalformedXML/InvalidArgument)。
+    #[test]
+    fn notification_configuration_rejects_invalid() {
+        // 非法事件(不在白名单)→ InvalidArgument
+        let e = parse_notification_configuration(
+            b"<NotificationConfiguration><QueueConfiguration><Id>a</Id>\
+              <Event>s3:ObjectCreated:Upsert</Event>\
+              <Queue>http://h/x</Queue></QueueConfiguration></NotificationConfiguration>",
+        )
+        .unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::InvalidArgument);
+        // 非法目标(SQS ARN)→ InvalidArgument(Webhook 起步,显式拒绝)
+        let e = parse_notification_configuration(
+            b"<NotificationConfiguration><QueueConfiguration><Id>a</Id>\
+              <Event>s3:ObjectCreated:*</Event>\
+              <Queue>arn:aws:sqs:us-east-1:1:q</Queue></QueueConfiguration></NotificationConfiguration>",
+        )
+        .unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::InvalidArgument);
+        assert!(e
+            .message_override
+            .as_deref()
+            .unwrap_or_default()
+            .contains("webhook"));
+        // 缺 Event → MalformedXML
+        let e = parse_notification_configuration(
+            b"<NotificationConfiguration><QueueConfiguration><Id>a</Id>\
+              <Queue>http://h/x</Queue></QueueConfiguration></NotificationConfiguration>",
+        )
+        .unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::MalformedXML);
+        // 缺目标元素 → MalformedXML
+        let e = parse_notification_configuration(
+            b"<NotificationConfiguration><QueueConfiguration><Id>a</Id>\
+              <Event>s3:ObjectCreated:*</Event></QueueConfiguration></NotificationConfiguration>",
+        )
+        .unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::MalformedXML);
+        // 重复 Id → InvalidArgument
+        let e = parse_notification_configuration(
+            b"<NotificationConfiguration>\
+              <QueueConfiguration><Id>a</Id><Event>s3:ObjectCreated:*</Event><Queue>http://h/x</Queue></QueueConfiguration>\
+              <QueueConfiguration><Id>a</Id><Event>s3:ObjectCreated:*</Event><Queue>http://h/y</Queue></QueueConfiguration>\
+              </NotificationConfiguration>",
+        )
+        .unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::InvalidArgument);
+        assert!(e
+            .message_override
+            .as_deref()
+            .unwrap_or_default()
+            .contains("duplicate"));
+        // FilterRule 缺 Value → MalformedXML
+        let e = parse_notification_configuration(
+            b"<NotificationConfiguration><QueueConfiguration><Id>a</Id>\
+              <Event>s3:ObjectCreated:*</Event><Queue>http://h/x</Queue>\
+              <Filter><S3Key><FilterRule><Name>prefix</Name></FilterRule></S3Key></Filter>\
+              </QueueConfiguration></NotificationConfiguration>",
+        )
+        .unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::MalformedXML);
+        // 重复 prefix FilterRule → MalformedXML
+        let e = parse_notification_configuration(
+            b"<NotificationConfiguration><QueueConfiguration><Id>a</Id>\
+              <Event>s3:ObjectCreated:*</Event><Queue>http://h/x</Queue>\
+              <Filter><S3Key><FilterRule><Name>prefix</Name><Value>a/</Value></FilterRule>\
+              <FilterRule><Name>prefix</Name><Value>b/</Value></FilterRule></S3Key></Filter>\
+              </QueueConfiguration></NotificationConfiguration>",
+        )
+        .unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::MalformedXML);
+        // 未知容器元素 / 未知子元素 → MalformedXML
+        let e = parse_notification_configuration(
+            b"<NotificationConfiguration><LambdaConfiguration><Id>a</Id>\
+              <Event>s3:ObjectCreated:*</Event><Lambda>http://h/x</Lambda>\
+              </LambdaConfiguration></NotificationConfiguration>",
+        )
+        .unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::MalformedXML);
+        let e = parse_notification_configuration(
+            b"<NotificationConfiguration><QueueConfiguration><Id>a</Id>\
+              <Event>s3:ObjectCreated:*</Event><Queue>http://h/x</Queue>\
+              <Bogus/></QueueConfiguration></NotificationConfiguration>",
+        )
+        .unwrap_err();
+        assert_eq!(e.code, S3ErrorCode::MalformedXML);
+        // 空 body / 缺根 → MalformedXML
+        assert_eq!(
+            parse_notification_configuration(b"").unwrap_err().code,
+            S3ErrorCode::MalformedXML
+        );
+        assert_eq!(
+            parse_notification_configuration(b"<oops/>")
+                .unwrap_err()
+                .code,
+            S3ErrorCode::MalformedXML
+        );
+        // XML 损坏 → MalformedXML
+        assert_eq!(
+            parse_notification_configuration(
+                b"<NotificationConfiguration><QueueConfiguration><Id>a</Id>"
+            )
+            .unwrap_err()
+            .code,
+            S3ErrorCode::MalformedXML
+        );
     }
 }

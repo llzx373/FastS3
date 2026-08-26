@@ -353,6 +353,19 @@ pub enum Op {
     LifecycleRulesDelete {
         bucket: String,
     },
+    /// 事件通知规则单事务整体替换(M15 N1;ADR-18 D-E4;同
+    /// LifecycleRulesReplace 先例:事务内扫描 `n:{bucket}\0` 旧规则键
+    /// 全删,再逐条写入新规则;规则集为空 = 纯清除)。桶不存在 →
+    /// NotFound。
+    NotificationRulesReplace {
+        bucket: String,
+        rules: Vec<fs3_core::NotificationRule>,
+    },
+    /// 事件通知规则整桶清除(幂等:无规则同样 Ok,DeleteBucketNotification-
+    /// Configuration 语义)。桶不存在 → NotFound。
+    NotificationRulesDelete {
+        bucket: String,
+    },
     /// 对象标签单事务读改写(M10 S1;PutObjectTagging/DeleteObjectTagging
     /// 落地):`vk = None` → 未版本化单键 `o:{b}\0{k}`;`Some(vk)` → 版本键
     /// (含 VK_NULL null 槽)。仅 tags 字段变更,不触碰数据段/统计;
@@ -575,6 +588,10 @@ pub struct MetaStore {
     /// 桶级生命周期规则缓存(GET/HEAD 每请求求 x-amz-expiration;
     /// 无规则桶避免反复 prefix scan。put/delete 规则随 commit 失效)。
     lifecycle_cache: Mutex<HashMap<String, Vec<fs3_core::LifecycleRule>>>,
+    /// 桶级事件通知规则缓存(M15 N1;ADR-18 D-E4:投递 worker/事件入队
+    /// 需快查桶订阅;无规则桶避免反复 prefix scan。put/delete 随 commit
+    /// 失效,同 lifecycle_cache 口径)。
+    notification_cache: Mutex<HashMap<String, Vec<fs3_core::NotificationRule>>>,
 }
 
 /// rocksdb 错误 → fs3 Error。
@@ -619,6 +636,38 @@ fn decode_lifecycle_rule(v: &[u8]) -> Result<fs3_core::LifecycleRule> {
                 noncurrent_expiration: old.noncurrent_expiration,
                 abort_incomplete_multipart: old.abort_incomplete_multipart,
                 legacy_prefix: false,
+            })
+        }
+    }
+}
+
+/// 事件通知规则值解码(M15 N1;ADR-18 D-E4)。双读:新格式优先,
+/// 失败回退 N1 初版缺失尾部字段的形态(照 decode_lifecycle_rule
+/// 先例——结构尾部只追加字段,零迁移)。
+fn decode_notification_rule(v: &[u8]) -> Result<fs3_core::NotificationRule> {
+    /// N1 初版规则格式(无 filter;如后续在尾部追加字段,此为回退)。
+    #[derive(serde::Deserialize)]
+    struct RuleV1 {
+        id: String,
+        events: Vec<String>,
+        kind: fs3_core::NotificationTargetKind,
+        url: String,
+        hmac_key: Option<String>,
+        enabled: bool,
+    }
+    match postcard::from_bytes::<fs3_core::NotificationRule>(v) {
+        Ok(r) => Ok(r),
+        Err(_) => {
+            let old: RuleV1 = postcard::from_bytes(v)
+                .map_err(|e| Error::Corrupt(format!("postcard decode notification rule: {e}")))?;
+            Ok(fs3_core::NotificationRule {
+                id: old.id,
+                events: old.events,
+                kind: old.kind,
+                url: old.url,
+                hmac_key: old.hmac_key,
+                enabled: old.enabled,
+                filter: fs3_core::NotificationKeyFilter::default(),
             })
         }
     }
@@ -1091,6 +1140,7 @@ impl MetaStore {
             txn_opts,
             flusher,
             lifecycle_cache: Mutex::new(HashMap::new()),
+            notification_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1871,6 +1921,11 @@ impl MetaStore {
                             | Op::LifecycleRulesDelete { bucket } => {
                                 self.lifecycle_cache.lock().unwrap().remove(bucket);
                             }
+                            // M15 N1(ADR-18 D-E4):通知规则缓存随 commit 失效
+                            Op::NotificationRulesReplace { bucket, .. }
+                            | Op::NotificationRulesDelete { bucket } => {
+                                self.notification_cache.lock().unwrap().remove(bucket);
+                            }
                             _ => {}
                         }
                     }
@@ -2147,6 +2202,50 @@ impl MetaStore {
         self.commit(&[Op::LifecycleRulesDelete {
             bucket: bucket.to_string(),
         }])
+    }
+
+    /// 桶事件通知规则(M15 N1;ADR-18 D-E4):前缀扫描 `n:{bucket}\0`,
+    /// 规则序 = rule_id 字典序;无规则/桶不存在 → 空表,桶存在性判定归
+    /// 协议层(同 get_lifecycle_rules 口径)。带缓存:无规则桶避免反复
+    /// prefix scan(投递/入队快查路径)。
+    pub fn get_notification_rules(&self, bucket: &str) -> Result<Vec<fs3_core::NotificationRule>> {
+        if let Some(hit) = self.notification_cache.lock().unwrap().get(bucket) {
+            return Ok(hit.clone());
+        }
+        let mut rules = Vec::new();
+        for item in scan_prefix(&self.db, &notification_rules_prefix(bucket)) {
+            let (_k, v) = item?;
+            rules.push(decode_notification_rule(&v)?);
+        }
+        self.notification_cache
+            .lock()
+            .unwrap()
+            .insert(bucket.to_string(), rules.clone());
+        Ok(rules)
+    }
+
+    /// 事件通知规则整体替换(单事务读旧写新;桶不存在 → NotFound)。
+    pub fn put_notification_rules(
+        &self,
+        bucket: &str,
+        rules: &[fs3_core::NotificationRule],
+    ) -> Result<u64> {
+        self.commit(&[Op::NotificationRulesReplace {
+            bucket: bucket.to_string(),
+            rules: rules.to_vec(),
+        }])
+    }
+
+    /// 事件通知规则整桶清除(幂等:无规则同样 Ok;桶不存在 → NotFound)。
+    pub fn delete_notification_rules(&self, bucket: &str) -> Result<u64> {
+        self.commit(&[Op::NotificationRulesDelete {
+            bucket: bucket.to_string(),
+        }])
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_clear_notification_cache(&self) {
+        self.notification_cache.lock().unwrap().clear();
     }
 
     /// 对象标签单事务读改写(M10 S1):`vk = None` → 未版本化单键;
@@ -2846,6 +2945,25 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
         Ok(keys)
     }
 
+    /// 事务内扫描桶事件通知规则键(M15 N1;ADR-18 D-E4;同
+    /// tscan_lifecycle_rule_keys 先例:`n:{bucket}\0` 前缀枚举)。
+    fn tscan_notification_rule_keys(
+        tx: &Transaction<OptimisticTransactionDB>,
+        bucket: &str,
+    ) -> Result<Vec<Vec<u8>>> {
+        let prefix = notification_rules_prefix(bucket);
+        let mut keys = Vec::new();
+        let mut it = tx.iterator(IteratorMode::From(&prefix, Direction::Forward));
+        for item in &mut it {
+            let (k, _v) = item.map_err(rocks_err)?;
+            if !k.starts_with(&prefix) {
+                break;
+            }
+            keys.push(k.to_vec());
+        }
+        Ok(keys)
+    }
+
     // 单点序列化:读 s:seq → 写 s:seq+1;并发事务在提交时冲突并重试
     let cur = tget(tx, SYS_SEQ)?
         .map(|v| u64::from_be_bytes(v.as_slice().try_into().unwrap()))
@@ -2885,6 +3003,11 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
                 // (三处联动之二;BucketConf::ALL 仅覆盖单段式配置键)
                 for rk in tscan_lifecycle_rule_keys(tx, name)? {
                     tremove(tx, &rk)?;
+                }
+                // M15 N1(ADR-18 D-E4):事件通知规则两段式键,前缀扫描
+                // 清理(同 `r:` 先例;删桶不残留通知配置)
+                for nk in tscan_notification_rule_keys(tx, name)? {
+                    tremove(tx, &nk)?;
                 }
             }
             Op::BucketSetVersioning { name, state } => {
@@ -2954,6 +3077,33 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
                     return Err(Error::NotFound(format!("bucket {bucket}")));
                 }
                 for old in tscan_lifecycle_rule_keys(tx, bucket)? {
+                    tremove(tx, &old)?;
+                }
+            }
+            Op::NotificationRulesReplace { bucket, rules } => {
+                if tget(tx, &bucket_key(bucket))?.is_none() {
+                    return Err(Error::NotFound(format!("bucket {bucket}")));
+                }
+                // N1(ADR-18 D-E4)单事务整体替换:旧规则键(前缀枚举)全删
+                // → 新规则逐条写(同 DL1 先例)
+                for old in tscan_notification_rule_keys(tx, bucket)? {
+                    tremove(tx, &old)?;
+                }
+                for r in rules {
+                    tinsert(
+                        tx,
+                        notification_rule_key(bucket, &r.id),
+                        encode(r).map_err(|e| {
+                            Error::Meta(format!("notification rule {} encode: {e}", r.id))
+                        })?,
+                    )?;
+                }
+            }
+            Op::NotificationRulesDelete { bucket } => {
+                if tget(tx, &bucket_key(bucket))?.is_none() {
+                    return Err(Error::NotFound(format!("bucket {bucket}")));
+                }
+                for old in tscan_notification_rule_keys(tx, bucket)? {
                     tremove(tx, &old)?;
                 }
             }
@@ -3552,6 +3702,116 @@ mod tests {
         let r2 = got.iter().find(|r| r.id == "r2").unwrap();
         assert!(!r2.legacy_prefix, "初版格式值回退 legacy_prefix=false");
         assert_eq!(r2.expiration.as_ref().unwrap().days, Some(7));
+    }
+
+    /// M15 N1(ADR-18 D-E4):通知规则整体替换/清除/删桶清理/桶间隔离。
+    #[test]
+    fn notification_rules_store_roundtrip() {
+        use fs3_core::{NotificationKeyFilter, NotificationRule, NotificationTargetKind as K};
+        let rule = |id: &str, url: &str| NotificationRule {
+            id: id.into(),
+            events: vec!["s3:ObjectCreated:*".into()],
+            kind: K::Queue,
+            url: url.into(),
+            hmac_key: None,
+            enabled: true,
+            filter: NotificationKeyFilter::default(),
+        };
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        s.commit_bucket_put("b2", &bucket_meta("b2")).unwrap();
+        // 空桶 → 空规则集(缓存 miss 路径)
+        assert_eq!(s.get_notification_rules("b1").unwrap(), vec![]);
+        // 多桶写入 + 逐桶读取(缓存命中路径)
+        s.put_notification_rules("b1", &[rule("n1", "http://a/x"), rule("n2", "http://b/y")])
+            .unwrap();
+        s.put_notification_rules("b2", &[rule("n1", "http://c/z")])
+            .unwrap();
+        assert_eq!(s.get_notification_rules("b1").unwrap().len(), 2);
+        assert_eq!(s.get_notification_rules("b2").unwrap().len(), 1);
+        // 整体替换:单事务读旧写新,规则序 = rule_id 字典序
+        s.put_notification_rules("b1", &[rule("n3", "http://d/w")])
+            .unwrap();
+        let got = s.get_notification_rules("b1").unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "n3");
+        assert_eq!(got[0].url, "http://d/w");
+        // b2 不受 b1 替换影响
+        assert_eq!(s.get_notification_rules("b2").unwrap().len(), 1);
+        // delete 幂等;不影响 b2
+        s.delete_notification_rules("b1").unwrap();
+        assert_eq!(s.get_notification_rules("b1").unwrap(), vec![]);
+        s.delete_notification_rules("b1").unwrap();
+        assert_eq!(s.get_notification_rules("b2").unwrap().len(), 1);
+        // 删桶 → n: 键同事务清理;再建同名桶无残留
+        s.put_notification_rules("b1", &[rule("n1", "http://a/x")])
+            .unwrap();
+        s.commit_bucket_delete("b1").unwrap();
+        assert_eq!(s.get_notification_rules("b1").unwrap(), vec![]);
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        assert_eq!(
+            s.get_notification_rules("b1").unwrap(),
+            vec![],
+            "删桶后通知规则必须随桶清理"
+        );
+        assert_eq!(s.get_notification_rules("b2").unwrap().len(), 1);
+        // 不存在的桶 → NotFound(与生命周期同口径)
+        assert!(s
+            .put_notification_rules("nope", &[rule("n1", "http://a/x")])
+            .is_err());
+        assert!(s.delete_notification_rules("nope").is_err());
+    }
+
+    /// M15 N1:NotificationRule 尾部追加 `filter` 字段——新格式往返 +
+    /// 初版格式字节直写回退(零迁移可读,照 lifecycle legacy_prefix 先例)。
+    #[test]
+    fn notification_rule_filter_tail_dual_read() {
+        use fs3_core::{NotificationKeyFilter, NotificationRule, NotificationTargetKind as K};
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        // 新格式:带 filter 往返
+        let rule = NotificationRule {
+            id: "n1".into(),
+            events: vec!["s3:ObjectCreated:*".into()],
+            kind: K::Topic,
+            url: "http://h/x".into(),
+            hmac_key: Some("k".into()),
+            enabled: true,
+            filter: NotificationKeyFilter {
+                prefix: Some("logs/".into()),
+                suffix: None,
+            },
+        };
+        s.put_notification_rules("b1", std::slice::from_ref(&rule))
+            .unwrap();
+        assert_eq!(s.get_notification_rules("b1").unwrap(), vec![rule]);
+        // 初版格式字节(无 filter 尾部)直写 → 回退空 filter
+        #[derive(serde::Serialize)]
+        struct RuleV1 {
+            id: String,
+            events: Vec<String>,
+            kind: K,
+            url: String,
+            hmac_key: Option<String>,
+            enabled: bool,
+        }
+        let old = RuleV1 {
+            id: "n2".into(),
+            events: vec!["s3:ObjectRemoved:Delete".into()],
+            kind: K::Queue,
+            url: "http://h/y".into(),
+            hmac_key: None,
+            enabled: true,
+        };
+        let bytes = postcard::to_allocvec(&old).unwrap();
+        s.db.put(notification_rule_key("b1", "n2"), &bytes)
+            .map_err(rocks_err)
+            .unwrap();
+        s.debug_clear_notification_cache();
+        let got = s.get_notification_rules("b1").unwrap();
+        let n2 = got.iter().find(|r| r.id == "n2").unwrap();
+        assert_eq!(n2.filter, NotificationKeyFilter::default());
+        assert_eq!(n2.events, vec!["s3:ObjectRemoved:Delete"]);
     }
 
     #[test]
