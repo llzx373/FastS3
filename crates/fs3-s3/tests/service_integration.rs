@@ -9760,12 +9760,25 @@ fn a1_2_storage_class_landing_end_to_end() {
         );
         assert!(c.compressed_size < m.size, "可压缩数据压缩率 > 0");
     }
-    // HEAD/GET 回显真实类 + 数据一致(压缩对象解压读)
-    let r = svc.handle(&req("HEAD", "/arc/g1", vec![])).unwrap();
-    assert_eq!(hdr(&r, "x-amz-storage-class").as_deref(), Some("GLACIER"));
-    let g = svc.handle(&req("GET", "/arc/g1", vec![])).unwrap();
-    assert_eq!(hdr(&g, "x-amz-storage-class").as_deref(), Some("GLACIER"));
-    assert_stream_eq(&svc, &g, &big, "GLACIER GET 明文一致");
+    // HEAD/GET 未恢复 → 403 InvalidObjectState + 响应头回显真实类
+    // (A2-1 门;恢复后明文读由 A2-2/A2-3 覆盖)
+    for (method, path) in [("HEAD", "/arc/g1"), ("GET", "/arc/g1")] {
+        let r = svc.handle(&req(method, path, vec![]));
+        match &r {
+            Err(e) => {
+                assert_eq!(format!("{:?}", e.code), "InvalidObjectState", "{method}");
+                assert_eq!(
+                    e.resp_headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("x-amz-storage-class"))
+                        .map(|(_, v)| v.clone())
+                        .as_deref(),
+                    Some("GLACIER")
+                );
+            }
+            Ok(_) => panic!("{method} 未恢复 GLACIER 必须 403"),
+        }
+    }
 
     // ② PUT GLACIER_IR:标准档在线可读
     svc.handle(&req_h(
@@ -9930,8 +9943,10 @@ fn a1_2_storage_class_landing_end_to_end() {
         assert_eq!(c.compressed_size, part_compressed);
     }
     let expect_all: Vec<u8> = etags.iter().flat_map(|(_, _, d)| d.clone()).collect();
-    let g = svc.handle(&req("GET", "/arc/mp", vec![])).unwrap();
-    assert_stream_eq(&svc, &g, &expect_all, "multipart 归档明文往返");
+    // 未恢复 → 403(A2-1 门;restore 后明文往返见 A2-2 集成)
+    let g = svc.handle(&req("GET", "/arc/mp", vec![]));
+    assert_eq!(err_code(&g), "InvalidObjectState");
+    let _ = &expect_all;
 
     // ⑧ SSE-C + 归档 + multipart → 显式 400(DA1.5)
     let up2 = svc.handle(&req_qh(
@@ -9982,6 +9997,87 @@ fn a1_2_storage_class_landing_end_to_end() {
     .unwrap()
     .to_string();
     assert!(ax.contains("<StorageClass>GLACIER</StorageClass>"), "{ax}");
+}
+
+/// M16 A2-1(ADR-19 DA1/DA2):未恢复归档对象读门——GLACIER/DEEP_ARCHIVE
+/// 未恢复 GET/HEAD → 403 InvalidObjectState(标准错误 XML + 响应头
+/// x-amz-storage-class 回显真实类);GLACIER_IR 在线可读;STANDARD 不受
+/// 影响;?versionId 寻址同门。
+#[test]
+fn a2_1_unrestored_archive_read_gate() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/arc2", vec![]))), 200);
+    svc.handle(&req_h(
+        "PUT",
+        "/arc2/g1",
+        &[("x-amz-storage-class", "GLACIER")],
+        b"archived".to_vec(),
+    ))
+    .unwrap();
+    svc.handle(&req_h(
+        "PUT",
+        "/arc2/d1",
+        &[("x-amz-storage-class", "DEEP_ARCHIVE")],
+        b"deep".to_vec(),
+    ))
+    .unwrap();
+    svc.handle(&req_h(
+        "PUT",
+        "/arc2/ir1",
+        &[("x-amz-storage-class", "GLACIER_IR")],
+        b"ir".to_vec(),
+    ))
+    .unwrap();
+    svc.handle(&req("PUT", "/arc2/s1", b"std".to_vec()))
+        .unwrap();
+
+    // GLACIER/DEEP_ARCHIVE:HEAD/GET → 403 InvalidObjectState +
+    // x-amz-storage-class 回显真实类
+    for (method, path, class) in [
+        ("HEAD", "/arc2/g1", "GLACIER"),
+        ("GET", "/arc2/g1", "GLACIER"),
+        ("HEAD", "/arc2/d1", "DEEP_ARCHIVE"),
+    ] {
+        let r = svc.handle(&req(method, path, vec![]));
+        match &r {
+            Err(e) => {
+                assert_eq!(
+                    format!("{:?}", e.code),
+                    "InvalidObjectState",
+                    "{method} {path}"
+                );
+                assert_eq!(
+                    e.resp_headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("x-amz-storage-class"))
+                        .map(|(_, v)| v.clone())
+                        .as_deref(),
+                    Some(class),
+                    "{method} {path} header"
+                );
+            }
+            Ok(r) => panic!("{method} {path} must be gated, got {:?}", r.status),
+        }
+    }
+    // Range GET 同门
+    let r = svc.handle(&req_q("GET", "/arc2/g1", &[("range", "bytes=0-3")], vec![]));
+    assert_eq!(err_code(&r), "InvalidObjectState");
+
+    // GLACIER_IR / STANDARD 在线可读
+    for path in ["/arc2/ir1", "/arc2/s1"] {
+        let r = svc.handle(&req("HEAD", path, vec![])).unwrap();
+        assert_eq!(r.status, 200, "{path} readable");
+        let g = svc.handle(&req("GET", path, vec![])).unwrap();
+        assert_eq!(g.status, 200, "{path} GET readable");
+    }
+    assert_eq!(
+        hdr(
+            &svc.handle(&req("HEAD", "/arc2/ir1", vec![])).unwrap(),
+            "x-amz-storage-class"
+        )
+        .as_deref(),
+        Some("GLACIER_IR")
+    );
 }
 
 /// H1-1:KeyTooLongError 触发路径——键 UTF-8 字节长 >1024 → 400

@@ -101,7 +101,7 @@
 - [x] A1-3 统计按存储类分账(五路径 + transition/restore 口径,DA5)+ admin 存储类视图
 
 #### A2 读取与 RestoreObject(≈1.5 pw)
-- [ ] A2-1 未恢复归档对象 GET/HEAD → 403 InvalidObjectState(标准错误 XML + x-amz-storage-class);GLACIER_IR 直接可读
+- [x] A2-1 未恢复归档对象 GET/HEAD → 403 InvalidObjectState(标准错误 XML + x-amz-storage-class);GLACIER_IR 直接可读
 - [ ] A2-2 POST ?restore(Days/Tier 解析校验;restore 作业入队;BackgroundWorker 节流/暂停;已恢复对象幂等延长)
 - [ ] A2-3 恢复副本生命周期:临时标准副本 + restored_until 过期后台 GC;x-amz-restore 响应头;过期后回落 InvalidObjectState
 - [ ] A2-4 CopyObject/UploadPartCopy/版本删除 × 归档语义(源归档未恢复 → InvalidObjectState;同存储类复制豁免;DeleteObjects 归档条目口径,DA5)

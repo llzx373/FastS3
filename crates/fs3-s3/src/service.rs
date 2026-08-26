@@ -4423,6 +4423,22 @@ impl S3Service {
         // 响应携带所读版本的 x-amz-version-id(版本化桶;Off 无头)
         let resp_version_id = version_id_response_header(bkt.versioning, &meta);
 
+        // M16 A2-1(ADR-19 DA1/DA2):未恢复的 GLACIER/DEEP_ARCHIVE 对象
+        // GET/HEAD → 403 InvalidObjectState(标准错误 XML + 响应头
+        // x-amz-storage-class 回显真实类;GLACIER_IR 在线可读不在此列;
+        // restore 进行中/有效 → 放行)。到期判定在请求路径(与 GC 时序
+        // 无关,DA2.4)。
+        if meta.archive_needs_restore() && !meta.restore_valid(engine.lock_now()) {
+            let class = meta.storage_class_name().to_string();
+            return Err(
+                S3Error::new(S3ErrorCode::InvalidObjectState)
+                    .with_resp_header("x-amz-storage-class", &class)
+                    .with_message(format!(
+                        "The operation is not valid for the object's storage class ({class});                          restore the object first (POST ?restore)"
+                    )),
+            );
+        }
+
         // M11 E1-2/E1-3 + D-E5(SSE-C)/ K1-2(SSE-S3):按 SseInfo.kind 分派——
         // · SSE-C 对象缺三头 → 400 InvalidRequest(AWS 口径:"The object was
         //   stored using a form of Server Side Encryption...");带三头 → E1-2
