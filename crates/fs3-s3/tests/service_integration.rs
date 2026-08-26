@@ -10213,6 +10213,82 @@ fn a2_2_restore_object_end_to_end() {
     assert_eq!(err_code(&r), "MalformedXML");
 }
 
+/// M16 A2-3(ADR-19 DA2.3/DA2.4):恢复副本生命周期——到期后读取回落
+/// InvalidObjectState(请求路径判定,与 GC 时序无关);GC 清除 restore_state
+/// 后 HEAD 恢复 403 门禁;x-amz-restore 头随回落消失。
+#[test]
+fn a2_3_restore_expiry_fallback_and_gc() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/arx", vec![]))), 200);
+    svc.handle(&req_h(
+        "PUT",
+        "/arx/g1",
+        &[("x-amz-storage-class", "GLACIER")],
+        b"expire me".to_vec(),
+    ))
+    .unwrap();
+    // restore + 物化
+    svc.handle(&req_q(
+        "POST",
+        "/arx/g1",
+        &[("restore", "")],
+        br#"<RestoreRequest><Days>3</Days></RestoreRequest>"#.to_vec(),
+    ))
+    .unwrap();
+    let now = {
+        let e = svc.engine().write();
+        e.lock_now()
+    };
+    {
+        let mut e = svc.engine().write();
+        let (done, _) = e.restore_worker_tick(now + 1, 8).unwrap();
+        assert_eq!(done, 1);
+    }
+    let g = svc.handle(&req("GET", "/arx/g1", vec![])).unwrap();
+    assert_eq!(g.status, 200, "已恢复可读");
+    // 模拟到期(直接改写 restore_state.restored_until 为过去;生产 = 时钟
+    // 自然流逝,请求路径同判)
+    {
+        let e = svc.engine().write();
+        let mut m = e.meta().get_object("arx", "g1").unwrap().unwrap();
+        let st = m.restore_state.as_mut().unwrap();
+        st.restored_until = now - 1;
+        let raw = fs3_meta::keys::object_key("arx", "g1");
+        e.meta().commit_object_meta_update(&raw, &m).unwrap();
+    }
+    // 到期后:GET/HEAD → 403(GC 未跑也应回落)
+    let r = svc.handle(&req("GET", "/arx/g1", vec![]));
+    assert_eq!(err_code(&r), "InvalidObjectState", "到期回落");
+    let r = svc.handle(&req("HEAD", "/arx/g1", vec![]));
+    assert_eq!(err_code(&r), "InvalidObjectState", "HEAD 到期回落");
+    // GC 清除副本状态
+    {
+        let mut e = svc.engine().write();
+        let cleared = e.restore_gc_scan(now + 1).unwrap();
+        assert_eq!(cleared, 1);
+    }
+    {
+        let e = svc.engine().read();
+        let m = e.meta().get_object("arx", "g1").unwrap().unwrap();
+        assert_eq!(m.restore_state, None, "GC 清 restore_state");
+    }
+    // 再次 restore 可重新入队(新副本)
+    let r = svc.handle(&req_q(
+        "POST",
+        "/arx/g1",
+        &[("restore", "")],
+        br#"<RestoreRequest><Days>2</Days></RestoreRequest>"#.to_vec(),
+    ));
+    assert_eq!(status(&r), 200);
+    {
+        let mut e = svc.engine().write();
+        let (done, _) = e.restore_worker_tick(now + 2, 8).unwrap();
+        assert_eq!(done, 1, "二次恢复物化");
+    }
+    let g = svc.handle(&req("GET", "/arx/g1", vec![])).unwrap();
+    assert_eq!(g.status, 200, "二次恢复后可读");
+}
+
 /// H1-1:KeyTooLongError 触发路径——键 UTF-8 字节长 >1024 → 400
 /// KeyTooLongError(PUT/GET/CreateMultipart 路径键 + CopyObject 的
 /// copy-source 键);恰好 1024 字节放行对照(AWS 上限口径)。
