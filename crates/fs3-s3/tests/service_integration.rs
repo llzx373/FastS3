@@ -10154,3 +10154,192 @@ fn sts_session_data_plane_roundtrip() {
         .is_err());
     assert!(svc.issue_session("ghost", None, None, "admin").is_err());
 }
+
+// ───────────────────── M15 I1:桶级 S3 Inventory(CSV 起步)─────────────────────
+
+/// ?inventory 请求构建 helper(闭包签名生命周期问题回避:显式函数)。
+fn inv_req(
+    method: &str,
+    path: &str,
+    id: Option<&str>,
+    extra: &[(&str, &str)],
+    body: Vec<u8>,
+) -> S3Request {
+    let mut query: Vec<(String, String)> = vec![("inventory".into(), String::new())];
+    if let Some(id) = id {
+        query.push(("id".into(), id.to_string()));
+    }
+    query.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+    let q: Vec<(&str, &str)> = query
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    req_q(method, path, &q, body)
+}
+
+/// Put/Get/Delete/ListBucketInventoryConfiguration 全流程:配置 CRUD +
+/// List 分页 + 404 NoSuchInventoryConfiguration + DELETE 幂等 +
+/// ORC/Parquet 显式拒绝 + 删桶清理 + 两桶隔离。
+#[test]
+fn bucket_inventory_config_flow() {
+    let (_d, svc) = setup();
+    svc.handle(&req("PUT", "/inv-bkt", vec![])).unwrap();
+    svc.handle(&req("PUT", "/inv-bkt2", vec![])).unwrap();
+
+    // 无配置 GET → 404 NoSuchInventoryConfiguration
+    let r = svc.handle(&inv_req("GET", "/inv-bkt", Some("nope"), &[], vec![]));
+    assert_eq!(status(&r), 404, "{r:?}");
+    assert_eq!(err_code(&r), "NoSuchInventoryConfiguration", "{r:?}");
+
+    // PUT 配置(全字段)→ 200
+    let body = br#"<InventoryConfiguration>
+      <Destination><S3BucketDestination>
+        <Bucket>arn:aws:s3:::dest-bkt</Bucket><Format>CSV</Format><Prefix>inv/</Prefix>
+      </S3BucketDestination></Destination>
+      <IsEnabled>true</IsEnabled><Filter><Prefix>src/</Prefix></Filter>
+      <Id>inv-1</Id><IncludedObjectVersions>All</IncludedObjectVersions>
+      <OptionalFields><Field>Size</Field><Field>ETag</Field></OptionalFields>
+      <Schedule><Frequency>Daily</Frequency></Schedule>
+    </InventoryConfiguration>"#
+        .to_vec();
+    let r = svc.handle(&inv_req("PUT", "/inv-bkt", Some("inv-1"), &[], body));
+    assert_eq!(status(&r), 200, "{r:?}");
+
+    // GET 往返
+    let x = body_str(
+        &svc.handle(&inv_req("GET", "/inv-bkt", Some("inv-1"), &[], vec![]))
+            .unwrap(),
+    );
+    for frag in [
+        "<Id>inv-1</Id>",
+        "<Bucket>arn:aws:s3:::dest-bkt</Bucket>",
+        "<Format>CSV</Format>",
+        "<Prefix>inv/</Prefix>",
+        "<IsEnabled>true</IsEnabled>",
+        "<Filter><Prefix>src/</Prefix></Filter>",
+        "<IncludedObjectVersions>All</IncludedObjectVersions>",
+        "<Frequency>Daily</Frequency>",
+    ] {
+        assert!(x.contains(frag), "missing {frag} in {x}");
+    }
+
+    // 第二配置(PUT 覆盖语义)
+    let body2 = br#"<InventoryConfiguration><Destination><S3BucketDestination><Bucket>arn:aws:s3:::dest-bkt</Bucket><Format>CSV</Format></S3BucketDestination></Destination><IsEnabled>false</IsEnabled><Id>inv-2</Id><IncludedObjectVersions>Current</IncludedObjectVersions><Schedule><Frequency>Weekly</Frequency></Schedule></InventoryConfiguration>"#.to_vec();
+    let r = svc.handle(&inv_req("PUT", "/inv-bkt", Some("inv-2"), &[], body2));
+    assert_eq!(status(&r), 200, "{r:?}");
+
+    // List:两配置 + 未截断
+    let x = body_str(
+        &svc.handle(&inv_req("GET", "/inv-bkt", None, &[], vec![]))
+            .unwrap(),
+    );
+    assert!(
+        x.contains("<Id>inv-1</Id>") && x.contains("<Id>inv-2</Id>"),
+        "{x}"
+    );
+    assert!(x.contains("<IsTruncated>false</IsTruncated>"), "{x}");
+    // List 分页(page=1):截断 + continuation-token = 末 id
+    for i in 0..120 {
+        let b = format!(
+            r#"<InventoryConfiguration><Destination><S3BucketDestination><Bucket>arn:aws:s3:::d</Bucket><Format>CSV</Format></S3BucketDestination></Destination><IsEnabled>true</IsEnabled><Id>inv-{i}</Id><IncludedObjectVersions>Current</IncludedObjectVersions><Schedule><Frequency>Daily</Frequency></Schedule></InventoryConfiguration>"#
+        );
+        let r = svc.handle(&inv_req(
+            "PUT",
+            "/inv-bkt",
+            Some(&format!("inv-{i}")),
+            &[],
+            b.into_bytes(),
+        ));
+        assert_eq!(status(&r), 200);
+    }
+    let x = body_str(
+        &svc.handle(&inv_req("GET", "/inv-bkt", None, &[], vec![]))
+            .unwrap(),
+    );
+    let _ = &x;
+    assert!(x.contains("<IsTruncated>true</IsTruncated>"), "{x}");
+    // 第二页(continuation-token = 上一页末 id)
+    let tok = x
+        .find("<ContinuationToken>")
+        .map(|i| {
+            let rest = &x[i + "<ContinuationToken>".len()..];
+            let end = rest.find("</ContinuationToken>").unwrap_or(0);
+            rest[..end].to_string()
+        })
+        .unwrap_or_default();
+    assert!(!tok.is_empty(), "分页 token 存在");
+    let x2 = body_str(
+        &svc.handle(&inv_req(
+            "GET",
+            "/inv-bkt",
+            None,
+            &[("continuation-token", &tok)],
+            vec![],
+        ))
+        .unwrap(),
+    );
+    assert!(x2.contains("<IsTruncated>false</IsTruncated>"), "{x2}");
+    assert!(!x2.contains("<Id>inv-1</Id>"), "第二页不含第一页内容:{x2}");
+
+    // ORC/Parquet 显式拒绝(不静默)
+    for fmt in ["ORC", "Parquet"] {
+        let bad = format!(
+            r#"<InventoryConfiguration><Destination><S3BucketDestination><Bucket>arn:aws:s3:::d</Bucket><Format>{fmt}</Format></S3BucketDestination></Destination><IsEnabled>true</IsEnabled><Id>bad</Id><IncludedObjectVersions>Current</IncludedObjectVersions><Schedule><Frequency>Daily</Frequency></Schedule></InventoryConfiguration>"#
+        );
+        let r = svc.handle(&inv_req(
+            "PUT",
+            "/inv-bkt",
+            Some("bad"),
+            &[],
+            bad.into_bytes(),
+        ));
+        assert_eq!(err_code(&r), "InvalidArgument", "{fmt}: {r:?}");
+    }
+    // 路径 id 与 XML Id 不符 → InvalidArgument
+    let body = br#"<InventoryConfiguration><Destination><S3BucketDestination><Bucket>arn:aws:s3:::d</Bucket><Format>CSV</Format></S3BucketDestination></Destination><IsEnabled>true</IsEnabled><Id>other</Id><IncludedObjectVersions>Current</IncludedObjectVersions><Schedule><Frequency>Daily</Frequency></Schedule></InventoryConfiguration>"#.to_vec();
+    let r = svc.handle(&inv_req("PUT", "/inv-bkt", Some("path-id"), &[], body));
+    assert_eq!(err_code(&r), "InvalidArgument", "{r:?}");
+
+    // DELETE → 204;再 DELETE → 204(幂等);再 GET → 404
+    let r = svc.handle(&inv_req("DELETE", "/inv-bkt", Some("inv-1"), &[], vec![]));
+    assert_eq!(status(&r), 204, "{r:?}");
+    let r = svc.handle(&inv_req("DELETE", "/inv-bkt", Some("inv-1"), &[], vec![]));
+    assert_eq!(status(&r), 204, "Delete 幂等");
+    let r = svc.handle(&inv_req("GET", "/inv-bkt", Some("inv-1"), &[], vec![]));
+    assert_eq!(err_code(&r), "NoSuchInventoryConfiguration", "{r:?}");
+
+    // 两桶隔离 + 删桶清理
+    let body_single = br#"<InventoryConfiguration><Destination><S3BucketDestination><Bucket>arn:aws:s3:::d2</Bucket><Format>CSV</Format></S3BucketDestination></Destination><IsEnabled>true</IsEnabled><Id>only</Id><IncludedObjectVersions>Current</IncludedObjectVersions><Schedule><Frequency>Daily</Frequency></Schedule></InventoryConfiguration>"#.to_vec();
+    svc.handle(&inv_req("PUT", "/inv-bkt2", Some("only"), &[], body_single))
+        .unwrap();
+    let x1 = body_str(
+        &svc.handle(&inv_req("GET", "/inv-bkt", None, &[], vec![]))
+            .unwrap(),
+    );
+    assert!(!x1.contains("<Id>only</Id>"), "bkt 不含 bkt2 配置:{x1}");
+    svc.handle(&req("DELETE", "/inv-bkt", vec![])).unwrap();
+    svc.handle(&req("PUT", "/inv-bkt", vec![])).unwrap();
+    let x1 = body_str(
+        &svc.handle(&inv_req("GET", "/inv-bkt", None, &[], vec![]))
+            .unwrap(),
+    );
+    assert!(
+        !x1.contains("<Id>inv-2</Id>"),
+        "删桶后 Inventory 配置必须随桶清理:{x1}"
+    );
+    let x2 = body_str(
+        &svc.handle(&inv_req("GET", "/inv-bkt2", None, &[], vec![]))
+            .unwrap(),
+    );
+    assert!(x2.contains("<Id>only</Id>"), "bkt2 配置不受影响:{x2}");
+    // 桶不存在 → NoSuchBucket(四方法同口径)
+    for m in ["GET", "PUT", "DELETE"] {
+        let body = if m == "PUT" {
+            br#"<InventoryConfiguration><Destination><S3BucketDestination><Bucket>arn:aws:s3:::d</Bucket><Format>CSV</Format></S3BucketDestination></Destination><IsEnabled>true</IsEnabled><Id>g</Id><IncludedObjectVersions>Current</IncludedObjectVersions><Schedule><Frequency>Daily</Frequency></Schedule></InventoryConfiguration>"#.to_vec()
+        } else {
+            vec![]
+        };
+        let r = svc.handle(&inv_req(m, "/ghost", Some("g"), &[], body));
+        assert_eq!(err_code(&r), "NoSuchBucket", "{m}");
+    }
+}

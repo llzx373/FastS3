@@ -418,6 +418,12 @@ pub struct BucketDto {
     /// `o:`/`p:` 段引用键,对 `n:`/`e:` 天然安全(三处,keys.rs 注释登记)。
     #[serde(default)]
     pub notification: Option<String>,
+    /// S3 Inventory 配置集(M15 I1 `iv:` 两段式键;**规范化 XML 列表**,
+    /// 同 lifecycle 先例;导入时逐条解析重写。旧导出无此字段 → None)。
+    /// 演进纪律三处联动:`iv:` 登记于 keys.rs 前缀表(一处);本 DTO
+    /// 承载配置文档(二处);check 可达性扫描对配置键天然安全(三处)。
+    #[serde(default)]
+    pub inventory: Option<String>,
 }
 
 /// 导出文件顶层结构。
@@ -512,6 +518,19 @@ pub fn run_meta_export(
                 .ok()
                 .filter(|rules| !rules.is_empty())
                 .map(|rules| fs3_s3::xml::render_notification_configuration(&rules));
+            // M15 I1:S3 Inventory 配置集 → 规范化 XML 列表
+            // (iv: 两段式键;无配置 → None;导入时逐条解析重写)
+            let inventory = store
+                .list_inventory_configs(&name)
+                .ok()
+                .filter(|rules| !rules.is_empty())
+                .map(|rules| {
+                    let mut xml = String::new();
+                    for r in &rules {
+                        xml.push_str(&fs3_s3::xml::render_inventory_configuration(r));
+                    }
+                    xml
+                });
             BucketDto {
                 name: name.clone(),
                 created: m.created,
@@ -531,6 +550,7 @@ pub fn run_meta_export(
                 policy: conf(fs3_meta::BucketConf::Policy),
                 lifecycle,
                 notification,
+                inventory,
             }
         })
         .collect();
@@ -727,6 +747,26 @@ pub fn run_meta_import(
                     ))
                 })?;
             store.put_notification_rules(&b.name, &rules)?;
+        }
+        // M15 I1:S3 Inventory 配置集恢复——首尾相接的 InventoryConfiguration
+        // 元素切分后逐一解析(协议层同一份校验),逐条写入;无配置 → 保持无
+        if let Some(doc) = &b.inventory {
+            let items =
+                fs3_s3::xml::split_inventory_configurations(doc.as_bytes()).map_err(|e| {
+                    fs3_core::Error::InvalidArgument(format!(
+                        "bucket {} inventory document invalid: {e}",
+                        b.name
+                    ))
+                })?;
+            for raw in items {
+                let rule = fs3_s3::xml::parse_inventory_configuration(&raw).map_err(|e| {
+                    fs3_core::Error::InvalidArgument(format!(
+                        "bucket {} inventory entry invalid: {e}",
+                        b.name
+                    ))
+                })?;
+                store.put_inventory_config(&b.name, &rule)?;
+            }
         }
     }
 
@@ -1413,6 +1453,17 @@ mod tests {
             )
             .unwrap();
             m.put_notification_rules("b1", &nrules).unwrap();
+            // M15 I1:S3 Inventory 配置(CSV;双配置)
+            let i1 = fs3_s3::xml::parse_inventory_configuration(
+                br#"<InventoryConfiguration><Destination><S3BucketDestination><Bucket>arn:aws:s3:::dest1</Bucket><Format>CSV</Format><Prefix>inv1/</Prefix></S3BucketDestination></Destination><IsEnabled>true</IsEnabled><Filter><Prefix>src/</Prefix></Filter><Id>in1</Id><IncludedObjectVersions>All</IncludedObjectVersions><Schedule><Frequency>Daily</Frequency></Schedule></InventoryConfiguration>"#,
+            )
+            .unwrap();
+            let i2 = fs3_s3::xml::parse_inventory_configuration(
+                br#"<InventoryConfiguration><Destination><S3BucketDestination><Bucket>arn:aws:s3:::dest2</Bucket><Format>CSV</Format></S3BucketDestination></Destination><IsEnabled>false</IsEnabled><Id>in2</Id><IncludedObjectVersions>Current</IncludedObjectVersions><Schedule><Frequency>Weekly</Frequency></Schedule></InventoryConfiguration>"#,
+            )
+            .unwrap();
+            m.put_inventory_config("b1", &i1).unwrap();
+            m.put_inventory_config("b1", &i2).unwrap();
             e.close().unwrap();
         }
         let export = dir.path().join("export.json");
@@ -1494,6 +1545,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(e2.meta().get_notification_rules("b1").unwrap(), nrules);
+        // M15 I1:S3 Inventory 配置集导入后与导出前逐字段相等
+        let inv = e2.meta().list_inventory_configs("b1").unwrap();
+        assert_eq!(inv.len(), 2, "双配置导入");
+        assert_eq!(inv[0].id, "in1");
+        assert_eq!(inv[0].destination_bucket, "dest1");
+        assert_eq!(inv[0].filter_prefix.as_deref(), Some("src/"));
+        assert_eq!(
+            inv[0].included_versions,
+            fs3_core::InventoryObjectVersions::All
+        );
+        assert_eq!(inv[0].schedule, fs3_core::InventoryFrequency::Daily);
+        assert_eq!(inv[1].id, "in2");
+        assert!(!inv[1].is_enabled);
+        assert_eq!(
+            inv[1].included_versions,
+            fs3_core::InventoryObjectVersions::Current
+        );
         e2.abort();
     }
 

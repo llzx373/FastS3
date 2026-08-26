@@ -76,6 +76,11 @@ pub const PREFIX_NOTIFICATION: &[u8] = b"n:";
 /// be64 字典序 = 数值序 = 写入序;有界环形(上限可配),批量截断最旧;
 /// 入队与触发它的数据操作同事务提交(崩溃零漂移,ADR-18 D-E1)。
 pub const PREFIX_EVENT: &[u8] = b"e:";
+/// S3 Inventory 配置(M15 I1;`iv:{bucket}\0{id}` → postcard
+/// InventoryRule;每配置一键)。新一级前缀:同 `n:` 三处同步(keys.rs
+/// 前缀表 + meta-export/import DTO + check 可达性扫描登记);两段式
+/// 桶级键入删桶清理(同 `r:`/`n:` 先例)。
+pub const PREFIX_INVENTORY: &[u8] = b"iv:";
 
 /// 系统单调计数器(每个事务 +1,单点序列化;ADR-5)。
 pub const SYS_SEQ: &[u8] = b"s:seq";
@@ -438,11 +443,47 @@ pub fn parse_notification_rule_key(raw: &[u8]) -> Result<(String, String)> {
         .iter()
         .position(|&b| b == 0x00)
         .ok_or_else(|| Error::Corrupt("notification key missing separator".into()))?;
+
     let bucket = String::from_utf8(body[..sep].to_vec())
         .map_err(|_| Error::Corrupt("bucket name not utf8".into()))?;
     let rid = String::from_utf8(body[sep + 1..].to_vec())
         .map_err(|_| Error::Corrupt("rule id not utf8".into()))?;
     Ok((bucket, rid))
+}
+
+/// S3 Inventory 配置键:`iv:{bucket}\0{id}`(M15 I1)。
+pub fn inventory_config_key(bucket: &str, id: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(PREFIX_INVENTORY.len() + bucket.len() + 1 + id.len());
+    k.extend_from_slice(PREFIX_INVENTORY);
+    k.extend_from_slice(bucket.as_bytes());
+    k.push(0x00);
+    k.extend_from_slice(id.as_bytes());
+    k
+}
+
+/// 桶级 Inventory 配置前缀:`iv:{bucket}\0`(List/删桶清理扫描边界)。
+pub fn inventory_configs_prefix(bucket: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(PREFIX_INVENTORY.len() + bucket.len() + 1);
+    k.extend_from_slice(PREFIX_INVENTORY);
+    k.extend_from_slice(bucket.as_bytes());
+    k.push(0x00);
+    k
+}
+
+/// 解析 `iv:` 键 → (bucket, config_id)。
+pub fn parse_inventory_config_key(raw: &[u8]) -> Result<(String, String)> {
+    let body = raw
+        .strip_prefix(PREFIX_INVENTORY)
+        .ok_or_else(|| Error::Corrupt("inventory key missing prefix".into()))?;
+    let sep = body
+        .iter()
+        .position(|&b| b == 0x00)
+        .ok_or_else(|| Error::Corrupt("inventory key missing separator".into()))?;
+    let bucket = String::from_utf8(body[..sep].to_vec())
+        .map_err(|_| Error::Corrupt("bucket name not utf8".into()))?;
+    let id = String::from_utf8(body[sep + 1..].to_vec())
+        .map_err(|_| Error::Corrupt("inventory id not utf8".into()))?;
+    Ok((bucket, id))
 }
 
 /// 事件队列条目键:`e:{seq be64}`(M15 N2;ADR-18 D-E1)。

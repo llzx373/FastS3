@@ -54,7 +54,7 @@
 - [x] T3 会话审计(签发/过期/使用六维检索扩展)+ 集成测试(boto3 sts 指向 FastS3 端点 → 临时凭证 → S3 数据面往返;会话策略 Deny 生效;过期后拒绝)
 
 ### I. S3 Inventory(CSV;NEXT-ROUND §5 I1~I3,≈1 pw)
-- [ ] I1 Put/Get/Delete/ListBucketInventoryConfigurations(?inventory;CSV 起步,ORC/Parquet 显式不支持)+ 配置校验
+- [x] I1 Put/Get/Delete/ListBucketInventoryConfigurations(?inventory;CSV 起步,ORC/Parquet 显式不支持)+ 配置校验
 - [ ] I2 生成 worker(复用 ListObjects 全量翻页;清单对象 + manifest.json 落桶;节流/暂停复用 BackgroundWorker)+ 指标
 - [ ] I3 集成测试(配置→生成→清单内容对账;版本化桶含删除标记口径)+ 迁移对账演示(mc/rclone 迁移后以清单逐项 md5 对账)
 

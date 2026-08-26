@@ -891,6 +891,94 @@ impl NotificationRule {
     }
 }
 
+/// S3 Inventory 清单格式(AWS `InventoryFormat` 枚举;M15 I1)。
+/// 变体序 = postcard 编码序,只允许尾部追加。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InventoryFormat {
+    /// CSV 起步;ORC/Parquet 显式不支持(协议层 InvalidArgument 报错)。
+    Csv,
+}
+
+/// 清单对象版本口径(AWS `InventoryIncludedObjectVersions`;M15 I1)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InventoryObjectVersions {
+    /// 全部版本(含历史版本与删除标记;清单含 VersionId/IsLatest/DeleteMarker)。
+    All,
+    /// 仅当前版本。
+    Current,
+}
+
+/// 清单生成周期(AWS `InventoryFrequency`;M15 I1)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InventoryFrequency {
+    Daily,
+    Weekly,
+}
+
+/// S3 Inventory 配置(M15 I1~I3;键 `iv:{bucket}\0{id}` → postcard
+/// InventoryRule;每配置一键,Put/Get/Delete/List ?inventory 承载)。
+/// CSV 起步(ORC/Parquet 显式不支持);生成 worker 复用 ListObjects
+/// 全量翻页,清单对象 + manifest.json 落目标桶;节流/暂停复用
+/// BackgroundWorker。演进纪律:结构只许尾部追加字段/变体(postcard 序)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryRule {
+    /// 配置 ID(桶内唯一,非空,≤255 字符;AWS 必填)。
+    pub id: String,
+    /// 启用态(AWS:true 才按周期生成清单;false = 配置留存但不生成)。
+    pub is_enabled: bool,
+    /// 源桶键前缀过滤(AWS Filter/Prefix;None = 全部对象)。
+    pub filter_prefix: Option<String>,
+    /// 对象版本口径(All/Current)。
+    pub included_versions: InventoryObjectVersions,
+    /// 生成周期(Daily/Weekly)。
+    pub schedule: InventoryFrequency,
+    /// 目标桶名(S3BucketDestination/Bucket;AWS 为 ARN,本实现接受
+    /// `arn:aws:s3:::<bucket>` 或裸桶名,存储归一为桶名)。
+    pub destination_bucket: String,
+    /// 目标格式(CSV 起步)。
+    pub format: InventoryFormat,
+    /// 目标键前缀(S3BucketDestination/Prefix;None = 桶根)。
+    pub destination_prefix: Option<String>,
+}
+
+/// InventoryRule 辅助(状态口径检查)。
+impl InventoryRule {
+    /// 目标键前缀(默认空 = 目标桶根)。
+    pub fn dest_prefix(&self) -> &str {
+        self.destination_prefix.as_deref().unwrap_or("")
+    }
+}
+
+/// 清单可选字段白名单(CSV 列;M15 I2 生成器支持集)。
+/// 与 AWS `InventoryOptionalField` 对齐但按实现面收敛:Size/ETag/
+/// StorageClass/VersionId/IsLatest/DeleteMarker/Size 等。生成器只输出
+/// 白名单内的列,未知字段在配置时显式拒绝(InvalidArgument,不静默)。
+pub const INVENTORY_OPTIONAL_FIELDS: &[&str] = &[
+    "Size",
+    "LastModifiedDate",
+    "ETag",
+    "StorageClass",
+    "IsMultipartUploaded",
+    "ReplicationStatus",
+    "EncryptionStatus",
+    "ObjectLockRetentionMode",
+    "ObjectLockRetainUntilDate",
+    "ObjectLockLegalHoldStatus",
+    "IntelligentTieringAccessTier",
+    "VersionId",
+    "IsLatest",
+    "DeleteMarker",
+    "ChecksumAlgorithm",
+    "ObjectAccessControlList",
+    "ObjectOwner",
+    "UserMetadata",
+];
+
+/// 清单可选字段校验(白名单;非法字段 → None,协议层显式拒绝)。
+pub fn inventory_field_valid(name: &str) -> bool {
+    INVENTORY_OPTIONAL_FIELDS.contains(&name)
+}
+
 /// 事件通知队列条目(M15 N2;ADR-18 D-E1;键 `e:{seq be64}` → postcard
 /// EventRecord)。seq = 触发它的数据事务 seq(单调,崩溃零漂移:入队与
 /// 数据操作同事务提交——已应答对象必有事件、未应答必无事件)。

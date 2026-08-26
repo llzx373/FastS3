@@ -390,6 +390,17 @@ pub enum Op {
     SessionDelete {
         session_id: String,
     },
+    /// S3 Inventory 配置写入(M15 I1;`iv:{bucket}\0{id}`;覆盖语义)。
+    InventoryRulePut {
+        bucket: String,
+        rule: fs3_core::InventoryRule,
+    },
+    /// S3 Inventory 配置删除(幂等;同 DeleteBucketInventoryConfiguration
+    /// 的 AWS 204 语义)。
+    InventoryRuleDelete {
+        bucket: String,
+        id: String,
+    },
     /// 对象标签单事务读改写(M10 S1;PutObjectTagging/DeleteObjectTagging
     /// 落地):`vk = None` → 未版本化单键 `o:{b}\0{k}`;`Some(vk)` → 版本键
     /// (含 VK_NULL null 槽)。仅 tags 字段变更,不触碰数据段/统计;
@@ -694,6 +705,17 @@ fn decode_notification_rule(v: &[u8]) -> Result<fs3_core::NotificationRule> {
                 filter: fs3_core::NotificationKeyFilter::default(),
             })
         }
+    }
+}
+
+/// M15 I1 Inventory 配置值解码(双读:新格式优先,失败回退初版——结构
+/// 尾部只追加字段,零迁移;照 decode_notification_rule 先例)。
+fn decode_inventory_rule(v: &[u8]) -> Result<fs3_core::InventoryRule> {
+    match postcard::from_bytes::<fs3_core::InventoryRule>(v) {
+        Ok(r) => Ok(r),
+        Err(e) => Err(Error::Corrupt(format!(
+            "postcard decode inventory rule: {e}"
+        ))),
     }
 }
 
@@ -2485,6 +2507,54 @@ impl MetaStore {
         Ok(out)
     }
 
+    // ── M15 I1:S3 Inventory 配置(ADR-18;`iv:` 前缀) ──
+
+    /// 桶 Inventory 配置列表(前缀扫描;键序 = config_id 字典序)。
+    pub fn list_inventory_configs(&self, bucket: &str) -> Result<Vec<fs3_core::InventoryRule>> {
+        let mut out = Vec::new();
+        for item in scan_prefix(&self.db, &inventory_configs_prefix(bucket)) {
+            let (_k, v) = item?;
+            out.push(decode_inventory_rule(&v)?);
+        }
+        Ok(out)
+    }
+
+    /// 单配置读取(GetBucketInventoryConfiguration;缺失 → None)。
+    pub fn get_inventory_config(
+        &self,
+        bucket: &str,
+        id: &str,
+    ) -> Result<Option<fs3_core::InventoryRule>> {
+        match self
+            .db
+            .get(inventory_config_key(bucket, id))
+            .map_err(rocks_err)?
+        {
+            Some(v) => decode_inventory_rule(&v).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// 配置写入(覆盖语义;桶不存在 → NotFound)。
+    pub fn put_inventory_config(
+        &self,
+        bucket: &str,
+        rule: &fs3_core::InventoryRule,
+    ) -> Result<u64> {
+        self.commit(&[Op::InventoryRulePut {
+            bucket: bucket.to_string(),
+            rule: rule.clone(),
+        }])
+    }
+
+    /// 配置删除(幂等;桶不存在 → NotFound)。
+    pub fn delete_inventory_config(&self, bucket: &str, id: &str) -> Result<u64> {
+        self.commit(&[Op::InventoryRuleDelete {
+            bucket: bucket.to_string(),
+            id: id.to_string(),
+        }])
+    }
+
     /// 对象标签单事务读改写(M10 S1):`vk = None` → 未版本化单键;
     /// `Some(vk)` → 版本键(含 VK_NULL null 槽)。目标不存在 → NotFound。
     pub fn commit_object_set_tags(
@@ -3316,6 +3386,25 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
         Ok(keys)
     }
 
+    /// 事务内扫描桶 Inventory 配置键(M15 I1;同
+    /// tscan_notification_rule_keys 先例:`iv:{bucket}\0` 前缀枚举)。
+    fn tscan_inventory_config_keys(
+        tx: &Transaction<OptimisticTransactionDB>,
+        bucket: &str,
+    ) -> Result<Vec<Vec<u8>>> {
+        let prefix = inventory_configs_prefix(bucket);
+        let mut keys = Vec::new();
+        let mut it = tx.iterator(IteratorMode::From(&prefix, Direction::Forward));
+        for item in &mut it {
+            let (k, _v) = item.map_err(rocks_err)?;
+            if !k.starts_with(&prefix) {
+                break;
+            }
+            keys.push(k.to_vec());
+        }
+        Ok(keys)
+    }
+
     // 单点序列化:读 s:seq → 写 s:seq+1;并发事务在提交时冲突并重试
     let cur = tget(tx, SYS_SEQ)?
         .map(|v| u64::from_be_bytes(v.as_slice().try_into().unwrap()))
@@ -3360,6 +3449,10 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
                 // 清理(同 `r:` 先例;删桶不残留通知配置)
                 for nk in tscan_notification_rule_keys(tx, name)? {
                     tremove(tx, &nk)?;
+                }
+                // M15 I1:S3 Inventory 配置两段式键,前缀扫描清理
+                for ik in tscan_inventory_config_keys(tx, name)? {
+                    tremove(tx, &ik)?;
                 }
             }
             Op::BucketSetVersioning { name, state } => {
@@ -3484,6 +3577,18 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
             }
             Op::SessionDelete { session_id } => {
                 tremove(tx, &sts_session_key(session_id))?;
+            }
+            Op::InventoryRulePut { bucket, rule } => {
+                if tget(tx, &bucket_key(bucket))?.is_none() {
+                    return Err(Error::NotFound(format!("bucket {bucket}")));
+                }
+                tinsert(tx, inventory_config_key(bucket, &rule.id), encode(rule)?)?;
+            }
+            Op::InventoryRuleDelete { bucket, id } => {
+                if tget(tx, &bucket_key(bucket))?.is_none() {
+                    return Err(Error::NotFound(format!("bucket {bucket}")));
+                }
+                tremove(tx, &inventory_config_key(bucket, id))?;
             }
             Op::ObjectSetTags {
                 bucket,

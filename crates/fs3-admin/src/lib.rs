@@ -1168,14 +1168,9 @@ impl AdminServer {
             Ok((temporary_access_key, secret, rec)) => {
                 // T3:签发审计(六维检索:who=签发者, op=IssueSession,
                 // key=session_id;不含任何密钥材料)
-                self.service.audit().push(
-                    issued_by,
-                    "IssueSession",
-                    "",
-                    &rec.session_id,
-                    200,
-                    "",
-                );
+                self.service
+                    .audit()
+                    .push(issued_by, "IssueSession", "", &rec.session_id, 200, "");
                 json::ok(serde_json::json!({
                     "session_id": rec.session_id,
                     "temporary_access_key": temporary_access_key,

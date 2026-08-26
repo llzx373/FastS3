@@ -3214,6 +3214,392 @@ pub fn render_notification_configuration(rules: &[fs3_core::NotificationRule]) -
     xml
 }
 
+// ───────────────────── S3 Inventory 配置(M15 I1)─────────────────────
+
+/// 解析单个 InventoryConfiguration 元素(共享行)。
+/// AWS 形状:<InventoryConfiguration><Destination><S3BucketDestination>
+/// <AccountId/><Bucket>arn:aws:s3:::dest</Bucket><Format>CSV</Format>
+/// <Prefix>p</Prefix></S3BucketDestination></Destination>
+/// <IsEnabled>true</IsEnabled><Filter><Prefix>src/</Prefix></Filter>
+/// <Id>id</Id><IncludedObjectVersions>All|Current</IncludedObjectVersions>
+/// <OptionalFields><Field>Size</Field>...</OptionalFields>
+/// <Schedule><Frequency>Daily|Weekly</Frequency></Schedule>
+/// </InventoryConfiguration>。
+/// 错误口径:结构/schema 违例 → MalformedXML;语义违例(ORC/Parquet
+/// 格式不支持、未知可选字段、缺必填元素)→ InvalidArgument(显式,
+/// 不静默——CSV 起步,ORC/Parquet 显式不支持)。
+pub fn parse_inventory_configuration(body: &[u8]) -> Result<fs3_core::InventoryRule, S3Error> {
+    let malformed = |m: String| S3Error::new(S3ErrorCode::MalformedXML).with_message(m);
+    let invalid = |m: String| S3Error::new(S3ErrorCode::InvalidArgument).with_message(m);
+    if body.iter().all(|&b| b.is_ascii_whitespace()) {
+        return Err(malformed("InventoryConfiguration body is empty".into()));
+    }
+
+    #[derive(Default)]
+    struct Acc {
+        id: Option<String>,
+        is_enabled: Option<bool>,
+        filter_prefix: Option<String>,
+        included_versions: Option<String>,
+        schedule: Option<String>,
+        dest_account: Option<String>,
+        dest_bucket: Option<String>,
+        dest_format: Option<String>,
+        dest_prefix: Option<String>,
+        fields: Vec<String>,
+    }
+
+    let mut reader = quick_xml::Reader::from_reader(body);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut acc = Acc::default();
+    let mut saw_root = false;
+    let mut stack: Vec<Vec<u8>> = Vec::new();
+    fn stack_top(stack: &[Vec<u8>]) -> Option<&[u8]> {
+        stack.last().map(|v| v.as_slice())
+    }
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(quick_xml::events::Event::Start(e)) => {
+                let name = e.name().as_ref().to_vec();
+                let ctx = stack_top(&stack);
+                let text = |r: &mut quick_xml::Reader<&[u8]>| -> Result<String, S3Error> {
+                    let raw = r
+                        .read_text(e.name())
+                        .map_err(|err| malformed(format!("malformed XML: {err}")))?;
+                    unescape_text(raw.as_ref()).map_err(malformed)
+                };
+                match name.as_slice() {
+                    b"InventoryConfiguration" => {
+                        saw_root = true;
+                        stack.push(name.clone());
+                    }
+                    b"Destination"
+                    | b"S3BucketDestination"
+                    | b"Filter"
+                    | b"OptionalFields"
+                    | b"Schedule" => {
+                        stack.push(name.clone());
+                    }
+                    b"Id" => {
+                        if let Some(v) = acc.id.take() {
+                            let _ = v;
+                            return Err(malformed("duplicate <Id>".into()));
+                        }
+                        acc.id = Some(text(&mut reader)?);
+                    }
+                    b"IsEnabled" => {
+                        let v = text(&mut reader)?;
+                        acc.is_enabled = Some(match v.as_str() {
+                            "true" => true,
+                            "false" => false,
+                            other => {
+                                return Err(malformed(format!(
+                                    "IsEnabled must be true/false (got {other})"
+                                )))
+                            }
+                        });
+                    }
+                    b"Prefix" => {
+                        let v = text(&mut reader)?;
+                        if ctx == Some(b"Filter") {
+                            acc.filter_prefix = Some(v);
+                        } else if ctx == Some(b"S3BucketDestination") {
+                            acc.dest_prefix = Some(v);
+                        }
+                    }
+                    b"IncludedObjectVersions" => {
+                        acc.included_versions = Some(text(&mut reader)?);
+                    }
+                    b"Frequency" => {
+                        acc.schedule = Some(text(&mut reader)?);
+                    }
+                    b"AccountId" => {
+                        acc.dest_account = Some(text(&mut reader)?);
+                    }
+                    b"Bucket" => {
+                        // S3BucketDestination 的 <Bucket>(ARN 或裸桶名)
+                        if ctx == Some(b"S3BucketDestination") {
+                            acc.dest_bucket = Some(text(&mut reader)?);
+                        }
+                    }
+                    b"Format" => {
+                        acc.dest_format = Some(text(&mut reader)?);
+                    }
+                    b"Field" => {
+                        if ctx == Some(b"OptionalFields") {
+                            acc.fields.push(text(&mut reader)?);
+                        }
+                    }
+                    _ => {
+                        return Err(malformed(format!(
+                            "unexpected element <{}>",
+                            String::from_utf8_lossy(&name)
+                        )))
+                    }
+                }
+            }
+            Ok(quick_xml::events::Event::Empty(e)) => {
+                let name = e.name().as_ref().to_vec();
+                match name.as_slice() {
+                    b"InventoryConfiguration" => saw_root = true,
+                    _ => {
+                        return Err(malformed(format!(
+                            "unexpected element <{}>",
+                            String::from_utf8_lossy(&name)
+                        )))
+                    }
+                }
+            }
+            Ok(quick_xml::events::Event::End(e)) => {
+                let name = e.name().as_ref().to_vec();
+                if stack.last().map(|s| s.as_slice()) == Some(name.as_slice()) {
+                    stack.pop();
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Err(e) => return Err(malformed(format!("malformed XML: {e}"))),
+            _ => {}
+        }
+    }
+    if !saw_root {
+        return Err(malformed("missing InventoryConfiguration root".into()));
+    }
+
+    // ── 语义校验 ──
+    let id = acc
+        .id
+        .ok_or_else(|| malformed("missing required element <Id>".into()))?;
+    if id.is_empty() || id.len() > 255 {
+        return Err(invalid(
+            "Inventory Id must be non-empty and at most 255 chars".into(),
+        ));
+    }
+    let is_enabled = acc
+        .is_enabled
+        .ok_or_else(|| malformed("missing required element <IsEnabled>".into()))?;
+    let included_versions = match acc.included_versions.as_deref() {
+        Some("All") => fs3_core::InventoryObjectVersions::All,
+        Some("Current") => fs3_core::InventoryObjectVersions::Current,
+        Some(other) => {
+            return Err(invalid(format!(
+                "IncludedObjectVersions must be All or Current (got {other})"
+            )))
+        }
+        None => {
+            return Err(malformed(
+                "missing required element <IncludedObjectVersions>".into(),
+            ))
+        }
+    };
+    let schedule = match acc.schedule.as_deref() {
+        Some("Daily") => fs3_core::InventoryFrequency::Daily,
+        Some("Weekly") => fs3_core::InventoryFrequency::Weekly,
+        Some(other) => {
+            return Err(invalid(format!(
+                "Schedule.Frequency must be Daily or Weekly (got {other})"
+            )))
+        }
+        None => {
+            return Err(malformed(
+                "missing required element <Schedule><Frequency>".into(),
+            ))
+        }
+    };
+    let dest_bucket_raw = acc.dest_bucket.ok_or_else(|| {
+        malformed("missing required element <Destination><S3BucketDestination><Bucket>".into())
+    })?;
+    // Bucket:接受 `arn:aws:s3:::<bucket>` 或裸桶名,归一为桶名
+    let dest_bucket = match dest_bucket_raw.strip_prefix("arn:aws:s3:::") {
+        Some(name) => name.to_string(),
+        None => dest_bucket_raw,
+    };
+    if dest_bucket.is_empty() {
+        return Err(invalid("destination bucket must not be empty".into()));
+    }
+    let dest_format = match acc.dest_format.as_deref() {
+        Some("CSV") => fs3_core::InventoryFormat::Csv,
+        Some(other) => {
+            return Err(invalid(format!(
+                "inventory format {other} is not supported (CSV only in v2.1; ORC/Parquet explicitly unsupported)"
+            )))
+        }
+        None => return Err(malformed("missing required element <Format>".into())),
+    };
+    for f in &acc.fields {
+        if !fs3_core::inventory_field_valid(f) {
+            return Err(invalid(format!(
+                "unknown OptionalFields Field {f} (supported: {})",
+                fs3_core::INVENTORY_OPTIONAL_FIELDS.join(", ")
+            )));
+        }
+    }
+    let _ = (acc.dest_account, is_enabled);
+    Ok(fs3_core::InventoryRule {
+        id,
+        is_enabled,
+        filter_prefix: acc.filter_prefix,
+        included_versions,
+        schedule,
+        destination_bucket: dest_bucket,
+        format: dest_format,
+        destination_prefix: acc.dest_prefix,
+    })
+}
+
+/// 渲染单个 InventoryConfiguration 元素(Get/List 回显)。
+pub fn render_inventory_configuration(rule: &fs3_core::InventoryRule) -> String {
+    let mut xml = String::from("<InventoryConfiguration>");
+    xml.push_str(&format!("<Id>{}</Id>", escape_xml(&rule.id)));
+    // 回显可选字段:存原始的 fields?v2.1 未存——渲染已知字段集
+    // (与存储口径:生成器固定列,配置阶段校验白名单;回显 = 白名单
+    // 全列,便于对账工具解析)
+    xml.push_str(&format!(
+        "<Destination><S3BucketDestination><Bucket>arn:aws:s3:::{}</Bucket><Format>{}</Format>{}</S3BucketDestination></Destination>",
+        escape_xml(&rule.destination_bucket),
+        match rule.format {
+            fs3_core::InventoryFormat::Csv => "CSV",
+        },
+        rule.destination_prefix
+            .as_ref()
+            .map(|p| format!("<Prefix>{}</Prefix>", escape_xml(p)))
+            .unwrap_or_default()
+    ));
+    xml.push_str(&format!(
+        "<IsEnabled>{}</IsEnabled>",
+        if rule.is_enabled { "true" } else { "false" }
+    ));
+    if let Some(p) = &rule.filter_prefix {
+        xml.push_str(&format!(
+            "<Filter><Prefix>{}</Prefix></Filter>",
+            escape_xml(p)
+        ));
+    }
+    xml.push_str(&format!(
+        "<IncludedObjectVersions>{}</IncludedObjectVersions>",
+        match rule.included_versions {
+            fs3_core::InventoryObjectVersions::All => "All",
+            fs3_core::InventoryObjectVersions::Current => "Current",
+        }
+    ));
+    xml.push_str("<OptionalFields>");
+    for f in fs3_core::INVENTORY_OPTIONAL_FIELDS {
+        xml.push_str(&format!("<Field>{f}</Field>"));
+    }
+    xml.push_str("</OptionalFields>");
+    xml.push_str(&format!(
+        "<Schedule><Frequency>{}</Frequency></Schedule>",
+        match rule.schedule {
+            fs3_core::InventoryFrequency::Daily => "Daily",
+            fs3_core::InventoryFrequency::Weekly => "Weekly",
+        }
+    ));
+    xml.push_str("</InventoryConfiguration>");
+    xml
+}
+
+/// 渲染 ListBucketInventoryConfigurations 响应。
+pub fn render_inventory_configuration_list(
+    bucket: &str,
+    rules: &[fs3_core::InventoryRule],
+    truncated: bool,
+    next_token: Option<&str>,
+) -> String {
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketInventoryConfigurationsResult xmlns=\"{XMLNS}\">"
+    );
+    for r in rules {
+        xml.push_str(&render_inventory_configuration(r));
+    }
+    xml.push_str(&format!(
+        "<IsTruncated>{}</IsTruncated>",
+        if truncated { "true" } else { "false" }
+    ));
+    if let Some(t) = next_token {
+        xml.push_str(&format!(
+            "<ContinuationToken>{}</ContinuationToken>",
+            escape_xml(t)
+        ));
+    }
+    xml.push_str(&format!("<Bucket>{}</Bucket>", escape_xml(bucket)));
+    xml.push_str("</ListBucketInventoryConfigurationsResult>");
+    xml
+}
+
+/// 按 `<InventoryConfiguration>` 容器流式切分(meta-export/import DTO 用:
+/// 导出把多配置首尾相接,导入逐一喂 parse_inventory_configuration)。
+/// 空白/注释跳过;畸形结构 → Err。
+pub fn split_inventory_configurations(body: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+    let mut reader = Reader::from_reader(body);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut items: Vec<Vec<u8>> = Vec::new();
+    let mut cur: Option<Vec<u8>> = None;
+    let mut depth = 0usize;
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name = e.name().as_ref().to_vec();
+                depth += 1;
+                let owned = cur.get_or_insert_with(Vec::new);
+                owned.push(b'<');
+                owned.extend_from_slice(&name);
+                for a in e.attributes() {
+                    let a = a.map_err(|e| format!("attr: {e}"))?;
+                    owned.push(b' ');
+                    owned.extend_from_slice(a.key.as_ref());
+                    owned.extend_from_slice(b"=\"");
+                    owned.extend_from_slice(&a.value);
+                    owned.push(b'"');
+                }
+                owned.push(b'>');
+            }
+            Ok(Event::Empty(e)) => {
+                let owned = cur.get_or_insert_with(Vec::new);
+                owned.push(b'<');
+                owned.extend_from_slice(e.name().as_ref());
+                for a in e.attributes() {
+                    let a = a.map_err(|e| format!("attr: {e}"))?;
+                    owned.push(b' ');
+                    owned.extend_from_slice(a.key.as_ref());
+                    owned.extend_from_slice(b"=\"");
+                    owned.extend_from_slice(&a.value);
+                    owned.push(b'"');
+                }
+                owned.extend_from_slice(b"/>");
+            }
+            Ok(Event::Text(t)) => {
+                if let Some(owned) = cur.as_mut() {
+                    owned.extend_from_slice(t.as_ref());
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = e.name().as_ref().to_vec();
+                if let Some(owned) = cur.as_mut() {
+                    owned.extend_from_slice(b"</");
+                    owned.extend_from_slice(&name);
+                    owned.push(b'>');
+                }
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    if let Some(v) = cur.take() {
+                        items.push(v);
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(e) => return Err(format!("split inventories: {e}")),
+        }
+    }
+    if cur.is_some() {
+        return Err("unclosed InventoryConfiguration element".into());
+    }
+    Ok(items)
+}
+
 // ───────────────────── Ownership Controls(M10 S7) ─────────────────────
 
 /// ObjectOwnership 取值(AWS 三值)。M10 S7 裁决:FastS3 单账号私有默认
@@ -4726,6 +5112,99 @@ mod tests {
             )
             .unwrap_err()
             .code,
+            S3ErrorCode::MalformedXML
+        );
+    }
+
+    // ───────────────────── M15 I1:S3 Inventory 配置(CSV 起步)─────────────────────
+
+    /// 解析 → 渲染往返(全字段);List 渲染;split 切分往返。
+    #[test]
+    fn inventory_configuration_roundtrip() {
+        let body = br#"<InventoryConfiguration>
+          <Destination><S3BucketDestination>
+            <Bucket>arn:aws:s3:::dest-bkt</Bucket>
+            <Format>CSV</Format>
+            <Prefix>inv/</Prefix>
+          </S3BucketDestination></Destination>
+          <IsEnabled>true</IsEnabled>
+          <Filter><Prefix>src/</Prefix></Filter>
+          <Id>inv-1</Id>
+          <IncludedObjectVersions>All</IncludedObjectVersions>
+          <OptionalFields><Field>Size</Field><Field>ETag</Field><Field>StorageClass</Field></OptionalFields>
+          <Schedule><Frequency>Daily</Frequency></Schedule>
+        </InventoryConfiguration>"#;
+        let rule = parse_inventory_configuration(body).unwrap();
+        assert_eq!(rule.id, "inv-1");
+        assert!(rule.is_enabled);
+        assert_eq!(rule.filter_prefix.as_deref(), Some("src/"));
+        assert_eq!(
+            rule.included_versions,
+            fs3_core::InventoryObjectVersions::All
+        );
+        assert_eq!(rule.schedule, fs3_core::InventoryFrequency::Daily);
+        assert_eq!(rule.destination_bucket, "dest-bkt");
+        assert_eq!(rule.destination_prefix.as_deref(), Some("inv/"));
+        assert_eq!(rule.format, fs3_core::InventoryFormat::Csv);
+        // 渲染 → 再解析 → 逐字段相等(往返)
+        let rendered = render_inventory_configuration(&rule);
+        let rule2 = parse_inventory_configuration(rendered.as_bytes()).unwrap();
+        assert_eq!(rule2, rule);
+        // List 渲染
+        let list = render_inventory_configuration_list("src-bkt", &[rule.clone()], false, None);
+        assert!(list.contains("<ListBucketInventoryConfigurationsResult"));
+        assert!(list.contains("<Id>inv-1</Id>"));
+        assert!(list.contains("<IsTruncated>false</IsTruncated>"));
+        // split 切分(首尾相接多配置;meta-export 路径)
+        let two = format!("{rendered}{rendered}");
+        let items = split_inventory_configurations(two.as_bytes()).unwrap();
+        assert_eq!(items.len(), 2);
+        for item in items {
+            assert_eq!(
+                parse_inventory_configuration(&item).unwrap(),
+                rule,
+                "切分后逐条可解析"
+            );
+        }
+    }
+
+    /// 显式报错矩阵:ORC/Parquet 格式;未知可选字段;缺必填元素;
+    /// 非法枚举;坏 XML。
+    #[test]
+    fn inventory_configuration_rejects_invalid() {
+        // ORC/Parquet 显式不支持(CSV 起步)→ InvalidArgument
+        for fmt in ["ORC", "Parquet"] {
+            let body = format!(
+                r#"<InventoryConfiguration><Destination><S3BucketDestination><Bucket>arn:aws:s3:::d</Bucket><Format>{fmt}</Format></S3BucketDestination></Destination><IsEnabled>true</IsEnabled><Id>i</Id><IncludedObjectVersions>Current</IncludedObjectVersions><Schedule><Frequency>Daily</Frequency></Schedule></InventoryConfiguration>"#
+            );
+            let e = parse_inventory_configuration(body.as_bytes()).unwrap_err();
+            assert_eq!(e.code, S3ErrorCode::InvalidArgument, "{fmt}: {e:?}");
+        }
+        // 未知可选字段 → InvalidArgument
+        let body = br#"<InventoryConfiguration><Destination><S3BucketDestination><Bucket>arn:aws:s3:::d</Bucket><Format>CSV</Format></S3BucketDestination></Destination><IsEnabled>true</IsEnabled><Id>i</Id><IncludedObjectVersions>Current</IncludedObjectVersions><OptionalFields><Field>Bogus</Field></OptionalFields><Schedule><Frequency>Daily</Frequency></Schedule></InventoryConfiguration>"#;
+        assert_eq!(
+            parse_inventory_configuration(body).unwrap_err().code,
+            S3ErrorCode::InvalidArgument
+        );
+        // 缺必填元素(Id/Schedule/Format)→ MalformedXML
+        let body = br#"<InventoryConfiguration><Destination><S3BucketDestination><Bucket>arn:aws:s3:::d</Bucket><Format>CSV</Format></S3BucketDestination></Destination><IsEnabled>true</IsEnabled><IncludedObjectVersions>Current</IncludedObjectVersions><Schedule><Frequency>Daily</Frequency></Schedule></InventoryConfiguration>"#;
+        assert_eq!(
+            parse_inventory_configuration(body).unwrap_err().code,
+            S3ErrorCode::MalformedXML
+        );
+        // 非法枚举(IsEnabled/included/schedule)→ 400 族
+        let body = br#"<InventoryConfiguration><Destination><S3BucketDestination><Bucket>arn:aws:s3:::d</Bucket><Format>CSV</Format></S3BucketDestination></Destination><IsEnabled>maybe</IsEnabled><Id>i</Id><IncludedObjectVersions>Current</IncludedObjectVersions><Schedule><Frequency>Daily</Frequency></Schedule></InventoryConfiguration>"#;
+        assert_eq!(
+            parse_inventory_configuration(body).unwrap_err().code,
+            S3ErrorCode::MalformedXML
+        );
+        // 坏 XML / 空 body → MalformedXML
+        assert_eq!(
+            parse_inventory_configuration(b"<oops/>").unwrap_err().code,
+            S3ErrorCode::MalformedXML
+        );
+        assert_eq!(
+            parse_inventory_configuration(b"").unwrap_err().code,
             S3ErrorCode::MalformedXML
         );
     }

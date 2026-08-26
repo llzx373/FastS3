@@ -109,6 +109,7 @@ pub enum S3ErrorCode {
     NoSuchCORSConfiguration,
     NoSuchKey,
     NoSuchLifecycleConfiguration,
+    NoSuchInventoryConfiguration,
     NoSuchTagSet,
     NoSuchUpload,
     NoSuchVersion,
@@ -230,6 +231,7 @@ impl S3ErrorCode {
             NoSuchCORSConfiguration => "The CORS configuration does not exist",
             NoSuchKey => "The specified key does not exist.",
             NoSuchLifecycleConfiguration => "The lifecycle configuration does not exist",
+            NoSuchInventoryConfiguration => "The specified inventory configuration id does not exist.",
             NoSuchTagSet => "There is no TagSet associated with the bucket.",
             NoSuchUpload => "The specified multipart upload does not exist. The upload ID might be invalid, or the multipart upload might have been aborted or completed.",
             NoSuchVersion => "The version ID specified in the request does not match an existing version.",
@@ -299,6 +301,7 @@ impl S3ErrorCode {
             | NoSuchBucketPolicy
             | NoSuchCORSConfiguration
             | NoSuchLifecycleConfiguration
+            | NoSuchInventoryConfiguration
             | NoSuchTagSet
             | ObjectLockConfigurationNotFoundError
             | NoSuchObjectLockConfiguration

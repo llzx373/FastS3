@@ -127,6 +127,26 @@ pub enum Operation {
     DeleteBucketNotificationConfiguration {
         bucket: String,
     },
+    // —— 桶级 S3 Inventory(M15 I1;`iv:{bucket}\0{id}` 键) ——
+    /// PUT ?inventory&id(单个配置;CSV 起步,ORC/Parquet 显式拒绝)。
+    PutBucketInventoryConfiguration {
+        bucket: String,
+        id: String,
+        rule: fs3_core::InventoryRule,
+    },
+    GetBucketInventoryConfiguration {
+        bucket: String,
+        id: String,
+    },
+    DeleteBucketInventoryConfiguration {
+        bucket: String,
+        id: String,
+    },
+    /// GET ?inventory(无 id)= 列表;continuation-token 分页。
+    ListBucketInventoryConfigurations {
+        bucket: String,
+        continuation_token: Option<String>,
+    },
     /// POST 表单上传(M10 S4;浏览器 POST policy)。仅 multipart/form-data
     /// 在服务层受理;其他 Content-Type 维持原 MethodNotAllowed。
     PostObject {
@@ -675,6 +695,32 @@ impl Router {
                     _ => Err(S3Error::new(S3ErrorCode::MethodNotAllowed)),
                 };
             }
+            // M15 I1:桶级 S3 Inventory(CSV 起步;ORC/Parquet 显式不支持)。
+            // ?inventory 单 query param 承载四方法:带 id = Put/Get/Delete
+            // BucketInventoryConfiguration;无 id GET = ListBucketInventory-
+            // Configurations(分页 continuation-token)。配置键 `iv:`。
+            if has_q("inventory") {
+                let id = get_q("id");
+                return match (method, id) {
+                    ("PUT", Some(id)) => Ok(Operation::PutBucketInventoryConfiguration {
+                        bucket,
+                        id: id.clone(),
+                        rule: crate::xml::parse_inventory_configuration(body)?,
+                    }),
+                    ("GET", Some(id)) => {
+                        Ok(Operation::GetBucketInventoryConfiguration { bucket, id })
+                    }
+                    ("DELETE", Some(id)) => {
+                        Ok(Operation::DeleteBucketInventoryConfiguration { bucket, id })
+                    }
+                    ("GET", None) => Ok(Operation::ListBucketInventoryConfigurations {
+                        bucket,
+                        continuation_token: get_q("continuation-token"),
+                    }),
+                    _ => Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                        .with_message("InventoryConfiguration requires an id parameter")),
+                };
+            }
             // 不支持/未实现的子资源
             for unsupported in [
                 "acl",
@@ -698,7 +744,8 @@ impl Router {
                 "publicAccessBlock",
                 "accelerate",
                 "analytics",
-                "inventory",
+                // "inventory" 自 M15 I1 起已实现(Put/Get/Delete/ListBucket-
+                // InventoryConfiguration),出表接线
                 "metrics",
                 "intelligent-tiering",
                 "legal-hold",

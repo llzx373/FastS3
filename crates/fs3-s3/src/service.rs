@@ -1539,6 +1539,20 @@ impl S3Service {
             Operation::DeleteBucketNotificationConfiguration { bucket } => {
                 Ok(self.op_delete_bucket_notification(&bucket)?)
             }
+            // —— M15 I1:桶级 S3 Inventory(CSV 起步) ——
+            Operation::PutBucketInventoryConfiguration { bucket, id, rule } => {
+                Ok(self.op_put_inventory_config(&bucket, &id, &rule)?)
+            }
+            Operation::GetBucketInventoryConfiguration { bucket, id } => {
+                Ok(self.op_get_inventory_config(&bucket, &id)?)
+            }
+            Operation::DeleteBucketInventoryConfiguration { bucket, id } => {
+                Ok(self.op_delete_inventory_config(&bucket, &id)?)
+            }
+            Operation::ListBucketInventoryConfigurations {
+                bucket,
+                continuation_token,
+            } => Ok(self.op_list_inventory_configs(&bucket, continuation_token.as_deref())?),
             // —— M10 S4:POST 表单上传 ——
             Operation::PostObject { bucket } => self.op_post_object(req, &bucket),
             Operation::ListObjectVersions {
@@ -3086,6 +3100,135 @@ impl S3Service {
             headers: vec![],
             body: ResponseBody::Empty,
         })
+    }
+
+    // ───────────────── M15 I1:桶级 S3 Inventory(CSV 起步)─────────────────
+
+    /// PutBucketInventoryConfiguration:单个配置(路由层已解析校验)落
+    /// `iv:{bucket}\0{id}` 键(覆盖语义)。AWS 返回 200(空 body);
+    /// 桶不存在 → NoSuchBucket。
+    fn op_put_inventory_config(
+        &self,
+        bucket: &str,
+        id: &str,
+        rule: &fs3_core::InventoryRule,
+    ) -> Result<ServiceResponse, S3Error> {
+        // 守卫:路径 id 与 XML Id 必须一致(防错配)
+        if rule.id != id {
+            return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                .with_message("query id and XML <Id> must match"));
+        }
+        let engine = self.engine.write();
+        engine
+            .meta()
+            .put_inventory_config(bucket, rule)
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        Ok(ServiceResponse {
+            status: 200,
+            headers: vec![],
+            body: ResponseBody::Empty,
+        })
+    }
+
+    /// GetBucketInventoryConfiguration:缺失 → 404 NoSuchInventoryConfiguration
+    /// (AWS 码;error.rs 占位挂接);桶不存在 → NoSuchBucket。
+    fn op_get_inventory_config(&self, bucket: &str, id: &str) -> Result<ServiceResponse, S3Error> {
+        let engine = self.engine.read();
+        if engine
+            .meta()
+            .get_bucket(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?
+            .is_none()
+        {
+            return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
+        }
+        let rule = engine
+            .meta()
+            .get_inventory_config(bucket, id)
+            .map_err(|e| map_engine_error(e, bucket, ""))?
+            .ok_or_else(|| {
+                S3Error::new(S3ErrorCode::NoSuchInventoryConfiguration)
+                    .with_extra("Id", id)
+                    .with_message(
+                        "The inventory configuration with specified ID does not exist.",
+                    )
+            })?;
+        Ok(Self::xml_response(xml::render_inventory_configuration(
+            &rule,
+        )))
+    }
+
+    /// DeleteBucketInventoryConfiguration:AWS 幂等口径——缺失同样 204;
+    /// 桶不存在 → NoSuchBucket。
+    fn op_delete_inventory_config(
+        &self,
+        bucket: &str,
+        id: &str,
+    ) -> Result<ServiceResponse, S3Error> {
+        let engine = self.engine.write();
+        engine
+            .meta()
+            .delete_inventory_config(bucket, id)
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        Ok(ServiceResponse {
+            status: 204,
+            headers: vec![],
+            body: ResponseBody::Empty,
+        })
+    }
+
+    /// ListBucketInventoryConfigurations:全桶配置列表(键序 = id 字典序;
+    /// continuation-token = 上一页末 id;AWS 分页语义)。无配置 →
+    /// 200 空列表(与同族 List 端点一致)。
+    fn op_list_inventory_configs(
+        &self,
+        bucket: &str,
+        continuation_token: Option<&str>,
+    ) -> Result<ServiceResponse, S3Error> {
+        let engine = self.engine.read();
+        if engine
+            .meta()
+            .get_bucket(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?
+            .is_none()
+        {
+            return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
+        }
+        let all = engine
+            .meta()
+            .list_inventory_configs(bucket)
+            .map_err(|e| map_engine_error(e, bucket, ""))?;
+        let (page, truncated, next) = match continuation_token {
+            Some(tok) => {
+                let skip = all
+                    .iter()
+                    .position(|r| r.id == tok)
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                let rest = &all[skip.min(all.len())..];
+                let page: Vec<fs3_core::InventoryRule> = rest.iter().take(100).cloned().collect();
+                let truncated = rest.len() > page.len();
+                let next = if truncated {
+                    page.last().map(|r| r.id.clone())
+                } else {
+                    None
+                };
+                (page, truncated, next)
+            }
+            None => {
+                let page: Vec<fs3_core::InventoryRule> = all.iter().take(100).cloned().collect();
+                let truncated = all.len() > page.len();
+                let next = if truncated {
+                    page.last().map(|r| r.id.clone())
+                } else {
+                    None
+                };
+                (page, truncated, next)
+            }
+        };
+        Ok(Self::xml_response(
+            xml::render_inventory_configuration_list(bucket, &page, truncated, next.as_deref()),
+        ))
     }
 
     // ───────────────── M10 S4:POST 表单上传 ─────────────────
@@ -6667,6 +6810,11 @@ fn route_op_bucket_key(req: &S3Request) -> (fs3_core::metrics::Op, String, Strin
         ("DELETE", _, "") if has_q("notification") => {
             (Op::Other, "DeleteBucketNotificationConfiguration")
         }
+        // M15 I1:Inventory 子资源审计名(AWS IAM 动作名
+        // s3:{Put,Get,Delete}InventoryConfiguration / s3:ListInventoryConfigurations)
+        ("PUT", _, "") if has_q("inventory") => (Op::Other, "PutInventoryConfiguration"),
+        ("GET", _, "") if has_q("inventory") => (Op::Other, "GetInventoryConfiguration"),
+        ("DELETE", _, "") if has_q("inventory") => (Op::Other, "DeleteInventoryConfiguration"),
         ("PUT", _, "") if has_q("object-lock") => (Op::Other, "PutObjectLockConfiguration"),
         ("GET", _, "") if has_q("object-lock") => (Op::Other, "GetObjectLockConfiguration"),
         // M10 V3:版本化子资源审计名
