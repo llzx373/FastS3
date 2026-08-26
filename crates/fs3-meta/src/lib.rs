@@ -71,6 +71,31 @@ pub struct StatsDelta {
     pub bytes: i64,
 }
 
+/// 对象值版本字节分布(M16 A1 扩展;count_object_value_versions 返回)。
+/// `cur` = 当前版本(写入恒当前);v2~v6 = 各存量旧版本(双读可读,
+/// 重写工具归一目标)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ValueVersionCount {
+    pub cur: u64,
+    pub v6: u64,
+    pub v5: u64,
+    pub v4: u64,
+    pub v3: u64,
+    pub v2: u64,
+}
+
+impl ValueVersionCount {
+    /// 全部存量值是否已归一当前版本(重写完成判定)。
+    pub fn all_current(&self) -> bool {
+        self.v2 + self.v3 + self.v4 + self.v5 + self.v6 == 0
+    }
+
+    /// 是否仍存在 v2 残留(v2→v3 重写完成标记判定)。
+    pub fn has_v2(&self) -> bool {
+        self.v2 > 0
+    }
+}
+
 /// SSE-S3 KEK 代状态(M11 K1-1,ADR-12 DS1;键 `s:sse_kek_gen`,值 =
 /// postcard 本结构)。**无密钥材料**:gen 是代数编号,KEK 本体由
 /// `s:sse_kek_seed` 按代确定性派生,永不落盘/下发。
@@ -3013,24 +3038,27 @@ impl MetaStore {
         Ok(out)
     }
 
-    /// 值版本字节只读探测(M10 V5-3):统计 o: 前缀下 v2 与当前可读格式
-    /// (v3/v4)值数量,返回 (v2, current)。只读首字节、不解码(供重写
-    /// 前后断言与引擎启动警告);首字节非 2/3/4 的值(无版本字节的旧布局
-    /// 值,ADR-9 已放弃前置兼容)→ Corrupt。
-    pub fn count_object_value_versions(&self) -> Result<(u64, u64)> {
+    /// 值版本字节只读探测(M10 V5-3 + M16 A1 扩展):统计 o: 前缀下各
+    /// 版本值数量(v2~v6 存量 + 当前版本)。只读首字节、不解码(供重写
+    /// 前后断言与引擎启动警告);首字节非 2..=当前版本 的值(无版本字节
+    /// 的旧布局值,ADR-9 已放弃前置兼容)→ Corrupt。
+    pub fn count_object_value_versions(&self) -> Result<ValueVersionCount> {
         let snap = self.db.snapshot();
-        let (mut v2, mut cur) = (0u64, 0u64);
+        let mut c = ValueVersionCount::default();
         for item in snap.iterator(IteratorMode::From(PREFIX_OBJECT, Direction::Forward)) {
             let (k, v) = item.map_err(rocks_err)?;
             if !k.starts_with(PREFIX_OBJECT) {
                 break;
             }
             match v.first() {
-                Some(&fs3_core::OBJECT_META_VERSION) => cur += 1,
-                // v3 存量值双读可读(无需重写即合法;重写工具会顺手归一到
-                // 当前版本),与当前版本同桶计数
-                Some(&fs3_core::OBJECT_META_VERSION_V3) => cur += 1,
-                Some(&2) => v2 += 1,
+                // 当前版本(写入恒当前版本)+ 各旧版本存量值(双读可读;
+                // 重写工具会顺手归一到当前版本)
+                Some(&fs3_core::OBJECT_META_VERSION) => c.cur += 1,
+                Some(&fs3_core::OBJECT_META_VERSION_V6) => c.v6 += 1,
+                Some(&fs3_core::OBJECT_META_VERSION_V5) => c.v5 += 1,
+                Some(&fs3_core::OBJECT_META_VERSION_V4) => c.v4 += 1,
+                Some(&fs3_core::OBJECT_META_VERSION_V3) => c.v3 += 1,
+                Some(&2) => c.v2 += 1,
                 other => {
                     return Err(Error::Corrupt(format!(
                         "object value version byte {other:?} unsupported"
@@ -3038,7 +3066,7 @@ impl MetaStore {
                 }
             }
         }
-        Ok((v2, cur))
+        Ok(c)
     }
 
     /// 值格式 v2→v3 重写完成标记(DESIGN-FUTURE §2.4:重写完成前禁回滚)。
@@ -3055,6 +3083,24 @@ impl MetaStore {
     pub fn mark_value_rewrite_v3_done(&self) -> Result<()> {
         self.db
             .put(SYS_KEY_VALUE_REWRITE_V3_DONE, env!("CARGO_PKG_VERSION"))
+            .map_err(rocks_err)?;
+        self.db.flush_wal(true).map_err(rocks_err)
+    }
+
+    /// 值格式 v6→v7 重写完成标记(M16 A1,ADR-19 DA4:重写完成前禁回滚到
+    /// v2.1.x 二进制——v7 值新二进制才可解,v2.1.x 拒绝解码)。
+    pub fn value_rewrite_v7_done(&self) -> Result<bool> {
+        Ok(self
+            .db
+            .get(SYS_KEY_VALUE_REWRITE_V7_DONE)
+            .map_err(rocks_err)?
+            .is_some())
+    }
+
+    /// 落 v6→v7 重写完成标记(直写 + fsync;幂等;同 v3 标记先例)。
+    pub fn mark_value_rewrite_v7_done(&self) -> Result<()> {
+        self.db
+            .put(SYS_KEY_VALUE_REWRITE_V7_DONE, env!("CARGO_PKG_VERSION"))
             .map_err(rocks_err)?;
         self.db.flush_wal(true).map_err(rocks_err)
     }
@@ -3947,6 +3993,8 @@ mod tests {
             part_checksums: Vec::new(),
             compressed: None,
             requested_storage_class: None,
+            storage_class: None,
+            restore_state: None,
         }
     }
 
@@ -4911,14 +4959,16 @@ mod tests {
             .unwrap();
         s.put_object_value_raw("b1", "vk", Some(&vk), &encode_v2_value(&mv))
             .unwrap();
-        assert_eq!(s.count_object_value_versions().unwrap(), (2, 0));
+        let c0 = s.count_object_value_versions().unwrap();
+        assert_eq!((c0.v2, c0.cur), (2, 0));
 
         // 重写:值内容不变、版本字节 → 3、统计/分配零触碰
         for e in s.snapshot_all_objects_raw().unwrap() {
             assert_eq!(e.value_version, 2);
             s.commit_object_meta_update(&e.raw_key, &e.meta).unwrap();
         }
-        assert_eq!(s.count_object_value_versions().unwrap(), (0, 2));
+        let c1 = s.count_object_value_versions().unwrap();
+        assert_eq!((c1.v2, c1.cur), (0, 2));
         let expect_m = ObjectMeta::decode_value(&encode_v2_value(&m)).unwrap();
         assert_eq!(s.get_object("b1", "k").unwrap().unwrap(), expect_m);
         // 重写 = 双读结果的原样重编码:v2 无 version_id 字段,双读后为
@@ -4984,7 +5034,8 @@ mod tests {
             .filter(|e| e.value_version == fs3_core::OBJECT_META_VERSION)
             .count();
         assert_eq!((v2, cur), (1, 2));
-        assert_eq!(s.count_object_value_versions().unwrap(), (1, 2));
+        let c2 = s.count_object_value_versions().unwrap();
+        assert_eq!((c2.v2, c2.cur), (1, 2));
 
         // 完成标记:未落 → false;落 → true(幂等)
         assert!(!s.value_rewrite_v3_done().unwrap());

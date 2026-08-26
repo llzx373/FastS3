@@ -4952,7 +4952,7 @@ mod tests {
     /// 三容器形态 × 事件 × Filter × FastS3 扩展密钥:解析 → 渲染往返。
     #[test]
     fn notification_configuration_roundtrip() {
-        use fs3_core::{NotificationKeyFilter, NotificationRule, NotificationTargetKind as K};
+        use fs3_core::{NotificationKeyFilter, NotificationTargetKind as K};
         let body = concat!(
             r#"<NotificationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
             "<TopicConfiguration><Id>topic-1</Id>",

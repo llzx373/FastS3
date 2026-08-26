@@ -336,14 +336,17 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 false,
             )?;
             if args.count_only {
-                let (v2, v3) = rewrite::count_value_versions(&engine_cfg.meta_dir)?;
-                println!("rewrite-values: value-versions v2={v2} v3={v3}");
+                let c = rewrite::count_value_versions(&engine_cfg.meta_dir)?;
+                println!(
+                    "rewrite-values: value-versions cur={} v6={} v5={} v4={} v3={} v2={}",
+                    c.cur, c.v6, c.v5, c.v4, c.v3, c.v2
+                );
                 return Ok(());
             }
             let r = rewrite::run_rewrite(&engine_cfg.meta_dir, &args)?;
             println!(
-                "rewrite-values: scanned={} rewritten={} skipped_v3={} skipped_markers={} errors={} elapsed={:.1}s",
-                r.scanned, r.rewritten, r.skipped_v3, r.skipped_marker, r.errors, r.elapsed_secs
+                "rewrite-values: scanned={} rewritten={} skipped_cur={} skipped_markers={} errors={} elapsed={:.1}s",
+                r.scanned, r.rewritten, r.skipped_cur, r.skipped_marker, r.errors, r.elapsed_secs
             );
             if r.errors > 0 {
                 return Err(fs3_core::Error::Meta(format!(

@@ -1375,7 +1375,7 @@ fn version_id_of(_svc: &S3Service, r: ServiceResponse) -> String {
 }
 
 /// POST ?uploads → UploadId。
-fn upload_id_of(svc: &S3Service, r: &Result<ServiceResponse, fs3_s3::S3Error>) -> String {
+fn upload_id_of(_svc: &S3Service, r: &Result<ServiceResponse, fs3_s3::S3Error>) -> String {
     let resp = r.as_ref().unwrap();
     extract(&body_str(resp), "UploadId")
 }
@@ -10732,7 +10732,7 @@ fn c2_auth_failure_audit_note_distinguishes_disabled() {
     // 建桶 + 未签名请求探路(审计 ring 直接可读)
     assert_eq!(status(&svc.handle(&req("PUT", "/authn", vec![]))), 200);
     // 1) 不存在密钥 → 403 InvalidAccessKeyId + 审计 key_not_found
-    let r = svc.handle(&req_h("GET", "/authn", &[], vec![]));
+    let _r = svc.handle(&req_h("GET", "/authn", &[], vec![]));
     // req_h 用的是 "test" 密钥(存在),换手动伪造的 access key:
     let bad = req_bad_key("ghost-key");
     let r = svc.handle(&bad);

@@ -129,6 +129,66 @@ pub struct ObjectDto {
     /// 旧导出无此字段 → None。
     #[serde(default)]
     pub requested_storage_class: Option<String>,
+    /// M16 A1(ADR-19 DA4):真实存储类(v7;None = STANDARD;归档三值
+    /// GLACIER_IR/GLACIER/DEEP_ARCHIVE)。旧导出无此字段 → None。
+    #[serde(default)]
+    pub storage_class: Option<String>,
+    /// M16 A2(ADR-19 DA2/DA4):恢复状态(仅归档类对象;临时标准副本
+    /// 随导出/导入往返——副本段与主 extents 同属数据区,导入需同
+    /// 等段校验与分配记账)。旧导出无此字段 → None。
+    #[serde(default)]
+    pub restore_state: Option<RestoreStateDto>,
+}
+
+/// 恢复状态导出形态(与 SegmentDto/inline_b64 同构:段经 SegmentDto、
+/// 内联数据 base64)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestoreStateDto {
+    pub restored_until: i64,
+    pub restored_at: i64,
+    pub restored_size: u64,
+    pub tier: String,
+    pub restored_extents: Vec<SegmentDto>,
+    pub restored_inline_b64: Option<String>,
+}
+
+impl RestoreStateDto {
+    fn from_state(st: &fs3_core::RestoreState) -> Self {
+        RestoreStateDto {
+            restored_until: st.restored_until,
+            restored_at: st.restored_at,
+            restored_size: st.restored_size,
+            tier: st.tier.clone(),
+            restored_extents: st.restored_extents.iter().map(SegmentDto::from).collect(),
+            restored_inline_b64: st
+                .restored_inline
+                .as_ref()
+                .map(|d| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, d)),
+        }
+    }
+
+    fn to_state(&self) -> fs3_core::Result<fs3_core::RestoreState> {
+        let restored_inline = match &self.restored_inline_b64 {
+            Some(b) => Some(
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b).map_err(
+                    |e| fs3_core::Error::InvalidArgument(format!("restore inline base64: {e}")),
+                )?,
+            ),
+            None => None,
+        };
+        Ok(fs3_core::RestoreState {
+            restored_until: self.restored_until,
+            restored_at: self.restored_at,
+            restored_size: self.restored_size,
+            tier: self.tier.clone(),
+            restored_extents: self
+                .restored_extents
+                .iter()
+                .map(SegmentDto::to_segment)
+                .collect(),
+            restored_inline,
+        })
+    }
 }
 
 /// 键形态 vk → 导出 DTO 的版本串(None = 单键;"null" = null 槽;hex = 真实 vk)。
@@ -185,6 +245,8 @@ impl ObjectDto {
             legal_hold: m.legal_hold,
             part_checksums: m.part_checksums.clone(),
             requested_storage_class: m.requested_storage_class.clone(),
+            storage_class: m.storage_class.clone(),
+            restore_state: m.restore_state.as_ref().map(RestoreStateDto::from_state),
         }
     }
 
@@ -224,6 +286,13 @@ impl ObjectDto {
                 part_checksums: self.part_checksums.clone(),
                 compressed: None,
                 requested_storage_class: self.requested_storage_class.clone(),
+                // M16 A1:真实存储类 + 恢复状态随导出/导入往返(ADR-19 DA4)
+                storage_class: self.storage_class.clone(),
+                restore_state: self
+                    .restore_state
+                    .as_ref()
+                    .map(RestoreStateDto::to_state)
+                    .transpose()?,
             },
         ))
     }
@@ -810,7 +879,13 @@ pub fn run_meta_import(
             )));
         }
         validate_segments(&meta.extents, &layout)?;
-        let draft = draft_for_segments(&meta.extents);
+        let mut draft = draft_for_segments(&meta.extents);
+        // M16 A1:恢复副本段同属数据区,导入需同等校验 + 分配记账
+        // (ADR-19 DA4/DA5:恢复副本不占桶统计,但段引用必须入账)
+        if let Some(rs) = &meta.restore_state {
+            validate_segments(&rs.restored_extents, &layout)?;
+            draft = draft.merge(draft_for_segments(&rs.restored_extents));
+        }
         let zero = StatsDelta::default();
         if meta.is_delete_marker {
             // 删除标记:经 ObjectDeleteCurrent 落键(事务臂校验 D3 契约:

@@ -91,6 +91,10 @@ pub const SYS_KEY_SEED_SALT: &[u8] = b"s:key_seed_salt";
 /// 故 meta-export DTO 与 check 可达性扫描无需联动(§2.2 三处联动仅约束
 /// 新前缀)。
 pub const SYS_KEY_VALUE_REWRITE_V3_DONE: &[u8] = b"s:value_rewrite_v3_done";
+/// 值格式 v6→v7 在线重写完成标记(M16 A1;ADR-19 DA4:重写完成前禁回滚到
+/// v2.1.x 二进制——v7 值新二进制才可解,v2.1.x 拒绝解码;与 v3 标记同
+/// 一 s: 前缀族,不新增前缀)。
+pub const SYS_KEY_VALUE_REWRITE_V7_DONE: &[u8] = b"s:value_rewrite_v7_done";
 /// SSE-S3 KEK 种子(M11 K1-1,ADR-12 DS1;64 字节随机,首次需要时生成,
 /// 持久化;**与 s:key_seed_salt 访问密钥种子相互独立**)。红线:seed 及
 /// 其派生的 KEK/DEK 明文零导出、零日志、永不下发——meta-export DTO 不

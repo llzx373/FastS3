@@ -1,24 +1,29 @@
-//! 值格式在线重写(M10 V5-3;ADR-11 D0 / DESIGN-FUTURE §2.4):ObjectMeta
-//! 旧版本值(v2/v3)→ 当前版本逐键重写工具。
+//! 值格式在线重写(M10 V5-3;ADR-11 D0 / DESIGN-FUTURE §2.4;M16 A1
+//! ADR-19 DA4 扩展):ObjectMeta 旧版本值(v2~v6)→ 当前版本逐键重写工具。
 //!
 //! 背景:v1.0.x 写入的存量对象值 = `[版本字节 2] + postcard(v2 结构)`;v1.1
-//! 起写入恒为 v3,M11 起恒为 v4(ADR-12 D-E3 尾部追加 part_checksums)。
-//! 双读(decode_value)使旧值零迁移可读,但为:
+//! 起写入恒为 v3,M11 起恒为 v4(ADR-12 D-E3 尾部追加 part_checksums),
+//! M13 起恒 v5(compressed),M15 起恒 v6(requested_storage_class),M16
+//! 起恒 v7(storage_class/restore_state)。双读(decode_value)使旧值零迁移
+//! 可读,但为:
 //! ① 消除每次读的回退解码尝试;② 落实「重写完成前禁回滚」的升级纪律
 //! (§2.4:v3+ 值旧二进制拒绝解码,回滚到 v1.0.x 仅在重写**未完成**且
-//! 无 v1.1 新写时可行;完成标记 = `s:value_rewrite_v3_done`) —— 本工具
-//! 在停机/维护窗口把全部对象值归一重写为当前版本。
+//! 无 v1.1 新写时可行;v7 同理禁回滚 v2.1.x,完成标记 =
+//! `s:value_rewrite_v7_done`,ADR-19 DA4)—— 本工具在停机/维护窗口把
+//! 全部对象值归一重写为当前版本。
 //!
 //! 语义:
 //! - 幂等:重写 = 双读结果按当前版本重编码同值;已当前版本的值跳过,
 //!   中断可续跑;
 //! - 跳过:当前版本值与删除标记(标记恒为当前版本 —— 版本化是 v1.1 新键,
 //!   写入恒当前版本;若防御性遇到旧版本标记仍重写,完成不变量 = 全库零
-//!   v2);
+//!   旧版本);
 //! - 节流:Tier2 语义(每秒最多 `rate` 次重写,默认 500/s;0 = 不限速);
 //! - 暂停:`--pause-file <path>` 存在即暂停(轮询 1s,`touch` 暂停 /
 //!   `rm` 恢复);
-//! - 完成:errors=0 且全库无 v2 残留 → 落完成标记(持久,幂等)。
+//! - 完成:errors=0 且全库无旧版本残留 → 落完成标记(v3 标记 + v7 标记,
+//!   持久,幂等;v6→v7 重写不改变对象语义 —— v6 值升格 storage_class/
+//!   restore_state = None,见 ObjectMetaV6::from)。
 //!
 //! 用法(停机或维护窗口;与运行中的服务互斥 —— rocksdb 目录锁保证):
 //! ```bash
@@ -41,7 +46,7 @@ pub struct RewriteValuesArgs {
     /// 存在即暂停(轮询 1s;`touch` 暂停,`rm` 恢复)
     #[arg(long)]
     pub pause_file: Option<PathBuf>,
-    /// 只探测值版本分布(v2/当前可读计数)不重写(演练/巡检断言用)
+    /// 只探测值版本分布(v2~v6/当前可读计数)不重写(演练/巡检断言用)
     #[arg(long)]
     pub count_only: bool,
 }
@@ -54,9 +59,14 @@ pub fn run_rewrite(meta_dir: &Path, args: &RewriteValuesArgs) -> Result<RewriteR
             "rewrite-values: done marker present (s:value_rewrite_v3_done); idempotent re-run"
         );
     }
+    if store.value_rewrite_v7_done()? {
+        println!(
+            "rewrite-values: done marker present (s:value_rewrite_v7_done); idempotent re-run"
+        );
+    }
     let all = store.snapshot_all_objects_raw()?;
     let mut rewritten = 0usize;
-    let mut skipped_v3 = 0usize;
+    let mut skipped_cur = 0usize;
     let mut skipped_marker = 0usize;
     let mut errors = 0usize;
     let start = std::time::Instant::now();
@@ -77,7 +87,7 @@ pub fn run_rewrite(meta_dir: &Path, args: &RewriteValuesArgs) -> Result<RewriteR
             if e.meta.is_delete_marker {
                 skipped_marker += 1;
             } else {
-                skipped_v3 += 1;
+                skipped_cur += 1;
             }
             continue;
         }
@@ -101,25 +111,36 @@ pub fn run_rewrite(meta_dir: &Path, args: &RewriteValuesArgs) -> Result<RewriteR
     let report = RewriteReport {
         scanned: all.len(),
         rewritten,
-        skipped_v3,
+        skipped_cur,
         skipped_marker,
         errors,
         elapsed_secs: start.elapsed().as_secs_f64(),
     };
-    // 完成判定:零错误且重写后全库无 v2 残留 → 落完成标记(§2.4 回滚门禁)
+    // 完成判定:零错误且重写后全库无旧版本残留 → 落完成标记(回滚门禁)
     if errors == 0 {
-        let (v2, _) = store.count_object_value_versions()?;
-        if v2 == 0 {
-            store.mark_value_rewrite_v3_done()?;
+        let c = store.count_object_value_versions()?;
+        if c.all_current() {
+            // v2→v3 标记(v1.0.x 回滚门禁;无 v2 残留即可落)
+            if !c.has_v2() {
+                store.mark_value_rewrite_v3_done()?;
+            }
+            // v6→v7 标记(M16 A1,ADR-19 DA4:v2.1.x 回滚门禁;全部值
+            // 已归一当前版本即可落)
+            store.mark_value_rewrite_v7_done()?;
             println!(
-                "rewrite-values: all values at current version; done marker written (s:value_rewrite_v3_done)."
+                "rewrite-values: all values at current version; done markers written \
+                 (s:value_rewrite_v3_done, s:value_rewrite_v7_done)."
             );
             println!(
-                "rewrite-values: 回滚纪律(§2.4):此后禁止回滚到 v1.0.x 二进制(其拒绝解码 \
-                 v3 值);回滚只能走「meta-export 快照 + 底层卷快照」恢复路径(fasts3d upgrade 注释)。"
+                "rewrite-values: 回滚纪律(§2.4):此后禁止回滚到 v1.0.x/v2.1.x 二进制(其拒绝 \
+                 解码 v3+/v7 值);回滚只能走「meta-export 快照 + 底层卷快照」恢复路径 \
+                 (fasts3d upgrade 注释)。"
             );
         } else {
-            println!("rewrite-values: {v2} v2 value(s) remain (new writes during run?); re-run to converge");
+            println!(
+                "rewrite-values: {} old value(s) remain (new writes during run?); re-run to converge",
+                c.v2 + c.v3 + c.v4 + c.v5 + c.v6
+            );
         }
     }
     Ok(report)
@@ -129,15 +150,15 @@ pub fn run_rewrite(meta_dir: &Path, args: &RewriteValuesArgs) -> Result<RewriteR
 pub struct RewriteReport {
     pub scanned: usize,
     pub rewritten: usize,
-    pub skipped_v3: usize,
+    pub skipped_cur: usize,
     pub skipped_marker: usize,
     pub errors: usize,
     pub elapsed_secs: f64,
 }
 
-/// 值格式探测:全库 o: 值按首字节统计 (v2, v3)(只读;供演练脚本与
-/// 完成判定断言「重写后无 v2 残留」)。
-pub fn count_value_versions(meta_dir: &Path) -> Result<(u64, u64)> {
+/// 值格式探测:全库 o: 值按首字节统计(v2~v6/当前;只读;供演练脚本与
+/// 完成判定断言「重写后无旧版本残留」)。
+pub fn count_value_versions(meta_dir: &Path) -> Result<fs3_meta::ValueVersionCount> {
     let store = MetaStore::open(meta_dir, &MetaConfig::default())?;
     store.count_object_value_versions()
 }
@@ -206,6 +227,58 @@ mod tests {
         }
     }
 
+    /// v6 值格式夹具(M16 A1:M15 C1 现格式,无 storage_class/restore_state
+    /// 尾部字段;postcard 字段序即编码序)。
+    #[derive(serde::Serialize)]
+    struct ObjectMetaV6Fixture {
+        size: u64,
+        etag: [u8; 16],
+        mtime: i64,
+        extents: Vec<fs3_core::Segment>,
+        content_type: String,
+        user_meta: Vec<(String, String)>,
+        inline: Option<Vec<u8>>,
+        parts: Vec<u64>,
+        resp_headers: Vec<(String, String)>,
+        version_id: Option<[u8; 16]>,
+        is_delete_marker: bool,
+        tags: Vec<(String, String)>,
+        sse: Option<fs3_core::SseInfo>,
+        checksum: Option<fs3_core::ChecksumInfo>,
+        retention: Option<fs3_core::Retention>,
+        legal_hold: bool,
+        part_checksums: Vec<Option<fs3_core::ChecksumInfo>>,
+        compressed: Option<fs3_core::CompressionInfo>,
+        requested_storage_class: Option<String>,
+    }
+
+    fn encode_v6_value(m: &fs3_core::ObjectMeta) -> Vec<u8> {
+        let f = ObjectMetaV6Fixture {
+            size: m.size,
+            etag: m.etag,
+            mtime: m.mtime,
+            extents: m.extents.clone(),
+            content_type: m.content_type.clone(),
+            user_meta: m.user_meta.clone(),
+            inline: m.inline.clone(),
+            parts: m.parts.clone(),
+            resp_headers: m.resp_headers.clone(),
+            version_id: m.version_id,
+            is_delete_marker: m.is_delete_marker,
+            tags: m.tags.clone(),
+            sse: m.sse.clone(),
+            checksum: m.checksum.clone(),
+            retention: m.retention.clone(),
+            legal_hold: m.legal_hold,
+            part_checksums: m.part_checksums.clone(),
+            compressed: m.compressed.clone(),
+            requested_storage_class: Some("GLACIER".into()),
+        };
+        let mut v = vec![6u8];
+        v.extend(postcard::to_allocvec(&f).unwrap());
+        v
+    }
+
     fn bucket_meta() -> fs3_core::BucketMeta {
         fs3_core::BucketMeta {
             created: 1,
@@ -268,7 +341,8 @@ mod tests {
         // 口径)、统计不变、完成标记落盘、幂等续跑 rewritten=0。
         let dir = tempfile::tempdir().unwrap();
         let (s, vk_data, vk_v2) = mixed_store(dir.path());
-        assert_eq!(s.count_object_value_versions().unwrap(), (2, 3));
+        let c = s.count_object_value_versions().unwrap();
+        assert_eq!((c.v2, c.cur), (2, 3));
         let stats_before = s.get_bucket("b1").unwrap().unwrap().stats;
         drop(s);
 
@@ -283,10 +357,11 @@ mod tests {
         .unwrap();
         assert_eq!(report.scanned, 5);
         assert_eq!(report.rewritten, 2, "两个 v2 值被重写");
-        assert_eq!(report.skipped_v3, 2, "v3 数据条目跳过");
+        assert_eq!(report.skipped_cur, 2, "v3 数据条目跳过");
         assert_eq!(report.skipped_marker, 1, "v3 删除标记跳过");
         assert_eq!(report.errors, 0);
-        assert_eq!(count_value_versions(dir.path()).unwrap(), (0, 5));
+        let c = count_value_versions(dir.path()).unwrap();
+        assert_eq!((c.v2, c.cur), (0, 5));
 
         // 内容一致(双读口径 = 重写前后的 decode 结果相等)+ 统计不变
         let s = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
@@ -323,7 +398,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report2.rewritten, 0);
-        assert_eq!(report2.skipped_v3, 4);
+        assert_eq!(report2.skipped_cur, 4);
         assert_eq!(report2.skipped_marker, 1);
         assert_eq!(report2.errors, 0);
     }
@@ -356,7 +431,8 @@ mod tests {
         std::fs::remove_file(&pause).unwrap();
         let report = handle.join().unwrap();
         assert_eq!(report.errors, 0);
-        assert_eq!(count_value_versions(dir.path()).unwrap(), (0, 5));
+        let c = count_value_versions(dir.path()).unwrap();
+        assert_eq!((c.v2, c.cur), (0, 5));
     }
 
     #[test]
@@ -399,5 +475,73 @@ mod tests {
         assert_eq!(report.errors, 0);
         let s = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
         assert!(s.value_rewrite_v3_done().unwrap());
+    }
+
+    #[test]
+    fn rewrite_v6_to_v7_converges_and_marks() {
+        // M16 A1 主验收(ADR-19 DA4):v6 存量值(M15 C1 现格式,含 GLACIER
+        // 请求类)→ rewrite → 全部 v7、内容一致(双读口径)、请求类保留、
+        // 真实类不升格(None = STANDARD)、v7 完成标记落盘、幂等续跑。
+        let dir = tempfile::tempdir().unwrap();
+        let s = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
+        s.commit_bucket_put("b1", &bucket_meta()).unwrap();
+        let zero = StatsDelta::default();
+        let draft = AllocDraft::default();
+        // 当前版本(v7)条目 + v6 存量值条目
+        s.commit_object_put("b1", "new", &object_meta(8, 1), draft.clone(), zero)
+            .unwrap();
+        s.put_object_value_raw("b1", "old", None, &encode_v6_value(&object_meta(24, 4)))
+            .unwrap();
+        let c0 = s.count_object_value_versions().unwrap();
+        assert_eq!((c0.v2, c0.v6, c0.cur), (0, 1, 1));
+        let stats_before = s.get_bucket("b1").unwrap().unwrap().stats;
+        drop(s);
+
+        let report = run_rewrite(
+            dir.path(),
+            &RewriteValuesArgs {
+                rate: 0,
+                pause_file: None,
+                count_only: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.scanned, 2);
+        assert_eq!(report.rewritten, 1, "v6 值被重写为 v7");
+        assert_eq!(report.skipped_cur, 1, "v7 数据条目跳过");
+        assert_eq!(report.errors, 0);
+        let c = count_value_versions(dir.path()).unwrap();
+        assert_eq!((c.v2, c.v6, c.cur), (0, 0, 2));
+
+        // 内容一致 + 请求类保留 + 真实类不升格(ADR-19 DA4:v6 存量
+        // GLACIER 请求类仅审计,升级不改变对象形态)
+        let s = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
+        let old = s.get_object("b1", "old").unwrap().unwrap();
+        assert_eq!(old.size, 24);
+        assert_eq!(old.inline, Some(vec![4u8; 24]));
+        assert_eq!(
+            old.requested_storage_class.as_deref(),
+            Some("GLACIER"),
+            "请求类随重写保留"
+        );
+        assert_eq!(old.storage_class, None, "v6 值不升格真归档");
+        assert_eq!(old.restore_state, None);
+        assert_eq!(s.get_bucket("b1").unwrap().unwrap().stats, stats_before);
+        assert!(s.value_rewrite_v7_done().unwrap(), "v7 完成标记已落");
+        drop(s);
+
+        // 幂等续跑:全部已 v7 → rewritten=0
+        let report2 = run_rewrite(
+            dir.path(),
+            &RewriteValuesArgs {
+                rate: 0,
+                pause_file: None,
+                count_only: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(report2.rewritten, 0);
+        assert_eq!(report2.skipped_cur, 2, "两条 v7 条目均跳过");
+        assert_eq!(report2.errors, 0);
     }
 }

@@ -649,12 +649,13 @@ impl Engine {
         //     值且未完成标记 → 提示补跑 rewrite-values;完成标记在 → 零成本
         //     跳过探测。重写完成前禁止回滚到 v1.0.x(其拒绝解码 v3 值)。
         if !meta.value_rewrite_v3_done()? {
-            let (v2, _) = meta.count_object_value_versions()?;
-            if v2 > 0 {
+            let vc = meta.count_object_value_versions()?;
+            if vc.v2 > 0 {
                 tracing::warn!(
-                    "metadata holds {v2} object value(s) in v2 format; run `fasts3d \
+                    "metadata holds {} object value(s) in v2 format; run `fasts3d \
                      rewrite-values` in a maintenance window — rollback to v1.0.x \
-                     binaries is FORBIDDEN until rewrite completes (DESIGN-FUTURE §2.4)"
+                     binaries is FORBIDDEN until rewrite completes (DESIGN-FUTURE §2.4)",
+                    vc.v2
                 );
             }
         }
@@ -2071,6 +2072,9 @@ impl Engine {
                 part_checksums: Vec::new(),
                 compressed: compression_info,
                 requested_storage_class: requested_storage_class.clone(),
+                // M16 A1:真实存储类/恢复状态(ADR-19 DA4;写路径按请求类升格)
+                storage_class: None,
+                restore_state: None,
             };
             let mut draft = Staged::default();
             if !old.segments.is_empty() {
@@ -2218,6 +2222,9 @@ impl Engine {
             part_checksums: Vec::new(),
             compressed,
             requested_storage_class,
+            // M16 A1:真实存储类/恢复状态(ADR-19 DA4;A1-2 写路径按请求类升格)
+            storage_class: None,
+            restore_state: None,
         };
 
         // 覆盖语义(ADR-9 §5.4):新段记账必须在旧段释放**之前**——开放 extent
@@ -4621,6 +4628,9 @@ impl Engine {
                         compressed: None,
 
                         requested_storage_class: session.requested_storage_class.clone(),
+                        // M16 A1:真实存储类/恢复状态(ADR-19 DA4;写路径按请求类升格)
+                        storage_class: None,
+                        restore_state: None,
                     }
                 } else {
                     // extent:逐 part 解密直灌 SSE 写上下文(单一对象网格;
@@ -4676,6 +4686,9 @@ impl Engine {
                         compressed: None,
 
                         requested_storage_class: session.requested_storage_class.clone(),
+                        // M16 A1:真实存储类/恢复状态(ADR-19 DA4;写路径按请求类升格)
+                        storage_class: None,
+                        restore_state: None,
                     }
                 }
             } else if all_inline && total_size <= self.small_object_limit as u64 {
@@ -4707,6 +4720,9 @@ impl Engine {
                     compressed: None,
 
                     requested_storage_class: session.requested_storage_class.clone(),
+                    // M16 A1:真实存储类/恢复状态(ADR-19 DA4;写路径按请求类升格)
+                    storage_class: None,
+                    restore_state: None,
                 }
             } else if all_extent {
                 // 零数据搬运:段列表按序拼接(所有权从分片转移给对象;
@@ -4736,6 +4752,9 @@ impl Engine {
                     compressed: None,
 
                     requested_storage_class: session.requested_storage_class.clone(),
+                    // M16 A1:真实存储类/恢复状态(ADR-19 DA4;写路径按请求类升格)
+                    storage_class: None,
+                    restore_state: None,
                 }
             } else {
                 // 混合(小分片 + 大分片):数据路径组合(仅请求子集,REVIEW §4.12)
@@ -4794,6 +4813,9 @@ impl Engine {
                     compressed,
 
                     requested_storage_class: session.requested_storage_class.clone(),
+                    // M16 A1:真实存储类/恢复状态(ADR-19 DA4;写路径按请求类升格)
+                    storage_class: None,
+                    restore_state: None,
                 }
             };
 
@@ -6258,6 +6280,9 @@ fn delete_marker_meta(vid: Option<[u8; 16]>) -> ObjectMeta {
         part_checksums: Vec::new(),
         compressed: None,
         requested_storage_class: None,
+        // M16 A1:真实存储类/恢复状态(ADR-19 DA4;写路径按请求类升格)
+        storage_class: None,
+        restore_state: None,
     }
 }
 

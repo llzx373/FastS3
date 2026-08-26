@@ -118,14 +118,58 @@ pub struct ObjectMeta {
     /// STANDARD,此处记录请求类;HEAD/GET 回显实际类恒 STANDARD,admin
     /// 面可见请求类)。None = 未携带头(等价 STANDARD)。
     pub requested_storage_class: Option<String>,
+    /// M16 A1(ADR-19 DA4):**真实存储类**(v7 尾部字段;None = STANDARD,
+    /// 与请求类解耦:STANDARD 系请求类恒落 None)。合法非空值仅
+    /// GLACIER_IR / GLACIER / DEEP_ARCHIVE(归档三值,由写路径从
+    /// requested_storage_class 升格);HEAD/GET/List/GetObjectAttributes
+    /// 回显真实类;未恢复的 GLACIER/DEEP_ARCHIVE 读 → InvalidObjectState。
+    pub storage_class: Option<String>,
+    /// M16 A2(ADR-19 DA2/DA4):**恢复状态**(v7 尾部字段;仅归档类对象):
+    /// - `Some(RestoreState{restored_until: 0})` = restore 进行中
+    ///   (作业入队即落盘,`x-amz-restore: ongoing-request="true"`;
+    ///   完成时同事务改写为真实到期时刻);
+    /// - `Some(RestoreState{restored_until: t>0})` = 已恢复,到期 unix 秒
+    ///   t(读路径取明文副本;到期即时失效,GC 滞后只影响空间回收);
+    /// - `None` = 未恢复(或恢复副本已被 GC)。
+    pub restore_state: Option<RestoreState>,
 }
 
-/// 对象元数据值格式版本(ADR-11 D0 + ADR-12 D-E3 + M13 Z1 + M15 C1:
-/// `[version: u8 = 6] + postcard(ObjectMeta)`;v3/v4/v5/v6 五读、写入恒 v6;
-/// 无版本字节的旧值放弃前置兼容,直接拒绝)。
-pub const OBJECT_META_VERSION: u8 = 6;
+/// 归档对象恢复状态(M16 A2,ADR-19 DA2/DA4;ObjectMeta v7 尾部字段)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreState {
+    /// 恢复副本到期 unix 秒;0 = 进行中(ongoing-request,作业未完成)。
+    pub restored_until: i64,
+    /// 恢复作业完成时刻(unix 秒;进行中 = 入队时刻,审计/admin 展示)。
+    pub restored_at: i64,
+    /// 明文逻辑大小(与 ObjectMeta.size 一致;恢复副本为明文,无压缩)。
+    pub restored_size: u64,
+    /// 请求 Tier(Expedited/Standard/Bulk;本机三档同一快速取回,仅记录)。
+    pub tier: String,
+    /// 临时标准副本段(明文 extents;小对象 = restored_inline 非空)。
+    pub restored_extents: Vec<Segment>,
+    /// 小对象明文内联副本(与 restored_extents 互斥;大对象落盘)。
+    pub restored_inline: Option<Vec<u8>>,
+}
 
-/// v5 值格式(M15 C1:无 requested_storage_class 尾部字段;六读回退格式)。
+/// 归档类判别(M16 A1,ADR-19 DA1):GLACIER_IR / GLACIER / DEEP_ARCHIVE
+/// 为真实归档类;其余(含 STANDARD 系)一律非归档。协议层存储类接受
+/// 矩阵沿用 M15 C1(storage_class_accepted),本函数仅判真实类语义。
+pub fn is_archive_class(c: &str) -> bool {
+    c.eq_ignore_ascii_case("GLACIER_IR")
+        || c.eq_ignore_ascii_case("GLACIER")
+        || c.eq_ignore_ascii_case("DEEP_ARCHIVE")
+}
+
+/// 对象元数据值格式版本(ADR-11 D0 + ADR-12 D-E3 + M13 Z1 + M15 C1 +
+/// M16 A1: `[version: u8 = 7] + postcard(ObjectMeta)`;v2~v6 六读、写入恒
+/// v7;无版本字节的旧值放弃前置兼容,直接拒绝)。
+pub const OBJECT_META_VERSION: u8 = 7;
+
+/// v6 值格式(M16 A1:无 storage_class/restore_state 尾部字段;M15 C1 现格式,
+/// 六读回退格式)。
+pub const OBJECT_META_VERSION_V6: u8 = 6;
+
+/// v5 值格式(M15 C1:无 requested_storage_class 尾部字段;七读回退格式)。
 pub const OBJECT_META_VERSION_V5: u8 = 5;
 
 /// v4 值格式版本(M13 Z1:无 compressed 尾部字段;四读回退格式)。
@@ -170,6 +214,15 @@ pub struct AllocDraft {
 impl AllocDraft {
     pub fn is_empty(&self) -> bool {
         self.alloc.is_empty() && self.ref_inc.is_empty() && self.ref_dec.is_empty()
+    }
+
+    /// 合并另一草稿(导入路径组合主 extents 与恢复副本段记账用;两草稿
+    /// 域不相交——同一段不会同时出现在两处,直接拼接)。
+    pub fn merge(mut self, other: AllocDraft) -> Self {
+        self.alloc.extend(other.alloc);
+        self.ref_inc.extend(other.ref_inc);
+        self.ref_dec.extend(other.ref_dec);
+        self
     }
 }
 
@@ -471,6 +524,60 @@ impl ObjectMeta {
         }
     }
 
+    /// M16 A1(ADR-19 DA1/DA4):响应回显的真实存储类(协议值;None →
+    /// "STANDARD")。与请求类解耦:请求类仅审计,真实类由写路径升格。
+    pub fn storage_class_name(&self) -> &str {
+        self.storage_class.as_deref().unwrap_or("STANDARD")
+    }
+
+    /// M16 A1:是否为归档类对象(GLACIER_IR / GLACIER / DEEP_ARCHIVE)。
+    pub fn is_archive(&self) -> bool {
+        self.storage_class.as_deref().is_some_and(is_archive_class)
+    }
+
+    /// M16 A1:归档类中**需 restore 方可读**的类(GLACIER/DEEP_ARCHIVE;
+    /// GLACIER_IR 在线可读,不在此列)。
+    pub fn archive_needs_restore(&self) -> bool {
+        self.storage_class.as_deref().is_some_and(|c| {
+            c.eq_ignore_ascii_case("GLACIER") || c.eq_ignore_ascii_case("DEEP_ARCHIVE")
+        })
+    }
+
+    /// M16 A2(ADR-19 DA2):恢复是否**进行中**(作业入队未完成;回显
+    /// `x-amz-restore: ongoing-request="true"`)。
+    pub fn restore_ongoing(&self) -> bool {
+        matches!(
+            self.restore_state,
+            Some(RestoreState {
+                restored_until: 0,
+                ..
+            })
+        )
+    }
+
+    /// M16 A2:恢复副本当前是否**有效**(已恢复且未到期;`now` = 可信
+    /// 时钟当前 unix 秒;到期判定在请求路径,与 GC 时序无关)。
+    pub fn restore_valid(&self, now: i64) -> bool {
+        matches!(
+            self.restore_state,
+            Some(RestoreState {
+                restored_until,
+                ..
+            }) if restored_until > 0 && now < restored_until
+        )
+    }
+
+    /// M16 A2:恢复副本已到期但尚未 GC(读路径视同未恢复;GC 仅回收空间)。
+    pub fn restore_expired(&self, now: i64) -> bool {
+        matches!(
+            self.restore_state,
+            Some(RestoreState {
+                restored_until,
+                ..
+            }) if restored_until > 0 && now >= restored_until
+        )
+    }
+
     /// 编码为值格式:`[version: u8] + postcard(Self)`。
     pub fn encode_value(&self) -> Result<Vec<u8>> {
         let mut v = Vec::with_capacity(64);
@@ -497,6 +604,11 @@ impl ObjectMeta {
         };
         match ver {
             OBJECT_META_VERSION => postcard::from_bytes(&buf[1..])
+                .map_err(|e| Error::Corrupt(format!("postcard decode object meta: {e}"))),
+            // v6 双读回退(M16 A1:无 storage_class/restore_state 尾部字段 →
+            // None;M15 C1 现格式按 STANDARD 语义升格)
+            OBJECT_META_VERSION_V6 => postcard::from_bytes::<ObjectMetaV6>(&buf[1..])
+                .map(Into::into)
                 .map_err(|e| Error::Corrupt(format!("postcard decode object meta: {e}"))),
             // v5 双读回退(M15 C1:无 requested_storage_class 尾部字段 → None)
             OBJECT_META_VERSION_V5 => postcard::from_bytes::<ObjectMetaV5>(&buf[1..])
@@ -568,6 +680,9 @@ impl From<ObjectMetaV3> for ObjectMeta {
             part_checksums: Vec::new(),
             compressed: None,
             requested_storage_class: None,
+            // M16 A1:旧格式值无真实存储类/恢复状态字段 → None(STANDARD 语义)
+            storage_class: None,
+            restore_state: None,
         }
     }
 }
@@ -616,6 +731,65 @@ impl From<ObjectMetaV4> for ObjectMeta {
             part_checksums: l.part_checksums,
             compressed: None,
             requested_storage_class: None,
+            // M16 A1:旧格式值无真实存储类/恢复状态字段 → None(STANDARD 语义)
+            storage_class: None,
+            restore_state: None,
+        }
+    }
+}
+
+/// v6 值格式(v2.1.0-M15 C1 现格式;无 storage_class/restore_state 尾部
+/// 字段;M16 A1 双读回退用)。
+#[derive(Serialize, Deserialize)]
+struct ObjectMetaV6 {
+    size: u64,
+    etag: [u8; 16],
+    mtime: i64,
+    extents: Vec<Segment>,
+    content_type: String,
+    user_meta: Vec<(String, String)>,
+    inline: Option<Vec<u8>>,
+    parts: Vec<u64>,
+    resp_headers: Vec<(String, String)>,
+    version_id: Option<[u8; 16]>,
+    is_delete_marker: bool,
+    tags: Vec<(String, String)>,
+    sse: Option<SseInfo>,
+    checksum: Option<ChecksumInfo>,
+    retention: Option<Retention>,
+    legal_hold: bool,
+    part_checksums: Vec<Option<ChecksumInfo>>,
+    compressed: Option<CompressionInfo>,
+    requested_storage_class: Option<String>,
+}
+
+impl From<ObjectMetaV6> for ObjectMeta {
+    fn from(l: ObjectMetaV6) -> Self {
+        ObjectMeta {
+            size: l.size,
+            etag: l.etag,
+            mtime: l.mtime,
+            extents: l.extents,
+            content_type: l.content_type,
+            user_meta: l.user_meta,
+            inline: l.inline,
+            parts: l.parts,
+            resp_headers: l.resp_headers,
+            version_id: l.version_id,
+            is_delete_marker: l.is_delete_marker,
+            tags: l.tags,
+            sse: l.sse,
+            checksum: l.checksum,
+            retention: l.retention,
+            legal_hold: l.legal_hold,
+            part_checksums: l.part_checksums,
+            compressed: l.compressed,
+            requested_storage_class: l.requested_storage_class,
+            // M16 A1:存量 v6 值 = M15「统一落 STANDARD」语义,真实类恒
+            // STANDARD(None),无恢复状态(ADR-19 DA4:升级不改变既有对象
+            // 形态——请求类仅审计,不升格为真归档)。
+            storage_class: None,
+            restore_state: None,
         }
     }
 }
@@ -666,6 +840,9 @@ impl From<ObjectMetaV5> for ObjectMeta {
             part_checksums: l.part_checksums,
             compressed: l.compressed,
             requested_storage_class: None,
+            // M16 A1:旧格式值无真实存储类/恢复状态字段 → None(STANDARD 语义)
+            storage_class: None,
+            restore_state: None,
         }
     }
 }
@@ -706,6 +883,9 @@ impl From<ObjectMetaV2> for ObjectMeta {
             part_checksums: Vec::new(),
             compressed: None,
             requested_storage_class: None,
+            // M16 A1:旧格式值无真实存储类/恢复状态字段 → None(STANDARD 语义)
+            storage_class: None,
+            restore_state: None,
         }
     }
 }
@@ -745,6 +925,9 @@ impl From<LegacyObjectMeta> for ObjectMeta {
             part_checksums: Vec::new(),
             compressed: None,
             requested_storage_class: None,
+            // M16 A1:旧格式值无真实存储类/恢复状态字段 → None(STANDARD 语义)
+            storage_class: None,
+            restore_state: None,
         }
     }
 }
@@ -2009,16 +2192,25 @@ mod tests {
             ],
             compressed: None,
             requested_storage_class: Some("STANDARD_IA".into()),
+            storage_class: Some("GLACIER".into()),
+            restore_state: Some(RestoreState {
+                restored_until: 1_900_000_000,
+                restored_at: 1_800_000_100,
+                restored_size: 5 * 1024 * 1024,
+                tier: "Standard".into(),
+                restored_extents: vec![],
+                restored_inline: Some(vec![1, 2, 3]),
+            }),
         };
         let v = m.encode_value().unwrap();
         assert_eq!(v[0], OBJECT_META_VERSION);
-        assert_eq!(v[0], 6, "M15 C1 起写入恒 v6");
+        assert_eq!(v[0], 7, "M16 A1 起写入恒 v7");
         assert_eq!(ObjectMeta::decode_value(&v).unwrap(), m);
         // 无版本字节(旧布局值)→ 拒绝
         let legacy = postcard::to_allocvec(&m).unwrap();
         assert!(ObjectMeta::decode_value(&legacy).is_err());
-        // 版本字节不符 → 拒绝(2/3/4/5 为回退格式,不在此列)
-        for bad_ver in [0u8, 1, 7, 0xFF] {
+        // 版本字节不符 → 拒绝(2/3/4/5/6 为回退格式,不在此列)
+        for bad_ver in [0u8, 1, 8, 0xFF] {
             let mut bad = v.clone();
             bad[0] = bad_ver;
             assert!(ObjectMeta::decode_value(&bad).is_err());
@@ -2166,6 +2358,46 @@ mod tests {
         assert_eq!(dec.version_id, m.version_id);
         assert_eq!(dec.requested_storage_class, None, "v5 值无该字段,补 None");
         assert_eq!(dec.compressed, m.compressed);
+        // M16 A1 双读:v6 值(M15 C1 现格式,无 storage_class/restore_state
+        // 尾部字段)回退补 None —— 存量 v6 值按 STANDARD 语义升格,不因
+        // 请求类自动变真归档(ADR-19 DA4:升级不改变既有对象形态)
+        let v6_value = {
+            let mut b = vec![6u8];
+            let m6 = ObjectMetaV6 {
+                size: m.size,
+                etag: m.etag,
+                mtime: m.mtime,
+                extents: m.extents.clone(),
+                content_type: m.content_type.clone(),
+                user_meta: m.user_meta.clone(),
+                inline: m.inline.clone(),
+                parts: m.parts.clone(),
+                resp_headers: vec![("x".into(), "y".into())],
+                version_id: m.version_id,
+                is_delete_marker: m.is_delete_marker,
+                tags: m.tags.clone(),
+                sse: m.sse.clone(),
+                checksum: m.checksum.clone(),
+                retention: m.retention.clone(),
+                legal_hold: m.legal_hold,
+                part_checksums: m.part_checksums.clone(),
+                compressed: m.compressed.clone(),
+                requested_storage_class: Some("GLACIER".into()),
+            };
+            b.extend_from_slice(&postcard::to_allocvec(&m6).unwrap());
+            b
+        };
+        let dec = ObjectMeta::decode_value(&v6_value).unwrap();
+        assert_eq!(dec.size, m.size, "v6 值原样保留");
+        assert_eq!(dec.resp_headers, vec![("x".to_string(), "y".to_string())]);
+        assert_eq!(dec.requested_storage_class, Some("GLACIER".to_string()));
+        assert_eq!(
+            dec.storage_class, None,
+            "v6 值无真实类字段,补 None(= STANDARD)"
+        );
+        assert_eq!(dec.restore_state, None, "v6 值无恢复状态字段,补 None");
+        assert!(!dec.restore_valid(1));
+        assert!(!dec.is_archive(), "v6 存量 GLACIER 请求类不升格真归档");
         // v2 值损坏(截断)→ 两种回退格式都失败 → Corrupt
         let truncated = &v2_value[..v2_value.len() / 2];
         assert!(matches!(
