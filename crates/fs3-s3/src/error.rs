@@ -286,7 +286,8 @@ impl S3ErrorCode {
             | InvalidSignature
             | InvalidToken
             | TokenRefreshRequired
-            | QuotaExceeded => 403,
+            | QuotaExceeded
+            | InvalidObjectState => 403,
             BucketAlreadyExists | BucketAlreadyOwnedByYou | BucketNotEmpty | OperationAborted => {
                 409
             }
