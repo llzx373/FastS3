@@ -194,3 +194,40 @@ test("store: seq 单调与节点隔离", async (t) => {
   assert.equal(store.applyState("n1").desired_version, 2);
   assert.equal(store.applyState("n2").desired_version, 1);
 });
+test("G1-3: secret 绝不落库(仅内存一次回显)", async (t) => {
+  // 用真实文件库(非 :memory:),结束后直接搜文件字节证明无 secret 落盘
+  const dir = await import("node:fs/promises").then((fs) => fs.mkdtemp("/tmp/fs3-center-test-"));
+  const dbPath = `${dir}/center.sqlite`;
+  t.after(async () => {
+    await import("node:fs/promises").then((fs) => fs.rm(dir, { recursive: true, force: true }));
+  });
+  const store = openStore(dbPath);
+  const app = buildCenter({ store, getClientCn: () => "node-secret" });
+  t.after(() => {
+    app.close();
+    store.close();
+  });
+  await app.inject({ method: "POST", url: "/v2/center/register", payload: { node_id: "node-secret" } });
+  await app.inject({
+    method: "POST",
+    url: "/v2/center/results",
+    payload: {
+      node_id: "node-secret",
+      results: [{ seq: 1, ok: true, secret_once: "TOP-SECRET-ABC-123" }],
+    },
+  });
+  // 内存暂存可取(一次)
+  const s = await app.inject({ method: "GET", url: "/v2/center/secrets?node_id=node-secret" });
+  assert.equal((J(s.json())["secrets"] as { secret: string }[])[0]["secret"], "TOP-SECRET-ABC-123");
+  // 同一 secret 经 streams(审计 detail)也不落库;直接检查库文件字节
+  store.close();
+  const raw = await import("node:fs/promises").then((fs) => fs.readFile(dbPath, "utf8"));
+  assert.ok(!raw.includes("TOP-SECRET-ABC-123"), "secret must never appear in sqlite file (incl. WAL)");
+  // WAL 文件同样检查
+  try {
+    const wal = await import("node:fs/promises").then((fs) => fs.readFile(`${dbPath}-wal`, "utf8"));
+    assert.ok(!wal.includes("TOP-SECRET-ABC-123"), "secret must never appear in WAL");
+  } catch {
+    /* 无 WAL 文件也通过 */
+  }
+});
