@@ -120,3 +120,58 @@ test("center console api: 登录/节点/批量下发/账本/审计/secret", asyn
   r = await app.inject({ method: "GET", url: "/center/api/secrets?node_id=node", headers: { authorization: `Bearer ${token}` } });
   assert.equal((J(r.json())["secrets"] as unknown[]).length, 0);
 });
+test("ADR-20: 控制台同步任务 CRUD + 手动触发 + metrics 导出", async (t) => {
+  const { registerCenterConsole } = await import("./console.js");
+  const Fastify = (await import("fastify")).default;
+  const store = openStore(":memory:");
+  const app = Fastify({ logger: false });
+  registerCenterConsole(app, {
+    store,
+    jwtSecret: "test-secret",
+    usersCsv: "admin:admin123",
+  });
+  t.after(() => {
+    app.close();
+    store.close();
+  });
+
+  const login = async () => {
+    const l = await app.inject({ method: "POST", url: "/center/api/login", payload: { username: "admin", password: "admin123" } });
+    return (l.json() as { token: string }).token;
+  };
+  const token = await login();
+  const h = { authorization: `Bearer ${token}` };
+
+  // 未注册节点 → 400
+  let r = await app.inject({ method: "POST", url: "/center/api/sync-tasks", headers: h, payload: { id: "t1", source_node: "nope", source_bucket: "s", dest_node: "n2", dest_bucket: "d", mode: "mirror", schedule_secs: 60, source_endpoint: "http://a", source_key: "k", source_secret: "x", dest_endpoint: "http://b", dest_key: "k2", dest_secret: "y" } });
+  assert.equal(r.statusCode, 400);
+
+  // 注册两节点(经 mTLS 通道 API;此处直接 store upsert)
+  store.upsertNode({ node_id: "n1", hostname: "h1", version: "v" });
+  store.upsertNode({ node_id: "n2", hostname: "h2", version: "v" });
+
+  // 创建 + 列表
+  r = await app.inject({ method: "POST", url: "/center/api/sync-tasks", headers: h, payload: { id: "t1", name: "backup", source_node: "n1", source_bucket: "src", dest_node: "n2", dest_bucket: "dst", mode: "mirror", schedule_secs: 60, source_endpoint: "http://a", source_key: "k", source_secret: "x", dest_endpoint: "http://b", dest_key: "k2", dest_secret: "y" } });
+  assert.equal(r.statusCode, 201);
+  r = await app.inject({ method: "GET", url: "/center/api/sync-tasks", headers: h });
+  assert.equal((r.json() as { total: number }).total, 1);
+
+  // 启用 + 手动触发 + 账本出现 sync.run(调度器不经控制台,直接验证 store 结算)
+  r = await app.inject({ method: "PATCH", url: "/center/api/sync-tasks/t1", headers: h, payload: { enabled: true } });
+  assert.equal(r.statusCode, 200);
+  r = await app.inject({ method: "POST", url: "/center/api/sync-tasks/t1/run", headers: h });
+  assert.equal(r.statusCode, 200);
+  store.recordSyncRun("t1", "ok", "", 7);
+
+  // metrics 导出(含 stalled 判定:last_run_at=0 且 enabled → 不 stalled)
+  r = await app.inject({ method: "GET", url: "/center/api/metrics" });
+  assert.equal(r.statusCode, 200);
+  const m = r.body;
+  assert.ok(m.includes("fasts3_center_sync_task_stalled"), m);
+  assert.ok(m.includes('task_id="t1"'), m);
+  assert.ok(m.includes("fasts3_center_sync_tasks_total 1"), m);
+
+  // 删除
+  r = await app.inject({ method: "DELETE", url: "/center/api/sync-tasks/t1", headers: h });
+  assert.equal(r.statusCode, 200);
+});

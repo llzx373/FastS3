@@ -31,6 +31,23 @@ export interface CenterOp {
   applied_at: number | null;
 }
 
+export interface CenterSyncTask {
+  id: string;
+  name: string;
+  source_node: string;
+  source_bucket: string;
+  dest_node: string;
+  dest_bucket: string;
+  mode: "mirror" | "incremental";
+  schedule_secs: number;
+  enabled: boolean;
+  last_run_at: number;
+  last_result: string;
+  last_error: string;
+  last_transferred: number;
+  created_at: number;
+}
+
 export interface AuditEntry {
   node_id: string;
   ts: number;
@@ -119,4 +136,18 @@ export const centerApi = {
       "GET",
       `/center/api/secrets?node_id=${encodeURIComponent(nodeId)}`,
     ),
+  // ADR-20:同步任务(复制策略化)
+  syncTasks: () => req<{ total: number; tasks: CenterSyncTask[] }>("GET", "/center/api/sync-tasks"),
+  createSyncTask: (t: Record<string, unknown>) =>
+    req<{ ok: boolean; task: CenterSyncTask }>("POST", "/center/api/sync-tasks", t),
+  patchSyncTask: (id: string, patch: Record<string, unknown>) =>
+    req<{ ok: boolean; task: CenterSyncTask }>(
+      "PATCH",
+      `/center/api/sync-tasks/${encodeURIComponent(id)}`,
+      patch,
+    ),
+  deleteSyncTask: (id: string) =>
+    req<{ ok: boolean }>("DELETE", `/center/api/sync-tasks/${encodeURIComponent(id)}`),
+  runSyncTask: (id: string) =>
+    req<{ ok: boolean }>("POST", `/center/api/sync-tasks/${encodeURIComponent(id)}/run`),
 };

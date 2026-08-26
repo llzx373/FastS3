@@ -14,6 +14,7 @@
  * - GET  /center/api/state?node_id=     对账状态
  * - GET  /center/api/audit?…            跨节点审计聚合检索
  * - GET  /center/api/secrets?node_id=   secret 一次性取回(G1-3)
+ * - /center/api/sync-tasks*             同步任务 CRUD/启停/手动触发(ADR-20)
  */
 
 import Fastify, { type FastifyInstance } from "fastify";
@@ -85,6 +86,9 @@ const KINDS = new Set([
   "bucket.create",
   "bucket.patch",
   "bucket.delete",
+  // ADR-20 DR2:复制策略化(ops 白名单 8 类;一般经同步任务页创建,
+  // 不直接模板化下发——payload 含双端凭据,页面表单更安全)
+  "sync.run",
 ]);
 
 export function registerCenterConsole(
@@ -235,6 +239,168 @@ export function registerCenterConsole(
     if (forbidden) return reply.code(forbidden.statusCode).send({ error: forbidden });
     const q = req.query as Record<string, string>;
     return reply.send({ secrets: store.takeSecrets(String(q.node_id ?? "")) });
+  });
+
+  // ── ADR-20 同步任务(控制台;JWT,admin 写 / readonly 读)────────────
+  const auth = (req: { headers: Record<string, string | string[] | undefined> }) => {
+    if (Array.isArray(req.headers.authorization)) req.headers.authorization = req.headers.authorization[0];
+    const claims = verifyJwt(
+      String((req.headers.authorization ?? "").replace(/^Bearer /, "")),
+      opts.jwtSecret,
+    );
+    return claims;
+  };
+  const taskRow = (t: import("./store.js").SyncTaskRow) => ({
+    id: t.id,
+    name: t.name,
+    source_node: t.source_node,
+    source_bucket: t.source_bucket,
+    dest_node: t.dest_node,
+    dest_bucket: t.dest_bucket,
+    mode: t.mode,
+    schedule_secs: t.schedule_secs,
+    enabled: t.enabled === 1,
+    last_run_at: t.last_run_at,
+    last_result: t.last_result,
+    last_error: t.last_error,
+    last_transferred: t.last_transferred,
+    created_at: t.created_at,
+  });
+
+  app.get("/center/api/sync-tasks", async (req, reply) => {
+    if (!auth(req)) return reply.code(401).send({ error: { code: "unauthorized" } });
+    const tasks = store.listSyncTasks().map(taskRow);
+    return reply.send({ tasks, total: tasks.length });
+  });
+
+  app.post("/center/api/sync-tasks", async (req, reply) => {
+    if (!auth(req)) return reply.code(401).send({ error: { code: "unauthorized" } });
+    const forbidden = requireAdmin((auth(req) as { role?: string })?.role ?? "");
+    if (forbidden) return reply.code(forbidden.statusCode).send({ error: forbidden });
+    const b = (req.body ?? {}) as Record<string, unknown>;
+    const pickStr = (k: string) => String(b[k] ?? "");
+    const mode = String(b.mode ?? "incremental");
+    const scheduleSecs = Number(b.schedule_secs ?? 300) || 300;
+    if (!pickStr("id") || !pickStr("source_node") || !pickStr("source_bucket") ||
+        !pickStr("dest_node") || !pickStr("dest_bucket") ||
+        !pickStr("source_endpoint") || !pickStr("source_key") || !pickStr("source_secret") ||
+        !pickStr("dest_endpoint") || !pickStr("dest_key") || !pickStr("dest_secret")) {
+      return reply.code(400).send({ error: { code: "bad_request", message: "missing required fields" } });
+    }
+    if (!["mirror", "incremental"].includes(mode)) {
+      return reply.code(400).send({ error: { code: "bad_request", message: "mode must be mirror|incremental" } });
+    }
+    if (scheduleSecs < 30) {
+      return reply.code(400).send({ error: { code: "bad_request", message: "schedule_secs must be >= 30" } });
+    }
+    if (pickStr("source_node") === pickStr("dest_node") && pickStr("source_bucket") === pickStr("dest_bucket")) {
+      return reply.code(400).send({ error: { code: "bad_request", message: "source and dest must differ" } });
+    }
+    if (!store.getNode(pickStr("source_node")) || !store.getNode(pickStr("dest_node"))) {
+      return reply.code(400).send({ error: { code: "bad_request", message: "source/dest node must be registered" } });
+    }
+    if (store.getSyncTask(pickStr("id"))) {
+      return reply.code(409).send({ error: { code: "conflict", message: `task ${pickStr("id")} exists` } });
+    }
+    try {
+      const t = store.createSyncTask({
+        id: pickStr("id"),
+        name: pickStr("name"),
+        source_node: pickStr("source_node"),
+        source_bucket: pickStr("source_bucket"),
+        dest_node: pickStr("dest_node"),
+        dest_bucket: pickStr("dest_bucket"),
+        mode,
+        schedule_secs: scheduleSecs,
+        source_endpoint: pickStr("source_endpoint"),
+        source_key: pickStr("source_key"),
+        source_secret: pickStr("source_secret"),
+        dest_endpoint: pickStr("dest_endpoint"),
+        dest_key: pickStr("dest_key"),
+        dest_secret: pickStr("dest_secret"),
+      });
+      return reply.code(201).send({ ok: true, task: taskRow(t) });
+    } catch (e) {
+      return reply.code(409).send({ error: { code: "conflict", message: e instanceof Error ? e.message : String(e) } });
+    }
+  });
+
+  app.patch("/center/api/sync-tasks/:id", async (req, reply) => {
+    if (!auth(req)) return reply.code(401).send({ error: { code: "unauthorized" } });
+    const forbidden = requireAdmin((auth(req) as { role?: string })?.role ?? "");
+    if (forbidden) return reply.code(forbidden.statusCode).send({ error: forbidden });
+    const id = String((req.params as { id: string }).id);
+    const b = (req.body ?? {}) as Record<string, unknown>;
+    const patch: Record<string, unknown> = {};
+    for (const k of [
+      "name", "source_node", "source_bucket", "dest_node", "dest_bucket", "mode",
+      "source_endpoint", "source_key", "source_secret",
+      "dest_endpoint", "dest_key", "dest_secret",
+    ]) {
+      if (b[k] !== undefined) patch[k] = String(b[k]);
+    }
+    if (b.schedule_secs !== undefined) {
+      const s = Number(b.schedule_secs) || 0;
+      if (s < 30) return reply.code(400).send({ error: { code: "bad_request", message: "schedule_secs must be >= 30" } });
+      patch.schedule_secs = s;
+    }
+    if (b.enabled !== undefined) patch.enabled = b.enabled === true || b.enabled === 1 || b.enabled === "1" ? 1 : 0;
+    try {
+      const t = store.updateSyncTask(id, patch as never);
+      if (!t) return reply.code(404).send({ error: { code: "no_such_task", message: `task ${id}` } });
+      return reply.send({ ok: true, task: taskRow(t) });
+    } catch (e) {
+      return reply.code(409).send({ error: { code: "conflict", message: e instanceof Error ? e.message : String(e) } });
+    }
+  });
+
+  app.delete("/center/api/sync-tasks/:id", async (req, reply) => {
+    if (!auth(req)) return reply.code(401).send({ error: { code: "unauthorized" } });
+    const forbidden = requireAdmin((auth(req) as { role?: string })?.role ?? "");
+    if (forbidden) return reply.code(forbidden.statusCode).send({ error: forbidden });
+    const id = String((req.params as { id: string }).id);
+    if (!store.deleteSyncTask(id)) {
+      return reply.code(404).send({ error: { code: "no_such_task", message: `task ${id}` } });
+    }
+    return reply.send({ ok: true });
+  });
+
+  app.post("/center/api/sync-tasks/:id/run", async (req, reply) => {
+    if (!auth(req)) return reply.code(401).send({ error: { code: "unauthorized" } });
+    const forbidden = requireAdmin((auth(req) as { role?: string })?.role ?? "");
+    if (forbidden) return reply.code(forbidden.statusCode).send({ error: forbidden });
+    const id = String((req.params as { id: string }).id);
+    if (!store.requestSyncRun(id)) {
+      const t = store.getSyncTask(id);
+      if (!t) return reply.code(404).send({ error: { code: "no_such_task", message: `task ${id}` } });
+      return reply.code(400).send({ error: { code: "disabled", message: `task ${id} is disabled` } });
+    }
+    return reply.send({ ok: true });
+  });
+
+  /** Prometheus 文本导出(ADR-20 DR4 告警数据源;控制台 web 实例承载,
+   *  管理面信息——部署文档要求该端口仅内网可达,强隔离请前置反向代理) */
+  app.get("/center/api/metrics", async (_req, reply) => {
+    const tasks = store.listSyncTasks();
+    const nowSec = Math.floor(Date.now() / 1000);
+    const esc = (s: string) => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    const lines: string[] = [
+      "# HELP fasts3_center_sync_task_stalled 同步任务停摆(启用且超 2×调度未执行;ADR-20 DR4)",
+      "# TYPE fasts3_center_sync_task_stalled gauge",
+    ];
+    for (const t of tasks) {
+      const stalled =
+        t.enabled === 1 && t.last_run_at > 0 && nowSec - t.last_run_at > 2 * t.schedule_secs;
+      lines.push(
+        `fasts3_center_sync_task_stalled{task_id="${esc(t.id)}",mode="${esc(t.mode)}"} ${stalled ? 1 : 0}`,
+      );
+      lines.push(
+        `fasts3_center_sync_task_last_result{task_id="${esc(t.id)}",result="${esc(t.last_result || "never")}"} 1`,
+      );
+    }
+    lines.push(`fasts3_center_sync_tasks_total ${tasks.length}`);
+    reply.header("content-type", "text/plain; version=0.0.4; charset=utf-8");
+    return reply.send(lines.join("\n") + "\n");
   });
 
   /** 控制台静态托管(SPA 回退;最后注册,精确路由优先) */

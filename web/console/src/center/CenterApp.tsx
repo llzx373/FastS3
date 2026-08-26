@@ -14,6 +14,7 @@ import {
 import CenterDashboard from "./pages/CenterDashboard";
 import CenterOps from "./pages/CenterOps";
 import CenterAudit from "./pages/CenterAudit";
+import CenterSyncTasks from "./pages/CenterSyncTasks";
 import CenterLogin from "./pages/CenterLogin";
 
 export default function CenterApp() {
@@ -65,6 +66,9 @@ export default function CenterApp() {
           <button className={route.startsWith("/center/audit") ? "active" : ""} onClick={() => nav("/center/audit")}>
             审计检索
           </button>
+          <button className={route.startsWith("/center/sync") ? "active" : ""} onClick={() => nav("/center/sync")}>
+            同步任务
+          </button>
         </nav>
         <div style={{ position: "absolute", bottom: 16, left: 16, right: 16 }}>
           <div className="sub">角色:{role}</div>
@@ -89,6 +93,8 @@ export default function CenterApp() {
           <CenterOps onError={onError} />
         ) : route.startsWith("/center/audit") ? (
           <CenterAudit onError={onError} />
+        ) : route.startsWith("/center/sync") ? (
+          <CenterSyncTasks onError={onError} />
         ) : (
           <CenterDashboard onError={onError} />
         )}

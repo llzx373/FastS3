@@ -138,6 +138,19 @@ groups:
           summary: "归档恢复作业停滞(队列非空但长时间零物化)"
           description: "fasts3_restore_queue_depth 非空且 last_completed 停滞;检查 fs3-restore worker 线程日志(设备只读/SSE-C 拒单循环?)"
 
+      # 同步任务停摆(M16 R1-4,ADR-20 DR4):任务启用但超过 2×调度间隔
+      # 未执行。指标由中心控制台 /center/api/metrics 导出
+      # (fasts3_center_sync_task_stalled;控制台 web 实例,内网可达)。
+      - alert: FastS3SyncTaskStalled
+        expr: |
+          fasts3_center_sync_task_stalled == 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "同步任务超过 2×调度间隔未执行"
+          description: "任务 {{ $labels.task_id }}(mode={{ $labels.mode }})停摆;检查中心调度器日志与源节点 agent 在线状态(执行失败以 rejected 展示在控制台同步任务页)"
+
       # 生命周期删除突增(信息级):规则误配(如 prefix 过宽)的第一信号
       - alert: FastS3LifecycleDeletedSpike
         expr: |
