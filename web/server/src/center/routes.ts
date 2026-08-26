@@ -8,6 +8,8 @@
  * - GET  /v2/center/desired    下发拉取(?seq 增量 / ?mode=full 全量对账)
  * - POST /v2/center/results    应用结果回执(mark acked/rejected;
  *                              secret_once 仅内存暂存,不落库 G1-3)
+ * - /v2/center/sync-tasks*     同步任务 CRUD/手动触发(ADR-20;复制策略化;
+ *                              startSyncScheduler 周期下发 sync.run)
  *
  * 身份:节点 = mTLS 客户端证书 CN(getClientCn 注入;生产实现取
  * req.socket.getPeerCertificate().subject.CN,测试注入桩)。
@@ -137,6 +139,23 @@ export function registerCenterRoutes(app: FastifyInstance, opts: CenterRouteOpti
         }
       } else {
         store.markRejected(nodeId, seq, String(r?.error ?? "rejected"));
+      }
+      // ADR-20 DR2-2:sync.run 结算 → 同步任务状态
+      const op = store.listOps(nodeId).find((o) => o.seq === seq);
+      if (op && op.kind === "sync.run") {
+        try {
+          const p = JSON.parse(op.payload) as { task_id?: string; error?: string };
+          if (p.task_id) {
+            store.recordSyncRun(
+              p.task_id,
+              r?.ok === true ? "ok" : "rejected",
+              r?.ok === true ? "" : String(r?.error ?? p.error ?? "rejected"),
+              Number(r?.transferred ?? 0) || 0,
+            );
+          }
+        } catch {
+          /* ignore malformed payload */
+        }
       }
     }
     if (acked.length > 0) store.markAcked(nodeId, acked);
@@ -270,6 +289,9 @@ export function registerCenterRoutes(app: FastifyInstance, opts: CenterRouteOpti
       "bucket.create",
       "bucket.patch",
       "bucket.delete",
+      // ADR-20 DR2-1:ops 白名单 7 类 → 8 类(复制策略化;节点本地执行
+      // mc mirror/rclone copy,payload 自描述,见 POST /sync-tasks)
+      "sync.run",
     ]);
     if (!nodeId || !KINDS.has(kind)) {
       return reply
@@ -297,6 +319,221 @@ export function registerCenterRoutes(app: FastifyInstance, opts: CenterRouteOpti
     if (!nodeId) return reply.code(400).send(BAD("bad_request", "node_id required", 400));
     return reply.send({ node_id: nodeId, apply_state: store.applyState(nodeId) });
   });
+
+  // ── ADR-20 复制策略化:同步任务 CRUD + 手动触发 ──────────────────────
+  // 任务 = 配置(desired);执行 = 节点本地 mc mirror/rclone(实际状态);
+  // 中心只调度与对账(DV1 同构)。凭据为管理面配置,存中心 SQLite(DR1-3)。
+
+  const cnRequired = (req: { socket: unknown }) => {
+    const cn = getClientCn(req);
+    if (!cn) return null;
+    return cn;
+  };
+
+  const taskRow = (t: import("./store.js").SyncTaskRow) => ({
+    id: t.id,
+    name: t.name,
+    source_node: t.source_node,
+    source_bucket: t.source_bucket,
+    dest_node: t.dest_node,
+    dest_bucket: t.dest_bucket,
+    mode: t.mode,
+    schedule_secs: t.schedule_secs,
+    enabled: t.enabled === 1,
+    last_run_at: t.last_run_at,
+    last_result: t.last_result,
+    last_error: t.last_error,
+    last_transferred: t.last_transferred,
+    created_at: t.created_at,
+  });
+
+  app.get("/v2/center/sync-tasks", async (req, reply) => {
+    if (!cnRequired(req)) {
+      return reply.code(401).send(BAD("unauthorized", "missing client certificate", 401));
+    }
+    const tasks = store.listSyncTasks().map(taskRow);
+    return reply.send({ tasks, total: tasks.length });
+  });
+
+  app.post("/v2/center/sync-tasks", async (req, reply) => {
+    if (!cnRequired(req)) {
+      return reply.code(401).send(BAD("unauthorized", "missing client certificate", 401));
+    }
+    const b = (req.body ?? {}) as Record<string, unknown>;
+    const id = String(b.id ?? "");
+    const name = String(b.name ?? "");
+    const sourceNode = String(b.source_node ?? "");
+    const sourceBucket = String(b.source_bucket ?? "");
+    const destNode = String(b.dest_node ?? "");
+    const destBucket = String(b.dest_bucket ?? "");
+    const mode = String(b.mode ?? "incremental");
+    const scheduleSecs = Number(b.schedule_secs ?? 300) || 300;
+    const srcEp = String(b.source_endpoint ?? "");
+    const srcKey = String(b.source_key ?? "");
+    const srcSecret = String(b.source_secret ?? "");
+    const dstEp = String(b.dest_endpoint ?? "");
+    const dstKey = String(b.dest_key ?? "");
+    const dstSecret = String(b.dest_secret ?? "");
+    if (
+      !id ||
+      !sourceNode ||
+      !sourceBucket ||
+      !destNode ||
+      !destBucket ||
+      !srcEp ||
+      !srcKey ||
+      !srcSecret ||
+      !dstEp ||
+      !dstKey ||
+      !dstSecret
+    ) {
+      return reply.code(400).send(BAD("bad_request", "missing required sync task fields", 400));
+    }
+    if (!["mirror", "incremental"].includes(mode)) {
+      return reply.code(400).send(BAD("bad_request", `mode must be mirror|incremental, got ${mode}`, 400));
+    }
+    if (scheduleSecs < 30) {
+      return reply.code(400).send(BAD("bad_request", "schedule_secs must be >= 30", 400));
+    }
+    if (sourceNode === destNode && sourceBucket === destBucket) {
+      return reply.code(400).send(BAD("bad_request", "source and dest must differ", 400));
+    }
+    if (!store.getNode(sourceNode) || !store.getNode(destNode)) {
+      return reply.code(400).send(BAD("no_such_node", "source/dest node must be registered", 400));
+    }
+    if (store.getSyncTask(id)) {
+      return reply.code(409).send(BAD("conflict", `task ${id} already exists`, 409));
+    }
+    try {
+      const t = store.createSyncTask({
+        id,
+        name,
+        source_node: sourceNode,
+        source_bucket: sourceBucket,
+        dest_node: destNode,
+        dest_bucket: destBucket,
+        mode,
+        schedule_secs: scheduleSecs,
+        source_endpoint: srcEp,
+        source_key: srcKey,
+        source_secret: srcSecret,
+        dest_endpoint: dstEp,
+        dest_key: dstKey,
+        dest_secret: dstSecret,
+      });
+      return reply.code(201).send({ ok: true, task: taskRow(t) });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return reply.code(409).send(BAD("conflict", msg, 409));
+    }
+  });
+
+  app.patch("/v2/center/sync-tasks/:id", async (req, reply) => {
+    if (!cnRequired(req)) {
+      return reply.code(401).send(BAD("unauthorized", "missing client certificate", 401));
+    }
+    const id = String((req.params as { id: string }).id);
+    const b = (req.body ?? {}) as Record<string, unknown>;
+    const patch: Record<string, unknown> = {};
+    for (const k of [
+      "name",
+      "source_node",
+      "source_bucket",
+      "dest_node",
+      "dest_bucket",
+      "mode",
+      "source_endpoint",
+      "source_key",
+      "source_secret",
+      "dest_endpoint",
+      "dest_key",
+      "dest_secret",
+    ]) {
+      if (b[k] !== undefined) patch[k] = String(b[k]);
+    }
+    if (b.schedule_secs !== undefined) {
+      const s = Number(b.schedule_secs) || 0;
+      if (s < 30) return reply.code(400).send(BAD("bad_request", "schedule_secs must be >= 30", 400));
+      patch.schedule_secs = s;
+    }
+    if (b.enabled !== undefined) {
+      const en = b.enabled === true || b.enabled === 1 || b.enabled === "1";
+      patch.enabled = en ? 1 : 0;
+    }
+    try {
+      const t = store.updateSyncTask(id, patch as never);
+      if (!t) return reply.code(404).send(BAD("no_such_task", `task ${id}`, 404));
+      return reply.send({ ok: true, task: taskRow(t) });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return reply.code(409).send(BAD("conflict", msg, 409));
+    }
+  });
+
+  app.delete("/v2/center/sync-tasks/:id", async (req, reply) => {
+    if (!cnRequired(req)) {
+      return reply.code(401).send(BAD("unauthorized", "missing client certificate", 401));
+    }
+    const id = String((req.params as { id: string }).id);
+    if (!store.deleteSyncTask(id)) {
+      return reply.code(404).send(BAD("no_such_task", `task ${id}`, 404));
+    }
+    return reply.send({ ok: true });
+  });
+
+  /** 手动触发一次(置 run_now;调度器下一 tick 下发,幂等) */
+  app.post("/v2/center/sync-tasks/:id/run", async (req, reply) => {
+    if (!cnRequired(req)) {
+      return reply.code(401).send(BAD("unauthorized", "missing client certificate", 401));
+    }
+    const id = String((req.params as { id: string }).id);
+    if (!store.requestSyncRun(id)) {
+      const t = store.getSyncTask(id);
+      if (!t) return reply.code(404).send(BAD("no_such_task", `task ${id}`, 404));
+      return reply.code(400).send(BAD("disabled", `task ${id} is disabled`, 400));
+    }
+    return reply.send({ ok: true });
+  });
+}
+
+/**
+ * 同步任务调度器(ADR-20 DR2):周期扫描到期任务 → 下发 sync.run op
+ * 到源节点(源侧推送到目标;payload 自描述)。仅中心主进程调用
+ * (center/index.ts main);测试用 buildCenter 不启动调度器。
+ * 中心不可达 = 安全停止(无新 op;已领取任务由节点侧继续执行)。
+ */
+export function startSyncScheduler(
+  store: CenterStore,
+  opts: { intervalMs?: number; log?: (msg: string) => void } = {},
+): { stop(): void } {
+  const intervalMs = opts.intervalMs ?? 5000;
+  const log = opts.log ?? (() => {});
+  const timer = setInterval(() => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const due = store.syncTasksDue(nowSec);
+    for (const t of due) {
+      const payload = {
+        task_id: t.id,
+        name: t.name,
+        mode: t.mode,
+        source_bucket: t.source_bucket,
+        dest_bucket: t.dest_bucket,
+        source_endpoint: t.source_endpoint,
+        source_key: t.source_key,
+        source_secret: t.source_secret,
+        dest_endpoint: t.dest_endpoint,
+        dest_key: t.dest_key,
+        dest_secret: t.dest_secret,
+      };
+      try {
+        store.addOp(t.source_node, "sync.run", payload);
+        log(`sync scheduler: dispatched sync.run task=${t.id} to ${t.source_node}`);
+      } catch (e) {
+        log(`sync scheduler: dispatch failed task=${t.id}: ${String(e)}`);
+      }
+    }
+  }, intervalMs);
+  return { stop: () => clearInterval(timer) };
 }
 
 function safeJson(s: string): unknown {

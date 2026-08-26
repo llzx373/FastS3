@@ -311,3 +311,147 @@ test("G2-1: 管理面 —— ops 入账/视图、state、节点详情、审计�
   assert.equal(r.statusCode, 401);
   await app2.close();
 });
+
+test("ADR-20: 同步任务 CRUD + 单写者冲突 + 手动触发 + 调度器下发 sync.run", async (t) => {
+  const { app, store, setCn } = makeApp("node-a");
+  t.after(() => {
+    app.close();
+    store.close();
+  });
+  // 注册源/目标节点(CN 必须与 node_id 一致)
+  for (const n of ["node-a", "node-b"]) {
+    setCn(n);
+    await app.inject({ method: "POST", url: "/v2/center/register", payload: { node_id: n } });
+  }
+  setCn("center-admin");
+
+  // 无证书 → 401
+  const noCn = buildCenter({ store: openStore(":memory:"), getClientCn: () => "" });
+  let r = await noCn.inject({ method: "GET", url: "/v2/center/sync-tasks" });
+  assert.equal(r.statusCode, 401);
+  await noCn.close();
+
+  const base = {
+    source_node: "node-a",
+    source_bucket: "src",
+    dest_node: "node-b",
+    dest_bucket: "dst",
+    mode: "mirror",
+    schedule_secs: 60,
+    source_endpoint: "http://127.0.0.1:19000",
+    source_key: "ak-src",
+    source_secret: "sk-src",
+    dest_endpoint: "http://127.0.0.1:19001",
+    dest_key: "ak-dst",
+    dest_secret: "sk-dst",
+  };
+
+  // 创建
+  r = await app.inject({ method: "POST", url: "/v2/center/sync-tasks", payload: { id: "t1", name: "mirror-src->dst", ...base } });
+  assert.equal(r.statusCode, 201);
+  // 非法 mode / 未注册节点 / 自同步 → 400
+  r = await app.inject({ method: "POST", url: "/v2/center/sync-tasks", payload: { id: "t2", ...base, mode: "bidi" } });
+  assert.equal(r.statusCode, 400);
+  r = await app.inject({ method: "POST", url: "/v2/center/sync-tasks", payload: { id: "t3", ...base, dest_node: "ghost" } });
+  assert.equal(r.statusCode, 400);
+  r = await app.inject({ method: "POST", url: "/v2/center/sync-tasks", payload: { id: "t4", ...base, dest_node: "node-a", dest_bucket: "src" } });
+  assert.equal(r.statusCode, 400);
+
+  // 列表 + 默认 disabled
+  r = await app.inject({ method: "GET", url: "/v2/center/sync-tasks" });
+  let body = J(r.json());
+  assert.equal(body["total"], 1);
+  assert.equal((body["tasks"] as Record<string, unknown>[])[0]["enabled"], false);
+
+  // 启用 → 同目标桶再启用 → 409(单写者;DR1-5)
+  r = await app.inject({ method: "PATCH", url: "/v2/center/sync-tasks/t1", payload: { enabled: true } });
+  assert.equal(r.statusCode, 200);
+  r = await app.inject({ method: "POST", url: "/v2/center/sync-tasks", payload: { id: "t5", name: "dup-dest", ...base, dest_bucket: "dst" } });
+  assert.equal(r.statusCode, 409);
+
+  // 手动触发(run_now=1)→ 调度器 tick 下发 sync.run 到源节点
+  r = await app.inject({ method: "POST", url: "/v2/center/sync-tasks/t1/run" });
+  assert.equal(r.statusCode, 200);
+  const sched = await import("./routes.js").then((m) => m.startSyncScheduler(store, { intervalMs: 20 }));
+  await new Promise((res) => setTimeout(res, 120));
+  sched.stop();
+  const ops = store.listOps("node-a");
+  assert.equal(ops.length, 1);
+  assert.equal(ops[0].kind, "sync.run");
+  const opPayload = JSON.parse(ops[0].payload) as Record<string, unknown>;
+  assert.equal(opPayload["task_id"], "t1");
+  assert.equal(opPayload["mode"], "mirror");
+
+  // 未结算期间 → syncTasksDue 去重(不重复下发;ADR-20 DR2-1)
+  assert.equal(store.syncTasksDue(Math.floor(Date.now() / 1000)).length, 0);
+
+  // 结果结算 → 任务状态更新 + run_now 清除(回执走节点身份 CN=node-a)
+  setCn("node-a");
+  r = await app.inject({
+    method: "POST",
+    url: "/v2/center/results",
+    payload: { node_id: "node-a", results: [{ seq: ops[0].seq, ok: true, transferred: 1234 }] },
+  });
+  assert.equal(J(r.json())["acked_seq"], 1);
+  const t1 = store.getSyncTask("t1");
+  assert.equal(t1?.last_result, "ok");
+  assert.equal(t1?.last_transferred, 1234);
+  assert.ok(t1 && t1.last_run_at > 0);
+  assert.equal(t1.run_now, 0);
+
+  // rejected 结算 → last_result=rejected + last_error(再次手动触发 → 新 op)
+  await app.inject({ method: "POST", url: "/v2/center/sync-tasks/t1/run" });
+  const sched2 = await import("./routes.js").then((m) => m.startSyncScheduler(store, { intervalMs: 20 }));
+  await new Promise((res) => setTimeout(res, 120));
+  sched2.stop();
+  const ops2 = store.listOps("node-a").filter((o) => o.kind === "sync.run" && !o.acked);
+  assert.equal(ops2.length, 1);
+  await app.inject({
+    method: "POST",
+    url: "/v2/center/results",
+    payload: { node_id: "node-a", results: [{ seq: ops2[0].seq, ok: false, error: "mc not found" }] },
+  });
+  const t2 = store.getSyncTask("t1");
+  assert.equal(t2?.last_result, "rejected");
+  assert.equal(t2?.last_error, "mc not found");
+
+  // 删除
+  r = await app.inject({ method: "DELETE", url: "/v2/center/sync-tasks/t1" });
+  assert.equal(r.statusCode, 200);
+  assert.equal(store.getSyncTask("t1"), null);
+  r = await app.inject({ method: "DELETE", url: "/v2/center/sync-tasks/t1" });
+  assert.equal(r.statusCode, 404);
+});
+
+test("ADR-20: 调度周期(schedule_secs 到期)+ 中心不可达语义(无调度器 = 安全停止)", async (t) => {
+  const store = openStore(":memory:");
+  t.after(() => store.close());
+  store.createSyncTask({
+    id: "t-sched",
+    name: "periodic",
+    source_node: "node-a",
+    source_bucket: "src",
+    dest_node: "node-b",
+    dest_bucket: "dst",
+    mode: "incremental",
+    schedule_secs: 30,
+    source_endpoint: "http://e1",
+    source_key: "k1",
+    source_secret: "s1",
+    dest_endpoint: "http://e2",
+    dest_key: "k2",
+    dest_secret: "s2",
+  });
+  // 未启用 → 永不到期
+  assert.equal(store.syncTasksDue(9999999999).length, 0);
+  store.updateSyncTask("t-sched", { enabled: 1 });
+  // last_run_at=0 → 立即到期
+  assert.equal(store.syncTasksDue(9999999999).length, 1);
+  // 结算后按 schedule 到期(last_run_at 由 recordSyncRun 置为真实时间)
+  store.recordSyncRun("t-sched", "ok", "", 10);
+  const lastRun = store.getSyncTask("t-sched")?.last_run_at ?? 0;
+  assert.equal(store.syncTasksDue(lastRun + 29).length, 0);
+  assert.equal(store.syncTasksDue(lastRun + 30).length, 1);
+  // 中心不可达 = 无调度器运行 → 无新 op(安全停止)
+  assert.equal(store.listOps("node-a").length, 0);
+});

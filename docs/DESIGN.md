@@ -1242,7 +1242,8 @@ s3-tests 出排除集且 100%(transition/restore/storage-class);崩溃 ≥500
 1. **调度器在中心**(web server 内,周期 tick 扫描):
    任务 enabled 且 `now - last_run_at >= schedule_secs` → 追加
    **desired_ops 第 8 类 `sync.run`**(ops 白名单 7 类 → 8 类扩展),
-   payload 自描述:task_id + 源/目标 endpoint/桶/凭据 + mode。
+   **下发到源节点(source_node;源侧推送,目标只读)**,payload
+   自描述:task_id + 源/目标 endpoint/桶/凭据 + mode。
    每个任务同一时刻至多一个未结算 sync.run(去重,防积压)。
 2. **账本结算复用既有通道**:agent 执行后 POST /v2/center/results
    (ok/rejected + error);中心按 seq 结算 desired_ops 的同时,

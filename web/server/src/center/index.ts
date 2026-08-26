@@ -20,7 +20,7 @@ import tls from "node:tls";
 import { listenHostPort } from "../config.js";
 import { openStore, type CenterStore } from "./store.js";
 import type { FastifyInstance } from "fastify";
-import { registerCenterRoutes } from "./routes.js";
+import { registerCenterRoutes, startSyncScheduler } from "./routes.js";
 import { buildCenterConsole, type CenterWebHttpsOptions } from "./console.js";
 
 const env = process.env;
@@ -100,6 +100,23 @@ function main(): void {
     process.exit(1);
   }
   const store = openStore(pick("FS3_CENTER_DB", "./center-data/center.sqlite"));
+  // ADR-20 DR2:同步任务调度器(周期下发 sync.run;中心 = 配置源)
+  const syncScheduler = startSyncScheduler(store, {
+    intervalMs: Number(env.FS3_CENTER_SYNC_TICK_MS ?? "5000") || 5000,
+    log: (m) => console.log(`[sync-scheduler] ${m}`),
+  });
+  const stopAll = () => {
+    syncScheduler.stop();
+    store.close();
+  };
+  process.on("SIGINT", () => {
+    stopAll();
+    process.exit(0);
+  });
+  process.on("SIGTERM", () => {
+    stopAll();
+    process.exit(0);
+  });
   // mTLS:要求客户端证书并经 CA 校验(requestCert + rejectUnauthorized = 红线)
   const app = buildCenter({
     store,

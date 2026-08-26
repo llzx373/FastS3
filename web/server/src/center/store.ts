@@ -9,6 +9,7 @@
  * - nodes        节点注册/拓扑/健康聚合(heartbeat 刷 last_seen/health/snapshot)
  * - desired_ops  per-node 下发账本(seq 单调;acked/rejected 结算;G1-2 对账权威)
  * - audit        节点审计流汇入(流式上报 INSERT;UNIQUE 去重,at-least-once 语义)
+ * - sync_tasks   同步任务配置(ADR-20;中心 = 配置源;凭据 = 管理面配置)
  * - meta         版本计数等
  *
  * 安全:secret 永不落库(G1-3;key.create 的 secret_once 只在内存
@@ -55,6 +56,46 @@ export interface AuditRow {
   status: number;
   detail: string;
 }
+
+/** 同步任务(ADR-20 DR1;中心 = 配置源,节点本地执行 = 裁决权威) */
+export interface SyncTaskRow {
+  id: string;
+  name: string;
+  source_node: string;
+  source_bucket: string;
+  dest_node: string;
+  dest_bucket: string;
+  mode: string; // mirror | incremental
+  schedule_secs: number;
+  enabled: number; // 0|1
+  run_now: number; // 0|1 手动触发(调度器优先下发)
+  source_endpoint: string;
+  source_key: string;
+  source_secret: string;
+  dest_endpoint: string;
+  dest_key: string;
+  dest_secret: string;
+  last_run_at: number;
+  last_result: string; // '' | ok | rejected
+  last_error: string;
+  last_transferred: number;
+  created_at: number;
+}
+
+/** 创建/更新入参(不直接暴露运行态字段) */
+export type SyncTaskInput = Omit<
+  SyncTaskRow,
+  | "enabled"
+  | "run_now"
+  | "last_run_at"
+  | "last_result"
+  | "last_error"
+  | "last_transferred"
+  | "created_at"
+>;
+
+/** 单写者冲突(ADR-20 DR1-5):同目标桶仅允许一个启用任务 */
+export class SyncTaskConflict extends Error {}
 
 export interface CenterStore {
   /** 注册/心跳 upsert 节点;返回是否新注册 */
@@ -107,6 +148,31 @@ export interface CenterStore {
   takeSecrets(node_id: string): { seq: number; secret: string }[];
   secretsPending(node_id: string): number;
 
+  /** 同步任务(ADR-20;DR1/DR2) */
+  createSyncTask(input: SyncTaskInput): SyncTaskRow;
+  listSyncTasks(): SyncTaskRow[];
+  getSyncTask(id: string): SyncTaskRow | null;
+  /** 更新任务;enabled 置 1 或目标桶变更时做单写者冲突校验 */
+  updateSyncTask(
+    id: string,
+    patch: Partial<SyncTaskInput> & { enabled?: number },
+  ): SyncTaskRow | null;
+  deleteSyncTask(id: string): boolean;
+  /** 手动触发:置 run_now=1,调度器下一 tick 即下发(幂等) */
+  requestSyncRun(id: string): boolean;
+  /**
+   * 调度器取到期任务:enabled 且(run_now=1 或 now-last_run_at>=schedule_secs),
+   * 且该任务无未结算 sync.run op(去重,防积压;ADR-20 DR2-1)。
+   */
+  syncTasksDue(nowSec: number): SyncTaskRow[];
+  /** 结算 sync.run 结果到任务状态(ADR-20 DR2-2) */
+  recordSyncRun(
+    id: string,
+    result: "ok" | "rejected",
+    error: string,
+    transferred: number,
+  ): void;
+
   close(): void;
 }
 
@@ -156,6 +222,30 @@ export function openStore(dbPath: string): CenterStore {
     );
     CREATE INDEX IF NOT EXISTS idx_audit_node_ts ON audit(node_id, ts);
     CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit(ts);
+    CREATE TABLE IF NOT EXISTS sync_tasks (
+      id               TEXT PRIMARY KEY,
+      name             TEXT NOT NULL DEFAULT '',
+      source_node      TEXT NOT NULL,
+      source_bucket    TEXT NOT NULL,
+      dest_node        TEXT NOT NULL,
+      dest_bucket      TEXT NOT NULL,
+      mode             TEXT NOT NULL DEFAULT 'incremental',
+      schedule_secs    INTEGER NOT NULL DEFAULT 300,
+      enabled          INTEGER NOT NULL DEFAULT 0,
+      run_now          INTEGER NOT NULL DEFAULT 0,
+      source_endpoint  TEXT NOT NULL,
+      source_key       TEXT NOT NULL,
+      source_secret    TEXT NOT NULL,
+      dest_endpoint    TEXT NOT NULL,
+      dest_key         TEXT NOT NULL,
+      dest_secret      TEXT NOT NULL,
+      last_run_at      INTEGER NOT NULL DEFAULT 0,
+      last_result      TEXT NOT NULL DEFAULT '',
+      last_error       TEXT NOT NULL DEFAULT '',
+      last_transferred INTEGER NOT NULL DEFAULT 0,
+      created_at       INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_sync_enabled ON sync_tasks(enabled);
     CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
   `);
   const now = () => Math.floor(Date.now() / 1000);
@@ -399,6 +489,187 @@ export function openStore(dbPath: string): CenterStore {
 
   const secretsPending = (node_id: string) => pendingSecrets.get(node_id)?.size ?? 0;
 
+  // ── 同步任务(ADR-20 DR1/DR2)──────────────────────────────────────────
+
+  const rowToTask = (r: Record<string, unknown>): SyncTaskRow => ({
+    id: r.id as string,
+    name: r.name as string,
+    source_node: r.source_node as string,
+    source_bucket: r.source_bucket as string,
+    dest_node: r.dest_node as string,
+    dest_bucket: r.dest_bucket as string,
+    mode: r.mode as string,
+    schedule_secs: r.schedule_secs as number,
+    enabled: r.enabled as number,
+    run_now: r.run_now as number,
+    source_endpoint: r.source_endpoint as string,
+    source_key: r.source_key as string,
+    source_secret: r.source_secret as string,
+    dest_endpoint: r.dest_endpoint as string,
+    dest_key: r.dest_key as string,
+    dest_secret: r.dest_secret as string,
+    last_run_at: r.last_run_at as number,
+    last_result: r.last_result as string,
+    last_error: r.last_error as string,
+    last_transferred: r.last_transferred as number,
+    created_at: r.created_at as number,
+  });
+
+  /** 单写者冲突(ADR-20 DR1-5):同 dest_node+dest_bucket 已存在启用任务 */
+  const assertNoDestConflict = (destNode: string, destBucket: string, exceptId?: string) => {
+    const rows = db
+      .prepare(
+        `SELECT id FROM sync_tasks
+         WHERE dest_node = ? AND dest_bucket = ? AND enabled = 1 AND id != ?`,
+      )
+      .all(destNode, destBucket, exceptId ?? "") as { id: string }[];
+    if (rows.length > 0) {
+      throw new SyncTaskConflict(
+        `single-writer conflict: dest ${destNode}/${destBucket} already used by task ${rows[0].id}`,
+      );
+    }
+  };
+
+  const createSyncTask = (input: SyncTaskInput): SyncTaskRow => {
+    assertNoDestConflict(input.dest_node, input.dest_bucket);
+    const createdAt = now();
+    db.prepare(
+      `INSERT INTO sync_tasks (
+         id, name, source_node, source_bucket, dest_node, dest_bucket, mode,
+         schedule_secs, source_endpoint, source_key, source_secret,
+         dest_endpoint, dest_key, dest_secret, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      input.id,
+      input.name,
+      input.source_node,
+      input.source_bucket,
+      input.dest_node,
+      input.dest_bucket,
+      input.mode,
+      input.schedule_secs,
+      input.source_endpoint,
+      input.source_key,
+      input.source_secret,
+      input.dest_endpoint,
+      input.dest_key,
+      input.dest_secret,
+      createdAt,
+    );
+    return db
+      .prepare("SELECT * FROM sync_tasks WHERE id = ?")
+      .get(input.id) as unknown as SyncTaskRow;
+  };
+
+  const listSyncTasks = () =>
+    (db.prepare("SELECT * FROM sync_tasks ORDER BY created_at DESC").all() as Record<
+      string,
+      unknown
+    >[]).map(rowToTask);
+
+  const getSyncTask = (id: string): SyncTaskRow | null => {
+    const r = db.prepare("SELECT * FROM sync_tasks WHERE id = ?").get(id) as
+      | Record<string, unknown>
+      | undefined;
+    return r ? rowToTask(r) : null;
+  };
+
+  const updateSyncTask = (id: string, patch: Partial<SyncTaskInput>): SyncTaskRow | null => {
+    const cur = getSyncTask(id);
+    if (!cur) return null;
+    const next = { ...cur, ...patch } as SyncTaskRow;
+    // 目标桶变更或从禁用切启用 → 单写者校验
+    const destChanged =
+      patch.dest_node !== undefined || patch.dest_bucket !== undefined;
+    if ((destChanged || next.enabled === 1) && next.enabled === 1) {
+      assertNoDestConflict(next.dest_node, next.dest_bucket, id);
+    }
+    db.prepare(
+      `UPDATE sync_tasks SET
+         name = ?, source_node = ?, source_bucket = ?, dest_node = ?, dest_bucket = ?,
+         mode = ?, schedule_secs = ?, enabled = ?,
+         source_endpoint = ?, source_key = ?, source_secret = ?,
+         dest_endpoint = ?, dest_key = ?, dest_secret = ?
+       WHERE id = ?`,
+    ).run(
+      next.name,
+      next.source_node,
+      next.source_bucket,
+      next.dest_node,
+      next.dest_bucket,
+      next.mode,
+      next.schedule_secs,
+      next.enabled,
+      next.source_endpoint,
+      next.source_key,
+      next.source_secret,
+      next.dest_endpoint,
+      next.dest_key,
+      next.dest_secret,
+      id,
+    );
+    return getSyncTask(id);
+  };
+
+  const deleteSyncTask = (id: string): boolean => {
+    const info = db.prepare("DELETE FROM sync_tasks WHERE id = ?").run(id);
+    return info.changes > 0;
+  };
+
+  const requestSyncRun = (id: string): boolean => {
+    const info = db
+      .prepare("UPDATE sync_tasks SET run_now = 1 WHERE id = ? AND enabled = 1")
+      .run(id);
+    return info.changes > 0;
+  };
+
+  /** 某任务是否有未结算 sync.run op(去重;ADR-20 DR2-1) */
+  const hasPendingSyncOp = (taskId: string) => {
+    const rows = db
+      .prepare(
+        `SELECT node_id, seq FROM desired_ops
+         WHERE kind = 'sync.run' AND acked = 0 AND rejected = 0`,
+      )
+      .all() as { node_id: string; seq: number; payload?: never }[];
+    for (const r of rows) {
+      const op = db
+        .prepare("SELECT payload FROM desired_ops WHERE node_id = ? AND seq = ?")
+        .get(r.node_id, r.seq) as { payload: string } | undefined;
+      if (!op) continue;
+      try {
+        const p = JSON.parse(op.payload) as { task_id?: string };
+        if (p.task_id === taskId) return true;
+      } catch {
+        /* ignore */
+      }
+    }
+    return false;
+  };
+
+  const syncTasksDue = (nowSec: number): SyncTaskRow[] => {
+    const rows = db
+      .prepare(
+        `SELECT * FROM sync_tasks
+         WHERE enabled = 1 AND (run_now = 1 OR last_run_at = 0 OR ? - last_run_at >= schedule_secs)
+         ORDER BY run_now DESC, last_run_at ASC`,
+      )
+      .all(nowSec) as Record<string, unknown>[];
+    return rows.map(rowToTask).filter((t) => !hasPendingSyncOp(t.id));
+  };
+
+  const recordSyncRun = (
+    id: string,
+    result: "ok" | "rejected",
+    error: string,
+    transferred: number,
+  ) => {
+    db.prepare(
+      `UPDATE sync_tasks SET
+         last_run_at = ?, last_result = ?, last_error = ?, last_transferred = ?, run_now = 0
+       WHERE id = ?`,
+    ).run(now(), result, error, transferred, id);
+  };
+
   return {
     upsertNode,
     touchNode,
@@ -420,6 +691,14 @@ export function openStore(dbPath: string): CenterStore {
     putSecret,
     takeSecrets,
     secretsPending,
+    createSyncTask,
+    listSyncTasks,
+    getSyncTask,
+    updateSyncTask,
+    deleteSyncTask,
+    requestSyncRun,
+    syncTasksDue,
+    recordSyncRun,
     close: () => db.close(),
   };
 }

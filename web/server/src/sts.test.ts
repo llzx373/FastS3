@@ -101,6 +101,10 @@ class FakeAdmin implements Partial<AdminApi> {
 }
 
 const fake = new FakeAdmin();
+// 配置确定性:config.json(仓库内开发/门禁产物)可能带自定义 accessKey,
+// 测试断言的是默认管理身份密钥;显式注入环境变量覆盖(env > file > default)。
+process.env.FS3_S3_ACCESS_KEY = "fasts3dev";
+process.env.FS3_S3_SECRET_KEY = "fasts3dev";
 const app = buildServer({ admin: fake as never, s3: {} as never, cfg: loadConfig() });
 
 async function login(): Promise<string> {
