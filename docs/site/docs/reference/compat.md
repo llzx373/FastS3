@@ -62,7 +62,11 @@ meta-export/import 可见并可往返;真实类独立落 ObjectMeta v7 `storage_
   事件;锁定对象跳过;NoncurrentVersionTransition 显式 NotImplemented。
 - **复制**:源归档未恢复且目标类 ≠ 源类 → 403 InvalidObjectState;同存储类
   复制豁免(COW 段共享);复制目标不继承恢复状态;归档对象删除无需先
-  restore(主段 + 恢复副本段一并释放)。
+  restore(主段 + 恢复副本段一并释放)。**跨节点复制不内置**
+  (`PUT Bucket replication` → 501 NotImplemented,ADR-20):企业 DR 经
+  中心纳管同步任务落地(控制台「同步任务」页;mirror = mc mirror 含删除
+  传播 / incremental = rclone copy 只增不删;中心调度 + 节点本地执行 +
+  对账视图,见 docs/m14-center-contract.md §6)。
 - **SSE**:SSE-S3 归档可恢复(服务端 KEK 自持解密);SSE-C 归档恢复显式
   400(客户密钥零落盘);SSE + 归档 + multipart 显式 400。
 - 存储类分账:`BucketStats.by_class`(对象数/逻辑字节 × 四类;Σ == 桶统计),

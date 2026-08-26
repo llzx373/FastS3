@@ -65,7 +65,32 @@
 - 中心:不落库,内存 pendingSecrets 暂存,`/v2/center/secrets` 取一次即清,
   进程重启即失;若后续启用"中心留存"模式,须文档明示留存 = 运维责任。
 
-## 6. 中心运维
+## 6. 同步任务(ADR-20 复制策略化;M16)
+
+- **模型**:复制不内置(数据面无 `?replication`,501 显式);同步 = 中心
+  配置(desired)+ 节点本地执行(实际);任务存中心 SQLite `sync_tasks`:
+  `{id, name, source_node/bucket, dest_node/bucket, mode,
+  schedule_secs, enabled, 双端 endpoint+key+secret, last_run_at,
+  last_result, last_error, last_transferred}`。
+- **调度**:中心调度器(主进程内,`FS3_CENTER_SYNC_TICK_MS` 默认 5000ms)
+  周期扫描到期任务 → 追加 `desired_ops` 第 8 类 `sync.run`(**下发到源
+  节点**,源侧推送;payload 自描述含双端凭据);同任务未结算 op 去重
+  (防积压);`POST /v2/center/sync-tasks/:id/run` 手动触发(run_now)。
+- **执行**:节点 agent 收到 sync.run → 本地 spawn 执行器(mirror =
+  `mc mirror --overwrite` 含删除传播;incremental = `rclone copy` 只增
+  不删);二进制缺失/失败 → **rejected 显式上报**;超时 1800s kill;
+  transferred = 执行器 --json 输出近似对象数。
+- **结算**:results 回执携带 `transferred`;中心按 task_id 回写任务状态
+  (last_run_at/last_result/last_error/last_transferred)。
+- **中心不可达 = 安全停止**:sync.run 全由中心下发;中心离线期间无新 op
+  (任务自然暂停,目标零变化);中心恢复后 agent 自动重连,按计划继续。
+- **凭据**:双端同步凭据 = 管理面配置,存中心 SQLite(控制台可维护);
+  G1-3 仅约束数据面密钥。控制台 `/center/api/metrics` 导出
+  `fasts3_center_sync_task_stalled`(Prometheus;内网可达部署)。
+- **冲突口径 = 单写者**:同目标桶仅允许一个启用任务(CRUD 409);
+  目标桶被外部并发写不设数据面锁(运维责任,对账视图可见偏差)。
+
+## 7. 中心运维
 
 ```bash
 export FS3_CENTER_LISTEN=0.0.0.0:9443      # agent mTLS 通道(强制客户端证书)

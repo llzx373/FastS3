@@ -116,15 +116,15 @@
 
 #### A5 测试与门禁(≈1.3 pw)
 - [x] A5-1 s3-tests transition/restore/storage-class 族出排除集且 100%(test_lifecycle_transition_* 出集;test_restore_object* 按实现口径出集或逐名记录;EXCLUDE 正则与 README 矩阵同步)
-- [ ] A5-2 崩溃 ≥500 轮(归档写/transition/restore/GC 混载)零撕裂/零泄漏/账目零漂移;transition×压缩 worker 并发回归(在 D1 S8 根治后复核)
+- [x] A5-2 崩溃 ≥500 轮(归档写/transition/restore/GC 混载)零撕裂/零泄漏/账目零漂移;transition×压缩 worker 并发回归(在 D1 S8 根治后复核)
 - [x] A5-3 升级演练 v2.1→v2.2(含 ObjectMeta v6→v7 在线重写 + 回滚实测);归档读带宽/恢复耗时基准写入发布报告(§9.1 口径)
 - [x] A5-4 客户端矩阵:aws cli RestoreObject/存储类往返 + mc/rclone 归档对象行为;compat.md 存储类矩阵从「M15 映射 STANDARD」升版为真实归档语义
 
 ### R. 复制策略化落地(≈2 pw;ADR-20;立项条件 = DR 诉求证据)
-- [ ] R1-1 ADR-20:同步任务模型(中心 = 配置源,节点本地执行 = 裁决权威,沿用 ADR-17 DV1;不内置 ?replication,compat 声明;调度语义与冲突口径)
-- [ ] R1-2 中心:sync 任务 CRUD(源/目标桶与节点、调度、mode=mirror/增量)+ 下发 ops 白名单 7 类 → 8 类扩展 + 账本入账/对账
-- [ ] R1-3 节点:本地调度执行 mc mirror/rclone(经本地 admin 编排;节流档;失败重试与 rejected 显式上报)
-- [ ] R1-4 健康/对账视图(任务状态/lag/校验和 + 告警)+ 控制台同步任务页
+- [x] R1-1 ADR-20:同步任务模型(中心 = 配置源,节点本地执行 = 裁决权威,沿用 ADR-17 DV1;不内置 ?replication,compat 声明;调度语义与冲突口径)
+- [x] R1-2 中心:sync 任务 CRUD(源/目标桶与节点、调度、mode=mirror/增量)+ 下发 ops 白名单 7 类 → 8 类扩展 + 账本入账/对账
+- [x] R1-3 节点:本地调度执行 mc mirror/rclone(经本地 admin 编排;节流档;失败重试与 rejected 显式上报)
+- [x] R1-4 健康/对账视图(任务状态/lag/校验和 + 告警)+ 控制台同步任务页
 - [ ] R1-5 演练:双节点互备 drill(断线重连恰好同步一次、拔中心后按最后配置安全停止/继续语义实测)+ 文档化
 
 ### L. LDAP / OpenID(≈2 pw;ADR-21;立项条件 = 企业 SSO 诉求)
