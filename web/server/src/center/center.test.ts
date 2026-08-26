@@ -278,9 +278,10 @@ test("G2-1: 管理面 —— ops 入账/视图、state、节点详情、审计�
   // 账本视图
   r = await app.inject({ method: "GET", url: "/v2/center/ops?node_id=node-a" });
   const ops = J(r.json());
-  assert.equal((ops["ops"] as unknown[]).length, 1);
-  assert.equal(J(ops["ops"] as unknown[])[0]["kind"], "key.create");
-  assert.equal(J(ops["apply_state"])["desired_version"], 1);
+  const opList = ops["ops"] as Record<string, unknown>[];
+  assert.equal(opList.length, 1);
+  assert.equal(opList[0]["kind"], "key.create");
+  assert.equal((ops["apply_state"] as Record<string, unknown>)["desired_version"], 1);
 
   // 节点详情(含 apply_state / metrics_text / status_snapshot)
   r = await app.inject({ method: "GET", url: "/v2/center/nodes/node-a" });
