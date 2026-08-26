@@ -23,6 +23,7 @@ pub async fn request_json<I>(
     io: I,
     method: &str,
     path: &str,
+    host: Option<&str>,
     header_value: Option<(&str, &str)>,
     body: Option<&serde_json::Value>,
 ) -> Result<JsonResponse, String>
@@ -33,6 +34,11 @@ where
         .method(method)
         .uri(path)
         .header("content-type", "application/json");
+    // HTTP/1.1 必须携带 Host(node 侧 http 服务器对缺失 Host 的请求回 400
+    // 空体;hyper 对 path-only URI 不自动补 Host)
+    if let Some(h) = host {
+        builder = builder.header("host", h);
+    }
     if let Some((k, v)) = header_value {
         builder = builder.header(k, v);
     }

@@ -379,7 +379,7 @@
 - [x] G1-3 密钥下发语义:secret 仅生成时明文一次(节点本地生成,回执仅一次携带;中心只存 access 元数据);中心留存策略文档化(默认不存——仅内存 pendingSecrets 一次回显,进程重启即失;留存 = 运维责任,红线外选项,ADR-17 DV1-4);新增落盘证明测试(secret 字符串绝不出现在 sqlite 主库与 WAL 文件字节中,center.test.ts「G1-3」)
 - [x] G2-1 中心:节点注册/拓扑/健康聚合(G1-1 接收端 + 本步管理面:节点列表/详情含 apply_state、按节点与跨节点审计聚合检索)+ 下发 API(ops 入账白名单 7 类、账本视图、对账状态视图)+ 对账(SQLite 账本权威、acked_seq/pending/rejected);管理面端点契约入 docs/m14-center-contract.md §3.1
 - [x] G3-1 中心控制台:节点仪表盘(健康/离线/水位/对账状态/secret 待取,10s 刷新)、批量桶/密钥/策略管理(模板化下发,payload 支持 `${node_id}` 按节点差异;全选+离线标识;下发账本视图 + secret 一次性取回)、审计聚合检索(跨节点,节点/操作/桶过滤);实现 = 控制台 web 实例(JWT 会话,浏览器免 mTLS,`FS3_CENTER_WEB_LISTEN` 独立端口)+ React `#/center/*` 子应用(独立登录态)
-- [ ] G4-1 演练:3 节点(2 边缘 + 1 云)纳管 + 断网重连对账一致 + **拔中心单机功能完整**(红线实测)
+- [x] G4-1 演练:tests/center/m14_managed_drill.sh 三节点(2 边缘 edge-1/edge-2 + 1 云 cloud-1)全流程10 步通过:出站 mTLS 注册/健康聚合 → 批量模板化下发(${node_id} 差异桶/密钥)本地裁决应用 → secret 一次性回显取后即清 → edge-2 离线期间入账 2 条,重连全量对账恰好应用一次且账本收敛(acked=desired=3 pending=0)→ **拔中心红线实测(中心杀掉后 cloud-1 S3 数据面 SigV4 冒烟全过 + 本地 admin + S3 端口应答)** → 中心重启 3 节点自动重连;演练暴露并修复:AuthConfig.allow_anonymous 缺 serde default(手写 [auth] 解析失败)、agent HTTP 客户端缺 Host 头(node 侧 400 空体)、sigv4_smoke 重复建桶断言过时(对齐 M9/C5 幂等重建 200 语义)
 
 ### H. HTTP/3 与热缓存(§7.2/§7.3)
 - [ ] H1-1 HTTP/3 quinn 实验开关(默认关):每核 Endpoint、0-RTT 仅幂等 GET/HEAD、弱网基准

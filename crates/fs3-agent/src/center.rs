@@ -67,7 +67,9 @@ impl CenterClient {
         body: Option<&serde_json::Value>,
     ) -> Result<serde_json::Value, String> {
         let io = self.connect().await?;
-        let resp = request_json(io, method, path, None, body).await?;
+        let (host, port) = self.host_port()?;
+        let host_line = format!("{host}:{port}");
+        let resp = request_json(io, method, path, Some(&host_line), None, body).await?;
         expect_ok(&resp, &format!("center {method} {path}"))
     }
 

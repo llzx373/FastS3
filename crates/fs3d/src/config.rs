@@ -106,7 +106,8 @@ pub struct ServerConfig {
 pub struct AuthConfig {
     /// SigV4 区域(默认 us-east-1)。
     pub region: Option<String>,
-    /// 允许匿名 GET/HEAD。
+    /// 允许匿名 GET/HEAD(缺省 false = 关闭;wizard 恒写入,手写配置可省略)。
+    #[serde(default)]
     pub allow_anonymous: bool,
     /// 访问密钥表。
     #[serde(default)]

@@ -115,8 +115,11 @@ def main():
     # 桶 CRUD
     r, _ = request("PUT", "/smoke-bucket", expected=200)
     check("CreateBucket", r.status == 200)
-    r, _ = request("PUT", "/smoke-bucket", expected=409)
-    check("CreateBucket dup → 409", r.status == 409)
+    # M9/C5:重复创建(无 ACL 头)= 幂等 no-op 返回 200,属性保留现状
+    # (AWS 语义为 409 BucketAlreadyOwnedByYou;FastS3 文档化偏离,见 service.rs
+    # op_create_bucket;s3-tests create_bucket_exists 恒排除(RGW 专有))
+    r, _ = request("PUT", "/smoke-bucket", expected=200)
+    check("CreateBucket dup → 200 幂等重建(M9/C5)", r.status == 200)
     r, _ = request("GET", "/", expected=200)
     check("ListBuckets", b"<Name>smoke-bucket</Name>" in _)
     r, _ = request("GET", "/smoke-bucket", query={"location": ""}, expected=200)

@@ -32,7 +32,8 @@ impl LocalAdmin {
             let sock = UnixStream::connect(PathBuf::from(stripped))
                 .await
                 .map_err(|e| format!("connect admin unix {}: {e}", self.listen))?;
-            self.call_io(sock, method, path, body).await
+            self.call_io(sock, method, path, Some("localhost"), body)
+                .await
         } else {
             let addr: std::net::SocketAddr = self
                 .listen
@@ -41,7 +42,8 @@ impl LocalAdmin {
             let tcp = TcpStream::connect(addr)
                 .await
                 .map_err(|e| format!("connect admin tcp {}: {e}", self.listen))?;
-            self.call_io(tcp, method, path, body).await
+            let host = format!("{}:{}", addr.ip(), addr.port());
+            self.call_io(tcp, method, path, Some(&host), body).await
         }
     }
 
@@ -50,16 +52,17 @@ impl LocalAdmin {
         io: I,
         method: &str,
         path: &str,
+        host: Option<&str>,
         body: Option<&serde_json::Value>,
     ) -> Result<JsonResponse, String>
     where
         I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         if self.token.is_empty() {
-            request_json(io, method, path, None, body).await
+            request_json(io, method, path, host, None, body).await
         } else {
             let auth = format!("Bearer {}", self.token);
-            request_json(io, method, path, Some(("authorization", &auth)), body).await
+            request_json(io, method, path, host, Some(("authorization", &auth)), body).await
         }
     }
 }
