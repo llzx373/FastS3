@@ -36,7 +36,7 @@ FastS3 v0.5 的协议一致性门禁 = **已实现特性的完整兼容**。跑 
 
 | 排除特性 | 版本计划 | 说明 |
 | --- | --- | --- |
-| Versioning 全部落地(PutBucketVersioning 状态机/版本键空间/删除标记/ListObjectVersions 分页/版本寻址 GET·HEAD·DELETE·CopyObject/版本化条件写) | ✅ v1.1(M10 V2~V4,V6-1 出集) | 残余排除项仅 5 个文档化 token:口径裁决 3(RGW/目录桶 vs AWS,取 AWS——return_version_id:Suspended 写回 `VersionId:"null"`;delete_marker_nonversioned:未版本化删除 404 不带标记头;delete_object_current_if_match:版本化桶 DELETE 不存在键插入标记;均 fails_on_aws 族/目录桶语义)+ 显式 501 红线 1(multipart_copy_versioned:UploadPartCopy 源 versionId 未实现)+ lifecycle 依附 1(delete_marker_expiration);versioned_object_attributes 已随 M11 C1 出集(GetObjectAttributes 版本寻址交付) |
+| Versioning 全部落地(PutBucketVersioning 状态机/版本键空间/删除标记/ListObjectVersions 分页/版本寻址 GET·HEAD·DELETE·CopyObject/版本化条件写) | ✅ v1.1(M10 V2~V4,V6-1 出集) | 残余排除项仅 4 个文档化 token:口径裁决 3(RGW/目录桶 vs AWS,取 AWS——return_version_id:Suspended 写回 `VersionId:"null"`;delete_marker_nonversioned:未版本化删除 404 不带标记头;delete_object_current_if_match:版本化桶 DELETE 不存在键插入标记;均 fails_on_aws 族/目录桶语义)+ lifecycle 依附 1(delete_marker_expiration);multipart_copy_versioned 已随 M15 C2 出集(UploadPartCopy 源 ?versionId 寻址交付),versioned_object_attributes 已随 M11 C1 出集 |
 | 版本化条件写(PUT/DELETE If-Match/If-None-Match×version/current、LastModifiedTime、Size) | ✅ v1.1(M10 V3-4,V6-1 出集) | V6-1 修复:DeleteObjects 条件元素 LastModifiedTime 按 RFC 7231 解析(botocore 实测线格式,此前误 ISO8601→InvalidArgument);D1a 同秒裁决双边保序(null 族写侧 +1s、next_vk 基址含 null 族 mtime) |
 | SSE-C(E1 全栈:分块 AES-256-GCM/三头校验/key-MD5 比对/GET·HEAD 解密/multipart 逐片加密/CopyObject·UploadPartCopy 重加密/预签名组合) | ✅ v1.2(M11 E1,G-1 出集) | 残余逐名(G-1 实测):**post_object_sse_c**(DE4 裁决:POST 表单不支持 SSE-C,显式 400;用例期望 204 = RGW 口径)+ **policy 两例**(enforced/deny_algo_with_bucket_policy,Null/StringNotEquals × sse 键 = Condition 超集,显式 MalformedPolicy 红线)+ **copy sse-c→unencrypted 5 例**(DE3 裁决:加密源目标未指定加密 = 显式 400 红线,用例期望成功 = RGW 口径)。token:sse_c_post_object_authenticated_request/sse_c_enforced_with_bucket_policy/sse_c_deny_algo_with_bucket_policy/copy_enc\[sse-c-unencrypted/copy_part_enc\[sse-c-unencrypted |
 | SSE-S3 + 桶默认加密(K1:KEK/DEK 两级/Put·Get·DeleteBucketEncryption/AES256 头处理/桶默认自动加密/复制语义) | ✅ v1.2(M11 K1,G-1 出集) | 残余逐名(G-1 实测):**incorrect_algo_sse_s3**(StringNotEquals × s3:x-amz-server-side-encryption = Condition 超集 MalformedPolicy 红线)+ **copy sse-s3→unencrypted 5 例**(同 DE3 裁决)。SSE-KMS 不做(参数显式拒绝,DESIGN-FUTURE §4.3 DS4),kms 族恒排除。token:incorrect_algo_sse_s3/copy_enc\[sse-s3-unencrypted/copy_part_enc\[sse-s3-unencrypted/kms |
@@ -53,7 +53,7 @@ FastS3 v0.5 的协议一致性门禁 = **已实现特性的完整兼容**。跑 
 | ownership 跨账号语义(bucket_owner/object_writer 6 个) | 恒排除 | M10 S7 已交付纯配置往返(2 个出集);保留 6 个断言跨账号 owner 身份(alt client + public policy + ACL 组合),单账号身份映射不可满足(详见「单账号模型限制」)。token:bucket_owner/object_writer |
 | POST 表单上传 SSE/checksum 组 | v1.2 | post_object 认证族已出集(M10 S4);checksum 组已出集(M11 C1:test_post_object_upload_checksum 通过,x-amz-checksum-* 表单字段 policy 覆盖豁免 + 值验算);SSE 组已出集(M11 G-1:test_sse_s3_default_post_object_authenticated_request 通过——桶默认加密对 POST 生效;残余仅 test_encryption_sse_c_post_object_authenticated_request,DE4 裁决,见 SSE-C 行) |
 | 兼容性已知项:`test_bucket_create_exists(_nonowner)`(botocore ClientError 无 .status)、`test_bucket_head_extended`(RGW 专有 x-rgw-object-count) | 长期 | M1 已记录,服务端行为正确;bucket 重建属性(recreate_overwrite_acl)同为已知开放项 |
-| 静态网站(Website)/ Torrent / 租户(tenant)/ expected-bucket-owner / object_manifest | 不做 | 定位排除(Website 由 nginx/LB 替代;tenant/expected-bucket-owner 单账号模型,expected-bucket-owner 显式语义随 M15 C2);**Torrent = 停售排除(AWS 2021 弃用,已移除)**;**S3 Select = 停售排除(AWS 2024-07-25 起不对新客户提供,Glacier Select 同),不列入管线**。对应 EXCLUDE token:website/torrent/tenant/expected_bucket_owner/object_manifest |
+| 静态网站(Website)/ Torrent / 租户(tenant)/ expected-bucket-owner / object_manifest | 不做 | 定位排除(Website 由 nginx/LB 替代;tenant 单账号模型;expected-bucket-owner 语义已实现(M15 C2:= 自身放行,≠ 自身 403),用例仍排除因前置 PutBucketAcl = Put*Acl 501 红线);**Torrent = 停售排除(AWS 2021 弃用,已移除)**;**S3 Select = 停售排除(AWS 2024-07-25 起不对新客户提供,Glacier Select 同),不列入管线**。对应 EXCLUDE token:website/torrent/tenant/expected_bucket_owner/object_manifest |
 
 > 维护:新增排除必须同步本表;`run_s3tests.sh` 的 `EXCLUDE` 正则与之一一对应。
 
@@ -321,8 +321,8 @@ S3TEST_CONF=/tmp/s3-tests/s3tests.conf bash tests/s3-tests/run_s3tests.sh
 - 维持排除(既有 token 覆盖):bucket_logging_*_versioned 9 个(`logging`)、
   lifecycle 2 个、object_lock 2 个、versioned_object_acl 2 个(`object_acl`);
   新增文档化 token:`delete_marker_expiration`(依附 PutBucketLifecycle 501)、
-  `multipart_copy_versioned`(UploadPartCopy 源 versionId 显式 501 红线)、
-  `versioned_object_attributes`(API v1.2)。
+  `multipart_copy_versioned`(UploadPartCopy 源 versionId 显式 501 红线;
+  M15 C2 交付后出集)、`versioned_object_attributes`(API v1.2)。
 - 全量 gate(838 用例,2GiB 设备,compaction_enabled=false):**passed=356
   skipped=94 excluded_failures=388 unexpected_failures=0 → RESULT: PASS**
   (两轮一致;较 S5 基线 passed+5 / excluded−5 = 5 个修复转绿)。
@@ -386,3 +386,16 @@ S3TEST_CONF=/tmp/s3-tests/s3tests.conf bash tests/s3-tests/run_s3tests.sh
     与 AWS/RGW 一致,原 400 InvalidRequest)。
 - 单测同步:`router` 分页参数路由、`fs3-meta` location 键事务往返、
   `fs3-s3` 集成(location 回显/默认空元素)。
+
+## M15 C2 实测记录(2026-08-26,协议补完出集)
+
+- 出集:`multipart_copy_versioned`(UploadPartCopy 源 ?versionId 寻址交付——
+  null/hex 寻址、NoSuchVersion、非法 400 InvalidArgument、range 直灌逐版本
+  内容一致、x-amz-copy-source-version-id 回显;gate 实测 1 passed)。
+- 保留排除并逐名记录理由:`expected_bucket_owner`(语义已实现 = 自身放行/
+  ≠ 自身 403 AccessDenied;用例前置 `put_bucket_acl(public-read-write)` =
+  Put*Acl 501 红线,依赖面无法在 gate 内满足;语义由自有集成测试
+  `c2_expected_bucket_owner_semantics` 覆盖)。
+- M15 C2 密钥状态语义(S3-GAP §3.7 #7):禁用 vs 不存在在 admin/审计面可区分
+  (审计 `auth_note`:key_disabled/key_not_found/session_token_invalid),
+  协议错误码维持 AWS 同义(均 InvalidAccessKeyId)。
