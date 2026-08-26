@@ -89,3 +89,10 @@ key_rps = 0
 # stall_after_secs = 120
 # 事件队列上限(默认 100000;超上限 + slack 批量截断删最旧,同审计环形口径)
 # max_queued = 100000
+[inventory]
+# M15 I2:S3 Inventory 生成 worker。默认启用;无启用配置桶零动作。
+# 关闭 = 配置 CRUD 仍可用(Put/Get/Delete/ListBucketInventoryConfiguration),
+# 但不生成清单对象。
+# enabled = true
+# 生成周期秒(默认 3600 = 1h;Daily/Weekly 配置的观测粒度;测试可调小)
+# interval_secs = 3600

@@ -7165,3 +7165,123 @@ fn notification_event_complete_and_copy() -> Result<()> {
     e.abort();
     Ok(())
 }
+
+/// M15 I2:Inventory 生成 worker 端到端——配置(Daily/All/Filter)→
+/// 手动触发一轮 → 目标桶出现 manifest.json + data CSV;CSV 行数与
+/// 过滤枚举一致;manifest 含 files[].MD5checksum;周期 worker 空闲轮
+/// 零动作。
+#[test]
+fn inventory_worker_generates_csv_and_manifest() {
+    use crate::inventory::{InventoryStats, InventoryWorker};
+    use fs3_core::{InventoryFrequency, InventoryObjectVersions, InventoryRule};
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    // 源桶 + 目标桶
+    e.ensure_bucket("src").unwrap();
+    e.ensure_bucket("dest-bkt").unwrap();
+    // 3 个对象(logs/a.txt, logs/b.txt, other/c.txt)+ 过滤 logs/
+    e.put("src", "logs/a.txt", &mut Cursor::new(b"aaa".to_vec()))
+        .unwrap();
+    e.put("src", "logs/b.txt", &mut Cursor::new(b"bbbb".to_vec()))
+        .unwrap();
+    e.put("src", "other/c.txt", &mut Cursor::new(b"ccccc".to_vec()))
+        .unwrap();
+    // 配置:Daily/All/Filter=logs/ → dest-bkt + 前缀 inv/
+    e.meta()
+        .put_inventory_config(
+            "src",
+            &InventoryRule {
+                id: "inv-1".into(),
+                is_enabled: true,
+                filter_prefix: Some("logs/".into()),
+                included_versions: InventoryObjectVersions::All,
+                schedule: InventoryFrequency::Daily,
+                destination_bucket: "dest-bkt".into(),
+                format: fs3_core::InventoryFormat::Csv,
+                destination_prefix: Some("inv/".into()),
+            },
+        )
+        .unwrap();
+    // disabled 配置不生成
+    e.meta()
+        .put_inventory_config(
+            "src",
+            &InventoryRule {
+                id: "inv-off".into(),
+                is_enabled: false,
+                filter_prefix: None,
+                included_versions: InventoryObjectVersions::Current,
+                schedule: InventoryFrequency::Daily,
+                destination_bucket: "dest-bkt".into(),
+                format: fs3_core::InventoryFormat::Csv,
+                destination_prefix: None,
+            },
+        )
+        .unwrap();
+
+    let stats = Arc::new(InventoryStats::default());
+    let meta = e.meta_arc();
+    let mut w = InventoryWorker::new(
+        crate::lifecycle::DirectEngine(&mut e),
+        meta,
+        stats.clone(),
+        std::time::Duration::from_secs(3600),
+    );
+    let budget = crate::worker::Throttle::new(64 * 1024 * 1024);
+    w.run_cycle_blocking(&budget).unwrap();
+
+    // 清单对象 + manifest 存在于目标桶
+    let objs: Vec<String> = e
+        .list_objects("dest-bkt", "")
+        .unwrap()
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    let manifest = objs
+        .iter()
+        .find(|k| k.ends_with("/manifest.json"))
+        .cloned()
+        .expect("manifest");
+    let csv = objs
+        .iter()
+        .find(|k| k.ends_with(".csv"))
+        .cloned()
+        .expect("csv");
+    assert!(
+        csv.contains("inventory/") && csv.contains("/data/inventory-"),
+        "{csv}"
+    );
+    // CSV 行:头 + 2 个 logs/ 对象(filter=logs/;other/c.txt 排除)
+    let mut csv_out = Vec::new();
+    e.get_to("dest-bkt", &csv, 0..u64::MAX, &mut csv_out)
+        .unwrap();
+    let text = String::from_utf8(csv_out).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 3, "头 + 2 行:{text}");
+    assert!(lines[0].starts_with("Bucket,Key,Size,"), "head ok");
+    assert!(lines[1].contains("logs/a.txt"), "row1");
+    assert!(lines[2].contains("logs/b.txt"), "row2");
+    assert!(!text.contains("other/c.txt"), "Filter 排除:{text}");
+    // manifest:files[].key 指向 csv;MD5checksum 与文件一致
+    let mut m_out = Vec::new();
+    e.get_to("dest-bkt", &manifest, 0..u64::MAX, &mut m_out)
+        .unwrap();
+    let mtext = String::from_utf8(m_out).unwrap();
+    assert!(
+        mtext.contains(format!("\"key\":\"{csv}\"").as_str()),
+        "{mtext}"
+    );
+    assert!(mtext.contains("\"fileFormat\":\"CSV\""), "{mtext}");
+    assert!(mtext.contains("\"sourceBucket\":\"src\""), "{mtext}");
+    assert!(
+        mtext.contains("\"destinationBucket\":\"dest-bkt\""),
+        "{mtext}"
+    );
+    // 指标
+    let snap = stats.snapshot();
+    assert_eq!(snap.cycles, 1);
+    assert_eq!(snap.generated_files, 2, "csv + manifest");
+    assert!(snap.generated_bytes > 0);
+    assert!(snap.last_run_at > 0);
+    e.abort();
+}

@@ -800,6 +800,28 @@ fn cmd_serve(
     };
     let notification_stats = notification_worker.as_ref().map(|(_, _, s, _)| s.clone());
 
+    // M15 I2:S3 Inventory 生成 worker(默认启用;无启用配置桶零动作;
+    // 只读引擎与显式关闭不启动)。stats Arc 注入 admin /metrics 渲染
+    // fasts3_inventory_* 指标。
+    let inventory_worker = if !engine_cfg.read_only && cfg.inventory.enabled.unwrap_or(true) {
+        let period = Duration::from_secs(cfg.inventory.interval_secs.unwrap_or(3600).max(1));
+        let (meta, throttle) = {
+            let e = engine.read();
+            (e.meta_arc(), e.throttle())
+        };
+        let stats = Arc::new(fs3_engine::inventory::InventoryStats::default());
+        let worker = fs3_engine::inventory::InventoryWorker::new(
+            SharedEngine(engine.clone()),
+            meta,
+            stats.clone(),
+            period,
+        );
+        Some((worker, throttle, stats))
+    } else {
+        None
+    };
+    let inventory_stats = inventory_worker.as_ref().map(|(_, _, s)| s.clone());
+
     // M6 / K4:优雅停机标志(SIGTERM/SIGINT → 排空 → 引擎收尾)。
     // 提前创建供 admin/agent 等后台模块注入(agent 循环每周期观测)。
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -841,7 +863,8 @@ fn cmd_serve(
         let admin = fs3_admin::AdminServer::new(engine.clone(), service.clone(), admin_cfg)
             .with_reload(reload)
             .with_lifecycle_stats(lifecycle_stats)
-            .with_notification_stats(notification_stats.clone());
+            .with_notification_stats(notification_stats.clone())
+            .with_inventory_stats(inventory_stats.clone());
         // M6 / J5:设置页供应器(admin GET/PATCH /v1/admin/config)
         let provider = Arc::new(settings::SettingsProvider::new(
             config_path.clone(),
@@ -913,6 +936,17 @@ fn cmd_serve(
     // 全局共享令牌桶;关闭态不启动)
     let mut notification_worker = notification_worker.map(|(worker, throttle, _stats, poll)| {
         fs3_engine::worker::WorkerHandle::spawn("fs3-notification", worker, throttle, poll)
+    });
+
+    // M15 I2:Inventory 生成 worker 启动(独立线程 + 全局共享令牌桶;
+    // 周期由 worker 内部 next_due 控制,轮询钳制 1s)
+    let mut inventory_worker = inventory_worker.map(|(worker, throttle, _stats)| {
+        fs3_engine::worker::WorkerHandle::spawn(
+            "fs3-inventory",
+            worker,
+            throttle,
+            Duration::from_secs(1),
+        )
     });
 
     let addr: std::net::SocketAddr = listen
@@ -1048,6 +1082,9 @@ fn cmd_serve(
         h.stop();
     }
     if let Some(mut h) = notification_worker.take() {
+        h.stop();
+    }
+    if let Some(mut h) = inventory_worker.take() {
         h.stop();
     }
     tracing::info!("http workers drained; finalizing engine (checkpoint + meta close)");

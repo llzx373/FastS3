@@ -26,6 +26,19 @@ pub struct RootConfig {
     /// M15 N3(ADR-18 D-E1/D-E4):事件通知投递 worker(`[notification]`)。
     #[serde(default)]
     pub notification: NotificationConfig,
+    /// M15 I2:S3 Inventory 生成 worker(`[inventory]`)。
+    #[serde(default)]
+    pub inventory: InventoryConfig,
+}
+
+/// M15 I2:`[inventory]` 段(S3 Inventory 生成 worker;默认启用,
+/// 无启用配置桶零动作)。关闭 = 配置 CRUD 仍可用,但不生成清单。
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+pub struct InventoryConfig {
+    /// 总开关(默认 true)。
+    pub enabled: Option<bool>,
+    /// 生成周期秒(默认 3600 = 1h;Daily/Weekly 配置的观测粒度)。
+    pub interval_secs: Option<u64>,
 }
 
 /// M15 N3:`[notification]` 段(事件通知投递 worker;默认启用,

@@ -14,6 +14,7 @@
 //! 旧设备直接拒绝。
 
 pub mod compaction;
+pub mod inventory;
 pub mod io;
 pub mod lifecycle;
 pub mod worker;

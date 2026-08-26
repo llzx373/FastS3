@@ -3149,9 +3149,7 @@ impl S3Service {
             .ok_or_else(|| {
                 S3Error::new(S3ErrorCode::NoSuchInventoryConfiguration)
                     .with_extra("Id", id)
-                    .with_message(
-                        "The inventory configuration with specified ID does not exist.",
-                    )
+                    .with_message("The inventory configuration with specified ID does not exist.")
             })?;
         Ok(Self::xml_response(xml::render_inventory_configuration(
             &rule,

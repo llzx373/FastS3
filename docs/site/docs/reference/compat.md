@@ -61,6 +61,18 @@ admin 可见);归档真语义(Transition/RestoreObject)规划于 v2.2(M16)。
 | 临时 secret 派生 | `HMAC-SHA256(基密钥 secret, "fasts3-session:" + 会话 id)` 确定性派生——数据面可重算验签、明文零落盘;派生可计算性不构成提权(会话权限 ⊆ 基密钥) |
 | 审计 | 签发/撤销经管理面操作审计;会话使用按基密钥记 `who`(六维检索可查) |
 
+## S3 Inventory(v2.1 M15 起)
+
+| 项 | 说明 |
+| --- | --- |
+| 配置 API | `Put/Get/DeleteBucketInventoryConfiguration`(?inventory&id)+ `ListBucketInventoryConfigurations`(?inventory,continuation-token 分页,单页 ≤100) |
+| 格式 | **CSV 起步(ADR-18 范围声明)**;ORC/Parquet 配置 → InvalidArgument 显式拒绝(不静默);`IncludedObjectVersions` = All(含历史版本/删除标记)/ Current |
+| 生成 | 后台 worker(与压缩/生命周期同源令牌桶):复用 ListObjects 全量枚举 → CSV + manifest.json 落目标桶(`{dest_prefix}{src}/inventory/{ts}/manifest.json` + `data/inventory-{ts}.csv`);节流/暂停复用 BackgroundWorker;单桶失败只记指标不影响其它桶 |
+| CSV 列 | AWS v2016-11-30 头对齐(20 列:Size/LastModifiedDate/ETag/StorageClass/.../VersionId/IsLatest/DeleteMarker/...);未实现列留空;键值 RFC 4180 转义 |
+| manifest | AWS 形状(sourceBucket/destinationBucket/creationTimestamp/fileFormat/fileSchema/files[].key\|size\|MD5checksum) |
+| 指标 | `fasts3_inventory_*`(cycles/generated_files/generated_bytes/failed_rounds/last_run_timestamp;告警 InventoryGenerationStalled 消费 last_run_timestamp) |
+| 目标桶 | 必须是已存在桶(生成失败记指标;配置阶段仅做字段校验) |
+
 ## OS / 打包形态
 
 | 平台 | 包 | 构建 | 状态 |

@@ -89,6 +89,9 @@ pub struct AdminServer {
     /// 通知投递指标(M15 N3;worker 启用时由 fs3d 注入;None = 未启用,
     /// /metrics 相应指标组缺席)。
     notification_stats: Option<Arc<fs3_http::notify::NotificationStats>>,
+    /// S3 Inventory 生成指标(M15 I2;worker 启用时由 fs3d 注入;None =
+    /// 未启用,/metrics 相应指标组缺席)。
+    inventory_stats: Option<Arc<fs3_engine::inventory::InventoryStats>>,
 }
 
 impl AdminServer {
@@ -102,6 +105,7 @@ impl AdminServer {
             config_patch: None,
             lifecycle_stats: None,
             notification_stats: None,
+            inventory_stats: None,
         }
     }
 
@@ -126,6 +130,15 @@ impl AdminServer {
         stats: Option<Arc<fs3_http::notify::NotificationStats>>,
     ) -> Self {
         self.notification_stats = stats;
+        self
+    }
+
+    /// 注入 S3 Inventory 生成指标(M15 I2;/metrics 渲染 fasts3_inventory_*)。
+    pub fn with_inventory_stats(
+        mut self,
+        stats: Option<Arc<fs3_engine::inventory::InventoryStats>>,
+    ) -> Self {
+        self.inventory_stats = stats;
         self
     }
 
@@ -213,6 +226,7 @@ impl AdminServer {
             config_patch: self.config_patch.clone(),
             lifecycle_stats: self.lifecycle_stats.clone(),
             notification_stats: self.notification_stats.clone(),
+            inventory_stats: self.inventory_stats.clone(),
         })
     }
 
@@ -797,6 +811,42 @@ impl AdminServer {
             text.push_str(&format!(
                 "fasts3_notification_last_delivery_timestamp {}\n",
                 s.last_delivered_at
+            ));
+        }
+        // M15 I2:S3 Inventory 生成指标组(worker 未启用 = 缺席;告警
+        // InventoryGenerationStalled 消费 last_run_timestamp)。
+        if let Some(stats) = &self.inventory_stats {
+            let s = stats.snapshot();
+            text.push_str(
+                "# HELP fasts3_inventory_cycles_total Inventory generation cycles completed\n",
+            );
+            text.push_str("# TYPE fasts3_inventory_cycles_total counter\n");
+            text.push_str(&format!("fasts3_inventory_cycles_total {}\n", s.cycles));
+            text.push_str("# HELP fasts3_inventory_generated_files_total Inventory objects written (csv + manifest)\n");
+            text.push_str("# TYPE fasts3_inventory_generated_files_total counter\n");
+            text.push_str(&format!(
+                "fasts3_inventory_generated_files_total {}\n",
+                s.generated_files
+            ));
+            text.push_str(
+                "# HELP fasts3_inventory_generated_bytes_total Inventory bytes written\n",
+            );
+            text.push_str("# TYPE fasts3_inventory_generated_bytes_total counter\n");
+            text.push_str(&format!(
+                "fasts3_inventory_generated_bytes_total {}\n",
+                s.generated_bytes
+            ));
+            text.push_str("# HELP fasts3_inventory_failed_rounds_total Bucket-rule rounds that failed to generate\n");
+            text.push_str("# TYPE fasts3_inventory_failed_rounds_total counter\n");
+            text.push_str(&format!(
+                "fasts3_inventory_failed_rounds_total {}\n",
+                s.failed_rounds
+            ));
+            text.push_str("# HELP fasts3_inventory_last_run_timestamp Unix time of last generation round (0 = never)\n");
+            text.push_str("# TYPE fasts3_inventory_last_run_timestamp gauge\n");
+            text.push_str(&format!(
+                "fasts3_inventory_last_run_timestamp {}\n",
+                s.last_run_at
             ));
         }
         Response::builder()
