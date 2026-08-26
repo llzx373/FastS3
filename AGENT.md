@@ -112,6 +112,28 @@ pnpm -r test
 fio 基线脚本、crash harness、loadgen、warp、s3-tests 配置
 ```
 
+### 9.1 外部依赖与离线预置(2026-08-26;agent 外网不佳时的可用面)
+
+- **网络**:HTTP(S) 代理 `http://192.168.1.27:7897` 已持久写入 `~/.cargo/config.toml`;
+  Node/pip/git 按需以 `HTTP_PROXY/HTTPS_PROXY` 环境变量使用(不写入全局配置)。
+- **Rust**:全量依赖已 `cargo fetch` 缓存并经 `cargo check --offline` 验证;`target/`
+  已构建,增量构建零外网。cargo-audit 0.22.2 + advisory-db 已刷新。
+- **Node**:web 三包 pnpm store 已满,离线重装验证通过(`pnpm install --offline`)。
+- **客户端矩阵(均已就位,离线可用)**:`~/.local/bin` 下 aws cli 2.36.31 /
+  rclone 1.75.0 / mc RELEASE.2025-08-13 / restic 0.19.1 / warp 1.3.0;
+  duplicati 2.3.0.4(自包含 CLI)在 `/tmp/clients/duplicati/`;
+  `client_smoke.sh` 的 `CLIENTS_DIR` 默认 `/tmp/clients`(mc/rclone 已符号链接,
+  aws 经 PATH 解析)。
+- **湖仓/备份冒烟(M15 D3)**:JDK 21(Temurin,`~/.local/jdk-21`,`java` 在 PATH);
+  Hadoop 3.4.1(`~/.local/hadoop-3.4.1`,含 `hadoop-aws-3.4.1.jar` + AWS SDK v2
+  `bundle-2.24.6.jar`);S3A 冒烟设 `JAVA_HOME=$HOME/.local/jdk-21`、
+  `HADOOP_HOME=$HOME/.local/hadoop-3.4.1`。Veeam 为授权软件,需外部环境。
+- **s3-tests**:`/tmp/s3-tests`(仓库 + venv;boto3 1.43.80 / pytest 9.1.1 已装)。
+  venv 重建注意:本机 `python3 -m venv` 缺 ensurepip,需先
+  `curl bootstrap.pypa.io/get-pip.py` 引导 pip 再装 requirements。
+- **易失提醒**:`/tmp` 为 tmpfs,重启即失(`/tmp/clients`、`/tmp/s3-tests`);
+  长期保留应迁移到 `~/.local` 并调整 `CLIENTS_DIR`/`S3TESTS_DIR`。
+
 ## 10. 提交规范
 
 - 前缀:`feat` / `fix` / `docs` / `test` / `perf` / `refactor` / `chore`
