@@ -221,6 +221,8 @@ fn admin_buckets_crud_and_quota() {
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["quota"].as_u64(), Some(2097152));
     assert_eq!(v["objects"].as_u64(), Some(0));
+    // M16 A1:存储类分账视图(空桶 → 空表;Σ by_class == objects/bytes)
+    assert_eq!(v["by_class"].as_array().map(|a| a.len()), Some(0));
     // 不存在的桶 → 404
     let (code, _) = http_unix(sock, "GET", "/v1/admin/buckets/nope", None, "t");
     assert_eq!(code, 404);

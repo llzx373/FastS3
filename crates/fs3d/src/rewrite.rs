@@ -300,7 +300,7 @@ mod tests {
         let zero = StatsDelta::default();
         let draft = AllocDraft::default();
         // v3 单键(当前二进制写入恒 v3)
-        s.commit_object_put("b1", "new", &object_meta(8, 1), draft.clone(), zero)
+        s.commit_object_put("b1", "new", &object_meta(8, 1), draft.clone(), zero.clone())
             .unwrap();
         // v3 版本条目 + v3 删除标记(Enabled 形态)
         let vk_data = [0x11; 16];
@@ -308,8 +308,15 @@ mod tests {
             version_id: Some(vk_data),
             ..object_meta(16, 2)
         };
-        s.commit_object_put_version("b1", "vk-obj", &vk_data, &m_data, draft.clone(), zero)
-            .unwrap();
+        s.commit_object_put_version(
+            "b1",
+            "vk-obj",
+            &vk_data,
+            &m_data,
+            draft.clone(),
+            zero.clone(),
+        )
+        .unwrap();
         let vk_marker = [0x22; 16];
         let marker = fs3_core::ObjectMeta {
             size: 0,
@@ -319,8 +326,15 @@ mod tests {
             is_delete_marker: true,
             ..object_meta(0, 3)
         };
-        s.commit_object_delete_current("b1", "vk-obj", Some(&vk_marker), &marker, draft, zero)
-            .unwrap();
+        s.commit_object_delete_current(
+            "b1",
+            "vk-obj",
+            Some(&vk_marker),
+            &marker,
+            draft,
+            zero.clone(),
+        )
+        .unwrap();
         // v2 存量值(单键 + 版本键;模拟 v1.0.x 遗留)
         s.put_object_value_raw("b1", "old", None, &encode_v2_value(&object_meta(24, 4)))
             .unwrap();
@@ -488,7 +502,7 @@ mod tests {
         let zero = StatsDelta::default();
         let draft = AllocDraft::default();
         // 当前版本(v7)条目 + v6 存量值条目
-        s.commit_object_put("b1", "new", &object_meta(8, 1), draft.clone(), zero)
+        s.commit_object_put("b1", "new", &object_meta(8, 1), draft.clone(), zero.clone())
             .unwrap();
         s.put_object_value_raw("b1", "old", None, &encode_v6_value(&object_meta(24, 4)))
             .unwrap();

@@ -456,6 +456,9 @@ pub struct BucketDto {
     pub owner: String,
     pub objects: u64,
     pub bytes: u64,
+    /// M16 A1(ADR-19 DA5):存储类分账(类名 → 计数;旧导出无此字段 → 空)。
+    #[serde(default)]
+    pub by_class: Vec<(String, fs3_core::BucketClassTally)>,
     pub quota: Option<u64>,
     /// 创建时 LocationConstraint(M8 回显语义;旧导出无此字段 → 默认 "")。
     #[serde(default)]
@@ -624,6 +627,7 @@ pub fn run_meta_export(
                 owner: m.owner,
                 objects: m.stats.objects,
                 bytes: m.stats.bytes,
+                by_class: m.stats.by_class.clone(),
                 quota: m.quota,
                 location: Some(store.bucket_location(&name).unwrap_or_default()),
                 created_with_acl: m.created_with_acl,
@@ -785,6 +789,7 @@ pub fn run_meta_import(
             stats: fs3_core::BucketStats {
                 objects: b.objects,
                 bytes: b.bytes,
+                by_class: b.by_class.clone(),
             },
             quota: b.quota,
             created_with_acl: b.created_with_acl,

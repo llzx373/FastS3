@@ -1543,6 +1543,30 @@ impl Engine {
 
     // ───────────────────── 版本化公共件(ADR-11,V2) ─────────────────────
 
+    /// M16 A1(ADR-19 DA5):写路径存储类分账(带符号)——新对象入账
+    /// (+objects/+size 于 new_class,旧版本覆盖出账(-1/-old.size 于
+    /// old_class;未计入/无旧值则免)。objects 口径与总账一致:
+    /// 覆盖写旧计入 → 新 objects 增量 0(类账目 = 旧类 -1 新类 +1);
+    /// 纯新增 → 旧类无出账、新类 +1。transition/restore 由各自路径
+    /// 单独入账。
+    ///
+    /// 参数:`old` = 覆盖目标旧视图(未计入时免出账),`new_class` = 新
+    /// 对象真实类名(归档三值或 STANDARD),`size` = 新对象明文大小。
+    fn class_stats_delta(old: &OldVersion, new_class: &str, size: u64) -> Vec<(String, i64, i64)> {
+        let mut v = Vec::new();
+        if old.counted {
+            v.push((
+                old.class.as_deref().unwrap_or("STANDARD").to_string(),
+                -1,
+                -old.size,
+            ));
+            v.push((new_class.to_string(), 1, size as i64));
+        } else {
+            v.push((new_class.to_string(), 1, size as i64));
+        }
+        v
+    }
+
     /// 写路径版本化分叉(ADR-11 §3.4.2):返回提交目标与旧值视图。
     ///
     /// - Off:读旧未版本化条目;`counted` = 旧数据版本存在(含内联,
@@ -1572,6 +1596,10 @@ impl Engine {
                         counted: old.as_ref().is_some_and(|o| !o.is_delete_marker),
                         segments,
                         size,
+                        class: old
+                            .as_ref()
+                            .filter(|o| !o.is_delete_marker)
+                            .and_then(|o| o.storage_class.clone()),
                     },
                 ))
             }
@@ -1590,6 +1618,11 @@ impl Engine {
                                 counted: !legacy.is_delete_marker,
                                 segments: legacy.extents.clone(),
                                 size: legacy.size as i64,
+                                class: if legacy.is_delete_marker {
+                                    None
+                                } else {
+                                    legacy.storage_class.clone()
+                                },
                             },
                         ))
                     }
@@ -1605,6 +1638,10 @@ impl Engine {
                         counted,
                         segments,
                         size,
+                        class: old
+                            .as_ref()
+                            .filter(|o| !o.is_delete_marker)
+                            .and_then(|o| o.storage_class.clone()),
                     },
                 ))
             }
@@ -2093,6 +2130,9 @@ impl Engine {
             let delta = StatsDelta {
                 objects: if old.counted { 0 } else { 1 },
                 bytes: size as i64 - old.size,
+                // M16 A1(ADR-19 DA5):按类入账(覆盖跨类 = 旧类出账 +
+                // 新类入账;纯新增 = 新类 +1)
+                by_class: Self::class_stats_delta(&old, meta.storage_class_name(), size),
             };
             // E4:配额检查(超限不落盘、不入账)
             self.check_quota(bucket, delta.bytes)?;
@@ -2185,6 +2225,8 @@ impl Engine {
         } = ctx;
         let old_size = old.size;
         let old_segments = old.segments;
+        let old_class = old.class.clone();
+        let old_counted = old.counted;
         let mut draft = Staged::default();
         let outcome =
             match self.stream_to_extents(reader, &mut draft, sse_key, None, compression_level) {
@@ -2254,6 +2296,18 @@ impl Engine {
         let delta = StatsDelta {
             objects: if old.counted { 0 } else { 1 },
             bytes: size as i64 - old_size,
+            // M16 A1(ADR-19 DA5):按类入账(覆盖跨类 = 旧类出账 + 新类入账)
+            by_class: Self::class_stats_delta(
+                &OldVersion {
+                    existed: old.existed,
+                    counted: old_counted,
+                    segments: Vec::new(),
+                    size: old_size,
+                    class: old_class,
+                },
+                meta.storage_class_name(),
+                size,
+            ),
         };
         // E4:配额检查(超限回滚暂存分配,数据段已写盘但未提交 → 泄漏面
         // 由分配回滚覆盖,不产生账目漂移)
@@ -3626,6 +3680,12 @@ impl Engine {
             StatsDelta {
                 objects: -1,
                 bytes: -(meta.size as i64),
+                // M16 A1(ADR-19 DA5):删除按对象真实类出账
+                by_class: vec![(
+                    meta.storage_class_name().to_string(),
+                    -1,
+                    -(meta.size as i64),
+                )],
             }
         };
         // M15 N2(ADR-18 D-E1):物理删除 = ObjectRemoved:Delete /
@@ -3684,6 +3744,8 @@ impl Engine {
                 delta = StatsDelta {
                     objects: -1,
                     bytes: -(o.size as i64),
+                    // M16 A1(ADR-19 DA5):旧 null 族数据版本按类出账
+                    by_class: vec![(o.storage_class_name().to_string(), -1, -(o.size as i64))],
                 };
             }
         }
@@ -3744,6 +3806,12 @@ impl Engine {
             delta = StatsDelta {
                 objects: -1,
                 bytes: -(meta.size as i64),
+                // M16 A1(ADR-19 DA5):删除按对象真实类出账
+                by_class: vec![(
+                    meta.storage_class_name().to_string(),
+                    -1,
+                    -(meta.size as i64),
+                )],
             };
         }
         // M15 N2(ADR-18 D-E1):版本物理删除 = ObjectRemoved/LifecycleExpiration
@@ -3802,6 +3870,12 @@ impl Engine {
                 StatsDelta {
                     objects: -1,
                     bytes: -(meta.size as i64),
+                    // M16 A1(ADR-19 DA5):按对象真实类出账
+                    by_class: vec![(
+                        meta.storage_class_name().to_string(),
+                        -1,
+                        -(meta.size as i64),
+                    )],
                 }
             };
             let r = match vk {
@@ -4052,7 +4126,11 @@ impl Engine {
             // nonce_base = D-E6 确定性派生(重传幂等);K1-1:有效写密钥
             // (SSE-C 请求密钥 / SSE-S3 会话 DEK),SseInfo 静态字段随类型分派
             // M16 A1:归档会话小分片 = 内联压缩帧(明文→zstd;SSE 会话
-            // 已在入口拒绝,此处仅明文压缩臂)
+            // 已在入口拒绝,此处仅明文压缩臂)。size 恒记**明文**长度
+            // (与 extent 分片口径一致:PartMeta.size = 逻辑明文,压缩
+            // 帧长度在 compressed_size;Complete 拼接与 checksum 重算
+            // 依赖该口径)
+            let plain_size = prefix.len() as u64;
             let compressed_inline: Option<Vec<u8>> = if part_level > 0 {
                 zstd::bulk::compress(&prefix, part_level as i32)
                     .map_err(|e| Error::Meta(format!("zstd part inline compress: {e}")))
@@ -4084,7 +4162,7 @@ impl Engine {
             };
             let etag = self.compute_etag(&inline_data);
             PartMeta {
-                size: inline_data.len() as u64,
+                size: plain_size,
                 etag,
                 mtime,
                 extents: Vec::new(),
@@ -5092,6 +5170,13 @@ impl Engine {
                     }
                 },
                 bytes: total_size as i64 - old.size,
+                // M16 A1(ADR-19 DA5):Complete 按会话真实类入账(归档
+                // 会话 = 升格类;STANDARD = None 语义)
+                by_class: Self::class_stats_delta(
+                    &old,
+                    promoted_class.as_deref().unwrap_or("STANDARD"),
+                    total_size,
+                ),
             };
             // E4:配额检查(multipart complete 是字节入账点)
             self.check_quota(bucket, delta.bytes)?;
@@ -5953,6 +6038,16 @@ impl Engine {
             StatsDelta {
                 objects: if old.counted { -1 } else { 0 },
                 bytes: -old.size,
+                // M16 A1(ADR-19 DA5):旧 null 族数据版本按类出账
+                by_class: if old.counted {
+                    vec![(
+                        old.class.as_deref().unwrap_or("STANDARD").to_string(),
+                        -1,
+                        -old.size,
+                    )]
+                } else {
+                    Vec::new()
+                },
             }
         } else {
             StatsDelta {
@@ -5976,6 +6071,8 @@ impl Engine {
                     }
                 },
                 bytes: meta.size as i64 - old.size,
+                // M16 A1(ADR-19 DA5):copy 数据版本按目标真实类入账
+                by_class: Self::class_stats_delta(&old, meta.storage_class_name(), meta.size),
             }
         };
         // E4:配额检查(copy 目标桶入账点)
@@ -6717,6 +6814,9 @@ struct OldVersion {
     segments: Vec<Segment>,
     /// 旧版本字节数(无旧值 = 0)。
     size: i64,
+    /// M16 A1(ADR-19 DA5):旧版本真实存储类(覆盖写跨类时旧类出账
+    /// 依据;无旧值/未计入 = None → STANDARD 语义)。
+    class: Option<String>,
 }
 
 /// 当前 Unix 微秒(vk 时间戳分量用,ADR-11 D2)。

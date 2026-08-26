@@ -1001,6 +1001,15 @@ impl AdminServer {
                 "name": name,
                 "objects": m.stats.objects,
                 "bytes": m.stats.bytes,
+                // M16 A1(ADR-19 DA5):存储类分账视图(类名 → {objects, bytes};
+                // 不变量 Σ by_class == objects/bytes)
+                "by_class": m.stats.by_class.iter().map(|(c, t)| {
+                    serde_json::json!({
+                        "class": c,
+                        "objects": t.objects,
+                        "bytes": t.bytes,
+                    })
+                }).collect::<Vec<_>>(),
                 "quota": m.quota,
             })),
             Ok(None) => json::err(

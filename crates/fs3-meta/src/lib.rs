@@ -65,10 +65,15 @@ impl Default for MetaConfig {
 pub use fs3_core::AllocDraft;
 
 /// 桶统计增量。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StatsDelta {
     pub objects: i64,
     pub bytes: i64,
+    /// M16 A1(ADR-19 DA5):存储类分账增量(类名, objects, bytes;带符号,
+    /// 可为负——覆盖扣旧类/删除)。写路径按新对象真实类 + 旧版本类
+    /// 成对入账;transition = 类间移动(旧类负 + 新类正);restore 不动账。
+    /// 不变量:Σ by_class == 桶统计(各类求和恒等)。
+    pub by_class: Vec<(String, i64, i64)>,
 }
 
 /// 对象值版本字节分布(M16 A1 扩展;count_object_value_versions 返回)。
@@ -3900,6 +3905,11 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
                 meta.stats.objects =
                     (meta.stats.objects as i128 + delta.objects as i128).max(0) as u64;
                 meta.stats.bytes = (meta.stats.bytes as i128 + delta.bytes as i128).max(0) as u64;
+                // M16 A1:存储类分账随同一事务落盘(崩溃零漂移:统计与
+                // 类账目同键同事务;不变量 Σ by_class == 桶统计)
+                for (class, dobj, dbytes) in &delta.by_class {
+                    meta.stats.apply_class_delta(class, *dobj, *dbytes);
+                }
                 tinsert(tx, k, meta.encode_value()?)?;
             }
             Op::MultipartCreate { upload_id, session } => {
@@ -4429,6 +4439,7 @@ mod tests {
                     delta: StatsDelta {
                         objects: 1,
                         bytes: 3,
+                        by_class: Vec::new(),
                     },
                 },
             ];
@@ -4571,6 +4582,7 @@ mod tests {
             StatsDelta {
                 objects: 1,
                 bytes: 3,
+                by_class: Vec::new(),
             },
         )
         .unwrap();
@@ -4608,6 +4620,7 @@ mod tests {
                 StatsDelta {
                     objects: 1,
                     bytes: 100,
+                    by_class: Vec::new(),
                 },
             )
             .unwrap();
@@ -4639,6 +4652,7 @@ mod tests {
             StatsDelta {
                 objects: -1,
                 bytes: -100,
+                by_class: Vec::new(),
             },
         )
         .unwrap();
@@ -4667,6 +4681,7 @@ mod tests {
                 StatsDelta {
                     objects: 1,
                     bytes: size as i64,
+                    by_class: Vec::new(),
                 },
             )
             .unwrap();
@@ -4699,6 +4714,7 @@ mod tests {
                 StatsDelta {
                     objects: -1,
                     bytes: -size,
+                    by_class: Vec::new(),
                 },
             )
             .unwrap();
@@ -4755,6 +4771,7 @@ mod tests {
                         StatsDelta {
                             objects: 1,
                             bytes: j,
+                            by_class: Vec::new(),
                         },
                     )
                     .unwrap();
@@ -4846,6 +4863,7 @@ mod tests {
                 StatsDelta {
                     objects: 1,
                     bytes: 5,
+                    by_class: Vec::new(),
                 },
             )
             .unwrap();
@@ -4875,6 +4893,7 @@ mod tests {
                 StatsDelta {
                     objects: 1,
                     bytes: 7,
+                    by_class: Vec::new(),
                 },
             )
             .unwrap();
@@ -4965,6 +4984,7 @@ mod tests {
             StatsDelta {
                 objects: 1,
                 bytes: 64,
+                by_class: Vec::new(),
             },
         )
         .unwrap();
@@ -4982,6 +5002,7 @@ mod tests {
             StatsDelta {
                 objects: 1,
                 bytes: 32,
+                by_class: Vec::new(),
             },
         )
         .unwrap();
@@ -5679,13 +5700,15 @@ mod tests {
         struct LegacyBucket {
             created: i64,
             owner: String,
-            stats: fs3_core::BucketStats,
+            // v1.0.0 桶值 stats = 两 u64(无 by_class);tuple 编码字节
+            // 与旧 BucketStats 一致
+            stats: (u64, u64),
             quota: Option<u64>,
         }
         let legacy = LegacyBucket {
             created: 1,
             owner: "u".into(),
-            stats: fs3_core::BucketStats::default(),
+            stats: (0, 0),
             quota: None,
         };
         s.db.put(bucket_key("b1"), postcard::to_allocvec(&legacy).unwrap())
@@ -5717,14 +5740,16 @@ mod tests {
         struct BucketMetaV1 {
             created: i64,
             owner: String,
-            stats: fs3_core::BucketStats,
+            // v1.1.0 桶值 stats = 两 u64(无 by_class);tuple 编码字节
+            // 与旧 BucketStats 一致
+            stats: (u64, u64),
             quota: Option<u64>,
             created_with_acl: bool,
         }
         let v11 = BucketMetaV1 {
             created: 1_724_155_200,
             owner: "u".into(),
-            stats: fs3_core::BucketStats::default(),
+            stats: (0, 0),
             quota: Some(7),
             created_with_acl: true,
         };
@@ -5752,6 +5777,7 @@ mod tests {
             StatsDelta {
                 objects: 1,
                 bytes: 100,
+                by_class: Vec::new(),
             },
         )
         .unwrap();
@@ -5838,6 +5864,7 @@ mod tests {
             delta: StatsDelta {
                 objects: 1,
                 bytes: 100,
+                by_class: Vec::new(),
             },
         }])
         .unwrap();
@@ -5852,6 +5879,7 @@ mod tests {
             StatsDelta {
                 objects: -1,
                 bytes: -100,
+                by_class: Vec::new(),
             },
         )
         .unwrap();
@@ -5899,6 +5927,7 @@ mod tests {
             StatsDelta {
                 objects: 1,
                 bytes: 100,
+                by_class: Vec::new(),
             },
         )
         .unwrap();
@@ -5945,6 +5974,7 @@ mod tests {
             StatsDelta {
                 objects: 1,
                 bytes: 200,
+                by_class: Vec::new(),
             },
         )
         .unwrap();
@@ -5959,6 +5989,7 @@ mod tests {
             StatsDelta {
                 objects: 1,
                 bytes: 50,
+                by_class: Vec::new(),
             },
         )
         .unwrap();
@@ -5989,6 +6020,7 @@ mod tests {
             delta: StatsDelta {
                 objects: 1,
                 bytes: 100,
+                by_class: Vec::new(),
             },
         }])
         .unwrap();
@@ -6001,6 +6033,7 @@ mod tests {
             StatsDelta {
                 objects: -1,
                 bytes: -100,
+                by_class: Vec::new(),
             },
         )
         .unwrap();
@@ -6027,6 +6060,7 @@ mod tests {
             delta: StatsDelta {
                 objects: 1,
                 bytes: 80,
+                by_class: Vec::new(),
             },
         }])
         .unwrap();
@@ -6043,6 +6077,7 @@ mod tests {
             StatsDelta {
                 objects: -1,
                 bytes: -80,
+                by_class: Vec::new(),
             },
         )
         .unwrap();
@@ -6102,6 +6137,7 @@ mod tests {
             StatsDelta {
                 objects: 1,
                 bytes: 64,
+                by_class: Vec::new(),
             },
         )
         .unwrap();
@@ -6151,6 +6187,7 @@ mod tests {
             StatsDelta {
                 objects: 0,
                 bytes: -32,
+                by_class: Vec::new(),
             },
         )
         .unwrap();
@@ -6568,6 +6605,7 @@ mod tests {
             StatsDelta {
                 objects: 1,
                 bytes: 5,
+                by_class: Vec::new(),
             },
         )
         .unwrap_err();
@@ -6584,6 +6622,7 @@ mod tests {
             StatsDelta {
                 objects: 1,
                 bytes: 5,
+                by_class: Vec::new(),
             },
         )
         .unwrap();
@@ -6607,6 +6646,7 @@ mod tests {
             StatsDelta {
                 objects: 1,
                 bytes: 5,
+                by_class: Vec::new(),
             },
         )
         .unwrap();
@@ -6798,6 +6838,7 @@ mod tests {
             StatsDelta {
                 objects: -1,
                 bytes: -10,
+                by_class: Vec::new(),
             },
         )
         .unwrap();

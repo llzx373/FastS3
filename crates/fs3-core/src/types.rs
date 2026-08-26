@@ -959,9 +959,13 @@ pub struct BucketMeta {
     pub default_retention: Option<ObjectLockDefaultRetention>,
 }
 
-/// 桶元数据值格式版本(ADR-11:`[version: u8 = 2] + postcard(BucketMeta)`;
-/// 存量 v1.x 值无版本字节,decode_value 双读回退)。
-pub const BUCKET_META_VERSION: u8 = 2;
+/// 桶元数据值格式版本(ADR-11 + M16 A1:`[version: u8 = 3] + postcard(
+/// BucketMeta)`;v2 存量双读回退,写入恒 v3;存量 v1.x 值无版本字节,
+/// decode_value 双读回退)。
+pub const BUCKET_META_VERSION: u8 = 3;
+
+/// v2 桶值格式(M16 A1:无 stats.by_class 尾部字段;双读回退格式)。
+pub const BUCKET_META_VERSION_V2: u8 = 2;
 
 /// 版本化状态(ADR-11 D1。变体序 = postcard 编码序,只允许尾部追加)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -1293,25 +1297,47 @@ impl BucketMeta {
             })
     }
 
-    /// 解码桶值(M10/ADR-11 双读 + ADR-13 尾部字段):首字节 ==
-    /// BUCKET_META_VERSION 且新格式解码成功 → 现 v2(含 default_retention);
-    /// 失败则回退无 default_retention 的 v2 形态;再否则按存量无版本字节
-    /// 格式回退(v1.1.0 五字段优先、v1.0.0 四字段次之)。
+    /// 解码桶值(M10/ADR-11 双读 + ADR-13 尾部字段 + M16 A1 v3):版本
+    /// 字节 3 → 现格式(含 stats.by_class);2 → v2 存量(无 by_class,
+    /// 补空表);无版本字节 → 按存量格式回退(v1.1.0 六字段优先、v1.0.0
+    /// 五字段次之),均失败 → Corrupt。
     ///
     /// 首字节消歧论证:存量值首字段 `created` 为 unix 秒,postcard 按 zigzag
     /// varint 编码;现实时间戳(≥ 1.7e9 秒)zigzag 后逾 34 亿,首字节必带
     /// 续位(≥ 0x80),仅 created ≤ 63(1970-01-01)才可能编码出单字节
-    /// 0x02 —— 实际不存在,故 0x02 首字节可安全判为新格式。
+    /// 0x02/0x03 —— 实际不存在,故 2/3 首字节可安全判为版本字节。
     pub fn decode_value(buf: &[u8]) -> Result<Self> {
-        if buf.first() == Some(&BUCKET_META_VERSION) {
-            if let Ok(m) = postcard::from_bytes::<BucketMeta>(&buf[1..]) {
-                return Ok(m);
+        match buf.first() {
+            Some(&BUCKET_META_VERSION) => {
+                if let Ok(m) = postcard::from_bytes::<BucketMeta>(&buf[1..]) {
+                    return Ok(m);
+                }
+                // v3 解码失败:损坏或 1970 年理论歧义(created ≤ 63 时
+                // zigzag 首字节恰为 2/3);回退存量形态时用**全缓冲**
+                // (版本字节本属 zigzag 数据,载荷切分会错位)——真实
+                // 存量值首字节 ≥ 0x80 必走 _ 臂,此路径无歧义。
+                BucketMeta::decode_legacy(buf)
             }
-            if let Ok(old) = postcard::from_bytes::<BucketMetaV2NoDefault>(&buf[1..]) {
-                return Ok(old.into());
+            Some(&BUCKET_META_VERSION_V2) => {
+                // v2 双形态:9 字段(ADR-13 含 default_retention)→ 8 字段
+                // (M10..M12 无 default_retention),均在载荷上尝试
+                if let Ok(m) = postcard::from_bytes::<BucketMetaV2>(&buf[1..]) {
+                    return Ok(m.into());
+                }
+                if let Ok(old) = postcard::from_bytes::<BucketMetaV2NoDefault>(&buf[1..]) {
+                    return Ok(old.into());
+                }
+                BucketMeta::decode_legacy(buf)
             }
-            // 新格式解码失败:上述 1970 年理论歧义或损坏,继续按存量格式
-            // 尝试,均失败 → Corrupt。
+            _ => BucketMeta::decode_legacy(buf),
+        }
+    }
+
+    /// 存量无版本字节形态回退(v2 无 default_retention 优先、v1.1.0
+    /// 六字段次之、v1.0.0 五字段最后)。
+    fn decode_legacy(buf: &[u8]) -> Result<Self> {
+        if let Ok(old) = postcard::from_bytes::<BucketMetaV2NoDefault>(buf) {
+            return Ok(old.into());
         }
         match postcard::from_bytes::<BucketMetaV1>(buf) {
             Ok(l) => Ok(l.into()),
@@ -1324,12 +1350,53 @@ impl BucketMeta {
     }
 }
 
+/// v2/v1 存量桶值的 stats 形态(M16 A1 前:无 by_class;双读回退用)。
+#[derive(Serialize, Deserialize)]
+struct BucketStatsV2 {
+    objects: u64,
+    bytes: u64,
+}
+
+/// M16 A1 之前的 BucketMeta v2(无 stats.by_class 尾部;双读回退)。
+#[derive(Serialize, Deserialize)]
+struct BucketMetaV2 {
+    created: i64,
+    owner: String,
+    stats: BucketStatsV2,
+    quota: Option<u64>,
+    created_with_acl: bool,
+    versioning: VersioningState,
+    default_encryption: Option<SseAlgorithm>,
+    object_lock: bool,
+    default_retention: Option<ObjectLockDefaultRetention>,
+}
+
+impl From<BucketMetaV2> for BucketMeta {
+    fn from(l: BucketMetaV2) -> Self {
+        BucketMeta {
+            created: l.created,
+            owner: l.owner,
+            stats: BucketStats {
+                objects: l.stats.objects,
+                bytes: l.stats.bytes,
+                by_class: Vec::new(),
+            },
+            quota: l.quota,
+            created_with_acl: l.created_with_acl,
+            versioning: l.versioning,
+            default_encryption: l.default_encryption,
+            object_lock: l.object_lock,
+            default_retention: l.default_retention,
+        }
+    }
+}
+
 /// M12 之前的 BucketMeta v2(无 default_retention 尾部;ADR-13 双读回退)。
 #[derive(Serialize, Deserialize)]
 struct BucketMetaV2NoDefault {
     created: i64,
     owner: String,
-    stats: BucketStats,
+    stats: BucketStatsV2,
     quota: Option<u64>,
     created_with_acl: bool,
     versioning: VersioningState,
@@ -1342,7 +1409,11 @@ impl From<BucketMetaV2NoDefault> for BucketMeta {
         BucketMeta {
             created: l.created,
             owner: l.owner,
-            stats: l.stats,
+            stats: BucketStats {
+                objects: l.stats.objects,
+                bytes: l.stats.bytes,
+                by_class: Vec::new(),
+            },
             quota: l.quota,
             created_with_acl: l.created_with_acl,
             versioning: l.versioning,
@@ -1358,7 +1429,7 @@ impl From<BucketMetaV2NoDefault> for BucketMeta {
 struct BucketMetaV1 {
     created: i64,
     owner: String,
-    stats: BucketStats,
+    stats: BucketStatsV2,
     quota: Option<u64>,
     created_with_acl: bool,
 }
@@ -1368,7 +1439,11 @@ impl From<BucketMetaV1> for BucketMeta {
         BucketMeta {
             created: l.created,
             owner: l.owner,
-            stats: l.stats,
+            stats: BucketStats {
+                objects: l.stats.objects,
+                bytes: l.stats.bytes,
+                by_class: Vec::new(),
+            },
             quota: l.quota,
             created_with_acl: l.created_with_acl,
             versioning: VersioningState::Off,
@@ -1384,7 +1459,7 @@ impl From<BucketMetaV1> for BucketMeta {
 struct LegacyBucketMeta {
     created: i64,
     owner: String,
-    stats: BucketStats,
+    stats: BucketStatsV2,
     quota: Option<u64>,
 }
 
@@ -1393,7 +1468,11 @@ impl From<LegacyBucketMeta> for BucketMeta {
         BucketMeta {
             created: l.created,
             owner: l.owner,
-            stats: l.stats,
+            stats: BucketStats {
+                objects: l.stats.objects,
+                bytes: l.stats.bytes,
+                by_class: Vec::new(),
+            },
             quota: l.quota,
             created_with_acl: false,
             versioning: VersioningState::Off,
@@ -1404,10 +1483,65 @@ impl From<LegacyBucketMeta> for BucketMeta {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BucketStats {
     pub objects: u64,
     pub bytes: u64,
+    /// M16 A1(ADR-19 DA5):存储类分账(对象数 + 逻辑字节;压缩对象按
+    /// 明文逻辑大小计,恢复副本不计入)。有序 Vec<(类名, 计数)>,类名 ∈
+    /// {STANDARD, GLACIER_IR, GLACIER, DEEP_ARCHIVE};不变量:Σ by_class
+    /// == objects/bytes(桶统计 = 各类求和)。写入路径经
+    /// `apply_class_delta` 维护,transition 为类间移动,restore 不动账。
+    pub by_class: Vec<(String, BucketClassTally)>,
+}
+
+/// 存储类分账计数(M16 A1;BucketStats.by_class 元素)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketClassTally {
+    pub objects: u64,
+    pub bytes: u64,
+}
+
+impl BucketStats {
+    /// 某类的计数(缺席 = 零)。
+    pub fn class_tally(&self, class: &str) -> BucketClassTally {
+        self.by_class
+            .iter()
+            .find(|(c, _)| c == class)
+            .map(|(_, t)| *t)
+            .unwrap_or_default()
+    }
+
+    /// M16 A1:按类增减(带符号;saturating 防下溢,归零条目移除)。
+    pub fn apply_class_delta(&mut self, class: &str, objects: i64, bytes: i64) {
+        if objects == 0 && bytes == 0 {
+            return;
+        }
+        match self.by_class.iter_mut().find(|(c, _)| c == class) {
+            Some((_, t)) => {
+                t.objects = (t.objects as i64 + objects).max(0) as u64;
+                t.bytes = (t.bytes as i64 + bytes).max(0) as u64;
+            }
+            None => {
+                self.by_class.push((
+                    class.to_string(),
+                    BucketClassTally {
+                        objects: objects.max(0) as u64,
+                        bytes: bytes.max(0) as u64,
+                    },
+                ));
+            }
+        }
+        self.by_class
+            .retain(|(_, t)| t.objects != 0 || t.bytes != 0);
+    }
+
+    /// 各类求和(不变量校验:应恒等于 objects/bytes)。
+    pub fn class_sum(&self) -> (u64, u64) {
+        self.by_class
+            .iter()
+            .fold((0u64, 0u64), |(o, b), (_, t)| (o + t.objects, b + t.bytes))
+    }
 }
 
 /// S3 访问密钥记录(键 `k:{access_key}`;DESIGN §9 密钥存储)。
@@ -2487,6 +2621,13 @@ mod tests {
             stats: BucketStats {
                 objects: 3,
                 bytes: 42,
+                by_class: vec![(
+                    "GLACIER".to_string(),
+                    BucketClassTally {
+                        objects: 1,
+                        bytes: 10,
+                    },
+                )],
             },
             quota: Some(1024),
             created_with_acl: true,
@@ -2501,21 +2642,62 @@ mod tests {
         };
         let v = m.encode_value().unwrap();
         assert_eq!(v[0], BUCKET_META_VERSION);
-        assert_eq!(v[0], 2);
+        assert_eq!(v[0], 3, "M16 A1 起写入恒 v3");
         assert_eq!(BucketMeta::decode_value(&v).unwrap(), m);
+        // v2 存量值(带 default_retention、无 by_class)→ 补空表
+        {
+            #[derive(serde::Serialize)]
+            struct BucketMetaV2 {
+                created: i64,
+                owner: String,
+                stats: BucketStatsV2,
+                quota: Option<u64>,
+                created_with_acl: bool,
+                versioning: VersioningState,
+                default_encryption: Option<SseAlgorithm>,
+                object_lock: bool,
+                default_retention: Option<ObjectLockDefaultRetention>,
+            }
+            let mut b = vec![BUCKET_META_VERSION_V2];
+            b.extend(
+                postcard::to_allocvec(&BucketMetaV2 {
+                    created: m.created,
+                    owner: m.owner.clone(),
+                    stats: BucketStatsV2 {
+                        objects: m.stats.objects,
+                        bytes: m.stats.bytes,
+                    },
+                    quota: m.quota,
+                    created_with_acl: m.created_with_acl,
+                    versioning: m.versioning,
+                    default_encryption: m.default_encryption,
+                    object_lock: m.object_lock,
+                    default_retention: m.default_retention.clone(),
+                })
+                .unwrap(),
+            );
+            let dec = BucketMeta::decode_value(&b).unwrap();
+            assert_eq!(dec.stats.objects, m.stats.objects);
+            assert_eq!(dec.stats.bytes, m.stats.bytes);
+            assert!(dec.stats.by_class.is_empty(), "v2 存量补空表");
+            assert_eq!(dec.default_retention, m.default_retention);
+        }
         // v1.1.0 存量值(五字段,无版本字节)双读回退:v2 尾部字段补默认
         #[derive(serde::Serialize)]
         struct BucketMetaV1 {
             created: i64,
             owner: String,
-            stats: BucketStats,
+            stats: BucketStatsV2,
             quota: Option<u64>,
             created_with_acl: bool,
         }
         let v11 = postcard::to_allocvec(&BucketMetaV1 {
             created: m.created,
             owner: "u".into(),
-            stats: m.stats,
+            stats: BucketStatsV2 {
+                objects: m.stats.objects,
+                bytes: m.stats.bytes,
+            },
             quota: None,
             created_with_acl: true,
         })
@@ -2532,19 +2714,22 @@ mod tests {
         struct BucketMetaV2NoDefault {
             created: i64,
             owner: String,
-            stats: BucketStats,
+            stats: BucketStatsV2,
             quota: Option<u64>,
             created_with_acl: bool,
             versioning: VersioningState,
             default_encryption: Option<SseAlgorithm>,
             object_lock: bool,
         }
-        let mut old_v2 = vec![BUCKET_META_VERSION];
+        let mut old_v2 = vec![BUCKET_META_VERSION_V2];
         old_v2.extend(
             postcard::to_allocvec(&BucketMetaV2NoDefault {
                 created: m.created,
                 owner: "u".into(),
-                stats: m.stats,
+                stats: BucketStatsV2 {
+                    objects: m.stats.objects,
+                    bytes: m.stats.bytes,
+                },
                 quota: m.quota,
                 created_with_acl: true,
                 versioning: VersioningState::Enabled,
@@ -2562,13 +2747,16 @@ mod tests {
         struct LegacyBucket {
             created: i64,
             owner: String,
-            stats: BucketStats,
+            stats: BucketStatsV2,
             quota: Option<u64>,
         }
         let v10 = postcard::to_allocvec(&LegacyBucket {
             created: m.created,
             owner: "u".into(),
-            stats: m.stats,
+            stats: BucketStatsV2 {
+                objects: m.stats.objects,
+                bytes: m.stats.bytes,
+            },
             quota: None,
         })
         .unwrap();

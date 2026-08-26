@@ -3460,6 +3460,7 @@ fn vk_anti_rollback_engine_level() {
             StatsDelta {
                 objects: 1,
                 bytes: fm.size as i64,
+                by_class: Vec::new(),
             },
         )
         .unwrap();
@@ -7464,6 +7465,164 @@ fn storage_class_requested_recorded() -> Result<()> {
         Some("ONEZONE_IA"),
         "multipart 对象记录 Create 时请求类"
     );
+    e.abort();
+    Ok(())
+}
+
+/// M16 A1(ADR-19 DA5):存储类分账五路径——PUT 新增/覆盖(跨类出账)、
+/// DELETE、multipart Complete、Copy;Σ by_class == 桶统计不变量;
+/// BucketMeta v3 双读(v2 存量补空表)。
+#[test]
+fn class_stats_accounting_five_paths() -> Result<()> {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let bstats = |e: &Engine| e.meta().get_bucket("b1").unwrap().unwrap().stats;
+    let put =
+        |e: &mut Engine, key: &str, data: Vec<u8>, class: Option<&str>| -> Result<ObjectMeta> {
+            e.put_with_lock_ev(
+                "b1",
+                key,
+                &mut Cursor::new(data),
+                None,
+                vec![],
+                vec![],
+                vec![],
+                None,
+                None,
+                None,
+                ObjectLockWrite::default(),
+                None,
+                class.map(|c| c.to_string()),
+                fs3_core::promote_storage_class(class),
+            )
+        };
+
+    // ① PUT 新增:STANDARD + GLACIER
+    put(&mut e, "s1", b"std-data".to_vec(), None)?;
+    put(&mut e, "g1", b"archive-data".to_vec(), Some("GLACIER"))?;
+    let s = bstats(&e);
+    assert_eq!(
+        (s.objects, s.bytes),
+        (2, 20),
+        "std-data 8B + archive-data 12B"
+    );
+    assert_eq!(s.class_tally("STANDARD").objects, 1);
+    assert_eq!(s.class_tally("GLACIER").objects, 1);
+    assert_eq!(s.class_tally("GLACIER").bytes, 12);
+    assert_eq!(s.class_sum(), (s.objects, s.bytes), "Σ by_class == 桶统计");
+
+    // ② 覆盖写跨类:GLACIER → 被 STANDARD 覆盖(旧类出账 + 新类入账)
+    put(&mut e, "g1", b"std-overwrite".to_vec(), None)?;
+    let s = bstats(&e);
+    assert_eq!(
+        (s.objects, s.bytes),
+        (2, 21),
+        "std-data 8B + std-overwrite 13B"
+    );
+    assert_eq!(s.class_tally("GLACIER").objects, 0, "旧 GLACIER 条目出账");
+    assert_eq!(s.class_tally("GLACIER").bytes, 0);
+    assert_eq!(s.class_tally("STANDARD").objects, 2);
+    assert_eq!(s.class_sum(), (s.objects, s.bytes));
+
+    // ③ 覆盖写同类:GLACIER → GLACIER(objects 不变、bytes 差值)
+    put(&mut e, "g2", b"aa".to_vec(), Some("GLACIER"))?;
+    put(&mut e, "g2", b"aaaaaa".to_vec(), Some("GLACIER"))?;
+    let s = bstats(&e);
+    assert_eq!((s.objects, s.bytes), (3, 27));
+    assert_eq!(s.class_tally("GLACIER").objects, 1);
+    assert_eq!(s.class_tally("GLACIER").bytes, 6);
+    assert_eq!(s.class_sum(), (s.objects, s.bytes));
+
+    // ④ DELETE:按类出账
+    e.delete("b1", "g2")?;
+    let s = bstats(&e);
+    assert_eq!((s.objects, s.bytes), (2, 21));
+    assert_eq!(s.class_tally("GLACIER").objects, 0);
+    assert_eq!(s.class_sum(), (s.objects, s.bytes));
+
+    // ⑤ multipart Complete(归档会话):按会话类入账
+    let uid = e
+        .create_multipart_lock(
+            "b1",
+            "mp1",
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("DEEP_ARCHIVE".into()),
+        )
+        .unwrap();
+    let part = e
+        .upload_part(&uid, 1, &mut Cursor::new(b"deep".to_vec()), None, None)
+        .unwrap();
+    e.complete_multipart(
+        "b1",
+        "mp1",
+        &uid,
+        &[fs3_core::CompletePart {
+            part_number: 1,
+            etag_hex: part.etag_hex(),
+            checksum: None,
+        }],
+        None,
+        None,
+    )
+    .unwrap();
+    let s = bstats(&e);
+    assert_eq!((s.objects, s.bytes), (3, 25));
+    assert_eq!(s.class_tally("DEEP_ARCHIVE").objects, 1);
+    assert_eq!(s.class_tally("DEEP_ARCHIVE").bytes, 4);
+    assert_eq!(s.class_sum(), (s.objects, s.bytes));
+
+    // ⑥ Copy:目标类入账(未带头继承源类)
+    e.copy_object_version("b1", "mp1", None, "b1", "cp1", None, None, None, None)
+        .unwrap();
+    let s = bstats(&e);
+    assert_eq!((s.objects, s.bytes), (4, 29));
+    assert_eq!(s.class_tally("DEEP_ARCHIVE").objects, 2, "copy 继承源类");
+    assert_eq!(s.class_sum(), (s.objects, s.bytes));
+
+    // ⑦ 写入恒 v3
+    let m = e.meta().get_bucket("b1").unwrap().unwrap();
+    let v3 = m.encode_value().unwrap();
+    assert_eq!(v3[0], fs3_core::BUCKET_META_VERSION, "写入恒 v3");
+    // (v2 存量双读补空表在 fs3-core bucket_meta_value_version_roundtrip 覆盖)
+
+    // ⑧ 显式标准复制(请求头 STANDARD):真实类 None,分账入 STANDARD
+    put(&mut e, "g3", b"zz".to_vec(), Some("GLACIER"))?;
+    e.copy_object_with_lock_ev(
+        "b1",
+        "g3",
+        None,
+        "b1",
+        "cp2",
+        None,
+        None,
+        None,
+        None,
+        fs3_core::VersioningState::Off,
+        None,
+        None,
+        ObjectLockWrite::default(),
+        None,
+        Some("STANDARD".into()),
+        fs3_core::promote_storage_class(Some("STANDARD")),
+    )
+    .unwrap();
+    let m = e.meta().get_object("b1", "cp2").unwrap().unwrap();
+    assert_eq!(m.storage_class, None, "显式 STANDARD 复制 → None");
+    let s = bstats(&e);
+    assert_eq!((s.objects, s.bytes), (6, 33));
+    assert_eq!(s.class_tally("GLACIER").objects, 1);
+    assert_eq!(s.class_tally("GLACIER").bytes, 2);
+    assert_eq!(s.class_tally("STANDARD").objects, 3, "s1 + g1覆盖 + cp2");
+    assert_eq!(s.class_tally("STANDARD").bytes, 23);
+    assert_eq!(s.class_sum(), (s.objects, s.bytes));
     e.abort();
     Ok(())
 }
