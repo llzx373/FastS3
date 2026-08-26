@@ -274,6 +274,14 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 export const api = {
   login: (username: string, password: string) =>
     request<{ token: string; role: string; username: string }>("POST", "/api/login", { username, password }),
+  // ADR-21 DL3:OIDC 控制台 SSO
+  oidcDiscovery: () =>
+    request<{ enabled: boolean; authorize_url: string; issuer: string }>("GET", "/api/oidc/discovery"),
+  oidcLogin: (id_token: string, nonce: string) =>
+    request<{ token: string; role: string; username: string }>("POST", "/api/oidc/login", {
+      id_token,
+      nonce,
+    }),
 
   dashboard: () => request<Dashboard>("GET", "/api/dashboard"),
 

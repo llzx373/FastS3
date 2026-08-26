@@ -61,9 +61,16 @@ export function authPlugin(app: {
     return undefined as JwtClaims | undefined;
   });
   app.addHook("preHandler", async (req: FastifyRequest, reply: FastifyReply) => {
-    // 登录/健康检查/首启探测/静态资源免认证
+    // 登录/健康检查/首启探测/OIDC SSO(ADR-21 DL3 登录一刻)/静态资源免认证
     const p = req.url.split("?")[0];
-    if (p === "/api/login" || p === "/api/health" || p === "/api/bootstrap" || !p.startsWith("/api/")) {
+    if (
+      p === "/api/login" ||
+      p === "/api/health" ||
+      p === "/api/bootstrap" ||
+      p === "/api/oidc/discovery" ||
+      p === "/api/oidc/login" ||
+      !p.startsWith("/api/")
+    ) {
       return;
     }
     const h = req.headers.authorization;

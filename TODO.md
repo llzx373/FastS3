@@ -125,13 +125,13 @@
 - [x] R1-2 中心:sync 任务 CRUD(源/目标桶与节点、调度、mode=mirror/增量)+ 下发 ops 白名单 7 类 → 8 类扩展 + 账本入账/对账
 - [x] R1-3 节点:本地调度执行 mc mirror/rclone(经本地 admin 编排;节流档;失败重试与 rejected 显式上报)
 - [x] R1-4 健康/对账视图(任务状态/lag/校验和 + 告警)+ 控制台同步任务页
-- [ ] R1-5 演练:双节点互备 drill(断线重连恰好同步一次、拔中心后按最后配置安全停止/继续语义实测)+ 文档化
+- [x] R1-5 演练:双节点互备 drill(断线重连恰好同步一次、拔中心后按最后配置安全停止/继续语义实测)+ 文档化
 
 ### L. LDAP / OpenID(≈2 pw;ADR-21;立项条件 = 企业 SSO 诉求)
-- [ ] L1-1 ADR-21:LDAP 组 → FastS3 密钥/角色映射模型(bind 凭据管理;密码不落盘不进数据面)
-- [ ] L1-2 Node 管理面 LDAP 目录同步(用户/组查询;组 → 密钥创建/禁用/删除策略;周期同步 + 失败告警)
-- [ ] L1-3 OIDC SSO 控制台登录(JWT 角色映射;浏览器免 LDAP 密码;与既有 JWT 会话共存)
-- [ ] L1-4 审计(身份来源/映射变更可检索)+ 集成测试(mock LDAP/OIDC)+ 部署文档
+- [x] L1-1 ADR-21:LDAP 组 → FastS3 密钥/角色映射模型(bind 凭据管理;密码不落盘不进数据面)
+- [x] L1-2 Node 管理面 LDAP 目录同步(用户/组查询;组 → 密钥创建/禁用/删除策略;周期同步 + 失败告警)
+- [x] L1-3 OIDC SSO 控制台登录(JWT 角色映射;浏览器免 LDAP 密码;与既有 JWT 会话共存)
+- [x] L1-4 审计(身份来源/映射变更可检索)+ 集成测试(mock LDAP/OIDC)+ 部署文档
 
 ### B. Batch Operations(后置评估,≈2~3 pw;立项条件 = 批量运维诉求;前置 = M15 通知底座 ✅)
 - [ ] B1-1 ADR:Job 状态机 + CSV manifest 模型(CreateJob/GetJob/ListJobs;操作集 copy/delete/restore/tag 起步)

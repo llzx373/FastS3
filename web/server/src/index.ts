@@ -34,6 +34,8 @@ import { readFileSync } from "node:fs";
 import { WebSocketServer } from "ws";
 import { loadConfig, listenHostPort, type WebConfig } from "./config.js";
 import { authPlugin, issueToken, requireRole, verifyJwt, type JwtClaims } from "./auth.js";
+import { IdentityEvents, LdapSync, type LdapSyncConfig } from "./ldap-sync.js";
+import { OidcVerifier, OidcError, type OidcConfig } from "./oidc.js";
 import { AdminClient } from "./admin-client.js";
 import { AdminWsClient } from "./admin-ws.js";
 import { S3Client, S3M10Client, type BucketCorsRule, type LifecycleRule, type ObjectLockConfig, type S3Tag } from "./s3-client.js";
@@ -49,6 +51,12 @@ export interface ServerDeps {
   cfg: WebConfig;
   /** 指标历史环形缓冲(共享实例;缺省时 buildServer 自建) */
   metricsHistory?: MetricsHistory;
+  /** 身份集成(ADR-21;测试注入,缺省时按 cfg 惰性装配) */
+  identity?: {
+    events: IdentityEvents;
+    ldap: LdapSync;
+    oidc: OidcVerifier;
+  };
 }
 
 /** 读取 web/server/package.json 的 version(进程启动时缓存一次)。 */
@@ -71,6 +79,15 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   const { admin, s3, cfg } = deps;
   const history = deps.metricsHistory ?? new MetricsHistory();
 
+  // ── 身份集成(ADR-21):LDAP 同步器 + OIDC 校验器 + 身份事件缓冲 ──
+  const identity = deps.identity ?? {
+    events: new IdentityEvents(),
+    ldap: new LdapSync(cfg.ldap as LdapSyncConfig, admin, new IdentityEvents()),
+    oidc: new OidcVerifier(cfg.oidc as OidcConfig),
+  };
+  // ADR-21 DL1:LDAP 目录同步 worker(仅启用时;立即首轮 + 周期,unref)
+  if (cfg.ldap.enabled) identity.ldap.start();
+
   // ── 登录(无认证) ──
   app.post("/api/login", async (req, reply) => {
     const body = req.body as { username?: string; password?: string } | null;
@@ -83,6 +100,66 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       });
     }
     return { token: issueToken(user, cfg.jwtSecret), role: user.role, username: user.username };
+  });
+
+  // ── OIDC 控制台 SSO(ADR-21 DL3;登录一刻身份证明,无认证) ──
+  app.get("/api/oidc/discovery", async (_req, reply) => {
+    if (!cfg.oidc.enabled) {
+      return reply.code(404).send({ error: { code: "oidc_disabled", message: "OIDC 未启用" } });
+    }
+    try {
+      const disc = await identity.oidc.discovery();
+      return reply.send({
+        enabled: true,
+        authorize_url: `${disc.authorization_endpoint}?response_type=id_token&client_id=${encodeURIComponent(
+          cfg.oidc.client_id,
+        )}&redirect_uri=${encodeURIComponent(cfg.oidc.redirect_uri)}&scope=openid%20email&nonce=NONCE_PLACEHOLDER`,
+        issuer: disc.issuer,
+      });
+    } catch (e) {
+      const status = e instanceof OidcError ? e.status : 503;
+      return reply.code(status).send({ error: { code: "oidc_unavailable", message: (e as Error).message } });
+    }
+  });
+
+  app.post("/api/oidc/login", async (req, reply) => {
+    if (!cfg.oidc.enabled) {
+      return reply.code(404).send({ error: { code: "oidc_disabled", message: "OIDC 未启用" } });
+    }
+    const body = req.body as { id_token?: string; nonce?: string } | null;
+    const idToken = body?.id_token ?? "";
+    const nonce = body?.nonce ?? "";
+    if (!idToken || !nonce) {
+      return reply.code(400).send({ error: { code: "bad_request", message: "id_token + nonce required" } });
+    }
+    try {
+      const r = await identity.oidc.verifyIdToken(idToken, nonce);
+      const user = { username: r.subject, password: "", role: r.role } as never;
+      identity.events.push({
+        source: "oidc",
+        action: "login",
+        detail: `subject=${r.subject} role=${r.role}${r.email ? ` email=${r.email}` : ""}`,
+      });
+      return reply.send({ token: issueToken(user, cfg.jwtSecret), role: r.role, username: r.subject });
+    } catch (e) {
+      const status = e instanceof OidcError ? e.status : 500;
+      return reply.code(status).send({ error: { code: "oidc_login_failed", message: (e as Error).message } });
+    }
+  });
+
+  // ── 身份集成状态/事件(管理面;JWT) ──
+  app.get("/api/ldap/status", async (_req, reply) => {
+    try {
+      return reply.send(identity.ldap.status());
+    } catch (e) {
+      return reply.code(502).send({ error: { code: "bad_config", message: (e as Error).message } });
+    }
+  });
+
+  app.get("/api/identity-events", async (req, reply) => {
+    const q = req.query as Record<string, string>;
+    const limit = Math.min(Number(q.limit ?? "100") || 100, 500);
+    return reply.send({ total: identity.events.list(limit).length, events: identity.events.list(limit) });
   });
 
   // ── 健康检查(无认证) ──

@@ -48,7 +48,73 @@
 **联系渠道**:GitHub Security Advisory(私有报告)优先;issue 模板含
 「疑似安全缺陷」标记路径。外部安全审计计划见 GA 检查单 ④(docs/ga/checklist.md)。
 
-## 4. 发布产物信任链
+## 4. 身份集成(ADR-21;LDAP 目录同步 + OIDC 控制台 SSO)
+
+> 管理面特性,数据面零改动(数据面仍只认 access key)。配置位于
+> web/server config.json(`ldap` / `oidc` 段)或 `FS3_LDAP_*` /
+> `FS3_OIDC_*` 环境变量。
+
+### 4.1 LDAP 目录同步(组 → 密钥生命周期)
+
+```json
+{
+  "ldap": {
+    "enabled": true,
+    "url": "ldaps://ldap.corp:636",
+    "bind_dn": "cn=fasts3-sync,ou=service,dc=corp",
+    "bind_password": "来自环境变量 FS3_LDAP_BIND_PASSWORD(推荐)",
+    "base_dn": "ou=groups,dc=corp",
+    "group_filter": "(objectClass=groupOfNames)",
+    "groups": ["s3-admin", "s3-backup"],
+    "key_prefix": "ldap-",
+    "sync_interval_secs": 300
+  }
+}
+```
+
+- 每个配置组对应一个数据面 access key(`<key_prefix><组名>`);
+  组存在且有成员 → 自动创建/启用密钥;组消失或无成员 → 禁用密钥
+  (不删除);组从配置移除 → 删除密钥。
+- **bind 密码仅进程内存持有**,不落盘、不进数据面、不进审计
+  (G1-3 同构);配置文件中明文 = 运维责任,生产用环境变量注入。
+- 目录不可达/绑定失败 → 本轮跳过(不动任何密钥,防误删),状态见
+  `GET /api/ldap/status`,事件见 `GET /api/identity-events`。
+
+### 4.2 OIDC 控制台 SSO
+
+```json
+{
+  "oidc": {
+    "enabled": true,
+    "issuer": "https://sso.corp/realms/main",
+    "client_id": "fasts3-console",
+    "redirect_uri": "https://fasts3.example.com/",
+    "role_claim": "roles",
+    "admin_values": ["fasts3-admin"],
+    "readonly_values": ["fasts3-viewer"],
+    "fallback_role": ""
+  }
+}
+```
+
+- 登录页出现「使用 OIDC 单点登录」:跳转 issuer authorize(implicit
+  flow,`response_type=id_token`)→ 浏览器回跳携带 id_token → 服务端
+  校验(iss/aud/exp/nonce + JWKS RS256 或 HS256 client_secret)→ 签发
+  既有本地会话 JWT(8h,与账号密码登录共存)。
+- 角色映射 = `role_claim` 取值命中 `admin_values` / `readonly_values`;
+  未命中且 `fallback_role` 为空 → 拒绝登录。
+- issuer 不可达 → 明确报错,回退本地账号登录;会话生命周期不依赖
+  issuer 在线(无状态 HS256)。
+- 取舍:不做 authorization code + PKCE(内网管理面 implicit 够用,
+  ADR-21 DL4 范围外)。
+
+### 4.3 身份审计
+
+- `GET /api/identity-events?limit=N`:LDAP 密钥创建/启用/禁用/删除/
+  同步跳过与 OIDC 登录事件(内存环形缓冲 ≤500 条,进程重启即失,
+  文档化;需要持久化请接日志采集)。
+
+## 5. 发布产物信任链
 
 - **签名**:minisign 优先,openssl pkeyutl ed25519 回退(`tools/package/sign.sh`);
   公钥随 RELEASES 发布;校验:`tools/package/verify-release.sh`。
