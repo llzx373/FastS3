@@ -382,6 +382,14 @@ pub enum Op {
     EventDelete {
         seq: u64,
     },
+    /// STS 会话写入(M15 T1;ADR-18 D-E2;覆盖语义;`s:session\0{id}` 键)。
+    SessionPut {
+        record: fs3_core::SessionRecord,
+    },
+    /// STS 会话删除(撤销;幂等)。
+    SessionDelete {
+        session_id: String,
+    },
     /// 对象标签单事务读改写(M10 S1;PutObjectTagging/DeleteObjectTagging
     /// 落地):`vk = None` → 未版本化单键 `o:{b}\0{k}`;`Some(vk)` → 版本键
     /// (含 VK_NULL null 槽)。仅 tags 字段变更,不触碰数据段/统计;
@@ -724,6 +732,17 @@ fn decode_event_record(v: &[u8]) -> Result<fs3_core::EventRecord> {
                 dead: false,
             })
         }
+    }
+}
+
+/// M15 T1 会话值解码(ADR-18 D-E2;双读:新格式优先,失败回退初版——
+/// 结构尾部只追加字段,零迁移;照 decode_event_record 先例)。
+fn decode_sts_session(v: &[u8]) -> Result<fs3_core::SessionRecord> {
+    match postcard::from_bytes::<fs3_core::SessionRecord>(v) {
+        Ok(r) => Ok(r),
+        Err(e) => Err(Error::Corrupt(format!(
+            "postcard decode session record: {e}"
+        ))),
     }
 }
 
@@ -2428,6 +2447,44 @@ impl MetaStore {
         Ok(n as u64)
     }
 
+    // ── M15 T1:STS 会话(ADR-18 D-E2;`s:session` 系统键族) ──
+
+    /// 会话写入/更新(M15 T1;管理面签发后落库;覆盖语义)。
+    pub fn put_session(&self, record: &fs3_core::SessionRecord) -> Result<u64> {
+        self.commit(&[Op::SessionPut {
+            record: record.clone(),
+        }])
+    }
+
+    /// 会话读取(数据面 `x-amz-security-token` 校验入口)。
+    pub fn get_session(&self, session_id: &str) -> Result<Option<fs3_core::SessionRecord>> {
+        match self
+            .db
+            .get(sts_session_key(session_id))
+            .map_err(rocks_err)?
+        {
+            Some(v) => decode_sts_session(&v).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// 会话撤销(删键;剩余 TTL 内新会话重签)。幂等:不存在同样 Ok。
+    pub fn delete_session(&self, session_id: &str) -> Result<u64> {
+        self.commit(&[Op::SessionDelete {
+            session_id: session_id.to_string(),
+        }])
+    }
+
+    /// 全量会话列表(管理面展示/审计;键序 = session_id 字典序)。
+    pub fn list_sessions(&self) -> Result<Vec<fs3_core::SessionRecord>> {
+        let mut out = Vec::new();
+        for item in scan_prefix(&self.db, PREFIX_SESSION) {
+            let (_k, v) = item?;
+            out.push(decode_sts_session(&v)?);
+        }
+        Ok(out)
+    }
+
     /// 对象标签单事务读改写(M10 S1):`vk = None` → 未版本化单键;
     /// `Some(vk)` → 版本键(含 VK_NULL null 槽)。目标不存在 → NotFound。
     pub fn commit_object_set_tags(
@@ -3420,6 +3477,13 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
             }
             Op::EventDelete { seq } => {
                 tremove(tx, &event_key(*seq))?;
+            }
+            Op::SessionPut { record } => {
+                // s: 系统键族,无桶锚定;与既有会话同 id 覆盖(重签语义)
+                tinsert(tx, sts_session_key(&record.session_id), encode(record)?)?;
+            }
+            Op::SessionDelete { session_id } => {
+                tremove(tx, &sts_session_key(session_id))?;
             }
             Op::ObjectSetTags {
                 bucket,

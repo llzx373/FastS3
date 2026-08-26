@@ -375,6 +375,22 @@ impl Authenticator {
         self.find_key(access_key)
     }
 
+    /// M15 T2:仅解析 Authorization 头中的 Credential access key(不解析
+    /// 签名、不查密钥表;会话路径先用 token 找会话,再按派生 secret 验签)。
+    /// 无 Authorization 头 → None。
+    pub fn peek_access_key(&self, headers: &[(String, String)]) -> Option<String> {
+        let auth_header = headers
+            .iter()
+            .find(|(k, _)| k == "authorization")
+            .map(|(_, v)| v.trim().to_string())?;
+        // Authorization: AWS4-HMAC-SHA256 Credential=AK/date/region/s3/aws4_request, ...
+        let rest = auth_header.split_once(' ')?.1;
+        let cred_part = rest
+            .split(',')
+            .find_map(|part| part.trim().strip_prefix("Credential="))?;
+        cred_part.split('/').next().map(String::from)
+    }
+
     /// 共享密钥表(admin API 通过它运行时增删密钥)。
     pub fn key_table(&self) -> &Arc<parking_lot::RwLock<Vec<Credentials>>> {
         &self.keys
@@ -394,6 +410,34 @@ impl Authenticator {
         path: &str,
         query: &[(String, String)],
         headers: &[(String, String)],
+    ) -> Result<AuthOutcome, S3Error> {
+        self.verify_header_auth_impl(method, path, query, headers, None)
+    }
+
+    /// M15 T2(ADR-18 D-E2):会话凭证校验——Credential scope 的 access key
+    /// 不在常驻密钥表(临时会话凭证),由调用方给出已解析的临时 secret
+    /// (从 SessionRecord 的基密钥派生/回读;secret 明文不入表,验签用
+    /// 后即弃)。`session_secret` = Some → 用其验签(替代 find_key);
+    /// None = 常驻密钥表路径。其余语义(时间/区域/载荷哈希/签名核对)
+    /// 与 verify_header_auth 逐字节一致。
+    pub fn verify_header_auth_sessions(
+        &self,
+        method: &str,
+        path: &str,
+        query: &[(String, String)],
+        headers: &[(String, String)],
+        session_secret: Option<&str>,
+    ) -> Result<AuthOutcome, S3Error> {
+        self.verify_header_auth_impl(method, path, query, headers, session_secret)
+    }
+
+    fn verify_header_auth_impl(
+        &self,
+        method: &str,
+        path: &str,
+        query: &[(String, String)],
+        headers: &[(String, String)],
+        session_secret: Option<&str>,
     ) -> Result<AuthOutcome, S3Error> {
         let auth_header = headers
             .iter()
@@ -419,11 +463,18 @@ impl Authenticator {
             })?;
         check_time_skew(&amz_date, self.now())?;
 
-        // 凭据
-        let cred = self.find_key(&parsed.access_key).ok_or_else(|| {
-            S3Error::new(S3ErrorCode::InvalidAccessKeyId)
-                .with_message("The AWS access key ID you provided does not exist in our records.")
-        })?;
+        // 凭据:常驻密钥表;会话路径由调用方给临时 secret(明文不入表)
+        let (access_key_id, secret_key) = match session_secret {
+            Some(sec) => (parsed.access_key.clone(), sec.to_string()),
+            None => {
+                let cred = self.find_key(&parsed.access_key).ok_or_else(|| {
+                    S3Error::new(S3ErrorCode::InvalidAccessKeyId).with_message(
+                        "The AWS access key ID you provided does not exist in our records.",
+                    )
+                })?;
+                (cred.access_key.clone(), cred.secret_key)
+            }
+        };
         if parsed.region != self.region || parsed.service != SERVICE {
             return Err(S3Error::new(S3ErrorCode::AuthorizationHeaderMalformed)
                 .with_message("credential scope region/service mismatch"));
@@ -439,12 +490,12 @@ impl Authenticator {
             headers,
             &parsed,
             &amz_date,
-            &cred.secret_key,
+            &secret_key,
             &payload_hash,
         )?;
 
         Ok(AuthOutcome::Authenticated {
-            access_key: parsed.access_key,
+            access_key: access_key_id,
             payload_hash,
             seed_signature: Some(parsed.signature),
             amz_date,

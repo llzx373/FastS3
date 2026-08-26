@@ -114,6 +114,13 @@ pub struct ReadinessReport {
     pub checks: Vec<(&'static str, bool, String)>,
 }
 
+/// 待认证身份(会话感知路径):`who` = 审计身份(基密钥或常驻密钥);
+/// `session` = 会话记录(带入 authorize 求交)。
+pub struct AuthIdentity {
+    pub who: String,
+    pub session: Option<Arc<fs3_core::SessionRecord>>,
+}
+
 pub struct S3Service {
     engine: Arc<parking_lot::RwLock<Engine>>,
     auth: Authenticator,
@@ -549,12 +556,19 @@ impl S3Service {
     /// - 匿名请求:仅桶策略 Allow 放行;NoMatch 在此放行后由 require_auth 的
     ///   全局匿名开关兜底(读)或拒绝(写);显式 Deny 在此直接拒绝。
     ///
+    /// M15 T2(ADR-18 D-E2):会话请求(身份.session = Some)多一层
+    /// **会话策略求交**——最终权限 = 基密钥策略 ∩ 会话策略(先与桶策略
+    /// 双层求交的语义叠加):会话策略显式 Deny → 拒绝;会话策略非显式
+    /// Allow → 拒绝(会话 = 作用域下限,「未显式放行 = 不放行」,与
+    /// AWS session policy 语义一致)。会话策略不参与匿名路径(匿名无
+    /// 会话)。
+    ///
     /// `action` 为审计操作名(如 PutObject;经 s3_action_name 归一为 S3 动作);
     /// `bucket`/`key` 构成资源 ARN。无策略/未知密钥 → 放行(密钥有效性已由
     /// 认证把关)。PostObject 不经此入口(键在表单体内,op_post_object 自判)。
     fn authorize(
         &self,
-        access: Option<&str>,
+        auth: Option<&AuthIdentity>,
         action: &str,
         bucket: &str,
         key: &str,
@@ -564,6 +578,7 @@ impl S3Service {
         let resource = resource_arn(bucket, key);
         let action = s3_action_name(action, bucket, key);
         let ctx = self.policy_ctx(req, bucket, key);
+        let access = auth.map(|a| a.who.as_str());
         let denied = || {
             S3Error::new(S3ErrorCode::AccessDenied).with_message(format!(
                 "access key {} is not authorized for {action} on {resource}",
@@ -584,6 +599,24 @@ impl S3Service {
         };
         if key_decision == Decision::Deny {
             return Err(denied());
+        }
+        // M15 T2:会话策略求交(显式 Deny → 拒绝;非显式 Allow → 拒绝;
+        // 会话 = 作用域下限)
+        if let Some(a) = auth {
+            if let Some(sess) = &a.session {
+                if let Some(sp) = &sess.session_policy {
+                    match crate::policy::Policy::parse(sp) {
+                        Ok(p) => {
+                            let sd = p.decide(action, &resource, true, &ctx);
+                            if sd != Decision::Allow {
+                                return Err(denied());
+                            }
+                        }
+                        // 策略解析失败(存量脏数据)→ 保守拒绝(绝不扩权)
+                        Err(_) => return Err(denied()),
+                    }
+                }
+            }
         }
         // —— 桶层(服务级操作无桶 → NoMatch)——
         let bucket_decision = if bucket.is_empty() {
@@ -619,7 +652,7 @@ impl S3Service {
     /// 有策略则必须显式 Allow,ADR-13 DL7)。无头不走此检查。
     fn authorize_bypass_if_requested(
         &self,
-        access: Option<&str>,
+        auth: Option<&AuthIdentity>,
         name: &str,
         bucket: &str,
         key: &str,
@@ -631,7 +664,7 @@ impl S3Service {
         if !matches!(name, "PutObjectRetention" | "DeleteObject") {
             return Ok(());
         }
-        self.authorize(access, "BypassGovernanceRetention", bucket, key, req)
+        self.authorize(auth, "BypassGovernanceRetention", bucket, key, req)
     }
 
     /// M4 D4 掉盘只读降级:写方法(PUT/POST/DELETE)在降级期一律拒绝,
@@ -703,16 +736,154 @@ impl S3Service {
         self.auth.find_key_by_access(access_key)
     }
 
+    // ── M15 T1/T2:STS 临时凭证(ADR-18 D-E2) ──
+
+    /// TTL 默认(1h)与上限(36h = AWS GetSessionToken 上限对齐)。
+    pub const STS_TTL_DEFAULT_SECS: i64 = 3600;
+    pub const STS_TTL_MAX_SECS: i64 = 36 * 3600;
+
+    /// 签发会话(T1;管理面经 admin API 调用):基于既有密钥签发临时
+    /// 凭证。语义(ADR-18 D-E2):
+    /// - 会话 = 基密钥 + 会话策略求交,无角色派生;
+    /// - **临时 secret = HMAC-SHA256(基密钥 secret, "fasts3-session:" +
+    ///   会话 id)确定性派生**——数据面可重算验签、明文零落盘;本函数
+    ///   只回显一次派生值,库中仅存 SHA-256 哈希比对子;
+    /// - TTL 默认 1h,上限对齐 AWS(36h),越界 → InvalidArgument。
+    ///
+    /// 返回 (session_id, 临时 secret 明文[仅一次], SessionRecord);
+    /// `issued_by` = 签发者(管理面 access key;审计)。
+    pub fn issue_session(
+        &self,
+        base_access_key: &str,
+        session_policy: Option<String>,
+        ttl_secs: Option<i64>,
+        issued_by: &str,
+    ) -> Result<(String, String, fs3_core::SessionRecord), S3Error> {
+        // 基密钥必须存在且启用(会话不能建立在幽灵密钥上)
+        let engine = self.engine.read();
+        let meta = engine.meta();
+        let base = meta
+            .get_key(base_access_key)
+            .map_err(|e| map_engine_error(e, "", ""))?
+            .ok_or_else(|| {
+                S3Error::new(S3ErrorCode::InvalidToken)
+                    .with_message(format!("base key {base_access_key} does not exist"))
+            })?;
+        if !base.enabled {
+            return Err(S3Error::new(S3ErrorCode::InvalidToken)
+                .with_message(format!("base key {base_access_key} is disabled")));
+        }
+        if let Some(p) = &session_policy {
+            if crate::policy::Policy::parse(p).is_err() {
+                return Err(S3Error::new(S3ErrorCode::MalformedPolicy)
+                    .with_message("session policy is not a valid AWS policy document"));
+            }
+        }
+        let ttl = ttl_secs.unwrap_or(Self::STS_TTL_DEFAULT_SECS);
+        if !(300..=Self::STS_TTL_MAX_SECS).contains(&ttl) {
+            return Err(
+                S3Error::new(S3ErrorCode::InvalidArgument).with_message(format!(
+                    "DurationSeconds must be between 300 and {} (got {ttl})",
+                    Self::STS_TTL_MAX_SECS
+                )),
+            );
+        }
+        // 会话 id(32 hex)
+        let session_id: String = {
+            let mut buf = [0u8; 16];
+            fs3_core::random_bytes(&mut buf).map_err(|e| map_engine_error(e, "", ""))?;
+            hex::encode(buf)
+        };
+        // 临时 credentials:AccessKeyId(会话绑定;SigV4 scope 用)派生自
+        // 会话 id(前缀区分会话族,32 字符大写字母数字),不与常驻密钥
+        // 表冲突;secret = HMAC(base_secret, "fasts3-session:"+id)
+        let temporary_access_key: String = {
+            let mut buf = [0u8; 16];
+            fs3_core::random_bytes(&mut buf).map_err(|e| map_engine_error(e, "", ""))?;
+            const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+            let body: String = buf
+                .iter()
+                .map(|b| CHARS[(*b as usize) % CHARS.len()] as char)
+                .collect();
+            format!("FSST{}", body) // 20 字符
+        };
+        // 基密钥明文 secret(运行时认证表;签发侧同样经此取用)
+        let base_secret = self
+            .auth
+            .find_key_by_access(base_access_key)
+            .map(|c| c.secret_key)
+            .ok_or_else(|| {
+                S3Error::new(S3ErrorCode::InvalidToken)
+                    .with_message("the base key credentials are not loaded in this instance")
+            })?;
+        let secret = derive_session_secret(&base_secret, &session_id);
+        let now = unix_now() as i64;
+        let record = fs3_core::SessionRecord {
+            session_id: session_id.clone(),
+            temporary_access_key: temporary_access_key.clone(),
+            base_access_key: base_access_key.to_string(),
+            session_policy,
+            expires_at: now + ttl,
+            secret_hash: fs3_core::SessionRecord::hash_secret(&secret),
+            issued_at: now,
+            issued_by: issued_by.to_string(),
+        };
+        meta.put_session(&record)
+            .map_err(|e| map_engine_error(e, "", ""))?;
+        Ok((temporary_access_key, secret, record))
+    }
+
+    /// 数据面会话解析(T2;`x-amz-security-token` 头 == session_id):
+    /// 校验会话存在、未过期、secret 哈希比对。返回 SessionRecord(供
+    /// 基密钥求交鉴权);过期/不存在 → InvalidToken 显式错误。
+    pub fn resolve_session(
+        &self,
+        token: &str,
+        claimed_secret: &str,
+    ) -> Result<fs3_core::SessionRecord, S3Error> {
+        let engine = self.engine.read();
+        let rec = engine
+            .meta()
+            .get_session(token)
+            .map_err(|e| map_engine_error(e, "", ""))?
+            .ok_or_else(|| {
+                S3Error::new(S3ErrorCode::InvalidToken)
+                    .with_message("The security token included in the request is invalid.")
+            })?;
+        if rec.expired(unix_now() as i64) {
+            return Err(S3Error::new(S3ErrorCode::InvalidToken)
+                .with_message("The provided security token has expired."));
+        }
+        if !rec.verify_secret(claimed_secret) {
+            return Err(S3Error::new(S3ErrorCode::InvalidToken)
+                .with_message("The security token does not match the session credentials."));
+        }
+        Ok(rec)
+    }
+
+    /// 会话撤销(管理面;幂等)。
+    pub fn revoke_session(&self, session_id: &str) -> Result<(), S3Error> {
+        self.engine
+            .read()
+            .meta()
+            .delete_session(session_id)
+            .map_err(|e| map_engine_error(e, "", ""))?;
+        Ok(())
+    }
+
     /// 主入口包装:计时 + 指标 + 审计(H2)。
     pub fn handle(&self, req: &S3Request) -> Result<ServiceResponse, S3Error> {
         let start = std::time::Instant::now();
         // M4 D4 时钟回拨监控(每请求采样;廉价原子比较)
         self.check_clock(unix_now() as i64);
-        // 审计需要 who(access key):提前认证一次(仅查表/HMAC,无副作用;
-        // 内部 handle_inner 仍会认证——M5 性能冲刺时合并)
-        let access = self.authenticate(req).ok().flatten();
+        // 审计需要 who(access key):提前认证一次(M15 T2 起会话感知:
+        // 带 x-amz-security-token 的请求按会话路径解析,授权求交
+        // 会话策略;内部 handle_inner 仍会认证——M5 性能冲刺时合并)
+        let auth = self.authenticate_full(req).ok().flatten();
+        let access: Option<&str> = auth.as_ref().map(|a| a.who.as_str());
         let (op, name, bucket, key) = route_op_bucket_key(req);
-        // H4 每密钥限速:超限 503 SlowDown + Retry-After(AWS 节流语义)
+        // H4 每密钥限速:超限 503 SlowDown + Retry-After(AWS 节流语义;
+        // 会话请求按基密钥计)
         if let Some(ak) = &access {
             if !self.limiter.check(ak) {
                 self.metrics.record_error("SlowDown");
@@ -722,11 +893,12 @@ impl S3Service {
             }
         }
         // J4 密钥策略 × M10 S3 桶策略双层求交(Deny 优先;同账号 Allow 并集)。
+        // M15 T2:会话请求另加会话策略求交(见 authorize)。
         // PostObject 除外:键在表单体内,授权(含匿名桶策略放行)由
         // op_post_object 解析后按真实键执行。
         if name != "PostObject" {
-            self.authorize(access.as_deref(), &name, &bucket, &key, req)?;
-            self.authorize_bypass_if_requested(access.as_deref(), &name, &bucket, &key, req)?;
+            self.authorize(auth.as_ref(), &name, &bucket, &key, req)?;
+            self.authorize_bypass_if_requested(auth.as_ref(), &name, &bucket, &key, req)?;
         }
         // M4 D4 掉盘只读降级:写方法在降级期拒绝(读不受影响)
         self.check_writable(req)?;
@@ -739,7 +911,7 @@ impl S3Service {
             }
         };
         self.metrics.record(op, status, start.elapsed(), 0);
-        self.audit_record(access.as_deref(), &name, &bucket, &key, status);
+        self.audit_record(access, &name, &bucket, &key, status);
         result
     }
 
@@ -912,6 +1084,142 @@ impl S3Service {
         }
     }
 
+    /// M15 T2(ADR-18 D-E2):会话感知认证——请求带
+    /// `x-amz-security-token` 时按会话路径解析(临时 AK → 会话记录 →
+    /// 派生临时 secret 验签 → 基密钥 + 会话策略求交);无 token = 常驻
+    /// 密钥路径(与 authenticate 逐字节等价)。返回身份:审计 who =
+    /// 基密钥;authorize 用 [`AuthIdentity::session`] 施加会话策略求交。
+    ///
+    /// **临时 secret 确定性派生**(数据面可重算验签、明文零落盘):
+    /// `session_secret = HMAC-SHA256(base_secret, "fasts3-session:" +
+    /// session_id)`;签发侧与本侧同式;库中只存 SHA-256 哈希比对子
+    /// (Record.verify_secret 双保险)。派生可计算性不构成提权:会话权限
+    /// = 基密钥 ∩ 会话策略 ⊆ 基密钥,故不可派生新权限(仅能重算
+    /// 「已签发会话自己的 secret」,该会话权限本就 ≤ 基密钥)。
+    fn authenticate_full(&self, req: &S3Request) -> Result<Option<AuthIdentity>, S3Error> {
+        let token = header(req, "x-amz-security-token");
+        match token {
+            // 会话路径:token 存在 → 会话记录先行(暂不解签) → 派生
+            // secret → 完整验签;会话失败显式 InvalidToken
+            Some(tok) => {
+                let parsed_ak = self.auth.peek_access_key(&req.headers);
+                let Some(parsed_ak) = parsed_ak else {
+                    // 带 token 但无签名:匿名不允许(会话必然伴随签名)
+                    return Err(S3Error::new(S3ErrorCode::InvalidToken)
+                        .with_message("x-amz-security-token requires signed credentials."));
+                };
+                let engine = self.engine.read();
+                let rec = engine
+                    .meta()
+                    .get_session(tok)
+                    .map_err(|e| map_engine_error(e, "", ""))?
+                    .ok_or_else(|| {
+                        S3Error::new(S3ErrorCode::InvalidToken)
+                            .with_message("The security token included in the request is invalid.")
+                    })?;
+                if parsed_ak != rec.temporary_access_key {
+                    return Err(S3Error::new(S3ErrorCode::InvalidToken).with_message(
+                        "The access key in the credential scope does not match the security token.",
+                    ));
+                }
+                if rec.expired(unix_now() as i64) {
+                    return Err(S3Error::new(S3ErrorCode::InvalidToken)
+                        .with_message("The provided security token has expired."));
+                }
+                // 基密钥必须仍存在且启用(密钥被删/禁用 → 会话立即失效)
+                let base_ak = rec.base_access_key.clone();
+                let base = engine
+                    .meta()
+                    .get_key(&base_ak)
+                    .map_err(|e| map_engine_error(e, "", ""))?
+                    .ok_or_else(|| {
+                        S3Error::new(S3ErrorCode::InvalidToken).with_message(format!(
+                            "the base key of the session ({base_ak}) no longer exists"
+                        ))
+                    })?;
+                if !base.enabled {
+                    return Err(
+                        S3Error::new(S3ErrorCode::InvalidToken).with_message(format!(
+                            "the base key of the session ({base_ak}) is disabled"
+                        )),
+                    );
+                }
+                drop(base);
+                // 派生临时 secret(确定性派生,数据面可重算验签;库中仅哈希)
+                let base_secret = self
+                    .auth
+                    .find_key_by_access(&base_ak)
+                    .map(|c| c.secret_key)
+                    .ok_or_else(|| {
+                        S3Error::new(S3ErrorCode::InvalidToken).with_message(
+                            "the base key credentials are not loaded in this instance",
+                        )
+                    })?;
+                let derived = derive_session_secret(&base_secret, tok);
+                if !rec.verify_secret(&derived) {
+                    return Err(S3Error::new(S3ErrorCode::InvalidToken).with_message(
+                        "the session secret derivation does not match the issued credentials.",
+                    ));
+                }
+                // 用派生 secret 验签(token 会话的 SigV4 按 AWS 语义:
+                // 签名基于临时 AK + 临时 secret)
+                let outcome = self.auth.verify_header_auth_sessions(
+                    &req.method,
+                    &req.raw_path,
+                    &req.query,
+                    &req.headers,
+                    Some(&derived),
+                )?;
+                match outcome {
+                    AuthOutcome::Authenticated {
+                        access_key: _ak, ..
+                    } => Ok(Some(AuthIdentity {
+                        who: base_ak,
+                        session: Some(Arc::new(rec)),
+                    })),
+                    AuthOutcome::Anonymous => Ok(None),
+                }
+            }
+            None => {
+                // 常驻密钥路径(与 authenticate 逐字节等价)
+                let outcome = self.auth.verify_header_auth(
+                    &req.method,
+                    &req.raw_path,
+                    &req.query,
+                    &req.headers,
+                )?;
+                match outcome {
+                    AuthOutcome::Anonymous => {
+                        let outcome = self.auth.verify_query_auth(
+                            &req.method,
+                            &req.raw_path,
+                            &req.query,
+                            &req.headers,
+                        )?;
+                        match outcome {
+                            AuthOutcome::Authenticated { access_key, .. } => {
+                                Ok(Some(AuthIdentity {
+                                    who: access_key,
+                                    session: None,
+                                }))
+                            }
+                            AuthOutcome::Anonymous => Ok(None),
+                        }
+                    }
+                    AuthOutcome::Authenticated { access_key, .. } => Ok(Some(AuthIdentity {
+                        who: access_key,
+                        session: None,
+                    })),
+                }
+            }
+        }
+    }
+
+    /// 会话 token 是否随请求携带(header 路径;`audit` 六维检索附加维用)。
+    pub fn session_token_of(&self, req: &S3Request) -> Option<String> {
+        header(req, "x-amz-security-token").map(String::from)
+    }
+
     /// M9/A1:未实现头显式拒绝(红线 6:静默忽略客户端头 = 拒绝合入)。
     ///
     /// - SSE-KMS 家族 / 网站重定向 → 501 NotImplemented
@@ -962,7 +1270,8 @@ impl S3Service {
     }
 
     fn require_auth(&self, req: &S3Request) -> Result<Option<String>, S3Error> {
-        let access = self.authenticate(req)?;
+        let auth = self.authenticate_full(req)?;
+        let access: Option<String> = auth.map(|a| a.who);
         if access.is_none() {
             // M10 S3:桶策略可对匿名显式授权(Principal "*" 且 Allow;读写同口径)。
             // 显式 Deny 已在 authorize 拒绝;NoMatch 落回既有语义(写拒绝/
@@ -1461,7 +1770,9 @@ impl S3Service {
         reader: &mut dyn Read,
     ) -> Result<ServiceResponse, S3Error> {
         let start = std::time::Instant::now();
-        let access = self.authenticate(req).ok().flatten();
+        // M15 T2 会话感知认证(带 x-amz-security-token → 会话路径)
+        let auth = self.authenticate_full(req).ok().flatten();
+        let access: Option<&str> = auth.as_ref().map(|a| a.who.as_str());
         let (op, name, bucket, key) = route_op_bucket_key(req);
         // H4 每密钥限速:流式路径(>8MiB PUT / aws-chunked / 大分片)与缓冲路径
         // 同语义——大数据上传恰是流量最大的路径,不能绕过令牌桶(REVIEW §2.5)。
@@ -1476,22 +1787,21 @@ impl S3Service {
         // J4 密钥策略 × M10 S3 桶策略双层求交(流式 PUT / UploadPart 同语义;
         // 认证失败在此体现为 handle_inner 的 AccessDenied,策略判定对未认证
         // 请求仅施加桶策略显式 Deny)
-        if let Err(e) = self.authorize(access.as_deref(), &name, &bucket, &key, req) {
+        if let Err(e) = self.authorize(auth.as_ref(), &name, &bucket, &key, req) {
             self.metrics.record_error(&e.code_name());
-            self.audit_record(access.as_deref(), &name, &bucket, &key, e.status());
+            self.audit_record(access, &name, &bucket, &key, e.status());
             return Err(e);
         }
-        if let Err(e) =
-            self.authorize_bypass_if_requested(access.as_deref(), &name, &bucket, &key, req)
+        if let Err(e) = self.authorize_bypass_if_requested(auth.as_ref(), &name, &bucket, &key, req)
         {
             self.metrics.record_error(&e.code_name());
-            self.audit_record(access.as_deref(), &name, &bucket, &key, e.status());
+            self.audit_record(access, &name, &bucket, &key, e.status());
             return Err(e);
         }
         // M4 D4 掉盘只读降级:写方法在降级期拒绝
         if let Err(e) = self.check_writable(req) {
             self.metrics.record_error(&e.code_name());
-            self.audit_record(access.as_deref(), &name, &bucket, &key, e.status());
+            self.audit_record(access, &name, &bucket, &key, e.status());
             return Err(e);
         }
         let result = self.put_object_stream_inner(req, reader);
@@ -1503,7 +1813,7 @@ impl S3Service {
             }
         };
         self.metrics.record(op, status, start.elapsed(), 0);
-        self.audit_record(access.as_deref(), &name, &bucket, &key, status);
+        self.audit_record(access, &name, &bucket, &key, status);
         result
     }
 
@@ -2868,9 +3178,15 @@ impl S3Service {
             }
         };
 
-        // —— 密钥策略 × 桶策略双层求交(动作 s3:PutObject)——
+        // —— 密钥策略 × 桶策略双层求交(动作 s3:PutObject;M15 T2 会话感知)——
         match &identity {
-            Some(ak) => self.authorize(Some(ak), "PutObject", bucket, &key, req)?,
+            Some(ak) => {
+                let ident = AuthIdentity {
+                    who: ak.clone(),
+                    session: None,
+                };
+                self.authorize(Some(&ident), "PutObject", bucket, &key, req)?
+            }
             None => {
                 if !self.anonymous_bucket_grant(
                     "PutObject",
@@ -6468,6 +6784,22 @@ fn unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// M15 T2(ADR-18 D-E2):会话临时 secret 确定性派生:
+/// `HMAC-SHA256(base_secret, "fasts3-session:" + session_id)` → hex。
+/// 签发侧与数据面同式(数据面可重算验签;明文零落盘,库中仅哈希)。
+/// 派生可计算性不构成提权:会话权限 ⊆ 基密钥(求交),故不可派生
+/// 「超出基密钥」的权限(仅能重算已签发会话自己的 secret)。
+pub fn derive_session_secret(base_secret: &str, session_id: &str) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac =
+        HmacSha256::new_from_slice(base_secret.as_bytes()).expect("hmac accepts any key length");
+    mac.update(b"fasts3-session:");
+    mac.update(session_id.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
 }
 
 #[cfg(test)]

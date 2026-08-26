@@ -9979,3 +9979,178 @@ fn bucket_notification_event_rollback_on_failed_put() {
     assert_eq!(recs.len(), 1, "只有成功 PUT(k2)入队;412 失败零事件");
     assert_eq!(recs[0].key, "k2", "失败请求未留下事件(零漂移)");
 }
+
+// ───────────────────── M15 T1/T2:STS 临时凭证(ADR-18 D-E2)─────────────────────
+
+/// 带任意凭据 + 附加头的已签名请求(会话请求构造用;头参与签名)。
+fn req_creds(
+    method: &str,
+    path: &str,
+    creds: &Credentials,
+    extra: &[(&str, &str)],
+    body: Vec<u8>,
+) -> S3Request {
+    let amz_date = auth::now_amz();
+    let hash = hex::encode(Sha256::digest(&body));
+    let mut headers: Vec<(String, String)> = Vec::new();
+    for (k, v) in extra {
+        headers.retain(|(kk, _)| !kk.eq_ignore_ascii_case(k));
+        headers.push((k.to_string(), v.to_string()));
+    }
+    let base: [(&str, String); 3] = [
+        ("host", "localhost:9000".into()),
+        ("x-amz-date", amz_date.clone()),
+        ("x-amz-content-sha256", hash.clone()),
+    ];
+    for (k, v) in base {
+        if !headers.iter().any(|(kk, _)| kk.eq_ignore_ascii_case(k)) {
+            headers.push((k.to_string(), v));
+        }
+    }
+    let auth_hdr = auth::sign_request(
+        creds,
+        "us-east-1",
+        method,
+        path,
+        &[],
+        &headers,
+        &amz_date,
+        &auth::PayloadHash::HexSha256(hash),
+    )
+    .unwrap();
+    headers.push(("authorization".into(), auth_hdr));
+    S3Request {
+        method: method.into(),
+        raw_path: path.into(),
+        decoded_path: path.into(),
+        host: "localhost".into(),
+        query: vec![],
+        headers,
+        body,
+    }
+}
+
+/// 签发 → 会话凭证访问数据面(SigV4 含 token,AWS 语义)→ 成功;
+/// 会话策略 Deny → 拒绝;过期/撤销 → InvalidToken;基密钥禁用 → 失效。
+#[test]
+fn sts_session_data_plane_roundtrip() {
+    use fs3_core::SessionRecord;
+    let (_d, svc) = setup();
+    // 基密钥落 k: 记录(issue_session/数据面会话校验都要求 meta 里有
+    // 可解密的密钥记录;S3Service 构造只灌了内存认证表)
+    svc.add_key("test", "secret123", None).unwrap();
+    // 建桶 + 写对象(常驻密钥)
+    svc.handle(&req("PUT", "/sts-bkt", vec![])).unwrap();
+    svc.handle(&req_q(
+        "PUT",
+        "/sts-bkt/base.txt",
+        &[],
+        b"base-data".to_vec(),
+    ))
+    .unwrap();
+    svc.handle(&req_q("PUT", "/sts-bkt/other.txt", &[], b"other".to_vec()))
+        .unwrap();
+
+    // ① 签发会话(带会话策略:仅 s3:GetObject on sts-bkt/*)
+    let policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::sts-bkt/*"]}]}"#;
+    let (temp_ak, secret, rec) = svc
+        .issue_session("test", Some(policy.to_string()), Some(3600), "admin")
+        .unwrap();
+    assert_eq!(rec.base_access_key, "test");
+    assert!(!rec.expired(1_700_000_000));
+    // 会话记录落在 meta(库中只有哈希比对子,无明文 secret)
+    let stored: SessionRecord = svc
+        .engine()
+        .read()
+        .meta()
+        .get_session(&rec.session_id)
+        .unwrap()
+        .expect("session persisted");
+    assert_eq!(stored.secret_hash, SessionRecord::hash_secret(&secret));
+    assert_ne!(stored.secret_hash, secret, "明文 secret 零落盘");
+    // 派生可重算(数据面验签路径)
+    let derived = fs3_s3::service::derive_session_secret("secret123", &rec.session_id);
+    assert_eq!(derived, secret, "签发/数据面派生同式");
+    assert!(stored.verify_secret(&derived));
+
+    // ② 会话 GET(带 x-amz-security-token)→ 200(会话策略 Allow)
+    let creds = Credentials {
+        access_key: temp_ak.clone(),
+        secret_key: secret.clone(),
+    };
+    let r = svc.handle(&req_creds(
+        "GET",
+        "/sts-bkt/base.txt",
+        &creds,
+        &[("x-amz-security-token", &rec.session_id)],
+        vec![],
+    ));
+    assert_eq!(status(&r), 200, "{r:?}");
+    // ObjectStream 响应经 length 断言(与既有大对象读路径同口径)
+    match &r.unwrap().body {
+        fs3_s3::service::ResponseBody::ObjectStream { length, .. } => {
+            assert_eq!(*length, 9, "base-data 长度")
+        }
+        other => panic!("expected stream body, got {other:?}"),
+    }
+
+    // ③ 会话 PUT → 403(会话策略仅 GetObject;Deny 由「未显式 Allow」给出)
+    let r = svc.handle(&req_creds(
+        "PUT",
+        "/sts-bkt/write.txt",
+        &creds,
+        &[("x-amz-security-token", &rec.session_id)],
+        b"nope".to_vec(),
+    ));
+    assert_eq!(err_code(&r), "AccessDenied", "{r:?}");
+
+    // ④ 无 token 直接以临时 AK 访问 → InvalidAccessKeyId(临时 AK 不在
+    // 常驻密钥表;必须带 token)
+    let r = svc.handle(&req_creds("GET", "/sts-bkt/base.txt", &creds, &[], vec![]));
+    assert_eq!(err_code(&r), "InvalidAccessKeyId", "{r:?}");
+
+    // ⑤ 会话已过期 → InvalidToken(回填过去的签发记录)
+    let old = SessionRecord {
+        session_id: "deadbeef".into(),
+        temporary_access_key: "FSSTDEAD0000".into(),
+        base_access_key: "test".into(),
+        session_policy: None,
+        expires_at: 1, // 1970:早已过期
+        secret_hash: SessionRecord::hash_secret("x"),
+        issued_at: 0,
+        issued_by: "admin".into(),
+    };
+    svc.engine().read().meta().put_session(&old).unwrap();
+    let r = svc.handle(&req_creds(
+        "GET",
+        "/sts-bkt/base.txt",
+        &Credentials {
+            access_key: "FSSTDEAD0000".into(),
+            secret_key: "x".into(),
+        },
+        &[("x-amz-security-token", "deadbeef")],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "InvalidToken", "{r:?}");
+
+    // ⑥ 撤销 → InvalidToken
+    svc.revoke_session(&rec.session_id).unwrap();
+    let r = svc.handle(&req_creds(
+        "GET",
+        "/sts-bkt/base.txt",
+        &creds,
+        &[("x-amz-security-token", &rec.session_id)],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "InvalidToken", "撤销后立即失效");
+
+    // ⑦ 签发校验:TTL 越界拒绝;策略非法拒绝;幽灵基密钥拒绝
+    assert!(svc.issue_session("test", None, Some(60), "admin").is_err());
+    assert!(svc
+        .issue_session("test", None, Some(200_000), "admin")
+        .is_err());
+    assert!(svc
+        .issue_session("test", Some("{not-json}".into()), None, "admin")
+        .is_err());
+    assert!(svc.issue_session("ghost", None, None, "admin").is_err());
+}

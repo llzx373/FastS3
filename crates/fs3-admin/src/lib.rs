@@ -443,6 +443,9 @@ impl AdminServer {
             ("POST", ["keys"]) => self.handle_key_create(body),
             ("DELETE", ["keys", access]) => self.handle_key_delete(access),
             ("PATCH", ["keys", access]) => self.handle_key_patch(access, body),
+            ("GET", ["sessions"]) => self.handle_sessions_list(),
+            ("POST", ["sessions"]) => self.handle_session_create(body),
+            ("DELETE", ["sessions", id]) => self.handle_session_delete(id),
             ("GET", ["uploads"]) => self.handle_uploads(),
             ("POST", ["uploads", id, "abort"]) => self.handle_upload_abort(id),
             ("GET", ["audit"]) => self.handle_audit(query),
@@ -1093,6 +1096,98 @@ impl AdminServer {
             );
         }
         json::ok(resp)
+    }
+
+    // ───────────────────── M15 T1:STS 会话(ADR-18 D-E2)─────────────────────
+
+    /// GET /v1/admin/sessions:全部会话(不含明文 secret——只有 SHA-256
+    /// 哈希比对子在库中;签发时仅一次回显早已过去)。
+    fn handle_sessions_list(&self) -> Response<String> {
+        let engine = self.engine.read();
+        match engine.meta().list_sessions() {
+            Ok(sessions) => json::ok(serde_json::json!({
+                "sessions": sessions.iter().map(|s| {
+                    serde_json::json!({
+                        "session_id": s.session_id,
+                        "temporary_access_key": s.temporary_access_key,
+                        "base_access_key": s.base_access_key,
+                        "session_policy": s.session_policy,
+                        "expires_at": s.expires_at,
+                        "issued_at": s.issued_at,
+                        "issued_by": s.issued_by,
+                        "expired": s.expired(std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0)),
+                    })
+                }).collect::<Vec<_>>(),
+            })),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    /// POST /v1/admin/sessions:签发会话。body:
+    /// `{"base_access_key": "...", "session_policy": "…JSON…"(可选),
+    ///   "ttl_secs": 300..=129600(可选,默认 3600)}`。
+    /// 响应含 `temporary_access_key` + `secret_key`(明文**仅此一次**) +
+    /// `session_token`;之后 sessions 列表/数据面只有哈希比对子。
+    fn handle_session_create(&self, body: &[u8]) -> Response<String> {
+        let parsed: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(_) => {
+                return json::err(StatusCode::BAD_REQUEST, "bad_request", "invalid JSON body")
+            }
+        };
+        let base_access_key = parsed
+            .get("base_access_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if base_access_key.is_empty() {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "missing required field: base_access_key",
+            );
+        }
+        let session_policy = parsed
+            .get("session_policy")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let ttl_secs = parsed.get("ttl_secs").and_then(|v| v.as_i64());
+        // 签发者身份:管理面调用方(admin token 承载;审计 who 用它,不含
+        // 会话 secret——明文不出本响应)
+        let issued_by = "admin";
+        match self
+            .service
+            .issue_session(base_access_key, session_policy, ttl_secs, issued_by)
+        {
+            Ok((temporary_access_key, secret, rec)) => json::ok(serde_json::json!({
+                "session_id": rec.session_id,
+                "temporary_access_key": temporary_access_key,
+                // 仅此一次下发明文(之后库中只有 SHA-256 哈希比对子)
+                "secret_key": secret,
+                "session_token": rec.session_id,
+                "expires_at": rec.expires_at,
+                "issued_at": rec.issued_at,
+            })),
+            Err(e) => json::err(StatusCode::BAD_REQUEST, "session_error", &e.describe()),
+        }
+    }
+
+    /// DELETE /v1/admin/sessions/{id}:撤销会话(幂等;立即失效)。
+    fn handle_session_delete(&self, id: &str) -> Response<String> {
+        match self.service.revoke_session(id) {
+            Ok(()) => json::ok(serde_json::json!({"revoked": id})),
+            Err(e) => json::err(
+                StatusCode::NOT_FOUND,
+                "no_such_session",
+                &format!("session {id}: {}", e.describe()),
+            ),
+        }
     }
 
     fn handle_uploads(&self) -> Response<String> {

@@ -26,6 +26,21 @@ export interface AdminApi {
   patchConfig(patch: Record<string, unknown>): Promise<ConfigPatchResult>;
   reloadConfig(): Promise<Record<string, unknown>>;
   repair(): Promise<Record<string, unknown>>;
+  // M15 T1:STS 会话(管理面签发/撤销/列表)
+  createSession(
+    baseAccessKey: string,
+    sessionPolicy?: string | null,
+    ttlSecs?: number
+  ): Promise<{
+    session_id: string;
+    temporary_access_key: string;
+    secret_key: string;
+    session_token: string;
+    expires_at: number;
+    issued_at: number;
+  }>;
+  sessions(): Promise<{ sessions: SessionInfo[] }>;
+  revokeSession(sessionId: string): Promise<Record<string, unknown>>;
 }
 
 /** 审计查询过滤(J5:与 limit 并存的 query 参数,全部转发 Rust 侧)。 */
@@ -300,4 +315,46 @@ export class AdminClient implements AdminApi {
   repair(): Promise<Record<string, unknown>> {
     return this.expect("POST", "/v1/admin/repair");
   }
+
+  // ── M15 T1:STS 会话(ADR-18 D-E2;管理面签发) ──
+
+  /** 签发会话(secret 明文仅本响应一次)。 */
+  createSession(
+    baseAccessKey: string,
+    sessionPolicy?: string | null,
+    ttlSecs?: number
+  ): Promise<{
+    session_id: string;
+    temporary_access_key: string;
+    secret_key: string;
+    session_token: string;
+    expires_at: number;
+    issued_at: number;
+  }> {
+    return this.expect("POST", "/v1/admin/sessions", {
+      base_access_key: baseAccessKey,
+      session_policy: sessionPolicy ?? undefined,
+      ttl_secs: ttlSecs,
+    });
+  }
+
+  sessions(): Promise<{ sessions: SessionInfo[] }> {
+    return this.expect("GET", "/v1/admin/sessions");
+  }
+
+  revokeSession(sessionId: string): Promise<Record<string, unknown>> {
+    return this.expect("DELETE", `/v1/admin/sessions/${encodeURIComponent(sessionId)}`);
+  }
+}
+
+/** M15 T1:会话信息(管理面展示;不含明文 secret)。 */
+export interface SessionInfo {
+  session_id: string;
+  temporary_access_key: string;
+  base_access_key: string;
+  session_policy: string | null;
+  expires_at: number;
+  issued_at: number;
+  issued_by: string;
+  expired: boolean;
 }

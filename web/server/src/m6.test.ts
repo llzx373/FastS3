@@ -101,6 +101,16 @@ class FakeAdmin implements AdminApi {
   async repair(): Promise<never> {
     throw new Error("not used");
   }
+  // M15 T1:STS 会话(测试未直接使用;接口占位)
+  async createSession(): Promise<never> {
+    throw new Error("not used");
+  }
+  async sessions(): Promise<never> {
+    throw new Error("not used");
+  }
+  async revokeSession(): Promise<never> {
+    throw new Error("not used");
+  }
 }
 
 const cfg = loadConfig();

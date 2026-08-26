@@ -113,6 +113,12 @@ pub const SYS_POOL: &[u8] = b"s:pool";
 /// SYS_KEY_VALUE_REWRITE_V3_DONE 注释口径)。
 pub const PREFIX_AUDIT: &[u8] = b"s:audit\x00";
 
+/// STS 会话记录(M15 T1/T2;ADR-18 D-E2):`s:session\0{session_id}` →
+/// postcard(fs3_core::SessionRecord)。s: 既有前缀下的系统键族(同
+/// PREFIX_AUDIT 口径:不新增一级前缀,DTO/check/删桶三处无需联动);
+/// 会话撤销 = 删键;过期由数据面按记录 expires_at 判定。
+pub const PREFIX_SESSION: &[u8] = b"s:session\x00";
+
 /// 转义:S3 对象键可含任意字节,0x00/0xFF 需转义以保持键内无分隔符。
 pub fn escape(raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(raw.len() + raw.len() / 8 + 4);
@@ -311,6 +317,22 @@ pub fn audit_entry_key(seq: u64) -> Vec<u8> {
     k.extend_from_slice(PREFIX_AUDIT);
     k.extend_from_slice(&seq.to_be_bytes());
     k
+}
+
+/// 会话记录键:`s:session\0{session_id}`(M15 T1;ADR-18 D-E2)。
+pub fn sts_session_key(session_id: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(PREFIX_SESSION.len() + session_id.len());
+    k.extend_from_slice(PREFIX_SESSION);
+    k.extend_from_slice(session_id.as_bytes());
+    k
+}
+
+/// 解析 `s:session\0` 键 → session_id。
+pub fn parse_sts_session_id(raw: &[u8]) -> Result<String> {
+    let body = raw
+        .strip_prefix(PREFIX_SESSION)
+        .ok_or_else(|| Error::Corrupt("session key missing prefix".into()))?;
+    String::from_utf8(body.to_vec()).map_err(|_| Error::Corrupt("session id not utf8".into()))
 }
 
 /// 解析 `s:audit\0` 键中的 seq(回放种子/截断边界用)。

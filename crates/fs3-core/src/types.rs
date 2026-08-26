@@ -1182,6 +1182,62 @@ impl KeyRecord {
     }
 }
 
+/// STS 会话记录(M15 T1/T2;ADR-18 D-E2)。键 `s:session\0{session_id}` →
+/// postcard(SessionRecord)。语义:
+/// - 会话 = 基密钥(既有 `k:` 记录)+ 会话策略求交,无角色派生;
+/// - **secret 仅签发时一次回显、零落盘**:本记录只存 SHA-256 哈希比对子
+///   (数据面校验 = 提交的临时 secret 哈希比对;明文绝不入 meta/日志/审计);
+/// - TTL 到期后数据面拒绝(InvalidToken),管理面可先行撤销(删键);
+/// - 会话撤销 = 删键;剩余 TTL 内新会话重签。
+///
+/// 演进纪律:结构只许尾部追加字段/变体(postcard 序)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRecord {
+    /// 会话主键(随机 32 hex;管理面生成,`x-amz-security-token` 的值)。
+    pub session_id: String,
+    /// 临时凭据的 AccessKeyId(客户端 SigV4 Credential scope 用;
+    /// 与 `k:` 常驻密钥区分,数据面按 token → 会话 → 基密钥解析)。
+    pub temporary_access_key: String,
+    /// 基密钥(会话权限的来源;`k:` 记录引用)。
+    pub base_access_key: String,
+    /// 会话策略 JSON(AWS 策略语法子集;可空 = 仅基密钥策略)。
+    pub session_policy: Option<String>,
+    /// 过期时刻(unix 秒;== 签发时刻 + TTL)。
+    pub expires_at: i64,
+    /// 临时 secret 的 SHA-256 哈希(hex)。明文零落盘(红线:会话 secret
+    /// 与密钥种子同档);数据面校验 = 提交的临时 secret 哈希比对。
+    pub secret_hash: String,
+    /// 签发时刻(unix 秒)。
+    pub issued_at: i64,
+    /// 签发者(管理面 access key;审计用)。
+    pub issued_by: String,
+}
+
+impl SessionRecord {
+    /// 会话是否已过期(`now` = 当前 unix 秒)。
+    pub fn expired(&self, now: i64) -> bool {
+        now >= self.expires_at
+    }
+
+    /// 校验提交的临时 secret 与签发值匹配(SHA-256 恒定时间比较)。
+    pub fn verify_secret(&self, secret: &str) -> bool {
+        let got = sha256_hex(secret.as_bytes());
+        got.len() == self.secret_hash.len()
+            && constant_time_eq(got.as_bytes(), self.secret_hash.as_bytes())
+    }
+
+    /// 计算临时 secret 的 SHA-256(hex;签发侧与数据面共用同一函数)。
+    pub fn hash_secret(secret: &str) -> String {
+        sha256_hex(secret.as_bytes())
+    }
+}
+
+/// SHA-256 十六进制(SessionRecord 哈希比对子用)。
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(data))
+}
+
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;

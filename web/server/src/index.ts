@@ -795,6 +795,81 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     }
   });
 
+  // ── M15 T1:STS 会话(ADR-18 D-E2;管理面签发,数据面校验) ──
+  // Query API(GetSessionToken/AssumeRole 最小集):boto3 sts 客户端
+  // 指向本端点时按 AWS Query 协议 POST 表单参数。会话 = 既有密钥 +
+  // 会话策略求交(无角色派生);secret 仅签发响应一次回显(Rust 侧
+  // 同一语义,库中只有 SHA-256 比对子)。
+  // AWS Query API 的 content-type 为 application/x-www-form-urlencoded;
+  // Fastify 5 默认不解析该媒体类型,此路由按原始字符串接收自行解码。
+  app.addContentTypeParser(
+    "application/x-www-form-urlencoded",
+    { parseAs: "string" },
+    (_req, body, done) => done(null, body as string)
+  );
+  app.post<{ Body: string | Record<string, unknown> }>("/api/sts", async (req, reply) => {
+    // Fastify 对 form 体默认解析为 object;raw 字符串时自行解码
+    let params = new URLSearchParams();
+    if (typeof req.body === "string") {
+      params = new URLSearchParams(req.body);
+    } else if (req.body && typeof req.body === "object") {
+      for (const [k, v] of Object.entries(req.body as Record<string, unknown>)) {
+        params.set(k, String(v));
+      }
+    }
+    const action = params.get("Action") ?? "";
+    const version = params.get("Version") ?? "";
+    try {
+      if (action === "GetSessionToken") {
+        const duration = Number(params.get("DurationSeconds") ?? 3600);
+        const policy = params.get("Policy") ?? undefined;
+        const creds = await admin.createSession(adminIdentity(req), policy || null, duration);
+        return reply
+          .type("text/xml")
+          .send(renderGetSessionTokenResponse(creds, req));
+      }
+      if (action === "AssumeRole") {
+        // D-E2:无角色派生——AssumeRole 接受 RoleArn 但语义 = 按会话策略
+        // 签发(范围声明进 compat.md);基密钥 = 管理面调用方身份
+        const duration = Number(params.get("DurationSeconds") ?? 3600);
+        const policy = params.get("Policy") ?? undefined;
+        const roleSessionName = params.get("RoleSessionName") ?? "fasts3-session";
+        const creds = await admin.createSession(adminIdentity(req), policy || null, duration);
+        return reply
+          .type("text/xml")
+          .send(renderAssumeRoleResponse(creds, roleSessionName, req));
+      }
+      const _ = version;
+      return reply.code(400).type("text/xml").send(
+        renderStsError("InvalidAction", `unsupported STS action: ${action || "(empty)"}`)
+      );
+    } catch (e) {
+      return reply.code(400).type("text/xml").send(
+        renderStsError("InternalFailure", (e as Error).message)
+      );
+    }
+  });
+
+  app.get("/api/sessions", async (_req, reply) => {
+    try {
+      return await admin.sessions();
+    } catch (e) {
+      return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+    }
+  });
+
+  app.delete<{ Params: { id: string } }>(
+    "/api/sessions/:id",
+    { preHandler: requireRole("admin") },
+    async (req, reply) => {
+      try {
+        return await admin.revokeSession(req.params.id);
+      } catch (e) {
+        return reply.code(404).send({ error: { code: "no_such_session", message: (e as Error).message } });
+      }
+    }
+  );
+
   app.post<{ Body: { access_key?: string; note?: string } }>(
     "/api/keys",
     { preHandler: requireRole("admin") },
@@ -1088,4 +1163,93 @@ export function startServer(): void {
 // 直接运行时启动(测试通过 buildServer 自行注入)
 if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith("dist/index.js")) {
   startServer();
+}
+
+// ───────────────────── M15 T1:STS Query API 辅助(ADR-18 D-E2)─────────────────────
+
+/** 管理面调用方身份(STS 会话的 issued_by / AssumeRole 基密钥):
+ * admin(JWT admin 角色)签发;单账号模型下管理面 = 唯一身份。
+ * 注:此处签发人标识固定 "admin";若未来接入多管理员,可改为
+ * JWT username 透传(buildServer 有 req 上下文,扩展即可)。 */
+function adminIdentity(_req: unknown): string {
+  return "admin";
+}
+
+/** 会话签发响应中的临时凭证三元组(AWS GetSessionTokenResponse 形状)。 */
+function stsXmlCredentials(creds: {
+  temporary_access_key: string;
+  secret_key: string;
+  session_token: string;
+  expires_at: number;
+}): string {
+  const exp = new Date(creds.expires_at * 1000).toISOString();
+  return (
+    `<Credentials>` +
+    `<AccessKeyId>${escapeXml(creds.temporary_access_key)}</AccessKeyId>` +
+    `<SecretAccessKey>${escapeXml(creds.secret_key)}</SecretAccessKey>` +
+    `<SessionToken>${escapeXml(creds.session_token)}</SessionToken>` +
+    `<Expiration>${exp}</Expiration>` +
+    `</Credentials>`
+  );
+}
+
+function renderGetSessionTokenResponse(
+  creds: {
+    temporary_access_key: string;
+    secret_key: string;
+    session_token: string;
+    expires_at: number;
+  },
+  _req: unknown
+): string {
+  return (
+    `<?xml version="1.0" encoding="UTF-8"?>\n` +
+    `<GetSessionTokenResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">` +
+    `<GetSessionTokenResult>${stsXmlCredentials(creds)}</GetSessionTokenResult>` +
+    `<ResponseMetadata><RequestId>fasts3-sts</RequestId></ResponseMetadata>` +
+    `</GetSessionTokenResponse>`
+  );
+}
+
+function renderAssumeRoleResponse(
+  creds: {
+    temporary_access_key: string;
+    secret_key: string;
+    session_token: string;
+    expires_at: number;
+  },
+  roleSessionName: string,
+  _req: unknown
+): string {
+  return (
+    `<?xml version="1.0" encoding="UTF-8"?>\n` +
+    `<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">` +
+    `<AssumeRoleResult>` +
+    `<AssumedRoleUser>` +
+    `<AssumedRoleId>AROAFASTS3:${escapeXml(roleSessionName)}</AssumedRoleId>` +
+    `<Arn>arn:aws:sts:::assumed-role/fasts3/${escapeXml(roleSessionName)}</Arn>` +
+    `</AssumedRoleUser>` +
+    stsXmlCredentials(creds) +
+    `</AssumeRoleResult>` +
+    `<ResponseMetadata><RequestId>fasts3-sts</RequestId></ResponseMetadata>` +
+    `</AssumeRoleResponse>`
+  );
+}
+
+function renderStsError(code: string, message: string): string {
+  return (
+    `<?xml version="1.0" encoding="UTF-8"?>\n` +
+    `<ErrorResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">` +
+    `<Error><Type>Receiver</Type><Code>${escapeXml(code)}</Code><Message>${escapeXml(message)}</Message></Error>` +
+    `<RequestId>fasts3-sts</RequestId>` +
+    `</ErrorResponse>`
+  );
+}
+
+function escapeXml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
