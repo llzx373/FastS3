@@ -386,8 +386,8 @@
 - [x] H1-2 缓存:用户态 LRU(fs3-core::cache,HashMap+VecDeque 惰性淘汰;`[cache]` 配置默认关/内存额度/上限对象大小);命中含高频 Range 头(整对象缓存按区间裁剪);SSE 对象不入缓存(密钥作用域红线);fs3-s3 GET 单段路径接线(miss 整读填充,失败降级标准流路径);admin /metrics 命中率指标组;集成测试 cache_behavior(开关/命中/miss/Range/超限/SSE 排除/served_bytes 口径);开/关对照基准 1.28× + 命中率 99.8%(docs/perf-M14.md §5)
 
 ### T. 生态评估(§7.4)
-- [ ] T1-1 Terraform provider 评估(需求投票 ≥10 则立项;admin API 桶/密钥 CRUD 已具备)
-- [ ] T2-1 K8s Operator 评估(节点生命周期/桶密钥 CRD/监控集成;**明确不做 CSI**)
+- [x] T1-1 Terraform provider 评估:结论 = 暂不立项(持有);可行性高(admin API 桶/密钥 CRUD + config + /v2/center 均已具备,TF Plugin Framework 3 资源 ≈1~1.5pw),立项门槛 = issue 投票 ≥10;secret 仅创建时一次返回,provider 状态不得持久化(G1-3 语义);评估见 docs/m14-ecosystem-eval.md §1
+- [x] T2-1 K8s Operator 评估:结论 = 暂不立项(持有);范围 = 节点生命周期 + 桶/密钥 CRD + 监控集成(/v1/admin/metrics 现成),**明确不做 CSI**(块设备语义);可行性中(≈2~3pw),立项门槛 = issue 投票 ≥10;评估见 docs/m14-ecosystem-eval.md §2
 
 ### M14 门禁(退出条件)
 - [ ] 纳管演练 + 红线实测(拔中心)通过;agent 关闭下与 v1.x 行为/性能零差异
