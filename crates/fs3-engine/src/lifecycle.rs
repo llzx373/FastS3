@@ -791,13 +791,32 @@ impl<E: EngineAccess> LifecycleWorker<E> {
                 let deleted = match ga.action {
                     // L2-3 分叉由删除原语按桶状态兑现(Off=物理删单键;
                     // Enabled=新 vk 标记;Suspended=null 族覆盖)
-                    LifecycleAction::DeleteCurrent | LifecycleAction::InsertDeleteMarker => {
-                        e.delete_version_for(bucket, key, None, versioning)?
-                    }
+                    // M15 N2(ADR-18 D-E1):生命周期删除入 LifecycleExpiration
+                    // 事件(同事务;载荷 etag/size 由删除漏斗按结果裁决)
+                    LifecycleAction::DeleteCurrent | LifecycleAction::InsertDeleteMarker => e
+                        .delete_version_for_ev(
+                            bucket,
+                            key,
+                            None,
+                            versioning,
+                            Some(fs3_core::EventDraft {
+                                bucket: bucket.to_string(),
+                                key: key.to_string(),
+                                kind: fs3_core::EventDraftKind::LifecycleExpiration,
+                            }),
+                        )?,
                     LifecycleAction::DeleteNoncurrentVersion { .. }
-                    | LifecycleAction::ExpireDeleteMarker => {
-                        e.delete_version_for(bucket, key, Some(ga.target_vk), versioning)?
-                    }
+                    | LifecycleAction::ExpireDeleteMarker => e.delete_version_for_ev(
+                        bucket,
+                        key,
+                        Some(ga.target_vk),
+                        versioning,
+                        Some(fs3_core::EventDraft {
+                            bucket: bucket.to_string(),
+                            key: key.to_string(),
+                            kind: fs3_core::EventDraftKind::LifecycleExpiration,
+                        }),
+                    )?,
                     LifecycleAction::AbortUpload => unreachable!("会话动作不经组执行"),
                 };
                 if deleted.is_some() {

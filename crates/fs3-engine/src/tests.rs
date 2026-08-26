@@ -6958,3 +6958,210 @@ fn overwrite_same_geometry_keeps_segments_intact() -> Result<()> {
     e.abort();
     Ok(())
 }
+
+/// M15 N2(ADR-18 D-E1):事件草案经真实数据原语**同事务**入队——
+/// ① put_with_lock_ev(有草案)→ 事件落 `e:` 队列,载荷 etag/size 由
+///    提交路径置出;
+/// ② put_with_lock_ev(无草案)→ 零事件(零配置路径零开销);
+/// ③ 前置校验失败(条件写 412)→ 无事件(未应答必无事件,零漂移);
+/// ④ delete_version_with_lock_ev(Off 桶)→ ObjectRemoved:Delete;
+/// ⑤ complete_multipart_ev → ObjectCreated:CompleteMultipartUpload;
+/// ⑥ copy 草案 → ObjectCreated:Copy;
+/// ⑦ 投递成功删键(delete_event)→ 队列头前移。
+#[test]
+fn notification_event_same_txn_enqueue() -> Result<()> {
+    use fs3_core::{EventDraft, EventDraftKind};
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let draft = |kind| {
+        Some(EventDraft {
+            bucket: "b1".into(),
+            key: "k1".into(),
+            kind,
+        })
+    };
+
+    // ① PUT + 草案(ObjectCreated:Put 同事务入队)
+    let data = b"hello".to_vec();
+    let meta = e
+        .put_with_lock_ev(
+            "b1",
+            "k1",
+            &mut Cursor::new(data.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            ObjectLockWrite::default(),
+            draft(fs3_core::EventDraftKind::ObjectCreated(
+                "s3:ObjectCreated:Put",
+            )),
+        )
+        .unwrap();
+    let recs = e.meta().pending_events(10, None)?;
+    assert_eq!(recs.len(), 1, "PUT 草案同事务入队");
+    assert_eq!(recs[0].bucket, "b1");
+    assert_eq!(recs[0].key, "k1");
+    assert_eq!(recs[0].event, "s3:ObjectCreated:Put");
+    assert_eq!(recs[0].size, Some(5));
+    assert_eq!(
+        recs[0].etag.as_deref(),
+        Some(meta.etag_hex().as_str()),
+        "载荷 etag 由提交路径置出"
+    );
+    assert!(!recs[0].delete_marker);
+    assert!(!recs[0].dead);
+    let seq1 = recs[0].seq;
+
+    // ② 无草案 PUT → 无新事件(队列仍 1 条)
+    e.put("b1", "k2", &mut Cursor::new(b"world".to_vec()))
+        .unwrap();
+    assert_eq!(e.meta().pending_events(10, None)?.len(), 1, "无草案零事件");
+
+    // ③ 条件写失败 → 无事件(412 路径未提交)
+    let precond = WritePrecondition {
+        if_match: Some(vec!["bogus-etag".into()]),
+        ..Default::default()
+    };
+    let r = e.put_with_lock_ev(
+        "b1",
+        "k3",
+        &mut Cursor::new(b"x".to_vec()),
+        None,
+        vec![],
+        vec![],
+        vec![],
+        Some(&precond),
+        None,
+        None,
+        ObjectLockWrite::default(),
+        draft(fs3_core::EventDraftKind::ObjectCreated(
+            "s3:ObjectCreated:Put",
+        )),
+    );
+    assert!(
+        matches!(
+            r,
+            Err(Error::PreconditionFailed(_)) | Err(Error::NotFound(_))
+        ),
+        "条件写失败(412/404)必须未提交"
+    );
+    assert_eq!(
+        e.meta().pending_events(10, None)?.len(),
+        1,
+        "未应答必无事件(零漂移)"
+    );
+
+    // ④ 删除草案(ObjectRemoved;Off 桶物理删 → Delete)
+    e.delete_version_with_lock_ev(
+        "b1",
+        "k1",
+        None,
+        VersioningState::Off,
+        false,
+        Some(EventDraft {
+            bucket: "b1".into(),
+            key: "k1".into(),
+            kind: EventDraftKind::ObjectRemoved,
+        }),
+    )
+    .unwrap();
+    let recs = e.meta().pending_events(10, None)?;
+    assert_eq!(recs.len(), 2);
+    let del = recs.iter().find(|r| r.seq != seq1).unwrap();
+    assert_eq!(del.event, "s3:ObjectRemoved:Delete");
+    assert_eq!(del.etag.as_deref(), Some(meta.etag_hex().as_str()));
+    assert!(!del.delete_marker);
+
+    // ⑦ 投递成功删键 → 队列头前移
+    e.meta().delete_event(seq1)?;
+    let recs = e.meta().pending_events(10, None)?;
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].event, "s3:ObjectRemoved:Delete");
+    assert_eq!(e.meta().event_head_seq()?, Some(del.seq));
+    e.abort();
+    Ok(())
+}
+
+/// M15 N2:multipart Complete / Copy 草案同事务入队(事件名正确性)。
+#[test]
+fn notification_event_complete_and_copy() -> Result<()> {
+    use fs3_core::{EventDraft, EventDraftKind};
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+
+    // multipart:create → 分片 → complete(草案;单分片即可,非末分片
+    // 有 ≥5MiB 约束(AWS EntityTooSmall),单分片路径避开)
+    let uid = e.create_multipart("b1", "mp", None, vec![], vec![], vec![], None, None, None)?;
+    let p1 = e.upload_part(&uid, 1, &mut Cursor::new(b"aaa".to_vec()), None, None)?;
+    let mkcp = |no: u32, etag: String| CompletePart {
+        part_number: no,
+        etag_hex: etag,
+        checksum: None,
+    };
+    e.complete_multipart_ev(
+        "b1",
+        "mp",
+        &uid,
+        &[mkcp(1, p1.etag_hex())],
+        None,
+        None,
+        Some(EventDraft {
+            bucket: "b1".into(),
+            key: "mp".into(),
+            kind: EventDraftKind::ObjectCreated("s3:ObjectCreated:CompleteMultipartUpload"),
+        }),
+    )?;
+    let recs = e.meta().pending_events(10, None)?;
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].event, "s3:ObjectCreated:CompleteMultipartUpload");
+    assert_eq!(recs[0].key, "mp");
+
+    // Copy 草案(dst 目标桶提交)
+    e.copy_object_with_lock_ev(
+        "b1",
+        "mp",
+        None,
+        "b1",
+        "copy-of-mp",
+        None,
+        None,
+        None,
+        None,
+        VersioningState::Off,
+        None,
+        None,
+        ObjectLockWrite::default(),
+        Some(EventDraft {
+            bucket: "b1".into(),
+            key: "copy-of-mp".into(),
+            kind: EventDraftKind::ObjectCreated("s3:ObjectCreated:Copy"),
+        }),
+    )?;
+    let recs = e.meta().pending_events(10, None)?;
+    assert_eq!(recs.len(), 2);
+    assert_eq!(recs[1].event, "s3:ObjectCreated:Copy");
+    // 无草案的同一原语(旧路径调用方)→ 零事件
+    let n = e.meta().event_count()?;
+    e.copy_object_with_lock(
+        "b1",
+        "mp",
+        None,
+        "b1",
+        "copy-noevent",
+        None,
+        None,
+        None,
+        None,
+        VersioningState::Off,
+        None,
+        None,
+        ObjectLockWrite::default(),
+    )?;
+    assert_eq!(e.meta().event_count()?, n, "旧签名调用零事件");
+    e.abort();
+    Ok(())
+}

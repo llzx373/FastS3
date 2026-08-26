@@ -2755,9 +2755,12 @@ pub fn render_lifecycle_configuration(rules: &[fs3_core::LifecycleRule]) -> Stri
 
 // ───────────────────── 事件通知配置(M15 N1;ADR-18 D-E4)─────────────────────
 
-/// AWS 事件白名单(M15 N2 入队口径:ObjectCreated*/ObjectRemoved*/
-/// Restore*/Lifecycle* 起步;其余事件 → InvalidArgument 显式拒绝)。
-/// 通配名(带 `:*`)按前缀匹配子事件;精确名全等匹配。
+/// AWS 事件白名单(botocore `Event` 枚举逐名对齐,2026-08;M15 N2 入队
+/// 口径:ObjectCreated*/ObjectRemoved*/Restore*/Lifecycle* 起步;其余
+/// AWS 事件族——Replication*/ObjectTagging*/ObjectAcl:Put/
+/// IntelligentTiering/ReducedRedundancyLostObject/ObjectAnnotation*/
+/// ObjectRestore:Delete 等 → InvalidArgument 显式拒绝,注册随实现面
+/// 扩展)。通配名(带 `:*`)按前缀匹配子事件;精确名全等匹配。
 const NOTIFICATION_EVENTS: &[&str] = &[
     // ObjectCreated 族(Put/Post/Copy/CompleteMultipartUpload)
     "s3:ObjectCreated:*",
@@ -2773,12 +2776,11 @@ const NOTIFICATION_EVENTS: &[&str] = &[
     "s3:ObjectRestore:*",
     "s3:ObjectRestore:Post",
     "s3:ObjectRestore:Completed",
-    // Lifecycle 族(过期/转换;生命周期执行器操作点补入)
+    // Lifecycle 族(N2 起过期执行器补入;Transition 语义 M16)
     "s3:LifecycleExpiration:*",
-    "s3:LifecycleExpiration:Expiration",
-    "s3:LifecycleExpiration:DeleteMarker",
-    "s3:LifecycleTransition:*",
-    "s3:LifecycleTransition:Transition",
+    "s3:LifecycleExpiration:Delete",
+    "s3:LifecycleExpiration:DeleteMarkerCreated",
+    "s3:LifecycleTransition",
 ];
 
 /// 事件是否在 AWS 白名单内(通配名允许,精确名全等)。

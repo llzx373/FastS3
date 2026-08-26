@@ -1730,8 +1730,17 @@ impl S3Service {
                         bkt.default_retention.as_ref(),
                         engine.lock_now(),
                     )?;
+                    // M15 N2(ADR-18 D-E1):ObjectCreated:Put 事件草案
+                    // (同事务入队;零配置 None)
+                    let event = notification_draft(
+                        engine.meta(),
+                        bucket,
+                        key,
+                        fs3_core::EventDraftKind::ObjectCreated("s3:ObjectCreated:Put"),
+                        "s3:ObjectCreated:Put",
+                    );
                     engine
-                        .put_with_lock(
+                        .put_with_lock_ev(
                             bucket,
                             key,
                             reader,
@@ -1749,6 +1758,7 @@ impl S3Service {
                             // reader,先于加密,不可颠倒)
                             write_key.as_ref(),
                             lock,
+                            event,
                         )
                         .map(|m| (m.etag, Some(m), None))
                         .map_err(|e| map_engine_error(e, bucket, key))
@@ -3024,8 +3034,16 @@ impl S3Service {
             bucket_default_retention.as_ref(),
             engine.lock_now(),
         )?;
+        // M15 N2(ADR-18 D-E1):ObjectCreated:Post 事件草案(同事务入队)
+        let event = notification_draft(
+            engine.meta(),
+            bucket,
+            &key,
+            fs3_core::EventDraftKind::ObjectCreated("s3:ObjectCreated:Post"),
+            "s3:ObjectCreated:Post",
+        );
         let meta = engine
-            .put_with_lock(
+            .put_with_lock_ev(
                 bucket,
                 &key,
                 &mut std::io::Cursor::new(form.file.clone()),
@@ -3041,6 +3059,7 @@ impl S3Service {
                 // SSE-C 恒 None);K1-3:桶默认 SSE-S3 生效
                 post_wk.as_ref(),
                 post_lock,
+                event,
             )
             .map_err(|e| map_engine_error(e, bucket, &key))?;
         // M11 门禁:checksum 写后比对(不符回滚 + BadDigest,同 PUT 口径)
@@ -3705,8 +3724,17 @@ impl S3Service {
             bkt.default_retention.as_ref(),
             engine.lock_now(),
         )?;
+        // M15 N2(ADR-18 D-E1):桶有 ObjectCreated:Put 通知规则 → 事件草案
+        // (零配置 None;与数据同事务入队)
+        let event = notification_draft(
+            engine.meta(),
+            bucket,
+            key,
+            fs3_core::EventDraftKind::ObjectCreated("s3:ObjectCreated:Put"),
+            "s3:ObjectCreated:Put",
+        );
         let meta = engine
-            .put_with_lock(
+            .put_with_lock_ev(
                 bucket,
                 key,
                 &mut std::io::Cursor::new(req.body.clone()),
@@ -3722,6 +3750,7 @@ impl S3Service {
                 // 密文 CRC/MD5,顺序见引擎 put_with_meta 注释)
                 write_key.as_ref(),
                 lock,
+                event,
             )
             .map_err(|e| map_engine_error(e, bucket, key))?;
         if md5_ok == Some(false) {
@@ -4672,8 +4701,17 @@ impl S3Service {
                 .check_put_precondition(bucket, key, &p)
                 .map_err(|e| map_engine_error(e, bucket, key))?;
         }
+        // M15 N2(ADR-18 D-E1):ObjectCreated:CompleteMultipartUpload 事件草案
+        // (同事务入队;零配置 None)
+        let event = notification_draft(
+            engine.meta(),
+            bucket,
+            key,
+            fs3_core::EventDraftKind::ObjectCreated("s3:ObjectCreated:CompleteMultipartUpload"),
+            "s3:ObjectCreated:CompleteMultipartUpload",
+        );
         let meta = engine
-            .complete_multipart(
+            .complete_multipart_ev(
                 bucket,
                 key,
                 upload_id,
@@ -4681,6 +4719,7 @@ impl S3Service {
                 composite.as_ref(),
                 // M11 E1-4:Complete 重加密密钥(D-E4 裁决,见引擎注释)
                 ssec.as_ref().map(|s| &s.key),
+                event,
             )
             .map_err(|e| map_engine_error(e, bucket, key))?;
         // M11 C1-4 门禁:对象带 checksum 时 body 输出 <Checksum{ALG}> 与
@@ -5260,8 +5299,17 @@ impl S3Service {
             dst_bkt.default_retention.as_ref(),
             engine.lock_now(),
         )?;
+        // M15 N2(ADR-18 D-E1):ObjectCreated:Copy 事件草案(目标桶规则;
+        // 零配置 None)
+        let event = notification_draft(
+            engine.meta(),
+            bucket,
+            key,
+            fs3_core::EventDraftKind::ObjectCreated("s3:ObjectCreated:Copy"),
+            "s3:ObjectCreated:Copy",
+        );
         let meta = engine
-            .copy_object_with_lock(
+            .copy_object_with_lock_ev(
                 &copy_source.bucket,
                 &copy_source.key,
                 src_vk.as_ref(),
@@ -5276,6 +5324,7 @@ impl S3Service {
                 cs_ssec.as_ref().map(|s| &s.key),
                 dst_wk.as_ref(),
                 lock,
+                event,
             )
             .map_err(|e| map_engine_error(e, &copy_source.bucket, &copy_source.key))?;
         let xml = xml::render_copy_object(&meta.etag_full(), &xml::ts_to_rfc3339(meta.mtime));
@@ -5348,8 +5397,17 @@ impl S3Service {
                 .map_err(|e| map_engine_error(e, bucket, key))?;
         }
         let bypass = crate::object_lock::bypass_governance(&req.headers);
+        // M15 N2(ADR-18 D-E1):ObjectRemoved 事件草案(删除漏斗按结果裁决
+        // Delete/DeleteMarkerCreated;零配置 None)
+        let event = notification_draft(
+            engine.meta(),
+            bucket,
+            key,
+            fs3_core::EventDraftKind::ObjectRemoved,
+            "s3:ObjectRemoved:*",
+        );
         let deleted = engine
-            .delete_version_with_lock(bucket, key, vk, bkt.versioning, bypass)
+            .delete_version_with_lock_ev(bucket, key, vk, bkt.versioning, bypass, event)
             .map_err(|e| map_engine_error(e, bucket, key))?;
         if version_id.is_some() {
             if let Some(m) = deleted.as_ref() {
@@ -5510,12 +5568,22 @@ impl S3Service {
                     }
                 }
             }
-            match engine.delete_version_with_lock(
+            // M15 N2(ADR-18 D-E1):ObjectRemoved 事件草案(删除漏斗按
+            // 结果裁决 Delete/DeleteMarkerCreated;零配置 None)
+            let ev = notification_draft(
+                engine.meta(),
+                bucket,
+                key,
+                fs3_core::EventDraftKind::ObjectRemoved,
+                "s3:ObjectRemoved:*",
+            );
+            match engine.delete_version_with_lock_ev(
                 bucket,
                 key,
                 vk,
                 bkt.versioning,
                 crate::object_lock::bypass_governance(&req.headers),
+                ev,
             ) {
                 Ok(d) => {
                     let bypass = crate::object_lock::bypass_governance(&req.headers);
@@ -6184,6 +6252,42 @@ fn resource_arn(bucket: &str, key: &str) -> String {
     } else {
         format!("arn:aws:s3:::{bucket}/{key}")
     }
+}
+
+/// M15 N2(ADR-18 D-E1):桶有匹配通知规则时构造事件入队草案(数据原语
+/// 同事务入队;零配置桶返回 None = 数据面零事件路径)。判定 = 任一规则
+/// 事件命中(`event_match` 通配/精确)且键过滤命中;规则集为缓存读取
+/// (get_notification_rules 带桶级缓存,无规则桶前缀扫描仅首查一次)。
+/// ObjectRemoved 族按结果裁决(Delete/DeleteMarkerCreated),草案判定
+/// 时两候选事件任一命中即入队(具体子事件由删除漏斗按结果命名)。
+fn notification_draft(
+    meta: &fs3_meta::MetaStore,
+    bucket: &str,
+    key: &str,
+    kind: fs3_core::EventDraftKind,
+    event_name: &str,
+) -> Option<fs3_core::EventDraft> {
+    let rules = meta.get_notification_rules(bucket).ok()?;
+    let hit = rules.iter().any(|r| {
+        if !r.enabled || !r.filter.matches(key) {
+            return false;
+        }
+        r.event_match(event_name)
+            || (matches!(kind, fs3_core::EventDraftKind::ObjectRemoved)
+                && (r.event_match("s3:ObjectRemoved:Delete")
+                    || r.event_match("s3:ObjectRemoved:DeleteMarkerCreated")))
+            || (matches!(kind, fs3_core::EventDraftKind::LifecycleExpiration)
+                && (r.event_match("s3:LifecycleExpiration:Delete")
+                    || r.event_match("s3:LifecycleExpiration:DeleteMarkerCreated")))
+    });
+    if !hit {
+        return None;
+    }
+    Some(fs3_core::EventDraft {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        kind,
+    })
 }
 
 /// 审计操作名 → S3 策略动作名(M10 S3;多数审计名即动作名,原样返回)。

@@ -9871,3 +9871,111 @@ fn bucket_notification_delete_cleanup_and_isolation() {
     );
     assert!(x2.contains("n-two"), "b2 通知规则不受 b1 删桶影响:{x2}");
 }
+
+// ───────────────────── M15 N2:事件队列(ADR-18 D-E1;同事务入队)─────────────────────
+
+/// 配置 → PUT 对象 → 事件同事务落 `e:` 队列(载荷 etag/size/key 断言);
+/// 无配置桶 → 零事件;DELETE → ObjectRemoved:Delete;队列删除/死信流转;
+/// 事件随数据事务失败零残留(条件写 412)。
+#[test]
+fn bucket_notification_event_queue() {
+    let (_d, svc) = setup();
+    svc.handle(&req("PUT", "/bkt1", vec![])).unwrap();
+    let q = &[("notification", "")];
+    // 配置一条 ObjectCreated:* + ObjectRemoved:* 规则(Webhook 起步)
+    let body = br#"<NotificationConfiguration><QueueConfiguration><Id>n1</Id>
+        <Event>s3:ObjectCreated:*</Event><Event>s3:ObjectRemoved:*</Event>
+        <Queue>http://127.0.0.1:8080/hook</Queue></QueueConfiguration></NotificationConfiguration>"#
+        .to_vec();
+    let r = svc.handle(&req_q("PUT", "/bkt1", q, body));
+    assert_eq!(status(&r), 200, "{r:?}");
+
+    // PUT 对象 → 事件同事务入队(签名与载荷同体,避免 sha256 失配)
+    let rr = svc.handle(&req_q("PUT", "/bkt1/a.txt", &[], b"hello".to_vec()));
+    assert_eq!(status(&rr), 200, "{rr:?}");
+    let etag = rr
+        .as_ref()
+        .ok()
+        .map(|r| {
+            r.headers
+                .as_slice()
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("ETag"))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+
+    let e = svc.engine().write();
+    let recs = e.meta().pending_events(10, None).unwrap();
+    assert_eq!(recs.len(), 1, "配置桶 PUT 同事务入队");
+    assert_eq!(recs[0].bucket, "bkt1");
+    assert_eq!(recs[0].key, "a.txt");
+    assert_eq!(recs[0].event, "s3:ObjectCreated:Put");
+    assert_eq!(recs[0].size, Some(5));
+    // ETag 载荷与响应头一致(引号去除后比较)
+    let payload_etag = recs[0].etag.clone().unwrap_or_default();
+    assert_eq!(payload_etag, etag.trim_matches('"'), "{recs:?}");
+    let seq1 = recs[0].seq;
+    drop(e);
+
+    // DELETE → ObjectRemoved:Delete(同队列,时序在后)
+    svc.handle(&req("DELETE", "/bkt1/a.txt", vec![])).unwrap();
+    let e = svc.engine().write();
+    let recs = e.meta().pending_events(10, None).unwrap();
+    assert_eq!(recs.len(), 2, "删除事件入队");
+    let del = recs.iter().find(|r| r.seq != seq1).unwrap();
+    assert_eq!(del.event, "s3:ObjectRemoved:Delete");
+    assert_eq!(del.key, "a.txt");
+    // 死信流转 + 删除(worker 语义的存储面):置死信后不再进 pending
+    e.meta().mark_event_dead(seq1).unwrap();
+    let recs = e.meta().pending_events(10, None).unwrap();
+    assert_eq!(recs.len(), 1, "死信条目跳过");
+    // 投递成功删键
+    e.meta().delete_event(recs[0].seq).unwrap();
+    assert_eq!(e.meta().event_count().unwrap(), 1, "待投递 + 死信各一");
+    drop(e);
+
+    // 无配置桶 → 零事件(PUT 不带草案)
+    svc.handle(&req("PUT", "/bkt2", vec![])).unwrap();
+    svc.handle(&req_q("PUT", "/bkt2/k", &[], b"z".to_vec()))
+        .unwrap();
+    let e = svc.engine().read();
+    assert_eq!(e.meta().event_count().unwrap(), 1, "无配置桶零事件路径");
+    drop(e);
+}
+
+/// 条件写失败 → 未应答必无事件(零漂移;D-E1 崩溃语义的请求面等价)。
+#[test]
+fn bucket_notification_event_rollback_on_failed_put() {
+    let (_d, svc) = setup();
+    svc.handle(&req("PUT", "/bkt1", vec![])).unwrap();
+    // 已有对象 k(记录当前 ETag)
+    svc.handle(&req_q("PUT", "/bkt1/k", &[], b"data".to_vec()))
+        .unwrap();
+    let q = &[("notification", "")];
+    let body = br#"<NotificationConfiguration><QueueConfiguration><Id>n1</Id>
+        <Event>s3:ObjectCreated:*</Event>
+        <Queue>http://127.0.0.1:8080/hook</Queue></QueueConfiguration></NotificationConfiguration>"#
+        .to_vec();
+    svc.handle(&req_q("PUT", "/bkt1", q, body)).unwrap();
+    // If-None-Match: * → 对象已存在时 412(工具 req_h 带签名头)
+    let rr = svc.handle(&req_h(
+        "PUT",
+        "/bkt1/k2",
+        &[("If-None-Match", "*")],
+        b"x".to_vec(),
+    ));
+    assert_eq!(status(&rr), 200, "k2 不存在,If-None-Match * 放行");
+    let rr = svc.handle(&req_h(
+        "PUT",
+        "/bkt1/k",
+        &[("If-None-Match", "*")],
+        b"overwrite".to_vec(),
+    ));
+    assert_eq!(err_code(&rr), "PreconditionFailed", "{rr:?}");
+    let e = svc.engine().write();
+    let recs = e.meta().pending_events(10, None).unwrap();
+    assert_eq!(recs.len(), 1, "只有成功 PUT(k2)入队;412 失败零事件");
+    assert_eq!(recs[0].key, "k2", "失败请求未留下事件(零漂移)");
+}

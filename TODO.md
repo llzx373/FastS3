@@ -43,7 +43,7 @@
 
 ### N. 事件通知(Webhook 起步;NEXT-ROUND §5 N1~N5,≈4 pw)
 - [x] N1 `n:{bucket}\0{id}` 配置键 + Put/Get/DeleteBucketNotificationConfiguration(?notification 新旧参数兼容;XML 校验,非法目标/事件 → MalformedXML/InvalidArgument 显式报错)
-- [ ] N2 持久化事件队列(新键前缀 `e:`;复用审计环形底座模式:批量截断删最旧、崩溃零漂移;事件集 = ObjectCreated:*/ObjectRemoved:*/Restore*/Lifecycle* 起步;三处同步:keys.rs 前缀表、meta-export/import DTO、check 可达性扫描)
+- [x] N2 持久化事件队列(新键前缀 `e:`;复用审计环形底座模式:批量截断删最旧、崩溃零漂移;事件集 = ObjectCreated:*/ObjectRemoved:*/Restore*/Lifecycle* 起步;三处同步:keys.rs 前缀表、meta-export/import DTO、check 可达性扫描)
 - [ ] N3 投递 worker(BackgroundWorker 实例:节流/暂停/批额度;Webhook = HTTP POST + HMAC 签名;重试指数退避 + 死信留存;指标 `fasts3_notification_*` + 告警 FastS3NotificationDeliveryStalled)
 - [ ] N4 集成测试(配置→写对象→投递→载荷/签名断言;失败重试与死信;重启后队列继续;投递失败不影响数据面请求语义)
 - [ ] N5 s3-tests notification 族出排除集且 100%(EXCLUDE 移除 `notification` token)+ 关闭态 perf 零回退对照

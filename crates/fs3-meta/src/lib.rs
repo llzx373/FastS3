@@ -16,7 +16,7 @@ use fs3_core::{AllocRecord, BucketMeta, Error, ObjectMeta, Result, Segment, MAX_
 use rocksdb::{
     BlockBasedOptions, Cache, DBCompressionType, Direction, Error as RocksError, ErrorKind,
     IteratorMode, OptimisticTransactionDB, OptimisticTransactionOptions, Options, Transaction,
-    WriteOptions,
+    WriteBatchWithTransaction, WriteOptions,
 };
 use serde::{Deserialize, Serialize};
 
@@ -366,6 +366,22 @@ pub enum Op {
     NotificationRulesDelete {
         bucket: String,
     },
+    /// 事件入队(M15 N2;ADR-18 D-E1):与触发它的数据操作**同事务**
+    /// 提交——崩溃零漂移(已应答必有事件、未应答必无事件)。seq 由
+    /// apply_ops 填充为当前事务 seq(键 `e:{seq be64}` = 写入序);
+    /// 单事务至多一条(多事件入队 = 多事务,由引擎原语保证)。
+    EventEnqueue {
+        record: fs3_core::EventRecord,
+    },
+    /// 事件死信置位(N3 投递 worker 重试超限;值改写 dead=true,键保留
+    /// 供死信留存;截断只删终态条目)。
+    EventMarkDead {
+        seq: u64,
+    },
+    /// 事件删除(投递成功 / 截断;终态条目的清理通道)。
+    EventDelete {
+        seq: u64,
+    },
     /// 对象标签单事务读改写(M10 S1;PutObjectTagging/DeleteObjectTagging
     /// 落地):`vk = None` → 未版本化单键 `o:{b}\0{k}`;`Some(vk)` → 版本键
     /// (含 VK_NULL null 槽)。仅 tags 字段变更,不触碰数据段/统计;
@@ -668,6 +684,44 @@ fn decode_notification_rule(v: &[u8]) -> Result<fs3_core::NotificationRule> {
                 hmac_key: old.hmac_key,
                 enabled: old.enabled,
                 filter: fs3_core::NotificationKeyFilter::default(),
+            })
+        }
+    }
+}
+
+/// M15 N2 事件队列值解码(ADR-18 D-E1)。双读:新格式优先,失败回退
+/// 初版格式(无 `dead` 尾部字段 → false;照 decode_notification_rule
+/// 先例——结构尾部只追加字段,零迁移)。
+fn decode_event_record(v: &[u8]) -> Result<fs3_core::EventRecord> {
+    /// N2 初版事件格式(无 dead 尾部字段;回退用)。
+    #[derive(serde::Deserialize)]
+    struct EventV1 {
+        seq: u64,
+        ts: u64,
+        bucket: String,
+        key: String,
+        event: String,
+        etag: Option<String>,
+        size: Option<u64>,
+        version_id: Option<String>,
+        delete_marker: bool,
+    }
+    match postcard::from_bytes::<fs3_core::EventRecord>(v) {
+        Ok(r) => Ok(r),
+        Err(_) => {
+            let old: EventV1 = postcard::from_bytes(v)
+                .map_err(|e| Error::Corrupt(format!("postcard decode event record: {e}")))?;
+            Ok(fs3_core::EventRecord {
+                seq: old.seq,
+                ts: old.ts,
+                bucket: old.bucket,
+                key: old.key,
+                event: old.event,
+                etag: old.etag,
+                size: old.size,
+                version_id: old.version_id,
+                delete_marker: old.delete_marker,
+                dead: false,
             })
         }
     }
@@ -2248,6 +2302,132 @@ impl MetaStore {
         self.notification_cache.lock().unwrap().clear();
     }
 
+    // ── M15 N2:事件队列(ADR-18 D-E1;`e:` 前缀) ──
+
+    /// 事件入队(与调用方指定的数据 op 同事务提交;seq = 事务 seq)。
+    pub fn commit_with_event(&self, ops: &[Op], record: &fs3_core::EventRecord) -> Result<u64> {
+        let mut all = ops.to_vec();
+        all.push(Op::EventEnqueue {
+            record: record.clone(),
+        });
+        self.commit(&all)
+    }
+
+    /// 投递成功/截断删除事件(独立小事务;幂等:键不存在同样 Ok)。
+    pub fn delete_event(&self, seq: u64) -> Result<u64> {
+        self.commit(&[Op::EventDelete { seq }])
+    }
+
+    /// 死信置位(重试超限;值改写 dead=true;键保留供留存诊断)。
+    pub fn mark_event_dead(&self, seq: u64) -> Result<u64> {
+        self.commit(&[Op::EventMarkDead { seq }])
+    }
+
+    /// 队首 seq(最小事件键;空队 = None)。投递 worker 读头续投。
+    pub fn event_head_seq(&self) -> Result<Option<u64>> {
+        let mut it = self
+            .db
+            .iterator(IteratorMode::From(PREFIX_EVENT, Direction::Forward));
+        match it.next() {
+            Some(item) => {
+                let (k, _v) = item.map_err(rocks_err)?;
+                if !k.starts_with(PREFIX_EVENT) {
+                    return Ok(None);
+                }
+                Ok(Some(parse_event_seq(&k)?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// 自队首读取至多 `limit` 条未死信事件(旧→新;跳过死信;供投递
+    /// worker 批处理)。`after_seq` = 仅返回 seq 严格大于该值者(N3
+    /// 断点续投;None = 从头)。
+    pub fn pending_events(
+        &self,
+        limit: usize,
+        after_seq: Option<u64>,
+    ) -> Result<Vec<fs3_core::EventRecord>> {
+        let mut out = Vec::new();
+        let start = match after_seq {
+            Some(s) => event_key(s + 1),
+            None => PREFIX_EVENT.to_vec(),
+        };
+        for item in self
+            .db
+            .iterator(IteratorMode::From(&start, Direction::Forward))
+        {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(PREFIX_EVENT) {
+                break;
+            }
+            let rec = decode_event_record(&v)?;
+            if !rec.dead {
+                out.push(rec);
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// 事件队列当前条数(环形有界上限的截断基准)。
+    pub fn event_count(&self) -> Result<usize> {
+        let mut n = 0usize;
+        for item in self
+            .db
+            .iterator(IteratorMode::From(PREFIX_EVENT, Direction::Forward))
+        {
+            let (k, _v) = item.map_err(rocks_err)?;
+            if !k.starts_with(PREFIX_EVENT) {
+                break;
+            }
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// 事件队列批量截断(M15 N2;ADR-18 D-E1 有界环形):条数超
+    /// `max + slack` 时单 WriteBatch 删最旧回 `max`(slack 批量摊销,
+    /// 同 AuditStore 口径);**只删最旧终态条目(死信/已投递已删键外的最
+    /// 旧项)**——若最旧为未投递(投递停滞),显式放弃最旧并告警指标
+    /// 计数,与 DE1「截断删最旧」的编排一致(未投递事件是 at-least-once
+    /// 承诺,但队列有界上限优先,防投递停滞时无限堆积;告警由 worker
+    /// 上报 FastS3NotificationQueueTruncated)。
+    pub fn truncate_events(&self, max: usize) -> Result<u64> {
+        let max = max.max(1);
+        let slack = (max / 10).clamp(1, 4096);
+        let count = self.event_count()?;
+        if count <= max + slack {
+            return Ok(0);
+        }
+        let excess = count - max;
+        let mut batch = WriteBatchWithTransaction::<true>::default();
+        let mut n = 0usize;
+        for item in self
+            .db
+            .iterator(IteratorMode::From(PREFIX_EVENT, Direction::Forward))
+        {
+            let (k, _v) = item.map_err(rocks_err)?;
+            if !k.starts_with(PREFIX_EVENT) {
+                break;
+            }
+            batch.delete(&k);
+            n += 1;
+            if n >= excess {
+                break;
+            }
+        }
+        self.db
+            .write_opt(batch, &self.write_opts)
+            .map_err(rocks_err)?;
+        if self.sync_mode == SyncMode::Full {
+            self.db.flush_wal(true).map_err(rocks_err)?;
+        }
+        Ok(n as u64)
+    }
+
     /// 对象标签单事务读改写(M10 S1):`vk = None` → 未版本化单键;
     /// `Some(vk)` → 版本键(含 VK_NULL null 槽)。目标不存在 → NotFound。
     pub fn commit_object_set_tags(
@@ -2376,13 +2556,27 @@ impl MetaStore {
         draft: AllocDraft,
         delta: StatsDelta,
     ) -> Result<u64> {
+        self.commit_object_put_ev(bucket, key, meta, draft, delta, None)
+    }
+
+    /// M15 N2(ADR-18 D-E1):`commit_object_put` + 同事务事件入队
+    /// (event = ObjectCreated:* 实体;None = 无事件路径)。
+    pub fn commit_object_put_ev(
+        &self,
+        bucket: &str,
+        key: &str,
+        meta: &ObjectMeta,
+        draft: AllocDraft,
+        delta: StatsDelta,
+        event: Option<fs3_core::EventRecord>,
+    ) -> Result<u64> {
         if meta.size > MAX_OBJECT_SIZE {
             return Err(Error::InvalidArgument(format!(
                 "object size {} exceeds max {}",
                 meta.size, MAX_OBJECT_SIZE
             )));
         }
-        self.commit(&[
+        let mut ops = vec![
             Op::ObjectPut {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
@@ -2393,7 +2587,11 @@ impl MetaStore {
                 bucket: bucket.to_string(),
                 delta,
             },
-        ])
+        ];
+        if let Some(rec) = event {
+            ops.push(Op::EventEnqueue { record: rec });
+        }
+        self.commit(&ops)
     }
 
     /// 对象删除 + 分配记录 + 桶统计。
@@ -2404,7 +2602,20 @@ impl MetaStore {
         draft: AllocDraft,
         delta: StatsDelta,
     ) -> Result<u64> {
-        self.commit(&[
+        self.commit_object_delete_ev(bucket, key, draft, delta, None)
+    }
+
+    /// M15 N2(ADR-18 D-E1):`commit_object_delete` + 同事务事件入队
+    /// (event = 删除结果实体;None = 无事件路径,与旧签名逐字节等价)。
+    pub fn commit_object_delete_ev(
+        &self,
+        bucket: &str,
+        key: &str,
+        draft: AllocDraft,
+        delta: StatsDelta,
+        event: Option<fs3_core::EventRecord>,
+    ) -> Result<u64> {
+        let mut ops = vec![
             Op::ObjectDelete {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
@@ -2414,7 +2625,11 @@ impl MetaStore {
                 bucket: bucket.to_string(),
                 delta,
             },
-        ])
+        ];
+        if let Some(rec) = event {
+            ops.push(Op::EventEnqueue { record: rec });
+        }
+        self.commit(&ops)
     }
 
     /// 写删除标记 + 分配记录 + 桶统计(ADR-11 D5 口径:删除标记本身零
@@ -2432,7 +2647,23 @@ impl MetaStore {
         draft: AllocDraft,
         delta: StatsDelta,
     ) -> Result<u64> {
-        self.commit(&[
+        self.commit_object_delete_current_ev(bucket, key, vk, marker, draft, delta, None)
+    }
+
+    /// M15 N2(ADR-18 D-E1):`commit_object_delete_current` + 同事务事件
+    /// 入队(event = ObjectRemoved:DeleteMarkerCreated 实体;None = 无事件)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_object_delete_current_ev(
+        &self,
+        bucket: &str,
+        key: &str,
+        vk: Option<&[u8; 16]>,
+        marker: &ObjectMeta,
+        draft: AllocDraft,
+        delta: StatsDelta,
+        event: Option<fs3_core::EventRecord>,
+    ) -> Result<u64> {
+        let mut ops = vec![
             Op::ObjectDeleteCurrent {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
@@ -2444,7 +2675,11 @@ impl MetaStore {
                 bucket: bucket.to_string(),
                 delta,
             },
-        ])
+        ];
+        if let Some(rec) = event {
+            ops.push(Op::EventEnqueue { record: rec });
+        }
+        self.commit(&ops)
     }
 
     /// 版本化对象 PUT + 分配记录 + 桶统计(ADR-11 D1;Enabled 新 vk /
@@ -2458,13 +2693,28 @@ impl MetaStore {
         draft: AllocDraft,
         delta: StatsDelta,
     ) -> Result<u64> {
+        self.commit_object_put_version_ev(bucket, key, vk, meta, draft, delta, None)
+    }
+
+    /// M15 N2(ADR-18 D-E1):`commit_object_put_version` + 同事务事件入队。
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_object_put_version_ev(
+        &self,
+        bucket: &str,
+        key: &str,
+        vk: &[u8; 16],
+        meta: &ObjectMeta,
+        draft: AllocDraft,
+        delta: StatsDelta,
+        event: Option<fs3_core::EventRecord>,
+    ) -> Result<u64> {
         if meta.size > MAX_OBJECT_SIZE {
             return Err(Error::InvalidArgument(format!(
                 "object size {} exceeds max {}",
                 meta.size, MAX_OBJECT_SIZE
             )));
         }
-        self.commit(&[
+        let mut ops = vec![
             Op::ObjectPutVersion {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
@@ -2476,7 +2726,11 @@ impl MetaStore {
                 bucket: bucket.to_string(),
                 delta,
             },
-        ])
+        ];
+        if let Some(rec) = event {
+            ops.push(Op::EventEnqueue { record: rec });
+        }
+        self.commit(&ops)
     }
 
     /// 值格式在线重写(M10 V5-3):按原始键单事务重编码对象值为 v3,
@@ -2501,7 +2755,21 @@ impl MetaStore {
         draft: AllocDraft,
         delta: StatsDelta,
     ) -> Result<u64> {
-        self.commit(&[
+        self.commit_object_delete_version_ev(bucket, key, vk, draft, delta, None)
+    }
+
+    /// M15 N2(ADR-18 D-E1):`commit_object_delete_version` + 同事务事件
+    /// 入队(event = ObjectRemoved:Delete 实体;None = 无事件)。
+    pub fn commit_object_delete_version_ev(
+        &self,
+        bucket: &str,
+        key: &str,
+        vk: &[u8; 16],
+        draft: AllocDraft,
+        delta: StatsDelta,
+        event: Option<fs3_core::EventRecord>,
+    ) -> Result<u64> {
+        let mut ops = vec![
             Op::ObjectDeleteVersion {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
@@ -2512,7 +2780,11 @@ impl MetaStore {
                 bucket: bucket.to_string(),
                 delta,
             },
-        ])
+        ];
+        if let Some(rec) = event {
+            ops.push(Op::EventEnqueue { record: rec });
+        }
+        self.commit(&ops)
     }
 
     /// 压缩迁移事务(ADR-9 §6.2 阶段 3):单对象段列表更新(旧段→新段)+
@@ -2876,7 +3148,27 @@ impl MetaStore {
         draft: AllocDraft,
         delta: StatsDelta,
     ) -> Result<u64> {
-        let mut ops: Vec<Op> = Vec::with_capacity(part_keys.len() + 4);
+        self.complete_multipart_version_ev(
+            bucket, key, upload_id, vk, meta, part_keys, draft, delta, None,
+        )
+    }
+
+    /// M15 N2(ADR-18 D-E1):`complete_multipart_version` + 同事务事件
+    /// 入队(event = ObjectCreated:CompleteMultipartUpload 实体)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_multipart_version_ev(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        vk: Option<&[u8; 16]>,
+        meta: &ObjectMeta,
+        part_keys: &[Vec<u8>],
+        draft: AllocDraft,
+        delta: StatsDelta,
+        event: Option<fs3_core::EventRecord>,
+    ) -> Result<u64> {
+        let mut ops: Vec<Op> = Vec::with_capacity(part_keys.len() + 5);
         match vk {
             Some(vk) => ops.push(Op::ObjectPutVersion {
                 bucket: bucket.to_string(),
@@ -2905,6 +3197,9 @@ impl MetaStore {
             bucket: bucket.to_string(),
             delta,
         });
+        if let Some(rec) = event {
+            ops.push(Op::EventEnqueue { record: rec });
+        }
         self.commit(&ops)
     }
 }
@@ -3106,6 +3401,25 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
                 for old in tscan_notification_rule_keys(tx, bucket)? {
                     tremove(tx, &old)?;
                 }
+            }
+            Op::EventEnqueue { record } => {
+                // M15 N2(ADR-18 D-E1):事件键 seq = 当前事务 seq;值与
+                // 数据操作同事务落盘(崩溃零漂移)。单事务至多一条事件
+                // (多事件入队 = 多原语多事务,引擎侧保证)。
+                debug_assert!(record.seq == 0 || record.seq == seq);
+                let mut rec = record.clone();
+                rec.seq = seq;
+                tinsert(tx, event_key(seq), encode(&rec)?)?;
+            }
+            Op::EventMarkDead { seq } => {
+                let k = event_key(*seq);
+                let cur = tget(tx, &k)?.ok_or_else(|| Error::NotFound(format!("event {seq}")))?;
+                let mut rec: fs3_core::EventRecord = decode(&cur)?;
+                rec.dead = true;
+                tinsert(tx, k, encode(&rec)?)?;
+            }
+            Op::EventDelete { seq } => {
+                tremove(tx, &event_key(*seq))?;
             }
             Op::ObjectSetTags {
                 bucket,
@@ -3812,6 +4126,178 @@ mod tests {
         let n2 = got.iter().find(|r| r.id == "n2").unwrap();
         assert_eq!(n2.filter, NotificationKeyFilter::default());
         assert_eq!(n2.events, vec!["s3:ObjectRemoved:Delete"]);
+    }
+
+    /// M15 N2(ADR-18 D-E1):事件队列核心语义——
+    /// ① 同事务入队:数据 ops + EventEnqueue 一次 commit,事务 seq = 事件 seq
+    ///   (key `e:{seq}` 与 a:/t: 同源单调);
+    /// ② 全有或全无:数据 op 失败(此处用桶统计负增量触发可观察失败不复现,
+    ///   改验 commit 冲突回滚)则事件同回滚——直接断言孤立 commit_with_event
+    ///   在目标桶不存在时整体失败且队列无残留(NOT FOUND 路径即原子性证明);
+    /// ③ pending_events 扫描序 = 入队序(seq 升序),dead 跳过;
+    /// ④ mark_dead → 留存(可读)且不再进 pending;delete_event → 消失;
+    /// ⑤ truncate_events 有界环形(最旧截断);
+    /// ⑥ 重启后队列继续(重放 = 磁盘直读,head/seq 不变)。
+    #[test]
+    fn event_queue_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = |seq_seed: u64, key: &str| fs3_core::EventRecord {
+            seq: seq_seed,
+            ts: 1_700_000_000,
+            bucket: "b1".into(),
+            key: key.into(),
+            event: "s3:ObjectCreated:Put".into(),
+            etag: Some("d41d8cd98f00b204e9800998ecf8427e".into()),
+            size: Some(3),
+            version_id: None,
+            delete_marker: false,
+            dead: false,
+        };
+        {
+            let meta = Arc::new(MetaStore::open(dir.path(), &MetaConfig::default()).unwrap());
+            meta.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+            // ① 同事务:ObjectPut + EventEnqueue 一次 commit(seq = 事务 seq)
+            let ops = [
+                Op::ObjectPut {
+                    bucket: "b1".into(),
+                    key: "k1".into(),
+                    meta: object_meta(3),
+                },
+                Op::Alloc {
+                    draft: AllocDraft::default(),
+                },
+                Op::Stats {
+                    bucket: "b1".into(),
+                    delta: StatsDelta {
+                        objects: 1,
+                        bytes: 3,
+                    },
+                },
+            ];
+            let seq = meta.commit_with_event(&ops, &rec(0, "k1")).unwrap();
+            assert!(seq >= 2, "桶创建已消耗一个 seq;事件事务 seq 继续单调");
+            let head = meta.event_head_seq().unwrap();
+            assert_eq!(head, Some(seq), "事件键 seq = 事务 seq");
+            let recs = meta.pending_events(10, None).unwrap();
+            assert_eq!(recs.len(), 1);
+            assert_eq!(recs[0].seq, seq);
+            assert_eq!(recs[0].key, "k1");
+            assert_eq!(
+                recs[0].etag.as_deref(),
+                Some("d41d8cd98f00b204e9800998ecf8427e")
+            );
+            // 队列 FIFO:再入一条 → 序保持
+            let s2 = meta
+                .commit_with_event(
+                    &[Op::ObjectPut {
+                        bucket: "b1".into(),
+                        key: "k2".into(),
+                        meta: object_meta(1),
+                    }],
+                    &rec(0, "k2"),
+                )
+                .unwrap();
+            assert_eq!(s2, seq + 1);
+            let recs = meta.pending_events(10, None).unwrap();
+            assert_eq!(recs.len(), 2);
+            assert_eq!((recs[0].seq, recs[0].key.as_str()), (seq, "k1"));
+            assert_eq!((recs[1].seq, recs[1].key.as_str()), (s2, "k2"));
+            // ② 原子性:目标桶不存在 → 整事务失败(含事件)零残留
+            let err = meta.commit_with_event(
+                &[Op::ObjectPut {
+                    bucket: "ghost".into(),
+                    key: "k".into(),
+                    meta: object_meta(1),
+                }],
+                &rec(0, "k"),
+            );
+            assert!(err.is_err());
+            assert_eq!(meta.event_count().unwrap(), 2, "失败事务事件同回滚");
+            // ③④ 死信/删除流转
+            meta.mark_event_dead(seq).unwrap();
+            let recs = meta.pending_events(10, None).unwrap();
+            assert_eq!(recs.len(), 1, "死信条目不再进 pending");
+            assert_eq!(recs[0].seq, s2);
+            // 死信键仍可读(留存诊断):pending_events 跳过但键在(条数计数含死信)
+            assert_eq!(meta.pending_events(100, None).unwrap().len(), 1);
+            assert_eq!(meta.event_count().unwrap(), 2, "死信键保留在环形内");
+            meta.delete_event(s2).unwrap();
+            assert_eq!(meta.event_count().unwrap(), 1, "投递成功删键");
+            assert_eq!(
+                meta.event_head_seq().unwrap(),
+                Some(seq),
+                "键删最旧后 head 前移到最旧存留"
+            );
+            meta.delete_event(seq).unwrap();
+            assert_eq!(meta.event_count().unwrap(), 0);
+            assert_eq!(meta.event_head_seq().unwrap(), None);
+            // ⑤ 有界环形:max=5,slack=0(1/10 → 1):写 8 条 → 截断回 5
+            for i in 0..8u64 {
+                meta.commit_with_event(
+                    &[Op::ObjectPut {
+                        bucket: "b1".into(),
+                        key: format!("bulk{i}"),
+                        meta: object_meta(1),
+                    }],
+                    &rec(0, &format!("bulk{i}")),
+                )
+                .unwrap();
+            }
+            assert_eq!(meta.event_count().unwrap(), 8);
+            meta.truncate_events(5).unwrap();
+            assert_eq!(meta.event_count().unwrap(), 5);
+            let recs = meta.pending_events(100, None).unwrap();
+            assert_eq!(recs[0].key, "bulk3", "最旧 3 条被截断");
+            assert_eq!(recs[4].key, "bulk7");
+            // ⑥ 重启续投:显式落盘后重开,队列/head 不变
+            meta.flush().unwrap();
+        }
+        let meta = Arc::new(MetaStore::open(dir.path(), &MetaConfig::default()).unwrap());
+        assert_eq!(meta.event_count().unwrap(), 5, "重启后队列继续");
+        let head = meta.event_head_seq().unwrap().unwrap();
+        let recs = meta.pending_events(100, None).unwrap();
+        assert_eq!(recs[0].seq, head, "head = 最旧未投递条目的 seq");
+        assert_eq!(recs[0].key, "bulk3");
+        // after_seq 断点续投(N3 worker 游标)
+        let tail = meta.pending_events(100, Some(head)).unwrap();
+        assert_eq!(tail[0].key, "bulk4");
+    }
+
+    /// M15 N2:EventRecord 尾部 `dead` 字段——新格式往返 + 初版格式字节
+    /// 直写回退(dead=false,零迁移;照双读先例)。
+    #[test]
+    fn event_record_dead_tail_dual_read() {
+        let (_d, s) = open_tmp();
+        s.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        #[derive(serde::Serialize)]
+        struct EventV1 {
+            seq: u64,
+            ts: u64,
+            bucket: String,
+            key: String,
+            event: String,
+            etag: Option<String>,
+            size: Option<u64>,
+            version_id: Option<String>,
+            delete_marker: bool,
+        }
+        let old = EventV1 {
+            seq: 1,
+            ts: 1,
+            bucket: "b1".into(),
+            key: "k".into(),
+            event: "s3:ObjectCreated:Put".into(),
+            etag: None,
+            size: None,
+            version_id: None,
+            delete_marker: false,
+        };
+        #[allow(clippy::disallowed_methods)]
+        let bytes = postcard::to_allocvec(&old).unwrap();
+        s.db.put(event_key(1), &bytes).map_err(rocks_err).unwrap();
+        let recs = s.pending_events(10, None).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert!(!recs[0].dead, "初版格式值回退 dead=false");
     }
 
     #[test]

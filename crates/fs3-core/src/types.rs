@@ -891,6 +891,59 @@ impl NotificationRule {
     }
 }
 
+/// 事件通知队列条目(M15 N2;ADR-18 D-E1;键 `e:{seq be64}` → postcard
+/// EventRecord)。seq = 触发它的数据事务 seq(单调,崩溃零漂移:入队与
+/// 数据操作同事务提交——已应答对象必有事件、未应答必无事件)。
+/// 投递语义 = at-least-once;载荷 eventId = seq,目标端可幂等。
+/// 演进纪律:结构只许尾部追加字段/变体(postcard 序)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventRecord {
+    /// 事件 seq(= 触发事务 seq;单调;载荷 eventId)。
+    pub seq: u64,
+    /// 事件时刻(unix 秒)。
+    pub ts: u64,
+    pub bucket: String,
+    pub key: String,
+    /// 规范化 AWS 事件名(如 "s3:ObjectCreated:Put")。
+    pub event: String,
+    /// 对象 ETag(删除事件可空;AWS 载荷同口径)。
+    pub etag: Option<String>,
+    /// 对象字节数(删除事件可空)。
+    pub size: Option<u64>,
+    /// 版本 ID(版本化桶事件带;未版本化空)。
+    pub version_id: Option<String>,
+    /// 是否为删除标记创建事件(AWS payload 含 "deleteMarker": true)。
+    #[serde(default)]
+    pub delete_marker: bool,
+    /// 死信标记(N3 投递 worker 重试超限置位;死信留存由环形截断清理;
+    /// 绝不影响数据面)。#[serde(default)] 保证初版值可读。
+    #[serde(default)]
+    pub dead: bool,
+}
+
+/// 事件入队草案(M15 N2;ADR-18 D-E1)。服务层在触发数据原语**前**置入
+/// 引擎待入队槽,提交漏斗在**同一事务**内落盘(seq = 该事务 seq);
+/// 原语失败 → 草案作废(未应答必无事件,零漂移)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventDraftKind {
+    /// ObjectCreated 族:具体子事件由服务层已知(Put/Post/Copy/
+    /// CompleteMultipartUpload)。
+    ObjectCreated(&'static str),
+    /// ObjectRemoved 族:由删除漏斗按结果裁决(Delete / DeleteMarkerCreated)。
+    ObjectRemoved,
+    /// LifecycleExpiration 族(N2 起生命周期执行器删除时入队;由删除
+    /// 漏斗按结果裁决 Delete / DeleteMarkerCreated,AWS 同口径)。
+    LifecycleExpiration,
+}
+
+/// 事件入队草案(见 [`EventDraftKind`])。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventDraft {
+    pub bucket: String,
+    pub key: String,
+    pub kind: EventDraftKind,
+}
+
 impl BucketMeta {
     /// 编码为值格式:`[version: u8] + postcard(Self)`(M10 起写入恒 v2)。
     pub fn encode_value(&self) -> Result<Vec<u8>> {

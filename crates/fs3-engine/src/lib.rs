@@ -1660,6 +1660,9 @@ impl Engine {
 
     /// 对象 PUT 提交(版本化分叉收口):target 决定未版本化单键 vs 版本键
     /// (Enabled 新 vk / Suspended VK_NULL 槽);均为单事务(§3.4.6)。
+    /// `event`:M15 N2(ADR-18 D-E1)事件草案——同事务入队(seq = 事务
+    /// seq;事件实体在提交路径内构造:etag/size/vk 此处置出)。
+    #[allow(clippy::too_many_arguments)]
     fn commit_put_plan(
         &self,
         bucket: &str,
@@ -1668,12 +1671,38 @@ impl Engine {
         meta: &ObjectMeta,
         draft: AllocDraft,
         delta: StatsDelta,
+        event: Option<fs3_core::EventDraft>,
     ) -> Result<u64> {
+        let rec = event.map(|d| {
+            let name = match &d.kind {
+                fs3_core::EventDraftKind::ObjectCreated(name) => (*name).to_string(),
+                fs3_core::EventDraftKind::ObjectRemoved => {
+                    unreachable!("ObjectRemoved 草案不落 put 提交路径")
+                }
+                fs3_core::EventDraftKind::LifecycleExpiration => {
+                    unreachable!("LifecycleExpiration 草案不落 put 提交路径")
+                }
+            };
+            fs3_core::EventRecord {
+                seq: 0, // apply_ops 覆写为事务 seq
+                ts: crate::now_ts() as u64,
+                bucket: d.bucket,
+                key: d.key,
+                event: name,
+                etag: Some(meta.etag_hex()),
+                size: Some(meta.size),
+                version_id: meta.version_id.map(|v| crate::version_id_display(Some(&v))),
+                delete_marker: false,
+                dead: false,
+            }
+        });
         match target.version_key() {
-            None => self.meta.commit_object_put(bucket, key, meta, draft, delta),
+            None => self
+                .meta
+                .commit_object_put_ev(bucket, key, meta, draft, delta, rec),
             Some(vk) => self
                 .meta
-                .commit_object_put_version(bucket, key, &vk, meta, draft, delta),
+                .commit_object_put_version_ev(bucket, key, &vk, meta, draft, delta, rec),
         }
     }
 
@@ -1874,6 +1903,42 @@ impl Engine {
         sse_key: Option<&fs3_core::SseWriteKey>,
         lock: ObjectLockWrite,
     ) -> Result<ObjectMeta> {
+        self.put_with_lock_ev(
+            bucket,
+            key,
+            reader,
+            content_type,
+            user_meta,
+            resp_headers,
+            tags,
+            precond,
+            checksum_alg,
+            sse_key,
+            lock,
+            None,
+        )
+    }
+
+    /// [`put_with_lock`] + 事件入队草案(M15 N2,ADR-18 D-E1):`event` 与
+    /// 数据**同事务**提交(成功即落 `e:` 键;失败/中止则草案作废零漂移)。
+    /// 服务层仅在桶有匹配通知规则时传 Some(零配置路径 None = 与旧行为
+    /// 逐字节等价)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn put_with_lock_ev(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        reader: &mut dyn Read,
+        content_type: Option<&str>,
+        user_meta: Vec<(String, String)>,
+        resp_headers: Vec<(String, String)>,
+        tags: Vec<(String, String)>,
+        precond: Option<&WritePrecondition>,
+        checksum_alg: Option<ChecksumAlgorithm>,
+        sse_key: Option<&fs3_core::SseWriteKey>,
+        lock: ObjectLockWrite,
+        event: Option<fs3_core::EventDraft>,
+    ) -> Result<ObjectMeta> {
         let Some(bkt) = self.meta.get_bucket(bucket)? else {
             return Err(Error::NotFound(format!("bucket {bucket}")));
         };
@@ -2022,6 +2087,7 @@ impl Engine {
                 &meta,
                 self.alloc.to_alloc_draft(&draft),
                 delta,
+                event,
             ) {
                 Ok(_) => {
                     self.maybe_checkpoint()?;
@@ -2053,6 +2119,7 @@ impl Engine {
             sse_key,
             checksum_out: &checksum_out,
             lock,
+            event,
         });
         match result {
             Ok(meta) => {
@@ -2092,6 +2159,7 @@ impl Engine {
             sse_key,
             checksum_out,
             lock,
+            event,
         } = ctx;
         let old_size = old.size;
         let old_segments = old.segments;
@@ -2173,6 +2241,7 @@ impl Engine {
             &meta,
             self.alloc.to_alloc_draft(&draft),
             delta,
+            event,
         ) {
             Ok(_) => {
                 self.mark_open_committed();
@@ -3332,7 +3401,7 @@ impl Engine {
             .get_bucket(bucket)?
             .map(|b| b.versioning)
             .unwrap_or_default();
-        self.delete_version_inner(bucket, key, version, versioning, false, false)
+        self.delete_version_inner(bucket, key, version, versioning, false, false, None)
     }
 
     /// delete_version_for 的 GOVERNANCE bypass 形态(M12 W2-4):S3
@@ -3346,7 +3415,30 @@ impl Engine {
         versioning: VersioningState,
         bypass_governance: bool,
     ) -> Result<Option<ObjectMeta>> {
-        self.delete_version_inner(bucket, key, version, versioning, bypass_governance, false)
+        self.delete_version_with_lock_ev(bucket, key, version, versioning, bypass_governance, None)
+    }
+
+    /// [`delete_version_with_lock`] + 事件入队草案(M15 N2;ADR-18 D-E1:
+    /// ObjectRemoved:Delete / DeleteMarkerCreated 同事务裁决;None =
+    /// 无事件路径)。
+    pub fn delete_version_with_lock_ev(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version: Option<[u8; 16]>,
+        versioning: VersioningState,
+        bypass_governance: bool,
+        event: Option<fs3_core::EventDraft>,
+    ) -> Result<Option<ObjectMeta>> {
+        self.delete_version_inner(
+            bucket,
+            key,
+            version,
+            versioning,
+            bypass_governance,
+            false,
+            event,
+        )
     }
 
     /// PUT 写后校验失败回滚:跳过 Object Lock(客户端从未看见成功)。
@@ -3357,9 +3449,10 @@ impl Engine {
         version: Option<[u8; 16]>,
         versioning: VersioningState,
     ) -> Result<Option<ObjectMeta>> {
-        self.delete_version_inner(bucket, key, version, versioning, false, true)
+        self.delete_version_inner(bucket, key, version, versioning, false, true, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn delete_version_inner(
         &mut self,
         bucket: &str,
@@ -3368,20 +3461,21 @@ impl Engine {
         versioning: VersioningState,
         bypass_governance: bool,
         skip_lock: bool,
+        event: Option<fs3_core::EventDraft>,
     ) -> Result<Option<ObjectMeta>> {
         match (versioning, version) {
             (VersioningState::Off, None) => {
-                self.delete_plain(bucket, key, bypass_governance, skip_lock)
+                self.delete_plain(bucket, key, bypass_governance, skip_lock, event)
             }
             (VersioningState::Off, Some(vk)) if vk == VK_NULL => {
-                self.delete_plain(bucket, key, bypass_governance, skip_lock)
+                self.delete_plain(bucket, key, bypass_governance, skip_lock, event)
             }
             (VersioningState::Off, Some(_)) => Err(Error::InvalidArgument(format!(
                 "version id specified for unversioned bucket {bucket}"
             ))),
-            (_, None) => self.delete_current_marker(bucket, key, versioning),
+            (_, None) => self.delete_current_marker(bucket, key, versioning, event),
             (_, Some(vk)) => {
-                self.delete_object_version(bucket, key, &vk, bypass_governance, skip_lock)
+                self.delete_object_version(bucket, key, &vk, bypass_governance, skip_lock, event)
             }
         }
     }
@@ -3397,7 +3491,71 @@ impl Engine {
         version: Option<[u8; 16]>,
         versioning: VersioningState,
     ) -> Result<Option<ObjectMeta>> {
-        self.delete_version_inner(bucket, key, version, versioning, false, false)
+        self.delete_version_for_ev(bucket, key, version, versioning, None)
+    }
+
+    /// [`delete_version_for`] + 事件入队草案(M15 N2;ADR-18 D-E1:
+    /// 生命周期执行器经此入 LifecycleExpiration 事件;None = 无事件)。
+    pub fn delete_version_for_ev(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version: Option<[u8; 16]>,
+        versioning: VersioningState,
+        event: Option<fs3_core::EventDraft>,
+    ) -> Result<Option<ObjectMeta>> {
+        self.delete_version_inner(bucket, key, version, versioning, false, false, event)
+    }
+
+    /// M15 N2(ADR-18 D-E1):由删除草案构造事件实体(事件名按草案族 +
+    /// `marker_created` 裁决;etag/size 仅数据版本携带,删除标记零负载)。
+    /// None = 无草案(零配置路径零开销)。
+    fn delete_event_record(
+        &self,
+        draft: &Option<fs3_core::EventDraft>,
+        meta: &ObjectMeta,
+        marker_created: bool,
+    ) -> Option<fs3_core::EventRecord> {
+        let d = draft.as_ref()?;
+        let event = match &d.kind {
+            fs3_core::EventDraftKind::ObjectRemoved => {
+                if marker_created {
+                    "s3:ObjectRemoved:DeleteMarkerCreated"
+                } else {
+                    "s3:ObjectRemoved:Delete"
+                }
+            }
+            fs3_core::EventDraftKind::LifecycleExpiration => {
+                if marker_created {
+                    "s3:LifecycleExpiration:DeleteMarkerCreated"
+                } else {
+                    "s3:LifecycleExpiration:Delete"
+                }
+            }
+            fs3_core::EventDraftKind::ObjectCreated(_) => {
+                unreachable!("ObjectCreated 草案不落删除提交路径")
+            }
+        };
+        Some(fs3_core::EventRecord {
+            seq: 0,
+            ts: crate::now_ts() as u64,
+            bucket: d.bucket.clone(),
+            key: d.key.clone(),
+            event: event.to_string(),
+            etag: if marker_created {
+                None
+            } else {
+                Some(meta.etag_hex())
+            },
+            size: if marker_created {
+                None
+            } else {
+                Some(meta.size)
+            },
+            version_id: meta.version_id.map(|v| crate::version_id_display(Some(&v))),
+            delete_marker: marker_created || meta.is_delete_marker,
+            dead: false,
+        })
     }
 
     /// 未版本化物理删除(旧路径原样):元数据 + 释放记录同事务;live_bytes
@@ -3412,6 +3570,7 @@ impl Engine {
         key: &str,
         bypass_governance: bool,
         skip_lock: bool,
+        event: Option<fs3_core::EventDraft>,
     ) -> Result<Option<ObjectMeta>> {
         let meta = match self.meta.get_object(bucket, key)? {
             Some(m) => m,
@@ -3430,10 +3589,17 @@ impl Engine {
                 bytes: -(meta.size as i64),
             }
         };
-        match self
-            .meta
-            .commit_object_delete(bucket, key, self.alloc.to_alloc_draft(&draft), delta)
-        {
+        // M15 N2(ADR-18 D-E1):物理删除 = ObjectRemoved:Delete /
+        // LifecycleExpiration:Delete(非标记)或同族 DeleteMarkerCreated
+        // (删的是标记本身,零数据);事件与事务同提交,失败即作废。
+        let rec = self.delete_event_record(&event, &meta, false);
+        match self.meta.commit_object_delete_ev(
+            bucket,
+            key,
+            self.alloc.to_alloc_draft(&draft),
+            delta,
+            rec,
+        ) {
             Ok(_) => {
                 self.maybe_checkpoint()?;
                 Ok(Some(meta))
@@ -3454,6 +3620,7 @@ impl Engine {
         bucket: &str,
         key: &str,
         versioning: VersioningState,
+        event: Option<fs3_core::EventDraft>,
     ) -> Result<Option<ObjectMeta>> {
         // target_vk:Some = 版本键(Enabled 新 vk / Suspended VK_NULL);
         // None = 遗留单键原地覆盖(D1a-1,仅 Suspended)
@@ -3487,13 +3654,17 @@ impl Engine {
             // null 族标记 mtime 保序(D1a 同秒裁决,见 null_family_mtime)
             marker.mtime = self.null_family_mtime(bucket, key)?;
         }
-        match self.meta.commit_object_delete_current(
+        // M15 N2(ADR-18 D-E1):删除标记创建 = ObjectRemoved:DeleteMarkerCreated
+        // / LifecycleExpiration:DeleteMarkerCreated(marker=true,零数据负载)。
+        let rec = self.delete_event_record(&event, &marker, true);
+        match self.meta.commit_object_delete_current_ev(
             bucket,
             key,
             target_vk.as_ref(),
             &marker,
             self.alloc.to_alloc_draft(&draft),
             delta,
+            rec,
         ) {
             Ok(_) => {
                 self.maybe_checkpoint()?;
@@ -3517,9 +3688,10 @@ impl Engine {
         vk: &[u8; 16],
         bypass_governance: bool,
         skip_lock: bool,
+        event: Option<fs3_core::EventDraft>,
     ) -> Result<Option<ObjectMeta>> {
         if *vk == VK_NULL && self.meta.get_object(bucket, key)?.is_some() {
-            return self.delete_plain(bucket, key, bypass_governance, skip_lock);
+            return self.delete_plain(bucket, key, bypass_governance, skip_lock, event);
         }
         let Some(meta) = self.meta.get_object_version(bucket, key, vk)? else {
             return Ok(None);
@@ -3535,12 +3707,16 @@ impl Engine {
                 bytes: -(meta.size as i64),
             };
         }
-        match self.meta.commit_object_delete_version(
+        // M15 N2(ADR-18 D-E1):版本物理删除 = ObjectRemoved/LifecycleExpiration
+        // :Delete(删除标记版本同族 Delete,delete_marker 语义按被删实体)。
+        let rec = self.delete_event_record(&event, &meta, meta.is_delete_marker);
+        match self.meta.commit_object_delete_version_ev(
             bucket,
             key,
             vk,
             self.alloc.to_alloc_draft(&draft),
             delta,
+            rec,
         ) {
             Ok(_) => {
                 self.maybe_checkpoint()?;
@@ -4096,6 +4272,30 @@ impl Engine {
         composite: Option<&CompositeChecksum>,
         sse_key: Option<&fs3_core::SseCKey>,
     ) -> Result<ObjectMeta> {
+        self.complete_multipart_ev(
+            bucket,
+            key,
+            upload_id,
+            client_parts,
+            composite,
+            sse_key,
+            None,
+        )
+    }
+
+    /// [`complete_multipart`] + 事件入队草案(M15 N2;ADR-18 D-E1:
+    /// ObjectCreated:CompleteMultipartUpload 同事务;None = 无事件路径)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_multipart_ev(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        client_parts: &[CompletePart],
+        composite: Option<&CompositeChecksum>,
+        sse_key: Option<&fs3_core::SseCKey>,
+        event: Option<fs3_core::EventDraft>,
+    ) -> Result<ObjectMeta> {
         let session = self
             .meta
             .get_multipart(upload_id)?
@@ -4607,7 +4807,7 @@ impl Engine {
             };
             // E4:配额检查(multipart complete 是字节入账点)
             self.check_quota(bucket, delta.bytes)?;
-            self.meta.complete_multipart_version(
+            self.meta.complete_multipart_version_ev(
                 bucket,
                 key,
                 upload_id,
@@ -4616,6 +4816,24 @@ impl Engine {
                 &part_keys,
                 self.alloc.to_alloc_draft(&draft),
                 delta,
+                event.map(|d| {
+                    let name = match &d.kind {
+                        fs3_core::EventDraftKind::ObjectCreated(name) => (*name).to_string(),
+                        _ => unreachable!("complete 草案只能为 ObjectCreated"),
+                    };
+                    fs3_core::EventRecord {
+                        seq: 0,
+                        ts: crate::now_ts() as u64,
+                        bucket: d.bucket,
+                        key: d.key,
+                        event: name,
+                        etag: Some(meta.etag_hex()),
+                        size: Some(meta.size),
+                        version_id: meta.version_id.map(|v| crate::version_id_display(Some(&v))),
+                        delete_marker: false,
+                        dead: false,
+                    }
+                }),
             )?;
             Ok(meta)
         })();
@@ -4996,6 +5214,44 @@ impl Engine {
         sse_dst_key: Option<&fs3_core::SseWriteKey>,
         lock: ObjectLockWrite,
     ) -> Result<ObjectMeta> {
+        self.copy_object_with_lock_ev(
+            src_bucket,
+            src_key,
+            src_version,
+            dst_bucket,
+            dst_key,
+            replace_content_type,
+            replace_user_meta,
+            replace_resp_headers,
+            replace_tags,
+            dst_versioning,
+            sse_src_key,
+            sse_dst_key,
+            lock,
+            None,
+        )
+    }
+
+    /// [`copy_object_with_lock`] + 事件入队草案(M15 N2;ADR-18 D-E1:
+    /// ObjectCreated:Copy 同事务;None = 无事件路径)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_object_with_lock_ev(
+        &mut self,
+        src_bucket: &str,
+        src_key: &str,
+        src_version: Option<&[u8; 16]>,
+        dst_bucket: &str,
+        dst_key: &str,
+        replace_content_type: Option<&str>,
+        replace_user_meta: Option<&[(String, String)]>,
+        replace_resp_headers: Option<&[(String, String)]>,
+        replace_tags: Option<&[(String, String)]>,
+        dst_versioning: VersioningState,
+        sse_src_key: Option<&fs3_core::SseCKey>,
+        sse_dst_key: Option<&fs3_core::SseWriteKey>,
+        lock: ObjectLockWrite,
+        event: Option<fs3_core::EventDraft>,
+    ) -> Result<ObjectMeta> {
         let src = self.resolve_object_entry(src_bucket, src_key, src_version, None)?;
         let (target, old) = self.plan_object_write(dst_bucket, dst_key, dst_versioning)?;
 
@@ -5206,13 +5462,33 @@ impl Engine {
         // LegacySlot 经 vk=None 原地覆盖遗留单键,D1a-1);数据版本走 put
         // 分叉提交。均为单事务(§3.4.6)。
         let r = if meta.is_delete_marker {
-            self.meta.commit_object_delete_current(
+            self.meta.commit_object_delete_current_ev(
                 dst_bucket,
                 dst_key,
                 target.version_key().as_ref(),
                 &meta,
                 self.alloc.to_alloc_draft(&draft),
                 delta,
+                event.map(|d| {
+                    let name = match &d.kind {
+                        fs3_core::EventDraftKind::ObjectCreated(name) => (*name).to_string(),
+                        _ => unreachable!("copy 草案只能为 ObjectCreated"),
+                    };
+                    fs3_core::EventRecord {
+                        seq: 0,
+                        ts: crate::now_ts() as u64,
+                        bucket: d.bucket,
+                        key: d.key,
+                        event: name,
+                        etag: None,
+                        size: None,
+                        version_id: target
+                            .version_key()
+                            .map(|v| crate::version_id_display(Some(&v))),
+                        delete_marker: true,
+                        dead: false,
+                    }
+                }),
             )
         } else {
             self.commit_put_plan(
@@ -5222,6 +5498,7 @@ impl Engine {
                 &meta,
                 self.alloc.to_alloc_draft(&draft),
                 delta,
+                event,
             )
         };
         match r {
@@ -5857,6 +6134,8 @@ struct PutCtx<'a> {
     /// 提交前取回落 ObjectMeta.checksum(修复落盘恒 None 的时序缺口)。
     checksum_out: &'a std::cell::RefCell<Option<ChecksumInfo>>,
     lock: ObjectLockWrite,
+    /// M15 N2(ADR-18 D-E1):事件入队草案(同事务;None = 无事件路径)。
+    event: Option<fs3_core::EventDraft>,
 }
 
 /// 版本化写入目标(ADR-11 §3.4.2;put/copy/complete 共用分叉)。
