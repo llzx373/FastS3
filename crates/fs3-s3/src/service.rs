@@ -7126,6 +7126,9 @@ fn route_op_bucket_key(req: &S3Request) -> (fs3_core::metrics::Op, String, Strin
         // s3:GetObjectAttributes;对象级操作——桶级 ?attributes 归列表回退,
         // 不归此名;须在通配 GET 臂之前)
         ("GET", _, k) if !k.is_empty() && has_q("attributes") => (Op::Get, "GetObjectAttributes"),
+        // M16 A2:POST ?restore 审计名(AWS 动作 s3:RestoreObject;归档审计
+        // 过滤按此名检索)
+        ("POST", _, k) if !k.is_empty() && has_q("restore") => (Op::Other, "RestoreObject"),
         ("PUT", _, "") => (Op::CreateBucket, "CreateBucket"),
         ("DELETE", _, "") => (Op::DeleteBucket, "DeleteBucket"),
         ("HEAD", _, "") => (Op::Other, "HeadBucket"),

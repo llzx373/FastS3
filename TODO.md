@@ -112,7 +112,7 @@
 - [x] A3-3 指标与告警:fasts3_archive_*/fasts3_restore_* 指标组 + FastS3RestoreStalled 告警
 
 #### A4 管理面(≈0.5 pw)
-- [ ] A4-1 控制台/审计:存储类分布与 restore 状态展示、手动 restore 操作、归档审计过滤(web/server 桥接端点)
+- [x] A4-1 控制台/审计:存储类分布与 restore 状态展示、手动 restore 操作、归档审计过滤(web/server 桥接端点)
 
 #### A5 测试与门禁(≈1.3 pw)
 - [ ] A5-1 s3-tests transition/restore/storage-class 族出排除集且 100%(test_lifecycle_transition_* 出集;test_restore_object* 按实现口径出集或逐名记录;EXCLUDE 正则与 README 矩阵同步)

@@ -124,3 +124,36 @@ test("版本化/CORS/策略/标签端点", async () => {
   r = await authGet(app, "DELETE", "/api/buckets/b1/cors");
   assert.equal(r.statusCode, 200);
 });
+
+test("POST /api/buckets/:name/objects/restore 中转 RestoreObject(M16 A4-1)", async () => {
+  let called = false;
+  const fake = {
+    restoreObject: async (bucket: string, key: string, days: number, tier: string) => {
+      called = true;
+      assert.equal(bucket, "b1");
+      assert.equal(key, "arch/g1");
+      assert.equal(days, 3);
+      assert.equal(tier, "Standard");
+    },
+  } as unknown as S3M10Client;
+  const app = makeApp(fake);
+  const ok = await authGet(app, "POST", "/api/buckets/b1/objects/restore", {
+    key: "arch/g1",
+    days: 3,
+    tier: "Standard",
+  });
+  assert.equal(ok.statusCode, 200, ok.body);
+  assert.equal(called, true);
+  // 参数校验:days 越界 / 非法 tier → 400
+  const bad = await authGet(app, "POST", "/api/buckets/b1/objects/restore", {
+    key: "arch/g1",
+    days: 0,
+  });
+  assert.equal(bad.statusCode, 400);
+  const bad2 = await authGet(app, "POST", "/api/buckets/b1/objects/restore", {
+    key: "arch/g1",
+    days: 1,
+    tier: "Instant",
+  });
+  assert.equal(bad2.statusCode, 400);
+});

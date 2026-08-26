@@ -2,6 +2,14 @@ import { useCallback, useEffect, useState } from "react";
 import { api, fmtBytes, fmtTime, type BucketInfo, type BucketCorsRule, type LifecycleRule, type ObjectLockConfig } from "../api";
 import { validatePolicy } from "./Keys";
 
+/** M16 A1:存储类分布紧凑展示("G:2/1.2KB D:1/4B";空 = "—")。 */
+function fmtClassDist(byClass?: Array<{ class: string; objects: number; bytes: number }>): string {
+  if (!byClass || byClass.length === 0) return "—";
+  return byClass
+    .map((c) => `${c.class.slice(0, 3)}:${c.objects}/${fmtBytes(c.bytes)}`)
+    .join(" ");
+}
+
 export default function Buckets() {
   const [buckets, setBuckets] = useState<BucketInfo[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -72,6 +80,7 @@ export default function Buckets() {
               <th>名称</th>
               <th>对象数</th>
               <th>已用空间</th>
+              <th>存储类分布</th>
               <th>配额</th>
               <th>创建时间</th>
               <th>操作</th>
@@ -85,6 +94,7 @@ export default function Buckets() {
                 </td>
                 <td>{b.objects}</td>
                 <td>{fmtBytes(b.bytes)}</td>
+                <td title="存储类分账(M16)">{fmtClassDist(b.by_class)}</td>
                 <td>{b.quota ? fmtBytes(b.quota) : "不限"}</td>
                 <td className="muted">{fmtTime(b.created)}</td>
                 <td>
@@ -102,7 +112,7 @@ export default function Buckets() {
             ))}
             {buckets.length === 0 && (
               <tr>
-                <td colSpan={6} className="muted">
+                <td colSpan={7} className="muted">
                   暂无桶
                 </td>
               </tr>

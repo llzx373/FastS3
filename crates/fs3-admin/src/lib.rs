@@ -467,6 +467,10 @@ impl AdminServer {
                 self.handle_bucket_delete(name, force)
             }
             ("GET", ["buckets", name, "stats"]) => self.handle_bucket_stats(name),
+            // M16 A4-1:手动归档恢复(POST /v1/admin/buckets/{name}/objects/{key}/restore)
+            ("POST", ["buckets", name, "objects", key, "restore"]) => {
+                self.handle_object_restore(name, key, body)
+            }
             ("GET", ["keys"]) => self.handle_keys_list(),
             ("POST", ["keys"]) => self.handle_key_create(body),
             ("DELETE", ["keys", access]) => self.handle_key_delete(access),
@@ -940,6 +944,14 @@ impl AdminServer {
                         "owner": m.owner,
                         "objects": m.stats.objects,
                         "bytes": m.stats.bytes,
+                        // M16 A1(ADR-19 DA5):存储类分账(控制台分布视图)
+                        "by_class": m.stats.by_class.iter().map(|(c, t)| {
+                            serde_json::json!({
+                                "class": c,
+                                "objects": t.objects,
+                                "bytes": t.bytes,
+                            })
+                        }).collect::<Vec<_>>(),
                         "quota": m.quota,
                     })
                 }).collect::<Vec<_>>(),
@@ -1095,6 +1107,73 @@ impl AdminServer {
                 "internal",
                 &e.to_string(),
             ),
+        }
+    }
+
+    /// M16 A4-1(ADR-19 DA2):手动归档恢复(控制台「手动 restore」桥接;
+    /// JSON 体 {days, tier?, version_id?};走引擎恢复状态机——入队/幂等
+    /// 延长与数据面 POST ?restore 同语义)。
+    fn handle_object_restore(&self, bucket: &str, key: &str, body: &[u8]) -> Response<String> {
+        let parsed: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(e) => {
+                return json::err(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_json",
+                    &format!("body must be JSON: {e}"),
+                )
+            }
+        };
+        let days = match parsed.get("days").and_then(|d| d.as_u64()) {
+            Some(d) if (1..=365).contains(&d) => d as u32,
+            _ => {
+                return json::err(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_days",
+                    "days must be an integer in 1..=365",
+                )
+            }
+        };
+        let tier = parsed
+            .get("tier")
+            .and_then(|t| t.as_str())
+            .unwrap_or("Standard")
+            .to_string();
+        if !matches!(tier.as_str(), "Expedited" | "Standard" | "Bulk") {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "invalid_tier",
+                "tier must be one of Expedited/Standard/Bulk",
+            );
+        }
+        let vk = match parsed.get("version_id").and_then(|v| v.as_str()) {
+            None | Some("") => None,
+            Some("null") => Some(fs3_meta::keys::VK_NULL),
+            Some(hexs) => match hex::decode(hexs) {
+                Ok(b) if b.len() == 16 => {
+                    let mut v = [0u8; 16];
+                    v.copy_from_slice(&b);
+                    Some(v)
+                }
+                _ => {
+                    return json::err(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_version_id",
+                        "version_id must be a 32-char hex or 'null'",
+                    )
+                }
+            },
+        };
+        let mut engine = self.engine.write();
+        match engine.restore_enqueue(bucket, key, vk.as_ref(), days, &tier) {
+            Ok(outcome) => json::ok(serde_json::json!({
+                "accepted": true,
+                "extended_until": match outcome {
+                    fs3_engine::restore::RestoreEnqueueOutcome::Extended(until) => Some(until),
+                    fs3_engine::restore::RestoreEnqueueOutcome::Enqueued => None,
+                },
+            })),
+            Err(e) => json::err(StatusCode::BAD_REQUEST, "restore_failed", &e.to_string()),
         }
     }
 

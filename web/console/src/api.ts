@@ -38,6 +38,8 @@ export interface BucketInfo {
   objects: number;
   bytes: number;
   quota: number | null;
+  /** M16 A1:存储类分账(控制台分布视图)。 */
+  by_class?: Array<{ class: string; objects: number; bytes: number }>;
 }
 
 export interface KeyInfo {
@@ -159,6 +161,8 @@ export interface ListedObject {
   size: number;
   etag: string;
   lastModified: string;
+  /** M16 A1:真实存储类(归档三值 / STANDARD)。 */
+  storageClass?: string;
 }
 
 /** M10:对象版本条目(版本或删除标记)。 */
@@ -339,6 +343,13 @@ export const api = {
       key,
       versionId,
     }),
+  /** M16 A4-1:归档对象手动恢复(后台作业;Days 1..365,Tier 三档)。 */
+  restoreObject: (bucket: string, key: string, days: number, tier: string) =>
+    request<Record<string, unknown>>(
+      "POST",
+      `/api/buckets/${encodeURIComponent(bucket)}/objects/restore`,
+      { key, days, tier }
+    ),
   getVersioning: (bucket: string) =>
     request<{ Status: string }>("GET", `/api/buckets/${encodeURIComponent(bucket)}/versioning`),
   putVersioning: (bucket: string, status: "Enabled" | "Suspended") =>

@@ -796,3 +796,83 @@ fn admin_pool_device_views_and_usage_metrics() {
     assert!(text.contains("fasts3_pool_usage 0"), "{text}");
     drop(handle);
 }
+
+/// M16 A4-1(ADR-19 DA2):手动归档恢复桥接端点 + 存储类分布视图——
+/// PUT 归档对象 → POST .../objects/{key}/restore(JSON {days,tier})→
+/// 入队(accepted);参数校验(越界 days/非法 tier → 400);buckets 列表
+/// by_class 分布可见。
+#[test]
+fn admin_object_restore_and_class_distribution() {
+    let (_d, img) = setup();
+    let cfg = EngineConfig {
+        devices: vec![img.clone()],
+        meta_dir: img.parent().unwrap().join("meta"),
+        ..Default::default()
+    };
+    // 建桶 + 归档对象(先于 admin 启动——meta 目录锁互斥)
+    {
+        let mut e = fs3_engine::Engine::open(&cfg).unwrap();
+        e.ensure_bucket("ar").unwrap();
+        e.put_with_lock_ev(
+            "ar",
+            "g1",
+            &mut std::io::Cursor::new(b"archive me".to_vec()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            fs3_core::ObjectLockWrite::default(),
+            None,
+            Some("GLACIER".into()),
+            fs3_core::promote_storage_class(Some("GLACIER")),
+        )
+        .unwrap();
+        e.close().unwrap();
+    }
+    let (sock, handle) = start_admin(&cfg, "sekret");
+    let sock = sock.trim_start_matches("unix://");
+    // 存储类分布(buckets 列表 by_class)
+    let (code, body) = http_unix(sock, "GET", "/v1/admin/buckets", None, "sekret");
+    assert_eq!(code, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let arr = v["buckets"].as_array().unwrap();
+    let b = arr
+        .iter()
+        .find(|b| b["name"] == "ar")
+        .expect("bucket listed");
+    assert_eq!(b["by_class"][0]["class"], "GLACIER", "分布: {body}");
+    assert_eq!(b["by_class"][0]["objects"], 1);
+    // 手动 restore
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/admin/buckets/ar/objects/g1/restore",
+        Some(r#"{"days":3,"tier":"Standard"}"#),
+        "sekret",
+    );
+    assert_eq!(code, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["accepted"], true);
+    // 参数校验
+    let (code, _) = http_unix(
+        sock,
+        "POST",
+        "/v1/admin/buckets/ar/objects/g1/restore",
+        Some(r#"{"days":0}"#),
+        "sekret",
+    );
+    assert_eq!(code, 400, "days=0 拒绝");
+    let (code, _) = http_unix(
+        sock,
+        "POST",
+        "/v1/admin/buckets/ar/objects/g1/restore",
+        Some(r#"{"days":1,"tier":"Instant"}"#),
+        "sekret",
+    );
+    assert_eq!(code, 400, "非法 tier 拒绝");
+    // 200 + accepted:true = 恢复作业已入队(restore_enqueue 失败会 400)
+    let _ = handle;
+}

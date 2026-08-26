@@ -126,6 +126,8 @@ export interface ListedObject {
   size: number;
   etag: string;
   lastModified: string;
+  /** M16 A1:真实存储类(归档三值 / STANDARD)。 */
+  storageClass: string;
 }
 
 export interface ListResult {
@@ -157,7 +159,9 @@ function parseListXml(xml: string): ListResult {
     const size = /<Size>(\d+)<\/Size>/.exec(block)?.[1] ?? "0";
     const etag = /<ETag>"?([^"<]*)"?<\/ETag>/.exec(block)?.[1] ?? "";
     const lm = /<LastModified>([^<]*)<\/LastModified>/.exec(block)?.[1] ?? "";
-    out.objects.push({ key, size: Number(size), etag, lastModified: lm });
+    // M16 A1:真实存储类(ListObjectsV2 StorageClass 元素;缺省 STANDARD)
+    const sc = /<StorageClass>([^<]*)<\/StorageClass>/.exec(block)?.[1] ?? "STANDARD";
+    out.objects.push({ key, size: Number(size), etag, lastModified: lm, storageClass: sc });
   }
   const prefRe = /<CommonPrefixes>[\s\S]*?<Prefix>([^<]*)<\/Prefix>[\s\S]*?<\/CommonPrefixes>/g;
   while ((m = prefRe.exec(xml)) !== null) {
@@ -711,6 +715,18 @@ export class S3M10Client {
       }
     }
     await this.call("PUT", `/${bucket}/${this.encodeKey(key)}`, Buffer.alloc(0), headers);
+  }
+
+  /** M16 A2(ADR-19 DA2):归档对象恢复(POST ?restore;Days 1..365,Tier
+   * 三档;恢复为后台作业,ongoing/expiry 由后续 HEAD x-amz-restore 回显)。 */
+  async restoreObject(bucket: string, key: string, days: number, tier: string): Promise<void> {
+    const xml =
+      `<RestoreRequest><Days>${days}</Days><Tier>${tier}</Tier></RestoreRequest>`;
+    await this.call(
+      "POST",
+      `/${bucket}/${this.encodeKey(key)}?restore`,
+      Buffer.from(xml, "utf8")
+    );
   }
 
   /** 永久删除指定版本(DELETE ?versionId;删除标记同样按版本删除)。 */

@@ -374,6 +374,36 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       }
     );
 
+    // M16 A4-1:归档对象手动恢复(POST /api/buckets/:name/objects/restore;
+    // 控制台「手动 restore」桥接数据面 POST ?restore)
+    app.post<{
+      Params: { name: string };
+      Body: { key?: string; days?: number; tier?: string };
+    }>(
+      "/api/buckets/:name/objects/restore",
+      { preHandler: requireRole("admin") },
+      async (req, reply) => {
+        const { name } = req.params;
+        const { key, days, tier } = req.body ?? {};
+        if (!key) {
+          return reply.code(400).send({ error: { code: "bad_request", message: "missing key" } });
+        }
+        if (!days || days < 1 || days > 365) {
+          return reply.code(400).send({ error: { code: "bad_request", message: "days must be 1..365" } });
+        }
+        const t = tier ?? "Standard";
+        if (!["Expedited", "Standard", "Bulk"].includes(t)) {
+          return reply.code(400).send({ error: { code: "bad_request", message: "tier must be Expedited/Standard/Bulk" } });
+        }
+        try {
+          await m10.restoreObject(name, key, days, t);
+          return { restored: { key, days: days, tier: t } };
+        } catch (e) {
+          return m10Error(e, reply, name);
+        }
+      }
+    );
+
     // 版本化开关(Enabled/Suspended;Enabled→Off 由数据面 409 拒绝)
     app.get<{ Params: { name: string } }>("/api/buckets/:name/versioning", async (req, reply) => {
       try {

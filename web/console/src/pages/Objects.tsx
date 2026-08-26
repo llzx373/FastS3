@@ -113,6 +113,23 @@ export default function Objects() {
     }
   };
 
+  /** M16 A4-1:归档对象手动恢复(默认 1 天 Standard;后台作业,ongoing/
+   * expiry 由后续列表/详情中的 x-amz-restore 回显)。 */
+  const restoreArchive = async (key: string) => {
+    if (!bucket) return;
+    if (!window.confirm(`恢复归档对象 ${key}?(1 天,Standard 档)`)) return;
+    setBusy(true);
+    try {
+      await api.restoreObject(bucket, key, 1, "Standard");
+      setError(null);
+      await load();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const remove = async (key: string) => {
     if (!confirm(`删除对象 ${key}?`)) return;
     try {
@@ -225,6 +242,7 @@ export default function Objects() {
                   <th>大小</th>
                   <th>ETag</th>
                   <th>修改时间</th>
+                  <th>存储类</th>
                   <th>操作</th>
                 </tr>
               </thead>
@@ -249,9 +267,25 @@ export default function Objects() {
                     </td>
                     <td className="muted">{new Date(o.lastModified).toLocaleString()}</td>
                     <td>
+                      {o.storageClass && o.storageClass !== "STANDARD" ? (
+                        <span className="tag" title={`存储类 ${o.storageClass}(M16 归档)`}>
+                          {o.storageClass}
+                        </span>
+                      ) : (
+                        <span className="muted">STANDARD</span>
+                      )}
+                    </td>
+                    <td>
                       <button className="ghost small" onClick={() => download(o.key)}>
                         下载
                       </button>{" "}
+                      {o.storageClass === "GLACIER" ||
+                      o.storageClass === "DEEP_ARCHIVE" ||
+                      o.storageClass === "GLACIER_IR" ? (
+                        <button className="ghost small" onClick={() => restoreArchive(o.key)}>
+                          恢复
+                        </button>
+                      ) : null}{" "}
                       <button className="ghost small" onClick={() => setCopyKey(o.key)}>
                         复制
                       </button>{" "}
