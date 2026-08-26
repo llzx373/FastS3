@@ -905,6 +905,11 @@ v1.0 基线 <256MiB 空载。远期特性开启态的常驻增量:多设备位�
 | D-E2 | NEXT-ROUND §5.6 | STS 会话模型 | 会话 = 基密钥 + 会话策略求交,无角色派生;secret 仅签发时一次回显 | ADR-18(M15) |
 | D-E3 | NEXT-ROUND §5.6 | 存储类头接受矩阵 | GLACIER*/IA/IT/RRS 统一映射 STANDARD + 元数据记录请求类 + 响应回显实际类,文档化非静默 | ADR-18(M15) |
 | D-E4 | NEXT-ROUND §5.6 | 通知目标范围 | Webhook 起步;SQS/SNS/EventBridge 后置评估 | ADR-18(M15) |
+| DA1 | NEXT-ROUND §6 | 归档落地形态 | GLACIER_IR = zstd 标准档在线可读;GLACIER/DEEP_ARCHIVE = zstd 高压缩档需 restore;延迟无人工模拟;冷盘倾斜后置 | ADR-19(M16) |
+| DA2 | NEXT-ROUND §6 | RestoreObject 语义 | 后台解压临时标准副本 + restored_until 过期 GC;Tier 接受映射;x-amz-restore 回显;幂等延长 | ADR-19(M16) |
+| DA3 | NEXT-ROUND §6 | Transition 目标类 | 限定 GLACIER/GLACIER_IR/DEEP_ARCHIVE;INTELLIGENT_TIERING 映射 STANDARD 不迁移 | ADR-19(M16) |
+| DA4 | NEXT-ROUND §6 | ObjectMeta v7 | storage_class + restore_state 字段,v6 双读回退;transition 同版本(vk 不变)原子换数据 | ADR-19(M16) |
+| DA5 | NEXT-ROUND §6 | 归档 Copy/统计口径 | 同存储类复制豁免 COW;逻辑口径按类分账;锁定对象跳过 transition | ADR-19(M16) |
 
 ---
 

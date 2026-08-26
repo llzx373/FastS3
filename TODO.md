@@ -93,7 +93,7 @@
 ### A. 归档存储类 + RestoreObject(≈6 pw;ADR-19;立项条件 = 冷数据成本诉求)
 
 #### A0 决策落盘
-- [ ] A0-1 ADR-19 写入 DESIGN.md §3.3:DA1(归档落地形态:GLACIER_IR = zstd 标准档在线可读;GLACIER/DEEP_ARCHIVE = zstd 高压缩档需 restore;冷盘倾斜可选;DEEP_ARCHIVE 取回延迟无人工模拟,文档化与 AWS 差异)、DA2(RestoreObject 语义:后台解压出临时标准副本 + restored_until 过期 GC;Tier 接受并映射;x-amz-restore 回显 ongoing-request/done;重复 restore 幂等延长)、DA3(Transition 目标类限定 GLACIER/GLACIER_IR/DEEP_ARCHIVE;INTELLIGENT_TIERING 维持映射 STANDARD 不迁移)、DA4(ObjectMeta v7 值版本:storage_class + restore_state 字段,v6 双读回退;升格/复用 M15 C1 requested_storage_class;transition 同版本(vk 不变)原子换数据)、DA5(归档 Copy/版本删除/统计口径 + 锁定对象跳过)
+- [x] A0-1 ADR-19 写入 DESIGN.md §3.3:DA1(归档落地形态:GLACIER_IR = zstd 标准档在线可读;GLACIER/DEEP_ARCHIVE = zstd 高压缩档需 restore;冷盘倾斜可选;DEEP_ARCHIVE 取回延迟无人工模拟,文档化与 AWS 差异)、DA2(RestoreObject 语义:后台解压出临时标准副本 + restored_until 过期 GC;Tier 接受并映射;x-amz-restore 回显 ongoing-request/done;重复 restore 幂等延长)、DA3(Transition 目标类限定 GLACIER/GLACIER_IR/DEEP_ARCHIVE;INTELLIGENT_TIERING 维持映射 STANDARD 不迁移)、DA4(ObjectMeta v7 值版本:storage_class + restore_state 字段,v6 双读回退;升格/复用 M15 C1 requested_storage_class;transition 同版本(vk 不变)原子换数据)、DA5(归档 Copy/版本删除/统计口径 + 锁定对象跳过)
 
 #### A1 元数据与写路径(≈1.5 pw)
 - [ ] A1-1 ObjectMeta v7(值版本字节,v6 双读单写):storage_class(真实)+ restore_state{restored_until,restored_size};meta-export/import DTO 同步;升级工具 v6→v7 在线重写(复用值格式重写框架,自动回滚)

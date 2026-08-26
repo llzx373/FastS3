@@ -1043,6 +1043,166 @@ NEXT-ROUND §5.6 决策点 **D-E1~D-E4** 的推荐方案落盘(DESIGN-FUTURE §1
 (DESIGN-FUTURE §9.1 预算表口径);覆盖率 ≥80%;cargo audit 清零;
 发布 v2.1.0 记档。
 
+#### ADR-19(M16 立项决策):归档存储类落地形态 / RestoreObject 语义 / Transition 目标 / ObjectMeta v7 / 归档账目口径
+
+**背景**:M16「归档与复制」(v2.2.0;TODO M16)主力组 = 归档存储类 +
+RestoreObject(≈6 pw)。前置已全部就绪:v1.2 生命周期(M11,L1/L5
+`r:` 规则 + 执行器)、v1.4 zstd 数据压缩(M13,ADR-15 DZ1:写时压缩
+`明文 → zstd → (SSE 加密) → CRC`)、M15 C1 存储类头接受矩阵
+(ADR-18 D-E3:8 值接受、`requested_storage_class` 记录请求类、实际类
+恒 STANDARD)、M15 N2 事件队列(`e:`;Restore*/Lifecycle 族事件注册表
+预留「M16 真归档后启用」)。本 ADR 按 TODO M16/A0-1 决策点 **DA1~DA5**
+落盘(DESIGN-FUTURE §11 决策清单同步登记)。实现偏离推荐方案必须走
+ADR 流程,不得静默偏离(AGENT §5)。
+
+**DA1(归档落地形态:三种归档类 = 两种压缩档,冷盘倾斜后置)**:
+
+1. **存储类模型升级为真实分层**:M15 的「8 值统一落 STANDARD」升级为
+   —— STANDARD/STANDARD_IA/ONEZONE_IA/REDUCED_REDUNDANCY/
+   INTELLIGENT_TIERING 仍统一落 **STANDARD**(单机单标准类,无 IA 分层
+   语义,维持 D-E3 文档化映射);**GLACIER_IR / GLACIER / DEEP_ARCHIVE
+   升级为真实归档类**(ObjectMeta v7 `storage_class` 记录真实类,响应
+   回显真实类)。
+2. **GLACIER_IR = zstd 标准档在线可读**:写入即压缩(zstd 档位 1~3,
+   与既有全局压缩配置同档),读路径走既有解压读(zstd 流式解压,
+   `read_compressed_meta` 复用)——**无需 restore 即可 GET/HEAD/Range**。
+3. **GLACIER / DEEP_ARCHIVE = zstd 高压缩档,需 restore 方可读**:
+   写入即压缩(zstd 高压缩档,档位 9 起——归档读写低频,压缩率优先;
+   CPU 成本文档化入发布报告);未恢复时 GET/HEAD/Copy 源 →
+   **403 InvalidObjectState**(标准错误 XML + `x-amz-storage-class`
+   响应头回显真实类),与 AWS 同码同语义。两类的取回延迟差异
+   (AWS:GLACIER 3~12h、DEEP_ARCHIVE 12~48h)**不做人工模拟**——本机
+   解压即取回(秒级~分钟级,取决于对象大小),差异文档化进 compat.md
+   (「取回更快 ≠ 语义更强」,防 SLA 误读)。
+4. **归档类强制压缩,与全局 compression 配置正交**:即使全局压缩关闭,
+   归档类对象也必须压缩(归档 = 压缩,这是成本模型的前提);全局压缩
+   开启时 STANDARD 对象维持现状(可压缩可不压缩),**不因归档特性
+   改变既有对象形态**——关闭态零开销红线不变。
+5. **压缩流水线顺序沿用 ADR-15 DZ1**(先压缩后加密);SSE 与归档可组合
+   (SSE-C/SSE-S3 + 归档单对象 PUT:压缩 → 加密 → CRC,restore 时
+   解密 → 解压出明文标准副本)。**SSE + 归档 + multipart 组合显式
+   400 拒绝**(维持 v1.4 multipart×压缩限制的理由:分片独立帧 × SSE
+   重加密组合面不开放),单对象 PUT 路径覆盖组合。
+6. **冷盘倾斜(多设备池把归档类倾向低性能盘)= 后置,不进 v2.2**:
+   无冷盘成本诉求证据;池级设备权重(DM2)已提供粗粒度人工倾斜能力,
+   细粒度按存储类倾斜留待诉求出现后立项(记录于 S3-GAP §5)。
+
+**DA2(RestoreObject 语义:后台解压临时标准副本 + restored_until 过期
+GC;Tier 接受并映射;幂等延长)**:
+
+1. **POST ?restore 受理范围**:仅归档类对象(GLACIER_IR/GLACIER/
+   DEEP_ARCHIVE)可 restore;STANDARD 对象 → 400 InvalidObjectState
+   (AWS 同码);已恢复对象重复 restore = **幂等延长**(restored_until
+   重新起算,不重复解压——副本仍有效时仅延长;副本已过期未 GC 时
+   视为未恢复,重新解压)。
+2. **Days 校验 1~365**(AWS 口径;越界 → 400 InvalidArgument);
+   **Tier 接受 Expedited/Standard/Bulk 并记录**(本机无延迟分层,三档
+   映射同一快速取回,记录入 restore_state 供审计/admin 展示);
+   **DEEP_ARCHIVE + Expedited → 400 InvalidArgument**(AWS:DEEP_ARCHIVE
+   不支持 Expedited,显式报错不静默)。
+3. **restore = 后台作业**:`POST ?restore` 校验通过后**入持久化作业队列**
+   (新前缀 `x:{seq be64}` → postcard RestoreJob;同 `e:` 模式:be64
+   字典序、崩溃续跑、有界截断),立即返回 200(ongoing);**restore
+   worker**(BackgroundWorker 实例,节流/暂停/批额度复用既有抽象)消费
+   队列:读归档流(解密 → 解压)→ 写**临时标准副本**(明文 extents,
+   大对象落盘/小对象内联)→ 单事务把 ObjectMeta 更新为已恢复
+   (`restore_state` 落盘,含 restored_until)+ 释放作业条目。崩溃任意点
+   收敛:作业条目未消费 → 重启续跑;已消费未提交 → 重放;提交后 →
+   对象已恢复,作业删除(至少一次语义,作业幂等)。
+4. **临时副本生命周期**:恢复副本仅存于 `restore_state.restored_extents`
+   (不占桶统计——统计为逻辑口径,见 DA5);**读取侧到期判定在请求路径**
+   (now > restored_until → 视同未恢复,403 InvalidObjectState,与 GC
+   时序无关——到期即时生效);**后台 GC 回收到期副本**(归档/生命周期
+   worker 的周期扫描:到期 → 单事务释放副本 extents + 清 restore_state
+   + 事件入队 RestoreExpired;GC 滞后只影响空间回收,不影响语义)。
+5. **x-amz-restore 回显**(GET/HEAD,与 AWS 一致):恢复进行中 =
+   `ongoing-request="true"`;已完成 = `ongoing-request="false",
+   expiry-date="Sun, 01 Jan 2027 00:00:00 GMT"`(RFC1123);已过期/未
+   restore = 无该头。
+6. **事件联动(M15 N2 预留兑现)**:restore 作业完成 → `ObjectRestore:*
+   (Post/Completed/Delete)` 事件族入队;Transition 执行 → `Lifecycle
+   Transition` 事件入队(随执行器已有操作点)。
+
+**DA3(Transition 目标类限定 + INTELLIGENT_TIERING 不迁移)**:
+
+1. **Transition 目标类限定 GLACIER / GLACIER_IR / DEEP_ARCHIVE**(其余
+   目标类 → 400 InvalidArgument,显式不静默);Transition 只能从
+   STANDARD 进入归档(对象已归档/已是目标类 → 跳过,计入
+   `fasts3_lifecycle_transition_skipped` 指标);**不实现归档 → 标准
+   反向 Transition**(去归档 = restore + 读后重写,文档化)。
+2. **INTELLIGENT_TIERING 维持 D-E3 映射 STANDARD 且不可作为 Transition
+   目标**(单机无自动分层引擎;规则携带 → InvalidArgument,文档化)。
+3. **Days/Date 触发语义沿用 v1.2 既有框架**(`r:` 规则 + 执行器周期
+   扫描;Days 从对象 mtime 起算;Filter 复用 v1.2 语法;Date 按 UTC
+   日历日)。
+
+**DA4(ObjectMeta v7 值版本:storage_class + restore_state;v6 双读;
+transition 同版本原子换数据)**:
+
+1. **ObjectMeta v7**(值版本字节 7):尾部追加两个字段——
+   `storage_class: Option<String>`(真实存储类;None = STANDARD;合法值
+   仅 GLACIER_IR/GLACIER/DEEP_ARCHIVE,STANDARD 系一律 None)与
+   `restore_state: Option<RestoreState>`(仅归档类已恢复对象;
+   RestoreState = `{restored_until: i64(到期 unix 秒), restored_at:
+   i64, restored_size: u64(明文逻辑大小), tier: String(请求 Tier),
+   restored_extents: Vec<Segment>, restored_inline: Option<Vec<u8>>}`)。
+   写入恒 v7;v6/v5/v4/v3/v2 **双读回退**(v6 → storage_class=None、
+   restore_state=None;既有 5 读链尾部补默认)。
+2. **升格复用 M15 C1 `requested_storage_class` 字段不动**:请求类仍
+   记录于原字段(审计/兼容面),真实类落 v7 新字段;二者关系 =
+   `storage_class = requested_class ∈ 归档三值 ? 该值 : None`(STANDARD
+   系请求类 → None)。
+3. **升级路径**:`fasts3d rewrite-values` 扩展 v6→v7 在线逐键重写
+   (复用既有值重写框架:启动后台 worker 逐键、完成标记
+   `s:value_rewrite_v7_done`、重写完成前禁回滚 v2.1.x 二进制——同
+   v2→v3 纪律);升级工具在 `fasts3d upgrade` 链中作为 v6 值格式步骤
+   登记。新写入直接落 v7,存量 v6 值双读可读,**升级可在线执行零停机**。
+4. **transition 同版本原子换数据**:Transition 执行 = 压缩归档副本先行
+   落盘(新 extents)→ **单事务**(同 vk,版本标识不变):ObjectMeta
+   换 extents/内联为归档压缩流 + `storage_class` 置目标类 + 旧 extents
+   ref_dec + 统计跨类移动——崩溃任意点收敛(拷贝先行 → 事务切换 →
+   释放,沿用 Op::ObjectMigrate 既有 4 阶段语义,无新风险类)。
+5. **meta-export/import DTO 同步**(fs3d/meta.rs):v7 字段随导出/导入
+   往返;`x:` restore 作业队列键**不导出**(瞬态队列,同 `e:` 事件队列
+   口径——导出只含持久对象/桶/会话类键);keys.rs 前缀表 + check
+   可达性扫描登记 `x:`(扫描只读 `o:`/`p:` 段引用键,对 `x:` 天然安全)。
+
+**DA5(归档 Copy/版本删除/统计口径 + 锁定对象跳过)**:
+
+1. **CopyObject/UploadPartCopy 源 × 归档**:
+   - 源未恢复(GLACIER/DEEP_ARCHIVE,restore_state 无效)且目标类 ≠
+     源类 → **InvalidObjectState**(AWS 同码;需先 restore);
+   - **同存储类复制豁免**:目标类 == 源归档类 → 直接 COW 共享段
+     (extents 引用 + ref_inc,零解压零重压缩)——归档对象复制 = 廉价
+     元数据操作,段级共享语义与 STANDARD 复制一致;
+   - 源已恢复 → 从明文副本读数据复制(目标类按请求;目标为归档类时
+     新对象直接压缩落归档,不复用源压缩流——源副本可能已过期,独立
+     生命周期)。
+2. **版本删除/DeleteObjects × 归档**:删除 = 正常 extents 释放路径
+   (归档压缩流 + 恢复副本两套 extents 都释放;删除标记语义、版本化
+   桶行为与 STANDARD 对象零分叉);归档对象删除**无需先 restore**
+   (AWS 同:删除不受 InvalidObjectState 约束)。
+3. **统计口径(逻辑口径,不随压缩/恢复波动)**:`BucketStats` 扩展
+   存储类分账 `by_class: {STANDARD/GLACIER_IR/GLACIER/DEEP_ARCHIVE →
+   {objects, bytes}}`(对象数 + 逻辑字节;压缩对象按明文逻辑大小计,
+   与对象可见 Size 一致;恢复副本不计入——非独立对象)。**五路径**
+   (PUT 新写、覆盖写(旧版本出账)、Delete/DeleteObjects、multipart
+   Complete、Copy 目标)与 **transition(类间移动)**/**restore(不动账)**
+   口径全部落 `Op::Stats` 增量;桶统计 = 各类求和(与既有统计相等
+   不变量:Σ by_class == 桶统计 objects/bytes)。admin/控制台存储类
+   分布视图读 by_class。
+4. **锁定对象跳过**:Object Lock 保留/法定保留中的对象(Compliance/
+   Governance 未到期或 legal_hold)**不执行 transition**(与 M12 过期
+   删除 skipped_locked 同口径,计入 `fasts3_lifecycle_transition_
+   skipped_locked` 指标);restore 不受锁约束(读操作,放行)。
+
+**门禁口径同步**(TODO M16 门禁):ADR-19 与实现无偏离;归档族
+s3-tests 出排除集且 100%(transition/restore/storage-class);崩溃 ≥500
+轮(归档写/transition/restore/GC 混载)零撕裂/零泄漏/账目零漂移;
+升级 v2.1→v2.2 演练(v6→v7 在线重写 + 回滚实测);归档读带宽/恢复耗时
+基准进发布报告;非归档负载零回退(<5%);覆盖率 ≥80%;cargo audit
+清零;发布 v2.2.0 记档。
+
 ---
 
 ## 4. 存储引擎设计(Rust)
