@@ -218,16 +218,19 @@ UploadPartCopy 源版本寻址、expected-bucket-owner 显式语义)**,随后 M1
 
 ## 6. 后续候选(M16 v2.2 及以后)
 
-### M16 v2.2.0「归档与复制」(建议,立项后再拆)
+### M16 v2.2.0「归档与复制」(建议;任务级拆解已落地 TODO.md M16 节,2026-08-26)
 
 | 特性 | 现状依赖 | 评估结论 | 立项条件 |
 | --- | --- | --- | --- |
-| **归档存储类 + RestoreObject** | v1.2 lifecycle + v1.4 zstd/多设备已交付;M15 C1 头矩阵铺路 | **做**(约 4~5 pw):GLACIER*/DEEP_ARCHIVE 映射到 zstd 压缩档(多设备冷盘倾斜)+ 生命周期 Transition + RestoreObject 状态机(临时取回/恢复天数)+ 存储类统计 | 冷数据成本诉求反馈(M15 交付后复核) |
+| **归档存储类 + RestoreObject** | v1.2 lifecycle + v1.4 zstd/多设备已交付;M15 C1 请求类字段铺路 | **做**(≈6 pw;拆解见 TODO.md M16/A):GLACIER*/DEEP_ARCHIVE 映射到 zstd 压缩档(多设备冷盘倾斜)+ 生命周期 Transition + RestoreObject 状态机(临时取回/恢复天数)+ 存储类统计 | 冷数据成本诉求反馈(M15 交付后复核) |
 | **复制策略化落地** | v2.0 中心纳管 + mc/rclone 演练资产 | 维持策略化(不内置 ?replication):中心调度同步任务(批量模板化下发已有 G3-1)+ 同步任务健康/对账视图;compat.md 声明 | DR 诉求证据 |
 | LDAP / OpenID(管理面) | 管理面 JWT + 中心 SQLite | 做(管理面集成,数据面仍认 access key;DESIGN-FUTURE §8 结论不变) | 企业 SSO 诉求 |
 | Batch Operations | M15 通知底座交付后可行 | 后置评估(≈2~3 pw) | 批量运维诉求 |
 | BPA / expected-bucket-owner / tenant 族 | M15 C2 显式语义铺路 | 远期评估(默认私有已满足开箱) | 企业安全基线诉求 |
 | MFA Delete / mtime 二级索引 / Terraform·Operator | — | 维持持有(Terraform/Operator 门槛 = issue 投票 ≥10,m14-ecosystem-eval 结论) | 诉求证据 |
+
+> 任务级拆解(各组 WBS/ADR 编号/门禁)见 TODO.md M16 节(2026-08-26);后置评估组
+> (Batch/安全基线/MX)与持有组亦已任务化,方便按诉求证据勾选启动。
 
 ### 明确不进入管线(§3.2 终表)
 
