@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::local::LocalAdmin;
+use crate::sync_exec::{run_sync, SyncRunSpec};
 
 /// 中心下发的单条操作(desired 契约条目)。
 #[derive(Debug, Clone, Deserialize)]
@@ -31,6 +32,8 @@ pub struct OpResult {
     pub error: Option<String>,
     /// key.create 时节点回显的 secret(仅一次;中心不落盘,ADR-17 DV1-4)。
     pub secret_once: Option<String>,
+    /// sync.run 的转移对象数(近似;ADR-20 DR2-2 对账展示)。
+    pub transferred: Option<u64>,
 }
 
 /// 应用规划结果:预检通过 → 本地请求描述;或直接跳过。
@@ -44,6 +47,8 @@ pub enum Plan {
         path: String,
         body: Option<Value>,
     },
+    /// 复制策略化:节点本地执行 mc mirror / rclone copy(ADR-20 DR3)
+    SyncRun(SyncRunSpec),
 }
 
 /// 预检是否已存在(幂等;作弊本地 admin 列表现有资源)。
@@ -162,6 +167,9 @@ pub fn plan(op: &DesiredOp) -> Result<Plan, String> {
                 body: None,
             }
         }
+        "sync.run" => Plan::SyncRun(
+            serde_json::from_value(p).map_err(|e| format!("sync.run bad payload: {e}"))?,
+        ),
         other => return Err(format!("unknown op kind {other}")),
     };
     Ok(req)
@@ -178,6 +186,7 @@ pub async fn apply_one(local: &LocalAdmin, op: &DesiredOp) -> Result<OpResult, S
             noop: true,
             error: None,
             secret_once: None,
+            transferred: None,
         });
     }
     let plan = plan(op)?;
@@ -190,9 +199,22 @@ pub async fn apply_one(local: &LocalAdmin, op: &DesiredOp) -> Result<OpResult, S
                 noop: true,
                 error: None,
                 secret_once: None,
+                transferred: None,
             });
         }
         Plan::Request { method, path, body } => (method, path, body),
+        // ADR-20 DR3:sync.run 走本地执行器(mc/rclone),不经过本地 admin HTTP
+        Plan::SyncRun(spec) => {
+            let out = run_sync(&spec).await;
+            return Ok(OpResult {
+                seq: op.seq,
+                ok: out.ok,
+                noop: false,
+                error: out.error.clone(),
+                secret_once: None,
+                transferred: Some(out.transferred),
+            });
+        }
     };
     let resp = local.call(method, &path, body.as_ref()).await?;
     if resp.status >= 200 && resp.status < 300 {
@@ -211,6 +233,7 @@ pub async fn apply_one(local: &LocalAdmin, op: &DesiredOp) -> Result<OpResult, S
             noop: false,
             error: None,
             secret_once,
+            transferred: None,
         })
     } else {
         // 本机裁决失败:显式上报 rejected(ADR-17 DV1-3)
@@ -220,6 +243,7 @@ pub async fn apply_one(local: &LocalAdmin, op: &DesiredOp) -> Result<OpResult, S
             noop: false,
             error: Some(format!("HTTP {}: {}", resp.status, resp.body_text.trim())),
             secret_once: None,
+            transferred: None,
         })
     }
 }
@@ -238,6 +262,10 @@ pub fn op_result_json(r: &OpResult) -> Value {
         // M14 G1-3(ADR-17 DV1-4):secret 仅生成时明文一次回显;
         // 中心侧只展示不落盘
         v["secret_once"] = Value::String(s.clone());
+    }
+    if let Some(n) = r.transferred {
+        // ADR-20 DR2-2:sync.run 转移对象数(近似),中心结算任务状态
+        v["transferred"] = Value::from(n);
     }
     v
 }
@@ -302,10 +330,57 @@ mod tests {
             noop: false,
             error: None,
             secret_once: Some("s3cr3t".into()),
+            transferred: None,
         };
         let v = op_result_json(&r);
         assert_eq!(v["seq"], 3);
         assert_eq!(v["ok"], true);
         assert_eq!(v["secret_once"], "s3cr3t");
+
+        // sync.run 回执携带 transferred(ADR-20 DR2-2)
+        let r2 = OpResult {
+            seq: 4,
+            ok: true,
+            noop: false,
+            error: None,
+            secret_once: None,
+            transferred: Some(42),
+        };
+        let v2 = op_result_json(&r2);
+        assert_eq!(v2["transferred"], 42);
+    }
+
+    #[test]
+    fn sync_run_plans_to_local_executor() {
+        let op = DesiredOp {
+            seq: 9,
+            kind: "sync.run".into(),
+            payload: json!({
+                "task_id": "t1",
+                "mode": "mirror",
+                "source_bucket": "src",
+                "dest_bucket": "dst",
+                "source_endpoint": "http://a:1",
+                "source_key": "ak",
+                "source_secret": "sk",
+                "dest_endpoint": "http://b:1",
+                "dest_key": "ak2",
+                "dest_secret": "sk2",
+            }),
+            acked: false,
+        };
+        let Plan::SyncRun(spec) = plan(&op).unwrap() else {
+            panic!("expected SyncRun")
+        };
+        assert_eq!(spec.task_id, "t1");
+        assert_eq!(spec.mode, "mirror");
+        // 缺字段 → 显式 Err(节点侧 rejected)
+        let bad = DesiredOp {
+            seq: 10,
+            kind: "sync.run".into(),
+            payload: json!({"task_id": "t2"}),
+            acked: false,
+        };
+        assert!(plan(&bad).is_err());
     }
 }

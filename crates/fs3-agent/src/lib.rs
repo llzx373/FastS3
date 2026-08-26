@@ -25,6 +25,7 @@ mod center;
 mod config;
 mod http1;
 mod local;
+mod sync_exec;
 mod tls;
 
 #[cfg(test)]
