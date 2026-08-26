@@ -5351,7 +5351,12 @@ mod tests {
         let rule2 = parse_inventory_configuration(rendered.as_bytes()).unwrap();
         assert_eq!(rule2, rule);
         // List 渲染
-        let list = render_inventory_configuration_list("src-bkt", &[rule.clone()], false, None);
+        let list = render_inventory_configuration_list(
+            "src-bkt",
+            std::slice::from_ref(&rule),
+            false,
+            None,
+        );
         assert!(list.contains("<ListBucketInventoryConfigurationsResult"));
         assert!(list.contains("<Id>inv-1</Id>"));
         assert!(list.contains("<IsTruncated>false</IsTruncated>"));

@@ -620,10 +620,13 @@ mod tests {
         }
     }
 
+    /// 通知投递调用记录(path, headers, body)
+    type MockCalls = Vec<(String, Vec<(String, String)>, Vec<u8>)>;
+
     /// 计数替身:第 `fail_first` 次投递返回 [`fail_with`] 状态,其余 200。
     #[derive(Debug)]
     struct MockSender {
-        calls: std::sync::Mutex<Vec<(String, Vec<(String, String)>, Vec<u8>)>>,
+        calls: std::sync::Mutex<MockCalls>,
         fail_first: usize,
         fail_with: u16,
     }

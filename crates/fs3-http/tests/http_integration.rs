@@ -992,10 +992,9 @@ async fn bucket_cors_preflight_and_actual_over_http() {
 
 /// 极简一次性 HTTP 接收端线程:监听回环端口,收 POST,回 200,
 /// 记录 (path, headers, body) 到共享 Vec。
-fn spawn_webhook_receiver() -> (
-    std::net::SocketAddr,
-    std::sync::Arc<std::sync::Mutex<Vec<(String, String, Vec<u8>)>>>,
-) {
+/// 接收端共享记录(path, headers, body)
+type WebhookCalls = std::sync::Arc<std::sync::Mutex<Vec<(String, String, Vec<u8>)>>>;
+fn spawn_webhook_receiver() -> (std::net::SocketAddr, WebhookCalls) {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1128,7 +1127,6 @@ async fn notification_delivery_e2e() {
             batch: 64,
             stall_after: std::time::Duration::from_secs(60),
             max_queued: 1000,
-            ..Default::default()
         },
     );
 
@@ -1165,9 +1163,12 @@ async fn notification_delivery_e2e() {
 
     // 6) worker 投递 → 接收端收到载荷 + 签名头
     worker.run_round_blocking().unwrap();
-    let gotl = got.lock().unwrap();
-    assert_eq!(gotl.len(), 1, "接收端收到 1 次投递");
-    let (path, head, body) = &gotl[0];
+    let (path, head, body) = {
+        let gotl = got.lock().unwrap();
+        assert_eq!(gotl.len(), 1, "接收端收到 1 次投递");
+        gotl[0].clone()
+    };
+    let (path, head, body) = (&path, &head, &body);
     assert_eq!(path, "/hooks/fasts3", "投递到规则完整 URL(含路径)");
     assert!(head.contains("user-agent: fasts3/"), "{head}");
     let v: serde_json::Value = serde_json::from_slice(body).unwrap();
@@ -1190,7 +1191,6 @@ async fn notification_delivery_e2e() {
         fs3_core::util::hmac_sha256_hex("e2e-secret", body),
         "HMAC-SHA256 签名可复验"
     );
-    drop(gotl);
     assert_eq!(stats.snapshot().delivered, 1);
 
     // 7) 事件键已删 + 重启续投 = 零重复
