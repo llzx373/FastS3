@@ -915,6 +915,10 @@ v1.0 基线 <256MiB 空载。远期特性开启态的常驻增量:多设备位�
 | DR3 | NEXT-ROUND §8 | 执行器选择 | mirror = mc mirror(含删除传播);incremental = rclone copy(只增不删);节点本地 spawn,失败 rejected 显式上报 | ADR-20(M16) |
 | DR4 | NEXT-ROUND §8 | 对账视图 | 控制台同步任务页 + stalled 判定(2×schedule)+ FastS3SyncTaskStalled 告警 | ADR-20(M16) |
 | DR5 | NEXT-ROUND §8 | 范围与后置 | v2.2 只做任务化同步 + drill;双向/故障转移/replication 事件后置,无证据不动 | ADR-20(M16) |
+| DL1 | NEXT-ROUND §5.6 | LDAP 目录同步模型 | 管理面周期同步,组 → 密钥生命周期(出现创建/消失禁用/配置移除删除);bind 密码不落盘不进数据面;失败跳过防误删 | ADR-21(M16) |
+| DL2 | NEXT-ROUND §5.6 | LDAP 客户端 | 内置最小 LDAPv3(BER)BIND/SEARCH,零外部依赖;ldap/ldaps;mock LDAP 集成测试 | ADR-21(M16) |
+| DL3 | NEXT-ROUND §5.6 | OIDC 控制台 SSO | implicit flow id_token → 本地会话 JWT;角色映射配置化;issuer 不可达回退本地登录;会话不依赖 issuer 在线 | ADR-21(M16) |
+| DL4 | NEXT-ROUND §5.6 | 身份审计与范围 | 身份事件环形缓冲可检索 + 状态端点;LDAP 密码登录/数据面组鉴权/code+PKCE/SCIM 后置 | ADR-21(M16) |
 
 ---
 

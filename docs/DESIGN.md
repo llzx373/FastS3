@@ -1301,6 +1301,78 @@ s3-tests 无新增 API(无 ?replication,501 显式);drill 实测双节点
 控制台任务页 + 告警规则落盘;崩溃/覆盖率/audit 门禁沿用 M16 总
 口径。
 
+#### ADR-21(M16 立项决策):LDAP 目录同步模型 / OIDC 控制台 SSO / 身份审计口径
+
+**背景**:M16「归档与复制」(v2.2.0;TODO M16)L 组 = LDAP/OpenID
+(≈2 pw)。立项依据:NEXT-ROUND §4/§5 #14(B 档 P1——企业 AD 集成、
+SSO 诉求;M16 v2.2 候选);DESIGN-FUTURE §8「IAM/STS/LDAP/OpenID 集成」
+评估结论:数据面只认 access key 的现状保留(D-E2),集成放 Node 管理面
+(签发/校验临时凭证、LDAP 同步),密钥仍落 k: 表。本 ADR 按 TODO M16
+/L1-1 决策点 **DL1~DL4** 落盘(DESIGN-FUTURE §11 决策清单同步登记)。
+实现偏离推荐方案必须走 ADR 流程,不得静默偏离(AGENT §5)。
+
+**DL1(LDAP 目录同步:管理面周期同步,组 → 密钥生命周期)**:
+
+1. **同步位置 = Node 管理面(web/server)**,数据面零改动(仍只认
+   access key;D-E2 延续);同步出的密钥 = 普通数据面密钥(k: 表),
+   与手工/中心下发的密钥同权同生命周期。
+2. **映射策略(配置驱动)**:配置组清单 + `key_prefix`;周期同步
+   (LDAP SEARCH 组 membership)→ 组存在 → 确保密钥存在(创建,note
+   标注 `ldap:组名`);组在目录中消失/无成员 → **禁用密钥**
+   (disabled,不删除——密钥可审计可恢复);组从配置移除 → **删除密钥**。
+3. **bind 凭据为管理面配置**(配置文件/环境变量),**密码不落盘不进
+   数据面**:bind 密码仅进程内存持有,绝不写入 k: 表或审计 detail
+   (与 G1-3 密钥纪律同构);配置文件中明文 = 运维责任(文档化,
+   生产建议环境变量注入)。
+4. **同步失败语义**:LDAP 不可达/绑定失败 → 本轮跳过(不动任何密钥,
+   防目录抖动误删),状态端点暴露 last_error + 连续失败计数,
+   控制台可检索(identity events 告警条目)。
+
+**DL2(LDAP 客户端:内置最小 LDAPv3 客户端,零外部依赖)**:
+
+1. 内置 BER 编解码的极小客户端(BIND simple + SEARCH subtree +
+   UNBIND),不引入 npm 依赖(依赖最小化纪律,§9.3);支持
+   ldap:// 与 ldaps://(TLS)。
+2. 组查询:按配置 `group_filter`(默认
+   `(objectClass=groupOfNames)`)在 `base_dn` 下搜索,提取组名与
+   member DN/CN;member 归一化(CN=... 解析)。
+3. 集成测试以**内存 mock LDAP 服务器**(node:net + 手工 BER 响应)
+   驱动:绑定成功/失败、组出现/消失/无成员、目录不可达等路径。
+
+**DL3(OIDC 控制台 SSO:implicit flow id_token → 本地会话 JWT)**:
+
+1. 控制台登录页提供「OIDC 登录」按钮:跳转 issuer `authorize`
+   (`response_type=id_token` implicit flow,`client_id` + `redirect_uri`
+   + `nonce`);浏览器收到 `id_token`(URL fragment)→ POST
+   `/api/oidc/login`。
+2. 服务端校验:`iss/aud/exp/nonce` + 签名(discovery 取 JWKS,RS256;
+   亦支持 HS256 共享密钥);角色映射 = 配置 `role_claim` 的取值
+   (admin 名单 / readonly 名单,未匹配 → 拒绝或 readonly 按配置);
+   校验通过 → 签发**既有本地会话 JWT**(与账号密码登录同令牌,
+   同 8h TTL),两者共存。
+3. issuer 不可达/JWKS 失败 → 明确报错,回退本地账号登录(双通道
+   并存文档化);id_token 校验失败 → 401,不签发任何会话。
+4. 会话仍无状态 HS256(§7.3);OIDC 只负责「登录一刻」的身份证明,
+   会话生命周期不依赖 issuer 在线。
+
+**DL4(身份审计与范围)**:
+
+1. **身份事件可检索**:LDAP 同步(密钥创建/禁用/删除/跳过/失败)与
+   OIDC 登录(来源 subject、角色)写入内存环形事件缓冲(有界),
+   `/api/identity-events` 可检索(管理面;与 sessions 同寿命,
+   进程重启即失,文档化);同步状态 `/api/ldap/status`(last_sync_at/
+   last_ok/error/组数/密钥数)。
+2. **范围外(明确不做,无证据不动)**:LDAP 密码登录(只做目录同步,
+   不做 bind 认证登录);数据面 LDAP/组鉴权(数据面只认 access key);
+   OIDC authorization code + PKCE 全流程(控制台为内网管理面,
+   implicit 够用,文档化取舍);SCIM 增量同步(周期全量对账)。
+
+**门禁口径同步**(TODO M16 门禁):ADR-21 与实现无偏离;L 组
+s3-tests 零新增 API(管理面特性,数据面无新端点);mock LDAP/OIDC
+集成测试全过(绑定/搜索/组生命周期/令牌校验/角色映射/回退);
+身份事件与状态端点可检索;崩溃/覆盖率/audit 门禁沿用 M16 总
+口径。
+
 ---
 
 ## 4. 存储引擎设计(Rust)
