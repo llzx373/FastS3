@@ -16,12 +16,16 @@ mod admission;
 #[cfg(feature = "http3")]
 pub mod h3;
 mod handler;
+// M15 N3:事件通知投递 worker(Webhook + HMAC;独立后台线程,与压缩/
+// 生命周期同源令牌桶;完整模块文档见 notify.rs)
+pub mod notify;
 mod static_files;
 mod timeout_io;
 pub mod tls;
 mod zero_copy;
 
 pub use admission::Admission;
+pub use notify::{NotificationConfig, NotificationStats, NotificationWorker, WebhookSender};
 pub use timeout_io::DeadlinedIo;
 pub use tls::{TlsConfig, TlsState};
 pub use zero_copy::{probe_fd_capability, ZeroCopyIo, ZeroCtx};

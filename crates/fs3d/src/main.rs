@@ -765,6 +765,41 @@ fn cmd_serve(
     };
     let lifecycle_stats = lifecycle_worker.as_ref().map(|(w, _)| w.stats());
 
+    // M15 N3(ADR-18 D-E1.3/D-E4):事件通知投递 worker。默认启用;无规则
+    // 桶零动作(每轮空扫描,与生命周期同口径);仅读引擎(read_only)与
+    // 显式关闭时不启动。worker 先行创建、spawn 延后到 admin 装配之后——
+    // stats Arc 注入 admin /v1/admin/metrics 渲染 fasts3_notification_* 指标。
+    // 事件入队(N2)独立于本 worker 已在数据事务内完成:关闭态 = 队列堆积
+    // + 上限截断(见 config),恢复打开后续投,不影响数据面。
+    let notification_worker = if !engine_cfg.read_only && cfg.notification.enabled.unwrap_or(true) {
+        let npoll = Duration::from_secs_f64(cfg.notification.poll_secs.unwrap_or(1.0).max(0.1));
+        let ncfg = fs3_http::notify::NotificationConfig {
+            poll: npoll,
+            max_retries: cfg.notification.max_retries.unwrap_or(16),
+            retry_base: fs3_http::notify::DEFAULT_RETRY_BASE,
+            batch: cfg.notification.batch.unwrap_or(64),
+            stall_after: Duration::from_secs(
+                cfg.notification.stall_after_secs.unwrap_or(120).max(1),
+            ),
+            max_queued: cfg.notification.max_queued.unwrap_or(100_000),
+        };
+        let (meta, throttle) = {
+            let e = engine.read();
+            (e.meta_arc(), e.throttle())
+        };
+        let stats = Arc::new(fs3_http::notify::NotificationStats::default());
+        let worker = fs3_http::notify::NotificationWorker::new(
+            meta,
+            Arc::new(fs3_http::notify::SimpleWebhookSender::default()),
+            stats.clone(),
+            ncfg,
+        );
+        Some((worker, throttle, stats, npoll))
+    } else {
+        None
+    };
+    let notification_stats = notification_worker.as_ref().map(|(_, _, s, _)| s.clone());
+
     // M6 / K4:优雅停机标志(SIGTERM/SIGINT → 排空 → 引擎收尾)。
     // 提前创建供 admin/agent 等后台模块注入(agent 循环每周期观测)。
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -805,7 +840,8 @@ fn cmd_serve(
         });
         let admin = fs3_admin::AdminServer::new(engine.clone(), service.clone(), admin_cfg)
             .with_reload(reload)
-            .with_lifecycle_stats(lifecycle_stats);
+            .with_lifecycle_stats(lifecycle_stats)
+            .with_notification_stats(notification_stats.clone());
         // M6 / J5:设置页供应器(admin GET/PATCH /v1/admin/config)
         let provider = Arc::new(settings::SettingsProvider::new(
             config_path.clone(),
@@ -871,6 +907,12 @@ fn cmd_serve(
             throttle,
             Duration::from_secs(1),
         )
+    });
+
+    // M15 N3:通知投递 worker 启动(创建见 admin 装配前;独立线程 +
+    // 全局共享令牌桶;关闭态不启动)
+    let mut notification_worker = notification_worker.map(|(worker, throttle, _stats, poll)| {
+        fs3_engine::worker::WorkerHandle::spawn("fs3-notification", worker, throttle, poll)
     });
 
     let addr: std::net::SocketAddr = listen
@@ -1001,8 +1043,11 @@ fn cmd_serve(
         Duration::from_secs(drain_secs),
     );
     // serve 返回 → 所有 worker 已排空退出;先停生命周期 worker(避免与引擎
-    // 收尾抢写锁),再引擎收尾(最终检查点 + meta 关闭)
+    // 收尾抢写锁),再通知投递 worker,最后引擎收尾(最终检查点 + meta 关闭)
     if let Some(mut h) = lifecycle_worker.take() {
+        h.stop();
+    }
+    if let Some(mut h) = notification_worker.take() {
         h.stop();
     }
     tracing::info!("http workers drained; finalizing engine (checkpoint + meta close)");

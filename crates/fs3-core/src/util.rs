@@ -41,6 +41,17 @@ pub fn vk_time_us(vk: &[u8; 16]) -> u64 {
     u64::from_be_bytes(vk[..8].try_into().unwrap())
 }
 
+/// HMAC-SHA256 十六进制签名(M15 N3;ADR-18 D-E4 Webhook 签名;
+/// hmac + sha2 为 workspace 既有依赖,不新增)。
+pub fn hmac_sha256_hex(key: &str, body: &[u8]) -> String {
+    use hmac::{Hmac, Mac};
+    type HmacSha256 = Hmac<sha2::Sha256>;
+    let mut mac = HmacSha256::new_from_slice(key.as_bytes()).expect("hmac accepts any key length");
+    mac.update(body);
+    let digest = mac.finalize().into_bytes();
+    hex::encode(digest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

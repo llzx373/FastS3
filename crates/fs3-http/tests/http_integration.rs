@@ -987,3 +987,275 @@ async fn bucket_cors_preflight_and_actual_over_http() {
     let (s, _, _) = client.send(rel.into_bytes()).await;
     assert_eq!(s, 403, "配置删除后预检不再放行");
 }
+
+// ───────────────────── M15 N3/N4:事件通知投递 e2e(真实 Webhook 接收端)─────────────────────
+
+/// 极简一次性 HTTP 接收端线程:监听回环端口,收 POST,回 200,
+/// 记录 (path, headers, body) 到共享 Vec。
+fn spawn_webhook_receiver() -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::Mutex<Vec<(String, String, Vec<u8>)>>>,
+) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let got2 = got.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut acc = Vec::new();
+            let mut buf = [0u8; 4096];
+            // 读请求头
+            loop {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                acc.extend_from_slice(&buf[..n]);
+                if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head = String::from_utf8_lossy(&acc).to_string();
+            let clen: usize = head
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|v| v.trim().parse().unwrap_or(0))
+                })
+                .unwrap_or(0);
+            let hdr_end = head.find("\r\n\r\n").unwrap_or(0);
+            // 读满 body
+            while acc.len() < hdr_end + 4 + clen {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                acc.extend_from_slice(&buf[..n]);
+            }
+            let split = acc.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+            let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+            let body = acc[split + 4..].to_vec();
+            got2.lock().unwrap().push((path, head.clone(), body));
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        }
+    });
+    (addr, got)
+}
+
+/// 恒 500 接收端(确定性制造投递失败;避免死端口 connect 挂起)。
+fn spawn_webhook_receiver_500() -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::Mutex<usize>>,
+) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let n = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+    let n2 = n.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut acc = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let r = stream.read(&mut buf).unwrap_or(0);
+                if r == 0 {
+                    break;
+                }
+                acc.extend_from_slice(&buf[..r]);
+                if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            *n2.lock().unwrap() += 1;
+            let _ = stream
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
+        }
+    });
+    (addr, n)
+}
+
+/// 配置 → PUT 对象(真实 HTTP 服务 + SigV4)→ 真实投递 worker
+/// (SimpleWebhookSender)→ 本地接收端断言载荷/签名/事件清理;重启后
+/// 队列无残留;失败重试后成功;数据面不受投递失败影响。
+#[tokio::test]
+async fn notification_delivery_e2e() {
+    use fs3_http::notify::{NotificationConfig, NotificationWorker, SimpleWebhookSender};
+
+    let (_d, svc) = setup();
+    let addr = spawn_server(svc.clone()).await;
+    let mut client = RawClient::connect(addr).await;
+    let host = addr.to_string();
+
+    // 1) 建桶
+    let h = sigv4_headers(&host, "PUT", "/n-e2e", &[], &[], b"");
+    let (s, _, _) = client.send(render_request("PUT", "/n-e2e", &h, b"")).await;
+    assert_eq!(s, 200);
+    // 2) 通知配置(规则指向本地接收端,带 HMAC 密钥)——经 S3 API 写入
+    let body = format!(
+        r#"<NotificationConfiguration><QueueConfiguration><Id>rule-e2e</Id><Event>s3:ObjectCreated:*</Event><Queue>{hook}</Queue><FastS3WebhookSecretKey>e2e-secret</FastS3WebhookSecretKey></QueueConfiguration></NotificationConfiguration>"#,
+        hook = "http://127.0.0.1:1/placeholder" // 先占位,下面改写为真实接收端
+    );
+    let q = [("notification".to_string(), "".to_string())];
+    let h = sigv4_headers(&host, "PUT", "/n-e2e", &q, &[], body.as_bytes());
+    let (s, _, _) = client
+        .send(render_request(
+            "PUT",
+            "/n-e2e?notification",
+            &h,
+            body.as_bytes(),
+        ))
+        .await;
+    assert_eq!(s, 200, "配置写入");
+
+    // 3) 启动真实投递 worker(短退避便于测试)
+    let stats = std::sync::Arc::new(fs3_http::notify::NotificationStats::default());
+    let worker_meta = {
+        let e = svc.engine().read();
+        e.meta_arc()
+    };
+    let mut worker = NotificationWorker::new(
+        worker_meta.clone(),
+        std::sync::Arc::new(SimpleWebhookSender::default()),
+        stats.clone(),
+        NotificationConfig {
+            poll: std::time::Duration::from_millis(50),
+            retry_base: std::time::Duration::from_millis(20),
+            max_retries: 5,
+            batch: 64,
+            stall_after: std::time::Duration::from_secs(60),
+            max_queued: 1000,
+            ..Default::default()
+        },
+    );
+
+    // 4) 真实接收端 + 改写规则 URL 指向它
+    let (raddr, got) = spawn_webhook_receiver();
+    let hook_url = format!("http://{raddr}/hooks/fasts3");
+    let rule = fs3_core::NotificationRule {
+        id: "rule-e2e".into(),
+        events: vec!["s3:ObjectCreated:*".into()],
+        kind: fs3_core::NotificationTargetKind::Queue,
+        url: hook_url.clone(),
+        hmac_key: Some("e2e-secret".into()),
+        enabled: true,
+        filter: fs3_core::NotificationKeyFilter::default(),
+    };
+    {
+        let e = svc.engine().write();
+        e.meta()
+            .put_notification_rules("n-e2e", std::slice::from_ref(&rule))
+            .unwrap();
+    }
+
+    // 5) PUT 对象(经真实 HTTP 数据面)
+    let h = sigv4_headers(&host, "PUT", "/n-e2e/hello.txt", &[], &[], b"hello world");
+    let (s, _, _) = client
+        .send(render_request(
+            "PUT",
+            "/n-e2e/hello.txt",
+            &h,
+            b"hello world",
+        ))
+        .await;
+    assert_eq!(s, 200);
+
+    // 6) worker 投递 → 接收端收到载荷 + 签名头
+    worker.run_round_blocking().unwrap();
+    let gotl = got.lock().unwrap();
+    assert_eq!(gotl.len(), 1, "接收端收到 1 次投递");
+    let (path, head, body) = &gotl[0];
+    assert_eq!(path, "/hooks/fasts3", "投递到规则完整 URL(含路径)");
+    assert!(head.contains("user-agent: fasts3/"), "{head}");
+    let v: serde_json::Value = serde_json::from_slice(body).unwrap();
+    let record = &v["Records"][0];
+    assert_eq!(record["eventName"], "ObjectCreated:Put");
+    assert_eq!(record["s3"]["bucket"]["name"], "n-e2e");
+    assert_eq!(record["s3"]["object"]["key"], "hello.txt");
+    assert_eq!(record["s3"]["object"]["size"], 11);
+    // 签名头逐字节校验
+    let sig = head
+        .lines()
+        .find_map(|l| {
+            l.to_ascii_lowercase()
+                .strip_prefix("x-fasts3-signature:")
+                .map(|v| v.trim().to_string())
+        })
+        .expect("签名头存在");
+    assert_eq!(
+        sig,
+        fs3_core::util::hmac_sha256_hex("e2e-secret", body),
+        "HMAC-SHA256 签名可复验"
+    );
+    drop(gotl);
+    assert_eq!(stats.snapshot().delivered, 1);
+
+    // 7) 事件键已删 + 重启续投 = 零重复
+    {
+        let e = svc.engine().read();
+        assert_eq!(e.meta().event_count().unwrap(), 0, "投递成功后队列清空");
+    }
+    let mut w2 = NotificationWorker::new(
+        worker_meta.clone(),
+        std::sync::Arc::new(SimpleWebhookSender::default()),
+        stats.clone(),
+        NotificationConfig::default(),
+    );
+    w2.run_round_blocking().unwrap();
+    assert_eq!(got.lock().unwrap().len(), 1, "重启后无重复投递");
+
+    // 8) 投递失败 → 事件保留;恢复后重试成功;失败期间数据面不受影响
+    //    (用「恒 500」接收端确定性制造失败,避免死端口 connect 挂起)
+    let (bad_addr, _bad_got) = spawn_webhook_receiver_500();
+    let rule_bad = {
+        let mut r = rule.clone();
+        r.url = format!("http://{bad_addr}/hook");
+        r
+    };
+    {
+        let e = svc.engine().write();
+        e.meta()
+            .put_notification_rules("n-e2e", std::slice::from_ref(&rule_bad))
+            .unwrap();
+    }
+    let h = sigv4_headers(&host, "PUT", "/n-e2e/fail.txt", &[], &[], b"x");
+    let (s, _, _) = client
+        .send(render_request("PUT", "/n-e2e/fail.txt", &h, b"x"))
+        .await;
+    assert_eq!(s, 200);
+    worker.run_round_blocking().unwrap();
+    {
+        let e = svc.engine().read();
+        assert!(e.meta().event_count().unwrap() >= 1, "失败后事件保留");
+    }
+    // 失败期间数据面读取正常(投递失败不影响数据面请求语义)
+    let h = sigv4_headers(&host, "GET", "/n-e2e/hello.txt", &[], &[], b"");
+    let (s, _, body) = client
+        .send(render_request("GET", "/n-e2e/hello.txt", &h, b""))
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(body, b"hello world");
+    // 恢复可达 → 退避到期后重试成功
+    let (raddr2, _g2) = spawn_webhook_receiver();
+    let rule_ok = {
+        let mut r = rule.clone();
+        r.url = format!("http://{raddr2}/hooks/fasts3");
+        r
+    };
+    {
+        let e = svc.engine().write();
+        e.meta()
+            .put_notification_rules("n-e2e", std::slice::from_ref(&rule_ok))
+            .unwrap();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    worker.run_round_blocking().unwrap();
+    {
+        let e = svc.engine().read();
+        assert_eq!(e.meta().event_count().unwrap(), 0, "恢复后事件投递清空");
+    }
+    assert!(stats.snapshot().retried >= 1, "至少一次重试");
+}

@@ -71,3 +71,21 @@ key_rps = 0
 # 磁盘条数上限(默认 100000;超上限批量截断删最旧;与内存环形容量 4096
 # 相互独立——内存环形仍是检索面,持久化是冷备 + 重启连续性)
 # max_entries = 100000
+
+[notification]
+# M15 N3(ADR-18 D-E1/D-E4):事件通知投递 worker。默认启用;无通知规则
+# 桶零动作(与生命周期同口径)。事件入队(N2)与数据同事务,关闭本 worker
+# 只停止投递、不阻止入队(队列有界,超上限批量截断;恢复打开后续投)。
+# 关闭态 /metrics 无 fasts3_notification_* 指标组(告警按缺席处理)。
+# enabled = true
+# 投递轮询周期秒(默认 1;下限 0.1)
+# poll_secs = 1.0
+# 重试上限(默认 16;超限死信留存,环形截断清理)
+# max_retries = 16
+# 每轮批量上限(默认 64)
+# batch = 64
+# 队首滞留判定窗口秒(默认 120;触顶且零成功 →
+# fasts3_notification_delivery_stalled = 1,告警 FastS3NotificationDeliveryStalled)
+# stall_after_secs = 120
+# 事件队列上限(默认 100000;超上限 + slack 批量截断删最旧,同审计环形口径)
+# max_queued = 100000

@@ -23,6 +23,31 @@ pub struct RootConfig {
     /// M14 H1-2(§4.12):热对象缓存(默认关)。
     #[serde(default)]
     pub cache: CacheConfig,
+    /// M15 N3(ADR-18 D-E1/D-E4):事件通知投递 worker(`[notification]`)。
+    #[serde(default)]
+    pub notification: NotificationConfig,
+}
+
+/// M15 N3:`[notification]` 段(事件通知投递 worker;默认启用,
+/// 无规则桶零动作)。关闭 = 事件继续同事务入队,但不再投递
+/// (队列有界环形上限防无限堆积;恢复打开后续投)。
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+pub struct NotificationConfig {
+    /// 总开关(默认 true)。
+    pub enabled: Option<bool>,
+    /// 投递轮询周期秒(默认 1;下限 0.1)。
+    #[serde(default)]
+    pub poll_secs: Option<f64>,
+    /// 重试上限(默认 16;超限死信)。
+    pub max_retries: Option<u32>,
+    /// 每轮批量上限(默认 64)。
+    pub batch: Option<usize>,
+    /// 队首滞留判定窗口秒(默认 120;触顶且零成功 →
+    /// fasts3_notification_delivery_stalled = 1)。
+    pub stall_after_secs: Option<u64>,
+    /// 事件队列上限(默认 100_000;超上限 + slack 批量截断删最旧,
+    /// 同审计环形口径)。
+    pub max_queued: Option<usize>,
 }
 
 /// M14 H1-2:`[cache]` 段(用户态 LRU;默认关;内存额度=允许的基线冲突明示)。

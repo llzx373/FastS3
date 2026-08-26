@@ -27,6 +27,10 @@ h3-quinn = "0.0.10"
 [dependencies]
 fs3-core.workspace = true
 fs3-s3.workspace = true
+# M15 N3:通知投递 worker 直读 MetaStore(e: 队列/n: 规则;仅后台 worker
+# 短事务,不进数据热路径;依赖方向 fs3-http → fs3-meta 合规——fs3-http
+# 已在 fs3-s3 之下消费 fs3-engine,fs3-meta 是其被依赖方)。
+fs3-meta.workspace = true
 serde_json.workspace = true
 rcgen.workspace = true
 fs3-engine.workspace = true

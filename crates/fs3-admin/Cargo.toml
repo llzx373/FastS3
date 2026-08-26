@@ -11,6 +11,9 @@ fs3-core.workspace = true
 fs3-engine.workspace = true
 fs3-s3.workspace = true
 fs3-meta.workspace = true
+# M15 N3:通知投递指标渲染用(NotificationStats;fs3-http 不反向依赖
+# fs3-admin,无环)。
+fs3-http.workspace = true
 hyper = { version = "1.5", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 http-body-util = "0.1"

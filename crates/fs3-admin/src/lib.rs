@@ -86,6 +86,9 @@ pub struct AdminServer {
     /// 生命周期执行器指标(M11 L3-2;worker 启用时由 fs3d 注入,
     /// None = 未启用,/metrics 相应指标组缺席)。
     lifecycle_stats: Option<Arc<fs3_engine::lifecycle::LifecycleStats>>,
+    /// 通知投递指标(M15 N3;worker 启用时由 fs3d 注入;None = 未启用,
+    /// /metrics 相应指标组缺席)。
+    notification_stats: Option<Arc<fs3_http::notify::NotificationStats>>,
 }
 
 impl AdminServer {
@@ -98,6 +101,7 @@ impl AdminServer {
             config_get: None,
             config_patch: None,
             lifecycle_stats: None,
+            notification_stats: None,
         }
     }
 
@@ -113,6 +117,15 @@ impl AdminServer {
         stats: Option<Arc<fs3_engine::lifecycle::LifecycleStats>>,
     ) -> Self {
         self.lifecycle_stats = stats;
+        self
+    }
+
+    /// 注入通知投递指标(M15 N3;/metrics 渲染 fasts3_notification_*)。
+    pub fn with_notification_stats(
+        mut self,
+        stats: Option<Arc<fs3_http::notify::NotificationStats>>,
+    ) -> Self {
+        self.notification_stats = stats;
         self
     }
 
@@ -199,6 +212,7 @@ impl AdminServer {
             config_get: self.config_get.clone(),
             config_patch: self.config_patch.clone(),
             lifecycle_stats: self.lifecycle_stats.clone(),
+            notification_stats: self.notification_stats.clone(),
         })
     }
 
@@ -736,6 +750,50 @@ impl AdminServer {
             text.push_str(&format!(
                 "fasts3_lifecycle_last_cycle_timestamp {}\n",
                 s.last_cycle_at
+            ));
+        }
+        // M15 N3(ADR-18 D-E1.3/D-E4):通知投递指标组。worker 未启用 =
+        // 指标组缺席;告警规则按「缺席即未启用」口径处理
+        // (FastS3NotificationDeliveryStalled 消费 stalled 与
+        // last_delivery_timestamp)。
+        if let Some(stats) = &self.notification_stats {
+            let s = stats.snapshot();
+            text.push_str(
+                "# HELP fasts3_notification_delivered_total Webhook deliveries acknowledged 2xx\n",
+            );
+            text.push_str("# TYPE fasts3_notification_delivered_total counter\n");
+            text.push_str(&format!(
+                "fasts3_notification_delivered_total {}\n",
+                s.delivered
+            ));
+            text.push_str("# HELP fasts3_notification_failed_total Webhook delivery failures (non-2xx or network)\n");
+            text.push_str("# TYPE fasts3_notification_failed_total counter\n");
+            text.push_str(&format!("fasts3_notification_failed_total {}\n", s.failed));
+            text.push_str(
+                "# HELP fasts3_notification_dead_total Events dead-lettered after retry limit\n",
+            );
+            text.push_str("# TYPE fasts3_notification_dead_total counter\n");
+            text.push_str(&format!("fasts3_notification_dead_total {}\n", s.dead));
+            text.push_str("# HELP fasts3_notification_retries_total Delivery retry attempts\n");
+            text.push_str("# TYPE fasts3_notification_retries_total counter\n");
+            text.push_str(&format!(
+                "fasts3_notification_retries_total {}\n",
+                s.retried
+            ));
+            text.push_str("# HELP fasts3_notification_queue_depth Events currently in delivery queue (incl. dead-letter)\n");
+            text.push_str("# TYPE fasts3_notification_queue_depth gauge\n");
+            text.push_str(&format!("fasts3_notification_queue_depth {}\n", s.queue));
+            text.push_str("# HELP fasts3_notification_delivery_stalled 1 = queue head stalled past window with zero progress\n");
+            text.push_str("# TYPE fasts3_notification_delivery_stalled gauge\n");
+            text.push_str(&format!(
+                "fasts3_notification_delivery_stalled {}\n",
+                if s.stalled { 1 } else { 0 }
+            ));
+            text.push_str("# HELP fasts3_notification_last_delivery_timestamp Unix time of last successful delivery (0 = never)\n");
+            text.push_str("# TYPE fasts3_notification_last_delivery_timestamp gauge\n");
+            text.push_str(&format!(
+                "fasts3_notification_last_delivery_timestamp {}\n",
+                s.last_delivered_at
             ));
         }
         Response::builder()
