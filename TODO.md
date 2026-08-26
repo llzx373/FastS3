@@ -378,7 +378,7 @@
 - [x] G1-2 下发权威性:中心下发 = 配置源、执行与裁决在本机引擎(ADR-17 DV1-2;agent 经本地 admin 通道执行,失败条目显式上报 rejected 记入中心账本)**,per-node seq 乐观并发 + 断线重连全量对账(`mode=full`;acked/rejected 跳过,幂等预检防重复创建);集成测试 `reconcile_reconnect`(断网期间下发缓存 → 重连后收敛,无重复创建/secret 仅一次回显);证书登记脚本 `tests/center/m14-center-enroll.sh` + 协议契约文档 `docs/m14-center-contract.md`
 - [x] G1-3 密钥下发语义:secret 仅生成时明文一次(节点本地生成,回执仅一次携带;中心只存 access 元数据);中心留存策略文档化(默认不存——仅内存 pendingSecrets 一次回显,进程重启即失;留存 = 运维责任,红线外选项,ADR-17 DV1-4);新增落盘证明测试(secret 字符串绝不出现在 sqlite 主库与 WAL 文件字节中,center.test.ts「G1-3」)
 - [x] G2-1 中心:节点注册/拓扑/健康聚合(G1-1 接收端 + 本步管理面:节点列表/详情含 apply_state、按节点与跨节点审计聚合检索)+ 下发 API(ops 入账白名单 7 类、账本视图、对账状态视图)+ 对账(SQLite 账本权威、acked_seq/pending/rejected);管理面端点契约入 docs/m14-center-contract.md §3.1
-- [ ] G3-1 中心控制台:节点仪表盘、批量桶/密钥/策略管理(模板化下发)、审计聚合检索
+- [x] G3-1 中心控制台:节点仪表盘(健康/离线/水位/对账状态/secret 待取,10s 刷新)、批量桶/密钥/策略管理(模板化下发,payload 支持 `${node_id}` 按节点差异;全选+离线标识;下发账本视图 + secret 一次性取回)、审计聚合检索(跨节点,节点/操作/桶过滤);实现 = 控制台 web 实例(JWT 会话,浏览器免 mTLS,`FS3_CENTER_WEB_LISTEN` 独立端口)+ React `#/center/*` 子应用(独立登录态)
 - [ ] G4-1 演练:3 节点(2 边缘 + 1 云)纳管 + 断网重连对账一致 + **拔中心单机功能完整**(红线实测)
 
 ### H. HTTP/3 与热缓存(§7.2/§7.3)

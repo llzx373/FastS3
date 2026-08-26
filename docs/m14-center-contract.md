@@ -68,13 +68,20 @@
 ## 6. 中心运维
 
 ```bash
-export FS3_CENTER_LISTEN=0.0.0.0:9443
+export FS3_CENTER_LISTEN=0.0.0.0:9443      # agent mTLS 通道(强制客户端证书)
 export FS3_CENTER_TLS_CERT=.../center-cert.pem
 export FS3_CENTER_TLS_KEY=.../center-key.pem
 export FS3_CENTER_TLS_CA=.../ca.pem
 export FS3_CENTER_DB=./center-data/center.sqlite
+export FS3_CENTER_WEB_LISTEN=0.0.0.0:9444  # 控制台 web(JWT 会话;浏览器免 mTLS,共享同一 store)
+export FS3_CENTER_USERS=admin:admin123     # user:pass[:role][,...]
+export FS3_CENTER_JWT_SECRET=change-me
+export FS3_CENTER_STATIC=.../console/dist   # 控制台构建产物(可选)
 pnpm center:start        # 或 dev:center(tsx watch)
 ```
+
+> 两个监听:9443(mTLS,agent + 服务端管理调用)与 9444(JWT,浏览器控制台)。
+> 浏览器不承载客户端证书,控制台会话走 JWT;两条通道共享同一 SQLite store。
 
 agent 侧(fasts3.toml):
 

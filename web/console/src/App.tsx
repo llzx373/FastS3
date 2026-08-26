@@ -9,6 +9,7 @@ import Audit from "./pages/Audit";
 import Settings from "./pages/Settings";
 import Uploads from "./pages/Uploads";
 import FirstRun from "./pages/FirstRun";
+import CenterApp from "./center/CenterApp";
 import { FIRST_RUN_DISMISS_KEY } from "./pages/FirstRun";
 
 function useHashRoute(): string {
@@ -35,6 +36,11 @@ export default function App() {
   const route = useHashRoute();
   const [authed, setAuthed] = useState<boolean>(() => !!getToken());
   const [role, setRole] = useState<string>("admin");
+
+  // M14 G3-1:中心控制台(独立登录态;#/center/* 子应用)
+  if (route.startsWith("/center")) {
+    return <CenterApp />;
+  }
 
   useEffect(() => {
     // 校验 token 有效性(可选):dashboard 请求失败会 401 → 清 token

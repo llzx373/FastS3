@@ -19,7 +19,9 @@ import { readFileSync } from "node:fs";
 import tls from "node:tls";
 import { listenHostPort } from "../config.js";
 import { openStore, type CenterStore } from "./store.js";
+import type { FastifyInstance } from "fastify";
 import { registerCenterRoutes } from "./routes.js";
+import { buildCenterConsole, type CenterWebHttpsOptions } from "./console.js";
 
 const env = process.env;
 
@@ -71,6 +73,22 @@ export function buildCenter(opts: {
   return app;
 }
 
+/** 控制台 web 实例(独立端口,浏览器友好;见 buildCenterConsole) */
+export function buildCenterWeb(opts: {
+  store: CenterStore;
+  env?: NodeJS.ProcessEnv;
+  https?: CenterWebHttpsOptions;
+}): FastifyInstance {
+  const e = opts.env ?? process.env;
+  return buildCenterConsole({
+    store: opts.store,
+    jwtSecret: e.FS3_CENTER_JWT_SECRET ?? "dev-secret-change-me",
+    usersCsv: e.FS3_CENTER_USERS ?? "admin:admin123",
+    staticDir: e.FS3_CENTER_STATIC || undefined,
+    https: opts.https,
+  });
+}
+
 function main(): void {
   const cert = pick("FS3_CENTER_TLS_CERT", "");
   const key = pick("FS3_CENTER_TLS_KEY", "");
@@ -97,11 +115,30 @@ function main(): void {
   app
     .listen({ host, port })
     .then(() => {
-      app.log.info(`center listening on https://${host}:${port} (mTLS, CA=${ca})`);
-      app.log.info(`center store: ${pick("FS3_CENTER_DB", "./center-data/center.sqlite")}`);
+      app.log.info(`center(mTLS) listening on https://${host}:${port} (CA=${ca})`);
     })
     .catch((e) => {
       app.log.error(`center failed to start: ${e}`);
+      process.exit(1);
+    });
+  // 控制台 web 实例(浏览器 JWT;不要求客户端证书)
+  const web = buildCenterConsole({
+    store,
+    jwtSecret: env.FS3_CENTER_JWT_SECRET ?? "dev-secret-change-me",
+    usersCsv: env.FS3_CENTER_USERS ?? "admin:admin123",
+    staticDir: env.FS3_CENTER_STATIC || undefined,
+    https: { key: readFileSync(key), cert: readFileSync(cert) },
+  });
+  const { host: webHost, port: webPort } = listenHostPort(
+    pick("FS3_CENTER_WEB_LISTEN", "0.0.0.0:9444"),
+  );
+  web
+    .listen({ host: webHost, port: webPort })
+    .then(() => {
+      web.log.info(`center console on https://${webHost}:${webPort} (JWT)`);
+    })
+    .catch((e) => {
+      web.log.error(`center console failed to start: ${e}`);
       process.exit(1);
     });
 }
