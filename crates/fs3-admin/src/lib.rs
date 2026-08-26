@@ -1165,15 +1165,27 @@ impl AdminServer {
             .service
             .issue_session(base_access_key, session_policy, ttl_secs, issued_by)
         {
-            Ok((temporary_access_key, secret, rec)) => json::ok(serde_json::json!({
-                "session_id": rec.session_id,
-                "temporary_access_key": temporary_access_key,
-                // 仅此一次下发明文(之后库中只有 SHA-256 哈希比对子)
-                "secret_key": secret,
-                "session_token": rec.session_id,
-                "expires_at": rec.expires_at,
-                "issued_at": rec.issued_at,
-            })),
+            Ok((temporary_access_key, secret, rec)) => {
+                // T3:签发审计(六维检索:who=签发者, op=IssueSession,
+                // key=session_id;不含任何密钥材料)
+                self.service.audit().push(
+                    issued_by,
+                    "IssueSession",
+                    "",
+                    &rec.session_id,
+                    200,
+                    "",
+                );
+                json::ok(serde_json::json!({
+                    "session_id": rec.session_id,
+                    "temporary_access_key": temporary_access_key,
+                    // 仅此一次下发明文(之后库中只有 SHA-256 哈希比对子)
+                    "secret_key": secret,
+                    "session_token": rec.session_id,
+                    "expires_at": rec.expires_at,
+                    "issued_at": rec.issued_at,
+                }))
+            }
             Err(e) => json::err(StatusCode::BAD_REQUEST, "session_error", &e.describe()),
         }
     }
@@ -1181,7 +1193,12 @@ impl AdminServer {
     /// DELETE /v1/admin/sessions/{id}:撤销会话(幂等;立即失效)。
     fn handle_session_delete(&self, id: &str) -> Response<String> {
         match self.service.revoke_session(id) {
-            Ok(()) => json::ok(serde_json::json!({"revoked": id})),
+            Ok(()) => {
+                self.service
+                    .audit()
+                    .push("admin", "RevokeSession", "", id, 200, "");
+                json::ok(serde_json::json!({"revoked": id}))
+            }
             Err(e) => json::err(
                 StatusCode::NOT_FOUND,
                 "no_such_session",

@@ -823,7 +823,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       if (action === "GetSessionToken") {
         const duration = Number(params.get("DurationSeconds") ?? 3600);
         const policy = params.get("Policy") ?? undefined;
-        const creds = await admin.createSession(adminIdentity(req), policy || null, duration);
+        const creds = await admin.createSession(sessionBaseKey(cfg), policy || null, duration);
         return reply
           .type("text/xml")
           .send(renderGetSessionTokenResponse(creds, req));
@@ -834,7 +834,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         const duration = Number(params.get("DurationSeconds") ?? 3600);
         const policy = params.get("Policy") ?? undefined;
         const roleSessionName = params.get("RoleSessionName") ?? "fasts3-session";
-        const creds = await admin.createSession(adminIdentity(req), policy || null, duration);
+        const creds = await admin.createSession(sessionBaseKey(cfg), policy || null, duration);
         return reply
           .type("text/xml")
           .send(renderAssumeRoleResponse(creds, roleSessionName, req));
@@ -1171,8 +1171,12 @@ if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith
  * admin(JWT admin 角色)签发;单账号模型下管理面 = 唯一身份。
  * 注:此处签发人标识固定 "admin";若未来接入多管理员,可改为
  * JWT username 透传(buildServer 有 req 上下文,扩展即可)。 */
-function adminIdentity(_req: unknown): string {
-  return "admin";
+/** 会话基密钥 = 管理面配置的数据面访问密钥(web server 代理数据面
+ * 操作所用的常驻密钥;单账号模型下管理面身份 = 该密钥)。
+ * 注:GetSessionToken 的签发人审计 who=issued_by 保持 "admin"(管理面
+ * 角色),基密钥与签发人分离记录——会话权限仍限于基密钥 ∩ 会话策略。 */
+function sessionBaseKey(cfg: WebConfig): string {
+  return cfg.s3.accessKey;
 }
 
 /** 会话签发响应中的临时凭证三元组(AWS GetSessionTokenResponse 形状)。 */

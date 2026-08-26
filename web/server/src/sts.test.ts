@@ -134,7 +134,7 @@ test("sts get-session-token renders AWS-shaped response and forwards params", as
   assert.ok(body.includes("<Expiration>2027-01-15T08:00:00.000Z</Expiration>"), body);
   // 参数透传:ttl + 身份
   assert.equal(fake.createCalls.length, 1);
-  assert.equal(fake.createCalls[0].base, "admin");
+  assert.equal(fake.createCalls[0].base, "fasts3dev", "基密钥 = 管理面配置的数据面访问密钥");
   assert.equal(fake.createCalls[0].ttl, 7200);
 });
 
@@ -154,7 +154,7 @@ test("sts assume-role accepts role arn but mints on management identity (no role
   assert.ok(r.body.includes("<AssumedRoleId>AROAFASTS3:job-1</AssumedRoleId>"), r.body);
   assert.ok(r.body.includes("<SessionToken>sess-1234</SessionToken>"), r.body);
   assert.equal(fake.createCalls.length, 2);
-  assert.equal(fake.createCalls[1].base, "admin", "AssumeRole 基密钥 = 管理面身份(无角色派生)");
+  assert.equal(fake.createCalls[1].base, "fasts3dev", "AssumeRole 基密钥 = 管理面配置密钥(无角色派生)");
   assert.equal(fake.createCalls[1].ttl, 1800);
 });
 
