@@ -31,18 +31,43 @@ s3-tests 排除集方法论见 `tests/s3-tests/README.md`。
 
 ## 存储类
 
-v2.1(M15/C1,ADR-18 D-E3)接受矩阵(大小写不敏感):
+v2.2(M16/A,ADR-18 D-E3 + ADR-19 DA1/DA3)接受矩阵(大小写不敏感):
 
-| 请求值 | 落盘 | HEAD/GET/GetObjectAttributes 回显 |
+| 请求值 | 落盘 | HEAD/GET/List/GetObjectAttributes 回显 |
 | --- | --- | --- |
-| `STANDARD` / `STANDARD_IA` / `ONEZONE_IA` / `REDUCED_REDUNDANCY` / `INTELLIGENT_TIERING` / `GLACIER` / `GLACIER_IR` / `DEEP_ARCHIVE` | 统一 **STANDARD**(单机单存储层) | `x-amz-storage-class: STANDARD` + GetObjectAttributes `<StorageClass>STANDARD</StorageClass>` |
+| `STANDARD` / `STANDARD_IA` / `ONEZONE_IA` / `REDUCED_REDUNDANCY` / `INTELLIGENT_TIERING` | 统一 **STANDARD**(单机单标准层,无 IA 分层语义) | `x-amz-storage-class: STANDARD`(实际类) |
+| `GLACIER_IR` | **真实归档类 GLACIER_IR**:zstd 标准档压缩,**在线可读**(无需 restore) | `x-amz-storage-class: GLACIER_IR` |
+| `GLACIER` / `DEEP_ARCHIVE` | **真实归档类**:zstd 高压缩档(level 9);**需 restore 方可读**;未恢复 GET/HEAD/Copy 源 → 403 InvalidObjectState | `x-amz-storage-class: GLACIER/DEEP_ARCHIVE` |
 | `EXPRESS_ONEZONE`(目录桶类) | 显式拒绝 | 400 InvalidStorageClass(点名目录桶语义) |
 | 其它值 | 显式拒绝 | 400 InvalidStorageClass(与 AWS 同码,不静默) |
 
 请求类**记录于对象元数据**(`requested_storage_class`;PUT/CopyObject/Create
 MultipartUpload 落,multipart 随会话;Copy 未带头继承源请求类),admin 面与
-meta-export/import 可见并可往返;实际类恒 STANDARD。归档真语义
-(Transition/RestoreObject)规划于 v2.2(M16)。
+meta-export/import 可见并可往返;真实类独立落 ObjectMeta v7 `storage_class`
+(归档三值,其余恒 None = STANDARD)。
+
+归档语义(M16/A,ADR-19):
+
+- **RestoreObject(POST ?restore)**:Days 1..365 + Tier(Expedited/Standard/
+  Bulk 三档接受并记录;DEEP_ARCHIVE 拒 Expedited → 400);恢复 = 后台作业
+  (持久化队列 `x:` 前缀,崩溃续跑)→ 临时标准明文副本 + `restored_until`
+  到期;`x-amz-restore` 回显 `ongoing-request="true"` / `"false"` +
+  `expiry-date`;重复 restore 幂等延长;到期后读回落 403,后台 GC 回收副本
+  段(读语义与 GC 时序无关)。**取回延迟不做人工模拟**(本机解压即取回,
+  AWS 的 3~48h 延迟差异仅文档化)。
+- **生命周期 Transition**:目标类限定 GLACIER/GLACIER_IR/DEEP_ARCHIVE
+  (INTELLIGENT_TIERING 维持映射 STANDARD 且不可作目标,否则 400
+  InvalidArgument);当前版本 Days/Date 触发(与过期同 DL4 午夜语义);
+  执行 = 同版本(vk 不变)原子换数据 + 类间统计 + `s3:LifecycleTransition`
+  事件;锁定对象跳过;NoncurrentVersionTransition 显式 NotImplemented。
+- **复制**:源归档未恢复且目标类 ≠ 源类 → 403 InvalidObjectState;同存储类
+  复制豁免(COW 段共享);复制目标不继承恢复状态;归档对象删除无需先
+  restore(主段 + 恢复副本段一并释放)。
+- **SSE**:SSE-S3 归档可恢复(服务端 KEK 自持解密);SSE-C 归档恢复显式
+  400(客户密钥零落盘);SSE + 归档 + multipart 显式 400。
+- 存储类分账:`BucketStats.by_class`(对象数/逻辑字节 × 四类;Σ == 桶统计),
+  admin `/v1/admin/buckets/{name}/stats` 与列表视图可见;恢复副本不占
+  统计(非独立对象)。
 
 ## 事件通知(v2.1 M15 起)
 
