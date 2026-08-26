@@ -382,7 +382,7 @@
 - [x] G4-1 演练:tests/center/m14_managed_drill.sh 三节点(2 边缘 edge-1/edge-2 + 1 云 cloud-1)全流程10 步通过:出站 mTLS 注册/健康聚合 → 批量模板化下发(${node_id} 差异桶/密钥)本地裁决应用 → secret 一次性回显取后即清 → edge-2 离线期间入账 2 条,重连全量对账恰好应用一次且账本收敛(acked=desired=3 pending=0)→ **拔中心红线实测(中心杀掉后 cloud-1 S3 数据面 SigV4 冒烟全过 + 本地 admin + S3 端口应答)** → 中心重启 3 节点自动重连;演练暴露并修复:AuthConfig.allow_anonymous 缺 serde default(手写 [auth] 解析失败)、agent HTTP 客户端缺 Host 头(node 侧 400 空体)、sigv4_smoke 重复建桶断言过时(对齐 M9/C5 幂等重建 200 语义)
 
 ### H. HTTP/3 与热缓存(§7.2/§7.3)
-- [ ] H1-1 HTTP/3 quinn 实验开关(默认关):每核 Endpoint、0-RTT 仅幂等 GET/HEAD、弱网基准
+- [x] H1-1 HTTP/3 quinn 实验开关(默认关):fs3-http `http3` feature + quinn/h3(hyperium) 栈,每核 SO_REUSEPORT UDP + 独立 Endpoint(`[server] http3_listen` 接线,fs3d `http3` feature 构建);0-RTT 门:仅幂等 GET/HEAD 放行,非幂等 425 Too Early(RFC 8470),判定语义确定性(1-RTT 请求不可能先于握手可见);集成测试 h3_roundtrip(全握手 200 / 0-RTT PUT 425 或已验证后管线 4xx(回环握手同数据报完成)/ 0-RTT GET 200 / 常规 PUT 非 425)+ 门禁决策单测 + 吞吐基准(顺序 167 ops/s、并发 16×8 130 ops/s,每请求新连接保守口径;h1/h2 对照 1894 ops/s keep-alive);弱网对照(netem)评估期待办;文档 docs/perf-M14.md(含 0-RTT 防重放实验边界声明)
 - [ ] H1-2 缓存:用户态 LRU(小对象 + 高频 Range 头;默认关;内存额度用户配置;命中率指标)
 
 ### T. 生态评估(§7.4)

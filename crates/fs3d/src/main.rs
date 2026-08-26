@@ -911,6 +911,61 @@ fn cmd_serve(
         tracing::info!("embedded console enabled (web_root={})", root.display());
     }
 
+    // M14 H1-1(ADR-17 DV2):HTTP/3 实验服务(feature `http3` 编译期 gate +
+    // [server] http3_listen 配置 gate;QUIC 强制 TLS,复用同对证书)。
+    #[cfg(feature = "http3")]
+    {
+        if let Some(h3_listen) = cfg.server.http3_listen.clone() {
+            match (&cfg.server.tls_cert, &cfg.server.tls_key) {
+                (Some(cert), Some(key)) => {
+                    let h3_addr = h3_listen.parse::<std::net::SocketAddr>().map_err(|e| {
+                        fs3_core::Error::InvalidArgument(format!(
+                            "bad server.http3_listen {h3_listen}: {e}"
+                        ))
+                    })?;
+                    let h3_cfg = fs3_http::Http3Config {
+                        listen: h3_addr,
+                        workers: cfg.server.workers.unwrap_or(0),
+                        cert_path: cert.clone(),
+                        key_path: key.clone(),
+                        max_inflight_bytes: cfg
+                            .server
+                            .max_inflight_bytes
+                            .unwrap_or(16 * 1024 * 1024 * 1024),
+                        web_root: cfg.server.web_root.clone(),
+                        cors_allow_origins: cfg
+                            .server
+                            .cors_allow_origins
+                            .clone()
+                            .unwrap_or_default(),
+                    };
+                    let svc = service.clone();
+                    let shutdown_h3 = shutdown.clone();
+                    std::thread::Builder::new()
+                        .name("fs3-h3".into())
+                        .spawn(move || {
+                            if let Err(e) = fs3_http::h3::serve(svc, &h3_cfg, Some(shutdown_h3)) {
+                                tracing::error!("http3 serve exited: {e}");
+                            }
+                        })
+                        .map_err(fs3_core::Error::Io)?;
+                    tracing::info!("http3 (experimental) enabled on udp {h3_addr}");
+                }
+                _ => {
+                    tracing::warn!(
+                        "server.http3_listen 已配置但缺少 tls_cert/tls_key 配对;http3 跳过"
+                    );
+                }
+            }
+        }
+    }
+    #[cfg(not(feature = "http3"))]
+    if cfg.server.http3_listen.is_some() {
+        tracing::warn!(
+            "server.http3_listen 已配置但构建缺 `http3` feature (cargo build --features http3);忽略"
+        );
+    }
+
     // M6 / K4:优雅停机(SIGTERM/SIGINT → 排空 → 引擎收尾)
     signal::install(shutdown.clone())?;
     let serve_result = fs3_http::serve_with_shutdown(

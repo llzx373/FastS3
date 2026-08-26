@@ -13,6 +13,8 @@ use fs3_s3::S3Service;
 use tokio::net::TcpListener;
 
 mod admission;
+#[cfg(feature = "http3")]
+pub mod h3;
 mod handler;
 mod static_files;
 mod timeout_io;
@@ -23,6 +25,9 @@ pub use admission::Admission;
 pub use timeout_io::DeadlinedIo;
 pub use tls::{TlsConfig, TlsState};
 pub use zero_copy::{probe_fd_capability, ZeroCopyIo, ZeroCtx};
+
+#[cfg(feature = "http3")]
+pub use h3::Http3Config;
 
 /// 单连接处理(测试与内嵌复用)。
 pub use handler::{serve_connection, serve_connection_tls};

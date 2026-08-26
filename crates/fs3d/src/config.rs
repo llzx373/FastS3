@@ -95,6 +95,10 @@ pub struct ServerConfig {
     pub tls_key: Option<std::path::PathBuf>,
     /// 内嵌控制台静态目录(M7/I5;等价 serve --web-root)。
     pub web_root: Option<std::path::PathBuf>,
+    /// M14 H1-1(ADR-17 DV2):HTTP/3 实验监听(如 "0.0.0.0:9443"）。
+    /// 缺省 = 关闭;需 `--features http3` 构建,QUIC 强制 TLS(复用 tls_cert/key)。
+    #[cfg_attr(not(feature = "http3"), allow(dead_code))]
+    pub http3_listen: Option<String>,
     /// REVIEW §2.4:受控 CORS 允许源列表(浏览器跨源直传数据面)。
     /// 空/缺省 = 关闭;`["*"]` = 允许任意源(仅建议内网)。实际写操作仍需合法签名。
     pub cors_allow_origins: Option<Vec<String>>,

@@ -439,6 +439,7 @@ fn latin1_encode(s: &str) -> Vec<u8> {
     s.chars().map(|c| c as u8).collect()
 }
 
+/// h1/h2 入口(Incoming;零拷贝标记帧仅限 h1 明文)。
 async fn handle(
     service: Arc<S3Service>,
     admission: Arc<crate::Admission>,
@@ -446,6 +447,22 @@ async fn handle(
     web_root: Option<std::path::PathBuf>,
     req: Request<Incoming>,
 ) -> Result<Response<RespBody>, std::convert::Infallible> {
+    handle_generic(service, admission, zc_ctx, web_root, req).await
+}
+
+/// 通用请求处理(h1/h2 的 Incoming 与 h3 的 Full 等 body 类型共用;
+/// M14 H1-1:HTTP/3 适配层经此复用完整 S3 管线,避免双份语义)。
+pub(crate) async fn handle_generic<B>(
+    service: Arc<S3Service>,
+    admission: Arc<crate::Admission>,
+    zc_ctx: Option<crate::zero_copy::ZeroCtx>,
+    web_root: Option<std::path::PathBuf>,
+    req: Request<B>,
+) -> Result<Response<RespBody>, std::convert::Infallible>
+where
+    B: http_body::Body<Data = Bytes> + Unpin + Send + 'static,
+    B::Error: std::fmt::Display + Send + Sync + 'static,
+{
     // M9/D4:host_id 来自服务实例(随机 64 位 hex,替代恒值 "fasts3");
     // 每请求 trace id = {request_id}/{host_id}(错误响应 XML HostId 同源)。
     let host_id = service.host_id().to_string();

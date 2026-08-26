@@ -46,3 +46,6 @@ md-5.workspace = true
 # M14 G1-1(ADR-17 DV1):纳管 agent;默认关(Cargo 无 default = 全关)。
 # 关闭 = fs3-agent 不编译,二进制与 v1.x 零差异(门禁)。
 agent = ["dep:fs3-agent"]
+# M14 H1-1(ADR-17 DV2):HTTP/3 实验(quinn);默认关。评估期 6 个月,
+# 无企业弱网诉求则冻结;默认构建零新增依赖(门禁内存 ≤256MiB 不回归)。
+http3 = ["fs3-http/http3"]
