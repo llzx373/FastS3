@@ -517,6 +517,7 @@ fn admin_metrics_lifecycle_counters() {
         }),
         noncurrent_expiration: None,
         abort_incomplete_multipart: None,
+        transition: None,
         legacy_prefix: false,
     };
     e.meta().put_lifecycle_rules("b1", &[rule]).unwrap();
@@ -598,6 +599,7 @@ fn audit_lifecycle_visible_after_restart() {
             }),
             noncurrent_expiration: None,
             abort_incomplete_multipart: None,
+            transition: None,
             legacy_prefix: false,
         };
         e.meta().put_lifecycle_rules("b1", &[rule]).unwrap();

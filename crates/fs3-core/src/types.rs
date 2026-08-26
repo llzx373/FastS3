@@ -1048,6 +1048,20 @@ pub struct NoncurrentVersionExpiration {
     pub newer_noncurrent_versions: Option<u32>,
 }
 
+/// 存储类转换动作(M16 A3,ADR-19 DA3):Days/Date 二选一(协议层校验
+/// 互斥);目标类限定 GLACIER/GLACIER_IR/DEEP_ARCHIVE(其余含
+/// INTELLIGENT_TIERING → 协议层 InvalidArgument,显式不静默)。
+/// 仅当前版本可转换(STANDARD → 归档);已归档/锁定对象跳过。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleTransition {
+    /// 对象年龄满 Days 整天后转换(AWS 午夜语义,同 Expiration DL4)。
+    pub days: Option<u32>,
+    /// 绝对转换时刻(unix 秒;XML 为 ISO8601 时间戳)。
+    pub date: Option<i64>,
+    /// 目标存储类(协议层校验后落盘;∈ 归档三值)。
+    pub storage_class: String,
+}
+
 /// 未完成 multipart 会话中止动作(替代硬编码 7 天惰性清扫,桶可配)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AbortIncompleteMultipartUpload {
@@ -1067,6 +1081,10 @@ pub struct LifecycleRule {
     pub filter: LifecycleFilter,
     pub expiration: Option<LifecycleExpiration>,
     pub noncurrent_expiration: Option<NoncurrentVersionExpiration>,
+    /// M16 A3(ADR-19 DA3):存储类转换动作(当前版本;目标类限定归档
+    /// 三值)。尾部追加字段,decode_lifecycle_rule 三层回退,存量规则
+    /// 按 None。
+    pub transition: Option<LifecycleTransition>,
     pub abort_incomplete_multipart: Option<AbortIncompleteMultipartUpload>,
     /// 提交形态标记(M11 L5):true = 规则以 AWS 旧版 Rule 直下
     /// `<Prefix>` 形态写入,GET 原样回渲染 `<Prefix>`(AWS/RGW 按原始
@@ -2600,6 +2618,11 @@ mod tests {
             abort_incomplete_multipart: Some(AbortIncompleteMultipartUpload {
                 days_after_initiation: 7,
             }),
+            transition: Some(LifecycleTransition {
+                days: Some(30),
+                date: None,
+                storage_class: "GLACIER".into(),
+            }),
             legacy_prefix: false,
         };
         let enc = postcard::to_allocvec(&full).unwrap();
@@ -2616,6 +2639,7 @@ mod tests {
             }),
             noncurrent_expiration: None,
             abort_incomplete_multipart: None,
+            transition: None,
             legacy_prefix: true,
         };
         let enc = postcard::to_allocvec(&marker).unwrap();

@@ -695,10 +695,22 @@ fn decode<T: serde::de::DeserializeOwned>(v: &[u8]) -> Result<T> {
     postcard::from_bytes(v).map_err(|e| Error::Corrupt(format!("postcard decode: {e}")))
 }
 
-/// M11/L5 双读:LifecycleRule 值格式尾部追加 `legacy_prefix` 字段;新格式
-/// 优先,失败回退 L1 初版格式(legacy_prefix=false——存量规则均为 Filter
-/// 归一渲染形态)。照 decode_session 先例,零迁移。
+/// M11/L5 + M16 A3 三层双读:LifecycleRule 值格式尾部追加 `legacy_prefix`
+/// (L5)与 `transition`(A3)字段;新格式优先,失败回退 L5 格式(含
+/// legacy_prefix 无 transition)、再回退 L1 初版格式(两者皆无)。照
+/// decode_session 先例,零迁移。
 fn decode_lifecycle_rule(v: &[u8]) -> Result<fs3_core::LifecycleRule> {
+    /// L5 规则格式(含 legacy_prefix,无 transition;A3 回退用)。
+    #[derive(serde::Deserialize)]
+    struct RuleV2 {
+        id: String,
+        status: fs3_core::LifecycleStatus,
+        filter: fs3_core::LifecycleFilter,
+        expiration: Option<fs3_core::LifecycleExpiration>,
+        noncurrent_expiration: Option<fs3_core::NoncurrentVersionExpiration>,
+        abort_incomplete_multipart: Option<fs3_core::AbortIncompleteMultipartUpload>,
+        legacy_prefix: bool,
+    }
     /// L1 初版规则格式(无 legacy_prefix;L5 回退用)。
     #[derive(serde::Deserialize)]
     struct RuleV12 {
@@ -712,6 +724,18 @@ fn decode_lifecycle_rule(v: &[u8]) -> Result<fs3_core::LifecycleRule> {
     match postcard::from_bytes::<fs3_core::LifecycleRule>(v) {
         Ok(r) => Ok(r),
         Err(_) => {
+            if let Ok(old) = postcard::from_bytes::<RuleV2>(v) {
+                return Ok(fs3_core::LifecycleRule {
+                    id: old.id,
+                    status: old.status,
+                    filter: old.filter,
+                    expiration: old.expiration,
+                    noncurrent_expiration: old.noncurrent_expiration,
+                    transition: None,
+                    abort_incomplete_multipart: old.abort_incomplete_multipart,
+                    legacy_prefix: old.legacy_prefix,
+                });
+            }
             let old: RuleV12 = postcard::from_bytes(v)
                 .map_err(|e| Error::Corrupt(format!("postcard decode lifecycle rule: {e}")))?;
             Ok(fs3_core::LifecycleRule {
@@ -720,6 +744,7 @@ fn decode_lifecycle_rule(v: &[u8]) -> Result<fs3_core::LifecycleRule> {
                 filter: old.filter,
                 expiration: old.expiration,
                 noncurrent_expiration: old.noncurrent_expiration,
+                transition: None,
                 abort_incomplete_multipart: old.abort_incomplete_multipart,
                 legacy_prefix: false,
             })
@@ -4223,6 +4248,7 @@ mod tests {
             }),
             noncurrent_expiration: None,
             abort_incomplete_multipart: None,
+            transition: None,
             legacy_prefix: false,
         };
         let (_d, s) = open_tmp();
@@ -4309,6 +4335,7 @@ mod tests {
             }),
             noncurrent_expiration: None,
             abort_incomplete_multipart: None,
+            transition: None,
             legacy_prefix: true,
         };
         s.put_lifecycle_rules("b1", std::slice::from_ref(&rule))

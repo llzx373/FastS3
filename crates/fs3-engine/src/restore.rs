@@ -89,7 +89,12 @@ impl Engine {
     /// 作业键解析:恢复作业定位的对象原始键(vk None = 未版本化单键;
     /// VK_NULL = 遗留单键优先、null 槽次之——与 resolve_object_entry
     /// D1a-4 同口径)。
-    fn restore_raw_key(&self, bucket: &str, key: &str, vk: Option<&[u8; 16]>) -> Result<Vec<u8>> {
+    pub(crate) fn restore_raw_key(
+        &self,
+        bucket: &str,
+        key: &str,
+        vk: Option<&[u8; 16]>,
+    ) -> Result<Vec<u8>> {
         use fs3_meta::keys::{object_key, object_version_key, VK_NULL};
         match vk {
             None => Ok(object_key(bucket, key)),
@@ -356,6 +361,22 @@ impl Engine {
         }
         Ok(cleared)
     }
+}
+
+/// 生命周期 Transition 执行结果(M16 A3-2;跳过 = 正常收敛,非错误)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleTransitionOutcome {
+    /// 已转换(数据换为归档压缩流,同 vk)。
+    Transitioned,
+    /// 删除标记(不转换)。
+    SkippedMarker,
+    /// 非 STANDARD(已归档/其它类,不重复转换)。
+    SkippedArchived,
+    /// Object Lock 保留中(Compliance/Governance 未到期或 legal_hold;
+    /// skipped_locked 指标,DA5)。
+    SkippedLocked,
+    /// 对象不存在(幂等)。
+    SkippedMissing,
 }
 
 /// POST ?restore 受理结果(服务层 200 响应;ongoing 回显由 restore_state

@@ -48,6 +48,9 @@ use crate::io::{fsync, open_io_engine, read_exact, read_exact_batch, write_all, 
 use crate::worker::{Throttle, WorkerHandle};
 
 pub use crate::compaction::{CompactionConfig, CompactionReport, CompactorMode, RebalanceConfig};
+pub use crate::restore::{
+    LifecycleTransitionOutcome, RestoreEnqueueOutcome, RestoreStats, RestoreWorker,
+};
 
 #[derive(Clone)]
 pub struct EngineConfig {
@@ -3876,6 +3879,145 @@ impl Engine {
                 self.maybe_checkpoint()?;
                 Ok(Some(meta))
             }
+            Err(e) => {
+                self.abort_draft(&draft);
+                Err(e)
+            }
+        }
+    }
+
+    /// M16 A3-2(ADR-19 DA3/DA4):生命周期 Transition 执行——压缩归档副本
+    /// 先行落盘(新 extents/内联)→ 单事务:ObjectMeta 换数据(同 vk,
+    /// 版本标识不变)+ storage_class 置目标类 + 统计类间移动 + 事件
+    /// s3:LifecycleTransition + 旧 extents 释放。崩溃任意点收敛:拷贝
+    /// 先行 → 事务切换 → 释放(Op::ObjectMigrate 4 阶段语义,无新风险类)。
+    ///
+    /// 跳过语义(返回 outcome 不报错):删除标记 / 已归档(非 STANDARD)/
+    /// Object Lock 保留中(skipped_locked,DA5)。仅当前版本可转换
+    /// (vk 寻址;历史版本不转换——AWS 当前版本 Transition 语义)。
+    pub fn lifecycle_transition(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        vk: Option<&[u8; 16]>,
+        target_class: &str,
+        now: i64,
+    ) -> Result<LifecycleTransitionOutcome> {
+        let meta = match self.resolve_object_entry(bucket, key, vk, None) {
+            Ok(m) => m,
+            Err(Error::NotFound(_)) => return Ok(LifecycleTransitionOutcome::SkippedMissing),
+            Err(e) => return Err(e),
+        };
+        if meta.is_delete_marker {
+            return Ok(LifecycleTransitionOutcome::SkippedMarker);
+        }
+        if meta.storage_class_name() != "STANDARD" {
+            // 已归档/非标准类:跳过(不重复转换;已归档对象由 restore 或
+            // 删除管理生命周期)
+            return Ok(LifecycleTransitionOutcome::SkippedArchived);
+        }
+        // DA5:锁定对象跳过(Compliance/Governance 未到期或 legal_hold;
+        // 与 M12 过期删除 skipped_locked 同口径)
+        if meta.legal_hold
+            || meta
+                .retention
+                .as_ref()
+                .is_some_and(|r| r.retain_until > now)
+        {
+            return Ok(LifecycleTransitionOutcome::SkippedLocked);
+        }
+        let level = fs3_core::archive_compression_level(
+            Some(target_class),
+            self.compression_cfg.enabled,
+            self.compression_cfg.level,
+        );
+        let raw_key = self.restore_raw_key(bucket, key, meta.version_id.as_ref())?;
+        let mut draft = Staged::default();
+        // 压缩归档副本先行(小对象内联压缩帧;大对象流式压缩)
+        let (extents, inline, compressed) = if meta.size <= self.small_object_limit as u64 {
+            let mut pt = Vec::with_capacity(meta.size as usize);
+            self.get_to_meta(&meta, 0..meta.size, &mut pt, None)?;
+            debug_assert_eq!(pt.len() as u64, meta.size);
+            let cb = zstd::bulk::compress(&pt, level as i32)
+                .map_err(|e| Error::Meta(format!("zstd transition compress: {e}")))?;
+            (
+                Vec::new(),
+                Some(cb.clone()),
+                Some(fs3_core::CompressionInfo {
+                    algorithm: fs3_core::CompressionAlgorithm::Zstd,
+                    level,
+                    original_size: meta.size,
+                    compressed_size: cb.len() as u64,
+                }),
+            )
+        } else {
+            let mut writer = ExtentWriter::new(self.chunk_size, self.etag_mode, None, None, level)?;
+            self.feed_object_plaintext(&mut writer, &mut draft, &meta, 0..meta.size, None)?;
+            let outcome = writer.finish(self, &mut draft)?;
+            debug_assert_eq!(outcome.size, meta.size);
+            (
+                outcome.segments,
+                None,
+                Some(fs3_core::CompressionInfo {
+                    algorithm: fs3_core::CompressionAlgorithm::Zstd,
+                    level,
+                    original_size: meta.size,
+                    compressed_size: outcome.compressed_size.unwrap_or(0),
+                }),
+            )
+        };
+        let mut m2 = meta.clone();
+        m2.extents = extents.clone();
+        m2.inline = inline;
+        m2.compressed = compressed;
+        m2.storage_class = Some(target_class.to_string());
+        m2.restore_state = None;
+        let from_class = "STANDARD".to_string();
+        let delta = StatsDelta {
+            objects: 0,
+            bytes: 0,
+            // 类间移动(统计入账;DA5 口径)
+            by_class: vec![
+                (from_class, -1, -(meta.size as i64)),
+                (target_class.to_string(), 1, meta.size as i64),
+            ],
+        };
+        let rec = fs3_core::EventRecord {
+            seq: 0,
+            ts: now as u64,
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            event: "s3:LifecycleTransition".to_string(),
+            etag: Some(meta.etag_hex()),
+            size: Some(meta.size),
+            version_id: meta.version_id.map(|v| crate::version_id_display(Some(&v))),
+            delete_marker: false,
+            dead: false,
+        };
+        // 新段记账 + 旧段释放(同事务;ADR-9 §5.4 覆盖语义:新段记账先于
+        // 旧段释放——开放 extent 原地覆盖时位图不被误清;崩溃 = 事务未
+        // 提交则新段为孤儿(可达性扫描回收),已提交则旧段已释放)
+        self.alloc.add_object(&mut draft, &extents);
+        if !meta.extents.is_empty() {
+            self.alloc.release_object(&mut draft, &meta.extents);
+            self.after_release(&meta.extents)?;
+        }
+        let commit = self.meta.commit(&[
+            fs3_meta::Op::ObjectMetaRewrite {
+                key: raw_key,
+                meta: m2,
+            },
+            fs3_meta::Op::Alloc {
+                draft: self.alloc.to_alloc_draft(&draft),
+            },
+            fs3_meta::Op::Stats {
+                bucket: bucket.to_string(),
+                delta,
+            },
+            fs3_meta::Op::EventEnqueue { record: rec },
+        ]);
+        match commit {
+            Ok(_) => Ok(LifecycleTransitionOutcome::Transitioned),
             Err(e) => {
                 self.abort_draft(&draft);
                 Err(e)

@@ -2209,6 +2209,8 @@ pub fn parse_lifecycle_configuration(body: &[u8]) -> Result<Vec<fs3_core::Lifecy
         and_conditions: u8,
         expiration: Option<LifecycleExpiration>,
         exp_fields: u8,
+        transition: Option<fs3_core::LifecycleTransition>,
+        trans_fields: u8,
         noncurrent: Option<NoncurrentVersionExpiration>,
         abort: Option<AbortIncompleteMultipartUpload>,
     }
@@ -2265,6 +2267,7 @@ pub fn parse_lifecycle_configuration(body: &[u8]) -> Result<Vec<fs3_core::Lifecy
                         stack.push(name.clone());
                     }
                     b"Expiration"
+                    | b"Transition"
                     | b"NoncurrentVersionExpiration"
                     | b"AbortIncompleteMultipartUpload"
                     | b"Tag" => {
@@ -2274,6 +2277,11 @@ pub fn parse_lifecycle_configuration(body: &[u8]) -> Result<Vec<fs3_core::Lifecy
                             b"Expiration" if ctx == Some(b"Rule") => {
                                 if let Some(r) = cur.as_mut() {
                                     r.expiration = Some(LifecycleExpiration::default());
+                                }
+                            }
+                            b"Transition" if ctx == Some(b"Rule") => {
+                                if let Some(r) = cur.as_mut() {
+                                    r.transition = Some(fs3_core::LifecycleTransition::default());
                                 }
                             }
                             b"NoncurrentVersionExpiration" if ctx == Some(b"Rule") => {
@@ -2301,12 +2309,13 @@ pub fn parse_lifecycle_configuration(body: &[u8]) -> Result<Vec<fs3_core::Lifecy
                         }
                         stack.push(name.clone());
                     }
-                    // 显式拒绝族(不静默):Transition 无存储类目标;
+                    // 显式拒绝族(不静默):NoncurrentVersionTransition 出
+                    // v2.2 实现面(仅当前版本 Transition,ADR-19 DA3);
                     // ObjectSize* 过滤器出 v1.2 子集
-                    b"Transition" | b"NoncurrentVersionTransition" => {
+                    b"NoncurrentVersionTransition" => {
                         return Err(not_impl(
-                            "Transition actions are not supported (no storage classes); \
-                             lifecycle transitions are explicitly rejected, not silently dropped",
+                            "NoncurrentVersionTransition is not supported in v2.2; \
+                             only current-version Transition actions are implemented",
                         ));
                     }
                     b"ObjectSizeGreaterThan" | b"ObjectSizeLessThan" => {
@@ -2375,6 +2384,40 @@ pub fn parse_lifecycle_configuration(body: &[u8]) -> Result<Vec<fs3_core::Lifecy
                             if let Some(e) = r.expiration.as_mut() {
                                 r.exp_fields += 1;
                                 e.date = Some(ts);
+                            }
+                        }
+                    }
+                    b"Days" if ctx == Some(b"Transition") => {
+                        let v = text(&mut reader)?;
+                        let d = v
+                            .parse::<u32>()
+                            .map_err(|_| malformed("Transition Days must be an integer".into()))?;
+                        if let Some(r) = cur.as_mut() {
+                            if let Some(t) = r.transition.as_mut() {
+                                r.trans_fields += 1;
+                                t.days = Some(d);
+                            }
+                        }
+                    }
+                    b"Date" if ctx == Some(b"Transition") => {
+                        let v = text(&mut reader)?;
+                        let ts = parse_iso8601(&v).ok_or_else(|| {
+                            malformed(format!(
+                                "Transition Date is not a valid ISO8601 timestamp: {v}"
+                            ))
+                        })?;
+                        if let Some(r) = cur.as_mut() {
+                            if let Some(t) = r.transition.as_mut() {
+                                r.trans_fields += 1;
+                                t.date = Some(ts);
+                            }
+                        }
+                    }
+                    b"StorageClass" if ctx == Some(b"Transition") => {
+                        let v = text(&mut reader)?;
+                        if let Some(r) = cur.as_mut() {
+                            if let Some(t) = r.transition.as_mut() {
+                                t.storage_class = v;
                             }
                         }
                     }
@@ -2462,6 +2505,11 @@ pub fn parse_lifecycle_configuration(body: &[u8]) -> Result<Vec<fs3_core::Lifecy
                             r.expiration = Some(LifecycleExpiration::default());
                         }
                     }
+                    b"Transition" if ctx == Some(b"Rule") => {
+                        if let Some(r) = cur.as_mut() {
+                            r.transition = Some(fs3_core::LifecycleTransition::default());
+                        }
+                    }
                     b"NoncurrentVersionExpiration" if ctx == Some(b"Rule") => {
                         if let Some(r) = cur.as_mut() {
                             r.noncurrent = Some(NoncurrentVersionExpiration::default());
@@ -2494,10 +2542,9 @@ pub fn parse_lifecycle_configuration(body: &[u8]) -> Result<Vec<fs3_core::Lifecy
                         return Err(malformed("Tag requires Key and Value elements".into()));
                     }
                     // 空元素形态的显式拒绝族同样拦截
-                    b"Transition" | b"NoncurrentVersionTransition" => {
+                    b"NoncurrentVersionTransition" => {
                         return Err(not_impl(
-                            "Transition actions are not supported (no storage classes); \
-                             lifecycle transitions are explicitly rejected, not silently dropped",
+                            "NoncurrentVersionTransition is not supported in v2.2",
                         ));
                     }
                     b"ObjectSizeGreaterThan" | b"ObjectSizeLessThan" => {
@@ -2537,6 +2584,7 @@ pub fn parse_lifecycle_configuration(body: &[u8]) -> Result<Vec<fs3_core::Lifecy
                     b"Filter"
                     | b"And"
                     | b"Expiration"
+                    | b"Transition"
                     | b"NoncurrentVersionExpiration"
                     | b"AbortIncompleteMultipartUpload" => {
                         if stack_top(&stack) == Some(name.as_ref()) {
@@ -2679,6 +2727,37 @@ pub fn parse_lifecycle_configuration(body: &[u8]) -> Result<Vec<fs3_core::Lifecy
                         .into(),
                 )),
             };
+        // Transition(ADR-19 DA3):Days/Date 恰选其一;Days > 0;目标类
+        // 限定归档三值(INTELLIGENT_TIERING 及其余 → InvalidArgument,
+        // 显式不静默)
+        let transition = match acc.transition {
+            None => None,
+            Some(_) if acc.trans_fields != 1 => {
+                return Err(malformed(
+                    "Transition requires exactly one of Days or Date".into(),
+                ))
+            }
+            Some(t) if t.days == Some(0) => {
+                return Err(invalid_arg(
+                    "'Days' for Transition action must be a positive integer",
+                ))
+            }
+            Some(t) => {
+                let ok = matches!(
+                    t.storage_class.as_str(),
+                    "GLACIER" | "GLACIER_IR" | "DEEP_ARCHIVE"
+                );
+                if !ok {
+                    return Err(invalid_arg(&format!(
+                        "Transition StorageClass must be one of GLACIER, GLACIER_IR, or \
+                         DEEP_ARCHIVE (got {:?}); INTELLIGENT_TIERING is mapped to STANDARD \
+                         and cannot be a transition target",
+                        t.storage_class
+                    )));
+                }
+                Some(t)
+            }
+        };
         // NoncurrentVersionExpiration:两字段至少其一;取值正整数
         let noncurrent_expiration = match acc.noncurrent {
             None => None,
@@ -2712,12 +2791,13 @@ pub fn parse_lifecycle_configuration(body: &[u8]) -> Result<Vec<fs3_core::Lifecy
         };
         // 至少一个动作(语义;无动作规则无意义)
         if expiration.is_none()
+            && transition.is_none()
             && noncurrent_expiration.is_none()
             && abort_incomplete_multipart.is_none()
         {
             return Err(invalid(
                 "Rule must include at least one lifecycle action (Expiration, \
-                 NoncurrentVersionExpiration, or AbortIncompleteMultipartUpload)",
+                 Transition, NoncurrentVersionExpiration, or AbortIncompleteMultipartUpload)",
             ));
         }
         Ok(LifecycleRule {
@@ -2725,6 +2805,7 @@ pub fn parse_lifecycle_configuration(body: &[u8]) -> Result<Vec<fs3_core::Lifecy
             status,
             filter,
             expiration,
+            transition,
             noncurrent_expiration,
             abort_incomplete_multipart,
             legacy_prefix,
@@ -2802,6 +2883,21 @@ pub fn render_lifecycle_configuration(rules: &[fs3_core::LifecycleRule]) -> Stri
                 xml.push_str("<ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker>");
             }
             xml.push_str("</Expiration>");
+        }
+        if let Some(t) = &r.transition {
+            xml.push_str("<Transition>");
+            if let Some(d) = t.days {
+                let _ = write!(xml, "<Days>{d}</Days>");
+            }
+            if let Some(ts) = t.date {
+                let _ = write!(xml, "<Date>{}</Date>", ts_to_rfc3339(ts));
+            }
+            let _ = write!(
+                xml,
+                "<StorageClass>{}</StorageClass>",
+                escape_xml(&t.storage_class)
+            );
+            xml.push_str("</Transition>");
         }
         if let Some(n) = &r.noncurrent_expiration {
             xml.push_str("<NoncurrentVersionExpiration>");
@@ -4923,9 +5019,27 @@ mod tests {
                     )),
                     S3ErrorCode::InvalidArgument,
                 ),
-                // Transition 族 / ObjectSize* 过滤器 → NotImplemented(显式,不静默)
+                // M16 A3:Transition 校验违例(Days 缺失/双选/零值/非法
+                // 目标类 → 显式 4xx,不静默);NoncurrentVersionTransition /
+                // ObjectSize* 过滤器 → NotImplemented(显式)
                 (
-                    wrap(r#"<Rule><ID>r</ID><Filter/><Status>Enabled</Status><Transition><Days>30</Days><StorageClass>GLACIER</StorageClass></Transition></Rule>"#),
+                    wrap(r#"<Rule><ID>r</ID><Filter/><Status>Enabled</Status><Transition><StorageClass>GLACIER</StorageClass></Transition></Rule>"#),
+                    S3ErrorCode::MalformedXML,
+                ),
+                (
+                    wrap(r#"<Rule><ID>r</ID><Filter/><Status>Enabled</Status><Transition><Days>1</Days><Date>2026-01-01T00:00:00Z</Date><StorageClass>GLACIER</StorageClass></Transition></Rule>"#),
+                    S3ErrorCode::MalformedXML,
+                ),
+                (
+                    wrap(r#"<Rule><ID>r</ID><Filter/><Status>Enabled</Status><Transition><Days>0</Days><StorageClass>GLACIER</StorageClass></Transition></Rule>"#),
+                    S3ErrorCode::InvalidArgument,
+                ),
+                (
+                    wrap(r#"<Rule><ID>r</ID><Filter/><Status>Enabled</Status><Transition><Days>30</Days><StorageClass>INTELLIGENT_TIERING</StorageClass></Transition></Rule>"#),
+                    S3ErrorCode::InvalidArgument,
+                ),
+                (
+                    wrap(r#"<Rule><ID>r</ID><Filter/><Status>Enabled</Status><NoncurrentVersionTransition><NoncurrentDays>30</NoncurrentDays><StorageClass>GLACIER</StorageClass></NoncurrentVersionTransition></Rule>"#),
                     S3ErrorCode::NotImplemented,
                 ),
                 (

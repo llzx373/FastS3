@@ -123,6 +123,21 @@ groups:
           summary: "生命周期执行器超过 2 个周期未运行"
           description: "fasts3_lifecycle_last_cycle_timestamp 停滞;检查 fs3-lifecycle worker 线程日志(规则桶过期删除/会话中止暂停中)"
 
+      # 归档恢复停滞(M16 A2/A3-3,ADR-19 DA2):恢复作业队列非空但长时间
+      # 零物化(last_completed_at 停滞,队列深度 > 0)。指标缺席 =
+      # worker 未启用(restore_enabled=false/只读引擎),不告警。
+      - alert: FastS3RestoreStalled
+        expr: |
+          (time() - fasts3_restore_last_completed_timestamp > 600)
+          and (fasts3_restore_queue_depth > 0)
+          and (fasts3_restore_last_completed_timestamp > 0)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "归档恢复作业停滞(队列非空但长时间零物化)"
+          description: "fasts3_restore_queue_depth 非空且 last_completed 停滞;检查 fs3-restore worker 线程日志(设备只读/SSE-C 拒单循环?)"
+
       # 生命周期删除突增(信息级):规则误配(如 prefix 过宽)的第一信号
       - alert: FastS3LifecycleDeletedSpike
         expr: |

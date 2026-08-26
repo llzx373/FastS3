@@ -3856,6 +3856,116 @@ fn cors_eval_matching() {
 /// DeleteBucketLifecycleConfiguration 全流程:多规则 + 各动作组合 +
 /// Filter(Prefix/Tag/And)往返;NoSuchLifecycleConfiguration;DELETE 幂等;
 /// 整体替换语义。
+/// M16 A3(ADR-19 DA3):生命周期 Transition——XML 解析/回渲染往返
+/// (Days+StorageClass;非法目标类/缺 Days → 显式 4xx);执行器按规则
+/// 转换对象(同 vk 换数据 + 类间统计);已归档跳过;NoncurrentVersion
+/// Transition 显式拒绝。
+#[test]
+fn lifecycle_transition_flow() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/lct", vec![]))), 200);
+    svc.handle(&req("PUT", "/lct/a.txt", b"transition me".to_vec()))
+        .unwrap();
+    // ① Put 规则(Transition Days=1 → GLACIER)→ Get 回渲染往返
+    let body = br#"<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ID>tr</ID><Filter><Prefix>a.</Prefix></Filter><Status>Enabled</Status><Transition><Days>1</Days><StorageClass>GLACIER</StorageClass></Transition></Rule></LifecycleConfiguration>"#.to_vec();
+    let r = svc.handle(&req_q("PUT", "/lct", &[("lifecycle", "")], body.clone()));
+    assert_eq!(status(&r), 200, "{:?}", r);
+    let g = svc
+        .handle(&req_q("GET", "/lct", &[("lifecycle", "")], vec![]))
+        .unwrap();
+    let gx = std::str::from_utf8(&match &g.body {
+        ResponseBody::Bytes(b) => b.clone(),
+        _ => panic!("xml expected"),
+    })
+    .unwrap()
+    .to_string();
+    assert!(
+        gx.contains("<Transition><Days>1</Days><StorageClass>GLACIER</StorageClass></Transition>"),
+        "{gx}"
+    );
+    // ② 非法目标类(INTELLIGENT_TIERING / STANDARD)→ InvalidArgument
+    //    (校验用独立桶——Put 规则 = 整配置替换,不污染 lct 的 tr 规则)
+    assert_eq!(status(&svc.handle(&req("PUT", "/lctv", vec![]))), 200);
+    for (sc, code) in [
+        ("INTELLIGENT_TIERING", "InvalidArgument"),
+        ("STANDARD", "InvalidArgument"),
+        ("GLACIER_IR", "OK"),
+        ("DEEP_ARCHIVE", "OK"),
+    ] {
+        let b = format!(
+            "<LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule><ID>x{sc}</ID><Filter/><Status>Enabled</Status><Transition><Days>1</Days><StorageClass>{sc}</StorageClass></Transition></Rule></LifecycleConfiguration>"
+        )
+        .into_bytes();
+        let r = svc.handle(&req_q("PUT", "/lctv", &[("lifecycle", "")], b));
+        let got = if code == "OK" { "OK" } else { &err_code(&r) };
+        assert_eq!(got, code, "target {sc}");
+    }
+    // 缺 Days → MalformedXML
+    let b = br#"<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ID>nd</ID><Filter/><Status>Enabled</Status><Transition><StorageClass>GLACIER</StorageClass></Transition></Rule></LifecycleConfiguration>"#.to_vec();
+    let r = svc.handle(&req_q("PUT", "/lctv", &[("lifecycle", "")], b));
+    assert_eq!(err_code(&r), "MalformedXML");
+    // NoncurrentVersionTransition → NotImplemented(显式)
+    let b = br#"<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ID>nv</ID><Filter/><Status>Enabled</Status><NoncurrentVersionTransition><NoncurrentDays>1</NoncurrentDays><StorageClass>GLACIER</StorageClass></NoncurrentVersionTransition></Rule></LifecycleConfiguration>"#.to_vec();
+    let r = svc.handle(&req_q("PUT", "/lctv", &[("lifecycle", "")], b));
+    assert_eq!(err_code(&r), "NotImplemented");
+    // ③ 执行器驱动转换:规则 tr(Days=1)已配;对象 a.txt mtime 置旧后
+    //    跑一轮 → 真实类 GLACIER + 压缩 + 类间统计
+    {
+        let e = svc.engine().write();
+        let mut m = e.meta().get_object("lct", "a.txt").unwrap().unwrap();
+        m.mtime = 1_000_000_000; // 远早于 Days=1 阈值
+        let raw = fs3_meta::keys::object_key("lct", "a.txt");
+        e.meta().commit_object_meta_update(&raw, &m).unwrap();
+    }
+    let now = {
+        let e = svc.engine().write();
+        e.lock_now()
+    };
+    {
+        let mut e = svc.engine().write();
+        let meta = e.meta_arc();
+        let mut w = fs3_engine::lifecycle::LifecycleWorker::new(
+            fs3_engine::lifecycle::DirectEngine(&mut e),
+            meta,
+            None,
+            std::time::Duration::from_secs(3600),
+        )
+        .with_clock(move || now);
+        let budget = fs3_engine::worker::Throttle::new(1 << 40);
+        let report = w.run_cycle_blocking(&budget).unwrap();
+        assert_eq!(report.transitioned, 1, "转换执行");
+    }
+    {
+        let e = svc.engine().read();
+        let m = e.meta().get_object("lct", "a.txt").unwrap().unwrap();
+        assert_eq!(
+            m.storage_class.as_deref(),
+            Some("GLACIER"),
+            "执行器转换后真实类"
+        );
+        let b = e.meta().get_bucket("lct").unwrap().unwrap();
+        assert_eq!(b.stats.class_tally("GLACIER").objects, 1);
+        assert_eq!(b.stats.class_sum(), (b.stats.objects, b.stats.bytes));
+    }
+    // 转换后对象未恢复 → 读门 403;恢复后可读
+    let r = svc.handle(&req("GET", "/lct/a.txt", vec![]));
+    assert_eq!(err_code(&r), "InvalidObjectState");
+    svc.handle(&req_q(
+        "POST",
+        "/lct/a.txt",
+        &[("restore", "")],
+        br#"<RestoreRequest><Days>1</Days></RestoreRequest>"#.to_vec(),
+    ))
+    .unwrap();
+    {
+        let mut e = svc.engine().write();
+        let (done, _) = e.restore_worker_tick(now + 1, 8).unwrap();
+        assert_eq!(done, 1);
+    }
+    let g = svc.handle(&req("GET", "/lct/a.txt", vec![])).unwrap();
+    assert_eq!(g.status, 200, "转换对象恢复后可读");
+}
+
 #[test]
 fn bucket_lifecycle_flow() {
     let (_d, svc) = setup();
@@ -3982,12 +4092,19 @@ fn bucket_lifecycle_rejects() {
             wrap(r#"<Rule><ID>r</ID><Filter/><Status>Enabled</Status></Rule>"#),
             "InvalidRequest",
         ),
-        // Transition / NoncurrentVersionTransition → NotImplemented(显式)
+        // M16 A3:Transition 非法目标类 → InvalidArgument;缺 Days →
+        // MalformedXML;NoncurrentVersionTransition → NotImplemented(显式)
         (
             wrap(
-                r#"<Rule><ID>r</ID><Filter/><Status>Enabled</Status><Transition><Days>30</Days><StorageClass>GLACIER</StorageClass></Transition></Rule>"#,
+                r#"<Rule><ID>r</ID><Filter/><Status>Enabled</Status><Transition><Days>30</Days><StorageClass>STANDARD</StorageClass></Transition></Rule>"#,
             ),
-            "NotImplemented",
+            "InvalidArgument",
+        ),
+        (
+            wrap(
+                r#"<Rule><ID>r</ID><Filter/><Status>Enabled</Status><Transition><StorageClass>GLACIER</StorageClass></Transition></Rule>"#,
+            ),
+            "MalformedXML",
         ),
         (
             wrap(

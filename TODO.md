@@ -107,9 +107,9 @@
 - [x] A2-4 CopyObject/UploadPartCopy/版本删除 × 归档语义(源归档未恢复 → InvalidObjectState;同存储类复制豁免;DeleteObjects 归档条目口径,DA5)
 
 #### A3 生命周期 Transition(≈0.7 pw)
-- [ ] A3-1 Transition XML(Days/Date + StorageClass 校验;Filter 复用 v1.2 语法;非法目标显式 InvalidArgument)
-- [ ] A3-2 执行器 transition 动作(压缩→归档 + 原子换数据,同版本 vk;统计入账;who=system:lifecycle 审计;锁定对象跳过 skipped_locked 沿用 M12)
-- [ ] A3-3 指标与告警:fasts3_archive_*/fasts3_restore_* 指标组 + FastS3RestoreStalled 告警
+- [x] A3-1 Transition XML(Days/Date + StorageClass 校验;Filter 复用 v1.2 语法;非法目标显式 InvalidArgument)
+- [x] A3-2 执行器 transition 动作(压缩→归档 + 原子换数据,同版本 vk;统计入账;who=system:lifecycle 审计;锁定对象跳过 skipped_locked 沿用 M12)
+- [x] A3-3 指标与告警:fasts3_archive_*/fasts3_restore_* 指标组 + FastS3RestoreStalled 告警
 
 #### A4 管理面(≈0.5 pw)
 - [ ] A4-1 控制台/审计:存储类分布与 restore 状态展示、手动 restore 操作、归档审计过滤(web/server 桥接端点)

@@ -99,7 +99,7 @@ pub fn days_deadline(base: i64, days: u32) -> i64 {
 // ─────────────────────────── 规则引擎(纯函数) ───────────────────────────
 
 /// 生命周期动作(规则引擎输出,L2-2;执行器映射到既有删除原语,L2-3)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LifecycleAction {
     /// 物理删除当前版本(未版本化桶)。
     DeleteCurrent,
@@ -110,6 +110,9 @@ pub enum LifecycleAction {
     /// 物理删除「唯一剩余版本是删除标记」的条目(AWS ExpiredObjectDeleteMarker;
     /// 不受 Object Lock 影响,DESIGN-FUTURE §5.4)。
     ExpireDeleteMarker,
+    /// M16 A3(ADR-19 DA3):当前版本存储类转换(STANDARD → 归档三值;
+    /// 同版本 vk 原子换数据;锁定对象跳过)。
+    Transition { storage_class: String },
     /// 中止未完成 multipart 会话(AbortIncompleteMultipartUpload;会话级
     /// 动作,由 [`eval_session_abort`] 产出,不经组评估)。
     AbortUpload,
@@ -163,6 +166,24 @@ pub fn match_entry(ctx: &EntryCtx, rules: &[LifecycleRule], now: i64) -> Vec<Lif
             continue;
         }
         if ctx.is_current {
+            // M16 A3(ADR-19 DA3):Transition 仅当前版本;Days/Date 语义同
+            // Expiration(DL4 午夜取整);与 Expiration 同现 = 各自独立评估
+            if let Some(tr) = &rule.transition {
+                if !ctx.meta.is_delete_marker {
+                    let days_hit = tr
+                        .days
+                        .is_some_and(|d| now >= days_deadline(ctx.meta.mtime, d));
+                    let date_hit = tr.date.is_some_and(|d| now >= d);
+                    if days_hit || date_hit {
+                        push_unique(
+                            &mut out,
+                            LifecycleAction::Transition {
+                                storage_class: tr.storage_class.clone(),
+                            },
+                        );
+                    }
+                }
+            }
             if let Some(exp) = &rule.expiration {
                 if ctx.meta.is_delete_marker {
                     // AWS:Days/Date 不作用于删除标记;ExpiredObjectDeleteMarker
@@ -213,7 +234,7 @@ pub fn match_entry(ctx: &EntryCtx, rules: &[LifecycleRule], now: i64) -> Vec<Lif
 }
 
 /// 组评估输出:动作 + 目标定位(执行器用)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupAction {
     pub action: LifecycleAction,
     /// 目标条目(VK_NULL = 遗留单键/null 槽;DeleteCurrent/InsertDeleteMarker
@@ -337,6 +358,7 @@ pub fn eval_key_group(
                 LifecycleAction::InsertDeleteMarker => (cur_vk, 0),
                 LifecycleAction::DeleteNoncurrentVersion { vk } => (vk, meta.size),
                 LifecycleAction::ExpireDeleteMarker => (cur_vk, 0),
+                LifecycleAction::Transition { .. } => (cur_vk, 0),
                 LifecycleAction::AbortUpload => unreachable!("会话动作不经组评估"),
             };
             let ga = GroupAction {
@@ -429,6 +451,8 @@ pub struct LifecycleStats {
     pub aborted_uploads: AtomicU64,
     /// L4-1 预留:锁保留跳过的删除动作数(L3-2 渲染 skipped_locked)。
     pub skipped_locked: AtomicU64,
+    /// M16 A3:转换成功数(fasts3_lifecycle_transitioned_total)。
+    pub transitioned: AtomicU64,
     /// 末次周期完成时刻(unix 秒;0 = 未跑过。L3-2 渲染
     /// fasts3_lifecycle_last_cycle_timestamp;worker 停滞告警判据)。
     pub last_cycle_at: AtomicU64,
@@ -443,6 +467,7 @@ pub struct LifecycleStatsSnapshot {
     pub deleted_bytes: u64,
     pub aborted_uploads: u64,
     pub skipped_locked: u64,
+    pub transitioned: u64,
     pub last_cycle_at: u64,
 }
 
@@ -455,6 +480,7 @@ impl LifecycleStats {
             deleted_bytes: self.deleted_bytes.load(Ordering::Relaxed),
             aborted_uploads: self.aborted_uploads.load(Ordering::Relaxed),
             skipped_locked: self.skipped_locked.load(Ordering::Relaxed),
+            transitioned: self.transitioned.load(Ordering::Relaxed),
             last_cycle_at: self.last_cycle_at.load(Ordering::Relaxed),
         }
     }
@@ -468,6 +494,8 @@ pub struct LifecycleReport {
     pub deleted_bytes: u64,
     pub aborted_uploads: u64,
     pub skipped_locked: u64,
+    /// M16 A3:转换成功数(fasts3_lifecycle_transitioned_total)。
+    pub transitioned: u64,
 }
 
 /// 一周期的游标状态(跨 run_batch 持久;批间让出前台,崩溃丢弃 =
@@ -501,6 +529,8 @@ struct ApplyDelta {
     deleted: u64,
     bytes: u64,
     skipped_locked: u64,
+    /// M16 A3:转换成功数(Transition 动作;与删除同属「执行」计数)。
+    transitioned: u64,
 }
 
 /// 生命周期执行器(ADR-12 DL2 的 [`BackgroundWorker`] 实例;线程名
@@ -616,6 +646,7 @@ impl<E: EngineAccess> LifecycleWorker<E> {
             actions += d.actions;
             let cycle = self.cycle.as_mut().unwrap();
             cycle.report.deleted_objects += d.deleted;
+            cycle.report.transitioned += d.transitioned;
             cycle.report.deleted_bytes += d.bytes;
             cycle.report.skipped_locked += d.skipped_locked;
             outcome.items += d.deleted;
@@ -817,6 +848,43 @@ impl<E: EngineAccess> LifecycleWorker<E> {
                             kind: fs3_core::EventDraftKind::LifecycleExpiration,
                         }),
                     )?,
+                    // M16 A3(ADR-19 DA3/DA4):转换 = 压缩归档副本 + 同 vk
+                    // 原子换数据 + 类间统计 + s3:LifecycleTransition 事件;
+                    // 跳过(已归档/锁定/标记)由引擎 outcome 汇报,幂等收敛
+                    LifecycleAction::Transition { storage_class } => {
+                        let outcome = e.lifecycle_transition(
+                            bucket,
+                            key,
+                            if ga.target_vk == VK_NULL {
+                                None
+                            } else {
+                                Some(&ga.target_vk)
+                            },
+                            storage_class.as_str(),
+                            now,
+                        )?;
+                        match outcome {
+                            crate::restore::LifecycleTransitionOutcome::Transitioned => {
+                                d.transitioned += 1;
+                                budget.consume(tmeta.size);
+                                if let Some(a) = &audit {
+                                    a.push(
+                                        "system:lifecycle",
+                                        "TransitionObject",
+                                        bucket,
+                                        key,
+                                        200,
+                                        "",
+                                    );
+                                }
+                            }
+                            crate::restore::LifecycleTransitionOutcome::SkippedLocked => {
+                                d.skipped_locked += 1;
+                            }
+                            _ => { /* 已归档/标记/并发消失:幂等跳过 */ }
+                        }
+                        None
+                    }
                     LifecycleAction::AbortUpload => unreachable!("会话动作不经组执行"),
                 };
                 if deleted.is_some() {
@@ -852,6 +920,9 @@ impl<E: EngineAccess> LifecycleWorker<E> {
         self.stats
             .skipped_locked
             .fetch_add(r.skipped_locked, Ordering::Relaxed);
+        self.stats
+            .transitioned
+            .fetch_add(r.transitioned, Ordering::Relaxed);
         if r.deleted_objects > 0 || r.aborted_uploads > 0 || r.skipped_locked > 0 {
             tracing::info!(
                 scanned = r.scanned_entries,
@@ -892,8 +963,8 @@ impl<E: EngineAccess + 'static> BackgroundWorker for LifecycleWorker<E> {
 mod tests {
     use super::*;
     use fs3_core::{
-        AbortIncompleteMultipartUpload, LifecycleExpiration, LifecycleFilter,
-        NoncurrentVersionExpiration, Retention, RetentionMode,
+        AbortIncompleteMultipartUpload, LifecycleExpiration, LifecycleFilter, LifecycleTransition,
+        NoncurrentVersionExpiration, ObjectLockWrite, Retention, RetentionMode,
     };
     use std::io::Cursor;
     use std::sync::atomic::AtomicI64;
@@ -934,6 +1005,7 @@ mod tests {
             expiration: None,
             noncurrent_expiration: None,
             abort_incomplete_multipart: None,
+            transition: None,
             legacy_prefix: false,
         }
     }
@@ -1009,6 +1081,124 @@ mod tests {
     }
 
     // ── 纯函数:DL4 午夜语义 ──
+
+    #[test]
+    fn transition_action_evals_and_executes() -> Result<()> {
+        // M16 A3(ADR-19 DA3/DA4):Transition 评估(当前版本 Days 命中)->
+        // 执行器转换(同 vk 换数据 + 类间统计 + 事件);已归档/删除标记/
+        // 锁定跳过;执行后可读(解压路径)。
+        let (_d, mut e) = test_engine();
+        // STANDARD 对象
+        e.put("b1", "k1", &mut Cursor::new(b"transition me".to_vec()))?;
+        let now0 = e.lock_now();
+        let rule = {
+            let mut r = rule("tr");
+            r.transition = Some(LifecycleTransition {
+                days: Some(1),
+                date: None,
+                storage_class: "GLACIER".into(),
+            });
+            r
+        };
+        // 未到期:不转换
+        let m0 = e.meta().get_object("b1", "k1")?.unwrap();
+        let actions = eval_key_group(
+            "k1",
+            &[(None, m0)],
+            VersioningState::Off,
+            std::slice::from_ref(&rule),
+            now0,
+        );
+        assert!(actions.is_empty(), "Days 未满不转换");
+        // 到期:转换动作
+        let deadline = days_deadline(now0, 1) + 1;
+        let m1 = e.meta().get_object("b1", "k1")?.unwrap();
+        let actions = eval_key_group(
+            "k1",
+            &[(None, m1)],
+            VersioningState::Off,
+            std::slice::from_ref(&rule),
+            deadline,
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                &a.action,
+                LifecycleAction::Transition { storage_class } if storage_class == "GLACIER"
+            )),
+            "到期必须产出转换动作"
+        );
+        // 执行:同 vk 换数据 + 类间统计 + 事件
+        let out = e.lifecycle_transition("b1", "k1", None, "GLACIER", deadline)?;
+        assert_eq!(
+            out,
+            crate::restore::LifecycleTransitionOutcome::Transitioned
+        );
+        let m = e.meta().get_object("b1", "k1")?.unwrap();
+        assert_eq!(m.storage_class.as_deref(), Some("GLACIER"), "真实类升格");
+        let c = m.compressed.as_ref().expect("归档必须压缩");
+        assert_eq!(c.level, fs3_core::ARCHIVE_DEEP_COMPRESSION_LEVEL);
+        assert_eq!(m.restore_state, None);
+        let b = e.meta().get_bucket("b1")?.unwrap();
+        assert_eq!(b.stats.class_tally("GLACIER").objects, 1, "类间统计移动");
+        assert_eq!(b.stats.class_tally("STANDARD").objects, 0);
+        assert_eq!(b.stats.class_sum(), (b.stats.objects, b.stats.bytes));
+        let events = e.meta().pending_events(10, None)?;
+        assert!(
+            events.iter().any(|r| r.event == "s3:LifecycleTransition"),
+            "转换事件入队"
+        );
+        // 已归档对象重复转换 -> 跳过
+        let out = e.lifecycle_transition("b1", "k1", None, "GLACIER", deadline)?;
+        assert_eq!(
+            out,
+            crate::restore::LifecycleTransitionOutcome::SkippedArchived
+        );
+        // 物理删除后 -> 幂等跳过(NotFound)
+        e.delete("b1", "k1")?;
+        let out = e.lifecycle_transition("b1", "k1", None, "GLACIER", deadline)?;
+        assert_eq!(
+            out,
+            crate::restore::LifecycleTransitionOutcome::SkippedMissing
+        );
+        // 账目零漂移
+        assert!(e.check_report()?.leaks.is_empty());
+        e.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn transition_skips_locked_objects() -> Result<()> {
+        // DA5:Object Lock 保留中对象跳过转换(skipped_locked)
+        let (_d, mut e) = test_engine();
+        e.put_with_lock(
+            "b1",
+            "locked",
+            &mut Cursor::new(b"locked data".to_vec()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            ObjectLockWrite {
+                retention: Some(fs3_core::Retention {
+                    mode: fs3_core::RetentionMode::Compliance,
+                    retain_until: 4_000_000_000,
+                }),
+                legal_hold: false,
+            },
+        )?;
+        let now0 = e.lock_now();
+        let out = e.lifecycle_transition("b1", "locked", None, "GLACIER", now0)?;
+        assert_eq!(
+            out,
+            crate::restore::LifecycleTransitionOutcome::SkippedLocked,
+            "锁定对象跳过"
+        );
+        e.abort();
+        Ok(())
+    }
 
     #[test]
     fn midnight_deadline_semantics() {

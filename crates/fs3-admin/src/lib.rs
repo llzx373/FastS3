@@ -776,6 +776,13 @@ impl AdminServer {
                 "fasts3_lifecycle_skipped_locked_total {}\n",
                 s.skipped_locked
             ));
+            // M16 A3(A3-3):转换计数(ADR-19 DA3)
+            text.push_str("# HELP fasts3_lifecycle_transitioned_total Objects transitioned to archive storage classes by lifecycle rules\n");
+            text.push_str("# TYPE fasts3_lifecycle_transitioned_total counter\n");
+            text.push_str(&format!(
+                "fasts3_lifecycle_transitioned_total {}\n",
+                s.transitioned
+            ));
             text.push_str("# HELP fasts3_lifecycle_last_cycle_timestamp Unix time of last completed lifecycle cycle (0 = never)\n");
             text.push_str("# TYPE fasts3_lifecycle_last_cycle_timestamp gauge\n");
             text.push_str(&format!(
@@ -908,6 +915,12 @@ impl AdminServer {
             text.push_str("# HELP fasts3_restore_queue_depth Pending restore jobs\n");
             text.push_str("# TYPE fasts3_restore_queue_depth gauge\n");
             text.push_str(&format!("fasts3_restore_queue_depth {}\n", s.queue));
+            text.push_str("# HELP fasts3_restore_last_completed_timestamp Unix time of last successful restore materialization (0 = never; FastS3RestoreStalled window)\n");
+            text.push_str("# TYPE fasts3_restore_last_completed_timestamp gauge\n");
+            text.push_str(&format!(
+                "fasts3_restore_last_completed_timestamp {}\n",
+                s.last_completed_at
+            ));
         }
         Response::builder()
             .status(StatusCode::OK)
