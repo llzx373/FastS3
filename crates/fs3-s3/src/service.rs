@@ -7180,6 +7180,10 @@ fn map_engine_error(e: CoreError, bucket: &str, key: &str) -> S3Error {
         CoreError::BadDigest(m) => S3Error::new(S3ErrorCode::BadDigest).with_message(m),
         // 复合无法合成等请求语义非法(M11 C1-4)→ 400 InvalidRequest
         CoreError::InvalidRequest(m) => S3Error::new(S3ErrorCode::InvalidRequest).with_message(m),
+        // M16 A2-4(ADR-19 DA5):归档源未恢复复制等 → 403 InvalidObjectState
+        CoreError::InvalidObjectState(m) => {
+            S3Error::new(S3ErrorCode::InvalidObjectState).with_message(m)
+        }
         CoreError::AccessDenied(m) => S3Error::new(S3ErrorCode::AccessDenied).with_message(m),
         // 删除标记命中(未走显式判定的兜底路径;§3.4.3:无 versionId = 404)
         CoreError::DeleteMarker(_) => S3Error::new(S3ErrorCode::NoSuchKey)

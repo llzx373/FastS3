@@ -1568,6 +1568,18 @@ impl Engine {
         v
     }
 
+    /// M16 A2-4(ADR-19 DA5):释放对象全部段(归档压缩流 extents + 恢复
+    /// 副本段 restored_extents——两套段同池同生命周期,删除/覆盖必须
+    /// 一并释放,否则副本段泄漏)。调用方继续 after_release 封口。
+    fn release_all_segments(&mut self, draft: &mut Staged, meta: &ObjectMeta) {
+        self.alloc.release_object(draft, &meta.extents);
+        if let Some(st) = &meta.restore_state {
+            if !st.restored_extents.is_empty() {
+                self.alloc.release_object(draft, &st.restored_extents);
+            }
+        }
+    }
+
     /// 写路径版本化分叉(ADR-11 §3.4.2):返回提交目标与旧值视图。
     ///
     /// - Off:读旧未版本化条目;`counted` = 旧数据版本存在(含内联,
@@ -1601,6 +1613,11 @@ impl Engine {
                             .as_ref()
                             .filter(|o| !o.is_delete_marker)
                             .and_then(|o| o.storage_class.clone()),
+                        restored_segments: old
+                            .as_ref()
+                            .and_then(|o| o.restore_state.as_ref())
+                            .map(|st| st.restored_extents.clone())
+                            .unwrap_or_default(),
                     },
                 ))
             }
@@ -1624,6 +1641,11 @@ impl Engine {
                                 } else {
                                     legacy.storage_class.clone()
                                 },
+                                restored_segments: legacy
+                                    .restore_state
+                                    .as_ref()
+                                    .map(|st| st.restored_extents.clone())
+                                    .unwrap_or_default(),
                             },
                         ))
                     }
@@ -1643,6 +1665,11 @@ impl Engine {
                             .as_ref()
                             .filter(|o| !o.is_delete_marker)
                             .and_then(|o| o.storage_class.clone()),
+                        restored_segments: old
+                            .as_ref()
+                            .and_then(|o| o.restore_state.as_ref())
+                            .map(|st| st.restored_extents.clone())
+                            .unwrap_or_default(),
                     },
                 ))
             }
@@ -2131,6 +2158,12 @@ impl Engine {
                 self.alloc.release_object(&mut draft, &old_no_overlap);
                 self.after_release(&old.segments)?;
             }
+            // M16 A2-4:旧版本恢复副本段一并释放(覆盖写 = 副本生命周期结束)
+            if !old.restored_segments.is_empty() {
+                self.alloc
+                    .release_object(&mut draft, &old.restored_segments);
+                self.after_release(&old.restored_segments)?;
+            }
             let delta = StatsDelta {
                 objects: if old.counted { 0 } else { 1 },
                 bytes: size as i64 - old.size,
@@ -2231,6 +2264,7 @@ impl Engine {
         let old_segments = old.segments;
         let old_class = old.class.clone();
         let old_counted = old.counted;
+        let old_restored = old.restored_segments.clone();
         let mut draft = Staged::default();
         let outcome =
             match self.stream_to_extents(reader, &mut draft, sse_key, None, compression_level) {
@@ -2295,6 +2329,12 @@ impl Engine {
             let old_no_overlap = release_non_overlapping(&old_segments, &meta.extents);
             self.alloc.release_object(&mut draft, &old_no_overlap);
         }
+        // M16 A2-4:旧版本恢复副本段一并释放(put_stream 的 old 字段在
+        // 上文已局部取出,恢复副本段经 old_restored 传递)
+        if !old_restored.is_empty() {
+            self.alloc.release_object(&mut draft, &old_restored);
+            self.after_release(&old_restored)?;
+        }
         // 统计(D5):Off = 旧数据版本覆盖 objects 不变;Enabled 纯追加
         // 恒 +1/+size;Suspended 覆盖 null 槽 = 先扣旧 null 数据版本再加新。
         let delta = StatsDelta {
@@ -2308,6 +2348,7 @@ impl Engine {
                     segments: Vec::new(),
                     size: old_size,
                     class: old_class,
+                    restored_segments: old_restored.clone(),
                 },
                 meta.storage_class_name(),
                 size,
@@ -3676,7 +3717,7 @@ impl Engine {
         };
         self.deny_if_locked(&meta, bypass_governance, skip_lock)?;
         let mut draft = Staged::default();
-        self.alloc.release_object(&mut draft, &meta.extents);
+        self.release_all_segments(&mut draft, &meta);
         // seal-on-delete:开放 extent 内出现死段 → 封口(保持"开放 extent 无洞")
         self.after_release(&meta.extents)?;
         let delta = if meta.is_delete_marker {
@@ -3743,8 +3784,9 @@ impl Engine {
         let mut delta = StatsDelta::default();
         if let Some(o) = &old_null {
             if !o.is_delete_marker {
-                // 旧 null 族数据版本:既有 release + 扣减(同事务)
-                self.alloc.release_object(&mut draft, &o.extents);
+                // 旧 null 族数据版本:既有 release + 扣减(同事务;恢复
+                // 副本段随主段一并释放,A2-4)
+                self.release_all_segments(&mut draft, o);
                 self.after_release(&o.extents)?;
                 delta = StatsDelta {
                     objects: -1,
@@ -3806,7 +3848,7 @@ impl Engine {
         let mut draft = Staged::default();
         let mut delta = StatsDelta::default();
         if !meta.is_delete_marker {
-            self.alloc.release_object(&mut draft, &meta.extents);
+            self.release_all_segments(&mut draft, &meta);
             self.after_release(&meta.extents)?;
             delta = StatsDelta {
                 objects: -1,
@@ -3866,7 +3908,7 @@ impl Engine {
         }
         for (key, vk, meta) in entries {
             let mut draft = Staged::default();
-            self.alloc.release_object(&mut draft, &meta.extents);
+            self.release_all_segments(&mut draft, &meta);
             self.after_release(&meta.extents)?;
             // 删除标记零 delta(本就未入账);数据版本按 size 扣减
             let delta = if meta.is_delete_marker {
@@ -4335,6 +4377,20 @@ impl Engine {
             return Err(Error::NotFound(format!(
                 "object {src_bucket}/{src_key} is a delete marker"
             )));
+        }
+        // M16 A2-4(ADR-19 DA5):UploadPartCopy 源 × 归档——源未恢复且
+        // 会话类 ≠ 源类 → InvalidObjectState(同存储类豁免语义同
+        // CopyObject;分片目标不携带恢复状态,读门按会话类裁决)
+        let session_class = session.requested_storage_class.clone();
+        if src.archive_needs_restore() && !src.restore_valid(self.lock_now()) {
+            let same_class = session_class.as_deref() == src.storage_class.as_deref();
+            if !same_class {
+                return Err(Error::InvalidObjectState(format!(
+                    "copy source {src_bucket}/{src_key} is archived ({}) and not restored; \
+                     restore the object first (POST ?restore) or use the same storage class session",
+                    src.storage_class_name()
+                )));
+            }
         }
         // DE3/DS3:源加密 + 目标(会话)未加密 → 显式拒绝(防静默解密落盘)
         let dst_encrypted = dst_sse_key.is_some() || session.sse_s3.is_some();
@@ -5150,6 +5206,12 @@ impl Engine {
                 self.alloc.release_object(&mut draft, &old_no_overlap);
                 self.after_release(&old.segments)?;
             }
+            // M16 A2-4:旧版本恢复副本段一并释放
+            if !old.restored_segments.is_empty() {
+                self.alloc
+                    .release_object(&mut draft, &old.restored_segments);
+                self.after_release(&old.restored_segments)?;
+            }
             let part_keys: Vec<Vec<u8>> = stored
                 .iter()
                 .map(|(no, _)| part_key(upload_id, *no))
@@ -5806,6 +5868,21 @@ impl Engine {
             self.compression_cfg.enabled,
             self.compression_cfg.level,
         );
+        // M16 A2-4(ADR-19 DA5):复制源 × 归档——源 GLACIER/DEEP_ARCHIVE
+        // 未恢复(restore 未完成/已过期)且目标类 ≠ 源类 →
+        // InvalidObjectState(需先 restore);**同存储类复制豁免** = COW
+        // 段共享(零解压零重压缩);源已恢复 → 放行(数据路径从归档流
+        // 解压或明文副本读取,目标类按请求)。
+        if src.archive_needs_restore() && !src.restore_valid(self.lock_now()) {
+            let same_class = target_class.as_deref() == src.storage_class.as_deref();
+            if !same_class {
+                return Err(Error::InvalidObjectState(format!(
+                    "copy source {src_bucket}/{src_key} is archived ({}) and not restored; \
+                     restore the object first (POST ?restore) or copy to the same storage class",
+                    src.storage_class_name()
+                )));
+            }
+        }
 
         let mut meta = src.clone();
         meta.mtime = now_ts();
@@ -5829,6 +5906,10 @@ impl Engine {
         // M15 C1(ADR-18 D-E3):x-amz-storage-class 头 → 记录请求类;
         // 未携带 → 继承源请求类(AWS:复制目标默认继承源存储类)。
         meta.requested_storage_class = requested_storage_class.or(meta.requested_storage_class);
+        // M16 A2-4(ADR-19 DA5):复制目标不继承恢复状态——恢复副本段不随
+        // COW 共享(仅主 extents 共享),残留 restore_state 会悬挂引用源
+        // 副本段(源 GC 释放后悬垂);目标对象按自身存储类独立走读门。
+        meta.restore_state = None;
         // M16 A1:真实类(请求升格或继承源;覆盖源类——复制目标类语义
         // 由本写路径裁决,COW 共享段不改变数据形态)
         meta.storage_class = target_class.clone();
@@ -6037,6 +6118,12 @@ impl Engine {
         if !old.segments.is_empty() {
             self.alloc.release_object(&mut draft, &old.segments);
             self.after_release(&old.segments)?;
+        }
+        // M16 A2-4:旧版本恢复副本段一并释放
+        if !old.restored_segments.is_empty() {
+            self.alloc
+                .release_object(&mut draft, &old.restored_segments);
+            self.after_release(&old.restored_segments)?;
         }
         let delta = if meta.is_delete_marker {
             // 删除标记零入账;仅被覆盖的旧 null 族数据版本扣减
@@ -6822,6 +6909,9 @@ struct OldVersion {
     /// M16 A1(ADR-19 DA5):旧版本真实存储类(覆盖写跨类时旧类出账
     /// 依据;无旧值/未计入 = None → STANDARD 语义)。
     class: Option<String>,
+    /// M16 A2-4(ADR-19 DA5):旧版本恢复副本段(覆盖/删除时随主段一并
+    /// 释放——副本段同池同生命周期,漏放 = 泄漏)。
+    restored_segments: Vec<Segment>,
 }
 
 /// 当前 Unix 微秒(vk 时间戳分量用,ADR-11 D2)。

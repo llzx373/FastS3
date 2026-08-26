@@ -46,6 +46,11 @@ pub enum Error {
     #[error("invalid part: {0}")]
     InvalidPart(String),
 
+    /// M16 A2-4(ADR-19 DA5):归档对象未恢复即读取/复制(AWS
+    /// InvalidObjectState;协议层 403 + x-amz-storage-class 回显)。
+    #[error("invalid object state: {0}")]
+    InvalidObjectState(String),
+
     /// multipart:分片号乱序(AWS InvalidPartOrder)。
     #[error("invalid part order: {0}")]
     InvalidPartOrder(String),

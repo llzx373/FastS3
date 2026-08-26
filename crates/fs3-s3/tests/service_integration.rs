@@ -9856,8 +9856,9 @@ fn a1_2_storage_class_landing_end_to_end() {
         assert_eq!(m.compressed, src.compressed, "压缩信息继承");
     }
 
-    // ⑥ Copy:GLACIER → STANDARD(请求覆盖)→ 真实类 None,压缩流保留
-    svc.handle(&req_h(
+    // ⑥ Copy:GLACIER → STANDARD(请求覆盖)→ A2-4 读门:源未恢复且目标
+    // 类 ≠ 源类 → 403 InvalidObjectState(需先 restore)
+    let r = svc.handle(&req_h(
         "PUT",
         "/arc/c3",
         &[
@@ -9865,16 +9866,12 @@ fn a1_2_storage_class_landing_end_to_end() {
             ("x-amz-storage-class", "STANDARD"),
         ],
         vec![],
-    ))
-    .unwrap();
-    {
-        let e = svc.engine().read();
-        let m = e.meta().get_object("arc", "c3").unwrap().unwrap();
-        assert_eq!(m.storage_class, None, "目标 STANDARD 不保留归档类");
-        assert!(m.compressed.is_some(), "压缩流原样继承(压缩标准对象)");
-        let g = svc.handle(&req("GET", "/arc/c3", vec![])).unwrap();
-        assert_stream_eq(&svc, &g, &big, "压缩标准对象可读");
-    }
+    ));
+    assert_eq!(
+        err_code(&r),
+        "InvalidObjectState",
+        "跨类复制未恢复源必须 403"
+    );
 
     // ⑦ 归档 multipart:Create(GLACIER)+ UploadPart(压缩帧)+ Complete
     //    零搬运拼接;GET 明文往返
@@ -10287,6 +10284,165 @@ fn a2_3_restore_expiry_fallback_and_gc() {
     }
     let g = svc.handle(&req("GET", "/arx/g1", vec![])).unwrap();
     assert_eq!(g.status, 200, "二次恢复后可读");
+}
+
+/// M16 A2-4(ADR-19 DA5):Copy/UploadPartCopy × 归档——同存储类复制豁免
+/// (COW 段共享,复制目标不继承恢复状态);跨类复制未恢复源 → 403
+/// InvalidObjectState;源恢复后跨类复制放行;版本删除释放恢复副本段
+/// (账目零漂移)。
+#[test]
+fn a2_4_archive_copy_semantics() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/arc4", vec![]))), 200);
+    let data = b"copy archive semantics".to_vec();
+    svc.handle(&req_h(
+        "PUT",
+        "/arc4/g1",
+        &[("x-amz-storage-class", "GLACIER")],
+        data.clone(),
+    ))
+    .unwrap();
+    // ① 同存储类复制豁免:未恢复源 → 200(COW),复制目标未恢复
+    let r = svc.handle(&req_h(
+        "PUT",
+        "/arc4/g2",
+        &[
+            ("x-amz-copy-source", "/arc4/g1"),
+            ("x-amz-storage-class", "GLACIER"),
+        ],
+        vec![],
+    ));
+    assert_eq!(status(&r), 200, "{:?}", r);
+    {
+        let e = svc.engine().read();
+        let m = e.meta().get_object("arc4", "g2").unwrap().unwrap();
+        assert_eq!(m.storage_class.as_deref(), Some("GLACIER"));
+        assert_eq!(m.restore_state, None, "复制目标不继承恢复状态");
+        let src = e.meta().get_object("arc4", "g1").unwrap().unwrap();
+        assert_eq!(m.extents, src.extents, "同存储类复制 = 段共享");
+    }
+    // 复制目标未恢复 → 读门 403
+    let r = svc.handle(&req("GET", "/arc4/g2", vec![]));
+    assert_eq!(err_code(&r), "InvalidObjectState");
+    // ② 跨类复制未恢复源(显式 STANDARD 目标)→ 403
+    let r = svc.handle(&req_h(
+        "PUT",
+        "/arc4/s1",
+        &[
+            ("x-amz-copy-source", "/arc4/g1"),
+            ("x-amz-storage-class", "STANDARD"),
+        ],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "InvalidObjectState", "跨类未恢复源拒绝");
+    // ③ 恢复源后跨类复制放行(目标 STANDARD 可读)
+    svc.handle(&req_q(
+        "POST",
+        "/arc4/g1",
+        &[("restore", "")],
+        br#"<RestoreRequest><Days>3</Days></RestoreRequest>"#.to_vec(),
+    ))
+    .unwrap();
+    let now = {
+        let e = svc.engine().write();
+        e.lock_now()
+    };
+    {
+        let mut e = svc.engine().write();
+        let (done, _) = e.restore_worker_tick(now + 1, 8).unwrap();
+        assert_eq!(done, 1);
+    }
+    let r = svc.handle(&req_h(
+        "PUT",
+        "/arc4/s1",
+        &[
+            ("x-amz-copy-source", "/arc4/g1"),
+            ("x-amz-storage-class", "STANDARD"),
+        ],
+        vec![],
+    ));
+    assert_eq!(status(&r), 200, "恢复后跨类复制放行 {:?}", r);
+    let g = svc.handle(&req("GET", "/arc4/s1", vec![])).unwrap();
+    assert_eq!(g.status, 200);
+    match &g.body {
+        ResponseBody::Bytes(b) => assert_eq!(b, &data),
+        ResponseBody::ObjectStream { .. } => assert_stream_eq(&svc, &g, &data, "恢复后复制"),
+        _ => panic!("unexpected body"),
+    }
+    // ④ UploadPartCopy:同存储类会话(归档)未恢复源放行;STANDARD 会话
+    // 未恢复源 → 403
+    let up = svc.handle(&req_qh(
+        "POST",
+        "/arc4/mpg",
+        &[("uploads", "")],
+        &[("x-amz-storage-class", "GLACIER")],
+        vec![],
+    ));
+    let up_xml = std::str::from_utf8(&match up.unwrap().body {
+        ResponseBody::Bytes(b) => b,
+        _ => panic!("init must return bytes"),
+    })
+    .unwrap()
+    .to_string();
+    let uid = extract(&up_xml, "UploadId");
+    // 先删 g2(未恢复)再恢复 g1 已做;用 g2 验证同存储类豁免:
+    // 等等——g2 未恢复且会话 GLACIER = 同存储类 → 放行
+    let r = svc.handle(&req_qh(
+        "PUT",
+        "/arc4/mpg",
+        &[("partNumber", "1"), ("uploadId", &uid)],
+        &[("x-amz-copy-source", "/arc4/g2")],
+        vec![],
+    ));
+    assert_eq!(status(&r), 200, "同存储类 UploadPartCopy 豁免 {:?}", r);
+    svc.handle(&req_qh(
+        "DELETE",
+        "/arc4/mpg",
+        &[("uploadId", &uid)],
+        &[],
+        vec![],
+    ))
+    .unwrap();
+    // STANDARD 会话 + 未恢复归档源 → 403
+    let up2 = svc.handle(&req_qh(
+        "POST",
+        "/arc4/mps",
+        &[("uploads", "")],
+        &[],
+        vec![],
+    ));
+    let up2_xml = std::str::from_utf8(&match up2.unwrap().body {
+        ResponseBody::Bytes(b) => b,
+        _ => panic!("init must return bytes"),
+    })
+    .unwrap()
+    .to_string();
+    let uid2 = extract(&up2_xml, "UploadId");
+    let r = svc.handle(&req_qh(
+        "PUT",
+        "/arc4/mps",
+        &[("partNumber", "1"), ("uploadId", &uid2)],
+        &[("x-amz-copy-source", "/arc4/g2")],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "InvalidObjectState", "STANDARD 会话跨类拒绝");
+    svc.handle(&req_qh(
+        "DELETE",
+        "/arc4/mps",
+        &[("uploadId", &uid2)],
+        &[],
+        vec![],
+    ))
+    .unwrap();
+    // ⑤ 版本删除(未版本化桶物理删除)释放恢复副本段 → 账目零漂移
+    svc.handle(&req("DELETE", "/arc4/g1", vec![])).unwrap();
+    {
+        let e = svc.engine().read();
+        assert!(
+            e.check_report().unwrap().leaks.is_empty(),
+            "删除后零泄漏(主段 + 恢复副本段)"
+        );
+    }
 }
 
 /// H1-1:KeyTooLongError 触发路径——键 UTF-8 字节长 >1024 → 400

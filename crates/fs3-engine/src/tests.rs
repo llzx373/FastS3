@@ -7593,8 +7593,33 @@ fn class_stats_accounting_five_paths() -> Result<()> {
     assert_eq!(v3[0], fs3_core::BUCKET_META_VERSION, "写入恒 v3");
     // (v2 存量双读补空表在 fs3-core bucket_meta_value_version_roundtrip 覆盖)
 
-    // ⑧ 显式标准复制(请求头 STANDARD):真实类 None,分账入 STANDARD
+    // ⑧ 显式标准复制(请求头 STANDARD):源未恢复跨类 → A2-4 读门 403
     put(&mut e, "g3", b"zz".to_vec(), Some("GLACIER"))?;
+    let r = e.copy_object_with_lock_ev(
+        "b1",
+        "g3",
+        None,
+        "b1",
+        "cp2",
+        None,
+        None,
+        None,
+        None,
+        fs3_core::VersioningState::Off,
+        None,
+        None,
+        ObjectLockWrite::default(),
+        None,
+        Some("STANDARD".into()),
+        fs3_core::promote_storage_class(Some("STANDARD")),
+    );
+    assert!(
+        matches!(r, Err(Error::InvalidObjectState(_))),
+        "未恢复归档源跨类复制必须拒绝"
+    );
+    // 恢复后再复制 → 放行,目标真实类 None,分账入 STANDARD
+    e.restore_enqueue("b1", "g3", None, 1, "Standard")?;
+    e.restore_worker_tick(e.lock_now() + 1, 8)?;
     e.copy_object_with_lock_ev(
         "b1",
         "g3",
