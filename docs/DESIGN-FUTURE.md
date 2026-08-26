@@ -760,11 +760,11 @@ admin 通道已完备:unix/TCP + Bearer、keys/buckets/config(GET-PATCH,热字�
 
 ### 7.5 v2.0 门禁
 
-- [ ] 纳管演练:3 节点(2 边缘 + 1 云)注册 → 指标/审计聚合可见 → 中心下发策略 → 节点离线重连对账一致 → **拔掉中心,单机功能完整**(红线实测)
-- [ ] agent 关闭状态下 v2.0 二进制与 v1.x 行为/性能零差异
-- [ ] mTLS 通道安全自审(与 GA 自审同标准)
-- [ ] HTTP/3(开关开启)基准 + 0-RTT 重放防护测试(PUT 无 0-RTT)
-- [ ] 缓存开/关对照、命中率可观测
+- [x] 纳管演练:3 节点(2 边缘 + 1 云)注册 → 指标/审计聚合可见 → 中心下发策略 → 节点离线重连对账一致 → **拔掉中心,单机功能完整**(红线实测)(2026-08-26,tests/center/m14_managed_drill.sh)
+- [x] agent 关闭状态下 v2.0 二进制与 v1.x 行为/性能零差异(对照 v1.4.0 基线 +0.6%,tests/bench/m14-zerodiff-compare.sh)
+- [x] mTLS 通道安全自审(与 GA 自审同标准;docs/ga/m14-v2-security-audit.md)
+- [x] HTTP/3(开关开启)基准 + 0-RTT 重放防护测试(PUT 无 0-RTT;fs3-http h3_roundtrip + gate_decision 单测;测试见 docs/perf-M14.md)
+- [x] 缓存开/关对照、命中率可观测(1.28×,99.8%,admin fasts3_cache_* 指标)
 
 ---
 

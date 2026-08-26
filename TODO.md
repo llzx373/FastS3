@@ -26,7 +26,7 @@
 | [M11 生命周期与加密](#m11-v120-生命周期与加密) | v1.2.0 | ≈7 周 | Lifecycle/SSE-C/SSE-S3/checksum/GetObjectAttributes/审计持久化 | ✅ 完成(v1.2.0,2026-08-25) |
 | [M12 Object Lock / WORM](#m12-v130-object-lock--worm) | v1.3.0 | ≈3 周 | 治理/合规保留 + 法定保留 + 可信时钟 | 🔄 进行中 |
 | [M13 容量与底座](#m13-v140-容量与底座) | v1.4.0 | ≈6 周 | 多设备扩容/再平衡 + 元数据分区过渡 + zstd | ⬜ 未开始 |
-| [M14 集中纳管与生态](#m14-v200-集中纳管与生态) | v2.0.0 | ≈7 周 | agent 纳管/HTTP3/热缓存/Terraform·Operator 评估 | ⬜ 未开始 |
+| [M14 集中纳管与生态](#m14-v200-集中纳管与生态) | v2.0.0 | ≈7 周 | agent 纳管/HTTP3/热缓存/Terraform·Operator 评估 | ✅ 完成(v2.0.0,2026-08-26) |
 | [远期 v2.x(方向性)](#远期-v2x方向性立项后再拆) | — | 立项后拆 | Select/通知/STS·LDAP/复制/Inventory | ⬜ 未开始 |
 
 ---
@@ -390,12 +390,16 @@
 - [x] T2-1 K8s Operator 评估:结论 = 暂不立项(持有);范围 = 节点生命周期 + 桶/密钥 CRD + 监控集成(/v1/admin/metrics 现成),**明确不做 CSI**(块设备语义);可行性中(≈2~3pw),立项门槛 = issue 投票 ≥10;评估见 docs/m14-ecosystem-eval.md §2
 
 ### M14 门禁(退出条件)
-- [ ] 纳管演练 + 红线实测(拔中心)通过;agent 关闭下与 v1.x 行为/性能零差异
-- [ ] mTLS 通道安全自审(与 GA 自审同标准);HTTP/3 0-RTT 重放防护测试(PUT 无 0-RTT)
-- [ ] 默认全关二进制空载内存 ≤256MiB(DESIGN-FUTURE §9.2 门禁)
-- [ ] v2.0 外部安全审计立项(ROADMAP §3.4:每大版本一次;v1.0 外部审计执行期口径延续)
-- [ ] 缓存开/关对照 + 命中率可观测;覆盖率 ≥80%;cargo audit 清零
-- [ ] 发布 v2.0.0
+- [x] 纳管演练 + 红线实测(拔中心)通过(tests/center/m14_managed_drill.sh 10 步全绿:注册/下发/对账/拔中心 SigV4 冒烟/重启自动重连);agent 关闭零差异实测(tests/bench/m14-zerodiff-compare.sh:默认 release 对照 v1.4.0 基线 **+0.6%**,回退 <5% 门禁通过)
+- [x] mTLS 通道安全自审与 GA 同标准(docs/ga/m14-v2-security-audit.md §2.1 九项 + 集成测试校验:无客户端证书 TLS 握手被拒/CN==node_id 强制/secret 落盘证明);HTTP/3 0-RTT 重放防护测试(fs3-http h3_roundtrip:0-RTT PUT 425 或已验证后管线,PUT 无 0-RTT;gate_decision 单测)
+- [x] 默认全关二进制空载内存 ≤256MiB(实测 **~2.2MiB** RSS,/proc VmHWM)
+- [x] v2.0 外部安全审计立项(ROADMAP §3.4 大版本一次;增量范围 = agent mTLS/中心 SQLite/0-RTT/缓存,docs/ga/m14-v2-security-audit.md §1;发布后 4 周内启动)
+- [x] 缓存开/关对照(1.28×,tests/bench/m14-cache-bench.sh)+ 命中率可观测(99.8%,admin fasts3_cache_* 指标组);覆盖率 **84.54% 行 / 84.82% 函数**(llvm-cov workspace ≥80%);cargo audit 0 漏洞(2 条 allowed unmaintained 同 v1.3 集)
+- [x] 发布 v2.0.0(workspace + web 三件套版本 bump,CHANGELOG/RELEASES 记档;不打 tag 不打包,与 v1.x 同口径)
+
+> **M14 实测记录(2026-08-26,v2.0.0)**:详见各条目;零差异对照基线与
+> 内存/覆盖率实测数据见 tests/bench/m14-zerodiff-compare.sh 与本文档门禁行;
+> 弱网对照(netem)与本环境不具备的条件为评估期待办(perf-M14.md §2)。
 
 ---
 

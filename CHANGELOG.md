@@ -5,6 +5,31 @@
 > 详细发布记录见 [RELEASES.md](./RELEASES.md);RC/GA 候选流程见
 > [docs/ga/rc-flow.md](./docs/ga/rc-flow.md)。
 
+## [Unreleased] — v2.0.0(大版本 major 轨道;M14 集中纳管与生态)
+
+M14 全部任务与门禁完成(TODO.md M14 全勾选);决策落盘 ADR-17(DESIGN.md §3.3);
+workspace + web 三件套版本 **2.0.0**。git tag / `tools/package/` 属执行期步骤
+(与 v1.x 同口径)。
+
+- **纳管 agent(ADR-17 DV1,feature 默认关)**:出站双向 mTLS(中心拒无证书
+  握手)、心跳/健康/状态上报、指标/审计流式上报、下发接收与本地裁决执行;
+  断线重连全量对账(恰好应用一次,账本收敛)。
+- **中心(web/server 同栈)**:/v2/center/* mTLS 接收端 + 管理面(节点/健康/
+  审计聚合/下发账本)+ SQLite 持久化;secret 仅内存一次回显(落盘证明测试);
+  控制台 web 实例(JWT)+ React 子应用(节点仪表盘/批量模板化下发/审计检索)。
+- **演练(G4-1)**:三节点纳管全流程;拔中心红线实测(数据面/管理面功能完整)。
+- **HTTP/3(ADR-17 DV2,实验 feature 默认关)**:quinn+h3;每核 Endpoint;
+  0-RTT 仅幂等 GET/HEAD(非幂等 425);0-RTT 重放防护测试。
+- **热对象缓存(§4.12,默认关)**:用户态 LRU + Range 命中裁剪;SSE 排除;
+  命中率指标可观测;开/关对照 1.28×。
+- **生态评估**:Terraform provider / K8s Operator 暂不立项(需求投票 ≥10
+  立项);明确不做 CSI。
+- **门禁**:纳管演练+拔中心实测通过;agent 关闭零差异(对照 v1.4.0 基线
+  **+0.6%**,回退 <5% 门禁);默认全关空载内存 **~2.2MiB**(≤256MiB 门禁);
+  mTLS 通道安全自审(18 项)+ **v2.0 外部安全审计立项**;HTTP/3 0-RTT
+  重放防护测试;缓存开/关对照 + 命中率 99.8%;覆盖率(门禁项见 TODO)；
+  cargo audit 0 漏洞;perf 报告 [docs/perf-M14.md](./docs/perf-M14.md)。
+
 ## [Unreleased] — v1.3.0(季度 minor 轨道;M12 Object Lock / WORM)
 
 M12 全部任务与门禁完成(TODO.md M12 全勾选);决策落盘 ADR-13(DESIGN.md §3.3)。

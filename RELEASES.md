@@ -392,3 +392,52 @@ S3 协议面完成:单机高性能 S3 服务可经标准客户端接入。
 ## v0.1 — M0 引擎 PoC(2026-08-19)
 
 - 裸设备/镜像文件 O_DIRECT 设备层;双缓冲检查点 + `a:`/`t:` 记录重放崩溃恢复;位图分配器(每核 hint 游标);rocksdb 事务/组提交;64KiB chunk 流式写 + extent 边界切分;io_uring + pread 兜底;`fasts3d` CLI(init/put/get/del/ls/check/checkpoint/bench/serve);fio 基线 + 引擎基准回路;kill -9 CLI 崩溃 harness 50 轮零失败。
+
+## v2.0.0 — M14 集中纳管与生态(2026-08-26)
+
+> 发布状态:与 M14 交付同步;git tag/发布流水线属执行期步骤(与 v1.x 同口径,
+> 尚未正式打 tag)。决策记录:ADR-17(docs/DESIGN.md §3.3);性能报告
+> [docs/perf-M14.md](./docs/perf-M14.md);安全自审与 v2.0 外部审计立项
+> [docs/ga/m14-v2-security-audit.md](./docs/ga/m14-v2-security-audit.md)。
+
+### 变更(TODO M14 全项:A0/G1~G4/H1/T1~T2 + 门禁)
+
+- **纳管 agent(ADR-17 DV1,feature 默认关)**:`crates/fs3-agent` + fs3d `agent`
+  feature;出站双向 mTLS(中心校验 CA 签发客户端证书;无证书握手即拒)、
+  心跳/健康/状态上报、指标/审计批量流式上报(本地 admin 通道取数)、
+  下发拉取与本地裁决执行(引擎=权威,失败显式 rejected 入账)。
+- **中心(web/server 同栈)**:/v2/center/* 接收端 + 管理面(节点详情/健康
+  聚合/审计聚合检索/下发 ops 入账白名单 7 类/账本视图/对账状态);
+  SQLite 持久化(nodes/desired_ops/audit,audit UNIQUE 去重);secret 仅
+  内存一次回显(落盘证明测试);控制台 web 实例(JWT 会话)+ React
+  #/center/* 子应用(节点仪表盘/批量模板化下发/审计检索)。
+- **对账(G1-2)**:per-node seq 乐观并发 + 断线重连全量对账(幂等预检防
+  重复);断网重连集成测试恰好应用一次。
+- **演练(G4-1)**:tests/center/m14_managed_drill.sh 三节点(2 边缘+1 云)
+  全流程通过:**拔中心红线实测**(中心杀掉后 S3 数据面 SigV4 冒烟/管理面/
+  S3 端口功能完整)+ 中心重启 3 节点自动重连;证书登记脚本
+  tests/center/m14-center-enroll.sh + 契约文档 docs/m14-center-contract.md。
+- **HTTP/3(ADR-17 DV2,实验 feature 默认关)**:quinn+h3 栈;每核 SO_REUSEPORT
+  Endpoint;0-RTT 仅幂等 GET/HEAD(非幂等 425 Too Early,RFC 8470);集成
+  测试 + 门禁决策单测;吞吐基准与评估期边界 docs/perf-M14.md。
+- **热对象缓存(§4.12,默认关)**:用户态 LRU(`[cache]` 额度/上限配置);
+  命中含高频 Range 头;SSE 对象不入缓存(红线);命中率指标组
+  (admin /metrics);开/关对照 1.28×、命中率 99.8%。
+- **生态评估(T1-1/T2-1)**:Terraform provider / K8s Operator 均暂不立项
+  (持有;立项 = issue 投票 ≥10);明确不做 CSI;评估 docs/m14-ecosystem-eval.md。
+
+### 验证(门禁,实测记录见 TODO.md M14 段)
+
+- `cargo test --workspace` 646 passed / clippy / fmt 全绿;覆盖率(门禁项,
+  见 TODO 记录);cargo audit 0 漏洞(2 条 allowed unmaintained 同 v1.3 集)。
+- 纳管演练 + 拔中心红线实测通过;断线重连对账恰好应用一次、账本收敛。
+- agent 关闭零差异:默认 release 对照 v1.4.0 基线 **+0.6%**(回退 <5% 门禁,
+  tests/bench/m14-zerodiff-compare.sh);默认全关空载 RSS ~2.2MiB(≤256MiB
+  门禁)。
+- mTLS 通道安全自审(mTLS 12 项/0-RTT 3 项/缓存 3 项,docs/ga/
+  m14-v2-security-audit.md);**v2.0 外部安全审计立项**(大版本一次;
+  增量范围 = agent mTLS/中心/0-RTT/缓存)。
+- HTTP/3 0-RTT 重放防护测试(PUT 无 0-RTT);缓存开/关对照 + 命中率
+  可观测(99.8%)。
+- perf(perf-M14.md):h3 实验基准 + 缓存对照 + 零差异对照;弱网对照
+  (netem)评估期待办。

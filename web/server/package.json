@@ -1,7 +1,7 @@
 {
   "name": "@fasts3/web-server",
   "private": true,
-  "version": "1.4.0",
+  "version": "2.0.0",
   "description": "FastS3 管理 API(Fastify + TS):JWT 登录、admin 通道代理、dashboard 聚合、presign、multipart 编排",
   "type": "module",
   "main": "dist/index.js",
