@@ -50,6 +50,13 @@ pub struct AuditEntry {
     pub retention_mode_before: Option<String>,
     #[serde(default)]
     pub retention_mode_after: Option<String>,
+    /// M15 C2(密钥状态语义):认证失败侧写 —— `key_disabled`(密钥存在
+    /// 但禁用)/ `key_not_found`(不存在)/ `session_token_invalid`(会话
+    /// token 缺失/过期/吊销);None = 非认证失败或无需侧写。协议错误码
+    /// 维持 AWS 同义,本字段仅供 admin/审计面区分。尾部追加,旧审计
+    /// 序列化回放按 None。
+    #[serde(default)]
+    pub auth_note: Option<String>,
 }
 
 /// 审计持久化后端(M11 L3-1;ADR-12 DL5)。实现 = fs3-meta `s:audit` 环形
@@ -363,6 +370,7 @@ mod tests {
             retain_until_after: None,
             retention_mode_before: Some("GOVERNANCE".into()),
             retention_mode_after: None,
+            auth_note: None,
         });
         let f = AuditFilter {
             bypass: Some(true),

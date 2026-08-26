@@ -4128,6 +4128,7 @@ impl Engine {
         part_no: u32,
         src_bucket: &str,
         src_key: &str,
+        src_version: Option<&[u8; 16]>,
         range: std::ops::Range<u64>,
         src_sse_key: Option<&fs3_core::SseCKey>,
         dst_sse_key: Option<&fs3_core::SseCKey>,
@@ -4147,10 +4148,15 @@ impl Engine {
                 "upload part SSE-C headers must not be present on an SSE-S3 multipart upload session".into(),
             ));
         }
-        let src = self
-            .meta
-            .get_object(src_bucket, src_key)?
-            .ok_or_else(|| Error::NotFound(format!("object {src_bucket}/{src_key}")))?;
+        // M15 C2:源版本寻址(ADR-11 §3.4.5 对齐 CopyObject)——None = 当前
+        // 版本(D1a 裁决);Some = 精确版本/null 槽;删除标记无数据面,作为
+        // 复制源显式拒绝(NoSuchKey 由协议层映射)
+        let src = self.resolve_object_entry(src_bucket, src_key, src_version, None)?;
+        if src.is_delete_marker {
+            return Err(Error::NotFound(format!(
+                "object {src_bucket}/{src_key} is a delete marker"
+            )));
+        }
         // DE3/DS3:源加密 + 目标(会话)未加密 → 显式拒绝(防静默解密落盘)
         let dst_encrypted = dst_sse_key.is_some() || session.sse_s3.is_some();
         if src.sse.is_some() && !dst_encrypted {

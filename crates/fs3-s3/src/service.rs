@@ -138,6 +138,9 @@ pub struct S3Service {
     last_peer: std::sync::Mutex<String>,
     /// M12 W3-2:本请求 Object Lock 审计细节(handle 收割进 AuditEntry)。
     last_lock_audit: std::sync::Mutex<Option<LockAuditNote>>,
+    /// M15 C2(密钥状态语义):最近一次认证失败侧写(禁用/不存在/会话失效),
+    /// audit_record 收割落 AuditEntry.auth_note;None = 无侧写。
+    last_auth_note: std::sync::Mutex<Option<String>>,
     /// 每密钥限速(H4;rps=0 关闭)。热重载可动态调整。
     limiter: Arc<crate::ratelimit::KeyLimiter>,
     /// 上次请求时的墙钟秒(M4 D4 时钟回拨检测;0 = 未初始化)。
@@ -213,6 +216,7 @@ impl S3Service {
             audit,
             last_peer: std::sync::Mutex::new(String::new()),
             last_lock_audit: std::sync::Mutex::new(None),
+            last_auth_note: std::sync::Mutex::new(None),
             limiter: Arc::new(crate::ratelimit::KeyLimiter::new()),
             cache: None,
             policies: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -284,6 +288,13 @@ impl S3Service {
     fn audit_record(&self, access: Option<&str>, op: &str, bucket: &str, key: &str, status: u16) {
         let peer = self.last_peer.lock().unwrap().clone();
         let lock = self.last_lock_audit.lock().unwrap().take();
+        // M15 C2:认证失败侧写仅附着在 403 记录上(禁用/不存在/会话失效;
+        // 成功路径/其它错误码不消费,防侧写串台)
+        let auth_note = if status == 403 {
+            self.last_auth_note.lock().unwrap().take()
+        } else {
+            None
+        };
         let mut entry = fs3_core::audit::AuditEntry {
             ts: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -304,7 +315,58 @@ impl S3Service {
             entry.retention_mode_before = n.retention_mode_before;
             entry.retention_mode_after = n.retention_mode_after;
         }
+        entry.auth_note = auth_note;
         self.audit.push_entry(entry);
+    }
+
+    /// M15 C2(密钥状态语义,S3-GAP §3.7 #7):认证失败时区分
+    /// 「密钥存在但禁用」/「密钥不存在」/「会话 token 失效」——协议错误码
+    /// 维持 AWS 同义(禁用与不存在同为 InvalidAccessKeyId;token 失效
+    /// InvalidToken),本侧写仅落 admin/审计面。仅在认证失败时由
+    /// handle/put_object_stream 设置(成功路径不设置)。
+    fn auth_failure_note(&self, req: &S3Request) -> Option<String> {
+        // 会话路径:token 在场但认证失败 = 缺失/过期/吊销
+        if header(req, "x-amz-security-token").is_some() {
+            return Some("session_token_invalid".into());
+        }
+        let ak = self.auth.peek_access_key(&req.headers)?;
+        let rec = self
+            .engine
+            .read()
+            .meta()
+            .list_keys()
+            .ok()?
+            .into_iter()
+            .find(|k| k.access_key == ak);
+        match rec {
+            Some(r) if !r.enabled => Some("key_disabled".into()),
+            Some(_) => None, // 启用密钥:签名/时间等普通失败,不侧写
+            None => Some("key_not_found".into()),
+        }
+    }
+
+    /// M15 C2(协议补完):x-amz-expected-bucket-owner —— 单账号模型语义:
+    /// 头值 = 桶属主(BucketMeta.owner)→ 放行;≠ → 403 AccessDenied(显式,
+    /// 不静默);无桶(服务级 op)或未带头 → 放行。桶不存在由下游 op 按
+    /// 既有 NoSuchBucket 语义裁决,不在此预判。
+    fn check_expected_bucket_owner(&self, req: &S3Request, bucket: &str) -> Result<(), S3Error> {
+        let Some(expected) = header(req, "x-amz-expected-bucket-owner") else {
+            return Ok(());
+        };
+        let owner = self
+            .engine
+            .read()
+            .meta()
+            .get_bucket(bucket)
+            .ok()
+            .flatten()
+            .map(|b| b.owner)
+            .unwrap_or_else(|| self.owner.clone());
+        if expected != owner {
+            return Err(S3Error::new(S3ErrorCode::AccessDenied)
+                .with_message("The request signature does not match the expected bucket owner."));
+        }
+        Ok(())
     }
 
     /// 成功路径记下 Object Lock 审计(handle 的 audit_record 收割)。
@@ -881,6 +943,12 @@ impl S3Service {
         // 会话策略;内部 handle_inner 仍会认证——M5 性能冲刺时合并)
         let auth = self.authenticate_full(req).ok().flatten();
         let access: Option<&str> = auth.as_ref().map(|a| a.who.as_str());
+        // M15 C2:认证失败侧写(禁用 vs 不存在 vs 会话失效;成功不设置)
+        *self.last_auth_note.lock().unwrap() = if auth.is_none() {
+            self.auth_failure_note(req)
+        } else {
+            None
+        };
         let (op, name, bucket, key) = route_op_bucket_key(req);
         // H4 每密钥限速:超限 503 SlowDown + Retry-After(AWS 节流语义;
         // 会话请求按基密钥计)
@@ -1414,6 +1482,14 @@ impl S3Service {
                 };
             }
         }
+        // M15 C2(协议补完):x-amz-expected-bucket-owner 门控(= 自身放行,
+        // ≠ 自身 403;桶级/对象级 op 通用,流式 PUT 在 put_object_stream 同判)
+        {
+            let (_op, _name, bucket, _key) = route_op_bucket_key(req);
+            if !bucket.is_empty() {
+                self.check_expected_bucket_owner(req, &bucket)?;
+            }
+        }
         // M10 S4:PostObject 自带认证(表单签名/header 认证/匿名桶策略判定
         // 在 op_post_object 内),跳过前置 require_auth——表单签名在请求体中,
         // 此处的 header/query 认证必然判匿名而误拒。
@@ -1818,7 +1894,17 @@ impl S3Service {
         // M15 T2 会话感知认证(带 x-amz-security-token → 会话路径)
         let auth = self.authenticate_full(req).ok().flatten();
         let access: Option<&str> = auth.as_ref().map(|a| a.who.as_str());
+        // M15 C2:认证失败侧写(禁用 vs 不存在 vs 会话失效;成功不设置)
+        *self.last_auth_note.lock().unwrap() = if auth.is_none() {
+            self.auth_failure_note(req)
+        } else {
+            None
+        };
         let (op, name, bucket, key) = route_op_bucket_key(req);
+        // M15 C2:流式 PUT 同受 x-amz-expected-bucket-owner 门控
+        if !bucket.is_empty() {
+            self.check_expected_bucket_owner(req, &bucket)?;
+        }
         // H4 每密钥限速:流式路径(>8MiB PUT / aws-chunked / 大分片)与缓冲路径
         // 同语义——大数据上传恰是流量最大的路径,不能绕过令牌桶(REVIEW §2.5)。
         if let Some(ak) = &access {
@@ -5027,12 +5113,25 @@ impl S3Service {
         copy_source: &xml::CopySource,
         copy_source_range: Option<&str>,
     ) -> Result<ServiceResponse, S3Error> {
-        // 源版本寻址(ADR-11 §3.4.5)目前仅 CopyObject 落地;UploadPartCopy
-        // 携带 versionId → 显式拒绝(不静默忽略,红线)
-        if copy_source.version_id.is_some() {
-            return Err(S3Error::new(S3ErrorCode::NotImplemented)
-                .with_message("UploadPartCopy with a source versionId is not implemented"));
-        }
+        // M15 C2:源版本寻址(ADR-11 §3.4.5 对齐 CopyObject)——copy-source
+        // ?versionId= 解析("null" → null 族;32 hex → 精确版本;非法 → 400)
+        let src_varg = match copy_source.version_id.as_deref() {
+            Some("null") => Some(VersionIdArg::Null),
+            Some(s) if s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                let mut vk = [0u8; 16];
+                hex::decode_to_slice(s, &mut vk).map_err(|_| {
+                    S3Error::new(S3ErrorCode::InvalidArgument)
+                        .with_message("Invalid version id specified")
+                })?;
+                Some(VersionIdArg::Vk(vk))
+            }
+            Some(_) => {
+                return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                    .with_message("Invalid version id specified"))
+            }
+            None => None,
+        };
+        let src_vk = src_varg.map(|v| v.vk());
         // M10 S1:x-amz-tagging 仅 Create 时携带(AWS);显式拒绝不静默
         if header(req, "x-amz-tagging").is_some() {
             return Err(S3Error::new(S3ErrorCode::InvalidArgument)
@@ -5060,14 +5159,21 @@ impl S3Service {
             return Err(S3Error::new(S3ErrorCode::NoSuchBucket)
                 .with_extra("BucketName", &copy_source.bucket));
         }
-        // 源大小(范围校验用;当前版本 D1a 裁决——删除标记当前 → NoSuchKey)
-        let src_meta = match engine.head_version(&copy_source.bucket, &copy_source.key, None) {
-            Ok(m) => m,
-            Err(CoreError::DeleteMarker(_)) | Err(CoreError::NotFound(_)) => {
-                return Err(S3Error::new(S3ErrorCode::NoSuchKey).with_extra("Key", &copy_source.key))
-            }
-            Err(e) => return Err(map_engine_error(e, &copy_source.bucket, &copy_source.key)),
-        };
+        // 源大小(范围校验用;所寻址版本——None = 当前版本 D1a 裁决;
+        // 删除标记作为分片复制源无数据面 → NoSuchKey)
+        let src_meta =
+            match engine.head_version(&copy_source.bucket, &copy_source.key, src_vk.as_ref()) {
+                Ok(m) => m,
+                Err(CoreError::DeleteMarker(_)) | Err(CoreError::NotFound(_)) => {
+                    return Err(match &src_varg {
+                        Some(v) => no_such_version_error(&copy_source.key, v),
+                        None => {
+                            S3Error::new(S3ErrorCode::NoSuchKey).with_extra("Key", &copy_source.key)
+                        }
+                    })
+                }
+                Err(e) => return Err(map_engine_error(e, &copy_source.bucket, &copy_source.key)),
+            };
         // M11 E1-5:目标侧 = 会话语义(UploadPartCopy 的分片归属会话;
         // key-MD5 与 Create 绑定值逐值比对);会话不存在时跳过,由引擎报
         // NoSuchUpload
@@ -5123,6 +5229,7 @@ impl S3Service {
                 part_number,
                 &copy_source.bucket,
                 &copy_source.key,
+                src_vk.as_ref(),
                 range,
                 cs_ssec.as_ref().map(|s| &s.key),
                 dst_ssec.as_ref().map(|s| &s.key),
@@ -5133,6 +5240,10 @@ impl S3Service {
             ("Content-Type".into(), "application/xml".into()),
             ("Content-Length".into(), xml.len().to_string()),
         ];
+        // M15 C2:源带版本寻址时回显 x-amz-copy-source-version-id(AWS 口径)
+        if let Some(v) = &src_varg {
+            headers.push(("x-amz-copy-source-version-id".into(), v.display()));
+        }
         // M11 E1-5:目标加密时回显 algorithm + key-MD5(AWS 口径)
         if let Some(s) = &dst_ssec {
             headers.extend(crate::sse::response_headers(s));

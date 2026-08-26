@@ -1326,6 +1326,95 @@ fn etag_of(r: &ServiceResponse) -> String {
         .unwrap_or_default()
 }
 
+/// 读响应体为字节(流式对象经引擎直读)。
+fn read_body_bytes(svc: &S3Service, r: &ServiceResponse) -> Vec<u8> {
+    match &r.body {
+        ResponseBody::Bytes(b) => b.clone(),
+        ResponseBody::ObjectStream {
+            bucket,
+            key,
+            version,
+            offset,
+            length,
+            versioning,
+            sse_key,
+            ..
+        } => {
+            let mut buf = vec![0u8; *length as usize];
+            svc.engine()
+                .read()
+                .read_at_version_for(
+                    bucket,
+                    key,
+                    version.as_ref(),
+                    *offset,
+                    &mut buf,
+                    *versioning,
+                    sse_key.as_ref(),
+                )
+                .unwrap();
+            buf
+        }
+        _ => panic!("unexpected body type"),
+    }
+}
+
+/// 建桶 + 写对象,返回响应。
+fn put_obj(svc: &S3Service, bucket: &str, key: &str, body: &[u8]) -> ServiceResponse {
+    svc.handle(&req("PUT", &format!("/{bucket}/{key}"), body.to_vec()))
+        .unwrap()
+}
+
+/// 取响应 x-amz-version-id 头(版本化写回显)。
+fn version_id_of(_svc: &S3Service, r: ServiceResponse) -> String {
+    r.headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-amz-version-id"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default()
+}
+
+/// POST ?uploads → UploadId。
+fn upload_id_of(svc: &S3Service, r: &Result<ServiceResponse, fs3_s3::S3Error>) -> String {
+    let resp = r.as_ref().unwrap();
+    extract(&body_str(resp), "UploadId")
+}
+
+/// 指定 access key 的已签名请求(密钥不存在的场景用;secret 任意)。
+fn req_bad_key(access_key: &str) -> S3Request {
+    let amz_date = auth::now_amz();
+    let hash = hex::encode(Sha256::digest(b""));
+    let headers: Vec<(String, String)> = vec![
+        ("host".into(), "localhost:9000".into()),
+        ("x-amz-date".into(), amz_date.clone()),
+        ("x-amz-content-sha256".into(), hash.clone()),
+    ];
+    let cred = Credentials {
+        access_key: access_key.into(),
+        secret_key: "whatever".into(),
+    };
+    let auth_hdr = auth::sign_request(
+        &cred,
+        "us-east-1",
+        "GET",
+        "/authn",
+        &[],
+        &headers,
+        &amz_date,
+        &PayloadHash::HexSha256(hash),
+    )
+    .unwrap();
+    S3Request {
+        method: "GET".into(),
+        raw_path: "/authn".into(),
+        decoded_path: "/authn".into(),
+        host: "localhost:9000".into(),
+        query: vec![],
+        headers: [headers, vec![("authorization".into(), auth_hdr)]].concat(),
+        body: vec![],
+    }
+}
+
 fn extract(xml: &str, tag: &str) -> String {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
@@ -10487,4 +10576,179 @@ fn bucket_inventory_config_flow() {
         let r = svc.handle(&inv_req(m, "/ghost", Some("g"), &[], body));
         assert_eq!(err_code(&r), "NoSuchBucket", "{m}");
     }
+}
+
+/// M15 C2(协议补完):UploadPartCopy 源 `?versionId` 寻址——版本化桶
+/// 多版本源,逐版本 UploadPartCopy(range 直灌)→ Complete 后内容与
+/// 所寻址版本一致;未带 versionId = 当前版本;版本不存在 → NoSuchVersion;
+/// 响应回显 x-amz-copy-source-version-id。
+#[test]
+fn c2_upload_part_copy_versioned_source() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/upcv", vec![]))), 200);
+    assert_eq!(status(&svc.handle(&req("PUT", "/upcv-dst", vec![]))), 200);
+    put_versioning(&svc, "upcv", "Enabled").unwrap();
+    // 写 3 个版本(内容不同)
+    let sz = 15 * 1024 * 1024;
+    let v1 = version_id_of(
+        &svc,
+        put_obj(&svc, "upcv", "src", b"A".repeat(sz).as_slice()),
+    );
+    let v2 = version_id_of(
+        &svc,
+        put_obj(&svc, "upcv", "src", b"B".repeat(sz).as_slice()),
+    );
+    let v3 = version_id_of(
+        &svc,
+        put_obj(&svc, "upcv", "src", b"C".repeat(sz).as_slice()),
+    );
+    assert!(!v1.is_empty() && !v2.is_empty() && !v3.is_empty());
+    // 逐版本 UploadPartCopy(5MiB 段 ×3 = 15MiB,与 s3-tests 同口径)
+    for (vid, marker) in [(&v1, b'A'), (&v2, b'B'), (&v3, b'C')] {
+        let uid = upload_id_of(
+            &svc,
+            &svc.handle(&req_q("POST", "/upcv-dst/out", &[("uploads", "")], vec![])),
+        );
+        let mut parts = Vec::new();
+        for (i, start) in (0..3).map(|i| i * 5 * 1024 * 1024).enumerate() {
+            let range = format!("bytes={}-{}", start, start + 5 * 1024 * 1024 - 1);
+            let r = svc.handle(&req_qh(
+                "PUT",
+                "/upcv-dst/out",
+                &[("partNumber", &(i + 1).to_string()), ("uploadId", &uid)],
+                &[
+                    ("x-amz-copy-source", &format!("/upcv/src?versionId={vid}")),
+                    ("x-amz-copy-source-range", &range),
+                ],
+                vec![],
+            ));
+            let resp = r.unwrap();
+            // 回显 x-amz-copy-source-version-id
+            let echoed = resp
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("x-amz-copy-source-version-id"))
+                .map(|(_, v)| v.clone());
+            assert_eq!(echoed.as_deref(), Some(vid.as_str()));
+            let xml = body_str(&resp);
+            let etag = extract(&xml, "ETag");
+            parts.push((i + 1, etag));
+        }
+        let cp = parts
+            .iter()
+            .map(|(n, e)| {
+                format!("<Part><PartNumber>{n}</PartNumber><ETag>&quot;{e}&quot;</ETag></Part>")
+            })
+            .collect::<String>();
+        let body = format!("<CompleteMultipartUpload>{cp}</CompleteMultipartUpload>");
+        svc.handle(&req_q(
+            "POST",
+            "/upcv-dst/out",
+            &[("uploadId", &uid)],
+            body.into_bytes(),
+        ))
+        .unwrap();
+        // 内容 = 所寻址版本
+        let got = svc.handle(&req("GET", "/upcv-dst/out", vec![])).unwrap();
+        let data = read_body_bytes(&svc, &got);
+        assert_eq!(data.len(), 15 * 1024 * 1024);
+        assert!(data.iter().all(|b| *b == marker), "版本 {vid} 内容一致");
+    }
+    // 版本不存在 → NoSuchVersion
+    let uid2 = upload_id_of(
+        &svc,
+        &svc.handle(&req_q("POST", "/upcv-dst/out2", &[("uploads", "")], vec![])),
+    );
+    let bad = "00000000000000000000000000000000";
+    let r = svc.handle(&req_qh(
+        "PUT",
+        "/upcv-dst/out2",
+        &[("partNumber", "1"), ("uploadId", &uid2)],
+        &[("x-amz-copy-source", &format!("/upcv/src?versionId={bad}"))],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "NoSuchVersion", "{r:?}");
+    // 非法 versionId → 400 InvalidArgument
+    let uid3 = upload_id_of(
+        &svc,
+        &svc.handle(&req_q("POST", "/upcv-dst/out3", &[("uploads", "")], vec![])),
+    );
+    let r = svc.handle(&req_qh(
+        "PUT",
+        "/upcv-dst/out3",
+        &[("partNumber", "1"), ("uploadId", &uid3)],
+        &[("x-amz-copy-source", "/upcv/src?versionId=not-hex!")],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "InvalidArgument", "{r:?}");
+}
+
+/// M15 C2(协议补完):x-amz-expected-bucket-owner —— 头值 = 桶属主
+/// ("fasts3")→ 放行;≠ 自身 → 403 AccessDenied(显式);无头放行。
+#[test]
+fn c2_expected_bucket_owner_semantics() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/ebo", vec![]))), 200);
+    svc.handle(&req("PUT", "/ebo/k", b"x".to_vec())).unwrap();
+    // = 自身 → 放行
+    let r = svc.handle(&req_h(
+        "GET",
+        "/ebo",
+        &[("x-amz-expected-bucket-owner", "fasts3")],
+        vec![],
+    ));
+    assert_eq!(status(&r), 200, "= 自身放行: {r:?}");
+    // ≠ 自身 → 403 AccessDenied(ListObjects / PutObject 同判)
+    for (m, path) in [("GET", "/ebo"), ("PUT", "/ebo/k2")] {
+        let r = if m == "GET" {
+            svc.handle(&req_h(
+                "GET",
+                path,
+                &[("x-amz-expected-bucket-owner", "someone-else")],
+                vec![],
+            ))
+        } else {
+            svc.handle(&req_h(
+                "PUT",
+                path,
+                &[("x-amz-expected-bucket-owner", "someone-else")],
+                b"y".to_vec(),
+            ))
+        };
+        let e = r.unwrap_err();
+        assert_eq!(e.status(), 403, "{m} {path}: {e:?}");
+        assert_eq!(e.code, fs3_s3::S3ErrorCode::AccessDenied, "{m}");
+    }
+    // 无头 → 放行
+    let r = svc.handle(&req("GET", "/ebo", vec![]));
+    assert_eq!(status(&r), 200);
+}
+
+/// M15 C2(密钥状态语义,S3-GAP §3.7 #7):认证失败审计侧写 —— 禁用密钥
+/// → key_disabled;不存在密钥 → key_not_found;协议错误码同 InvalidAccessKeyId。
+#[test]
+fn c2_auth_failure_audit_note_distinguishes_disabled() {
+    let (_d, svc) = setup();
+    // 建桶 + 未签名请求探路(审计 ring 直接可读)
+    assert_eq!(status(&svc.handle(&req("PUT", "/authn", vec![]))), 200);
+    // 1) 不存在密钥 → 403 InvalidAccessKeyId + 审计 key_not_found
+    let r = svc.handle(&req_h("GET", "/authn", &[], vec![]));
+    // req_h 用的是 "test" 密钥(存在),换手动伪造的 access key:
+    let bad = req_bad_key("ghost-key");
+    let r = svc.handle(&bad);
+    assert_eq!(err_code(&r), "InvalidAccessKeyId", "{r:?}");
+    let ring = svc.audit().search(&fs3_core::audit::AuditFilter::default());
+    let last = &ring[0];
+    assert_eq!(last.status, 403);
+    assert_eq!(last.auth_note.as_deref(), Some("key_not_found"), "{last:?}");
+    // 2) 禁用密钥 → 同协议码 + 审计 key_disabled
+    let rec = fs3_core::KeyRecord::new("disabled-key", "secret123", &[7u8; 32], None).unwrap();
+    let mut rec = rec;
+    rec.enabled = false;
+    svc.engine().write().meta().commit_key_put(&rec).unwrap();
+    let r = svc.handle(&req_bad_key("disabled-key"));
+    assert_eq!(err_code(&r), "InvalidAccessKeyId", "{r:?}");
+    let ring = svc.audit().search(&fs3_core::audit::AuditFilter::default());
+    let last = &ring[0];
+    assert_eq!(last.auth_note.as_deref(), Some("key_disabled"), "{last:?}");
 }

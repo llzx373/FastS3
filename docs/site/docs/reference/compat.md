@@ -80,6 +80,14 @@ meta-export/import 可见并可往返;实际类恒 STANDARD。归档真语义
 | 指标 | `fasts3_inventory_*`(cycles/generated_files/generated_bytes/failed_rounds/last_run_timestamp;告警 InventoryGenerationStalled 消费 last_run_timestamp) |
 | 目标桶 | 必须是已存在桶(生成失败记指标;配置阶段仅做字段校验) |
 
+## 协议补完(v2.1 M15/C2 起)
+
+| 项 | 说明 |
+| --- | --- |
+| UploadPartCopy 源 `?versionId` | 对齐 CopyObject(ADR-11 §3.4.5):`null` → null 族;32 hex → 精确版本;非法 → 400 InvalidArgument;版本不存在 → NoSuchVersion;响应回显 `x-amz-copy-source-version-id`;range 直灌按所寻址版本取数(s3-tests `multipart_copy_versioned` 出集) |
+| `x-amz-expected-bucket-owner` | 单账号模型语义:头值 = 桶属主(`fasts3`)→ 放行;≠ 自身 → 403 AccessDenied(显式,不静默);桶级/对象级 op 通用。s3-tests 同名用例仍排除:前置 `PutBucketAcl(public-read-write)` = Put*Acl 501 红线 |
+| 密钥状态语义(S3-GAP §3.7 #7) | 禁用 vs 不存在在 admin/审计面可区分:认证失败审计条目落 `auth_note`(`key_disabled` / `key_not_found` / `session_token_invalid`);**协议错误码维持 AWS 同义**(禁用/不存在均 InvalidAccessKeyId,会话失效 InvalidToken),侧写仅落 admin/审计面 |
+
 ## OS / 打包形态
 
 | 平台 | 包 | 构建 | 状态 |

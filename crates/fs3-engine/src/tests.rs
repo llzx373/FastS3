@@ -5182,7 +5182,16 @@ fn sse_c_upload_part_copy_matrix() {
     let range = 60_000..(5 * 1024 * 1024 + 200_000);
     let expect: Vec<u8> = src_data[range.start as usize..].to_vec();
     let p = e
-        .upload_part_copy(&uid, 1, "b1", "upc-plain", range.clone(), None, Some(&key))
+        .upload_part_copy(
+            &uid,
+            1,
+            "b1",
+            "upc-plain",
+            None,
+            range.clone(),
+            None,
+            Some(&key),
+        )
         .unwrap();
     let psse = p.sse.as_ref().expect("part encrypted");
     assert_eq!(p.size, expect.len() as u64);
@@ -5193,7 +5202,16 @@ fn sse_c_upload_part_copy_matrix() {
     );
     // SSE 源 + 同密钥 → 解密后重加密为 part 网格(part2 = 末片,无 5MiB 门槛)
     let p2 = e
-        .upload_part_copy(&uid, 2, "b1", "upc-enc", 0..100, Some(&key), Some(&key))
+        .upload_part_copy(
+            &uid,
+            2,
+            "b1",
+            "upc-enc",
+            None,
+            0..100,
+            Some(&key),
+            Some(&key),
+        )
         .unwrap();
     assert!(p2.sse.is_some());
     // Complete 后整对象读回 = 两段明文拼接
@@ -5230,23 +5248,23 @@ fn sse_c_upload_part_copy_matrix() {
         )
         .unwrap();
     let err = e
-        .upload_part_copy(&uid2, 1, "b1", "upc-enc", 0..100, Some(&key), None)
+        .upload_part_copy(&uid2, 1, "b1", "upc-enc", None, 0..100, Some(&key), None)
         .unwrap_err();
     assert!(matches!(err, Error::InvalidRequest(_)), "{err}");
     // SSE 源 + SSE 会话但缺 copy-source 密钥 → InvalidRequest
     let uid3 = create_sse_upload(&mut e, "upc-e2");
     let err = e
-        .upload_part_copy(&uid3, 1, "b1", "upc-enc", 0..100, None, Some(&key))
+        .upload_part_copy(&uid3, 1, "b1", "upc-enc", None, 0..100, None, Some(&key))
         .unwrap_err();
     assert!(matches!(err, Error::InvalidRequest(_)), "{err}");
     // SSE 会话缺目标密钥 → InvalidRequest(会话一致性)
     let err = e
-        .upload_part_copy(&uid3, 1, "b1", "upc-plain", 0..100, None, None)
+        .upload_part_copy(&uid3, 1, "b1", "upc-plain", None, 0..100, None, None)
         .unwrap_err();
     assert!(matches!(err, Error::InvalidRequest(_)), "{err}");
     // 明文会话带目标密钥 → InvalidRequest(不静默加密)
     let err = e
-        .upload_part_copy(&uid2, 1, "b1", "upc-plain", 0..100, None, Some(&key))
+        .upload_part_copy(&uid2, 1, "b1", "upc-plain", None, 0..100, None, Some(&key))
         .unwrap_err();
     assert!(matches!(err, Error::InvalidRequest(_)), "{err}");
     e.close().unwrap();
@@ -6907,6 +6925,7 @@ fn dbg_sse_c_copy_part_8mib_roundtrip() -> Result<()> {
             1,
             "b1",
             "src",
+            None,
             0..5 * 1024 * 1024,
             Some(&key),
             Some(&key),
@@ -6918,6 +6937,7 @@ fn dbg_sse_c_copy_part_8mib_roundtrip() -> Result<()> {
             2,
             "b1",
             "src",
+            None,
             5 * 1024 * 1024..8 * 1024 * 1024,
             Some(&key),
             Some(&key),
