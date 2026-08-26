@@ -8,9 +8,9 @@
 # 并把数值替换到本文件。当前数值录自 WSL2 虚拟盘(内存背衬,非真实 NVMe),
 # 仅用于本环境门禁自洽;真 NVMe 门禁以专用 runner 重录为准。
 {
-  "randread_4k_iops": 1270443,
-  "seqread_128k_mbps": 4900,
-  "host": "wsl-virtual-perf-runner",
-  "date": "2026-08-21T00:00:00Z",
-  "note": "WSL 虚拟盘种子基线;真 NVMe runner 需重录"
+  "randread_4k_iops": 1251251,
+  "seqread_128k_mbps": 12419,
+  "host": "LiuMainPC-wsl",
+  "date": "2026-08-26T22:05:00Z",
+  "note": "M16 \u95e8\u7981\u5bbf\u4e3b\u91cd\u5f55(WSL2 \u865a\u62df\u76d8,3 \u8f6e\u4e2d\u4f4d\u6570;randread \u5bbf\u4e3b\u566a\u58f0 \u00b18%);\u771f NVMe runner \u9700\u91cd\u5f55"
 }

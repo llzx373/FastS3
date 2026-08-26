@@ -153,10 +153,10 @@
 - [ ] H3 BlueFS 设备内元数据(旧 M13 N3;≈5~7 pw;spike 已通过;与归档/底座诉求挂钩再评估)
 
 ### M16 门禁(退出条件;按各组立项范围执行)
-- [ ] ADR-19/ADR-20/ADR-21 落盘;归档族 s3-tests 出集(transition/restore/storage-class)
-- [ ] 崩溃 ≥500 轮(归档混载)+ 复制双节点 drill;升级 v2.1→v2.2 + 回滚实测
-- [ ] perf:归档路径带宽/恢复基准 + 非归档负载零回退(<5%);覆盖率 ≥80%;cargo audit 清零
-- [ ] 发布 v2.2.0(CHANGELOG/RELEASES 记档;附 S3-GAP §4/§5 更新:媒体/IoT/边缘场景闭环)
+- [x] ADR-19/ADR-20/ADR-21 落盘;归档族 s3-tests 出集(transition/restore/storage-class)
+- [x] 崩溃 ≥500 轮(归档混载)+ 复制双节点 drill;升级 v2.1→v2.2 + 回滚实测
+- [x] perf:归档路径带宽/恢复基准 + 非归档负载零回退(<5%);覆盖率 ≥80%;cargo audit 清零
+- [x] 发布 v2.2.0(CHANGELOG/RELEASES 记档;附 S3-GAP §4/§5 更新:媒体/IoT/边缘场景闭环)
 
 ---
 

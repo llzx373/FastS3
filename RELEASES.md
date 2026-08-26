@@ -1,4 +1,37 @@
 # FastS3 发布记录
+
+## v2.2.0 — M16 归档与复制(2026-08-26)
+
+> 发布状态:与 M16 交付同步;git tag/发布流水线属执行期步骤(与 v2.1.0
+> 同口径)。决策记录:ADR-19/ADR-20/ADR-21(docs/DESIGN.md §3.3);性能
+> 报告 [docs/perf-M16.md](./docs/perf-M16.md)。
+
+### 变更(TODO M16 全项:A0/A1~A5 + R1 + L1 + 门禁)
+
+- **归档存储类(ADR-19)**:GLACIER_IR 在线可读压缩档;GLACIER/DEEP_ARCHIVE
+  高压缩档 + RestoreObject 后台恢复(幂等延长/Tier 映射/到期 GC);
+  Transition 生命周期;ObjectMeta v7 + BucketMeta v3 按类分账;存储类
+  头矩阵从「统一 STANDARD」升版为真实归档语义(compat.md)。
+- **复制策略化(ADR-20)**:不内置 ?replication;中心同步任务
+  (sync_tasks CRUD + 调度器 sync.run + 账本结算)+ 节点 mc mirror/
+  rclone copy 执行(串行节流档,引擎并发死锁规避见 S3-GAP §9)+
+  控制台同步任务页 + FastS3SyncTaskStalled 告警;双节点互备 drill 8/8。
+- **LDAP/OpenID(ADR-21)**:内置最小 LDAPv3(BER)客户端;组 → 密钥
+  生命周期周期同步(创建/禁用/删除,bind 密码不落盘不进数据面);
+  OIDC implicit flow 控制台 SSO(JWKS/HS256 校验,角色映射,回退本地
+  登录);身份事件可检索 + 部署文档(security.md §4)。
+- **门禁实测**:
+  - s3-tests:495 passed / 0 unexpected / 249 文档化排除(M16 归档族
+    出集,transition/restore/storage-class 族配置缺失跳过项逐名记录);
+  - 崩溃 ≥500 轮(归档写/transition/restore/GC 混载)零撕裂/零泄漏/
+    账目零漂移(leaks: none);
+  - 升级 v2.1→v2.2:ObjectMeta v6→v7 在线重写 + 回滚实测(禁回滚纪律);
+  - perf(perf-M16.md):归档路径写/读/恢复基准(STANDARD 同量级,恢复
+    秒级);非归档负载零回退 3/3 PASS;
+  - 覆盖率 llvm-cov workspace 行 83.89%(≥80%);cargo audit 0 漏洞;
+  - 客户端矩阵:aws cli 归档往返、mc --storage-class 回显真实类、
+    rclone 复制读取全过(m16_archive_smoke.sh 11 段)。
+
 ## v1.3.0 — M12 Object Lock / WORM(季度 minor 轨道)(2026-08-25)
 
 > 发布状态:与 M12 交付同步;git tag/发布流水线属执行期步骤(与 v1.2.x 同口径,

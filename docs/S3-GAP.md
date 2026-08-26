@@ -60,7 +60,7 @@
 | 认证安全 | SigV2 | ⛔ | P2 | 明确不做(默认关闭等价) |
 | 认证安全 | POST 表单签名 | ✅ v1.1 | P1 | — |
 | 认证安全 | STS 临时凭证 / Session Policy | ⛔ | P1(多租户) | 🔜 v2.1(M15 T) |
-| 认证安全 | LDAP / OpenID / IAM 联邦 | ⛔ | P1(企业 AD 集成) | v2.2 候选 |
+| 认证安全 | LDAP / OpenID / IAM 联邦 | 🟢 部分(LDAP 目录同步 + OIDC SSO v2.2,ADR-21;IAM 联邦维持远期) | P1(企业 AD 集成) | 数据面仍认 access key(D-E2 延续) |
 | 认证安全 | SSE-KMS / DSSE-KMS | ⛔ | P2 | ❌ 不做(无 KMS 托管;参数显式拒绝) |
 | 认证安全 | 密钥级 IAM 策略子集 | 🟡 已补最小 Condition 集(ipAddress/prefix/bypass 键);超集显式 400 | P1 | 超集远期 |
 | 数据保护 | 强一致 read-after-write | ✅(比 S3 官方更强) | P0 | — |
@@ -198,15 +198,15 @@
 | **合规 / WORM**(金融/医疗/制造边缘) | Object Lock ✅ v1.3、审计持久化 ✅ v1.2、SSE ✅ v1.2、可信时钟 ✅ v1.3、版本 ✅ v1.1 | ✅ 满足 | 无功能缺口(v2.0 外部审计执行期项不影响) |
 | **ML / 训练** | 高 IOPS/吞吐 ✅、多设备 ✅ v1.4、checkpoint 条件写 ✅ v1.1、缓存 ✅ v2.0 | ✅ 满足 | — |
 | **多租户 SaaS** | 桶隔离 ✅、桶策略+最小 Condition ✅ v1.1、配额 ✅、限速 ✅、审计 ✅ v1.2、STS ✅ v2.1、Inventory 计量 ✅ v2.1、expected-bucket-owner ✅ v2.1(C2) | 🟢 满足 | Condition 超集/tenant 族(远期) |
-| **媒体工作流** | multipart+Range ✅、大对象吞吐 ✅、事件通知 ✅ v2.1(N)、归档 ⛔ | 🟡 部分满足 | 归档/RestoreObject(M16) |
-| **IoT 接入** | chunked ✅、小对象扇入 ✅、生命周期过期 ✅ v1.2、前缀分片 ✅、事件通知 ✅ v2.1(N)、Transition 归档 ⛔(显式拒绝) | 🟡 部分满足 | 生命周期 Transition(M16) |
+| **媒体工作流** | multipart+Range ✅、大对象吞吐 ✅、事件通知 ✅ v2.1(N)、归档 ✅ v2.2(ADR-19:GLACIER_IR 在线 / GLACIER·DEEP 恢复) | ✅ 满足 | — |
+| **IoT 接入** | chunked ✅、小对象扇入 ✅、生命周期过期 ✅ v1.2、前缀分片 ✅、事件通知 ✅ v2.1(N)、Transition 归档 ✅ v2.2(Days/Date → GLACIER_IR/GLACIER/DEEP_ARCHIVE) | ✅ 满足 | — |
 | **DevOps / CI** | 小对象低延迟 ✅、预签名 ✅、POST 表单 ✅ v1.1、版本+生命周期 ✅、标签 ✅ v1.1 | ✅ 满足 | — |
 | **浏览器应用** | 预签名直传 ✅、CORS ✅ v1.1、SDK ✅;Website(定位性不做,nginx 替代) | ✅ 满足 | Website 属排除清单(如需 S3 Website API) |
-| **边缘 / 远程办公** | 轻量 ✅、缓存 ✅ v2.0、纳管 ✅ v2.0、站点复制(策略化,不内置) | 🟡 部分满足 | 复制策略化落地(M16 候选:中心调度同步 + 对账视图) |
+| **边缘 / 远程办公** | 轻量 ✅、缓存 ✅ v2.0、纳管 ✅ v2.0、复制策略化 ✅ v2.2(ADR-20:中心同步任务 + mc/rclone 执行 + 对账视图;拔中心安全停止) | ✅ 满足 | — |
 
-> **收口节奏**:M15(v2.1)交付后 9/10 场景闭环(多租户 SaaS 随 STS/Inventory/
-> expected-bucket-owner 转绿);残余 = 归档(媒体/IoT)+ 复制策略化(边缘)
-> 落 M16,Condition 超集/tenant 族维持远期。
+> **收口节奏**:M15(v2.1)交付后 9/10 场景闭环;M16(v2.2)归档(媒体/IoT)
+> + 复制策略化(边缘)落地后 **10/10 场景闭环**(企业硬门槛覆盖率见 §5,
+> 发布报告附一行)。Condition 超集/tenant 族维持远期。
 
 ## 5. 企业硬门槛 Top 20 与 FastS3 对照
 

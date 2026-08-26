@@ -5,6 +5,32 @@
 > 详细发布记录见 [RELEASES.md](./RELEASES.md);RC/GA 候选流程见
 > [docs/ga/rc-flow.md](./docs/ga/rc-flow.md)。
 
+## v2.2.0 — M16 归档与复制(2026-08-26)
+
+M16 全部任务与门禁完成(TODO.md M16 全勾选);决策落盘 ADR-19/ADR-20/ADR-21
+(DESIGN.md §3.3);workspace + web 三件套版本 **2.2.0**。git tag /
+`tools/package/` 属执行期步骤(与 v1.x/v2.0 同口径)。
+
+- **真实归档存储类(ADR-19)**:GLACIER_IR = zstd 标准档在线可读;
+  GLACIER/DEEP_ARCHIVE = zstd 高压缩档(档位 9)需 restore;未恢复
+  GET/HEAD/Copy 源 403 InvalidObjectState;ObjectMeta v7(storage_class +
+  restore_state,v6 双读回退)+ BucketMeta v3 按类分账(by_class)。
+- **RestoreObject**:后台作业队列(x: 前缀)幂等延长;Tier 三档接受映射;
+  x-amz-restore 回显(ongoing/expiry);到期读回落 403 + 后台 GC 回收
+  恢复副本;恢复副本不占桶统计。
+- **生命周期 Transition**:Days/Date 触发,目标类限定归档三态,同版本
+  原子换数据,锁定对象跳过;LifecycleTransition 事件。
+- **复制策略化(ADR-20)**:数据面不内置 ?replication(501);中心同步任务
+  (CRUD/调度/账本)+ 节点本地 mc mirror(--remove,删除传播)/rclone copy
+  (只增不删)执行 + 控制台任务页/stalled 告警;拔中心安全停止语义。
+- **LDAP/OpenID(ADR-21)**:内置最小 LDAPv3 客户端,组 → 密钥生命周期
+  周期同步(创建/禁用/删除,bind 密码不落盘);OIDC implicit flow
+  控制台 SSO(id_token → 本地会话 JWT,角色映射);身份事件可检索。
+- **门禁**:s3-tests 495/0/249(M16 归档族出集);崩溃 500 轮归档混载
+  零撕裂;升级 v2.1→v2.2 + 回滚实测;双节点互备 drill 8/8;perf 归档
+  路径基准 + 非归档零回退(3/3 PASS,见 perf-M16.md);覆盖率 83.89%;
+  audit 0 漏洞;客户端矩阵(aws cli/mc/rclone 归档往返)全过。
+
 ## v2.1.0 — M15 迁移即插即用(2026-08-26)
 
 M15 全部任务与门禁完成(TODO.md M15 全勾选);决策落盘 ADR-18(DESIGN.md §3.3);
