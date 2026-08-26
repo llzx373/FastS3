@@ -739,13 +739,18 @@ fn cmd_serve(
     };
     let lifecycle_stats = lifecycle_worker.as_ref().map(|(w, _)| w.stats());
 
+    // M6 / K4:优雅停机标志(SIGTERM/SIGINT → 排空 → 引擎收尾)。
+    // 提前创建供 admin/agent 等后台模块注入(agent 循环每周期观测)。
+    let shutdown = Arc::new(AtomicBool::new(false));
+
     // 管理 API(H1;可选)
     let admin_listen = cli_admin_listen.or_else(|| cfg.admin.listen.clone());
     if let Some(listen) = admin_listen {
         let token = cli_admin_token.or_else(|| cfg.admin.token.clone());
+        // listen/token 后续供 agent(LocalAdmin)复用:此处克隆,避免 move
         let admin_cfg = fs3_admin::AdminConfig {
-            listen,
-            token: token.unwrap_or_default(),
+            listen: listen.clone(),
+            token: token.clone().unwrap_or_default(),
         };
         // H3:配置热重载回调(重读配置文件,应用可重载子集:限速/匿名读/配置密钥)
         let reload: Option<Arc<fs3_admin::ReloadFn>> = config_path.clone().map(|path| {
@@ -790,6 +795,46 @@ fn cmd_serve(
                 }
             })
             .map_err(fs3_core::Error::Io)?;
+
+        // M14 G1-1(ADR-17 DV1):纳管 agent(feature `agent` 编译期 gate +
+        // 配置 enabled 运行期 gate)。agent 依赖本地 admin 通道做"远程化"
+        // 转发(设计 §7.1.1),无 admin → 提示并跳过。
+        #[cfg(feature = "agent")]
+        {
+            let agent_cfg = fs3_agent::AgentConfig {
+                enabled: cfg.agent.enabled,
+                center_url: cfg.agent.center_url.clone().unwrap_or_default(),
+                ca_cert: cfg.agent.ca_cert.clone().unwrap_or_default(),
+                client_cert: cfg.agent.client_cert.clone().unwrap_or_default(),
+                client_key: cfg.agent.client_key.clone().unwrap_or_default(),
+                node_id: cfg.agent.node_id.clone().unwrap_or_default(),
+                heartbeat_secs: cfg.agent.heartbeat_secs.unwrap_or(10),
+                stream_interval_secs: cfg.agent.stream_interval_secs.unwrap_or(15),
+                reconcile_on_start: cfg.agent.reconcile_on_start.unwrap_or(true),
+                ..Default::default()
+            };
+            if agent_cfg.enabled {
+                let local = fs3_agent::LocalAdmin {
+                    listen: listen.clone(),
+                    token: token.clone().unwrap_or_default(),
+                };
+                match fs3_agent::Agent::new(agent_cfg, local, shutdown.clone()) {
+                    Ok(agent) => {
+                        tracing::info!("agent module enabled; spawning");
+                        agent.spawn();
+                    }
+                    Err(e) => {
+                        tracing::error!("agent startup failed: {e}; continuing without agent");
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "agent"))]
+        if cfg.agent.enabled {
+            tracing::warn!(
+                "agent.enabled=true but build lacks `agent` feature (cargo build --features agent); ignoring"
+            );
+        }
     }
 
     // 生命周期 worker 启动(创建见 admin 装配前;解耦仅为注入 stats Arc)
@@ -867,7 +912,6 @@ fn cmd_serve(
     }
 
     // M6 / K4:优雅停机(SIGTERM/SIGINT → 排空 → 引擎收尾)
-    let shutdown = Arc::new(AtomicBool::new(false));
     signal::install(shutdown.clone())?;
     let serve_result = fs3_http::serve_with_shutdown(
         service,

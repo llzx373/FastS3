@@ -374,7 +374,7 @@
 - [x] A0-1 ADR:DV1(agent 出站 mTLS;中心=配置源,引擎=裁决权威)、DV2(HTTP/3 实验 feature 开关默认关,6 个月评估期)按推荐写入 DESIGN.md §3.3(ADR-17 落盘:出站双向 mTLS + 每节点凭证、per-node 版本号 + 断线重连全量对账、secret 仅生成时明文一次(默认中心不存 secret)、quinn 依赖审批登记、0-RTT 仅幂等 GET/HEAD;同步 DESIGN-FUTURE §11 决策清单 DV1/DV2 → ADR-17 与 §9.3 quinn 行)
 
 ### G. 多节点纳管(§7.1)
-- [ ] G1-1 agent 模块(fasts3d 内,feature-gate 默认关):出站 mTLS、心跳、指标/审计流式上报(复用 WS/批量)、下发接收
+- [x] G1-1 agent 模块(crates/fs3-agent,fs3d `agent` feature-gate 默认关)**:出站 mTLS(rustls 双向 TLS,无客户端证书被中心拒绝的集成测试)、心跳/健康上报、指标/审计批量流式上报(本地 admin 通道取数,"远程化"复用)、下发接收与本地裁决执行(经本地 admin 端点,本机引擎权威;key.create 幂等预检);中心最小 mTLS 接收端(web/server `/v2/center/*`:register/heartbeat/streams/desired/results/secrets/nodes + SQLite 存储 nodes/desired_ops/audit/meta,audit UNIQUE 去重;CN==node_id 强制校验 401/403;secret 仅内存一次回显 G1-3);附带修复 web test:unit 通配符(引号包裹,node 原生 glob)使既有 51 项测试实际执行(此前静默只跑嵌套目录);ADR-17 补遗(SQLite 中心存储偏离 Node 无状态纪律的记录)
 - [ ] G1-2 下发权威性:中心下发 = 配置源,执行与裁决在本机引擎;断线重连全量对账(乐观并发 + 版本号)
 - [ ] G1-3 密钥下发语义:secret 仅生成时明文一次(沿用"只下发一次"语义;中心是否留存文档化)
 - [ ] G2-1 中心:节点注册/拓扑/健康聚合 + 下发 API + 对账(Node 同栈扩展,不引入新语言)

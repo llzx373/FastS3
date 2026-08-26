@@ -29,6 +29,9 @@ fs3-engine.workspace = true
 fs3-s3.workspace = true
 fs3-http.workspace = true
 fs3-admin.workspace = true
+# M14 G1-1(ADR-17 DV1):纳管 agent 可选模块;feature 默认关,
+# 关闭时本 crate 不参与编译(默认二进制与 v1.x 行为/性能零差异,门禁)
+fs3-agent = { workspace = true, optional = true }
 clap.workspace = true
 toml.workspace = true
 serde_json.workspace = true
@@ -38,3 +41,8 @@ tracing-subscriber.workspace = true
 libc.workspace = true
 # M5 `bench-md5`:与 SIMD 多缓冲 MD5 对比的单缓冲基线(仅基准用)
 md-5.workspace = true
+
+[features]
+# M14 G1-1(ADR-17 DV1):纳管 agent;默认关(Cargo 无 default = 全关)。
+# 关闭 = fs3-agent 不编译,二进制与 v1.x 零差异(门禁)。
+agent = ["dep:fs3-agent"]

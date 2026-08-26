@@ -468,6 +468,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs3-agent"
+version = "1.4.0"
+dependencies = [
+ "base64",
+ "bytes",
+ "fs3-core",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "fs3-alloc"
 version = "1.4.0"
 dependencies = [
@@ -595,6 +618,7 @@ dependencies = [
  "base64",
  "clap",
  "fs3-admin",
+ "fs3-agent",
  "fs3-alloc",
  "fs3-core",
  "fs3-device",

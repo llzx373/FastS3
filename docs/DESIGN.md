@@ -936,6 +936,15 @@ React 控制台页面(与现有管理面同栈,不引入新语言);节点注册/
 聚合、下发 API、审计聚合检索全部在 Node 侧(永不进入数据热路径,AGENT
 §3 边界不变)。Rust 侧只新增 agent 模块与中心对账所需的最小端点能力。
 
+**G 实施期补遗(center 状态存储 = SQLite;用户裁决 2026-08-26)**:中心需
+持久化节点注册表、下发账本(per-node seq/acked/rejected,对账权威)与
+审计汇流,已超出 AGENT §7「Node 侧无状态,状态一律放 Rust 侧」的原义
+(该纪律为单机控制台而写;中心是独立管理面服务)。裁决:中心状态存储用
+**SQLite(better-sqlite3)**,G1-1 落地(`nodes` / `desired_ops` / `audit` /
+`meta` 四表,audit 以 UNIQUE 约束去重支撑 agent at-least-once 上报);
+secret 永不落库(仅在内存 pendingSecrets 暂存一次,取后即清,进程重启
+即失——G1-3 语义);该取舍待 v2.0 外部安全审计立项时评审。
+
 **门禁口径同步**(TODO M14 门禁):agent 关闭状态 v2.0 二进制与 v1.x
 行为/性能零差异;纳管演练含拔中心单机功能完整(红线实测);mTLS 通道
 安全自审与 GA 自审同标准;HTTP/3 0-RTT 重放防护测试(PUT 无 0-RTT);

@@ -17,6 +17,35 @@ pub struct RootConfig {
     pub limits: LimitsConfig,
     #[serde(default)]
     pub audit: AuditConfig,
+    /// M14 G1-1(ADR-17 DV1):纳管 agent(默认关;feature-gate 之外的第二道闸)。
+    #[serde(default)]
+    pub agent: AgentConfig,
+}
+
+/// M14 G1-1(ADR-17 DV1):`[agent]` 段。enabled=false(默认)不启动 agent。
+/// 关闭状态与 v1.x 行为/性能零差异(门禁);依赖 `[admin]` 通道执行下发。
+/// 字段仅在 `agent` feature 构建下消费;未启用 feature 时允许未读。
+#[cfg_attr(not(feature = "agent"), allow(dead_code))]
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+pub struct AgentConfig {
+    /// 总开关(默认 false)。
+    pub enabled: bool,
+    /// 中心地址;必须 https://(mTLS 通道,红线 §9.4 #3)。
+    pub center_url: Option<String>,
+    /// 中心 CA 证书 PEM。
+    pub ca_cert: Option<String>,
+    /// 本节点客户端证书 PEM(CN = node_id,中心侧一次性签发)。
+    pub client_cert: Option<String>,
+    /// 本节点客户端私钥 PEM。
+    pub client_key: Option<String>,
+    /// 节点标识(空 = hostname-随机后缀;须与证书 CN 一致,中心强制校验)。
+    pub node_id: Option<String>,
+    /// 心跳周期秒(默认 10)。
+    pub heartbeat_secs: Option<u64>,
+    /// 指标/审计流式上报周期秒(默认 15)。
+    pub stream_interval_secs: Option<u64>,
+    /// 启动/重连全量对账(默认 true)。
+    pub reconcile_on_start: Option<bool>,
 }
 
 /// 审计配置(M11 L3-1;ADR-12 DL5 `s:audit` 持久化环形)。

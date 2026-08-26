@@ -9,16 +9,21 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
-    "test:unit": "node --test --import tsx src/**/*.test.ts"
+    "test:unit": "node --test --import tsx \"src/**/*.test.ts\"",
+    "center:start": "node dist/center/index.js",
+    "dev:center": "tsx watch src/center/index.ts",
+    "test": "pnpm test:unit"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
+    "better-sqlite3": "^13.0.3",
     "fastify": "^5.12.1",
     "ws": "^8.21.3"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^26.2.0",
     "@types/ws": "^8.18.1",
     "tsx": "^4.23.12",
