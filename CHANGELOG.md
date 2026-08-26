@@ -5,7 +5,29 @@
 > 详细发布记录见 [RELEASES.md](./RELEASES.md);RC/GA 候选流程见
 > [docs/ga/rc-flow.md](./docs/ga/rc-flow.md)。
 
-## [Unreleased] — v2.0.0(大版本 major 轨道;M14 集中纳管与生态)
+## v2.1.0 — M15 迁移即插即用(2026-08-26)
+
+M15 全部任务与门禁完成(TODO.md M15 全勾选);决策落盘 ADR-18(DESIGN.md §3.3);
+workspace + web 三件套版本 **2.1.0**。git tag / `tools/package/` 属执行期步骤
+(与 v1.x/v2.0 同口径)。
+
+- **事件通知(Webhook 起步)**:`?notification` 配置 CRUD;Topic/Queue/
+  CloudFunction 容器直携 http/https Webhook;事件与数据**同事务**入队
+  (崩溃零漂移)、at-least-once 投递 + 退避 + 死信;HMAC 签名可选;指标组。
+- **STS 临时凭证**:管理面 GetSessionToken/AssumeRole(Node /api/sts);
+  数据面会话感知认证(基密钥 ∩ 会话策略,Deny 默认;撤销即拒;secret
+  仅一次回显零落盘)。
+- **S3 Inventory**:配置 CRUD + 生成 worker(20 列 CSV + manifest.json
+  落目标桶);All/Current 口径;迁移对账演示。
+- **存储类头接受矩阵**:8 值接受 → 统一落 STANDARD(元数据记录请求类、
+  回显实际类);EXPRESS_ONEZONE 显式拒绝。
+- **协议补完**:UploadPartCopy 源 ?versionId 寻址;expected-bucket-owner;
+  密钥状态语义(审计 auth_note 区分禁用/不存在/会话失效)。
+- **门禁**:s3-tests 495/0/249;崩溃 500 轮事件队列混载;perf 关闭态
+  -0.6% / 开启态 -0.3%;覆盖率 84.32%;audit 0 漏洞;客户端矩阵
+  (aws/boto3/mc/rclone + STS + restic + duplicati)全过;S3-GAP §4/§5 复核。
+
+## v2.0.0 — M14 集中纳管与生态(2026-08-26)
 
 M14 全部任务与门禁完成(TODO.md M14 全勾选);决策落盘 ADR-17(DESIGN.md §3.3);
 workspace + web 三件套版本 **2.0.0**。git tag / `tools/package/` 属执行期步骤

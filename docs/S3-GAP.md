@@ -197,15 +197,16 @@
 | **备份与恢复**(restic/Duplicati/Veeam/Commvault) | multipart ✅、ListObjectVersions ✅ v1.1、版本 ✅ v1.1、Object Lock ✅ v1.3、checksum ✅ v1.2;restic 0.19.1 / duplicati 2.3.0.4 ✅ 实测 | 🟡 基本满足 | Veeam(优先)/Commvault 实测(M15 D3);不可变仓库功能面已齐 |
 | **合规 / WORM**(金融/医疗/制造边缘) | Object Lock ✅ v1.3、审计持久化 ✅ v1.2、SSE ✅ v1.2、可信时钟 ✅ v1.3、版本 ✅ v1.1 | ✅ 满足 | 无功能缺口(v2.0 外部审计执行期项不影响) |
 | **ML / 训练** | 高 IOPS/吞吐 ✅、多设备 ✅ v1.4、checkpoint 条件写 ✅ v1.1、缓存 ✅ v2.0 | ✅ 满足 | — |
-| **多租户 SaaS** | 桶隔离 ✅、桶策略+最小 Condition ✅ v1.1、配额 ✅、限速 ✅、审计 ✅ v1.2、STS ⛔、计量 Inventory ⛔ | 🟡 部分满足 | STS(M15 T)、Inventory 计量(M15 I)、expected-bucket-owner 显式语义(M15 C2);Condition 超集/tenant 族(远期) |
-| **媒体工作流** | multipart+Range ✅、大对象吞吐 ✅、通知 ⛔、归档 ⛔ | 🟡 部分满足 | 事件通知(M15 N);归档/RestoreObject(M16) |
-| **IoT 接入** | chunked ✅、小对象扇入 ✅、生命周期过期 ✅ v1.2、前缀分片 ✅、通知 ⛔、Transition 归档 ⛔(显式拒绝) | 🟡 部分满足 | 事件通知(M15 N);生命周期 Transition(M16) |
+| **多租户 SaaS** | 桶隔离 ✅、桶策略+最小 Condition ✅ v1.1、配额 ✅、限速 ✅、审计 ✅ v1.2、STS ✅ v2.1、Inventory 计量 ✅ v2.1、expected-bucket-owner ✅ v2.1(C2) | 🟢 满足 | Condition 超集/tenant 族(远期) |
+| **媒体工作流** | multipart+Range ✅、大对象吞吐 ✅、事件通知 ✅ v2.1(N)、归档 ⛔ | 🟡 部分满足 | 归档/RestoreObject(M16) |
+| **IoT 接入** | chunked ✅、小对象扇入 ✅、生命周期过期 ✅ v1.2、前缀分片 ✅、事件通知 ✅ v2.1(N)、Transition 归档 ⛔(显式拒绝) | 🟡 部分满足 | 生命周期 Transition(M16) |
 | **DevOps / CI** | 小对象低延迟 ✅、预签名 ✅、POST 表单 ✅ v1.1、版本+生命周期 ✅、标签 ✅ v1.1 | ✅ 满足 | — |
 | **浏览器应用** | 预签名直传 ✅、CORS ✅ v1.1、SDK ✅;Website(定位性不做,nginx 替代) | ✅ 满足 | Website 属排除清单(如需 S3 Website API) |
 | **边缘 / 远程办公** | 轻量 ✅、缓存 ✅ v2.0、纳管 ✅ v2.0、站点复制(策略化,不内置) | 🟡 部分满足 | 复制策略化落地(M16 候选:中心调度同步 + 对账视图) |
 
-> **收口节奏**:M15(v2.1)交付后 8/10 场景闭环;残余 = 归档(媒体/IoT)+ 复制
-> 策略化(边缘)落 M16,Condition 超集/tenant 族维持远期。
+> **收口节奏**:M15(v2.1)交付后 9/10 场景闭环(多租户 SaaS 随 STS/Inventory/
+> expected-bucket-owner 转绿);残余 = 归档(媒体/IoT)+ 复制策略化(边缘)
+> 落 M16,Condition 超集/tenant 族维持远期。
 
 ## 5. 企业硬门槛 Top 20 与 FastS3 对照
 
@@ -232,10 +233,10 @@
 | # | 门槛 | FastS3 现状 | 差距动作 |
 | --- | --- | --- | --- |
 | 11 | Lifecycle(过期/非当前版本/过滤) | ✅ v1.2 达标(Transition 显式不支持 → v2.2) | M16 归档联动 |
-| 12 | 事件通知(≥Webhook/SQS 形态) | ⛔ | 🔜 v2.1(M15 N1~N5,Webhook 起步) |
+| 12 | 事件通知(≥Webhook/SQS 形态) | ✅ v2.1 达标(Webhook 起步,ADR-18 D-E4;SNS/SQS 目标显式拒绝) | — |
 | 13 | 复制/DR | ⛔ 内置;策略 = 底层 HA + 迁移脚本(mc mirror/rclone 已演练) | v2.2 候选(中心调度同步);compat 声明 |
-| 14 | 预签名 + STS/Session Policy | 🟡 预签名 ✓;STS ⛔ | STS → v2.1(M15 T1~T3) |
-| 15 | 多租户隔离 + 配额/计量 | 🟡 隔离(桶)/配额 ✓;计量 ⛔ | Inventory → v2.1(M15 I1~I3) |
+| 14 | 预签名 + STS/Session Policy | ✅ v2.1 达标(GetSessionToken/AssumeRole 管理面签发,会话策略求交;无角色派生,compat 声明) | — |
+| 15 | 多租户隔离 + 配额/计量 | ✅ v2.1 达标(桶隔离/配额;Inventory CSV 计量;expected-bucket-owner 显式语义) | — |
 | 16 | RestoreObject + 归档层 | ⛔ | 🔜 v2.2(M16;前置已全部就绪) |
 | 17 | CORS + 预检 | ✅ v1.1 达标 | — |
 | 18 | 访问日志 + 审计面 | ✅ v1.2 审计持久化(访问日志仍不做) | — |
@@ -244,7 +245,7 @@
 
 | # | 门槛 | FastS3 现状 | 差距动作 |
 | --- | --- | --- | --- |
-| 19 | S3 Select / Inventory / Batch Operations | 🚫 Select 停售排除(2024-07-25 起不对新客户);Inventory ⛔;Batch Operations ⛔ | 不做 Select;Inventory → v2.1;Batch 后置(依赖通知) |
+| 19 | S3 Select / Inventory / Batch Operations | 🚫 Select 停售排除(2024-07-25 起不对新客户);Inventory ✅ v2.1;Batch Operations ⛔ | 不做 Select;Batch 后置(依赖通知) |
 | 20 | 目录桶/Express / Accelerate / Object Lambda / S3 Tables / DSSE-KMS | ❌ 明确不做(Express 定位 = FastS3 单机本体;Accelerate/Tables 与定位冲突;Object Lambda 叠加停售 2025-11-07;DSSE 无 KMS) | 文档化定位声明 |
 
 ## 6. 差距 → 路线图收敛映射
@@ -257,10 +258,10 @@
 | 多设备扩容/再平衡、设备内元数据、zstd | v1.4(§6) | ✅ 已交付(v1.4.0,2026-08-26;BlueFS N3 持有) |
 | 纳管 agent、HTTP/3、热缓存、Terraform/Operator 评估 | v2.0(§7) | ✅ 已交付(v2.0.0,2026-08-26) |
 | 桶策略(桶级)、CORS、对象标签、POST 表单 | v1.1(§7 建议 1 已采纳) | ✅ 已交付(M10 S1~S4) |
-| 事件通知(Webhook 起步)、STS 临时凭证、Inventory、存储类头矩阵、UploadPartCopy 源版本寻址 | v2.1(NEXT-ROUND §5) | 🔜 M15(TODO.md) |
+| 事件通知(Webhook 起步)、STS 临时凭证、Inventory、存储类头矩阵、UploadPartCopy 源版本寻址 | v2.1(NEXT-ROUND §5) | ✅ 已交付(v2.1.0,2026-08-26) |
 | 归档存储类 + RestoreObject、复制策略化、LDAP/OpenID | v2.2(NEXT-ROUND §6) | 🔜 M16 候选(立项后拆) |
 | S3 Select / Glacier Select、Object Lambda、Torrent、ACL 全矩阵 | — | 🚫 停售排除(NEXT-ROUND §3.2,不列入管线) |
-| 协议正确性残余(密钥状态语义、expected-bucket-owner 显式语义) | v2.1(NEXT-ROUND §5 C) | 🔜 M15 C2/C3 |
+| 协议正确性残余(密钥状态语义、expected-bucket-owner 显式语义) | v2.1(NEXT-ROUND §5 C) | ✅ 已交付(M15 C2/C3,2026-08-26) |
 
 ## 7. 路线图增补与优先级建议
 

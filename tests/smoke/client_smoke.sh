@@ -209,9 +209,11 @@ for v in vers.get("Versions", []) + vers.get("DeleteMarkers", []):
 left = s3.list_object_versions(Bucket=bucket, Prefix="vkey")
 assert not left.get("Versions") and not left.get("DeleteMarkers"), left
 print("  ok: boto3 versioning roundtrip")
-# 清桶
+# 清桶:big 为版本化前写入(null 版本),须按版本清单逐版本删除
 for k in ["big"]:
-    s3.delete_object(Bucket=bucket, Key=k)
+    vers = s3.list_object_versions(Bucket=bucket, Prefix=k)
+    for v in vers.get("Versions", []) + vers.get("DeleteMarkers", []):
+        s3.delete_object(Bucket=bucket, Key=k, VersionId=v["VersionId"])
 s3.delete_bucket(Bucket=bucket)
 print("  ok: boto3 full flow")
 PYEOF

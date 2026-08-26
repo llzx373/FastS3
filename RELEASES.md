@@ -441,3 +441,62 @@ S3 协议面完成:单机高性能 S3 服务可经标准客户端接入。
   可观测(99.8%)。
 - perf(perf-M14.md):h3 实验基准 + 缓存对照 + 零差异对照;弱网对照
   (netem)评估期待办。
+
+## v2.1.0 — M15 迁移即插即用(2026-08-26)
+
+> 发布状态:与 M15 交付同步;git tag/发布流水线属执行期步骤(与 v1.x/v2.0
+> 同口径,尚未正式打 tag)。决策记录:ADR-18(docs/DESIGN.md §3.3);性能
+> 报告见下「验证」;s3-tests 排除矩阵 tests/s3-tests/README.md。
+
+### 变更(TODO M15 全项:A0 + N1~N5 + T1~T3 + I1~I3 + C1~C3 + 门禁 G)
+
+- **事件通知(ADR-18 D-E1/D-E4,Webhook 起步)**:Put/Get/DeleteBucket
+  NotificationConfiguration(?notification);Topic/Queue/CloudFunction
+  容器全接受、内部直携 http/https Webhook URL(SNS/SQS/Lambda ARN 显式
+  拒绝);事件集 s3:ObjectCreated:* / ObjectRemoved:* / LifecycleExpiration:*;
+  Filter 前缀/后缀;FastS3WebhookSecretKey 可选 HMAC-SHA256 签名头;
+  事件入队与数据操作**同事务**(崩溃零漂移),有界持久化队列,投递
+  at-least-once + 指数退避 + 死信,fasts3_notification_* 指标。
+- **STS 临时凭证(ADR-18 D-E2)**:管理面 Query API(GetSessionToken/
+  AssumeRole,Node /api/sts)+ 数据面会话感知认证(token → 会话记录 →
+  派生临时 secret 验签;基密钥 ∩ 会话策略求交,Deny 默认;TTL 1h 默认/
+  max 36h;撤销即拒;secret 仅签发一次回显,落盘只有哈希比对子);
+  boto3 STS→S3 往返实测。
+- **S3 Inventory(I1~I3)**:Put/Get/Delete/ListBucketInventoryConfigurations
+  (?inventory;CSV 起步,ORC/Parquet 显式拒绝);生成 worker 复用
+  ListObjects 全量枚举 → 20 列 CSV + manifest.json(含 MD5checksum)落目标
+  桶;All/Current 版本口径;BackgroundWorker 节流;迁移对账演示
+  (tests/smoke/client_inventory_smoke.sh)。
+- **存储类头接受矩阵(ADR-18 D-E3)**:STANDARD_IA/ONEZONE_IA/
+  REDUCED_REDUNDANCY/INTELLIGENT_TIERING/GLACIER/GLACIER_IR/
+  DEEP_ARCHIVE 8 值接受 → 统一落 STANDARD,ObjectMeta 记录请求类
+  (v6 值格式 + v5 回退;PUT/Copy 继承或覆盖/CreateMultipart 随会话);
+  HEAD/GET/GetObjectAttributes 回显实际类;EXPRESS_ONEZONE 显式拒绝;
+  admin/meta-export 可见请求类。
+- **协议补完(C2/C3)**:UploadPartCopy 源 ?versionId 寻址(null/hex/
+  非法 400/NoSuchVersion/回显 x-amz-copy-source-version-id;s3-tests
+  multipart_copy_versioned 出集);x-amz-expected-bucket-owner(= 自身放行,
+  ≠ 自身 403;单账号模型);密钥状态语义(禁用 vs 不存在在 admin/审计面
+  可区分 —— 审计 auth_note:key_disabled/key_not_found/
+  session_token_invalid,协议错误码维持 AWS 同义)。
+
+### 验证(门禁,实测记录见 TODO.md M15 段)
+
+- `cargo test --workspace` 全绿(669+ Rust:fs3-engine 159 / fs3-s3 lib 128 /
+  service_integration 118 等);Node 58 过;clippy/fmt 全绿;覆盖率 **84.32%**
+  (≥80% 门禁,cargo llvm-cov);cargo audit **0 漏洞**(2 条 allowed
+  unmaintained 同 v2.0 集)。
+- s3-tests 全量 gate:**495 passed / 0 unexpected / 249 excluded**(通知族
+  出集 + multipart_copy_versioned 出集;expected_bucket_owner 保留排除并
+  逐名记录理由 = PutBucketAcl 501 前置依赖)。
+- 客户端矩阵:aws cli/boto3/mc/rclone 全过;boto3 STS→S3 会话往返
+  (Allow/Deny/撤销)过;restic 0.19.1 backup/restore 往返过;duplicati
+  2.3.0.4 备份/恢复过(--s3-server-name + --aws-* 选项)。
+- 崩溃 ≥500 轮(事件队列写/投递/删混载,tests/crash/run_crash_m15.sh):
+  零撕裂/零泄漏/账目零漂移(每轮 check 零泄漏 + 已应答对象逐字节校验 +
+  队列终局排空 + webhook at-least-once 全覆盖)。
+- perf 关闭态零回退:HEAD vs v2.0.0 基线 **-0.6%**(<5% 门禁,
+  tests/bench/perf-m15-notify-compare.sh);通知开启态增量 **-0.3%**(µs 级
+  同事务小值写,DESIGN-FUTURE §9.1 预算表口径)。
+- S3-GAP §4/§5 复核:多租户 SaaS/媒体/IoT 卡点随 M15 清零,残余仅 M16 项
+  (归档/Transition、复制策略化)与远期项(Condition 超集/tenant 族)。

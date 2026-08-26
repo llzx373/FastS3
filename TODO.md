@@ -64,13 +64,13 @@
 - [x] C3 逐项 s3-tests/自有集成测试 + 排除正则收敛(`multipart_copy_versioned` 移除;`expected_bucket_owner`/`tenant` 按结论出集或保留并逐名记录理由)
 
 ### G. M15 门禁(退出条件)
-- [ ] ADR-18 落盘 DESIGN.md §3.3(D-E1~D-E4),与实现无偏离
-- [ ] s3-tests 全量零回归:notification 族出排除集且 100%;multipart_copy_versioned 出集;其余排除逐名记录(README 排除矩阵同步)
-- [ ] 客户端矩阵回归:aws cli/boto3/mc/rclone 全过 + boto3 STS→S3 会话往返 + restic/duplicati 复跑
-- [ ] S3-GAP §4 企业场景映射复核:多租户/媒体/IoT 场景卡点随 M15 清零,残余仅 M16 项(归档/Transition、复制策略化)与远期项(Condition 超集/tenant 族);§4 场景表与 §5 硬门槛对照表同步更新
-- [ ] 崩溃 ≥500 轮(事件队列写入/投递/删除混载)零撕裂/零泄漏/账目零漂移
-- [ ] perf:通知/STS/存储类关闭态零回退(<5% 门禁);开启态增量写入发布报告(DESIGN-FUTURE §9.1 预算表口径)
-- [ ] 覆盖率 ≥80%;cargo audit 清零;发布 v2.1.0(workspace + web 三件套 bump,CHANGELOG/RELEASES 记档;不打 tag 不打包,与 v1.x/v2.0 同口径)
+- [x]] ADR-18 落盘 DESIGN.md §3.3(D-E1~D-E4),与实现无偏离
+- [x]] s3-tests 全量零回归:notification 族出排除集且 100%;multipart_copy_versioned 出集;其余排除逐名记录(README 排除矩阵同步)
+- [x]] 客户端矩阵回归:aws cli/boto3/mc/rclone 全过 + boto3 STS→S3 会话往返 + restic/duplicati 复跑
+- [x]] S3-GAP §4 企业场景映射复核:多租户/媒体/IoT 场景卡点随 M15 清零,残余仅 M16 项(归档/Transition、复制策略化)与远期项(Condition 超集/tenant 族);§4 场景表与 §5 硬门槛对照表同步更新
+- [x]] 崩溃 ≥500 轮(事件队列写入/投递/删除混载)零撕裂/零泄漏/账目零漂移
+- [x]] perf:通知/STS/存储类关闭态零回退(<5% 门禁);开启态增量写入发布报告(DESIGN-FUTURE §9.1 预算表口径)
+- [x]] 覆盖率 ≥80%;cargo audit 清零;发布 v2.1.0(workspace + web 三件套 bump,CHANGELOG/RELEASES 记档;不打 tag 不打包,与 v1.x/v2.0 同口径)
 
 ### D. 债务轨道(并行,不占特性主线)
 - [ ] D1 S8 压缩迁移 × 流式读并发竞态根治(读钉扎/释放隔离期,跨 fs3-alloc/engine/s3/http;v1.1.x patch 承诺项,≈1.5~2 pw)

@@ -1,9 +1,9 @@
 {
   "name": "@fasts3/console",
   "private": true,
-  "version": "2.0.0",
+  "version": "2.1.0",
   "type": "module",
-  "description": "FastS3 Web 控制台(React + Vite + uPlot)",
+  "description": "FastS3 Web \u63a7\u5236\u53f0(React + Vite + uPlot)",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
