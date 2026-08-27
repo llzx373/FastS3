@@ -1043,6 +1043,14 @@ fn auth_and_errors() {
     // 起已实现:不存在桶 → NoSuchBucket)
     let r = svc.handle(&req_q("GET", "/bkt1", &[("website", "")], vec![]));
     assert_eq!(err_code(&r), "NotImplemented");
+    // M17/G2:?logging 维持 501,消息指向审计导出专节
+    let r = svc.handle(&req_q("GET", "/bkt1", &[("logging", "")], vec![]));
+    assert_eq!(err_code(&r), "NotImplemented");
+    let msg = r.as_ref().err().and_then(|e| e.message_override.as_deref()).unwrap_or("");
+    assert!(
+        msg.contains("audit/export") && msg.contains("用审计导出代替 S3 Server Access Logging"),
+        "logging 501 须指向审计导出专节: {msg}"
+    );
     let r = svc.handle(&req_q("GET", "/bkt1", &[("policy", "")], vec![]));
     assert_eq!(err_code(&r), "NoSuchBucket");
     let r = svc.handle(&req_q("GET", "/bkt1", &[("lifecycle", "")], vec![]));

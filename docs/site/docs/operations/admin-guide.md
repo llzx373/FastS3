@@ -130,6 +130,9 @@ curl -sS --unix-socket /run/fasts3/admin.sock \
 告警水位建议:watermark ≥ 80% 提示扩容评估;≥ 95% 紧急(写入将 ENOSPC 507);
 `degraded=true` 立即处理(设备 I/O 故障只读降级)。
 
+访问日志交接(代替 `?logging`):见
+[用审计导出代替 S3 Server Access Logging](audit-export.md)。
+
 ## 5. 升级
 
 ```bash

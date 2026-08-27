@@ -28,6 +28,9 @@ Put*Acl 显式 501)。
 **定位性不做(AWS 仍在提供)**:Website / Logging / RequesterPays、Transfer
 Acceleration、Access Points、Directory Buckets / S3 Express、SigV2、
 SSE-KMS / DSSE(无 KMS 托管,参数显式拒绝)。
+**Logging 替代**:不实现 `?logging` XML(`PUT/GET/DELETE ?logging` 维持 501);
+访问日志交接见专节[用审计导出代替 S3 Server Access Logging](../operations/audit-export.md)
+(`GET /v1/admin/audit/export` JSONL)。
 s3-tests 排除集方法论见 `tests/s3-tests/README.md`。
 
 ## 许可证
@@ -125,6 +128,14 @@ meta-export/import 可见并可往返;真实类独立落 ObjectMeta v7 `storage_
 | UploadPartCopy 源 `?versionId` | 对齐 CopyObject(ADR-11 §3.4.5):`null` → null 族;32 hex → 精确版本;非法 → 400 InvalidArgument;版本不存在 → NoSuchVersion;响应回显 `x-amz-copy-source-version-id`;range 直灌按所寻址版本取数(s3-tests `multipart_copy_versioned` 出集) |
 | `x-amz-expected-bucket-owner` | 单账号模型语义:头值 = 桶属主(`fasts3`)→ 放行;≠ 自身 → 403 AccessDenied(显式,不静默);桶级/对象级 op 通用。s3-tests 同名用例仍排除:前置 `PutBucketAcl(public-read-write)` = Put*Acl 501 红线 |
 | 密钥状态语义(S3-GAP §3.7 #7) | 禁用 vs 不存在在 admin/审计面可区分:认证失败审计条目落 `auth_note`(`key_disabled` / `key_not_found` / `session_token_invalid`);**协议错误码维持 AWS 同义**(禁用/不存在均 InvalidAccessKeyId,会话失效 InvalidToken),侧写仅落 admin/审计面 |
+
+## 用审计导出代替 S3 Server Access Logging
+
+`PUT`/`GET`/`DELETE` `?logging` 维持 **501 NotImplemented**,不实现 Logging XML。
+访问日志交接 = admin `GET /v1/admin/audit/export`(时间窗 + 可选桶/键前缀,JSONL,
+超限截断头 `X-FastS3-Truncated`)与控制台审计页下载。运维步骤见
+[用审计导出代替 S3 Server Access Logging](../operations/audit-export.md)。
+handler 501 消息指向该节与 `/v1/admin/audit/export`,与本声明一致。
 
 ## OS / 打包形态
 

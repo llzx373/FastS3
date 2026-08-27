@@ -31,6 +31,7 @@ nav:
       - 管理员指南: operations/admin-guide.md
       - 升级与回滚: operations/upgrade.md
       - 备份/恢复: operations/backup-restore.md
+      - 审计导出(代替 Logging): operations/audit-export.md
       - 退出路径: operations/exit.md
       - 迁移(MinIO/公有云): operations/migration.md
       - 性能调优: operations/tuning.md

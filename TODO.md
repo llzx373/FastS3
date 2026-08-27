@@ -171,7 +171,7 @@
 - [x] G1 admin `GET /v1/admin/audit/export`(时间窗 + 可选 bucket/key 前缀;JSONL;
   行内无 secret);控制台审计页提供下载。超限截断有明确头/参数
   - 用例:`audit_export_jsonl_time_range`;导出文件不含密钥明文
-- [ ] G2 compat.md + operations:专节「用审计导出代替 S3 Server Access Logging」;
+- [x] G2 compat.md + operations:专节「用审计导出代替 S3 Server Access Logging」;
   `?logging` 维持 501 并指向该节。不实现 Logging XML
   - 用例:compat 声明与 handler 501 一致
 

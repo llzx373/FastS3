@@ -762,6 +762,15 @@ impl Router {
                         .with_message("InventoryConfiguration requires an id parameter")),
                 };
             }
+            // M17/G2:Logging XML 不做;501 指向审计导出专节(不静默、不实现)。
+            if has_q("logging") {
+                return Err(S3Error::new(S3ErrorCode::NotImplemented).with_message(
+                    "S3 Server Access Logging (?logging) is not implemented. \
+                     Use admin GET /v1/admin/audit/export. \
+                     See docs: operations/audit-export \
+                     (用审计导出代替 S3 Server Access Logging).",
+                ));
+            }
             // 不支持/未实现的子资源
             for unsupported in [
                 "acl",
@@ -770,7 +779,6 @@ impl Router {
                 // tionConfiguration),出表接线
                 "replication",
                 "requestPayment",
-                "logging",
                 "uploads",
                 "uploadId",
                 "partNumber",
