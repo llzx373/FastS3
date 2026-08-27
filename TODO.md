@@ -164,7 +164,7 @@ F0 ADR-22
 
 - [x] F8-1 分配器/引擎:extent `pin_count`;`object_segments_meta` / 零拷贝快照 / 缓冲 GET 流 / MultiRange 入口 pin,对应 `Drop`/结束 unpin(含 abort、客户端断开)
   - 用例:`pin_drop_unpins` RAII;panic/unwind 也 unpin
-- [ ] F8-2 Compactor / lifecycle transition / restore GC:`release_object` 若 `pin_count>0` 则进入隔离队列,unpin 到 0 再清位;禁止把 pin 中的 extent 交给 `allocate`
+- [x] F8-2 Compactor / lifecycle transition / restore GC:`release_object` 若 `pin_count>0` 则进入隔离队列,unpin 到 0 再清位;禁止把 pin 中的 extent 交给 `allocate`
   - 用例:`compaction_skips_pinned_extent`;`allocate_does_not_reuse_pinned`
 - [ ] F8-3 集成:大对象 GET 零拷贝进行中触发 compact_once(碎片布局),GET 字节与写入一致;复现原先 ~50% 失败的 `multipart_upload_resend_part` 量级(≥30MiB)在 **compaction_enabled=true** 下稳定
   - 用例:`streaming_get_during_compaction_stable`(engine 或 http 集成);s3-tests 门禁配置改为允许压缩(或双跑:关/开各一次)

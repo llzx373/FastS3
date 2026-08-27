@@ -279,7 +279,11 @@ impl Compactor {
                         let slot = &self.devices[di];
                         slot.base..slot.base + slot.extent_count
                     })
-                    .filter(|&id| self.alloc.test_bit(id) && self.alloc.live_bytes_of(id) > 0)
+                    .filter(|&id| {
+                        self.alloc.test_bit(id)
+                            && self.alloc.live_bytes_of(id) > 0
+                            && !self.alloc.is_pinned(id)
+                    })
                     .collect::<Vec<u64>>()
             }
         };
@@ -690,6 +694,54 @@ mod tests {
         assert_eq!(m.extents.len(), 1);
         assert_ne!(m.extents[0].extent_id, 0);
         assert!(m.extents[0].offset < cap as u32);
+        e.close().unwrap();
+    }
+
+    /// F8-2:钉扎中的 extent 不进压缩候选,GET 期间旧布局不被回收。
+    #[test]
+    fn compaction_skips_pinned_extent() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("disk.img");
+        std::fs::File::create(&img)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
+        let cfg = crate::EngineConfig {
+            devices: vec![img],
+            meta_dir: dir.path().join("meta"),
+            compaction: CompactionConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut e = crate::Engine::open(&cfg).unwrap();
+        e.ensure_bucket("b1").unwrap();
+        let data = vec![0x11u8; 1024 * 1024];
+        for i in 0..3 {
+            e.put("b1", &format!("k{i}"), &mut Cursor::new(data.clone()))
+                .unwrap();
+        }
+        e.delete("b1", "k0").unwrap();
+        e.delete("b1", "k1").unwrap();
+        let meta = e.head("b1", "k2").unwrap().unwrap();
+        let pin = e.pin_extents_for_meta(&meta);
+        assert!(e.allocator().is_pinned(0));
+        let r = e.compact_once().unwrap();
+        assert_eq!(r.candidates, 0, "pinned extent must not be compacted");
+        assert!(e.allocator().test_bit(0));
+        let mut out = Vec::new();
+        e.get_to("b1", "k2", 0..u64::MAX, &mut out).unwrap();
+        assert_eq!(out, data);
+        drop(pin);
+        let r2 = e.compact_once().unwrap();
+        assert_eq!(r2.candidates, 1);
+        assert!(!e.allocator().test_bit(0), "unpinned extent can compact");
+        out.clear();
+        e.get_to("b1", "k2", 0..u64::MAX, &mut out).unwrap();
+        assert_eq!(out, data);
+        assert!(e.leaks().unwrap().is_empty());
         e.close().unwrap();
     }
 

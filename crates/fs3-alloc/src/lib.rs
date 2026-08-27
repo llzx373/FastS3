@@ -94,6 +94,8 @@ pub struct Allocator {
     shared: Mutex<HashMap<(u32, u32, u32), u32>>,
     /// 每 extent 读钉扎计数(ADR-22 (c);运行期,不持久化)。
     pin_count: Vec<AtomicU32>,
+    /// ADR-22 (c):live 已归零但仍被读钉扎的 extent,unpin 到 0 后再清位。
+    isolated: Mutex<HashSet<u64>>,
     total_alloc: AtomicU64,
     total_free: AtomicU64,
     n: u64,
@@ -112,6 +114,7 @@ impl Allocator {
                 .collect(),
             shared: Mutex::new(HashMap::new()),
             pin_count: (0..n).map(|_| AtomicU32::new(0)).collect(),
+            isolated: Mutex::new(HashSet::new()),
             total_alloc: AtomicU64::new(0),
             total_free: AtomicU64::new(0),
             n,
@@ -158,8 +161,13 @@ impl Allocator {
         let mut out = Vec::with_capacity(count as usize);
         HINT.with(|hint| {
             let mut h = hint.get();
-            for _ in 0..count {
+            while (out.len() as u64) < count {
                 match self.bitmap.alloc_one(&mut h) {
+                    Some(id) if self.is_pinned(id) => {
+                        // F8-2:钉扎中不得复用;alloc_one 已置位则保持隔离,另找
+                        self.isolated.lock().unwrap().insert(id);
+                        continue;
+                    }
                     Some(id) => {
                         hint.set(h);
                         self.refcounts[id as usize].store(0, Ordering::Release);
@@ -199,12 +207,22 @@ impl Allocator {
         let mut out = None;
         HINT.with(|hint| -> Result<()> {
             let mut h = hint.get();
-            if let Some(id) = self.bitmap.alloc_one_in_range(&mut h, start, count) {
-                hint.set(h);
-                self.refcounts[id as usize].store(0, Ordering::Release);
-                self.generations[id as usize].fetch_add(1, Ordering::Relaxed);
-                self.total_alloc.fetch_add(1, Ordering::Relaxed);
-                out = Some(id);
+            loop {
+                match self.bitmap.alloc_one_in_range(&mut h, start, count) {
+                    Some(id) if self.is_pinned(id) => {
+                        self.isolated.lock().unwrap().insert(id);
+                        continue;
+                    }
+                    Some(id) => {
+                        hint.set(h);
+                        self.refcounts[id as usize].store(0, Ordering::Release);
+                        self.generations[id as usize].fetch_add(1, Ordering::Relaxed);
+                        self.total_alloc.fetch_add(1, Ordering::Relaxed);
+                        out = Some(id);
+                        break;
+                    }
+                    None => break,
+                }
             }
             Ok(())
         })?;
@@ -404,6 +422,11 @@ impl Allocator {
         // live 置零,此处只补位图/状态的最终裁决。
         for &id in &staged.cleared {
             if self.live_bytes[id as usize].load(Ordering::Acquire) > 0 {
+                continue;
+            }
+            if self.is_pinned(id) {
+                // F8-2:钉扎中进隔离队列,unpin 到 0 再清位
+                self.isolated.lock().unwrap().insert(id);
                 continue;
             }
             if self.bitmap.test(id) {
@@ -642,10 +665,33 @@ impl Allocator {
 
     pub fn unpin(&self, ids: &[u64]) {
         for &id in ids {
-            if id < self.n {
-                self.pin_count[id as usize].fetch_sub(1, Ordering::AcqRel);
+            if id >= self.n {
+                continue;
+            }
+            let prev = self.pin_count[id as usize].fetch_sub(1, Ordering::AcqRel);
+            if prev == 1 {
+                self.release_isolated_if_idle(id);
             }
         }
+    }
+
+    fn release_isolated_if_idle(&self, id: u64) {
+        {
+            let mut iso = self.isolated.lock().unwrap();
+            if !iso.remove(&id) {
+                return;
+            }
+        }
+        if self.is_pinned(id) || self.live_bytes_of(id) > 0 {
+            self.isolated.lock().unwrap().insert(id);
+            return;
+        }
+        if self.bitmap.test(id) {
+            self.bitmap.clear_bit(id);
+            self.total_free.fetch_add(1, Ordering::Relaxed);
+        }
+        self.state[id as usize].store(ExtentState::Free as u8, Ordering::Release);
+        self.refcounts[id as usize].store(0, Ordering::Release);
     }
 
     pub fn is_pinned(&self, id: u64) -> bool {
@@ -739,7 +785,7 @@ impl Allocator {
     /// 前提:调用方已确认该 extent 无任何元数据可达(mark-sweep 结论);
     /// 位图未置位则跳过。派生 `live_bytes` 可能仍 >0(账目漂移),一并清零。
     pub fn release_leaked(&self, draft: &mut Staged, id: u64) -> bool {
-        if !self.bitmap.test(id) {
+        if !self.bitmap.test(id) || self.is_pinned(id) {
             return false;
         }
         self.bitmap.clear_bit(id);
@@ -765,7 +811,7 @@ impl Allocator {
     pub fn compaction_candidates(&self, threshold: f64, top_k: usize, capacity: u64) -> Vec<u64> {
         let mut v: Vec<(u64, u64)> = Vec::new();
         for id in 0..self.n {
-            if self.state_of(id) != ExtentState::Sealed {
+            if self.state_of(id) != ExtentState::Sealed || self.is_pinned(id) {
                 continue;
             }
             let lb = self.live_bytes_of(id) as u64;
@@ -875,6 +921,27 @@ mod tests {
         }));
         assert!(panicked.is_err());
         assert_eq!(a.pin_count_of(id), 0, "unwind must unpin");
+        Ok(())
+    }
+
+    /// F8-2:pin 中的 extent 不得被 allocate 重用;unpin 后才可清位回收。
+    #[test]
+    fn allocate_does_not_reuse_pinned() -> Result<()> {
+        let a = Arc::new(Allocator::new(8));
+        let mut d = Staged::default();
+        let id = a.allocate(&mut d, 1)?[0];
+        a.mark_sealed(id);
+        let s = seg(id as u32, 0, 4096);
+        a.add_object(&mut d, std::slice::from_ref(&s));
+        let pin = ReadPin::new(Arc::clone(&a), vec![id]);
+        a.release_object(&mut d, std::slice::from_ref(&s));
+        let _ = a.to_alloc_draft(&d);
+        assert!(a.test_bit(id), "pinned extent stays isolated");
+        let mut d2 = Staged::default();
+        let id2 = a.allocate(&mut d2, 1)?[0];
+        assert_ne!(id2, id, "allocate must not reuse pinned");
+        drop(pin);
+        assert!(!a.test_bit(id), "unpin to 0 releases isolated extent");
         Ok(())
     }
 
