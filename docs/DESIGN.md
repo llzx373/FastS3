@@ -67,7 +67,8 @@
 > LDAP/OIDC → ADR-21(v2.2);IAM 多租户(用户/组/策略/服务账号)→ ADR-28(v2.4);
 > 在线扩容 → ADR-15(v1.4);
 > 纠删码/跨节点复制仍非目标;站点级容灾走 ADR-20 策略化同步(不内置 ?replication)。
-> S3 Select 停售排除。完整现行范围见 [compat.md](./site/docs/reference/compat.md) 与 ADR-5/9/14/22/28。
+> Public Access Block → ADR-23(v2.3);S3 Select 停售排除。完整现行范围见
+> [compat.md](./site/docs/reference/compat.md) 与 ADR-5/9/14/22/23/28。
 
 - 多节点 / 分布式部署(单机内多设备条带化除外);
 - 纠删码、跨节点复制、站点级容灾(交给底层存储);
@@ -1423,6 +1424,91 @@ s3-tests 零新增 API(管理面特性,数据面无新端点);mock LDAP/OIDC
 
 **门禁**:TODO 审查修复 v2.2.1 F1–F8 定向用例 + G 门禁;每条含
 `leaks().is_empty()` / 准入归零 / fd 不线性涨。
+
+#### ADR-23(M17 立项决策):桶级 Public Access Block(BPA)四件事
+
+**背景**:M17「可交付私有化」(v2.3.0;TODO M17)B 组 = Public Access Block
+(≈1 pw)。私有化默认必须「新桶不可匿名公开」;AWS 自 2023-04 起新桶
+默认启用 BPA 四开关,客户对照表与 s3-tests `public_access` 族都按此
+预期。现状:`?publicAccessBlock` / `?policyStatus` 显式 501;Put\*Acl
+已 501;桶策略 Principal `*` 仍可匿名授权;`--allow-anonymous` 可开
+全局匿名读。本 ADR 按 TODO M17/A0-1 写死四件事,实现偏离必须再走
+ADR。账号级 Organizations / S3 Control PublicAccessBlock **不做**
+(单账号模型,M18 租户也不是 AWS 账号)。
+
+**DB1(作用域 = 仅桶级;新桶默认全 Block)**:
+
+1. **实现** `Put/Get/DeletePublicAccessBlock`(`?publicAccessBlock`)与
+   `GetBucketPolicyStatus`(`?policyStatus`)。账号级 PublicAccessBlock
+   (`account_` / S3 Control)在单账号模型下 **显式 501**,消息写明
+   「single-account;account-level BPA is not implemented」。
+2. **新桶默认四开关全部 `true`**(私有化安全默认;与 AWS 新桶默认启用
+   BPA 对齐)。无 `ba:{bucket}` 键 = 视为默认全 Block,Get 仍回显四
+   `true`,不返回 404。DeletePublicAccessBlock **回到该默认**(全
+   Block),**不是**「全开」。
+3. 元数据键 `ba:{bucket}`(ADR-11 D9 桶级配置独立键,经
+   `bucket_conf_key`;值 = 规范化 XML,与 `bo:` Ownership 同口径)。
+   前缀须同步 keys.rs / meta-export/import DTO / check 可达性扫描。
+4. XML 四字段名与 AWS 一致:`BlockPublicAcls` / `IgnorePublicAcls` /
+   `BlockPublicPolicy` / `RestrictPublicBuckets`;缺字段或非
+   `true`/`false` → `MalformedXML`。Put 整份替换,不做字段级 PATCH。
+5. 与 AWS 的差异(须写入 compat.md,禁止静默):
+   - 无账号级 BPA,故无「账号开关 ∪ 桶开关」求并;有效配置 = 仅桶级;
+   - Put\*Acl 恒 501,`BlockPublicAcls=false` 也不能写入 ACL;
+   - canned ACL 头(`public-read` 等)在 IgnorePublicAcls 下不产生公开
+     授权(GetAcl 维持私有桩,见 ADR-6)。
+
+**DB2(四开关语义,与既有 ACL 501 / 桶策略求交)**:
+
+1. **`BlockPublicAcls`**:拒绝会写入公开 ACL 的请求。本实现 PutObjectAcl /
+   PutBucketAcl / 公开 canned 写入路径本已 501,本开关与之**求交**:
+   再 Put\*Acl 仍 501(NotImplemented),不得改成 200。CreateBucket /
+   PutObject 带 `x-amz-acl: public-read|public-read-write|authenticated-read`
+   在本开关为 true 时 403 AccessDenied(先于 501);为 false 时仍走既有
+   ACL 501。私有 canned(`private` / `bucket-owner-full-control`)不受阻。
+2. **`IgnorePublicAcls`**:公开 canned/grant **不生效**。GetAcl / 列表
+   Owner 维持 ADR-6 私有桩;即使历史对象带公开 canned 头,求值时视为
+   私有。本实现本无持久化 ACL 矩阵,本开关的可观察效果 = GetAcl 永不
+   变成 public、匿名不因 canned 放行。
+3. **`BlockPublicPolicy`**:PutBucketPolicy 若文档会使桶**公开**(存在
+   Effect=Allow 且 Principal 为 `*` / `{"AWS":"*"}` 且 Action 覆盖匿名
+   可读或可写:`s3:GetObject` / `s3:PutObject` / `s3:ListBucket` /
+   `s3:*` 及对应通配)→ **403 AccessDenied**(优先)或明确
+   `InvalidPolicyDocument`;compat 钉死一种,测试按 AccessDenied 写。
+   不含 Principal `*` 的策略、仅 Deny、仅已认证 Principal 的策略放行。
+4. **`RestrictPublicBuckets`**:对**已存在**的公开策略停止授权:求值时
+   忽略 Principal `*` 的 Allow(IsPublic=false);已认证请求者仍按其余
+   语句。本开关不删除 `bp:` 文档,GetBucketPolicy 仍回显原文。
+
+**DB3(`GetBucketPolicyStatus.IsPublic` 与四开关 + 策略求交一致)**:
+
+`IsPublic = true` 当且仅当:**当前有效策略**含 Principal `*` 的 Allow
+匿名读或写,**且**未被 BPA 掐断。掐断条件任一成立则 `IsPublic=false`:
+
+- `BlockPublicPolicy=true`(公开策略根本写不进去;若升级前已有公开
+  策略,本开关本身不回溯删除,但新 Put 被拒);
+- `RestrictPublicBuckets=true`(存量公开 Allow 不再生效);
+- 无桶策略 / 策略无 Principal `*` Allow。
+
+`IgnorePublicAcls` / `BlockPublicAcls` 不单独改变 IsPublic(本实现无
+ACL 公开面)。响应 XML:`PolicyStatus/IsPublic`=`true`|`false`。
+
+**DB4(`--allow-anonymous` 不得绕过 BPA)**:
+
+1. `--allow-anonymous` / `auth.allow_anonymous` 仅是进程级「匿名公共读
+   门闩」(既有 REVIEW §3.5:只开 GET/HEAD)。**BPA 优先于该门闩**。
+2. 当 `RestrictPublicBuckets=true`(默认)或有效策略未显式 Allow 匿名时,
+   匿名 GET/HEAD/List **403**,即使 gate 开了匿名读。
+3. 仅当运维显式 Delete 或 Put 将相关开关关掉,**且**桶策略 Principal
+   `*` Allow(或 allow_anonymous 对 GET/HEAD 的既有语义在无公开策略时)
+   才放行。推荐生产:保持默认全 Block,不用 `--allow-anonymous` 当
+   公开站。
+4. 匿名 POST/PUT 仍只认桶策略 Allow,且同样受 `RestrictPublicBuckets`
+   约束;BPA 阻断时 403,不得因 allow_anonymous 放行写。
+
+**门禁口径同步**(TODO M17 门禁):ADR-23 与 BPA 实现无偏离;B1 往返 +
+B2 效果用例 + B3 s3-tests 出集或逐名;账号级 token 维持排除并写
+「单账号 501」。
 
 #### ADR-28(M18 立项决策):IAM 多租户(MinIO 熟悉的用户/组/策略/服务账号)
 

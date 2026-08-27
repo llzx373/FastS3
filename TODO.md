@@ -59,7 +59,7 @@
 
 ### A0 决策落盘
 
-- [ ] A0-1 ADR-23 写入 DESIGN.md §3.3,写死 BPA 四件事(偏离再走 ADR):
+- [x] A0-1 ADR-23 写入 DESIGN.md §3.3,写死 BPA 四件事(偏离再走 ADR):
   **(a)** 作用域 = **仅桶级** `Put/Get/DeletePublicAccessBlock`;账号级 PublicAccessBlock
   在单账号模型下 **显式 501**(不做伪多账号);新桶默认四开关全部 `true`(私有化安全默认;
   与 AWS 新桶默认启用 BPA 对齐,若实现细节有差必须在 compat.md 逐项写出);
