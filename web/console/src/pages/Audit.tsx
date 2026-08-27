@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, fmtTime, type AuditEntry, type AuditFilters } from "../api";
+import { api, fmtTime, getToken, type AuditEntry, type AuditFilters } from "../api";
 
 /** datetime-local 输入值(如 "2026-01-01T08:30") → unix 秒;空字符串 → undefined。 */
 function toUnix(value: string): number | undefined {
@@ -128,6 +128,39 @@ export default function Audit() {
     setFilters({ limit });
   };
 
+  const downloadJsonl = async () => {
+    try {
+      const token = getToken();
+      const headers: Record<string, string> = {};
+      if (token) headers.Authorization = `Bearer ${token}`;
+      const res = await fetch(api.auditExportPath({ ...filters, limit }), { headers });
+      if (res.status === 401) {
+        setError("unauthorized");
+        return;
+      }
+      if (!res.ok) {
+        setError(`导出失败 HTTP ${res.status}`);
+        return;
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "fasts3-audit.jsonl";
+      a.click();
+      URL.revokeObjectURL(url);
+      if (res.headers.get("x-fasts3-truncated") === "true") {
+        const matched = res.headers.get("x-fasts3-matched") ?? "?";
+        const lim = res.headers.get("x-fasts3-limit") ?? "?";
+        setError(`导出已截断: matched=${matched} limit=${lim}(增大 limit 或收窄时间窗)`);
+      } else {
+        setError(null);
+      }
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
+
   const statusColor = (s: number) => (s < 300 ? "var(--green)" : s < 500 ? "var(--amber)" : "var(--red)");
 
   const activeCount = Object.keys(filters).filter((k) => k !== "limit").length;
@@ -230,6 +263,9 @@ export default function Audit() {
           <button onClick={apply}>应用{activeCount > 0 ? `(${activeCount})` : ""}</button>
           <button className="ghost" onClick={() => load(filters)}>
             刷新
+          </button>
+          <button className="ghost" onClick={() => void downloadJsonl()}>
+            下载 JSONL
           </button>
         </div>
       </div>

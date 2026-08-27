@@ -58,6 +58,7 @@
 | `GET /api/uploads` | 在途 multipart 会话 |
 | `POST /api/uploads/{id}/abort` | 强制中止 |
 | `GET /api/audit?since&until&op&bucket&key&who&status&limit` | 审计检索(透传 Rust) |
+| `GET /api/audit/export?since&until&op&bucket&key&who&status&limit` | 审计 JSONL 下载(截断头 `X-FastS3-Truncated`/`Matched`/`Limit`) |
 | `GET /api/config` | 配置视图(applied/restart_required) |
 | `PATCH /api/config` | 部分更新(admin;热字段立即生效) |
 | `POST /api/config/reload` | 热重载配置文件(admin) |

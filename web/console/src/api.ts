@@ -590,6 +590,22 @@ export const api = {
     return request<{ audit: AuditEntry[] }>("GET", `/api/audit?${q}`);
   },
 
+  /** M17/G1:审计 JSONL 下载 URL(同过滤;由页面 fetch blob,避免 JSON 解析)。 */
+  auditExportPath: (opts: AuditFilters = {}) => {
+    const q = new URLSearchParams();
+    q.set("limit", String(opts.limit ?? 10000));
+    if (opts.since !== undefined) q.set("since", String(Math.floor(opts.since)));
+    if (opts.until !== undefined) q.set("until", String(Math.floor(opts.until)));
+    if (opts.op) q.set("op", opts.op);
+    if (opts.bucket) q.set("bucket", opts.bucket);
+    if (opts.key) q.set("key", opts.key);
+    if (opts.who) q.set("who", opts.who);
+    if (opts.status !== undefined) q.set("status", String(Math.floor(opts.status)));
+    if (opts.bypass === true) q.set("bypass", "true");
+    if (opts.bypass === false) q.set("bypass", "false");
+    return `/api/audit/export?${q}`;
+  },
+
   /** J5:首启探测(无认证)。 */
   bootstrap: () => request<BootstrapInfo>("GET", "/api/bootstrap"),
 

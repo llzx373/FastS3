@@ -87,6 +87,21 @@ class FakeAdmin implements AdminApi {
     this.auditCalls.push(opts);
     return { audit: [] };
   }
+  auditExportCalls: AuditQuery[] = [];
+  async auditExport(opts: AuditQuery = {}): Promise<{
+    body: string;
+    truncated: boolean;
+    matched: number;
+    limit: number;
+  }> {
+    this.auditExportCalls.push(opts);
+    return {
+      body: '{"ts":1,"who":"ak","op":"PutObject","bucket":"b","key":"k","status":200,"peer":""}\n',
+      truncated: true,
+      matched: 3,
+      limit: opts.limit ?? 1,
+    };
+  }
   async getConfig(): Promise<AdminConfig> {
     return this.configData;
   }
@@ -212,6 +227,25 @@ test("GET /api/audit: omitted/empty filters default limit=200 and skip others", 
     headers: { authorization: `Bearer ${token}` },
   });
   assert.deepEqual(fake.auditCalls, [{ limit: 200 }]);
+});
+
+test("GET /api/audit/export proxies JSONL and truncation headers", async () => {
+  const fake = new FakeAdmin();
+  const app = makeApp(fake);
+  const token = await loginToken(app);
+  const r = await app.inject({
+    method: "GET",
+    url: "/api/audit/export?since=100&until=200&bucket=b1&key=k&limit=1",
+    headers: { authorization: `Bearer ${token}` },
+  });
+  assert.equal(r.statusCode, 200, r.body);
+  assert.match(String(r.headers["content-type"] ?? ""), /ndjson/);
+  assert.equal(r.headers["x-fasts3-truncated"], "true");
+  assert.equal(r.headers["x-fasts3-matched"], "3");
+  assert.ok(r.body.includes("PutObject"));
+  assert.deepEqual(fake.auditExportCalls, [
+    { limit: 1, since: 100, until: 200, bucket: "b1", key: "k" },
+  ]);
 });
 
 test("GET /api/config proxies admin config (auth required)", async () => {

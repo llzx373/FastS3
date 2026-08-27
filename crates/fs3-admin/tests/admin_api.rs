@@ -107,6 +107,46 @@ fn http_unix(
     (code, body)
 }
 
+/// 同上,另捕获响应头(M17/G1 截断头)。
+fn http_unix_full(
+    sock: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    token: &str,
+) -> (u16, String, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let hdr = dir.path().join("h");
+    let bod = dir.path().join("b");
+    let mut cmd = Command::new("curl");
+    cmd.arg("-s")
+        .arg("-D")
+        .arg(&hdr)
+        .arg("-o")
+        .arg(&bod)
+        .arg("-w")
+        .arg("%{http_code}")
+        .arg("-X")
+        .arg(method)
+        .arg("--unix-socket")
+        .arg(sock)
+        .arg("-H")
+        .arg(format!("Authorization: Bearer {token}"));
+    if let Some(b) = body {
+        cmd.arg("-H").arg("Content-Type: application/json");
+        cmd.arg("-d").arg(b);
+    }
+    cmd.arg(format!("http://localhost{path}"));
+    let out = cmd.output().expect("curl");
+    let code: u16 = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0);
+    let headers = std::fs::read_to_string(&hdr).unwrap_or_default();
+    let body = std::fs::read_to_string(&bod).unwrap_or_default();
+    (code, headers, body)
+}
+
 #[test]
 fn admin_status_metrics_and_auth() {
     let (_d, img) = setup();
@@ -950,5 +990,108 @@ fn archive_metrics_exported_after_glacier_put() {
         body.contains("fasts3_archive_bytes{class=\"GLACIER\"} 10"),
         "GLACIER bytes missing:\n{body}"
     );
+    let _ = handle;
+}
+
+/// M17/G1:JSONL 时间窗导出;行内无 secret;超限截断头。
+#[test]
+fn audit_export_jsonl_time_range() {
+    let (_d, img) = setup();
+    let cfg = EngineConfig {
+        devices: vec![img.clone()],
+        meta_dir: img.parent().unwrap().join("meta"),
+        ..Default::default()
+    };
+    let engine = Arc::new(RwLock::new(Engine::open(&cfg).unwrap()));
+    let service = Arc::new(S3Service::new(
+        engine.clone(),
+        vec![Credentials {
+            access_key: "ak".into(),
+            secret_key: "sk-must-never-leak".into(),
+        }],
+        "us-east-1".into(),
+        false,
+    ));
+    let ring = service.audit();
+    let mk = |ts, bucket: &str, key: &str| fs3_core::audit::AuditEntry {
+        ts,
+        who: "ak".into(),
+        op: "PutObject".into(),
+        bucket: bucket.into(),
+        key: key.into(),
+        status: 200,
+        peer: "127.0.0.1:1".into(),
+        ..Default::default()
+    };
+    ring.push_entry(mk(100, "alpha", "a1"));
+    ring.push_entry(mk(200, "alpha", "a2"));
+    ring.push_entry(mk(300, "beta", "b1"));
+    ring.push_entry(mk(400, "alpha", "a3"));
+
+    let (sock, handle) = start_admin_with(&cfg, engine, service, "t", None);
+    let sock = sock.trim_start_matches("unix://");
+
+    // 时间窗 [150, 350] + bucket=alpha → 仅 ts=200
+    let (code, hdrs, body) = http_unix_full(
+        sock,
+        "GET",
+        "/v1/admin/audit/export?since=150&until=350&bucket=alpha",
+        None,
+        "t",
+    );
+    assert_eq!(code, 200, "{body}");
+    assert!(
+        hdrs.to_ascii_lowercase()
+            .contains("content-type: application/x-ndjson"),
+        "hdrs={hdrs}"
+    );
+    assert!(
+        hdrs.to_ascii_lowercase()
+            .contains("x-fasts3-truncated: false"),
+        "hdrs={hdrs}"
+    );
+    let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 1, "body={body}");
+    let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(v["ts"].as_u64(), Some(200));
+    assert_eq!(v["key"].as_str(), Some("a2"));
+    assert_eq!(v["bucket"].as_str(), Some("alpha"));
+    assert!(
+        !body.contains("sk-must-never-leak") && !body.contains("secret_key"),
+        "export must not contain secret: {body}"
+    );
+
+    // 超限截断
+    let (code, hdrs, body) = http_unix_full(
+        sock,
+        "GET",
+        "/v1/admin/audit/export?bucket=alpha&limit=1",
+        None,
+        "t",
+    );
+    assert_eq!(code, 200, "{body}");
+    let hdrs_l = hdrs.to_ascii_lowercase();
+    assert!(hdrs_l.contains("x-fasts3-truncated: true"), "hdrs={hdrs}");
+    assert!(hdrs_l.contains("x-fasts3-matched: 3"), "hdrs={hdrs}");
+    assert!(hdrs_l.contains("x-fasts3-limit: 1"), "hdrs={hdrs}");
+    let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 1, "truncated page size");
+
+    // 创建密钥后导出仍不含 secret 明文
+    let (code, created) = http_unix(
+        sock,
+        "POST",
+        "/v1/admin/keys",
+        Some(r#"{"access_key":"EXP1","note":"g1"}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "{created}");
+    let secret = serde_json::from_str::<serde_json::Value>(&created).unwrap()["secret_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (_, _, all) = http_unix_full(sock, "GET", "/v1/admin/audit/export", None, "t");
+    assert!(!all.contains(&secret), "JSONL must not contain key secret");
+
     let _ = handle;
 }

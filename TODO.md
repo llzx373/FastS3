@@ -168,7 +168,7 @@
 
 > 等保常点名「访问日志」。完整 `?logging` 不做(网关可替代)。本条把已有审计变成可交接文件。
 
-- [ ] G1 admin `GET /v1/admin/audit/export`(时间窗 + 可选 bucket/key 前缀;JSONL;
+- [x] G1 admin `GET /v1/admin/audit/export`(时间窗 + 可选 bucket/key 前缀;JSONL;
   行内无 secret);控制台审计页提供下载。超限截断有明确头/参数
   - 用例:`audit_export_jsonl_time_range`;导出文件不含密钥明文
 - [ ] G2 compat.md + operations:专节「用审计导出代替 S3 Server Access Logging」;

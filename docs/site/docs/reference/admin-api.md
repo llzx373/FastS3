@@ -79,6 +79,27 @@ curl -sS --unix-socket /run/fasts3/admin.sock \
   'http://localhost/v1/admin/audit?op=object_put&since=1785000000&limit=50'
 ```
 
+### `GET /v1/admin/audit/export`
+
+JSONL 导出(每行一条 `AuditEntry`)。查询参数与 `GET /v1/admin/audit` 相同
+(`since`/`until` 时间窗、`bucket`、`key` 前缀、`op`/`who`/`status`/`bypass`);
+`limit` 默认 10000、封顶 50000。行内无密钥明文。
+
+超限截断头:
+
+- `X-FastS3-Truncated: true|false`
+- `X-FastS3-Matched`: 过滤后总条数
+- `X-FastS3-Limit`: 本响应 limit
+- `Content-Type: application/x-ndjson`
+
+```bash
+curl -sS --unix-socket /run/fasts3/admin.sock \
+  -D - -o audit.jsonl \
+  'http://localhost/v1/admin/audit/export?since=1785000000&until=1785600000&bucket=logs'
+```
+
+控制台审计页提供「下载 JSONL」(代理 `GET /api/audit/export`)。
+
 ## 配置与维护
 
 | 方法/路径 | 说明 |

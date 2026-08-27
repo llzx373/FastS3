@@ -20,6 +20,7 @@
  *   PUT  /api/keys/{access}/policy        密钥策略文档(代理 admin PATCH)
  *   GET  /api/uploads;POST /api/uploads/{id}/abort
  *   GET  /api/audit                       审计查询(limit/since/until/op/bucket/key/who/status/bypass 透传)
+ *   GET  /api/audit/export                审计 JSONL 下载(同过滤;截断头透传)
  *   GET/PATCH /api/config                 运行时配置读取/部分更新(代理 admin)
  *   POST /api/config/reload               热重载配置(代理 admin)
  *   POST /api/repair                      泄漏修复
@@ -1322,6 +1323,52 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       if (q.bypass === "true") filt.bypass = true;
       if (q.bypass === "false") filt.bypass = false;
       return await admin.audit(filt);
+    } catch (e) {
+      return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+    }
+  });
+
+  // M17/G1:审计 JSONL 导出(过滤与 /api/audit 同;截断头透传)
+  app.get<{
+    Querystring: {
+      limit?: string;
+      since?: string;
+      until?: string;
+      op?: string;
+      bucket?: string;
+      key?: string;
+      who?: string;
+      status?: string;
+      bypass?: string;
+    };
+  }>("/api/audit/export", async (req, reply) => {
+    try {
+      const q = req.query;
+      const num = (v: string | undefined): number | undefined => {
+        if (v === undefined || v === "") return undefined;
+        const n = Number(v);
+        return Number.isFinite(n) ? n : undefined;
+      };
+      const filt: Parameters<typeof admin.auditExport>[0] = { limit: num(q.limit) ?? 10000 };
+      const since = num(q.since);
+      const until = num(q.until);
+      const status = num(q.status);
+      if (since !== undefined) filt.since = since;
+      if (until !== undefined) filt.until = until;
+      if (status !== undefined) filt.status = status;
+      if (q.op) filt.op = q.op;
+      if (q.bucket) filt.bucket = q.bucket;
+      if (q.key) filt.key = q.key;
+      if (q.who) filt.who = q.who;
+      if (q.bypass === "true") filt.bypass = true;
+      if (q.bypass === "false") filt.bypass = false;
+      const exp = await admin.auditExport(filt);
+      reply.header("content-type", "application/x-ndjson; charset=utf-8");
+      reply.header("content-disposition", 'attachment; filename="fasts3-audit.jsonl"');
+      reply.header("x-fasts3-truncated", exp.truncated ? "true" : "false");
+      reply.header("x-fasts3-matched", String(exp.matched));
+      reply.header("x-fasts3-limit", String(exp.limit));
+      return reply.send(exp.body);
     } catch (e) {
       return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
     }

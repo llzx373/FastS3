@@ -228,13 +228,23 @@ impl AuditRing {
     /// limit == 0 表示默认 100(与 recent 语义一致)。
     pub fn search(&self, f: &AuditFilter) -> Vec<AuditEntry> {
         let limit = if f.limit == 0 { 100 } else { f.limit.min(5000) };
+        self.search_page(f, limit).0
+    }
+
+    /// 分页检索:返回(本页条目,匹配总数)。`limit` 为 0 时默认 10000。
+    /// 截断判定 = `matched > page.len()`(M17/G1 导出头 `X-FastS3-Truncated`)。
+    pub fn search_page(&self, f: &AuditFilter, limit: usize) -> (Vec<AuditEntry>, usize) {
+        let cap = if limit == 0 { 10_000 } else { limit };
         let buf = self.buf.lock().unwrap();
-        buf.iter()
-            .rev()
-            .filter(|e| f.matches(e))
-            .take(limit)
-            .cloned()
-            .collect()
+        let mut matched = 0usize;
+        let mut out = Vec::new();
+        for e in buf.iter().rev().filter(|e| f.matches(e)) {
+            matched += 1;
+            if out.len() < cap {
+                out.push(e.clone());
+            }
+        }
+        (out, matched)
     }
 
     /// 当前条数。
@@ -335,6 +345,16 @@ mod tests {
         };
         assert_eq!(ring.search(&f).len(), 1);
         // who + status
+        let (page, n) = ring.search_page(
+            &AuditFilter {
+                bucket: Some("b1".into()),
+                ..Default::default()
+            },
+            1,
+        );
+        assert_eq!(page.len(), 1);
+        assert_eq!(n, 2, "截断时 matched 仍为全量");
+
         let f = AuditFilter {
             who: Some("ak1".into()),
             status: Some(404),

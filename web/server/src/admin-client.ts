@@ -22,6 +22,13 @@ export interface AdminApi {
   uploads(): Promise<{ uploads: UploadInfo[] }>;
   abortUpload(uploadId: string): Promise<Record<string, unknown>>;
   audit(opts?: AuditQuery): Promise<{ audit: AuditEntry[] }>;
+  /** M17/G1:审计 JSONL 导出(截断头)。 */
+  auditExport(opts?: AuditQuery): Promise<{
+    body: string;
+    truncated: boolean;
+    matched: number;
+    limit: number;
+  }>;
   getConfig(): Promise<AdminConfig>;
   patchConfig(patch: Record<string, unknown>): Promise<ConfigPatchResult>;
   reloadConfig(): Promise<Record<string, unknown>>;
@@ -179,7 +186,7 @@ export class AdminClient implements AdminApi {
     method: string,
     path: string,
     body?: unknown
-  ): Promise<{ status: number; json: unknown; text: string }> {
+  ): Promise<{ status: number; json: unknown; text: string; headers: http.IncomingHttpHeaders }> {
     return new Promise((resolve, reject) => {
       const headers: Record<string, string> = {};
       if (this.token) headers["authorization"] = `Bearer ${this.token}`;
@@ -202,7 +209,7 @@ export class AdminClient implements AdminApi {
             } catch {
               json = null;
             }
-            resolve({ status: res.statusCode ?? 0, json, text });
+            resolve({ status: res.statusCode ?? 0, json, text, headers: res.headers });
           });
         }
       );
@@ -301,6 +308,46 @@ export class AdminClient implements AdminApi {
     if (opts.bypass === true) q.set("bypass", "true");
     if (opts.bypass === false) q.set("bypass", "false");
     return this.expect("GET", `/v1/admin/audit?${q.toString()}`);
+  }
+
+  /** M17/G1:JSONL 导出,透传过滤条件;截断头原样上送。 */
+  async auditExport(opts: AuditQuery = {}): Promise<{
+    body: string;
+    truncated: boolean;
+    matched: number;
+    limit: number;
+  }> {
+    const q = new URLSearchParams();
+    const limit = opts.limit ?? 10000;
+    if (Number.isFinite(limit)) q.set("limit", String(limit));
+    if (opts.since !== undefined && Number.isFinite(opts.since)) q.set("since", String(opts.since));
+    if (opts.until !== undefined && Number.isFinite(opts.until)) q.set("until", String(opts.until));
+    if (opts.op) q.set("op", opts.op);
+    if (opts.bucket) q.set("bucket", opts.bucket);
+    if (opts.key) q.set("key", opts.key);
+    if (opts.who) q.set("who", opts.who);
+    if (opts.status !== undefined && Number.isFinite(opts.status)) q.set("status", String(opts.status));
+    if (opts.bypass === true) q.set("bypass", "true");
+    if (opts.bypass === false) q.set("bypass", "false");
+    const res = await this.request("GET", `/v1/admin/audit/export?${q.toString()}`);
+    if (res.status !== 200) {
+      const msg =
+        res.json && typeof res.json === "object" && "error" in (res.json as object)
+          ? ((res.json as { error: { message: string } }).error.message)
+          : res.text;
+      throw new Error(`admin GET /v1/admin/audit/export: HTTP ${res.status}: ${msg}`);
+    }
+    const hdr = (k: string): string => {
+      const v = res.headers[k] ?? res.headers[k.toLowerCase()];
+      if (Array.isArray(v)) return v[0] ?? "";
+      return v ?? "";
+    };
+    return {
+      body: res.text,
+      truncated: hdr("x-fasts3-truncated").toLowerCase() === "true",
+      matched: Number(hdr("x-fasts3-matched") || 0),
+      limit: Number(hdr("x-fasts3-limit") || 0),
+    };
   }
 
   /** J5:读取当前运行时配置(代理 GET /v1/admin/config)。 */

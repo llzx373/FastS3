@@ -17,6 +17,7 @@
 //! - `GET  /v1/admin/uploads`                   在途 multipart 会话
 //! - `POST /v1/admin/uploads/{id}/abort`        强制中止会话
 //! - `GET  /v1/admin/audit?limit=`              审计日志
+//! - `GET  /v1/admin/audit/export`              审计 JSONL 导出(时间窗/前缀;截断头)
 //! - `POST /v1/admin/repair`                    泄漏扫描修复(C4)
 //! - `POST /v1/admin/sse/rotate`                SSE-S3 KEK 轮换 + 后台重包裹(M11 K1-1)
 //! - `GET  /v1/admin/sse/status`                KEK 代数/轮换时间/重包裹进度(零密钥材料)
@@ -481,6 +482,7 @@ impl AdminServer {
             ("DELETE", ["sessions", id]) => self.handle_session_delete(id),
             ("GET", ["uploads"]) => self.handle_uploads(),
             ("POST", ["uploads", id, "abort"]) => self.handle_upload_abort(id),
+            ("GET", ["audit", "export"]) => self.handle_audit_export(query),
             ("GET", ["audit"]) => self.handle_audit(query),
             ("GET", ["config"]) => self.handle_config_get(),
             ("PATCH", ["config"]) => self.handle_config_patch(body),
@@ -1446,17 +1448,17 @@ impl AdminServer {
                     }
                 }
                 json::ok(serde_json::json!({
-                "uploads": sessions.iter().map(|(id, s)| {
-                    serde_json::json!({
-                        "upload_id": id,
-                        "bucket": s.bucket,
-                        "key": s.key,
-                        "created": s.created,
-                        "completed": s.completed,
-                        "parts": part_counts.get(id).copied().unwrap_or(0),
-                    })
-                }).collect::<Vec<_>>(),
-            }))
+                    "uploads": sessions.iter().map(|(id, s)| {
+                        serde_json::json!({
+                            "upload_id": id,
+                            "bucket": s.bucket,
+                            "key": s.key,
+                            "created": s.created,
+                            "completed": s.completed,
+                            "parts": part_counts.get(id).copied().unwrap_or(0),
+                        })
+                    }).collect::<Vec<_>>(),
+                }))
             }
             Err(e) => json::err(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1505,6 +1507,55 @@ impl AdminServer {
         };
         let entries = self.service.audit().search(&filter);
         json::ok(serde_json::json!({"audit": entries}))
+    }
+
+    /// M17/G1:审计 JSONL 导出(时间窗 + 可选 bucket/key 前缀)。
+    /// 行内无 secret;超限截断头 `X-FastS3-Truncated` / `X-FastS3-Matched` /
+    /// `X-FastS3-Limit`。默认 limit=10000,封顶 50000。
+    fn handle_audit_export(&self, query: &[(String, String)]) -> Response<String> {
+        let q = |k: &str| query.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone());
+        let limit = q("limit")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(10_000)
+            .min(50_000);
+        let filter = fs3_core::audit::AuditFilter {
+            limit: 0,
+            since: q("since").and_then(|v| v.parse::<i64>().ok()),
+            until: q("until").and_then(|v| v.parse::<i64>().ok()),
+            op: q("op").filter(|v| !v.is_empty()),
+            bucket: q("bucket").filter(|v| !v.is_empty()),
+            key_prefix: q("key").filter(|v| !v.is_empty()),
+            who: q("who").filter(|v| !v.is_empty()),
+            status: q("status").and_then(|v| v.parse::<u16>().ok()),
+            bypass: match q("bypass").as_deref() {
+                Some(v) if v.eq_ignore_ascii_case("true") => Some(true),
+                Some(v) if v.eq_ignore_ascii_case("false") => Some(false),
+                _ => None,
+            },
+        };
+        let (entries, matched) = self.service.audit().search_page(&filter, limit);
+        let truncated = matched > entries.len();
+        let mut body = String::new();
+        for e in &entries {
+            body.push_str(&serde_json::to_string(e).unwrap_or_default());
+            body.push('\n');
+        }
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/x-ndjson; charset=utf-8")
+            .header(
+                "content-disposition",
+                "attachment; filename=\"fasts3-audit.jsonl\"",
+            )
+            .header(
+                "x-fasts3-truncated",
+                if truncated { "true" } else { "false" },
+            )
+            .header("x-fasts3-matched", matched.to_string())
+            .header("x-fasts3-limit", limit.to_string())
+            .header("x-fasts3-returned", entries.len().to_string())
+            .body(body)
+            .unwrap()
     }
 
     /// M6 / J5:当前配置视图(供应器由 fs3d 注入)。
