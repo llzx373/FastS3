@@ -176,7 +176,7 @@ impl ObjectCache {
         inner.keys.insert(k, idx);
         inner.order.push_back(idx);
         inner.total_bytes += len;
-        // 超额度:继续淘汰最久未用
+        // 超额度:继续淘汰最久未用,槽归还 free(F5-4)
         while inner.total_bytes > self.config.max_bytes && !inner.order.is_empty() {
             let victim = inner.order.pop_front().expect("order");
             if let Some(slot) = inner.slots[victim].take() {
@@ -184,12 +184,23 @@ impl ObjectCache {
                 inner.total_bytes -= slot.bytes.len() as u64;
                 self.metrics.evicted.fetch_add(1, Ordering::Relaxed);
             }
+            inner.free.push(victim);
         }
         self.metrics.inserted.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn total_bytes(&self) -> u64 {
         self.inner.lock().unwrap().total_bytes
+    }
+
+    #[cfg(test)]
+    fn debug_free_len(&self) -> usize {
+        self.inner.lock().unwrap().free.len()
+    }
+
+    #[cfg(test)]
+    fn debug_slot_cap(&self) -> usize {
+        self.inner.lock().unwrap().slots.len()
     }
 }
 
@@ -255,5 +266,46 @@ mod tests {
         // 超上限的对象直接不插入
         c.insert("b", "big", None, vec![0u8; 128]);
         assert!(c.get("b", "big", None, 128).is_none());
+    }
+
+    #[test]
+    fn cache_evict_returns_slot_to_free() {
+        let cfg = CacheConfig {
+            enabled: true,
+            max_bytes: 12 * 1024,
+            max_object_size: 8 * 1024,
+        };
+        let c = ObjectCache::new(cfg);
+        let cap = c.debug_slot_cap();
+        for i in 0..3 {
+            c.insert("b", &format!("k{i}"), None, vec![i as u8; 4096]);
+        }
+        let free_before = c.debug_free_len();
+        assert_eq!(free_before, cap - 3);
+        // 第四条触发按字节淘汰:受害槽必须回到 free,否则槽泄漏
+        c.insert("b", "k3", None, vec![9u8; 4096]);
+        assert_eq!(c.debug_free_len(), cap - 3, "evicted slot returned to free");
+        assert!(c.get("b", "k0", None, 4096).is_none(), "LRU victim gone");
+        assert!(c.get("b", "k3", None, 4096).is_some());
+        // 插满再插后仍可插入
+        c.insert("b", "k4", None, vec![7u8; 4096]);
+        assert!(c.get("b", "k4", None, 4096).is_some());
+        assert_eq!(c.total_bytes(), 12 * 1024);
+    }
+
+    #[test]
+    fn cache_object_larger_than_max_bytes_rejected_no_panic() {
+        let cfg = CacheConfig {
+            enabled: true,
+            max_bytes: 64,
+            max_object_size: 1 << 20,
+        };
+        let c = ObjectCache::new(cfg);
+        c.insert("b", "huge", None, vec![1u8; 128]);
+        assert!(c.get("b", "huge", None, 128).is_none());
+        assert_eq!(c.total_bytes(), 0);
+        // 合法小对象仍可插入
+        c.insert("b", "ok", None, vec![2u8; 32]);
+        assert_eq!(c.get("b", "ok", None, 32).unwrap()[0], 2);
     }
 }

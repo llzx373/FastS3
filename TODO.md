@@ -132,7 +132,7 @@ F0 ADR-22
   - 用例:`expired_sts_session_is_deleted_from_meta`——签发 TTL=1s → 睡 2s → 鉴权 InvalidToken → 扫描无该 `s:session` 键;未过期会话仍在
 - [x] F5-3 通知 `retry` HashMap: `truncate_events` 后 `retain` 仍存在的 seq;成功/死信/无目标已 `remove` 保持;worker 关闭时若仍有桶规则,主循环或独立 tick 仍截断 `e:`(或配置互斥:关 worker 则拒绝 PutNotification)
   - 用例:`notification_retry_map_does_not_grow_after_truncate`;`notification_disabled_does_not_unbounded_enqueue`(关 worker 后写入不堆积或显式拒绝)
-- [ ] F5-4 热缓存超 `max_bytes` 淘汰的槽 **push 回 `free`**;单对象 `len > max_bytes` 拒绝插入(不 panic)
+- [x] F5-4 热缓存超 `max_bytes` 淘汰的槽 **push 回 `free`**;单对象 `len > max_bytes` 拒绝插入(不 panic)
   - 用例:`cache_evict_returns_slot_to_free`;`cache_object_larger_than_max_bytes_rejected_no_panic`;插满再插触发淘汰后仍可插入
 - [ ] F5-5 压缩发现扫描纳入版本对象(`vk`)与 `restored_extents`(迁数据、不删锁定版本;恢复副本可迁或显式跳过并文档化,二选一写进 ADR-22 补遗)
   - 用例:`compaction_discovers_versioned_and_restore_extents`(低活 extent 成为候选);锁定版本不回收(沿用 skipped_locked)
