@@ -47,6 +47,9 @@ workspace + web 三件套版本 **2.1.0**。git tag / `tools/package/` 属执行
   落目标桶);All/Current 口径;迁移对账演示。
 - **存储类头接受矩阵**:8 值接受 → 统一落 STANDARD(元数据记录请求类、
   回显实际类);EXPRESS_ONEZONE 显式拒绝。
+  **勘误(v2.2.1 F9-5)**:本条「统一 STANDARD」已被 M16 真实归档覆盖
+  ——`GLACIER_IR`/`GLACIER`/`DEEP_ARCHIVE` 落真实类(见 v2.2.0);
+  IA/IT/RRS 仍映射 STANDARD。以 compat.md 存储类表为准。
 - **协议补完**:UploadPartCopy 源 ?versionId 寻址;expected-bucket-owner;
   密钥状态语义(审计 auth_note 区分禁用/不存在/会话失效)。
 - **门禁**:s3-tests 495/0/249;崩溃 500 轮事件队列混载;perf 关闭态

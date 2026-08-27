@@ -78,7 +78,7 @@ meta-export/import 可见并可往返;真实类独立落 ObjectMeta v7 `storage_
 | 项 | 说明 |
 | --- | --- |
 | 配置 API | `Put/Get/DeleteBucketNotificationConfiguration`(`?notification`;旧名 `PutBucketNotification` 同线格式同语义,单路由承载) |
-| 目标形态 | **Webhook 起步(ADR-18 D-E4)**:`TopicConfiguration` / `QueueConfiguration` / `CloudFunctionConfiguration` 三种容器全部接受,`<Topic>/<Queue>/<CloudFunction>` 内直接携带 **http/https Webhook URL**;容器形态原样回渲染。**SQS/SNS/Lambda ARN 目标显式拒绝**(InvalidArgument)——目标形态后置评估,SNS/SQS/EventBridge 不在 v2.1 |
+| 目标形态 | **Webhook 起步(ADR-18 D-E4)**:`TopicConfiguration` / `QueueConfiguration` / `CloudFunctionConfiguration` 三种容器全部接受,`<Topic>/<Queue>/<CloudFunction>` 内直接携带 **http/https Webhook URL**;容器形态原样回渲染。**`https://` 由数据面 rustls 直连 POST**(审查修复 F6-1),无需前置 TLS 终结器。**SQS/SNS/Lambda ARN 目标显式拒绝**(InvalidArgument)——目标形态后置评估,SNS/SQS/EventBridge 不在 v2.1 |
 | 事件集 | `s3:ObjectCreated:*`(Put/Post/Copy/CompleteMultipartUpload)、`s3:ObjectRemoved:*`(Delete/DeleteMarkerCreated)、`s3:ObjectRestore:*`(注册,M16 后启用投递)、`s3:LifecycleExpiration:*`、`s3:LifecycleTransition`;白名单外事件 → InvalidArgument 显式报错 |
 | 过滤 | AWS `Filter/S3Key/FilterRule`(prefix/suffix 各至多一条;值 ≤1024 字符);不配置 = 全键命中 |
 | 签名 | FastS3 扩展元素 `<FastS3WebhookSecretKey>`(可选):配置即投递时对载荷计算 **HMAC-SHA256 签名**(请求头 `X-FastS3-Signature`);密钥仅存 `n:` 配置值(零日志/零审计)。s3-tests/S3 客户端只发标准 AWS XML 时,投递不带签名头 |

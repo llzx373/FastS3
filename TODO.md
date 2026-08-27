@@ -177,7 +177,7 @@ F0 ADR-22
 - [x] F9-2 `docs/S3-GAP.md` Restore/复制/通知/STS/Inventory 从 ⛔/🔜 改为已交付,残余缺口只列 HTTPS-or-proxy、Batch、BPA 等
 - [x] F9-3 README 当前状态补 M13–M16;「完整 S3」改为与 compat 同口径;Hadoop 保持「未测/规划」
 - [x] F9-4 DESIGN §1.3 V1 非目标加「已被后续 ADR 取代」指向;§4.3 位图权威 / §4.4 键前缀 / 检查点指针 / ETag hex 拼接与 ADR-5/9/14/22 对齐
-- [ ] F9-5 CHANGELOG v2.1 C1「统一 STANDARD」加勘误(被 M16 真实归档覆盖);compat.md Webhook HTTPS 与 F6-1 最终选择一致
+- [x] F9-5 CHANGELOG v2.1 C1「统一 STANDARD」加勘误(被 M16 真实归档覆盖);compat.md Webhook HTTPS 与 F6-1 最终选择一致
 - [ ] F9-6 s3-tests README:notification/归档「出集」改为「上游无测/配置 skip,不以 100% 声称」;N5/A5-1 门禁改为自有集成测试为权威
 - [ ] F9-7 STS/Inventory smoke:无 boto3 **不得 exit 0 当过**(fail 或 skip 非零/明确 SKIP 计数);T3 补 boto3 STS client 或改 TODO 措辞为「Query API 兼容」
 - [ ] F9-8 补 `docs/perf-M15.md`(或 CHANGELOG 声明 M15 perf 以 M16 报告为承接、作废独立文件);门禁数字与仓内报告一致

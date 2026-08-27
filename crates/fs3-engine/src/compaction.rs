@@ -1048,6 +1048,35 @@ mod tests {
         );
     }
 
+    /// F9-5:CHANGELOG v2.1 C1 勘误 + compat Webhook HTTPS 与 F6-1(rustls 直连)一致。
+    #[test]
+    fn changelog_c1_errata_and_compat_webhook_https() {
+        let cl = include_str!("../../../CHANGELOG.md");
+        let v21 = cl
+            .split("## v2.1.0")
+            .nth(1)
+            .and_then(|s| s.split("\n## ").next())
+            .expect("CHANGELOG v2.1.0");
+        assert!(
+            v21.contains("勘误") && v21.contains("M16"),
+            "v2.1 存储类「统一 STANDARD」须有被 M16 覆盖的勘误"
+        );
+        let compat = include_str!("../../../docs/site/docs/reference/compat.md");
+        let notify = compat
+            .split("## 事件通知")
+            .nth(1)
+            .and_then(|s| s.split("\n## ").next())
+            .expect("compat 事件通知");
+        assert!(
+            notify.contains("https") && notify.contains("rustls"),
+            "compat Webhook 须声明 https 由 rustls 直连(F6-1),不得写成仅 http"
+        );
+        assert!(
+            !notify.contains("须前置 TLS 终结"),
+            "F6-1 已实现 HTTPS,compat 不得降级为前置终结器"
+        );
+    }
+
     #[test]
     fn compaction_migrates_locked_object_keeps_retention() {
         // W4-1:压缩可搬锁定版本数据,不可当泄漏回收。
