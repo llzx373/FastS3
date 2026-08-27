@@ -91,7 +91,7 @@
   已 init 则跳过;失败容器非 0 退出并打明确日志。禁止再要求用户 exec init 才能 POC
   - 用例:`tests/container/poc_first_boot.sh`——空数据卷 `docker run` 后 `/health` 200、
     可用内置开发密钥(或打印一次性密钥)对 9000 做 ListBuckets;二次启动不重复 init、数据仍在
-- [ ] T2 compose **poc 配置**(默认):单服务、端口 9000(S3)+ 8080(控制台),数据卷 `./data`;
+- [x] T2 compose **poc 配置**(默认):单服务、端口 9000(S3)+ 8080(控制台),数据卷 `./data`;
   **prod 配置**(profile 或独立文件):数据面/管理面拆分,沿用现双服务。镜像标签与 workspace
   版本一致(现 2.2.1 → 随本版本 bump)。去掉默认拉起的第二 web 演示实例(移到 docs 示例)
   - 用例:文档中的一条命令 `docker compose -f deploy/container/docker-compose.yml up -d --build`

@@ -4,14 +4,14 @@
 
 | 形态 | 说明 |
 | --- | --- |
-| 单容器双进程(默认 ENTRYPOINT) | `docker run` 直接跑,entrypoint.sh 后台起 Node、前台跑 fasts3d,SIGTERM 先停数据面 |
-| 双容器拆分(compose) | `fasts3` 服务(9000)与 `fasts3-web` 服务(8080)共享同一镜像,便于独立扩缩容 |
+| POC 单容器(默认 compose / ENTRYPOINT) | 端口 9000(S3)+ 8080(控制台);entrypoint 首启自动 init |
+| 生产拆分(`docker-compose.prod.yml`) | `fasts3`(9000)与 `fasts3-web`(8080)共享同一镜像,独立扩缩容 |
 
 ## 构建
 
 ```bash
 # 从仓库根(需要 Docker >= 24、BuildKit 默认开启):
-docker build -f deploy/container/Dockerfile -t fasts3:1.0.0 .
+docker build -f deploy/container/Dockerfile -t fasts3:2.2.1 .
 # 或直接用 compose:
 docker compose -f deploy/container/docker-compose.yml build
 ```
@@ -36,7 +36,7 @@ docker run -d --name fasts3 \
   -p 9000:9000 -p 8080:8080 \
   -v "$(pwd)/data:/var/lib/fasts3" \
   --ulimit memlock=-1:-1 \
-  fasts3:1.0.0
+  fasts3:2.2.1
 
 # 3) 验证(首启 entrypoint 自动 init,无需 docker exec init):
 curl -s http://127.0.0.1:9000/health
@@ -61,7 +61,7 @@ docker run -d --name fasts3-raw \
   --ulimit memlock=-1:-1 \
   -v "$(pwd)/data/meta:/var/lib/fasts3/meta" \
   -v "$(pwd)/fasts3.toml:/etc/fasts3/fasts3.toml:ro" \
-  fasts3:1.0.0
+  fasts3:2.2.1
 ```
 
 ### 非 root 形态
@@ -92,22 +92,49 @@ tls_key  = "/etc/fasts3/tls/privkey.pem"
 
 ```bash
 # 数据卷不变,换镜像即可(N-1 原地升级保证,见 docs/site/operations/upgrade.md):
-docker build -f deploy/container/Dockerfile -t fasts3:1.0.0 .
+docker build -f deploy/container/Dockerfile -t fasts3:2.2.1 .
 docker stop fasts3 && docker rm fasts3
-docker run -d --name fasts3 ... fasts3:1.0.0        # 同一组 -v 数据卷
+docker run -d --name fasts3 ... fasts3:2.2.1        # 同一组 -v 数据卷
 # 布局迁移:镜像内 fasts3d upgrade --config /etc/fasts3/fasts3.toml
 # 回滚:退回旧镜像标签重跑即可;磁盘布局迁移失败会自动回滚(N-1 保证)
 ```
 
-## Compose(双服务)
+## Compose(POC 单服务,默认)
 
 ```bash
-cd deploy/container
-cp config/fasts3.example.toml ../config/fasts3.toml 2>/dev/null || true
-docker compose up -d --build
-# 数据面 http://127.0.0.1:9000   管理面 http://127.0.0.1:8080
-docker compose ps
+# 仓库根一条命令 = poc(9000 S3 + 8080 控制台,数据卷 deploy/container/data)
+docker compose -f deploy/container/docker-compose.yml up -d --build
+# S3 http://127.0.0.1:9000   控制台 http://127.0.0.1:8080
+# 开发密钥 fasts3dev/fasts3dev;首启自动 init,无需 docker exec
+docker compose -f deploy/container/docker-compose.yml ps
 ```
 
-细节见 `docker-compose.yml` 内注释(healthcheck 用 `/health` 存活探针,
-TCP 兜底兼容老版本镜像;特权 cap 注释;环境变量与继承关系)。
+生产拆分(数据面 / 管理面):
+
+```bash
+docker compose -f deploy/container/docker-compose.prod.yml up -d --build
+```
+
+第二 web 实例(无状态演示,不进默认 poc;JWT 密钥须与第一实例相同):
+
+```yaml
+# 追加到 prod 文件或独立 override,不要放进默认 poc
+fasts3-web2:
+  image: fasts3:2.2.1
+  entrypoint: ["/usr/bin/node", "/opt/fasts3/web/server/dist/index.js"]
+  ports: ["8081:8080"]
+  depends_on: [fasts3]
+  environment:
+    FS3_WEB_LISTEN: 0.0.0.0:8080
+    FS3_WEB_STATIC: /opt/fasts3/web/console/dist
+    FS3_WEB_JWT_SECRET: change-me-jwt-secret
+    FS3_WEB_USER: admin
+    FS3_WEB_PASSWORD: admin123
+    FS3_ADMIN_LISTEN: tcp://fasts3:9001
+    FS3_ADMIN_TOKEN: change-me
+    FS3_S3_ENDPOINT: http://fasts3:9000
+    FS3_S3_ACCESS_KEY: fasts3dev
+    FS3_S3_SECRET_KEY: fasts3dev
+```
+
+细节见 compose 文件内注释;校验:`tests/container/compose_config.sh`。

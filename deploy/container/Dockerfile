@@ -73,7 +73,7 @@ VOLUME ["/var/lib/fasts3"]
 EXPOSE 9000 8080
 
 ENV FASTS3_CONFIG=/etc/fasts3/fasts3.toml \
-    FS3_WEB_LISTEN=127.0.0.1:8080 \
+    FS3_WEB_LISTEN=0.0.0.0:8080 \
     FS3_WEB_STATIC=/opt/fasts3/web/console/dist
 
 # ── 非 root 运行说明(默认以 root 运行,原因如下)─────────────────────────

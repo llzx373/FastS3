@@ -1,0 +1,52 @@
+# FastS3 生产编排(M17/T2):数据面 / 管理面拆分,共享同一镜像。
+# 用法(仓库根):
+#   docker compose -f deploy/container/docker-compose.prod.yml up -d --build
+# POC 单容器默认见 docker-compose.yml。
+#
+# 镜像标签与 Cargo.toml workspace.package.version 对齐(现 2.2.1)。
+
+services:
+  fasts3:
+    build:
+      context: ../..
+      dockerfile: deploy/container/Dockerfile
+    image: fasts3:2.2.1
+    ports:
+      - "9000:9000"
+    volumes:
+      - ./data:/var/lib/fasts3
+    environment:
+      FASTS3_CONFIG: /etc/fasts3/fasts3.toml
+      FASTS3_INIT_SIZE: ${FASTS3_INIT_SIZE:-20GiB}
+      # 管理通道暴露给 fasts3-web(TCP;默认 unix 跨容器不通)
+      FASTS3_ARGS: --admin-listen tcp://0.0.0.0:9001 --admin-token change-me
+    healthcheck:
+      test: ["CMD", "sh", "-c", "wget -qO- http://127.0.0.1:9000/health >/dev/null 2>&1 || (command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 9000)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  fasts3-web:
+    image: fasts3:2.2.1
+    build:
+      context: ../..
+      dockerfile: deploy/container/Dockerfile
+    entrypoint: ["/usr/bin/node", "/opt/fasts3/web/server/dist/index.js"]
+    ports:
+      - "8080:8080"
+    depends_on:
+      - fasts3
+    environment:
+      FS3_WEB_LISTEN: 0.0.0.0:8080
+      FS3_WEB_STATIC: /opt/fasts3/web/console/dist
+      FS3_WEB_JWT_SECRET: change-me-jwt-secret
+      FS3_WEB_USER: admin
+      FS3_WEB_PASSWORD: admin123
+      FS3_ADMIN_LISTEN: tcp://fasts3:9001
+      FS3_ADMIN_TOKEN: change-me
+      FS3_S3_ENDPOINT: http://fasts3:9000
+      FS3_S3_ACCESS_KEY: fasts3dev
+      FS3_S3_SECRET_KEY: fasts3dev
+    restart: unless-stopped
