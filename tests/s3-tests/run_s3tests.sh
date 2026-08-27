@@ -12,9 +12,11 @@
 # 排除依据与版本映射见 README.md。
 #
 # 用法:
-#   S3TEST_CONF=... ./run_s3tests.sh            # 跑全量并校验排除集
+#   S3TEST_CONF=... ./run_s3tests.sh            # 全量 + 排除集校验(默认 xdist 并行)
+#   S3TESTS_N=0 ./run_s3tests.sh               # 强制串行
 #   ./run_s3tests.sh --list-failed              # 只列出失败(分析用)
-#   前置:fasts3d 已 serve(s3tests.conf 指向);venv 有 pytest + boto3。
+#   前置:fasts3d 已 serve;s3tests.conf fixtures.bucket prefix 含 {random};
+#        /tmp/s3-tests/venv 有 pytest + boto3 + pytest-xdist。
 
 set -u
 # M11 G-1:lifecycle 头用例用本地 naive now 对照 UTC 午夜;非 UTC 时区
@@ -130,10 +132,62 @@ trap 'rm -f "$OUT"' EXIT
 #    = Put*Acl 501 红线,依赖面无法在 gate 内满足;语义由自有集成测试覆盖。
 EXCLUDE='kms|sse_c_post_object_authenticated_request|sse_c_enforced_with_bucket_policy|sse_c_deny_algo_with_bucket_policy|incorrect_algo_sse_s3|test_bucket_list_unordered( -|$)|test_bucket_listv2_unordered( -|$)|test_100_continue( -|$)|test_lifecycle_expiration( -|$)|test_lifecyclev2_expiration( -|$)|test_lifecycle_expiration_tags1( -|$)|test_lifecycle_expiration_tags2( -|$)|test_lifecycle_expiration_versioned_tags2( -|$)|test_lifecycle_expiration_noncur_tags1( -|$)|test_lifecycle_noncur_expiration( -|$)|test_lifecycle_deletemarker_expiration( -|$)|test_lifecycle_deletemarker_expiration_with_days_tag( -|$)|test_lifecycle_multipart_expiration( -|$)|test_delete_marker_expiration( -|$)|test_lifecycle_set_invalid_date( -|$)|test_lifecycle_transition_set_invalid_date( -|$)|test_lifecycle_expiration_size_gt( -|$)|test_lifecycle_expiration_size_lt( -|$)|website|logging|replication|requester_pays|public_access|block_public|account_|bucket_acl|put_bucket_acl|get_bucket_acl|copy_enc\[sse-c-unencrypted|copy_part_enc\[sse-c-unencrypted|copy_enc\[sse-s3-unencrypted|copy_part_enc\[sse-s3-unencrypted|tenant|request_payment|expected_bucket_owner|bucket_create_exists|head_extended|access_bucket|torrent|object_manifest|head_bucket_usage|multipart_upload_owner|_objects_anonymous|anon_put_write_access|not_owned|multipart_resend_first_finishes_last|special_key_names|object_acl|canned|header_acl|public_block|ignore_public|bucket_owner|object_writer|raw_get_object_acl|_v2|existing_tag|request_obj_tag|put_obj_grant|s3_noenc|copy_source|IfExists|policy_acl|put_obj_acl|policy_multipart|policy_upload_part_copy|404_with_policy|policy_status|anonymous_request|success_code|put_acl|return_version_id|delete_marker_nonversioned|delete_object_current_if_match( -|$)'
 
-cd "$S3TESTS" && S3TEST_CONF="$CONF" python3 -m pytest s3tests/functional/test_s3.py -q --tb=no > "$OUT" 2>&1
+# 并行:pytest-xdist --dist load(按用例分发)。桶前缀必须含 {random},
+# 否则 autouse nuke_prefixed_buckets 会删掉其他 worker 的桶。
+# S3TESTS_N=0 强制串行;未设则 min(nproc,16)。优先用 s3-tests/venv。
+if [ -x "$S3TESTS/venv/bin/python3" ]; then
+    PY="$S3TESTS/venv/bin/python3"
+else
+    PY=python3
+fi
+PYTEST_ARGS=(-q --tb=no)
+if "$PY" -c "import xdist" 2>/dev/null; then
+    n="${S3TESTS_N-}"
+    if [ -z "$n" ]; then
+        c=$(nproc 2>/dev/null || echo 8)
+        n=$((c < 16 ? c : 16))
+        [ "$n" -lt 2 ] && n=2
+    fi
+    if [ "$n" != "0" ]; then
+        echo "pytest-xdist: $PY -n $n --dist load"
+        PYTEST_ARGS+=(-n "$n" --dist load)
+    fi
+else
+    echo "warning: pytest-xdist 未安装,串行($PY -m pip install pytest-xdist)"
+fi
+
+# 排除集内 Days 族每例 sleep 3~7×lc_debug_interval(默认 10s)——串行可吃掉十几分钟。
+# 已文档化排除,默认 --deselect 不跑;S3TESTS_SKIP_SLOW_EXCLUDED=0 可复跑核对。
+if [ "${S3TESTS_SKIP_SLOW_EXCLUDED:-1}" != "0" ]; then
+    for t in \
+        test_lifecycle_expiration \
+        test_lifecyclev2_expiration \
+        test_lifecycle_expiration_tags1 \
+        test_lifecycle_expiration_tags2 \
+        test_lifecycle_expiration_versioned_tags2 \
+        test_lifecycle_expiration_noncur_tags1 \
+        test_lifecycle_noncur_expiration \
+        test_lifecycle_deletemarker_expiration \
+        test_lifecycle_deletemarker_expiration_with_days_tag \
+        test_lifecycle_multipart_expiration \
+        test_delete_marker_expiration \
+        test_lifecycle_set_invalid_date \
+        test_lifecycle_transition_set_invalid_date \
+        test_lifecycle_expiration_size_gt \
+        test_lifecycle_expiration_size_lt
+    do
+        PYTEST_ARGS+=(--deselect "s3tests/functional/test_s3.py::$t")
+    done
+    echo "deselect: 15 个 EXCLUDE 长睡眠/恒失败 lifecycle 逐名"
+fi
+
+echo "pytest ${PYTEST_ARGS[*]} s3tests/functional/test_s3.py"
+cd "$S3TESTS" && S3TEST_CONF="$CONF" "$PY" -m pytest s3tests/functional/test_s3.py "${PYTEST_ARGS[@]}" > "$OUT" 2>&1
 TOTAL=$?
 echo "── s3-tests run finished (pytest exit=$TOTAL) ──"
-grep -E "^(FAILED|ERROR)" "$OUT" | sed 's/^FAILED //; s/^ERROR //' > "$OUT.failed" || true
+grep -E "FAILED|ERROR" "$OUT" | grep -E "test_s3\.py" \
+    | sed -E 's/.*FAILED[[:space:]]+//; s/.*ERROR[[:space:]]+//; s/^\[gw[0-9]+\][[:space:]]+//' \
+    > "$OUT.failed" || true
 
 if [ "${1:-}" = "--list-failed" ]; then
     cat "$OUT.failed"

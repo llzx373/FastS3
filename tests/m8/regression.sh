@@ -207,7 +207,7 @@ user = test
 key = secret123
 
 [fixtures]
-bucket prefix = fasts3-ga-
+bucket prefix = fasts3-ga-{random}-
 
 [s3 main]
 access_key = test

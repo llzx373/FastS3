@@ -80,7 +80,8 @@ FastS3 v0.5 的协议一致性门禁 = **已实现特性的完整兼容**。跑 
 #    午夜会把正确的 x-amz-expiration 头判失败(UTC+8 必现)。
 fasts3d serve --config s3tests-server.toml --key test:secret123 --allow-anonymous &
 # 2) 配置 s3tests.conf(host/port/ak/sk 指向上一步;tests/m8/regression.sh 自动生成)
-# 3) 门禁(全量跑 + 排除集校验;脚本无执行位,用 bash 调用;TZ=UTC 由 runner 导出)
+# 3) 门禁(全量 + 排除集;pytest-xdist 并行;`fixtures.bucket prefix` 须含 `{random}`
+#    以免 worker 互删桶;S3TESTS_N=0 串行,默认 min(nproc,16);TZ=UTC 由 runner 导出)
 S3TEST_CONF=/tmp/s3-tests/s3tests.conf bash tests/s3-tests/run_s3tests.sh
 ```
 

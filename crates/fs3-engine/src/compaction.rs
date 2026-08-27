@@ -1223,6 +1223,38 @@ mod tests {
         assert!(t.contains("proc_fd_count"));
     }
 
+    /// G4:s3-tests gate 复跑脚本强制 compaction_enabled=true。
+    #[test]
+    fn g4_s3tests_gate_enables_compaction() {
+        let sh = include_str!("../../../tests/s3-tests/run_g4.sh");
+        assert!(sh.contains("compaction_enabled = true"));
+        assert!(sh.contains("run_s3tests.sh"));
+        assert!(sh.contains("--allow-anonymous"));
+        assert!(
+            sh.contains("{random}"),
+            "G4 桶前缀须含 {{random}} 才能 xdist 并行"
+        );
+        let runner = include_str!("../../../tests/s3-tests/run_s3tests.sh");
+        assert!(
+            runner.contains("--dist load"),
+            "run_s3tests.sh 须 --dist load"
+        );
+        assert!(
+            runner.contains("pytest-xdist"),
+            "run_s3tests.sh 须提及 pytest-xdist"
+        );
+        let gate = include_str!("../../../tests/m8/regression.sh");
+        let marker = "cat > \"$CONF\" <<EOF";
+        let start = gate.find(marker).expect("gate toml");
+        let rest = &gate[start + marker.len()..];
+        let toml = &rest[..rest.find("\nEOF").expect("eof")];
+        assert!(toml.contains("compaction_enabled = true"));
+        assert!(
+            gate.contains("fasts3-ga-{random}-"),
+            "m8 regression s3tests.conf 桶前缀须含 {{random}}"
+        );
+    }
+
     #[test]
     fn compaction_migrates_locked_object_keeps_retention() {
         // W4-1:压缩可搬锁定版本数据,不可当泄漏回收。
