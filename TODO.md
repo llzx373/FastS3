@@ -156,7 +156,7 @@
 - [x] C1 Hadoop S3A 冒烟脚本 `tests/lakehouse/s3a_smoke.sh`:建桶、put/get/list、overwrite、
   条件写(If-None-Match)至少一条;失败即非 0。文档写 `JAVA_HOME`/`HADOOP_HOME`
   - 用例:本机按 AGENT 环境跑通;compat.md Hadoop 从「规划」改为「冒烟通过」并记版本
-- [ ] C2 Spark / Trino:脚本骨架 + 版本钉死(文档写明发行版);环境缺则打印 SKIP 并以非 0
+- [x] C2 Spark / Trino:脚本骨架 + 版本钉死(文档写明发行版);环境缺则打印 SKIP 并以非 0
   或明确 SKIP 计数退出(同 F9-7 纪律)。不把「未装 Spark」写成通过
   - 用例:无 Spark 时输出含 `SKIP`;有环境则一条 parquet 读写往返
 - [ ] C3 Object Lock 不可变仓库形态演练 `tests/backup/immutable_lock_drill.sh`

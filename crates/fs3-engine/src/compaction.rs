@@ -1047,6 +1047,38 @@ mod tests {
         );
     }
 
+    /// M17/C2:Spark/Trino 骨架无环境不得 exit 0;发行版钉死 3.5.3 / 476。
+    #[test]
+    fn spark_trino_smoke_skip_not_pass() {
+        let sh = include_str!("../../../tests/lakehouse/spark_trino_smoke.sh");
+        assert!(sh.contains("PINNED_SPARK=3.5.3"), "须钉死 Spark 3.5.3");
+        assert!(sh.contains("PINNED_TRINO=476"), "须钉死 Trino 476");
+        assert!(sh.contains("echo \"SKIP:"), "须打印 SKIP");
+        assert!(
+            sh.contains("SKIP_COUNT") && sh.contains("exit 77"),
+            "无环境须非零退出或明确 SKIP 计数"
+        );
+        assert!(
+            !sh.contains("exit 0")
+                || sh.contains("spark_trino_smoke: PASS"),
+            "exit 0 仅允许全绿 PASS 路径"
+        );
+        let probe_spark = sh
+            .split("if [ -z \"$SPARK_SUBMIT\" ]; then")
+            .nth(1)
+            .and_then(|s| s.split("fi").next())
+            .expect("spark probe");
+        assert!(
+            !probe_spark.contains("exit 0"),
+            "未装 Spark 不得 exit 0:\n{probe_spark}"
+        );
+        let compat = include_str!("../../../docs/site/docs/reference/compat.md");
+        assert!(
+            compat.contains("spark_trino_smoke.sh") && compat.contains("3.5.3"),
+            "compat Spark/Trino 行须指向骨架与钉死版本"
+        );
+    }
+
     /// F9-4:DESIGN §1.3 标明 V1 非目标已被后续 ADR 取代;§4.3/4.4/4.7 与 ADR-5/9/14/22 对齐。
     #[test]
     fn design_v1_nongoals_and_alloc_meta_aligned() {
