@@ -1427,8 +1427,11 @@ fn cmd_check(cfg: &EngineConfig) -> fs3_core::Result<()> {
         r.extent_count, r.allocated_extents
     );
     println!("buckets:      {}", r.buckets);
-    println!("objects:      {}", r.objects);
-    println!("object bytes: {}", r.total_bytes);
+    println!(
+        "objects:      {} (all versions, incl. delete markers)",
+        r.objects
+    );
+    println!("object bytes: {} (all versions)", r.total_bytes);
     println!("device bytes: {} (Σ 活段;ADR-9 设备占用)", r.live_bytes);
     if r.total_bytes > 0 {
         println!(

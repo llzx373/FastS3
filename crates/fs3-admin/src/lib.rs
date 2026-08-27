@@ -619,6 +619,7 @@ impl AdminServer {
             "buckets": check.buckets,
             "objects": check.objects,
             "object_bytes": check.total_bytes,
+            "object_scope": check.object_scope,
             "keys": self.service.key_count(),
             "io_engine": check.io_engine,
             "checkpoint_seq": check.checkpoint_seq,

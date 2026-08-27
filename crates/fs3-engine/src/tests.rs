@@ -2927,6 +2927,27 @@ fn repair_no_leaks_is_noop() {
     assert!(e.meta().get_object("b1", "x").unwrap().is_some());
 }
 
+/// F7-2:版本化桶 1 key × 2 版本,check_report 计入全部版本条目(非 ListObjects 当前 key)。
+#[test]
+fn check_report_counts_all_object_versions() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    set_versioning(&e, VersioningState::Enabled);
+    let v1 = rnd(1000, 11);
+    let v2 = rnd(2000, 12);
+    e.put("b1", "k", &mut Cursor::new(v1)).unwrap();
+    e.put("b1", "k", &mut Cursor::new(v2)).unwrap();
+    let listed = e.meta().list_objects("b1", "").unwrap();
+    assert_eq!(listed.len(), 1, "ListObjects 仅当前版本");
+    assert_eq!(listed[0].1.size, 2000);
+    let r = e.check_report().unwrap();
+    assert_eq!(r.object_scope, "all_versions");
+    assert_eq!(r.objects, 2, "check 必须计入两个版本条目,got {}", r.objects);
+    assert_eq!(r.total_bytes, 3000, "两版本逻辑字节合计");
+    assert!(r.leaks.is_empty(), "{:?}", r.leaks);
+    e.close().unwrap();
+}
+
 // ─────────────────────────── M4 D4 故障注入 ───────────────────────────
 
 /// 故障注入 I/O 引擎:前 `budget` 次写 submit 成功,其后写操作失败(errno)。

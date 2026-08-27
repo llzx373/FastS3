@@ -181,6 +181,9 @@ pub struct PoolStatus {
 }
 
 /// 只读摘要(check 命令)。
+///
+/// `objects` / `total_bytes` 口径 = **全部版本条目**(含历史版本与删除标记,
+/// F7-2 钉死;`object_scope` = `"all_versions"`)。不是 ListObjects 的当前 key。
 #[derive(Debug, Default)]
 pub struct CheckReport {
     pub device: String,
@@ -189,8 +192,12 @@ pub struct CheckReport {
     pub extent_count: u64,
     pub allocated_extents: u64,
     pub buckets: usize,
+    /// 版本条目数(含历史版本与删除标记)。
     pub objects: usize,
+    /// 上述条目逻辑字节合计(删除标记一般为 0)。
     pub total_bytes: u64,
+    /// 固定 `"all_versions"`,与 JSON/CLI 字段同口径。
+    pub object_scope: &'static str,
     /// 全设备活字节数(ADR-9:设备占用 = Σ 活段;利用率 = live_bytes/逻辑字节)。
     pub live_bytes: u64,
     pub leaks: Vec<u64>,
@@ -6875,11 +6882,10 @@ impl Engine {
         let buckets = self.meta.list_buckets()?;
         let mut objects = 0usize;
         let mut total_bytes = 0u64;
-        for (name, _) in &buckets {
-            for (_, m) in self.meta.list_objects(name, "")? {
-                objects += 1;
-                total_bytes += m.size;
-            }
+        // F7-2:全部 o: 版本条目(含历史/删除标记),禁止只扫 ListObjects 当前版本。
+        for (_, _, _, m) in self.meta.snapshot_all_objects()? {
+            objects += 1;
+            total_bytes += m.size;
         }
         let last_seq = self.meta.last_seq()?;
         let cp_seq = self.checkpoint.lock().unwrap().seq;
@@ -6893,6 +6899,7 @@ impl Engine {
             buckets: buckets.len(),
             objects,
             total_bytes,
+            object_scope: "all_versions",
             live_bytes: self.alloc.live_bytes_total(),
             leaks,
             io_engine: self.io.lock().unwrap().name(),
