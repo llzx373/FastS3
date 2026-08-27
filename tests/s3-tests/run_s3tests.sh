@@ -145,8 +145,10 @@ else
     PY=python3
 fi
 JUNIT="$OUT.junit.xml"
-trap 'rm -f "$OUT" "$OUT.failed" "$JUNIT"' EXIT
+JUNIT_SERIAL="$OUT.junit.serial.xml"
+trap 'rm -f "$OUT" "$OUT.failed" "$JUNIT" "$JUNIT_SERIAL"' EXIT
 PYTEST_ARGS=(-q --tb=line --junitxml="$JUNIT")
+SERIAL_GLOBAL=0
 if "$PY" -c "import xdist" 2>/dev/null; then
     n="${S3TESTS_N-}"
     if [ -z "$n" ]; then
@@ -157,6 +159,13 @@ if "$PY" -c "import xdist" 2>/dev/null; then
     if [ "$n" != "0" ]; then
         echo "pytest-xdist: $PY -n $n --dist load"
         PYTEST_ARGS+=(-n "$n" --dist load)
+        # 这两例断言「整实例 ListBuckets」为空/分页,并行时会被其他 worker 的桶污染。
+        SERIAL_GLOBAL=1
+        PYTEST_ARGS+=(
+            --deselect "s3tests/functional/test_s3.py::test_list_buckets_anonymous"
+            --deselect "s3tests/functional/test_s3.py::test_list_buckets_paginated"
+        )
+        echo "deselect: 2 个全局 ListBuckets 用例(主跑结束后串行补跑)"
     fi
 else
     echo "warning: pytest-xdist 未安装,串行($PY -m pip install pytest-xdist)"
@@ -196,12 +205,31 @@ if [ ! -s "$JUNIT" ]; then
     echo "RESULT: FAIL (no junitxml; pytest likely crashed before reporting)"
     exit 1
 fi
-read -r NPASS NSKIP NFAIL < <("$PY" - "$JUNIT" "$OUT.failed" <<'PY'
+if [ "$SERIAL_GLOBAL" = "1" ]; then
+    echo "serial: drain all buckets then test_list_buckets_anonymous + test_list_buckets_paginated"
+    cd "$S3TESTS" && S3TEST_CONF="$CONF" "$PY" -c '
+from s3tests.functional import configure, get_client, nuke_prefixed_buckets
+configure()
+nuke_prefixed_buckets(prefix="", client=get_client())
+' || true
+    cd "$S3TESTS" && S3TEST_CONF="$CONF" "$PY" -m pytest \
+        s3tests/functional/test_s3.py::test_list_buckets_anonymous \
+        s3tests/functional/test_s3.py::test_list_buckets_paginated \
+        -q --tb=line --junitxml="$JUNIT_SERIAL" >> "$OUT" 2>&1 || true
+    if [ ! -s "$JUNIT_SERIAL" ]; then
+        echo "RESULT: FAIL (serial ListBuckets junitxml missing)"
+        exit 1
+    fi
+    tail -n 4 "$OUT" || true
+fi
+read -r NPASS NSKIP NFAIL < <("$PY" - "$OUT.failed" "$JUNIT" ${JUNIT_SERIAL:+"$JUNIT_SERIAL"} <<'PY'
 import os, sys, xml.etree.ElementTree as ET
-junit, outp = sys.argv[1], sys.argv[2]
+outp = sys.argv[1]
 npass = nskip = 0
 failed = []
-if os.path.isfile(junit) and os.path.getsize(junit) > 0:
+for junit in sys.argv[2:]:
+    if not (os.path.isfile(junit) and os.path.getsize(junit) > 0):
+        continue
     root = ET.parse(junit).getroot()
     suites = root.findall("testsuite") if root.tag == "testsuites" else [root]
     for ts in suites:
