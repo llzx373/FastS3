@@ -162,7 +162,7 @@ F0 ADR-22
 
 > 前置:F3-1(zc Drop 关 fd)。完成前生产默认压缩可保持开启,但 s3-tests 仍关压缩直到本项勾选。
 
-- [ ] F8-1 分配器/引擎:extent `pin_count`;`object_segments_meta` / 零拷贝快照 / 缓冲 GET 流 / MultiRange 入口 pin,对应 `Drop`/结束 unpin(含 abort、客户端断开)
+- [x] F8-1 分配器/引擎:extent `pin_count`;`object_segments_meta` / 零拷贝快照 / 缓冲 GET 流 / MultiRange 入口 pin,对应 `Drop`/结束 unpin(含 abort、客户端断开)
   - 用例:`pin_drop_unpins` RAII;panic/unwind 也 unpin
 - [ ] F8-2 Compactor / lifecycle transition / restore GC:`release_object` 若 `pin_count>0` 则进入隔离队列,unpin 到 0 再清位;禁止把 pin 中的 extent 交给 `allocate`
   - 用例:`compaction_skips_pinned_extent`;`allocate_does_not_reuse_pinned`

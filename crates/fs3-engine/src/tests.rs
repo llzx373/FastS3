@@ -171,6 +171,53 @@ fn put_get_delete_roundtrip() {
     e.close().unwrap();
 }
 
+/// F8-1:缓冲 GET 钉扎;Drop 与 panic unwind 均 unpin。
+#[test]
+fn pin_drop_unpins() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let data = rnd(64 * 1024, 1);
+    e.put("b1", "k", &mut Cursor::new(data)).unwrap();
+    let ids: Vec<u64> = e
+        .head("b1", "k")
+        .unwrap()
+        .unwrap()
+        .extents
+        .iter()
+        .map(|s| u64::from(s.extent_id))
+        .collect();
+    assert!(!ids.is_empty());
+    struct Boom;
+    impl std::io::Write for Boom {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            panic!("get_to unwind");
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = e.get_to("b1", "k", 0..u64::MAX, &mut Boom);
+    }));
+    assert!(panicked.is_err());
+    for id in &ids {
+        assert_eq!(e.allocator().pin_count_of(*id), 0, "unwind must unpin {id}");
+    }
+    {
+        let meta = e.head("b1", "k").unwrap().unwrap();
+        let pin = e.pin_extents_for_meta(&meta);
+        for id in &ids {
+            assert!(e.allocator().pin_count_of(*id) >= 1);
+        }
+        drop(pin);
+    }
+    for id in &ids {
+        assert_eq!(e.allocator().pin_count_of(*id), 0);
+    }
+    assert!(e.leaks().unwrap().is_empty());
+    e.close().unwrap();
+}
+
 #[test]
 fn overwrite_releases_old_segments() {
     let (_d, cfg) = setup();

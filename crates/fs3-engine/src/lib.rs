@@ -51,6 +51,7 @@ pub use crate::compaction::{CompactionConfig, CompactionReport, CompactorMode, R
 pub use crate::restore::{
     LifecycleTransitionOutcome, RestoreEnqueueOutcome, RestoreStats, RestoreWorker,
 };
+pub use fs3_alloc::ReadPin;
 
 #[derive(Clone)]
 pub struct EngineConfig {
@@ -2950,6 +2951,7 @@ impl Engine {
         if start >= end {
             return Ok(0);
         }
+        let _pin = self.pin_extents_for_meta(meta);
         // M13 Z1:压缩对象走解压读路径(明文 → zstd → (SSE) → 落盘的反演:
         // 密文(可选)→ 解密(可选)→ zstd 解压 → Range 窗口裁剪)
         if meta.compressed.is_some() {
@@ -3370,6 +3372,7 @@ impl Engine {
         if offset >= meta.size || buf.is_empty() {
             return Ok(0);
         }
+        let _pin = self.pin_extents_for_meta(meta);
         let want = ((meta.size - offset) as usize).min(buf.len());
         // M13 Z1 补遗(M16 A1 实测暴露):压缩对象流式读必须走解压路径
         // ——此前 read_at_meta 直读存储流(压缩帧)原样输出,流式 GET
@@ -6652,6 +6655,24 @@ impl Engine {
     }
 
     // ─────────────────────────── 零拷贝读路径(B3/D2) ───────────────────────────
+
+    /// ADR-22 (c):对对象当前读视图涉及的 extent 钉扎,Drop 时 unpin。
+    pub fn pin_extents_for_meta(&self, meta: &ObjectMeta) -> ReadPin {
+        let restored_view;
+        let view = match self.restore_plaintext_view(meta) {
+            Some(v) => {
+                restored_view = v;
+                &restored_view
+            }
+            None => meta,
+        };
+        let ids: Vec<u64> = view
+            .extents
+            .iter()
+            .map(|s| u64::from(s.extent_id))
+            .collect();
+        ReadPin::new(Arc::clone(&self.alloc), ids)
+    }
 
     /// 对象数据段(设备偏移 + 长度),裁剪到 [offset, offset+length) 响应区间;
     /// 内联/空对象返回 Some(vec![])。零拷贝读路径用(B3/D2;ADR-9 段级拼接)。

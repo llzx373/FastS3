@@ -807,6 +807,7 @@ fn render_with(
             zc_verify,
             versioning,
             sse_key,
+            read_pin,
         } => {
             // 零拷贝候选(h1 + 设备支持 + 对象 extent 段 + 未开 verify_reads)
             let zc_body = zc.and_then(|(ctx, is_h2)| {
@@ -852,6 +853,7 @@ fn render_with(
                 let zbody = StreamBody::new(ZcBodyStream {
                     inner: Some(body),
                     guard,
+                    read_pin,
                 })
                 .boxed();
                 return builder.body(zbody).unwrap_or_else(|_| {
@@ -869,6 +871,7 @@ fn render_with(
             // 否则缓冲 GET(zipf 小对象、低于零拷贝阈值)吞吐回退约 30%。
             if sse_key.is_some() {
                 tokio::task::spawn_blocking(move || {
+                    let _read_pin = read_pin;
                     let _admit_guard = admit.map(|(a, n)| AdmitGuard::new(a, n));
                     let mut pos = 0u64;
                     let mut buf = vec![0u8; 4 * 1024 * 1024];
@@ -905,6 +908,7 @@ fn render_with(
                 });
             } else {
                 tokio::spawn(async move {
+                    let _read_pin = read_pin;
                     let _admit_guard = admit.map(|(a, n)| AdmitGuard::new(a, n));
                     let mut pos = 0u64;
                     let mut buf = vec![0u8; 4 * 1024 * 1024];
@@ -958,6 +962,7 @@ fn render_with(
             part_content_type,
             versioning,
             sse_key,
+            read_pin,
         } => {
             let total_len: u64 = ranges
                 .iter()
@@ -982,6 +987,7 @@ fn render_with(
             let svc = service.clone();
             if sse_key.is_some() {
                 tokio::task::spawn_blocking(move || {
+                    let _read_pin = read_pin;
                     let _admit_guard = admit.map(|(a, n)| AdmitGuard::new(a, n));
                     let mut buf = vec![0u8; 4 * 1024 * 1024];
                     for (s, e) in &ranges {
@@ -1032,6 +1038,7 @@ fn render_with(
                 });
             } else {
                 tokio::spawn(async move {
+                    let _read_pin = read_pin;
                     let _admit_guard = admit.map(|(a, n)| AdmitGuard::new(a, n));
                     let mut buf = vec![0u8; 4 * 1024 * 1024];
                     for (s, e) in &ranges {
@@ -1109,6 +1116,8 @@ struct ZcBodyStream {
     inner: Option<ZcBody>,
     /// (准入, 字节数):流结束/丢弃时释放。
     guard: Option<(Arc<crate::Admission>, u64)>,
+    /// ADR-22 (c):零拷贝发送期间钉扎,Drop/客户端断开 unpin。
+    read_pin: fs3_engine::ReadPin,
 }
 
 impl Drop for ZcBodyStream {
@@ -1117,6 +1126,7 @@ impl Drop for ZcBodyStream {
             a.release(*n);
         }
         self.inner = None;
+        // read_pin Drop → unpin
     }
 }
 

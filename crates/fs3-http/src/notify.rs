@@ -1031,7 +1031,10 @@ mod tests {
                 Vec::new()
             };
             got2.lock().unwrap().push((headers, body));
-            let _ = tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            let _ = std::io::Write::write_all(
+                &mut tls,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            );
         });
 
         let hook = format!("https://localhost:{}/hooks", addr.port());
@@ -1098,7 +1101,10 @@ mod tests {
             };
             let mut buf = [0u8; 4096];
             let _ = stream.read(&mut buf);
-            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            let _ = std::io::Write::write_all(
+                &mut stream,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            );
             *got2.lock().unwrap() = 200;
         });
         let sender = SimpleWebhookSender::new();

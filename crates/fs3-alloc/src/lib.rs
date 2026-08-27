@@ -21,7 +21,7 @@ pub use checkpointer::Checkpointer;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use fs3_core::AllocDraft;
 use fs3_core::{AllocRecord, CheckpointData, Error, Result, Segment};
@@ -92,6 +92,8 @@ pub struct Allocator {
     /// 仅 COW 复制段,ADR-22)。`release_object`:`n > 1` 只减计数;`n == 1`
     /// 删除条目并 `dec_live`(最后持有者);无条目 = 独占段,直接 `dec_live`。
     shared: Mutex<HashMap<(u32, u32, u32), u32>>,
+    /// 每 extent 读钉扎计数(ADR-22 (c);运行期,不持久化)。
+    pin_count: Vec<AtomicU32>,
     total_alloc: AtomicU64,
     total_free: AtomicU64,
     n: u64,
@@ -109,6 +111,7 @@ impl Allocator {
                 .map(|_| AtomicU8::new(ExtentState::Free as u8))
                 .collect(),
             shared: Mutex::new(HashMap::new()),
+            pin_count: (0..n).map(|_| AtomicU32::new(0)).collect(),
             total_alloc: AtomicU64::new(0),
             total_free: AtomicU64::new(0),
             n,
@@ -134,6 +137,7 @@ impl Allocator {
             .extend((0..count).map(|_| AtomicU32::new(0)));
         self.state
             .extend((0..count).map(|_| AtomicU8::new(ExtentState::Free as u8)));
+        self.pin_count.extend((0..count).map(|_| AtomicU32::new(0)));
         self.n += count;
         self.total_free.fetch_add(count, Ordering::Relaxed);
     }
@@ -623,6 +627,31 @@ impl Allocator {
         (0..self.n).map(|id| self.live_bytes_of(id) as u64).sum()
     }
 
+    pub fn pin_count_of(&self, id: u64) -> u32 {
+        self.pin_count[id as usize].load(Ordering::Acquire)
+    }
+
+    /// ADR-22 (c):读钉扎。对同一 id 多次 pin 可叠加。
+    pub fn pin(&self, ids: &[u64]) {
+        for &id in ids {
+            if id < self.n {
+                self.pin_count[id as usize].fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    pub fn unpin(&self, ids: &[u64]) {
+        for &id in ids {
+            if id < self.n {
+                self.pin_count[id as usize].fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    pub fn is_pinned(&self, id: u64) -> bool {
+        id < self.n && self.pin_count_of(id) > 0
+    }
+
     /// extent 的分配代数(供 extent 头使用)。
     pub fn generation(&self, id: u64) -> u64 {
         self.generations[id as usize].load(Ordering::Relaxed)
@@ -750,6 +779,49 @@ impl Allocator {
     }
 }
 
+/// GET/Range/零拷贝读钉扎守卫(ADR-22 (c)):Drop / panic unwind 均 unpin。
+pub struct ReadPin {
+    alloc: Option<Arc<Allocator>>,
+    ids: Vec<u64>,
+}
+
+impl std::fmt::Debug for ReadPin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadPin").field("ids", &self.ids).finish()
+    }
+}
+
+impl ReadPin {
+    pub fn empty() -> Self {
+        ReadPin {
+            alloc: None,
+            ids: Vec::new(),
+        }
+    }
+
+    pub fn new(alloc: Arc<Allocator>, mut ids: Vec<u64>) -> Self {
+        ids.sort_unstable();
+        ids.dedup();
+        alloc.pin(&ids);
+        ReadPin {
+            alloc: Some(alloc),
+            ids,
+        }
+    }
+
+    pub fn ids(&self) -> &[u64] {
+        &self.ids
+    }
+}
+
+impl Drop for ReadPin {
+    fn drop(&mut self) {
+        if let Some(a) = self.alloc.take() {
+            a.unpin(&self.ids);
+        }
+    }
+}
+
 /// 将递增的 id 列表压缩为 (start, count) 区间。
 fn compress_ranges(ids: &[u64]) -> Vec<(u64, u64)> {
     let mut out: Vec<(u64, u64)> = Vec::new();
@@ -781,6 +853,29 @@ mod tests {
     /// 分配器单测用 mark 集:live_bytes>0 的 extent(与 rebuild 后元数据对齐)。
     fn live_mark(a: &Allocator) -> HashSet<u64> {
         (0..a.len()).filter(|&id| a.live_bytes_of(id) > 0).collect()
+    }
+
+    /// F8-1:ReadPin Drop / panic unwind 都 unpin。
+    #[test]
+    fn pin_drop_unpins() -> Result<()> {
+        let a = Arc::new(Allocator::new(16));
+        let mut d = Staged::default();
+        let id = a.allocate(&mut d, 1)?[0];
+        {
+            let pin = ReadPin::new(Arc::clone(&a), vec![id, id]);
+            assert_eq!(a.pin_count_of(id), 1, "dedup then pin once");
+            assert!(a.is_pinned(id));
+            drop(pin);
+        }
+        assert_eq!(a.pin_count_of(id), 0);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _pin = ReadPin::new(Arc::clone(&a), vec![id]);
+            assert_eq!(a.pin_count_of(id), 1);
+            panic!("pin unwind");
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(a.pin_count_of(id), 0, "unwind must unpin");
+        Ok(())
     }
 
     #[test]

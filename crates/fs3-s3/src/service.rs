@@ -74,6 +74,8 @@ pub enum ResponseBody {
         /// HTTP 层逐块读取时回传 read_stream_chunk 用于解密;SSE-S3 对象
         /// 恒 None——服务端 KEK 体系自持解包,无客户密钥语义,K1-1)。
         sse_key: Option<fs3_core::SseCKey>,
+        /// ADR-22 (c):流式/零拷贝 GET 期间钉扎;HTTP 体 Drop/断开时 unpin。
+        read_pin: fs3_engine::ReadPin,
     },
     /// M9/B4:多段 Range → 206 multipart/byteranges。HTTP 层按段输出
     /// 边界帧 + 段数据(零拷贝禁用;Content-Length 已由服务层算好)。
@@ -94,6 +96,8 @@ pub enum ResponseBody {
         versioning: fs3_core::VersioningState,
         /// SSE-C 客户密钥(同 ObjectStream.sse_key)。
         sse_key: Option<fs3_core::SseCKey>,
+        /// ADR-22 (c):多段 Range 读期间钉扎。
+        read_pin: fs3_engine::ReadPin,
     },
 }
 
@@ -4662,6 +4666,7 @@ impl S3Service {
                             part_content_type: meta.content_type.clone(),
                             versioning: bkt.versioning,
                             sse_key: ssec.map(|s| s.key),
+                            read_pin: engine.pin_extents_for_meta(&meta),
                         }
                     },
                 });
@@ -4832,6 +4837,7 @@ impl S3Service {
         // 零拷贝段(同一锁内算好,避免 HTTP 层重复取锁;版本寻址形态)
         // M11 E1-3:SSE 对象 object_segments_version_for 恒 None(禁零
         // 拷贝,解密走下方 ObjectStream 缓冲路径)
+        let read_pin = engine.pin_extents_for_meta(&meta);
         let zc_segments = engine
             .object_segments_version_for(
                 bucket,
@@ -4859,6 +4865,7 @@ impl S3Service {
                 zc_verify,
                 versioning: bkt.versioning,
                 sse_key: ssec.map(|s| s.key),
+                read_pin,
             },
         })
     }
@@ -5792,6 +5799,7 @@ impl S3Service {
                 )
                 .map_err(|e| map_engine_error(e, bucket, key))?;
         }
+        let read_pin = engine.pin_extents_for_meta(&meta);
         let zc_segments = engine
             .object_segments_version_for(bucket, key, None, start, length, bkt.versioning)
             .ok()
@@ -5812,6 +5820,7 @@ impl S3Service {
                 zc_verify,
                 versioning: bkt.versioning,
                 sse_key: ssec.map(|s| s.key),
+                read_pin,
             },
         })
     }
