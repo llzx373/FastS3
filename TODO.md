@@ -149,7 +149,7 @@ F0 ADR-22
   - 用例:`ldap_sync_events_visible_on_identity_events_endpoint`(不注入 deps.identity,走默认装配)
 - [x] F6-5 LDAP bind 密码:配置加载拒绝把明文密码写入将落盘的 config(或启动时警告 + 文档删除 `security.md` 示例中的 `bind_password` 字段);只允许 env
   - 用例:`ldap_bind_password_not_serialized_to_config_file`
-- [ ] F6-6 `error.rs` 的 `InvalidToken` 注释从「预留:无 STS」改为 T2 语义
+- [x] F6-6 `error.rs` 的 `InvalidToken` 注释从「预留:无 STS」改为 T2 语义
 
 ### F7 `check` / `--fix` 覆盖缺口(依赖 F2、F4)
 

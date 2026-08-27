@@ -75,7 +75,8 @@ pub enum S3ErrorCode {
     InvalidTag,
     /// 预留:server access logging 未实现。
     InvalidTargetBucketForLogging,
-    /// 预留:无 session token/STS(x-amz-security-token 不签发)。
+    /// T2:STS 会话令牌无效。签发记录不存在、过期、已撤销、临时 AK 与会话
+    /// 不匹配,或 SigV4 携带的 `x-amz-security-token` 校验失败(HTTP 403)。
     InvalidToken,
     /// 路径 percent-decode 后非合法 UTF-8(M11 G-1,fs3-http 入口;AWS
     /// 对 \xAE\x8A 一类非法字节序列回 400 本码)。
@@ -511,5 +512,28 @@ mod tests {
             assert!(xml.contains(&format!("{code:?}")), "{code:?}");
             assert!(e.status() >= 300, "{code:?}"); // 304 NotModified 也算条件响应
         }
+    }
+
+    /// F6-6:`InvalidToken` 文档为 T2 已实现语义,不再标「预留:无 STS」。
+    #[test]
+    fn invalid_token_doc_comment_is_t2_not_reserved() {
+        let src = include_str!("error.rs");
+        let enum_body = src
+            .split("impl S3ErrorCode")
+            .next()
+            .expect("enum before impl");
+        assert!(
+            enum_body.contains("/// T2:STS 会话令牌无效"),
+            "InvalidToken must document T2 STS semantics"
+        );
+        assert!(
+            !enum_body.contains("x-amz-security-token 不签发"),
+            "stale reserved-STS comment on InvalidToken must be gone"
+        );
+        assert_eq!(S3ErrorCode::InvalidToken.status(), 403);
+        assert_eq!(
+            S3ErrorCode::InvalidToken.message(),
+            "The provided token is malformed or otherwise invalid."
+        );
     }
 }
