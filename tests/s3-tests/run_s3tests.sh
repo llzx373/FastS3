@@ -22,6 +22,10 @@ set -u
 # M11 G-1:lifecycle 头用例用本地 naive now 对照 UTC 午夜;非 UTC 时区
 # (如 UTC+8)会把正确的 x-amz-expiration 判失败。门禁固定 UTC。
 export TZ=UTC
+# boto3/urllib 会走 HTTP_PROXY;curl 对 127.0.0.1 默认直连。未设 NO_PROXY 时
+# ListBuckets 被代理成 502,autouse setup 全 ERROR(16 路/4 路假红同源)。
+export NO_PROXY="127.0.0.1,localhost,::1${NO_PROXY:+,$NO_PROXY}"
+export no_proxy="$NO_PROXY"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 S3TESTS="${S3TESTS_DIR:-/tmp/s3-tests}"
 CONF="${S3TEST_CONF:-$S3TESTS/s3tests.conf}"
