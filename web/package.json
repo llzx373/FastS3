@@ -3,6 +3,7 @@
   "private": true,
   "version": "2.1.0",
   "description": "FastS3 \u7ba1\u7406\u9762:fasts3-web(Node Fastify)+ console(React/Vite)(M3 \u8d77\u5b9e\u73b0)",
+  "license": "Apache-2.0",
   "engines": {
     "node": ">=20"
   },

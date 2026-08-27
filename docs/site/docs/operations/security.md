@@ -30,7 +30,8 @@
 7. 监控告警接入:Prometheus 指标 + Grafana 仪表盘 + alerts.yml
    (5xx/延迟/时钟回拨/可信时钟偏离/ring 饱和);
 8. 版本与供应链:使用带**签名 + SBOM** 的发布产物;`Cargo.lock`/
-   `pnpm-lock.yaml` 已入库;升级保留 N-1 回滚能力。
+   `pnpm-lock.yaml` 已入库;升级保留 N-1 回滚能力。SBOM 项目组件许可证
+   声明 Apache-2.0(与根 `LICENSE` 同口径)。
 9. **NTP/chrony 常开**(Object Lock 部署硬门槛):保证运行期墙钟不回拨。
    FastS3 保证运行期内单调(回拨不解除保留);**跨停机拨时钟**只以持久化
    `last_wall` 为下界,不能证明停机窗外墙钟未被拨快——见 ADR-13 承诺边界。
@@ -120,6 +121,7 @@
 - **签名**:minisign 优先,openssl pkeyutl ed25519 回退(`tools/package/sign.sh`);
   公钥随 RELEASES 发布;校验:`tools/package/verify-release.sh`。
 - **SBOM**:CycloneDX 1.5(Rust Cargo.lock 全部组件 + web workspace 包;
-  `tools/sbom/sbom.sh`);随发布产物归档。
+  `tools/sbom/sbom.sh`);`metadata.component.licenses` 声明项目口径
+  Apache-2.0;随发布产物归档。
 - **锁定**:Cargo.lock / pnpm-lock.yaml 提交入库;CI 冻结安装
   (`--frozen-lockfile`);依赖漏洞清零双门禁。

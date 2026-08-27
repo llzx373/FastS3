@@ -75,7 +75,7 @@
 > 现状:`Cargo.toml` workspace `license = "Apache-2.0"`,README 写「待定」,无 `LICENSE` 文件,
 > web 包无 license 字段。私有化合同第一行不能含糊。
 
-- [ ] L1 仓库根增加 `LICENSE`(Apache-2.0 全文,与 Cargo.toml 一致);README「许可证」改为 Apache-2.0
+- [x] L1 仓库根增加 `LICENSE`(Apache-2.0 全文,与 Cargo.toml 一致);README「许可证」改为 Apache-2.0
   并指向该文件;web 三件套 `package.json` 补 `"license": "Apache-2.0"`;文档站/compat/SBOM 生成
   物声明同一口径
   - 用例:脚本或测试断言 README 不再含「待定」;三个 `package.json` 与 `Cargo.toml` 的 license 字符串一致

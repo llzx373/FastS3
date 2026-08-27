@@ -973,6 +973,49 @@ mod tests {
         );
     }
 
+    /// M17/L1:仓库许可证口径唯一 Apache-2.0;README 不得含「待定」。
+    #[test]
+    fn license_caliber_apache20_no_pending() {
+        let readme = include_str!("../../../README.md");
+        assert!(
+            !readme.contains("待定"),
+            "README 不得再含「待定」"
+        );
+        assert!(
+            readme.contains("Apache-2.0"),
+            "README 许可证节须声明 Apache-2.0"
+        );
+        assert!(
+            readme.contains("./LICENSE") || readme.contains("](LICENSE)"),
+            "README 须指向 LICENSE 文件"
+        );
+        let cargo = include_str!("../../../Cargo.toml");
+        let ws = cargo
+            .split("[workspace.package]")
+            .nth(1)
+            .and_then(|s| s.split("\n[").next())
+            .expect("[workspace.package]");
+        assert!(
+            ws.contains("license = \"Apache-2.0\""),
+            "Cargo.toml workspace license 须为 Apache-2.0"
+        );
+        for (label, body) in [
+            ("web", include_str!("../../../web/package.json")),
+            ("web/server", include_str!("../../../web/server/package.json")),
+            ("web/console", include_str!("../../../web/console/package.json")),
+        ] {
+            assert!(
+                body.contains("\"license\": \"Apache-2.0\""),
+                "{label}/package.json 须声明 license Apache-2.0"
+            );
+        }
+        let license = include_str!("../../../LICENSE");
+        assert!(
+            license.contains("Apache License") && license.contains("Version 2.0"),
+            "根 LICENSE 须为 Apache-2.0 全文"
+        );
+    }
+
     /// F9-3:README 当前状态含 M13–M16;不以「完整 S3」声称;Hadoop 保持未测/规划。
     #[test]
     fn readme_status_m13_m16_compat_caliber() {

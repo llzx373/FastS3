@@ -5,9 +5,11 @@
 //!
 //! 输出形态(CycloneDX 1.5):
 //!   bomFormat "CycloneDX" / specVersion "1.5" / 随机 serialNumber(urn:uuid:v4)
+//!   metadata.component:FastS3 应用组件,licenses = Apache-2.0(与根 LICENSE 同口径)
 //!   components[]: { type: "library", name, version, purl: "pkg:cargo/<n>@<v>",
-//!                   licenses: [] }(licenses 可为空数组)
-//!   -n 附加的 web 侧 package.json 组件:purl "pkg:npm/<urlencode(name)>@<v>"
+//!                   licenses: [] }(第三方 licenses 可为空数组)
+//!   -n 附加的 web 侧 package.json 组件:purl "pkg:npm/<urlencode(name)>@<v>";
+//!      若 package.json 含 license 字段则写入 licenses
 //!
 //! 依赖最小化:serde/serde_json/toml;时间戳(UTC RFC3339)与 UUID v4 均手写,
 //! 不引入 chrono/uuid。
@@ -34,6 +36,8 @@ struct Bom {
 struct Metadata {
     timestamp: String,
     tools: Vec<Tool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    component: Option<Component>,
 }
 
 #[derive(Serialize, Debug)]
@@ -58,6 +62,12 @@ struct Component {
 struct NpmPkg {
     name: String,
     version: String,
+    #[serde(default)]
+    license: Option<String>,
+}
+
+fn spdx_license_entry(id: &str) -> serde_json::Value {
+    serde_json::json!({ "license": { "id": id } })
 }
 
 fn main() -> ExitCode {
@@ -151,12 +161,17 @@ fn main() -> ExitCode {
             }
         };
         let enc = urlencode_npm_name(&parsed.name);
+        let licenses = parsed
+            .license
+            .as_deref()
+            .map(|id| vec![spdx_license_entry(id)])
+            .unwrap_or_default();
         components.push(Component {
             kind: "library".into(),
             name: parsed.name.clone(),
             version: parsed.version.clone(),
             purl: format!("pkg:npm/{enc}@{v}", v = parsed.version),
-            licenses: Vec::new(),
+            licenses,
         });
     }
 
@@ -172,6 +187,13 @@ fn main() -> ExitCode {
                 name: "fasts3-sbom".into(),
                 version: env!("CARGO_PKG_VERSION").into(),
             }],
+            component: Some(Component {
+                kind: "application".into(),
+                name: "FastS3".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                purl: format!("pkg:generic/FastS3@{}", env!("CARGO_PKG_VERSION")),
+                licenses: vec![spdx_license_entry("Apache-2.0")],
+            }),
         }),
         components,
     };

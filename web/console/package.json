@@ -4,6 +4,7 @@
   "version": "2.2.1",
   "type": "module",
   "description": "FastS3 Web \u63a7\u5236\u53f0(React + Vite + uPlot)",
+  "license": "Apache-2.0",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",

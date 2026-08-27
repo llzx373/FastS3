@@ -49,3 +49,7 @@ FastS3/
 ```
 
 其余设计/路线图文档(仓库内):`docs/DESIGN.md`、`docs/ROADMAP.md`、`TODO.md`。
+
+## 许可证
+
+Apache-2.0,全文见仓库根 [`LICENSE`](https://github.com/example/fasts3/blob/main/LICENSE)。

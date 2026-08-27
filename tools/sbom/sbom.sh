@@ -52,6 +52,12 @@ import json, sys
 with open(sys.argv[1], encoding="utf-8") as f:
     bom = json.load(f)
 assert bom["bomFormat"] == "CycloneDX" and bom["specVersion"] in ("1.5", "1.6")
+comp = (bom.get("metadata") or {}).get("component") or {}
+ids = []
+for lic in comp.get("licenses") or []:
+    if isinstance(lic, dict) and "license" in lic:
+        ids.append(lic["license"].get("id"))
+assert "Apache-2.0" in ids, f"metadata.component 须声明 Apache-2.0, got {ids}"
 kinds = {}
 for c in bom["components"]:
     kinds[c["purl"].split(":", 2)[1].split("/", 1)[0]] = kinds.get(c["purl"].split(":", 2)[1].split("/", 1)[0], 0) + 1

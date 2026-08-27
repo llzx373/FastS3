@@ -7,6 +7,7 @@ site_description: FastS3 单机高性能 S3 服务 —— 安装、部署、运�
 site_url: https://example.com/fasts3/docs   # 占位:替换为真实文档站 URL
 repo_url: https://github.com/example/fasts3 # 占位:替换为真实仓库
 edit_uri: blob/main/docs/site/docs/
+copyright: FastS3 is licensed under the Apache License, Version 2.0. See LICENSE.
 
 # 主题:readthedocs 占位(零依赖开箱);GA 前评估 material 换肤
 #   pip install mkdocs-material 后改 theme: name: material,

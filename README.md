@@ -224,7 +224,7 @@ cd web/server && node dist/index.js       # 启动管理 API(默认 9090;需先�
 
 ## 许可证
 
-待定(将在首个公开版本发布前确定)。
+Apache-2.0。全文见仓库根 [LICENSE](./LICENSE);`Cargo.toml` workspace 与 web 三件套 `package.json` 声明同一字符串。
 
 ---
 

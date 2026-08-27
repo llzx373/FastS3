@@ -29,6 +29,13 @@ Acceleration、Access Points、Directory Buckets / S3 Express、SigV2、
 SSE-KMS / DSSE(无 KMS 托管,参数显式拒绝)。
 s3-tests 排除集方法论见 `tests/s3-tests/README.md`。
 
+## 许可证
+
+源码、文档站与发布 SBOM 的项目组件口径均为 **Apache-2.0**(与仓库根
+`LICENSE`、`Cargo.toml` workspace `license`、web 三件套 `package.json`
+同一字符串)。第三方依赖许可证以 SBOM `components[].licenses` 为准
+(未解析到的可为空数组)。
+
 ## 存储类
 
 v2.2(M16/A,ADR-18 D-E3 + ADR-19 DA1/DA3)接受矩阵(大小写不敏感):
