@@ -5,6 +5,29 @@
 > 详细发布记录见 [RELEASES.md](./RELEASES.md);RC/GA 候选流程见
 > [docs/ga/rc-flow.md](./docs/ga/rc-flow.md)。
 
+## v2.3.0 — M17 可交付私有化(2026-08-27)
+
+M17 全部任务与门禁完成(TODO.md M17 全勾选);ADR-23 落盘 DESIGN.md §3.3;
+workspace + web console/server 版本 **2.3.0**。git tag / `tools/package/`
+属执行期步骤(**本版本不打 tag**,与 v2.2.1 同口径)。
+
+- **开箱**:Apache-2.0 唯一口径;容器首启自动 init;compose poc/prod 拆分;
+  Quickstart「内网一天跑起来」。
+- **退出路径**:三层文档 + `tests/exit/exit_path_drill.sh`(rclone 迁出 md5 +
+  meta-export 往返)。
+- **mc 高并发死锁**:List/Head/GET 离开 reactor;默认同步并发 4;
+  `mc_mirror_concurrency` harness 与 kill -9 ×50 混载。S3-GAP §9 已修复。
+- **Public Access Block**(ADR-23):四开关往返、阻断公开策略/匿名读、
+  s3-tests 出集 6 + 逐名排除。
+- **客户端**:Hadoop S3A 冒烟(JDK 21 + Hadoop 3.4.1);Spark 3.5.3 / Trino 476
+  骨架无环境 SKIP 非 0;Object Lock 不可变仓库演练(无 Veeam 仍绿)。
+- **审计**:`GET /v1/admin/audit/export` JSONL + 控制台下载;`?logging` 维持
+  501 并指向「用审计导出代替 S3 Server Access Logging」。
+- **文档**:S3-GAP Hadoop/BPA/审计同步;tenant/`account_` 逐名定位排除;
+  BlueFS 再评估与归档脱钩。
+- **门禁**:`cargo test --workspace`;D1/T1/C1/C3/X2 演练;clippy `-D warnings`;
+  cargo audit 清零;覆盖率对照 v2.2.1 llvm-cov 行 **84.55%**(+0.14pt,不回退 >1pt)。
+
 ## v2.2.1 — 审查修复:数据正确性与资源生命周期(2026-08-27)
 
 对 v2.2.0 的只读审查修复(TODO 审查修复 F0–G 全勾选);决策落盘 ADR-22

@@ -1,5 +1,22 @@
 # FastS3 发布记录
 
+## v2.3.0 — M17 可交付私有化(2026-08-27)
+
+> 发布状态:与 M17 交付同步;git tag/发布流水线属执行期步骤(与 v2.2.1
+> 同口径,**本版本不打 tag**)。决策记录:ADR-23(docs/DESIGN.md §3.3)。
+
+### 变更(TODO M17 全项:A0/L/T/X/D/B/C/G/F + 门禁)
+
+- **可交付私有化**:许可证唯一、单容器开箱、退出路径演练、mc 死锁根治、
+  桶级 BPA、Hadoop S3A 冒烟、审计 JSONL 导出代替 Logging。
+- **门禁实测**:
+  - `cargo test --workspace` 全绿;
+  - D1 `mc_mirror_concurrency` + T1 poc 首启 + C1 S3A + C3 锁演练 + X2 退出演练;
+  - clippy `-D warnings`;cargo audit 0 漏洞;
+  - 覆盖率 llvm-cov workspace 行 **84.55%**(相对 v2.2.1 84.41% +0.14pt,回退门禁 ≤1pt);
+  - s3-tests 全量意外失败 0(461 passed / 261 文档化排除;BPA 按 B3 出集或逐名,
+    默认 BPA 前置公开 ACL/策略用例见 README「M17 门禁」节)。
+
 ## v2.2.1 — 审查修复:数据正确性与资源生命周期(2026-08-27)
 
 > 发布状态:与审查修复交付同步;git tag/发布流水线属执行期步骤(与 v2.2.0

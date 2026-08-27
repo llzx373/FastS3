@@ -19,7 +19,7 @@ FastS3 v0.5 的协议一致性门禁 = **已实现特性的完整兼容**。跑 
 | DeleteObjects(POST XML,Quiet/Verbose) | s3-tests multi_object_delete | ✅ |
 | SigV4 header/query + 预签名 | s3-tests auth_aws4 + presign | ✅ |
 | 对象与桶 Tagging(PUT/GET/DELETE tagging,上限/尺寸校验,multipart 标签) | s3-tests tagging/`_tags`/`with_tags` 族 | ✅ v1.1(M10 S2) |
-| CORS(SetCORS/Origin 回显/通配/预签名 SigV4) | s3-tests cors 族(非 `_v2`) | ✅ v1.1(M10 S1) |
+| CORS(SetCORS/Origin 回显/通配/预签名 SigV4) | s3-tests cors 族(非 `_v2`) | ✅ v1.1(M10 S1);M17 门禁:匿名 Origin/预签名 6 例因默认 BPA+public-read ACL 前置排除,API 仍由自有测试覆盖 |
 | 桶策略(PutBucketPolicy/Get/Delete,最小 Condition 集:IpAddress/StringEquals/StringLike × s3:prefix/s3:delimiter) | s3-tests bucket_policy/bucketv2/_with_policy 核心 | ✅ v1.1(M10 S3) |
 | POST 表单上传(策略签名认证族:条件/过期/尺寸/键规则) | s3-tests post_object 认证族 | ✅ v1.1(M10 S4) |
 | Ownership controls 纯配置(Get/Put/DeleteBucketOwnershipControls 往返 + 404) | s3-tests create_delete/no_ownership_controls | ✅ v1.1(M10 S7) |
@@ -49,7 +49,7 @@ FastS3 v0.5 的协议一致性门禁 = **已实现特性的完整兼容**。跑 
 | 桶策略单账号身份组(alt 身份不可区分) | 恒排除 | test_bucket_policy_multipart / upload_part_copy / head_object_404_with_policy_prefix:断言 alt 账号被策略拒绝;单账号模型主/备同密钥 → 拒绝不成立。token:policy_multipart/policy_upload_part_copy/404_with_policy(详见「单账号模型限制」) |
 | Block Public Access / GetBucketPolicyStatus / public block 族 | ✅ v2.3 部分出集(M17/B3) | 出集 6 例:`test_get_bucket_policy_status`、`test_get_nonpublicpolicy_principal_bucket_policy_status`、`test_put_public_block`、`test_block_public_object_canned_acls`、`test_block_public_policy`、`test_block_public_policy_with_principal`。逐名保留理由见「M17 B3 实测记录」;账号级 `account_` 维持排除(单账号 501,S3 Control PutPublicAccessBlock)。原族 token public_access/block_public/public_block/ignore_public/policy_status 已移除 |
 | ACL 全矩阵 / canned ACL / grant header / 匿名公开访问 | 不做(方向性排除) | AWS 2023-04 起新桶默认 BucketOwnerEnforced(ACL 默认禁用),与 FastS3 桶策略优先一致;维持私有默认 ACL 最小实现 + Owner;PutBucketAcl/PutObjectAcl 显式 501;s3-tests 2026 新版用例(object_acl*/canned/header_acl/special_key_names 尾部 PutObjectAcl)同集,M8 已同步正则;M10 S5 补 `put_acl`(test_object_put_acl_mtime,PutObjectAcl 501,见「单账号模型限制」恒排表)。token:bucket_acl/put_bucket_acl/get_bucket_acl/object_acl/canned/header_acl/special_key_names/access_bucket/put_acl |
-| 匿名读写语义(gate 服务 --allow-anonymous 下) | 远期 | gate 服务开启匿名读(README「运行」节);匿名写仍拒(anon_put_write_access/raw_get_object_acl 等依赖 public ACL,501/403 预期);`_objects_anonymous` 4 个含 ACL 501 与 allow-anonymous 配置语义对(pair `_fail` 期望拒绝、配置放行);匿名 POST 写组(token anonymous_request/success_code)依赖 public-read-write 桶 ACL;list_buckets_anonymous 翻绿出集,raw_get/raw_put/list_objects_anonymous 收窄或移除(M10 S5) |
+| 匿名读写语义(gate 服务 --allow-anonymous 下) | 远期 | gate 仍开匿名读;ADR-23 (d)`--allow-anonymous` 不得绕过默认 BPA。`list_buckets_anonymous` 仍出集;raw_get/raw_authenticated/expires 与 CORS 匿名 Origin 依赖 CreateBucket public-read,默认 BlockPublicAcls 拒绝(M17 门禁逐名,见下节)。匿名写/POST 仍由 `_objects_anonymous`/`anonymous_request`/`success_code` 覆盖 |
 | ownership 跨账号语义(bucket_owner/object_writer 6 个) | 恒排除 | M10 S7 已交付纯配置往返(2 个出集);保留 6 个断言跨账号 owner 身份(alt client + public policy + ACL 组合),单账号身份映射不可满足(详见「单账号模型限制」)。token:bucket_owner/object_writer |
 | POST 表单上传 SSE/checksum 组 | v1.2 | post_object 认证族已出集(M10 S4);checksum 组已出集(M11 C1:test_post_object_upload_checksum 通过,x-amz-checksum-* 表单字段 policy 覆盖豁免 + 值验算);SSE 组已出集(M11 G-1:test_sse_s3_default_post_object_authenticated_request 通过——桶默认加密对 POST 生效;残余仅 test_encryption_sse_c_post_object_authenticated_request,DE4 裁决,见 SSE-C 行) |
 | 兼容性已知项:`test_bucket_create_exists(_nonowner)`(botocore ClientError 无 .status)、`test_bucket_head_extended`(RGW 专有 x-rgw-object-count) | 长期 | M1 已记录,服务端行为正确;bucket 重建属性(recreate_overwrite_acl)同为已知开放项 |
@@ -64,9 +64,9 @@ FastS3 v0.5 的协议一致性门禁 = **已实现特性的完整兼容**。跑 
 #      [server] listen = "127.0.0.1:19500"
 #      [storage] devices = ["<2GiB 镜像>"] meta_dir = "<meta 目录>" sync_mode = "full"
 #                compaction_enabled = true)
-#    M10 S5 起必须带 --allow-anonymous:cors_origin_response/wildcard 首条断言为匿名 GET;
-#    匿名族翻转影响见排除矩阵「匿名读写语义」行(list_buckets_anonymous 翻绿出集,
-#    _objects_anonymous_fail pair 转为配置语义对,仍由 _objects_anonymous 覆盖)
+#    M10 S5 起必须带 --allow-anonymous(`list_buckets_anonymous` 出集)。
+#    M17 起新桶默认 BPA:cors_origin_*/raw_get 等依赖 public-read ACL 的用例
+#    已逐名排除(ADR-23 (d) 匿名开关不得绕过 BPA),见排除矩阵与「M17 门禁 BPA」节。
 #    审查修复 F8 后 gate 与生产一致:`compaction_enabled = true`(读钉扎 ADR-22 (c)
 #    关闭压缩迁移 × 流式读竞态)。下文 M10/M11 实测记录里的
 #    compaction_enabled=false 是 F8 完成前的缓解环境,不再作为运行要求。
@@ -467,3 +467,21 @@ S3TEST_CONF=/tmp/s3-tests/s3tests.conf bash tests/s3-tests/run_s3tests.sh
 | `test_put_bucket_ownership_bucket_owner_enforced` / `test_put_bucket_ownership_bucket_owner_preferred` / `test_put_bucket_ownership_object_writer` | 同上,token `bucket_owner`/`object_writer` |
 
 相关「单账号模型限制」表(multipart owner / policy alt / put_acl)仍然有效,与本表同属定位而非缺陷。
+
+## M17 门禁:默认 BPA 前置排除(2026-08-27,全量 gate)
+
+> **口径**:新桶四开关默认 `true`(ADR-23)。上游用例在未先 `PutPublicAccessBlock` 全 false
+> 的情况下 CreateBucket `ACL=public-read*` 或 PutBucketPolicy `Principal *` /
+> `AWS:*`,会被 BlockPublicAcls/BlockPublicPolicy 拒绝。这与 AWS 新桶 BPA
+> 默认同向,**不是回退**。`--allow-anonymous` 不得绕过(ADR-23 (d))。
+> 权威效果仍由 `bpa_*` 集成测试覆盖。
+
+全量 `run_g4.sh`(release,`compaction_enabled=true`)实测后逐名纳入 EXCLUDE:
+
+| 组 | 用例 | 前置 |
+| --- | --- | --- |
+| 匿名 raw | `test_object_raw_get` 及其 `_bucket_gone`/`_object_gone`/`_x_amz_expires_*`;`test_object_raw_authenticated*`;`test_object_delete_key_bucket_gone` | `_setup_bucket_object_acl('public-read')` |
+| CORS 匿名 Origin | `test_cors_origin_response`/`wildcard`/`header_option`;`test_cors_presigned_get_object`;`test_cors_presigned_put_object`(+`_with_acl`) | `_setup_bucket_acl(public-read)` |
+| 公开策略 | `test_bucket_policy`/`test_bucketv2_policy` 及 `_another_bucket`;`test_set_get_del_bucket_policy`;`test_multipart_upload_on_a_bucket_with_policy` | Principal `*` / `AWS:*` |
+| POST+ACL | `test_post_object_authenticated_no_content_type`/`_request_bad_access_key`;`test_post_object_success_redirect_action` | `create_bucket(ACL=public-read-write)` |
+| 建桶 ACL | `test_bucket_recreate_overwrite_acl` | `create_bucket(ACL=public-read)` |

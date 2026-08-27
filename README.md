@@ -89,7 +89,9 @@ FastS3 的对策:**不做底层已经做过的事**。工程力量全部投入�
 
 ✅ **M15 迁移即插即用完成(v2.1.0)。** 事件通知(Webhook http/https)+ STS 临时凭证 + S3 Inventory + 存储类头接受矩阵 + UploadPartCopy 源版本寻址。CHANGELOG v2.1.0。
 
-✅ **M16 归档与复制完成(v2.2.0)。** 真实归档类 + RestoreObject + Lifecycle Transition、复制策略化(不内置 ?replication)、LDAP/OIDC;审查修复 v2.2.1 关闭读钉扎与账目窗口。报告 [docs/perf-M16.md](./docs/perf-M16.md)。下一里程碑 **M17 可交付私有化**(任务见 [TODO.md](./TODO.md))。
+✅ **M16 归档与复制完成(v2.2.0)。** 真实归档类 + RestoreObject + Lifecycle Transition、复制策略化(不内置 ?replication)、LDAP/OIDC;审查修复 v2.2.1 关闭读钉扎与账目窗口。报告 [docs/perf-M16.md](./docs/perf-M16.md)。
+
+✅ **M17 可交付私有化完成(v2.3.0)。** Apache-2.0 口径、单容器首启、退出路径演练、mc 高并发死锁根治、桶级 Public Access Block、Hadoop S3A 冒烟、审计 JSONL 导出(代替 Logging)。任务见 [TODO.md](./TODO.md)。
 
 ✅ **M8 GA 发布(v1.0.0)。** 全量回归资产与本地实测(`tests/m8/regression.sh`:客户端 × OS × 内核 × 设备形态逐轴编排 + 汇总;CI 接入 regression.yml);RC1→RC2→GA 候选流程(`tests/m8/rc-gate.sh` + docs/ga/rc-flow.md + CHANGELOG.md);安全审计(自审 14 项全绿 + 外部审计范围,见 docs/ga/security-audit.md);发布流水线复核(签名 + SBOM 229 组件 + 供应链锁定,`tools/package/verify-release.sh` 实测 PASS,版本源统一为 Cargo.toml);官网与公告(文档站新增兼容矩阵/安全基线 CVE 响应/v1.0.0 公告页,mkdocs 0 警告);§1.1 开箱清单逐项证据表(docs/ga/checklist.md)+ 内置示例 `deploy/examples/backup-dir.sh`(实测);GA 检查单复核 → **v1.0.0 发布**(版本号全仓同步)。执行期门禁(真 NVMe §6.8 数值 / 外部审计执行 / rpm·ARM64 真机构建 / Beta 窗口)按 checklist.md 如实标注。RELEASES.md v1.0.0。
 
@@ -103,7 +105,7 @@ FastS3 的对策:**不做底层已经做过的事**。工程力量全部投入�
 | --- | --- |
 | [docs/DESIGN.md](./docs/DESIGN.md) | 总体架构、存储引擎、S3 协议、性能方案、管理面设计(含 ADR-1~5) |
 | [docs/ROADMAP.md](./docs/ROADMAP.md) | 实现规划、WBS 工作分解、里程碑计划、开箱即用验收标准 |
-| [TODO.md](./TODO.md) | 执行清单:当前 M17 v2.3.0;M18 IAM 多租户见 TODO;M15~v2.2.1 已归档 docs/archive/TODO-v2.2.1.md |
+| [TODO.md](./TODO.md) | 执行清单:M17 v2.3.0 已交付;当前 M18 IAM 多租户;M15~v2.2.1 已归档 docs/archive/TODO-v2.2.1.md |
 
 路线图:9 个里程碑(M0~M8,合计约 7 个月)→ v1.0 GA;v0.1 起逐版本发布(引擎 PoC → S3 核心 → 高级语义 → 管理面 → 加固 → 性能冲刺 → 打包开箱 → 文档与 Beta → GA)。
 

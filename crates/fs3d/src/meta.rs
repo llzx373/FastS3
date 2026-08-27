@@ -998,10 +998,17 @@ pub fn run_meta_import(
     drop(store);
 
     // 8) 引擎打开:检查点加载 + 导入记录全量重放(seq > cp.seq)+
-    //    段级可达性重建(引用计数/共享段表/泄漏报告)→ 收尾写新检查点
+    //    段级可达性重建(引用计数/共享段表/泄漏报告)→ 收尾写新检查点。
+    // 单次 CLI 不启后台压缩(与 put/export 的 engine_config 一致):默认
+    // CompactionConfig.enabled=true 会在 check_report 前把半满 extent
+    // 迁走,表现为假泄漏(live_bytes 仍在、旧段尚未入账为 free)。
     let engine_cfg = fs3_engine::EngineConfig {
         devices: vec![device.to_path_buf()],
         meta_dir: meta_dir.to_path_buf(),
+        compaction: fs3_engine::CompactionConfig {
+            enabled: false,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let mut engine = fs3_engine::Engine::open(&engine_cfg)?;
@@ -1202,6 +1209,10 @@ mod tests {
         fs3_engine::EngineConfig {
             devices: vec![device.to_path_buf()],
             meta_dir: meta_dir.to_path_buf(),
+            compaction: fs3_engine::CompactionConfig {
+                enabled: false,
+                ..Default::default()
+            },
             ..Default::default()
         }
     }

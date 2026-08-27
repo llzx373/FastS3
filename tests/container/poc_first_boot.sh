@@ -152,7 +152,7 @@ ok "init 失败非 0 且有明确日志"
 if [ "${FASTS3_POC_DOCKER:-0}" = "1" ]; then
     echo "===== T1 docker run(可选) ====="
     command -v docker >/dev/null 2>&1 || fail "FASTS3_POC_DOCKER=1 但无 docker"
-    IMG="${FASTS3_IMAGE:-fasts3:2.2.1}"
+    IMG="${FASTS3_IMAGE:-fasts3:2.3.0}"
     docker image inspect "$IMG" >/dev/null 2>&1 || fail "镜像 $IMG 不存在(先 docker build)"
     DDIR="$WORK/docker-data"
     mkdir -p "$DDIR"

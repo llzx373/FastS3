@@ -8,11 +8,11 @@ FastS3 是一个**单机 S3 服务**,面向裸块设备 / 磁盘镜像文件的�
 
 - 数据面 + S3 协议:**Rust**(io_uring + thread-per-core + O_DIRECT)
 - 管理面 + Web 控制台:**Node.js**(Fastify + React/Vite),永不进入数据热路径
-- 当前状态:**v2.2.1 已交付**(M0~M16 + 审查修复:GA 候选、版本/锁/加密/生命周期/
-  归档、Webhook/STS/Inventory、LDAP/OIDC、中心纳管与策略化复制)。
+- 当前状态:**v2.3.0 已交付**(M0~M17:可交付私有化——许可证、单容器开箱、
+  退出路径、mc 死锁根治、BPA、Hadoop S3A 冒烟、审计导出)。
   M9~M14 见 [docs/archive/TODO-v2.0.0.md](./docs/archive/TODO-v2.0.0.md);
   M15~v2.2.1 见 [docs/archive/TODO-v2.2.1.md](./docs/archive/TODO-v2.2.1.md)。
-  下一里程碑 **M17 v2.3.0 可交付私有化**(任务与门禁见 TODO.md)。
+  下一里程碑 **M18 v2.4.0 IAM 多租户**(任务与门禁见 TODO.md)。
   git tag / 真 NVMe / 外部审计属人工后置,不进当前 TODO
 
 ## 2. 权威文档(改动任何设计前必读)
@@ -23,7 +23,7 @@ FastS3 是一个**单机 S3 服务**,面向裸块设备 / 磁盘镜像文件的�
 | [docs/DESIGN-FUTURE.md](./docs/DESIGN-FUTURE.md) | 远期规划(v1.1~v2.0)详细设计与实现:§11 决策点清单、键空间/值格式演进纪律、每特性 WBS 与门禁 |
 | [docs/S3-GAP.md](./docs/S3-GAP.md) | 企业级 S3 特性差距分析:现状/缺口/优先级/路线归属;差距收敛标尺 = s3-tests 排除集收敛 |
 | [docs/ROADMAP.md](./docs/ROADMAP.md) | 规划:WBS 工作分解、里程碑与门禁、开箱即用验收标准 |
-| [TODO.md](./TODO.md) | 执行清单:M17 可交付私有化(当前)+ M18 IAM 多租户 + M19 好用的私有化;M15~v2.2.1 已归档 docs/archive/TODO-v2.2.1.md |
+| [TODO.md](./TODO.md) | 执行清单:M17 可交付私有化已交付 + M18 IAM 多租户 + M19 好用的私有化;M15~v2.2.1 已归档 docs/archive/TODO-v2.2.1.md |
 
 **规则:实现行为与 DESIGN.md 冲突时,以 DESIGN.md 为准,并走 ADR 流程修正文档(见 §5),不得静默偏离。**
 

@@ -20,7 +20,7 @@ export AWS_DEFAULT_REGION=us-east-1 AWS_EC2_METADATA_DISABLED=true
 aws --endpoint-url http://127.0.0.1:9000 s3api list-buckets
 ```
 
-镜像标签与 workspace 版本一致(现 `fasts3:2.2.1`)。数据卷
+镜像标签与 workspace 版本一致(现 `fasts3:2.3.0`)。数据卷
 `deploy/container/data`。镜像大小默认 20GiB 稀疏文件,可用
 `FASTS3_INIT_SIZE=64MiB` 缩小试用。细节见 [容器部署](../deployment/container.md)
 与 `deploy/container/README.md`。

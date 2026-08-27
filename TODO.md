@@ -14,7 +14,7 @@
 
 ## 使用约定
 
-1. **当前执行面 = [M17 可交付私有化](#m17-v230-可交付私有化)**。M18 IAM 不得抢跑(M17 门禁未过);M19 不得在 IAM 未交付前当「部门自助」宣传。
+1. **当前执行面 = [M18 IAM 多租户](#m18-v240-iam-多租户)**。M17 门禁已过;M18 未开始前不得抢跑实现。M19 不得在 IAM 未交付前当「部门自助」宣传。
 2. 按里程碑顺序推进;**门禁(退出条件)全部勾选**后方可进入下一里程碑(ROADMAP §5 纪律)。
 3. 每条任务标注所属 WBS 编号,完成时在提交/PR 描述中引用本文件条目。
 4. **决策纪律**:各组首条含 ADR 的必须先落盘——M17 = ADR-23(BPA);
@@ -41,7 +41,7 @@
 
 | 里程碑 | 版本 | 工期(2 人并行) | 核心交付 | 状态 |
 | --- | --- | --- | --- | --- |
-| [M17 可交付私有化](#m17-v230-可交付私有化) | v2.3.0 | ≈3 周 | 许可证对齐、单容器开箱、退出路径、mc 死锁、BPA、湖仓/不可变仓库冒烟、审计导出 | ⬜ 当前 |
+| [M17 可交付私有化](#m17-v230-可交付私有化) | v2.3.0 | ≈3 周 | 许可证对齐、单容器开箱、退出路径、mc 死锁、BPA、湖仓/不可变仓库冒烟、审计导出 | ✅ 已交付 |
 | [M18 IAM 多租户](#m18-v240-iam-多租户) | v2.4.0 | ≈4 周 | MinIO 熟悉的用户/组/策略/服务账号 + 租户隔离;部门管理员自助,不依赖 root | ⬜ 未开始 |
 | [M19 好用的私有化](#m19-v250-好用的私有化) | v2.5.0 | ≈6 周 | 控制台文件柜、保元数据迁入向导、Condition Date*、Kafka 通知、S3 Batch Operations | ⬜ 未开始 |
 
@@ -93,7 +93,7 @@
     可用内置开发密钥(或打印一次性密钥)对 9000 做 ListBuckets;二次启动不重复 init、数据仍在
 - [x] T2 compose **poc 配置**(默认):单服务、端口 9000(S3)+ 8080(控制台),数据卷 `./data`;
   **prod 配置**(profile 或独立文件):数据面/管理面拆分,沿用现双服务。镜像标签与 workspace
-  版本一致(现 2.2.1 → 随本版本 bump)。去掉默认拉起的第二 web 演示实例(移到 docs 示例)
+  版本一致(现 2.3.0)。去掉默认拉起的第二 web 演示实例(移到 docs 示例)
   - 用例:文档中的一条命令 `docker compose -f deploy/container/docker-compose.yml up -d --build`
     对应 poc;prod 文件单独可 `config` 校验
 - [x] T3 文档:Quickstart「内网一天跑起来」(compose poc / 单二进制 `--web-root` 两条);
@@ -185,12 +185,12 @@
 
 ### M17 门禁(退出条件)
 
-- [ ] ADR-23 落盘,与 BPA 实现无偏离
-- [ ] `cargo test --workspace` 全绿;D1 harness + T1 poc 脚本 + C1 S3A + C3 锁演练 + X2 退出演练绿
-- [ ] s3-tests 全量意外失败 0;BPA 按 B3 出集或逐名
-- [ ] 同步默认并发 ≥4 下,M16 双节点 drill 或等价 mirror 往返仍收敛
-- [ ] clippy -D warnings;覆盖率不回退 >1pt(相对 v2.2.1 口径);cargo audit 清零
-- [ ] 发布记录 v2.3.0:CHANGELOG/RELEASES + workspace/web 版本 bump(**不打 git tag、不跑公网 Release**,
+- [x] ADR-23 落盘,与 BPA 实现无偏离
+- [x] `cargo test --workspace` 全绿;D1 harness + T1 poc 脚本 + C1 S3A + C3 锁演练 + X2 退出演练绿
+- [x] s3-tests 全量意外失败 0;BPA 按 B3 出集或逐名
+- [x] 同步默认并发 ≥4 下,M16 双节点 drill 或等价 mirror 往返仍收敛
+- [x] clippy -D warnings;覆盖率不回退 >1pt(相对 v2.2.1 口径);cargo audit 清零
+- [x] 发布记录 v2.3.0:CHANGELOG/RELEASES + workspace/web 版本 bump(**不打 git tag、不跑公网 Release**,
   与既有口径一致;打包脚本可本地跑但不作为本门禁)
 
 ---

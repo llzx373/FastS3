@@ -7,7 +7,7 @@
 ## 镜像内容与形态
 
 镜像把**数据面(Rust)+ 管理面(Node)**打包在一起。镜像标签与
-`Cargo.toml` workspace 版本一致(现 `fasts3:2.2.1`)。
+`Cargo.toml` workspace 版本一致(现 `fasts3:2.3.0`)。
 
 | 形态 | 命令 | 端口 |
 | --- | --- | --- |
@@ -28,12 +28,12 @@
 
 ```bash
 # 仓库根,镜像标签与 workspace 版本对齐:
-docker build -f deploy/container/Dockerfile -t fasts3:2.2.1 .
+docker build -f deploy/container/Dockerfile -t fasts3:2.3.0 .
 docker run -d --name fasts3 \
   -p 9000:9000 -p 8080:8080 \
   -v "$(pwd)/data:/var/lib/fasts3" \
   --ulimit memlock=-1:-1 \
-  fasts3:2.2.1
+  fasts3:2.3.0
 curl -sf http://127.0.0.1:9000/health
 # 开发密钥 fasts3dev/fasts3dev
 ```
@@ -83,9 +83,9 @@ Quickstart 路径 B 逐步命令见 [内网一天跑起来](../getting-started/q
 ## 升级(N-1)
 
 ```bash
-docker build -f deploy/container/Dockerfile -t fasts3:2.2.1 .
+docker build -f deploy/container/Dockerfile -t fasts3:2.3.0 .
 docker stop fasts3 && docker rm fasts3
-docker run -d --name fasts3 ... fasts3:2.2.1    # 同一组 -v 数据卷
+docker run -d --name fasts3 ... fasts3:2.3.0    # 同一组 -v 数据卷
 docker exec fasts3 fasts3d upgrade --config /etc/fasts3/fasts3.toml
 ```
 

@@ -4,14 +4,14 @@
 #   docker compose -f deploy/container/docker-compose.yml up -d --build
 # 生产拆分见 docker-compose.prod.yml;第二 web 实例示例见本目录 README。
 #
-# 镜像标签与 Cargo.toml workspace.package.version 对齐(现 2.2.1)。
+# 镜像标签与 Cargo.toml workspace.package.version 对齐(现 2.3.0)。
 
 services:
   fasts3:
     build:
       context: ../..
       dockerfile: deploy/container/Dockerfile
-    image: fasts3:2.2.1
+    image: fasts3:2.3.0
     ports:
       - "9000:9000"
       - "8080:8080"
