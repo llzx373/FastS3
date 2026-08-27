@@ -1401,6 +1401,10 @@ s3-tests 零新增 API(管理面特性,数据面无新端点);mock LDAP/OIDC
   `restored_inline` / `restored_extents`(明文,`compressed=None`,
   `sse=None`);未恢复仍 403;GLACIER_IR 仍直接读归档流。
 - `check --fix` 不得回收仍被恢复副本引用的 extent。
+- **压缩发现(F5-5 补遗)**:扫描纳入版本键(`vk`)与
+  `restore_state.restored_extents`;迁移数据、不删除锁定版本
+  (W4-1:压缩可搬锁定段,回收只走生命周期 skipped_locked)。
+  恢复副本与主段同样迁移(不跳过)。
 
 **(c) 读钉扎(S8)**:
 

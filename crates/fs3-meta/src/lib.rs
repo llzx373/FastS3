@@ -333,9 +333,12 @@ pub enum Op {
     /// 压缩迁移(ADR-9 §6.2 阶段 3):事务内读对象并校验旧段仍被引用,
     /// 把 `old_segments` 按序替换为 `new_segments`;被并发覆盖/删除 →
     /// 返回 Error::ObjectChanged(调用方放弃该对象,下轮再来)。
+    /// F5-5:`vk = Some` 寻址版本键;`restore_state.restored_extents` 与
+    /// 主段同样重映射。
     ObjectMigrate {
         bucket: String,
         key: String,
+        vk: Option<[u8; 16]>,
         old_segments: Vec<Segment>,
         new_segments: Vec<Segment>,
     },
@@ -3143,12 +3146,16 @@ impl MetaStore {
     /// 压缩迁移事务(ADR-9 §6.2 阶段 3):单对象段列表更新(旧段→新段)+
     /// 分配/释放记录,同事务;**不触碰桶统计**(数据量不变)。
     ///
-    /// 事务内校验旧段仍按序被引用;对象被并发覆盖/删除 → `Error::ObjectChanged`
+    /// `vk = None` 未版本化单键;`Some` 版本键。F5-5 起版本条目与恢复
+    /// 副本段均可迁。
+    ///
+    /// 事务内校验旧段仍被引用;对象被并发覆盖/删除 → `Error::ObjectChanged`
     /// (调用方放弃该对象,下轮再来;乐观事务冲突自动重试)。
     pub fn commit_object_migrate(
         &self,
         bucket: &str,
         key: &str,
+        vk: Option<&[u8; 16]>,
         old_segments: &[Segment],
         new_segments: &[Segment],
         draft: AllocDraft,
@@ -3157,6 +3164,7 @@ impl MetaStore {
             Op::ObjectMigrate {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
+                vk: vk.copied(),
                 old_segments: old_segments.to_vec(),
                 new_segments: new_segments.to_vec(),
             },
@@ -3904,37 +3912,52 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
             Op::ObjectMigrate {
                 bucket,
                 key,
+                vk,
                 old_segments,
                 new_segments,
             } => {
-                let k = object_key(bucket, key);
+                let k = match vk {
+                    Some(vk) => object_version_key(bucket, key, vk),
+                    None => object_key(bucket, key),
+                };
                 let cur = tget(tx, &k)?.ok_or_else(|| {
                     Error::ObjectChanged(format!("{bucket}/{key} deleted during compaction"))
                 })?;
                 let mut meta = decode_object(&cur)?;
-                // 快照隔离 + 乐观重试:旧段必须仍按序被引用,否则放弃该对象
-                // (ADR-9 §6.2 阶段 3:对象被并发覆盖/删除 → 下轮再来)。
                 if old_segments.len() != new_segments.len() {
                     return Err(Error::ObjectChanged(format!(
                         "{bucket}/{key} segment mapping mismatch"
                     )));
                 }
-                let mut ptr = 0usize;
-                let mut out: Vec<Segment> = Vec::with_capacity(meta.extents.len());
-                for s in &meta.extents {
-                    if ptr < old_segments.len() && *s == old_segments[ptr] {
-                        out.push(new_segments[ptr].clone());
-                        ptr += 1;
-                    } else {
-                        out.push(s.clone());
-                    }
-                }
-                if ptr != old_segments.len() {
+                let remap = |list: &[Segment]| -> (Vec<Segment>, usize) {
+                    let mut n = 0usize;
+                    let out = list
+                        .iter()
+                        .map(|s| {
+                            if let Some(i) = old_segments.iter().position(|o| o == s) {
+                                n += 1;
+                                new_segments[i].clone()
+                            } else {
+                                s.clone()
+                            }
+                        })
+                        .collect();
+                    (out, n)
+                };
+                let (ext, n_ext) = remap(&meta.extents);
+                let (rest, n_rest) = match &meta.restore_state {
+                    Some(st) => remap(&st.restored_extents),
+                    None => (Vec::new(), 0),
+                };
+                if n_ext + n_rest != old_segments.len() {
                     return Err(Error::ObjectChanged(format!(
                         "{bucket}/{key} segments changed during compaction"
                     )));
                 }
-                meta.extents = out;
+                meta.extents = ext;
+                if let Some(st) = meta.restore_state.as_mut() {
+                    st.restored_extents = rest;
+                }
                 tinsert(tx, k, meta.encode_value()?)?;
             }
             Op::PartMigrate {
@@ -5338,6 +5361,7 @@ mod tests {
         s.commit_object_migrate(
             "b1",
             "k",
+            None,
             &old,
             &new,
             AllocDraft {
@@ -5351,12 +5375,12 @@ mod tests {
         assert_eq!(got.extents, new);
         assert_eq!(got.size, 200_000, "元数据其余字段不变");
         // 旧段已不存在 → ObjectChanged(对象被并发覆盖/删除的模拟)
-        let r = s.commit_object_migrate("b1", "k", &old, &new, AllocDraft::default());
+        let r = s.commit_object_migrate("b1", "k", None, &old, &new, AllocDraft::default());
         assert!(matches!(r, Err(Error::ObjectChanged(_))));
         // 对象已删除 → ObjectChanged(不得复活)
         s.commit_object_delete("b1", "k", AllocDraft::default(), StatsDelta::default())
             .unwrap();
-        let r = s.commit_object_migrate("b1", "k", &new, &old, AllocDraft::default());
+        let r = s.commit_object_migrate("b1", "k", None, &new, &old, AllocDraft::default());
         assert!(matches!(r, Err(Error::ObjectChanged(_))));
     }
 

@@ -113,10 +113,18 @@ pub struct CompactionReport {
 }
 
 /// 迁移目标:对象或分片(REVIEW §3.8:发现阶段覆盖 o: 与 p: 双前缀)。
+/// F5-5:对象目标带 vk(None = 未版本化单键)。
 #[derive(Debug, Clone)]
 enum PlanTarget {
-    Object { bucket: String, key: String },
-    Part { upload_id: String, part_no: u32 },
+    Object {
+        bucket: String,
+        key: String,
+        vk: Option<[u8; 16]>,
+    },
+    Part {
+        upload_id: String,
+        part_no: u32,
+    },
 }
 
 /// 迁移计划项:一个目标 + 其在候选 extent 中的段(按 extents 列表顺序)。
@@ -293,18 +301,25 @@ impl Compactor {
         report.parts_scanned = parts.len();
         let mut plan: Vec<PlanItem> = Vec::new();
         for (bucket, key, vk, m) in &objects {
-            // 版本化条目(vk = Some)与删除标记不在压缩迁移范围:
-            // ObjectMigrate 只写未版本化键,版本条目的段迁移留待后续里程碑
-            // (此处跳过 = 安全地不回收,绝不误写未版本化键)。
-            if vk.is_some() || m.is_delete_marker {
+            // 删除标记无数据段。F5-5:版本键与 restore 副本纳入发现;
+            // 锁定版本迁数据、不删对象(W4-1 skipped_locked 口径 = 不回收)。
+            if m.is_delete_marker {
                 continue;
             }
-            let old: Vec<Segment> = m
+            let mut old: Vec<Segment> = m
                 .extents
                 .iter()
                 .filter(|s| candidates.contains(&(s.extent_id as u64)))
                 .cloned()
                 .collect();
+            if let Some(st) = &m.restore_state {
+                old.extend(
+                    st.restored_extents
+                        .iter()
+                        .filter(|s| candidates.contains(&(s.extent_id as u64)))
+                        .cloned(),
+                );
+            }
             if old.is_empty() {
                 continue;
             }
@@ -317,6 +332,7 @@ impl Compactor {
                 target: PlanTarget::Object {
                     bucket: bucket.clone(),
                     key: key.clone(),
+                    vk: *vk,
                 },
                 old_segments: old,
                 new_segments: Vec::new(),
@@ -440,9 +456,10 @@ impl Compactor {
             self.alloc.add_object(&mut d, &item.new_segments);
             self.alloc.release_object(&mut d, &item.old_segments);
             let migrate = match &item.target {
-                PlanTarget::Object { bucket, key } => self.meta.commit_object_migrate(
+                PlanTarget::Object { bucket, key, vk } => self.meta.commit_object_migrate(
                     bucket,
                     key,
+                    vk.as_ref(),
                     &item.old_segments,
                     &item.new_segments,
                     self.alloc.to_alloc_draft(&d),
@@ -1096,6 +1113,121 @@ mod tests {
             "no leaks after phase-2 crash"
         );
         assert_eq!(e.allocator().live_bytes_of(0), 1024 * 1024);
+        e.close().unwrap();
+    }
+
+    /// F5-5:压缩发现纳入版本对象与 restore 副本;锁定版本迁数据不删除。
+    #[test]
+    fn compaction_discovers_versioned_and_restore_extents() {
+        use fs3_core::{ObjectLockWrite, VersioningState};
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("disk.img");
+        std::fs::File::create(&img)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
+        let cfg = crate::EngineConfig {
+            devices: vec![img],
+            meta_dir: dir.path().join("meta"),
+            compaction: CompactionConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut e = Engine::open(&cfg).unwrap();
+        e.ensure_bucket("b1").unwrap();
+        let mut b = e.meta().get_bucket("b1").unwrap().unwrap();
+        b.versioning = VersioningState::Enabled;
+        e.meta().commit_bucket_put("b1", &b).unwrap();
+
+        let v1data = vec![0xAAu8; 1024 * 1024];
+        let v2data = vec![0xBBu8; 1024 * 1024];
+        let v1 = e
+            .put("b1", "ver", &mut Cursor::new(v1data.clone()))
+            .unwrap()
+            .version_id
+            .unwrap();
+        let f0 = e
+            .put("b1", "fill0", &mut Cursor::new(vec![0x11u8; 1024 * 1024]))
+            .unwrap()
+            .version_id
+            .unwrap();
+        let f1 = e
+            .put("b1", "fill1", &mut Cursor::new(vec![0x22u8; 1024 * 1024]))
+            .unwrap()
+            .version_id
+            .unwrap();
+        let v2 = e
+            .put("b1", "ver", &mut Cursor::new(v2data.clone()))
+            .unwrap()
+            .version_id
+            .unwrap();
+        e.set_object_legal_hold("b1", "ver", Some(&v1), true)
+            .unwrap();
+        e.delete_version("b1", "fill0", Some(f0)).unwrap();
+        e.delete_version("b1", "fill1", Some(f1)).unwrap();
+
+        let rdata = vec![0xCCu8; 1024 * 1024];
+        let glac = e
+            .put_with_lock_ev(
+                "b1",
+                "glac",
+                &mut Cursor::new(rdata.clone()),
+                None,
+                vec![],
+                vec![],
+                vec![],
+                None,
+                None,
+                None,
+                ObjectLockWrite::default(),
+                None,
+                Some("GLACIER".into()),
+                fs3_core::promote_storage_class(Some("GLACIER")),
+            )
+            .unwrap();
+        let glac_vk = glac.version_id;
+        e.restore_enqueue("b1", "glac", glac_vk.as_ref(), 3, "Standard")
+            .unwrap();
+        let now = e.lock_now();
+        let (done, _) = e.restore_worker_tick(now + 1, 8).unwrap();
+        assert_eq!(done, 1);
+        let g0 = e
+            .put("b1", "gfill0", &mut Cursor::new(vec![0x33u8; 1024 * 1024]))
+            .unwrap()
+            .version_id
+            .unwrap();
+        let g1 = e
+            .put("b1", "gfill1", &mut Cursor::new(vec![0x44u8; 1024 * 1024]))
+            .unwrap()
+            .version_id
+            .unwrap();
+        e.delete_version("b1", "gfill0", Some(g0)).unwrap();
+        e.delete_version("b1", "gfill1", Some(g1)).unwrap();
+
+        let r = e.compact_once().unwrap();
+        assert!(
+            r.migrated_objects >= 1,
+            "versioned/restore extents must be compaction candidates: {r:?}"
+        );
+
+        let mut out = Vec::new();
+        e.get_to_version("b1", "ver", Some(&v1), 0..u64::MAX, &mut out)
+            .unwrap();
+        assert_eq!(out, v1data, "v1 intact after compaction");
+        out.clear();
+        e.get_to_version("b1", "ver", Some(&v2), 0..u64::MAX, &mut out)
+            .unwrap();
+        assert_eq!(out, v2data, "v2 intact after compaction");
+        let locked = e.head_version("b1", "ver", Some(&v1)).unwrap();
+        assert!(locked.legal_hold, "locked version is migrated not deleted");
+        out.clear();
+        e.get_to("b1", "glac", 0..rdata.len() as u64, &mut out)
+            .unwrap();
+        assert_eq!(out, rdata, "restore plaintext intact after compaction");
+        assert!(e.allocator().leaks().is_empty());
         e.close().unwrap();
     }
 }
