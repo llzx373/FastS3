@@ -10,6 +10,7 @@ import { loadConfig } from "./config.js";
 import { IdentityEvents, LdapSync } from "./ldap-sync.js";
 import { OidcVerifier } from "./oidc.js";
 import { MockIssuer } from "./oidc.test.js";
+import { MockLdapServer } from "./ldap.test.js";
 import type { FastifyInstance } from "fastify";
 
 function makeCfg(over: Record<string, unknown> = {}): ReturnType<typeof loadConfig> {
@@ -218,4 +219,72 @@ test("identity routes: oidc 未启用 → /api/oidc/* 404", async (t) => {
     payload: { id_token: "x", nonce: "y" },
   });
   assert.equal(r2.statusCode, 404);
+});
+
+/// F6-4:默认装配共用同一个 IdentityEvents(禁止只靠测试注入同一 ring 绿)。
+test("ldap_sync_events_visible_on_identity_events_endpoint", async (t) => {
+  const mock = new MockLdapServer({});
+  mock.failBind = true;
+  await mock.listen();
+  t.after(() => mock.close());
+  const admin = {
+    status: async () => ({}),
+    metrics: async () => "",
+    buckets: async () => ({ buckets: [] }),
+    createBucket: async () => ({}),
+    bucket: async () => null,
+    setBucketQuota: async () => ({}),
+    deleteBucket: async () => ({}),
+    keys: async () => ({ keys: [] }),
+    createKey: async () => ({ access_key: "x", secret_key: "s" }),
+    deleteKey: async () => ({}),
+    setKeyEnabled: async () => ({}),
+    setKeyPolicy: async () => ({}),
+    uploads: async () => ({ uploads: [] }),
+    abortUpload: async () => ({}),
+    sessions: async () => ({ sessions: [] }),
+    revokeSession: async () => ({}),
+    audit: async () => ({ audit: [] }),
+  };
+  const app = buildServer({
+    admin: admin as never,
+    s3: {} as never,
+    cfg: makeCfg({
+      ldap: {
+        enabled: true,
+        url: `ldap://127.0.0.1:${mock.port}`,
+        bind_dn: "cn=admin,dc=corp",
+        bind_password: "pw",
+        base_dn: "ou=groups,dc=corp",
+        group_filter: "(objectClass=groupOfNames)",
+        groups: ["dev"],
+        key_prefix: "ldap-",
+        sync_interval_secs: 300,
+      },
+    }),
+  });
+  t.after(() => app.close());
+  const lr = await app.inject({
+    method: "POST",
+    url: "/api/login",
+    payload: { username: "admin", password: "admin123" },
+  });
+  const token = (lr.json() as { token: string }).token;
+  const deadline = Date.now() + 5000;
+  let evs: { source: string; action: string }[] = [];
+  while (Date.now() < deadline) {
+    const r = await app.inject({
+      method: "GET",
+      url: "/api/identity-events",
+      headers: { authorization: `Bearer ${token}` },
+    });
+    assert.equal(r.statusCode, 200);
+    evs = (r.json() as { events: { source: string; action: string }[] }).events;
+    if (evs.some((e) => e.source === "ldap" && e.action === "sync.skipped")) break;
+    await new Promise((res) => setTimeout(res, 50));
+  }
+  assert.ok(
+    evs.some((e) => e.source === "ldap" && e.action === "sync.skipped"),
+    `expected ldap sync.skipped on default assembly, got ${JSON.stringify(evs)}`,
+  );
 });

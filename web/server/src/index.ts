@@ -80,13 +80,19 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   const history = deps.metricsHistory ?? new MetricsHistory();
 
   // ── 身份集成(ADR-21):LDAP 同步器 + OIDC 校验器 + 身份事件缓冲 ──
-  const identity = deps.identity ?? {
-    events: new IdentityEvents(),
-    ldap: new LdapSync(cfg.ldap as LdapSyncConfig, admin, new IdentityEvents()),
-    oidc: new OidcVerifier(cfg.oidc as OidcConfig),
-  };
+  const identity = deps.identity ?? (() => {
+    const events = new IdentityEvents();
+    return {
+      events,
+      ldap: new LdapSync(cfg.ldap as LdapSyncConfig, admin, events),
+      oidc: new OidcVerifier(cfg.oidc as OidcConfig),
+    };
+  })();
   // ADR-21 DL1:LDAP 目录同步 worker(仅启用时;立即首轮 + 周期,unref)
   if (cfg.ldap.enabled) identity.ldap.start();
+  app.addHook("onClose", async () => {
+    identity.ldap.stop();
+  });
 
   // ── 登录(无认证) ──
   app.post("/api/login", async (req, reply) => {
