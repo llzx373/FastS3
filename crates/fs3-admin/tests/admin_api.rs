@@ -902,3 +902,53 @@ fn alerts_yml_stalled_rules_match_exported_metrics() {
     assert!(admin.contains("fasts3_notification_delivery_stalled"));
     assert!(admin.contains("fasts3_inventory_last_run_timestamp"));
 }
+
+/// F6-3:PUT GLACIER 后 /metrics 含 fasts3_archive_* 分账。
+#[test]
+fn archive_metrics_exported_after_glacier_put() {
+    let (_d, img) = setup();
+    let cfg = EngineConfig {
+        devices: vec![img.clone()],
+        meta_dir: img.parent().unwrap().join("meta"),
+        ..Default::default()
+    };
+    {
+        let mut e = fs3_engine::Engine::open(&cfg).unwrap();
+        e.ensure_bucket("ar").unwrap();
+        e.put_with_lock_ev(
+            "ar",
+            "g1",
+            &mut std::io::Cursor::new(b"archive me".to_vec()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            fs3_core::ObjectLockWrite::default(),
+            None,
+            Some("GLACIER".into()),
+            fs3_core::promote_storage_class(Some("GLACIER")),
+        )
+        .unwrap();
+        e.close().unwrap();
+    }
+    let (sock, handle) = start_admin(&cfg, "sekret");
+    let sock = sock.trim_start_matches("unix://");
+    let (code, body) = http_unix(sock, "GET", "/v1/admin/metrics", None, "sekret");
+    assert_eq!(code, 200, "{body}");
+    assert!(
+        body.contains("fasts3_archive_"),
+        "missing fasts3_archive_ metrics:\n{body}"
+    );
+    assert!(
+        body.contains("fasts3_archive_objects{class=\"GLACIER\"} 1"),
+        "GLACIER object count missing:\n{body}"
+    );
+    assert!(
+        body.contains("fasts3_archive_bytes{class=\"GLACIER\"} 10"),
+        "GLACIER bytes missing:\n{body}"
+    );
+    let _ = handle;
+}

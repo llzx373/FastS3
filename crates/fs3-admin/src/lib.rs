@@ -25,6 +25,7 @@
 //!
 //! 认证:除 `/healthz` 外全部要求 `Authorization: Bearer <token>`(WS 亦接受 query token)。
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -745,6 +746,26 @@ impl AdminServer {
             "fasts3_device_degraded {}\n",
             if engine.degraded() { 1 } else { 0 }
         ));
+        // F6-3:存储类分账(跨桶合计)。transition 次数沿用
+        // fasts3_lifecycle_transitioned_total,不重复命名。
+        text.push_str("# HELP fasts3_archive_objects Objects by storage class (all buckets)\n");
+        text.push_str("# TYPE fasts3_archive_objects gauge\n");
+        text.push_str("# HELP fasts3_archive_bytes Logical bytes by storage class (all buckets)\n");
+        text.push_str("# TYPE fasts3_archive_bytes gauge\n");
+        let mut by_class: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+        if let Ok(buckets) = engine.list_buckets() {
+            for (_, m) in buckets {
+                for (c, t) in &m.stats.by_class {
+                    let e = by_class.entry(c.clone()).or_default();
+                    e.0 = e.0.saturating_add(t.objects);
+                    e.1 = e.1.saturating_add(t.bytes);
+                }
+            }
+        }
+        for (c, (objs, bytes)) in &by_class {
+            text.push_str(&format!("fasts3_archive_objects{{class=\"{c}\"}} {objs}\n"));
+            text.push_str(&format!("fasts3_archive_bytes{{class=\"{c}\"}} {bytes}\n"));
+        }
         // M11 L3-2(ADR-12 DL5):生命周期执行器指标;worker 启用时由 fs3d
         // 注入(未启用 = 指标组缺席,告警规则按「缺席即未启用」口径处理)。
         // 删除计数/字节为累计值;last_cycle_timestamp 供停滞告警(超 2 个

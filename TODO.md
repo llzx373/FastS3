@@ -143,7 +143,7 @@ F0 ADR-22
   - 用例:`webhook_https_posts_signed_body`(自签/测试 listener);失败重试/死信仍有效;`http` 回归不破
 - [x] F6-2 Grafana `alerts.yml` 增加 `FastS3NotificationDeliveryStalled`、`InventoryGenerationStalled`(表达式对准已有 `fasts3_notification_*` / inventory 指标;无指标则先加 counter 再加告警)
   - 用例:规则文件静态检查(promtool 或 yaml 含表达式 + 对应 metrics 名在 admin 导出字符串测试中出现)
-- [ ] F6-3 实现 `fasts3_archive_*` 指标组(对象数/字节按存储类、transition 次数已有则别重复命名)并进 admin `/metrics`
+- [x] F6-3 实现 `fasts3_archive_*` 指标组(对象数/字节按存储类、transition 次数已有则别重复命名)并进 admin `/metrics`
   - 用例:`archive_metrics_exported_after_glacier_put`(prometheus 文本含 `fasts3_archive_`)
 - [ ] F6-4 LDAP/OIDC:`buildServer` 默认把 **同一个** `IdentityEvents` 注入 `LdapSync` 与 `GET /api/identity-events`;生产路径补集成测试(禁止只靠测试注入同一 ring 绿)
   - 用例:`ldap_sync_events_visible_on_identity_events_endpoint`(不注入 deps.identity,走默认装配)
