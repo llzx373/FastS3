@@ -1151,6 +1151,32 @@ mod tests {
         );
     }
 
+    /// M17/F1:S3-GAP §9 死锁行已修复;Hadoop/BPA/审计导出状态同步。
+    #[test]
+    fn s3_gap_m17_deadlock_hadoop_bpa_audit() {
+        let gap = include_str!("../../../docs/S3-GAP.md");
+        let s9 = gap
+            .split("## 9. 已知问题与规避")
+            .nth(1)
+            .expect("S3-GAP §9");
+        assert!(
+            s9.contains("已修复") && s9.contains("mc_mirror_concurrency.sh"),
+            "§9 死锁须改为已修复并指向 D1 harness"
+        );
+        assert!(
+            !s9.contains("待专项立项"),
+            "§9 不得再写死锁待立项"
+        );
+        assert!(
+            gap.contains("冒烟通过") && gap.contains("PublicAccessBlock **桶级 ✅ v2.3"),
+            "Hadoop 冒烟与桶级 BPA 须同步"
+        );
+        assert!(
+            gap.contains("JSONL 导出") && gap.contains("/v1/admin/audit/export"),
+            "审计导出状态须同步"
+        );
+    }
+
     /// F9-6:notification/归档不以 s3-tests 100% 出集声称;权威为自有集成测试。
     #[test]
     fn s3tests_readme_notification_archive_not_claimed_100() {

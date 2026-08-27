@@ -23,7 +23,8 @@
 
 > 状态图例:✅ 完整 · 🟡 部分 · ⛔ 缺失 · 🔜 已排期(标注版本)· ❌ 明确不做 · 🚫 停售排除(不列入管线)
 > 优先级:P0 = 缺失即被采购否决;P1 = 缺失即某类工作流失败;P2 = 增强。
-> 更新(2026-08-27):对照 v2.2.0 主力交付 + 审查修复 F9;残余缺口见 Batch / BPA / 内置 ?replication。
+> 更新(2026-08-27):对照 v2.3.0 M17;BPA 桶级部分出集、审计导出代替 Logging、
+> Hadoop S3A 冒烟;残余缺口见 Batch / 内置 ?replication / IAM 多租户(M18)。
 
 | 域 | 特性 | 现状 | 优先级 | 路线归属 |
 | --- | --- | --- | --- | --- |
@@ -54,8 +55,8 @@
 | 桶配置 | Replication(CRR/SRR) | 🟡 策略化 ✅ v2.2(ADR-20 中心同步任务);**不内置** ?replication | P1(容灾场景) | 内置 CRR 明确不做 |
 | 桶配置 | Notification(EventBridge/SQS/SNS/Webhook) | ✅ v2.1 Webhook(http/https);SQS/SNS/EventBridge 目标显式拒绝 | P1 | — |
 | 桶配置 | Website 静态托管 | ⛔ | P2 | 不做(nginx 可替代) |
-| 桶配置 | Logging / Metrics / Analytics / Inventory | 🟡 审计 ✅ v1.2;Inventory ✅ v2.1;Logging/Analytics 不做 | P2 | — |
-| 桶配置 | Accelerate / RequestPayment / OwnershipControls / PublicAccessBlock | 🟡 OwnershipControls ✅ v1.1;Accelerate/RequestPayment 不做;PublicAccessBlock 远期(BPA) | P2/P1(多租户 BPA) | 残余:BPA |
+| 桶配置 | Logging / Metrics / Analytics / Inventory | 🟡 审计 ✅ v1.2 + **导出 JSONL ✅ v2.3**(M17/G1,代替 Logging);Inventory ✅ v2.1;`?logging` 501 | P2 | Logging XML 不做 |
+| 桶配置 | Accelerate / RequestPayment / OwnershipControls / PublicAccessBlock | 🟡 OwnershipControls ✅ v1.1;PublicAccessBlock **桶级 ✅ v2.3**(M17/B,ADR-23,出集 6);Accelerate/RequestPayment 不做;账号级 BPA 单账号 501 | P2/P1 | 账号级 BPA 不做 |
 | 认证安全 | SigV4 header + query 预签名 + aws-chunked | ✅ | P0 | — |
 | 认证安全 | SigV2 | ⛔ | P2 | 明确不做(默认关闭等价) |
 | 认证安全 | POST 表单签名 | ✅ v1.1 | P1 | — |
@@ -65,10 +66,10 @@
 | 认证安全 | 密钥级 IAM 策略子集 | 🟡 已补最小 Condition 集(ipAddress/prefix/bypass 键);超集显式 400 | P1 | 超集远期 |
 | 数据保护 | 强一致 read-after-write | ✅(比 S3 官方更强) | P0 | — |
 | 数据保护 | 崩溃/断电一致性、账目收敛 | ✅(1000 轮 + 断电模拟) | P0 | — |
-| 数据保护 | 审计流水 | ✅ v1.2 持久化(环形,重启可检索) | P1(合规) | — |
-| 数据保护 | 备份集成(restic/duplicati 等) | 🟡 restic/duplicati ✅ 实测;Veeam/Commvault 未实测 | P1 | 🔜 v2.1(M15 D3) |
+| 数据保护 | 审计流水 | ✅ v1.2 持久化 + v2.3 JSONL 导出(`/v1/admin/audit/export`) | P1(合规) | Logging XML 不做 |
+| 数据保护 | 备份集成(restic/duplicati 等) | 🟡 restic/duplicati ✅ 实测;Object Lock 不可变仓库演练 ✅ v2.3(M17/C3);Veeam/Commvault 真机未测 | P1 | 真机属人工后置 |
 | 生态集成 | aws cli / boto3 / mc / rclone | ✅(冒烟 + 迁移演练) | P0 | — |
-| 生态集成 | Hadoop S3A / Spark / Trino / 湖仓 | 🟡 未实测(依赖已具备;条件写 v1.1 已解锁) | P0(数据湖场景) | 🔜 v2.1(M15 D3) |
+| 生态集成 | Hadoop S3A / Spark / Trino / 湖仓 | 🟡 Hadoop S3A **冒烟通过** v2.3(M17/C1,JDK 21+Hadoop 3.4.1);Spark 3.5.3 / Trino 476 骨架 SKIP | P0(数据湖场景) | Spark/Trino 发行版环境 |
 | 生态集成 | Terraform provider / K8s Operator | 🟡 评估完成,暂不立项(持有,投票 ≥10) | P2 | 持有(m14-ecosystem-eval) |
 | 生态集成 | 事件通知 Kafka/AMQP | ⛔ | P2 | 后置评估(Webhook 起步 v2.1) |
 | 性能规模 | HTTP/3 | ✅ v2.0(实验开关默认关) | P2 | — |
@@ -122,7 +123,7 @@
 | Notification | ?notification 501 | 事件驱动管道(转码/索引/审计联动) | P1 / v2.x 倾向做(Webhook 起步,§8) |
 | Replication | ?replication 501 | 容灾 DR(单机定位下由底层 HA + 迁移脚本承担,见 §5 说明) | P1(策略化解) / v2.x 评估 |
 | Website / Logging / Metrics / Analytics / Inventory / Accelerate / RequestPayment | 均 501 | Website/Logging 可用 nginx/LB 替代;Accelerate 与单机定位冲突;Inventory 有低成本价值 | P2 / Inventory 评估,其余文档化不做或远期 |
-| OwnershipControls / PublicAccessBlock | 501 | 多租户防公开兜底(BPA);单机默认私有已满足开箱,随桶策略评估 | P2 / 远期 |
+| OwnershipControls / PublicAccessBlock | OwnershipControls ✅ v1.1;桶级 BPA ✅ v2.3(ADR-23) | 账号级 BPA / ACL 公开组合维持单账号定位排除 | 定位 / 出集见 s3-tests README M17 B3 |
 
 ### 3.3 认证与安全域
 
@@ -149,7 +150,7 @@
 
 | 缺口 | 现状 | 企业影响 | 路线 |
 | --- | --- | --- | --- |
-| Hadoop S3A / Spark / Trino | 未实测(矩阵"规划");依赖(multipart/列表一致/404 语义)已具备 | 数据湖/湖仓 = 最大企业场景;条件写缺失阻塞 Hudi/Iceberg 类提交器 | 回归补测 + v1.1 条件写解锁;S3A Committer 兼容测试列入 v1.1 门禁 |
+| Hadoop S3A / Spark / Trino | Hadoop S3A 冒烟通过(M17/C1);Spark/Trino 无环境 SKIP 计数(C2) | 数据湖/湖仓 | S3A Committer 全量与 Spark/Trino 真机属后续 |
 | Terraform / K8s Operator | 无 | IaC 管理;Operator 生态 | 🔜 v2.0 评估(§7.4) |
 | 事件通知(Kafka/AMQP) | 无 | 企业消息总线集成 | v2.x 评估(Webhook 起步) |
 | restic/Duplicati/Veeam | 未实测 | 备份场景验证 | 矩阵补测 |
@@ -193,7 +194,7 @@
 
 | 场景 | 依赖的关键特性(交付状态) | 现状判定 | 剩余不满足项 |
 | --- | --- | --- | --- |
-| **数据湖 / 湖仓**(Spark/Trino/Hudi/Iceberg/Delta) | 强一致 ✅、multipart ✅、404 确定性 ✅、条件写入 ✅ v1.1、checksum ✅ v1.2、ETag 对齐 ✅ v1.0.1、Copy COW ✅、S3A Committer 语义(未实测) | 🟡 基本满足 | ① Hadoop S3A/Spark/Trino 实测(M15 D3,环境补齐后);② 存储类头(部分工具带 IA/IT → 现 400,M15 C1 接受矩阵) |
+| **数据湖 / 湖仓**(Spark/Trino/Hudi/Iceberg/Delta) | 强一致 ✅、multipart ✅、404 确定性 ✅、条件写入 ✅ v1.1、checksum ✅ v1.2、ETag 对齐 ✅ v1.0.1、Copy COW ✅、Hadoop S3A 冒烟 ✅ v2.3 | 🟡 基本满足 | Spark/Trino 真机(C2 骨架);S3A Committer 全量 |
 | **备份与恢复**(restic/Duplicati/Veeam/Commvault) | multipart ✅、ListObjectVersions ✅ v1.1、版本 ✅ v1.1、Object Lock ✅ v1.3、checksum ✅ v1.2;restic 0.19.1 / duplicati 2.3.0.4 ✅ 实测 | 🟡 基本满足 | Veeam(优先)/Commvault 实测(M15 D3);不可变仓库功能面已齐 |
 | **合规 / WORM**(金融/医疗/制造边缘) | Object Lock ✅ v1.3、审计持久化 ✅ v1.2、SSE ✅ v1.2、可信时钟 ✅ v1.3、版本 ✅ v1.1 | ✅ 满足 | 无功能缺口(v2.0 外部审计执行期项不影响) |
 | **ML / 训练** | 高 IOPS/吞吐 ✅、多设备 ✅ v1.4、checkpoint 条件写 ✅ v1.1、缓存 ✅ v2.0 | ✅ 满足 | — |
@@ -239,13 +240,13 @@
 | 15 | 多租户隔离 + 配额/计量 | ✅ v2.1 达标(桶隔离/配额;Inventory CSV 计量;expected-bucket-owner 显式语义) | — |
 | 16 | RestoreObject + 归档层 | ✅ v2.2 达标(ADR-19) | — |
 | 17 | CORS + 预检 | ✅ v1.1 达标 | — |
-| 18 | 访问日志 + 审计面 | ✅ v1.2 审计持久化(访问日志仍不做) | — |
+| 18 | 访问日志 + 审计面 | ✅ v1.2 审计 + v2.3 JSONL 导出(代替 `?logging`) | Logging XML 不做 |
 
 ### C 档:锦上添花(2 项代表)
 
 | # | 门槛 | FastS3 现状 | 差距动作 |
 | --- | --- | --- | --- |
-| 19 | S3 Select / Inventory / Batch Operations | 🚫 Select 停售排除;Inventory ✅ v2.1;Batch Operations ⛔ 后置 | 残余:Batch、BPA |
+| 19 | S3 Select / Inventory / Batch Operations | 🚫 Select 停售排除;Inventory ✅ v2.1;Batch Operations ⛔ 后置 | 残余:Batch |
 | 20 | 目录桶/Express / Accelerate / Object Lambda / S3 Tables / DSSE-KMS | ❌ 明确不做(Express 定位 = FastS3 单机本体;Accelerate/Tables 与定位冲突;Object Lambda 叠加停售 2025-11-07;DSSE 无 KMS) | 文档化定位声明 |
 
 ## 6. 差距 → 路线图收敛映射
@@ -262,6 +263,7 @@
 | 归档存储类 + RestoreObject、复制策略化、LDAP/OpenID | v2.2(NEXT-ROUND §6) | ✅ 已交付(v2.2.0,2026-08-26;审查修复见 v2.2.1) |
 | S3 Select / Glacier Select、Object Lambda、Torrent、ACL 全矩阵 | — | 🚫 停售排除(NEXT-ROUND §3.2,不列入管线) |
 | 协议正确性残余(密钥状态语义、expected-bucket-owner 显式语义) | v2.1(NEXT-ROUND §5 C) | ✅ 已交付(M15 C2/C3,2026-08-26) |
+| 桶级 Public Access Block、审计 JSONL 导出、Hadoop S3A 冒烟、mc 高并发死锁 | v2.3(M17) | ✅ 已交付(2026-08-27;账号级 BPA / Logging XML 定位不做) |
 
 ## 7. 路线图增补与优先级建议
 
@@ -297,14 +299,14 @@
 
 ## 9. 已知问题与规避(2026-08-27 登记)
 
-1. **mc mirror 高并发触发引擎死锁(并发 PUT/List 混载竞态)**:M16 R1-5
-   演练实测——mc mirror 默认 `--max-workers autodetect`(多并发)对 FastS3
-   复制时,复制阶段后偶发整节点 S3 端口挂死(全线程 futex 等待,含
-   fs3-http worker;匿名探测也超时),崩溃门禁(500 轮)未覆盖此路径
-   (门禁用 aws-cli/python 客户端,非 mc 高并发)。规避:同步执行器
-   mc 侧固定 `--max-workers 1`、rclone 侧 `--transfers 1`(串行节流档,
-   ADR-20 DR3 已落盘);修复 = 引擎并发锁序调查(io_uring 完成回调 ×
-   meta 锁),待专项立项。
+1. **mc mirror 高并发触发引擎死锁(并发 PUT/List 混载竞态)**:✅ **已修复**
+   (M17/D,2026-08-27)。根因 = tokio reactor 上拿 `engine.read()/write()`
+   与流式 PUT 泵/io_uring 完成路径互等(全线程 futex,S3 端口无响应)。
+   修复 = List/Head/明文 GET/建连/`device_fd` 等离开 reactor(`spawn_blocking`);
+   同步执行器默认并发恢复 4(不再把 `--max-workers 1` 当产品口径)。
+   防复发:`tests/repro/mc_mirror_concurrency.sh`(`mc mirror --max-workers 8`,
+   ≥200 对象)超时内结束;`concurrent_put_list_no_deadlock`;
+   `tests/crash/mc_mirror_kill9.sh` ×50 轮账目零漂移。
 
 ---
 
