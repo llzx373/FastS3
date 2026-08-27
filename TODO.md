@@ -130,12 +130,12 @@
 - [x] D3 同步执行器默认并发恢复合理值:mc `--max-workers` 默认 ≥4(可配,上限文档化);
   rclone `--transfers` 对齐;compat/ADR-20 补遗删除「必须串行才能稳」的产品口径
   - 用例:单测或 drill 断言 spawn 参数不再写死 1;M16 双节点 drill 以新默认跑通
-- [ ] D4 崩溃混载补一条:并发 mirror 进行中 kill -9 × ≥50 轮,重启后账目零漂移、无挂死
+- [x] D4 崩溃混载补一条:并发 mirror 进行中 kill -9 × ≥50 轮,重启后账目零漂移、无挂死
   - 用例:`tests/crash` 增补或并入现有脚本;记录轮数与结果
 
 ### B. Public Access Block(≈1 pw;ADR-23)
 
-- [ ] B1 `Put/Get/DeletePublicAccessBlock` 配置往返(XML 四开关);非法 XML → MalformedXML;
+- [x] B1 `Put/Get/DeletePublicAccessBlock` 配置往返(XML 四开关);非法 XML → MalformedXML;
   未配置时 Get 按 ADR-23 默认(新桶全 Block);Delete 回到默认而非「全开」
   - 用例:`public_access_block_roundtrip`;新桶 Get 四开关均为 true
 - [ ] B2 效果:BlockPublicPolicy 下 PutBucketPolicy 含 Principal `*` 公开读/写 → 403/AccessDenied

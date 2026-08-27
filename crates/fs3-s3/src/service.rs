@@ -1640,6 +1640,15 @@ impl S3Service {
             Operation::DeleteBucketOwnershipControls { bucket } => {
                 Ok(self.op_delete_bucket_ownership_controls(&bucket)?)
             }
+            Operation::PutPublicAccessBlock { bucket, block } => {
+                Ok(self.op_put_public_access_block(&bucket, block)?)
+            }
+            Operation::GetPublicAccessBlock { bucket } => {
+                Ok(self.op_get_public_access_block(&bucket)?)
+            }
+            Operation::DeletePublicAccessBlock { bucket } => {
+                Ok(self.op_delete_public_access_block(&bucket)?)
+            }
             // —— M10 S3:桶策略(D9 `bp:` 键) ——
             Operation::PutBucketPolicy { bucket, body } => {
                 Ok(self.op_put_bucket_policy(&bucket, &body)?)
@@ -2958,6 +2967,36 @@ impl S3Service {
         bucket: &str,
     ) -> Result<ServiceResponse, S3Error> {
         self.delete_bucket_conf(bucket, fs3_meta::BucketConf::Ownership)
+    }
+
+    /// PutPublicAccessBlock(M17/B1;ADR-23):四开关整份替换落 `ba:`。
+    fn op_put_public_access_block(
+        &self,
+        bucket: &str,
+        block: xml::PublicAccessBlock,
+    ) -> Result<ServiceResponse, S3Error> {
+        self.write_bucket_conf(
+            bucket,
+            fs3_meta::BucketConf::PublicAccessBlock,
+            xml::render_public_access_block(block),
+        )
+    }
+
+    /// GetPublicAccessBlock:无 `ba:` 键 → 默认四开关全 true(不 404)。
+    fn op_get_public_access_block(&self, bucket: &str) -> Result<ServiceResponse, S3Error> {
+        match self.read_bucket_conf(bucket, fs3_meta::BucketConf::PublicAccessBlock)? {
+            Some(doc) => Ok(Self::xml_response(
+                String::from_utf8_lossy(&doc).into_owned(),
+            )),
+            None => Ok(Self::xml_response(xml::render_public_access_block(
+                xml::PublicAccessBlock::DEFAULT,
+            ))),
+        }
+    }
+
+    /// DeletePublicAccessBlock:删键回到默认全 Block(不是全开)。
+    fn op_delete_public_access_block(&self, bucket: &str) -> Result<ServiceResponse, S3Error> {
+        self.delete_bucket_conf(bucket, fs3_meta::BucketConf::PublicAccessBlock)
     }
 
     // ───────────────── M10 S3:桶策略(D9 `bp:` 键) ─────────────────
@@ -7098,6 +7137,9 @@ fn route_op_bucket_key(req: &S3Request) -> (fs3_core::metrics::Op, String, Strin
         ("DELETE", _, "") if has_q("ownershipControls") => {
             (Op::Other, "DeleteBucketOwnershipControls")
         }
+        ("PUT", _, "") if has_q("publicAccessBlock") => (Op::Other, "PutPublicAccessBlock"),
+        ("GET", _, "") if has_q("publicAccessBlock") => (Op::Other, "GetPublicAccessBlock"),
+        ("DELETE", _, "") if has_q("publicAccessBlock") => (Op::Other, "DeletePublicAccessBlock"),
         // M10 S3:桶策略子资源审计名(即 AWS 动作名 s3:{Get,Put,Delete}BucketPolicy)
         ("PUT", _, "") if has_q("policy") => (Op::Other, "PutBucketPolicy"),
         ("GET", _, "") if has_q("policy") => (Op::Other, "GetBucketPolicy"),

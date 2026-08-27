@@ -1649,6 +1649,114 @@ pub fn render_tagging(tags: &[(String, String)]) -> String {
     xml
 }
 
+// ───────────────────── Public Access Block(M17/B1;ADR-23) ─────────────────────
+
+/// 桶级 BPA 四开关(AWS `PublicAccessBlockConfiguration`;缺键 = 全 true)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicAccessBlock {
+    pub block_public_acls: bool,
+    pub ignore_public_acls: bool,
+    pub block_public_policy: bool,
+    pub restrict_public_buckets: bool,
+}
+
+impl PublicAccessBlock {
+    /// ADR-23:新桶 / Delete 后的默认 = 四开关全部 Block。
+    pub const DEFAULT: Self = Self {
+        block_public_acls: true,
+        ignore_public_acls: true,
+        block_public_policy: true,
+        restrict_public_buckets: true,
+    };
+}
+
+/// 解析 PutPublicAccessBlock XML;四字段均须出现且为 true/false。
+pub fn parse_public_access_block(body: &[u8]) -> Result<PublicAccessBlock, S3Error> {
+    let malformed = |m: String| S3Error::new(S3ErrorCode::MalformedXML).with_message(m);
+    if body.iter().all(|&b| b.is_ascii_whitespace()) {
+        return Err(malformed("PublicAccessBlockConfiguration body is empty".into()));
+    }
+    let mut reader = quick_xml::Reader::from_reader(body);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut saw_root = false;
+    let mut block_acls = None;
+    let mut ignore_acls = None;
+    let mut block_policy = None;
+    let mut restrict = None;
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(quick_xml::events::Event::Start(e)) => {
+                let name = e.name().as_ref().to_vec();
+                if name.as_slice() == b"PublicAccessBlockConfiguration" {
+                    saw_root = true;
+                    continue;
+                }
+                let raw = reader
+                    .read_text(e.name())
+                    .map_err(|err| malformed(format!("malformed XML: {err}")))?;
+                let txt = unescape_text(raw.as_ref()).map_err(malformed)?;
+                let parse_flag = |v: &str| -> Result<bool, S3Error> {
+                    match v {
+                        "true" => Ok(true),
+                        "false" => Ok(false),
+                        _ => Err(malformed(format!(
+                            "PublicAccessBlock flag must be true or false, got {v:?}"
+                        ))),
+                    }
+                };
+                match name.as_slice() {
+                    b"BlockPublicAcls" => block_acls = Some(parse_flag(&txt)?),
+                    b"IgnorePublicAcls" => ignore_acls = Some(parse_flag(&txt)?),
+                    b"BlockPublicPolicy" => block_policy = Some(parse_flag(&txt)?),
+                    b"RestrictPublicBuckets" => restrict = Some(parse_flag(&txt)?),
+                    _ => {}
+                }
+            }
+            Ok(quick_xml::events::Event::Empty(e))
+                if e.name().as_ref() == b"PublicAccessBlockConfiguration" =>
+            {
+                saw_root = true;
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Err(e) => return Err(malformed(format!("malformed XML: {e}"))),
+            _ => {}
+        }
+        buf.clear();
+    }
+    if !saw_root {
+        return Err(malformed(
+            "malformed XML: missing <PublicAccessBlockConfiguration>".into(),
+        ));
+    }
+    Ok(PublicAccessBlock {
+        block_public_acls: block_acls.ok_or_else(|| malformed("missing BlockPublicAcls".into()))?,
+        ignore_public_acls: ignore_acls
+            .ok_or_else(|| malformed("missing IgnorePublicAcls".into()))?,
+        block_public_policy: block_policy
+            .ok_or_else(|| malformed("missing BlockPublicPolicy".into()))?,
+        restrict_public_buckets: restrict
+            .ok_or_else(|| malformed("missing RestrictPublicBuckets".into()))?,
+    })
+}
+
+pub fn render_public_access_block(b: PublicAccessBlock) -> String {
+    let flag = |v: bool| if v { "true" } else { "false" };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<PublicAccessBlockConfiguration xmlns=\"{XMLNS}\">\
+<BlockPublicAcls>{}</BlockPublicAcls>\
+<IgnorePublicAcls>{}</IgnorePublicAcls>\
+<BlockPublicPolicy>{}</BlockPublicPolicy>\
+<RestrictPublicBuckets>{}</RestrictPublicBuckets>\
+</PublicAccessBlockConfiguration>",
+        flag(b.block_public_acls),
+        flag(b.ignore_public_acls),
+        flag(b.block_public_policy),
+        flag(b.restrict_public_buckets)
+    )
+}
+
 // ───────────────────── 桶级 CORS(M10 S2;ADR-11 D9;S3-GAP §7 建议 1) ─────────────────────
 
 /// CORS 规则(CORSRule 元素子集;ID 元素解析时忽略)。

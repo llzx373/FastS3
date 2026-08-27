@@ -3795,6 +3795,91 @@ fn bucket_cors_flow() {
     assert_eq!(err_code(&r), "NoSuchCORSConfiguration");
 }
 
+/// M17/B1:Put/Get/DeletePublicAccessBlock 往返;新桶默认全 true;Delete 回默认非全开。
+#[test]
+fn public_access_block_roundtrip() {
+    let (_d, svc) = setup();
+    svc.handle(&req("PUT", "/bkt1", vec![])).unwrap();
+
+    let r = svc.handle(&req_q("GET", "/bkt1", &[("publicAccessBlock", "")], vec![]));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let x = body_str(&r.unwrap());
+    assert!(x.contains("<BlockPublicAcls>true</BlockPublicAcls>"), "{x}");
+    assert!(x.contains("<IgnorePublicAcls>true</IgnorePublicAcls>"), "{x}");
+    assert!(
+        x.contains("<BlockPublicPolicy>true</BlockPublicPolicy>"),
+        "{x}"
+    );
+    assert!(
+        x.contains("<RestrictPublicBuckets>true</RestrictPublicBuckets>"),
+        "{x}"
+    );
+
+    let body = br#"<PublicAccessBlockConfiguration>
+<BlockPublicAcls>false</BlockPublicAcls>
+<IgnorePublicAcls>true</IgnorePublicAcls>
+<BlockPublicPolicy>false</BlockPublicPolicy>
+<RestrictPublicBuckets>true</RestrictPublicBuckets>
+</PublicAccessBlockConfiguration>"#
+        .to_vec();
+    let r = svc.handle(&req_q(
+        "PUT",
+        "/bkt1",
+        &[("publicAccessBlock", "")],
+        body,
+    ));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let r = svc.handle(&req_q("GET", "/bkt1", &[("publicAccessBlock", "")], vec![]));
+    let x = body_str(&r.unwrap());
+    assert!(x.contains("<BlockPublicAcls>false</BlockPublicAcls>"), "{x}");
+    assert!(x.contains("<IgnorePublicAcls>true</IgnorePublicAcls>"), "{x}");
+    assert!(
+        x.contains("<BlockPublicPolicy>false</BlockPublicPolicy>"),
+        "{x}"
+    );
+    assert!(
+        x.contains("<RestrictPublicBuckets>true</RestrictPublicBuckets>"),
+        "{x}"
+    );
+
+    let r = svc.handle(&req_q(
+        "PUT",
+        "/bkt1",
+        &[("publicAccessBlock", "")],
+        b"<oops".to_vec(),
+    ));
+    assert_eq!(err_code(&r), "MalformedXML");
+    let r = svc.handle(&req_q(
+        "PUT",
+        "/bkt1",
+        &[("publicAccessBlock", "")],
+        b"<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls></PublicAccessBlockConfiguration>".to_vec(),
+    ));
+    assert_eq!(err_code(&r), "MalformedXML");
+    let r = svc.handle(&req_q(
+        "PUT",
+        "/bkt1",
+        &[("publicAccessBlock", "")],
+        b"<PublicAccessBlockConfiguration><BlockPublicAcls>yes</BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>true</RestrictPublicBuckets></PublicAccessBlockConfiguration>".to_vec(),
+    ));
+    assert_eq!(err_code(&r), "MalformedXML");
+
+    let r = svc.handle(&req_q(
+        "DELETE",
+        "/bkt1",
+        &[("publicAccessBlock", "")],
+        vec![],
+    ));
+    assert_eq!(status(&r), 204, "{r:?}");
+    let r = svc.handle(&req_q("GET", "/bkt1", &[("publicAccessBlock", "")], vec![]));
+    let x = body_str(&r.unwrap());
+    assert!(x.contains("<BlockPublicAcls>true</BlockPublicAcls>"), "{x}");
+    assert!(
+        x.contains("<BlockPublicPolicy>true</BlockPublicPolicy>"),
+        "{x}"
+    );
+}
+
 /// cors_eval(HTTP 层预检/注头的服务侧评估):命中/未命中/头覆盖。
 #[test]
 fn cors_eval_matching() {

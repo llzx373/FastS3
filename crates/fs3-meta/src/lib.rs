@@ -286,6 +286,8 @@ pub enum BucketConf {
     Tagging,
     /// Ownership Controls(S7;键 `bo:{bucket}`)。
     Ownership,
+    /// Public Access Block(M17/B1;ADR-23;键 `ba:{bucket}`)。
+    PublicAccessBlock,
     /// 桶策略(S3;键 `bp:{bucket}`;值 = 原始 JSON 文本,逐字节回显)。
     Policy,
 }
@@ -294,10 +296,11 @@ impl BucketConf {
     /// 全部配置文档前缀(delete_bucket 事务清理用;新增 D9 前缀须在此登记,
     /// 并同步 fs3d meta-export/import DTO——演进纪律 DESIGN-FUTURE §2.2;
     /// check 可达性扫描只读 `o:`/`p:` 段引用键,对配置键天然安全)。
-    pub const ALL: [BucketConf; 4] = [
+    pub const ALL: [BucketConf; 5] = [
         BucketConf::Cors,
         BucketConf::Tagging,
         BucketConf::Ownership,
+        BucketConf::PublicAccessBlock,
         BucketConf::Policy,
     ];
 
@@ -306,6 +309,7 @@ impl BucketConf {
             BucketConf::Cors => PREFIX_BUCKET_CORS,
             BucketConf::Tagging => PREFIX_BUCKET_TAGGING,
             BucketConf::Ownership => PREFIX_BUCKET_OWNERSHIP,
+            BucketConf::PublicAccessBlock => PREFIX_BUCKET_BPA,
             BucketConf::Policy => PREFIX_BUCKET_POLICY,
         };
         bucket_conf_key(prefix, bucket)

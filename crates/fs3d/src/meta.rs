@@ -492,6 +492,10 @@ pub struct BucketDto {
     /// D9 桶级配置文档(M10 S3 桶策略 `bp:`;原始 JSON 文本;同上)。
     #[serde(default)]
     pub policy: Option<String>,
+    /// D9 桶级配置文档(M17/B1 Public Access Block `ba:`;规范化 XML;
+    /// 旧导出无此字段 → None = 默认全 Block,与 ADR-23 无键语义一致)。
+    #[serde(default)]
+    pub public_access_block: Option<String>,
     /// 生命周期规则集(M11 L1;ADR-12 DL1 `r:` 两段式键;**规范化 XML
     /// 字符串**,与 cors 同先例——DTO 存文档不存结构;导入时重新解析为
     /// 规则逐条重写。旧导出无此字段 → None = 无配置)。
@@ -639,6 +643,7 @@ pub fn run_meta_export(
                 cors: conf(fs3_meta::BucketConf::Cors),
                 ownership_controls: conf(fs3_meta::BucketConf::Ownership),
                 policy: conf(fs3_meta::BucketConf::Policy),
+                public_access_block: conf(fs3_meta::BucketConf::PublicAccessBlock),
                 lifecycle,
                 notification,
                 inventory,
@@ -811,6 +816,7 @@ pub fn run_meta_import(
             (fs3_meta::BucketConf::Cors, &b.cors),
             (fs3_meta::BucketConf::Ownership, &b.ownership_controls),
             (fs3_meta::BucketConf::Policy, &b.policy),
+            (fs3_meta::BucketConf::PublicAccessBlock, &b.public_access_block),
         ] {
             if let Some(doc) = doc {
                 store.commit_bucket_conf_put(&b.name, conf, doc.as_bytes())?;

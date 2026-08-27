@@ -64,6 +64,17 @@ pub enum Operation {
     DeleteBucketOwnershipControls {
         bucket: String,
     },
+    /// PUT ?publicAccessBlock(M17/B1;ADR-23;键 `ba:`)。
+    PutPublicAccessBlock {
+        bucket: String,
+        block: crate::xml::PublicAccessBlock,
+    },
+    GetPublicAccessBlock {
+        bucket: String,
+    },
+    DeletePublicAccessBlock {
+        bucket: String,
+    },
     // —— 桶策略(M10 S3;ADR-11 D9 `bp:` 键) ——
     /// PUT ?policy:JSON body 原样携带(服务层解析校验 + 原文入库,GET 逐字节
     /// 回显——s3-tests test_set_get_del_bucket_policy 断言逐字节相等)。
@@ -638,6 +649,18 @@ impl Router {
                     _ => Err(S3Error::new(S3ErrorCode::MethodNotAllowed)),
                 };
             }
+            // M17/B1:Public Access Block(ADR-23;D9 `ba:` 键)
+            if has_q("publicAccessBlock") {
+                return match method {
+                    "PUT" => Ok(Operation::PutPublicAccessBlock {
+                        bucket,
+                        block: crate::xml::parse_public_access_block(body)?,
+                    }),
+                    "GET" => Ok(Operation::GetPublicAccessBlock { bucket }),
+                    "DELETE" => Ok(Operation::DeletePublicAccessBlock { bucket }),
+                    _ => Err(S3Error::new(S3ErrorCode::MethodNotAllowed)),
+                };
+            }
             // M10 S3:桶策略(D9 `bp:` 键;JSON body 服务层解析校验)
             if has_q("policy") {
                 return match method {
@@ -731,11 +754,8 @@ impl Router {
             // 不支持/未实现的子资源
             for unsupported in [
                 "acl",
-                // GetBucketPolicyStatus 属 PublicAccessBlock 族(远期;M10 S3 不做,
-                // 显式 501 不静默落列表)
+                // GetBucketPolicyStatus:B2 接线;B1 仅配置往返,本条仍 501
                 "policyStatus",
-                // "lifecycle" 自 M11 L1 起已实现(Put/Get/DeleteBucketLifecycle-
-                // Configuration),出表接线
                 "website",
                 // "notification" 自 M15 N1 起已实现(Put/Get/DeleteBucketNotifica-
                 // tionConfiguration),出表接线
@@ -748,7 +768,6 @@ impl Router {
                 "versions",
                 "versionId",
                 // "object-lock" 自 M12 W2-2 起已实现(Put/GetObjectLockConfiguration)
-                "publicAccessBlock",
                 "accelerate",
                 "analytics",
                 // "inventory" 自 M15 I1 起已实现(Put/Get/Delete/ListBucket-

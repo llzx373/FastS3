@@ -12,6 +12,7 @@
 //! - `bc:{bucket}` 桶级 CORS 配置文档(M10 S2;ADR-11 D9,值 = 规范化 XML)
 //! - `bt:{bucket}` 桶级标签文档(M10 S1;ADR-11 D8,值 = 规范化 XML)
 //! - `bo:{bucket}` 桶级 OwnershipControls 文档(M10 S7,值 = 规范化 XML)
+//! - `ba:{bucket}` 桶级 Public Access Block(M17/B1;ADR-23,值 = 规范化 XML)
 //! - `bp:{bucket}` 桶策略文档(M10 S3;ADR-11 D9,值 = 原始 JSON 文本)
 //! - `r:{bucket}\0{rule_id}` 生命周期规则(M11 L1;ADR-12 DL1,值 =
 //!   postcard LifecycleRule;单事务整体替换;两段式同 `m:` 先例)
@@ -46,6 +47,8 @@ pub const PREFIX_BUCKET_CORS: &[u8] = b"bc:";
 pub const PREFIX_BUCKET_TAGGING: &[u8] = b"bt:";
 /// 桶级 OwnershipControls 文档(M10 S7;单账号模型下配置存取 + 回显)。
 pub const PREFIX_BUCKET_OWNERSHIP: &[u8] = b"bo:";
+/// 桶级 Public Access Block(M17/B1;ADR-23;`ba:{bucket}` → 规范化 XML)。
+pub const PREFIX_BUCKET_BPA: &[u8] = b"ba:";
 /// 桶策略文档(M10 S3;ADR-11 D9:桶级配置独立键前缀;值 = 客户端提交的
 /// 原始 JSON 文本,GetBucketPolicy 逐字节回显——s3-tests 断言逐字节相等)。
 pub const PREFIX_BUCKET_POLICY: &[u8] = b"bp:";
