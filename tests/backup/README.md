@@ -22,6 +22,14 @@ bash tests/backup/backup-restore-drill.sh [fasts3d 路径]
 
 通过输出:`PASS: 备份/恢复演练成功(对象 md5 一致、密钥完整、零泄漏)`。
 
+Object Lock 不可变仓库(M17/C3,Veeam 协议替身):
+
+```bash
+bash tests/backup/immutable_lock_drill.sh [fasts3d 路径]
+# GOVERNANCE/COMPLIANCE 覆盖后锁定版本仍在、合规期不可删、legal hold;
+# PATH 无 Veeam CE 时打印 SKIP,脚本仍必须绿。
+```
+
 要点:
 
 - **一致时刻**:先停机(close 写最终检查点)→ 导出 → 快照;运行中快照会

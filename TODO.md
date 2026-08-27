@@ -159,7 +159,7 @@
 - [x] C2 Spark / Trino:脚本骨架 + 版本钉死(文档写明发行版);环境缺则打印 SKIP 并以非 0
   或明确 SKIP 计数退出(同 F9-7 纪律)。不把「未装 Spark」写成通过
   - 用例:无 Spark 时输出含 `SKIP`;有环境则一条 parquet 读写往返
-- [ ] C3 Object Lock 不可变仓库形态演练 `tests/backup/immutable_lock_drill.sh`
+- [x] C3 Object Lock 不可变仓库形态演练 `tests/backup/immutable_lock_drill.sh`
   (governance + compliance:覆盖写拒绝、合规期不可删、legal hold);
   作为 Veeam 不可变仓库的协议替身。真 Veeam CE 若 PATH 中存在则加一轮往返,不存在则 SKIP 不计门禁失败
   - 用例:drill 无 Veeam 仍必须绿(锁语义);有 Veeam 则额外断言备份/不可变失败注入
