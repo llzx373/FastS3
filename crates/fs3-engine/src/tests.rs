@@ -601,10 +601,20 @@ fn checkpoint_tick_bounded_idle() {
     let (_d, mut cfg) = setup();
     cfg.checkpoint_tick_ms = 20;
     let mut e = open_engine(&cfg);
+    // 空闲 ≥10 个 interval(20ms × 12.5):有界 sync_channel(1) 满则跳过。
     std::thread::sleep(std::time::Duration::from_millis(250));
     let n = e.debug_drain_checkpoint_ticks();
     assert!(n <= 1, "idle tick queue must stay ≤1, got {n}");
     e.close().unwrap();
+    assert!(
+        e.debug_checkpoint_thread_joined(),
+        "close() must join the checkpoint ticker"
+    );
+    drop(e);
+
+    // Drop 路径同样 join(Engine::drop → close);join 挂死则本测超时。
+    let e2 = open_engine(&cfg);
+    drop(e2);
 }
 
 #[test]

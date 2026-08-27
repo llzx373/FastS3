@@ -1215,6 +1215,12 @@ impl Engine {
         n
     }
 
+    /// 测试钩子:检查点 tick 线程是否已 join(close/Drop 后为 true)。
+    #[cfg(test)]
+    pub(crate) fn debug_checkpoint_thread_joined(&self) -> bool {
+        self._checkpoint_thread.is_none()
+    }
+
     pub fn io_engine_name(&self) -> &'static str {
         self.io.lock().unwrap().name()
     }
