@@ -1224,6 +1224,23 @@ impl Engine {
         n
     }
 
+    /// 等到打开时那一拍入队并排空,避免「drain 过早、首次 PUT 仍撞上 tick」竞态。
+    #[cfg(test)]
+    pub(crate) fn debug_wait_drain_open_tick(&self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            if self.debug_drain_checkpoint_ticks() >= 1 {
+                let _ = self.debug_drain_checkpoint_ticks();
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = self.debug_drain_checkpoint_ticks();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     /// 测试钩子:检查点 tick 线程是否已 join(close/Drop 后为 true)。
     #[cfg(test)]
     pub(crate) fn debug_checkpoint_thread_joined(&self) -> bool {

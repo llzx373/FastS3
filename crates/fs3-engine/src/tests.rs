@@ -35,6 +35,9 @@ fn setup() -> (tempfile::TempDir, EngineConfig) {
 fn open_engine(cfg: &EngineConfig) -> Engine {
     let mut e = Engine::open(cfg).unwrap();
     e.ensure_bucket("b1").unwrap();
+    // 打开时 tick 线程立即入队一拍;等到入队并排空,否则首次写路径
+    // maybe_checkpoint 会立刻截断 a: 记录(G1)。
+    e.debug_wait_drain_open_tick();
     e
 }
 
@@ -2354,7 +2357,7 @@ fn alloc_records_first_and_last_segment() {
             .flat_map(|r| r.ref_dec)
             .collect()
     };
-    // 首个对象 → alloc 记录
+    // 首个对象 → alloc 记录(open_engine 已排空 open tick,避免立刻 checkpoint)
     e.put("b1", "k0", &mut Cursor::new(vec![1u8; 100_000]))
         .unwrap();
     let a0 = allocs(&e);
@@ -2373,6 +2376,56 @@ fn alloc_records_first_and_last_segment() {
     assert_eq!(d, vec![e0]);
     assert!(!e.allocator().test_bit(e0));
     assert_eq!(e.allocator().allocated_count(), 0);
+    assert!(e.leaks().unwrap().is_empty());
+    e.close().unwrap();
+}
+
+/// G1:排空 open tick 后,a: 记录在显式 checkpoint 前可见;截断日志不回收位图。
+#[test]
+fn alloc_records_visible_until_explicit_checkpoint() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    e.put("b1", "k0", &mut Cursor::new(vec![1u8; 100_000]))
+        .unwrap();
+    let recs = e.meta().list_alloc_records(0).unwrap();
+    assert_eq!(
+        recs.iter().flat_map(|r| r.alloc.iter()).count(),
+        1,
+        "排空 open tick 后 PUT 的 a: 记录仍可见"
+    );
+    assert_eq!(e.allocator().allocated_count(), 1);
+    assert!(e.leaks().unwrap().is_empty());
+    e.checkpoint().unwrap();
+    assert!(
+        e.meta().list_alloc_records(0).unwrap().is_empty(),
+        "显式 checkpoint 才 truncate a: 记录"
+    );
+    assert_eq!(
+        e.allocator().allocated_count(),
+        1,
+        "截断 alloc 日志不得回收位图"
+    );
+    assert!(e.leaks().unwrap().is_empty());
+    e.close().unwrap();
+}
+
+/// G1:待处理 tick + dirty 首次写会立刻 checkpoint,a: 日志被截断但位图仍置位。
+#[test]
+fn pending_checkpoint_tick_truncates_alloc_log_on_first_put() {
+    let (_d, mut cfg) = setup();
+    cfg.checkpoint_tick_ms = 20;
+    let mut e = Engine::open(&cfg).unwrap();
+    e.ensure_bucket("b1").unwrap();
+    e.debug_wait_drain_open_tick();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    e.put("b1", "k0", &mut Cursor::new(vec![1u8; 100_000]))
+        .unwrap();
+    assert!(
+        e.meta().list_alloc_records(0).unwrap().is_empty(),
+        "待处理 tick + dirty 首次写应 checkpoint 并截断 a: 日志"
+    );
+    assert_eq!(e.allocator().allocated_count(), 1);
+    assert!(e.leaks().unwrap().is_empty());
     e.close().unwrap();
 }
 

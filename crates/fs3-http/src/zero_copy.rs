@@ -93,6 +93,9 @@ pub struct ZeroCopyIo {
     zc_tx: Option<std::sync::mpsc::SyncSender<ZcJob>>,
     /// 待丢弃的填充零字节(帧可能分片到达;不等齐即可消费)。
     pad_remaining: usize,
+    /// 测试:Drop/close_dup 是否已 close 过 dup fd(避免并行测 F_GETFD 撞号)。
+    #[cfg(test)]
+    dup_closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// sendfile 线程任务:阻塞式发送 (fd, off, len);fd == PAD_FD 为无操作
@@ -268,6 +271,8 @@ impl ZeroCopyIo {
             buf_id: None,
             zfd: if dup >= 0 { Some(dup) } else { None },
             zc_tx: None,
+            #[cfg(test)]
+            dup_closed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -276,10 +281,18 @@ impl ZeroCopyIo {
         self.zfd
     }
 
+    #[cfg(test)]
+    pub(crate) fn dup_closed_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.dup_closed.clone()
+    }
+
     fn close_dup(&mut self) {
         if let Some(fd) = self.zfd.take() {
             // SAFETY: fd 由 dup() 得到,仅本结构持有。
             unsafe { libc::close(fd) };
+            #[cfg(test)]
+            self.dup_closed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -643,15 +656,21 @@ mod tests {
     async fn zero_copy_io_drop_closes_dup_fd() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let client = TcpStream::connect(addr).await.unwrap();
-        let (server, _) = listener.accept().await.unwrap();
-        let ctx = ZeroCtx::new();
-        let zc = ZeroCopyIo::new(server, &ctx);
-        let fd = zc.dup_fd().expect("dup");
-        drop(zc);
-        let rc = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        assert_eq!(rc, -1, "dup fd must be closed on Drop");
-        drop(client);
+        // 并行测试下内核会立刻复用刚 close 的 fd 号,F_GETFD 不能当权威。
+        for _ in 0..200 {
+            let client = TcpStream::connect(addr).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            let ctx = ZeroCtx::new();
+            let zc = ZeroCopyIo::new(server, &ctx);
+            assert!(zc.dup_fd().is_some(), "dup must succeed");
+            let closed = zc.dup_closed_flag();
+            drop(zc);
+            assert!(
+                closed.load(std::sync::atomic::Ordering::SeqCst),
+                "dup fd must be closed on Drop"
+            );
+            drop(client);
+        }
     }
 
     #[test]

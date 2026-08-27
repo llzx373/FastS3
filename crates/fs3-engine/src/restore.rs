@@ -524,6 +524,7 @@ mod tests {
     fn open_engine(cfg: &crate::EngineConfig) -> Engine {
         let mut e = Engine::open(cfg).unwrap();
         e.ensure_bucket("b1").unwrap();
+        e.debug_wait_drain_open_tick();
         e
     }
 
