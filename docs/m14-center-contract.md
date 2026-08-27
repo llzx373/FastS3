@@ -78,8 +78,9 @@
   (防积压);`POST /v2/center/sync-tasks/:id/run` 手动触发(run_now)。
 - **执行**:节点 agent 收到 sync.run → 本地 spawn 执行器(mirror =
   `mc mirror --overwrite` 含删除传播;incremental = `rclone copy` 只增
-  不删);**串行节流档**(mc `--max-workers 1` / rclone `--transfers 1`,
-  引擎并发死锁规避,见 S3-GAP §9);二进制缺失/失败 → **rejected 显式
+  不删);**默认并发 4**(mc `--max-workers` / rclone `--transfers`,
+  `FS3_SYNC_MC_WORKERS` / `FS3_SYNC_RCLONE_TRANSFERS` 可配,上限 32;
+  不再要求串行才能稳);二进制缺失/失败 → **rejected 显式
   上报**(mc 以 JSON error 行判定,exit code 不可靠);超时 1800s kill;
   transferred = 执行器 --json 输出近似对象数。
 - **结算**:results 回执携带 `transferred`;中心按 task_id 回写任务状态

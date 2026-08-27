@@ -14,11 +14,11 @@
 #   6) 单写者冲突(同目标桶第二任务 → 409)。
 #
 # 用法: ./m16_sync_drill.sh
-# 前置:target/release/fasts3d 带 agent feature;web/server/dist 已构建;
-#       mc/rclone 在 PATH;openssl/curl/python3。
+# 前置:fasts3d 带 agent feature(`FASTS3D_BIN` 或 target/release/fasts3d);
+#       web/server/dist 已构建;mc/rclone 在 PATH;openssl/curl/python3。
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-BIN="$ROOT/target/release/fasts3d"
+BIN="${FASTS3D_BIN:-$ROOT/target/release/fasts3d}"
 WEB="$ROOT/web/server"
 WORK="$(mktemp -d /tmp/fs3-m16-sync.XXXXXX)"
 FAILED=0
@@ -196,13 +196,14 @@ mc $alias_src cp "$WORK/data/f2.txt" SRCNODE/src-bucket/ >/dev/null 2>&1
 mc $alias_src cp "$WORK/data/f3.txt" SRCNODE/src-bucket/ >/dev/null 2>&1
 curl -sk -H "authorization: Bearer $TOKEN" -X POST "https://localhost:$C_WEB/center/api/sync-tasks/t-mirror/run" >/dev/null
 ST=""
+C2=""
 for _ in $(seq 1 60); do
   ST=$(task_state t-mirror)
-  [ "$ST" = "ok 2 " ] && break
+  C2=$(count_dst dst-bucket)
+  echo "$ST" | grep -q "^ok " && [ "$C2" = "3" ] && break
   sleep 0.5
 done
-[ "$ST" = "ok 2 " ] || fail "mirror 增量同步($ST;期望 ok 2 新对象)"
-C2=$(count_dst dst-bucket)
+echo "$ST" | grep -q "^ok " || fail "mirror 增量同步($ST;期望 ok,并发 JSON 行数为近似值)"
 [ "$C2" = "3" ] || fail "dst-bucket 对象数=$C2(期望 3,无重复)"
 pass "mirror 增量 + 手动触发:3 对象恰好一次无重复"
 
@@ -226,14 +227,15 @@ pass "目标断线:sync.run 显式 rejected(账本 + 任务 last_error)"
 PIDS+=($!)
 R0=$(task_run_at t-mirror)
 ST=""
+C3=""
 for _ in $(seq 1 120); do
   ST=$(task_state t-mirror)
   R=$(task_run_at t-mirror)
-  [ "$ST" = "ok 1 " ] && [ "$R" -gt "$R0" ] && break
+  C3=$(count_dst dst-bucket)
+  echo "$ST" | grep -q "^ok " && [ "$R" -gt "$R0" ] && [ "$C3" = "4" ] && break
   sleep 0.5
 done
-[ "$ST" = "ok 1 " ] || fail "目标恢复后自动重跑收敛($ST;期望 ok 1 新对象 f4)"
-C3=$(count_dst dst-bucket)
+echo "$ST" | grep -q "^ok " || fail "目标恢复后自动重跑收敛($ST;期望 ok)"
 [ "$C3" = "4" ] || fail "dst-bucket 对象数=$C3(期望 4)"
 pass "目标恢复:按调度自动重跑,f4 恰好一次,对象数 4"
 
@@ -263,14 +265,15 @@ done
 [ -n "$TOKEN" ] || { fail "中心重启 token"; }
 R1=$(task_run_at t-mirror)
 ST=""
+C5=""
 for _ in $(seq 1 120); do
   ST=$(task_state t-mirror)
   R=$(task_run_at t-mirror)
-  [ "$ST" = "ok 1 " ] && [ "$R" -gt "$R1" ] && break
+  C5=$(count_dst dst-bucket)
+  echo "$ST" | grep -q "^ok " && [ "$R" -gt "$R1" ] && [ "$C5" = "5" ] && break
   sleep 0.5
 done
-[ "$ST" = "ok 1 " ] || fail "中心恢复后继续同步($ST;期望 ok 1 新对象 f5)"
-C5=$(count_dst dst-bucket)
+echo "$ST" | grep -q "^ok " || fail "中心恢复后继续同步($ST;期望 ok)"
 [ "$C5" = "5" ] || fail "dst-bucket 对象数=$C5(期望 5)"
 pass "中心恢复:agent 自动重连 → 按计划继续,f5 同步,对象数 5"
 
@@ -285,10 +288,12 @@ ST=""
 for _ in $(seq 1 90); do
   ST=$(task_state t-incr)
   R=$(task_run_at t-incr)
-  [ "$ST" = "ok 2 " ] && [ "$R" -gt 0 ] && break
+  C_IN=$(count_src src-bucket2)
+  echo "$ST" | grep -q "^ok " && [ "$R" -gt 0 ] && [ "$C_IN" = "2" ] && break
   sleep 0.5
 done
-[ "$ST" = "ok 2 " ] || fail "incremental 首次同步($ST;期望 ok 2)"
+echo "$ST" | grep -q "^ok " || fail "incremental 首次同步($ST;期望 ok)"
+[ "${C_IN:-0}" = "2" ] || fail "incremental 首次同步对象数=$C_IN(期望 2)"
 # 删除源侧一个对象 → incremental 不删目标(重跑 0 新对象,目标保留)
 mc $alias_dst rm DSTNODE/dst-bucket2/f1.txt >/dev/null 2>&1
 curl -sk -H "authorization: Bearer $TOKEN" -X POST "https://localhost:$C_WEB/center/api/sync-tasks/t-incr/run" >/dev/null
@@ -297,7 +302,7 @@ ST=""
 for _ in $(seq 1 60); do
   ST=$(task_state t-incr)
   R=$(task_run_at t-incr)
-  [ "$ST" = "ok 0 " ] && [ "$R" -gt "$R3" ] && break
+  echo "$ST" | grep -q "^ok " && [ "$R" -gt "$R3" ] && break
   sleep 0.5
 done
 C6=$(count_src src-bucket2)
@@ -311,7 +316,7 @@ ST=""
 for _ in $(seq 1 60); do
   ST=$(task_state t-mirror)
   R=$(task_run_at t-mirror)
-  [ "$ST" = "ok 0 " ] && [ "$R" -gt "$R2" ] && break
+  echo "$ST" | grep -q "^ok " && [ "$R" -gt "$R2" ] && break
   sleep 0.5
 done
 C7=$(count_dst dst-bucket)

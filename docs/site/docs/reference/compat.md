@@ -73,7 +73,8 @@ meta-export/import 可见并可往返;真实类独立落 ObjectMeta v7 `storage_
   (`PUT Bucket replication` → 501 NotImplemented,ADR-20):企业 DR 经
   中心纳管同步任务落地(控制台「同步任务」页;mirror = mc mirror 含删除
   传播 / incremental = rclone copy 只增不删;中心调度 + 节点本地执行 +
-  对账视图,见 docs/m14-center-contract.md §6)。
+  对账视图,见 docs/m14-center-contract.md §6)。同步执行器默认
+  `--max-workers`/`--transfers` = 4(可配,上限 32),不要求串行才能稳定。
 - **SSE**:SSE-S3 归档可恢复(服务端 KEK 自持解密);SSE-C 归档恢复显式
   400(客户密钥零落盘);SSE + 归档 + multipart 显式 400。
 - 存储类分账:`BucketStats.by_class`(对象数/逻辑字节 × 四类;Σ == 桶统计),

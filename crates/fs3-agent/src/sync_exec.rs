@@ -7,6 +7,9 @@
 //! - mode=incremental → `rclone copy`(只增/更新,不删目标)
 //! - 二进制由部署方预装于 PATH;可用 FS3_SYNC_MC_BIN / FS3_SYNC_RCLONE_BIN
 //!   覆盖(测试注入桩;生产不建议)。
+//! - 默认并发(M17/D3):mc `--max-workers` / rclone `--transfers` = 4
+//!   (`FS3_SYNC_MC_WORKERS` / `FS3_SYNC_RCLONE_TRANSFERS` 可配,上限 32)。
+//!   v2.2 串行档已随引擎死锁修复撤销,不再作为产品口径。
 //! - 每次执行使用独立临时配置目录(MC_CONFIG_DIR / RCLONE_CONFIG),互不
 //!   污染;凭据经命令行传递(管理面配置,ADR-20 DR1-3 文档化)。
 //! - 快速失败:mc 带 `--retry 0`、rclone 带 `--retries 1`(目标不可达立即
@@ -49,6 +52,22 @@ pub struct SyncOutcome {
 
 /// 同步超时(大镜像可能很慢;超时 kill 并上报失败)
 const SYNC_TIMEOUT: Duration = Duration::from_secs(1800);
+
+/// 默认同步并发(mc `--max-workers` / rclone `--transfers`)。
+pub const DEFAULT_SYNC_CONCURRENCY: u32 = 4;
+/// 可配上限(文档化;再高对单节点收益有限且放大对端压力)。
+pub const MAX_SYNC_CONCURRENCY: u32 = 32;
+
+/// 解析并发:非法/缺省 → 默认 4;0 → 1;超过上限截断。
+fn sync_concurrency(var: &str) -> u32 {
+    match env::var(var) {
+        Ok(s) => {
+            let n = s.trim().parse::<u32>().unwrap_or(DEFAULT_SYNC_CONCURRENCY);
+            n.clamp(1, MAX_SYNC_CONCURRENCY)
+        }
+        Err(_) => DEFAULT_SYNC_CONCURRENCY,
+    }
+}
 
 /// 执行一次同步任务(节点本地裁决;ADR-20 DR3)。
 pub async fn run_sync(spec: &SyncRunSpec) -> SyncOutcome {
@@ -121,10 +140,8 @@ async fn run_mc_mirror(spec: &SyncRunSpec) -> SyncOutcome {
         // --remove:删除目标端多余对象(删除传播,mirror 语义核心;
         // 不带 --remove 时 mc mirror 不删任何目标对象)
         .arg("--remove")
-        // 串行节流档(--max-workers 1):并发 PUT/List 曾触发 fasts3d 引擎级
-        // 死锁(mc 默认 autodetect 高并发;已知问题见 S3-GAP,修复后放开)
         .arg("--max-workers")
-        .arg("1")
+        .arg(sync_concurrency("FS3_SYNC_MC_WORKERS").to_string())
         .arg("--json")
         .arg(format!("FS3SRC/{bucket}", bucket = spec.source_bucket))
         .arg(format!("FS3DST/{bucket}", bucket = spec.dest_bucket))
@@ -245,7 +262,7 @@ async fn run_rclone_copy(spec: &SyncRunSpec) -> SyncOutcome {
         .arg("--retries")
         .arg("1")
         .arg("--transfers")
-        .arg("1")
+        .arg(sync_concurrency("FS3_SYNC_RCLONE_TRANSFERS").to_string())
         .arg("--fast-list")
         // rclone copy 无 --json;transferred 从 stderr stats 行解析(wait_json)
         .arg(format!("FS3SRC:{bucket}", bucket = spec.source_bucket))
@@ -653,5 +670,85 @@ mod tests {
         let _ = std::fs::remove_file(&stub);
         assert!(!out.ok);
         assert!(out.error.as_deref().unwrap_or("").contains("stub stderr 1"));
+    }
+
+    #[tokio::test]
+    async fn spawn_concurrency_default_is_at_least_4_not_serial() {
+        // 桩把 argv 落到文件,断言不再写死 --max-workers 1 / --transfers 1。
+        let args_mc = std::env::temp_dir().join(format!("fs3-sync-args-mc-{}", std::process::id()));
+        let args_rc = std::env::temp_dir().join(format!("fs3-sync-args-rc-{}", std::process::id()));
+        let stub_mc = stub_script_record("mc-conc", &args_mc);
+        let stub_rc = stub_script_record("rc-conc", &args_rc);
+        let _g = ENV_LOCK.lock().await;
+        env::remove_var("FS3_SYNC_MC_WORKERS");
+        env::remove_var("FS3_SYNC_RCLONE_TRANSFERS");
+        env::set_var("FS3_SYNC_MC_BIN", &stub_mc);
+        let out = run_sync(&spec()).await;
+        env::remove_var("FS3_SYNC_MC_BIN");
+        assert!(out.ok, "mc: {:?}", out.error);
+        let mc_args = std::fs::read_to_string(&args_mc).unwrap_or_default();
+        assert!(
+            mc_args.contains("--max-workers 4"),
+            "default mc workers must be 4, got {mc_args:?}"
+        );
+        assert!(
+            !mc_args.contains("--max-workers 1"),
+            "must not keep serial throttle: {mc_args:?}"
+        );
+
+        env::set_var("FS3_SYNC_RCLONE_BIN", &stub_rc);
+        let mut s = spec();
+        s.mode = "incremental".into();
+        let out = run_sync(&s).await;
+        env::remove_var("FS3_SYNC_RCLONE_BIN");
+        assert!(out.ok, "rclone: {:?}", out.error);
+        let rc_args = std::fs::read_to_string(&args_rc).unwrap_or_default();
+        assert!(
+            rc_args.contains("--transfers 4"),
+            "default rclone transfers must be 4, got {rc_args:?}"
+        );
+        assert!(
+            !rc_args.contains("--transfers 1"),
+            "must not keep serial throttle: {rc_args:?}"
+        );
+
+        env::set_var("FS3_SYNC_MC_WORKERS", "99");
+        env::set_var("FS3_SYNC_MC_BIN", &stub_mc);
+        let _ = std::fs::remove_file(&args_mc);
+        let out = run_sync(&spec()).await;
+        env::remove_var("FS3_SYNC_MC_BIN");
+        env::remove_var("FS3_SYNC_MC_WORKERS");
+        let mc_cap = std::fs::read_to_string(&args_mc).unwrap_or_default();
+        assert!(
+            mc_cap.contains(&format!("--max-workers {MAX_SYNC_CONCURRENCY}")),
+            "cap 32, got {mc_cap:?}"
+        );
+        assert!(out.ok);
+
+        let _ = std::fs::remove_file(&stub_mc);
+        let _ = std::fs::remove_file(&stub_rc);
+        let _ = std::fs::remove_file(&args_mc);
+        let _ = std::fs::remove_file(&args_rc);
+        assert!(DEFAULT_SYNC_CONCURRENCY >= 4);
+    }
+
+    fn stub_script_record(tag: &str, args_file: &std::path::Path) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "fs3-sync-stub-{tag}-{pid}.sh",
+            pid = std::process::id()
+        ));
+        let af = args_file.display();
+        std::fs::write(
+            &p,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in mirror|copy) printf '%s\\n' \"$*\" > \"{af}\";; esac\ncase \"$1\" in --retry) shift 2;; esac\ncase \"$1\" in\n  --version|alias|config) exit 0;;\n  lsjson) echo '[]'; exit 0;;\nesac\necho '{{\"status\":\"success\",\"source\":\"a\"}}'\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&p).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&p, perms).unwrap();
+        p
     }
 }

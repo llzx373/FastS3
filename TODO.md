@@ -127,7 +127,7 @@
   互等的锁;补单测或内部探针覆盖「并发 PUT + List + Head」
   - 用例:`concurrent_put_list_no_deadlock`(线程或 HTTP 级,≥32 并发,跑完 `in_flight==0`
     且后续 ListBuckets 仍 200);D1 harness 转绿
-- [ ] D3 同步执行器默认并发恢复合理值:mc `--max-workers` 默认 ≥4(可配,上限文档化);
+- [x] D3 同步执行器默认并发恢复合理值:mc `--max-workers` 默认 ≥4(可配,上限文档化);
   rclone `--transfers` 对齐;compat/ADR-20 补遗删除「必须串行才能稳」的产品口径
   - 用例:单测或 drill 断言 spawn 参数不再写死 1;M16 双节点 drill 以新默认跑通
 - [ ] D4 崩溃混载补一条:并发 mirror 进行中 kill -9 × ≥50 轮,重启后账目零漂移、无挂死

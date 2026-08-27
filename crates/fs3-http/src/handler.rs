@@ -2,7 +2,7 @@
 //!
 //! - 小 PUT(Content-Length ≤ 阈值)缓冲后走 `handle`(可先验载荷哈希);
 //! - 大 PUT / aws-chunked 走 `put_object_stream`(通道泵 + 同步读);
-//! - GET/HEAD 走 `handle`;未加密流式 GET 走 `tokio::spawn`(v1.1);SSE 走 `spawn_blocking`(M11 G-2)。
+//! - GET/HEAD 走 `handle`;对象流式 GET(含明文)走 `spawn_blocking`(M17/D2:禁止在 reactor 上拿引擎锁)。
 //!
 //! 锁序(M17/D2):引擎 `RwLock` / `IoEngine` Mutex **不得**在 tokio reactor
 //! 线程上获取。流式 PUT 的 body 泵与 hyper 同 runtime;`handle` 若在
@@ -43,17 +43,23 @@ pub async fn serve_connection(
     web_root: Option<std::path::PathBuf>,
     cors_allow_origins: Arc<Vec<String>>,
 ) -> std::io::Result<()> {
-    // 零拷贝(B3/D2):注册设备 fd 白名单,包裹 socket 识别标记帧
-    crate::zero_copy::register_trusted_fd(service.device_fd());
-    for fd in service.zc_fds().into_iter().flatten() {
-        crate::zero_copy::register_trusted_fd(fd);
-    }
     // 审计用客户端地址(H2)
     let peer = stream
         .peer_addr()
         .map(|a| a.to_string())
         .unwrap_or_default();
     service.set_peer(&peer);
+    // 设备 fd 白名单:engine.read() 不得在 reactor 上取(与流式 PUT 写锁互等)
+    let svc_fd = service.clone();
+    let (dev_fd, zc) = tokio::task::spawn_blocking(move || {
+        (svc_fd.device_fd(), svc_fd.zc_fds())
+    })
+    .await
+    .unwrap_or((0, Vec::new()));
+    crate::zero_copy::register_trusted_fd(dev_fd);
+    for fd in zc.into_iter().flatten() {
+        crate::zero_copy::register_trusted_fd(fd);
+    }
     let zc_ctx = Some(crate::zero_copy::ZeroCtx::new());
     // H4:DeadlinedIo 提供 30s 首读(header)/ 60s 每读(idle)截止
     let io = TokioIo::new(crate::DeadlinedIo::new(
@@ -282,17 +288,6 @@ fn empty_body() -> RespBody {
     Full::new(Bytes::new())
         .map_err(|e| std::io::Error::other(e.to_string()))
         .boxed()
-}
-
-/// 多段 Range 流:非空字节即发(空发返回 true 保持语义简单)。
-async fn send_range_bytes(
-    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
-    bytes: &[u8],
-) -> bool {
-    if !bytes.is_empty() && tx.send(Ok(Bytes::copy_from_slice(bytes))).await.is_err() {
-        return false;
-    }
-    true
 }
 
 fn send_range_bytes_blocking(
@@ -533,16 +528,25 @@ where
         };
         if let (Some(origin), Some(acrm)) = (hdr("origin"), hdr("access-control-request-method")) {
             let acrh = hdr("access-control-request-headers");
-            return Ok(
-                match service.cors_eval(&host, &decoded_path, &origin, &acrm, acrh.as_deref()) {
-                    Some(allow) => cors_rule_preflight_response(&allow),
-                    None => {
-                        let err = S3Error::new(fs3_s3::S3ErrorCode::AccessDenied)
+            let svc = service.clone();
+            let host2 = host.clone();
+            let path2 = decoded_path.clone();
+            let origin2 = origin.clone();
+            let acrm2 = acrm.clone();
+            let allow = tokio::task::spawn_blocking(move || {
+                svc.cors_eval(&host2, &path2, &origin2, &acrm2, acrh.as_deref())
+            })
+            .await
+            .ok()
+            .flatten();
+            return Ok(match allow {
+                Some(allow) => cors_rule_preflight_response(&allow),
+                None => {
+                    let err = S3Error::new(fs3_s3::S3ErrorCode::AccessDenied)
                         .with_message("CORS preflight failed: no CORS configuration or no matching rule for this origin/method.");
-                        error_response(&err, &host_id, &request_id)
-                    }
-                },
-            );
+                    error_response(&err, &host_id, &request_id)
+                }
+            });
         }
         let err = S3Error::new(fs3_s3::S3ErrorCode::InvalidRequest)
             .with_message("CORS is not enabled for this bucket.");
@@ -888,86 +892,45 @@ fn render_with(
             }
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
             let svc = service.clone();
-            // M11 G-2:SSE 解密+同步 io_uring 若占 runtime worker,channel
-            // 反压时 hyper 无法 poll → 客户端 ReadTimeout。仅加密对象走
-            // spawn_blocking;未加密保持 v1.1 tokio::spawn + async send,
-            // 否则缓冲 GET(zipf 小对象、低于零拷贝阈值)吞吐回退约 30%。
-            if sse_key.is_some() {
-                tokio::task::spawn_blocking(move || {
-                    let _read_pin = read_pin;
-                    let _admit_guard = admit.map(|(a, n)| AdmitGuard::new(a, n));
-                    let mut pos = 0u64;
-                    let mut buf = vec![0u8; 4 * 1024 * 1024];
-                    loop {
-                        let n = match svc.read_stream_chunk(
-                            &bucket,
-                            &key,
-                            version.as_ref(),
-                            versioning,
-                            offset,
-                            length,
-                            &mut pos,
-                            &mut buf,
-                            sse_key.as_ref(),
-                        ) {
-                            Ok(n) => n,
-                            Err(e) => {
-                                let _ = tx.blocking_send(Err(std::io::Error::other(
-                                    e.render_xml("", ""),
-                                )));
-                                break;
-                            }
-                        };
-                        if n == 0 {
+            // M17/D2:读路径也必须离开 reactor。engine.read() 是 parking_lot
+            // 阻塞锁;未加密 GET 若在 tokio 线程上拿锁,会堵死同 runtime 的
+            // 流式 PUT body 泵(写锁持有者等 chunk)→ 整节点挂死。
+            tokio::task::spawn_blocking(move || {
+                let _read_pin = read_pin;
+                let _admit_guard = admit.map(|(a, n)| AdmitGuard::new(a, n));
+                let mut pos = 0u64;
+                let mut buf = vec![0u8; 4 * 1024 * 1024];
+                loop {
+                    let n = match svc.read_stream_chunk(
+                        &bucket,
+                        &key,
+                        version.as_ref(),
+                        versioning,
+                        offset,
+                        length,
+                        &mut pos,
+                        &mut buf,
+                        sse_key.as_ref(),
+                    ) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            let _ = tx.blocking_send(Err(std::io::Error::other(
+                                e.render_xml("", ""),
+                            )));
                             break;
                         }
-                        if tx
-                            .blocking_send(Ok(Bytes::copy_from_slice(&buf[..n])))
-                            .is_err()
-                        {
-                            break;
-                        }
+                    };
+                    if n == 0 {
+                        break;
                     }
-                });
-            } else {
-                tokio::spawn(async move {
-                    let _read_pin = read_pin;
-                    let _admit_guard = admit.map(|(a, n)| AdmitGuard::new(a, n));
-                    let mut pos = 0u64;
-                    let mut buf = vec![0u8; 4 * 1024 * 1024];
-                    loop {
-                        let n = match svc.read_stream_chunk(
-                            &bucket,
-                            &key,
-                            version.as_ref(),
-                            versioning,
-                            offset,
-                            length,
-                            &mut pos,
-                            &mut buf,
-                            sse_key.as_ref(),
-                        ) {
-                            Ok(n) => n,
-                            Err(e) => {
-                                let _ = tx
-                                    .send(Err(std::io::Error::other(e.render_xml("", ""))))
-                                    .await;
-                                break;
-                            }
-                        };
-                        if n == 0 {
-                            break;
-                        }
-                        if tx
-                            .send(Ok(Bytes::copy_from_slice(&buf[..n])))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
+                    if tx
+                        .blocking_send(Ok(Bytes::copy_from_slice(&buf[..n])))
+                        .is_err()
+                    {
+                        break;
                     }
-                });
-            }
+                }
+            });
             // Frame 包装:StreamBody 需要 Stream<Item = Result<Frame<D>, E>>
             let stream = ReceiverStream::new(rx).map(|r| r.map(hyper::body::Frame::data));
             let body = StreamBody::new(stream).boxed();
@@ -1008,110 +971,56 @@ fn render_with(
             };
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
             let svc = service.clone();
-            if sse_key.is_some() {
-                tokio::task::spawn_blocking(move || {
-                    let _read_pin = read_pin;
-                    let _admit_guard = admit.map(|(a, n)| AdmitGuard::new(a, n));
-                    let mut buf = vec![0u8; 4 * 1024 * 1024];
-                    for (s, e) in &ranges {
-                        let header = format!(
-                            "--{boundary}\r\nContent-Type: {part_content_type}\r\nContent-Range: bytes {s}-{e}/{total}\r\n\r\n"
-                        );
-                        if !send_range_bytes_blocking(&tx, header.as_bytes()) {
+            tokio::task::spawn_blocking(move || {
+                let _read_pin = read_pin;
+                let _admit_guard = admit.map(|(a, n)| AdmitGuard::new(a, n));
+                let mut buf = vec![0u8; 4 * 1024 * 1024];
+                for (s, e) in &ranges {
+                    let header = format!(
+                        "--{boundary}\r\nContent-Type: {part_content_type}\r\nContent-Range: bytes {s}-{e}/{total}\r\n\r\n"
+                    );
+                    if !send_range_bytes_blocking(&tx, header.as_bytes()) {
+                        break;
+                    }
+                    let len = e - s + 1;
+                    let mut pos = 0u64;
+                    loop {
+                        let n = match svc.read_stream_chunk(
+                            &bucket,
+                            &key,
+                            version.as_ref(),
+                            versioning,
+                            *s,
+                            len,
+                            &mut pos,
+                            &mut buf,
+                            sse_key.as_ref(),
+                        ) {
+                            Ok(n) => n,
+                            Err(err) => {
+                                let _ = tx.blocking_send(Err(std::io::Error::other(
+                                    err.render_xml("", ""),
+                                )));
+                                break;
+                            }
+                        };
+                        if n == 0 {
                             break;
                         }
-                        let len = e - s + 1;
-                        let mut pos = 0u64;
-                        loop {
-                            let n = match svc.read_stream_chunk(
-                                &bucket,
-                                &key,
-                                version.as_ref(),
-                                versioning,
-                                *s,
-                                len,
-                                &mut pos,
-                                &mut buf,
-                                sse_key.as_ref(),
-                            ) {
-                                Ok(n) => n,
-                                Err(err) => {
-                                    let _ = tx.blocking_send(Err(std::io::Error::other(
-                                        err.render_xml("", ""),
-                                    )));
-                                    break;
-                                }
-                            };
-                            if n == 0 {
-                                break;
-                            }
-                            if tx
-                                .blocking_send(Ok(Bytes::copy_from_slice(&buf[..n])))
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        if !send_range_bytes_blocking(&tx, b"\r\n") {
+                        if tx
+                            .blocking_send(Ok(Bytes::copy_from_slice(&buf[..n])))
+                            .is_err()
+                        {
                             break;
                         }
                     }
-                    let tail = format!("--{boundary}--\r\n");
-                    let _ = send_range_bytes_blocking(&tx, tail.as_bytes());
-                });
-            } else {
-                tokio::spawn(async move {
-                    let _read_pin = read_pin;
-                    let _admit_guard = admit.map(|(a, n)| AdmitGuard::new(a, n));
-                    let mut buf = vec![0u8; 4 * 1024 * 1024];
-                    for (s, e) in &ranges {
-                        let header = format!(
-                            "--{boundary}\r\nContent-Type: {part_content_type}\r\nContent-Range: bytes {s}-{e}/{total}\r\n\r\n"
-                        );
-                        if !send_range_bytes(&tx, header.as_bytes()).await {
-                            break;
-                        }
-                        let len = e - s + 1;
-                        let mut pos = 0u64;
-                        loop {
-                            let n = match svc.read_stream_chunk(
-                                &bucket,
-                                &key,
-                                version.as_ref(),
-                                versioning,
-                                *s,
-                                len,
-                                &mut pos,
-                                &mut buf,
-                                sse_key.as_ref(),
-                            ) {
-                                Ok(n) => n,
-                                Err(err) => {
-                                    let _ = tx
-                                        .send(Err(std::io::Error::other(err.render_xml("", ""))))
-                                        .await;
-                                    break;
-                                }
-                            };
-                            if n == 0 {
-                                break;
-                            }
-                            if tx
-                                .send(Ok(Bytes::copy_from_slice(&buf[..n])))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        if !send_range_bytes(&tx, b"\r\n").await {
-                            break;
-                        }
+                    if !send_range_bytes_blocking(&tx, b"\r\n") {
+                        break;
                     }
-                    let tail = format!("--{boundary}--\r\n");
-                    let _ = send_range_bytes(&tx, tail.as_bytes()).await;
-                });
-            }
+                }
+                let tail = format!("--{boundary}--\r\n");
+                let _ = send_range_bytes_blocking(&tx, tail.as_bytes());
+            });
             let stream = ReceiverStream::new(rx).map(|r| r.map(hyper::body::Frame::data));
             let body = StreamBody::new(stream).boxed();
             builder.body(body)
