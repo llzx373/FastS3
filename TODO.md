@@ -178,7 +178,7 @@ F0 ADR-22
 - [x] F9-3 README 当前状态补 M13–M16;「完整 S3」改为与 compat 同口径;Hadoop 保持「未测/规划」
 - [x] F9-4 DESIGN §1.3 V1 非目标加「已被后续 ADR 取代」指向;§4.3 位图权威 / §4.4 键前缀 / 检查点指针 / ETag hex 拼接与 ADR-5/9/14/22 对齐
 - [x] F9-5 CHANGELOG v2.1 C1「统一 STANDARD」加勘误(被 M16 真实归档覆盖);compat.md Webhook HTTPS 与 F6-1 最终选择一致
-- [ ] F9-6 s3-tests README:notification/归档「出集」改为「上游无测/配置 skip,不以 100% 声称」;N5/A5-1 门禁改为自有集成测试为权威
+- [x] F9-6 s3-tests README:notification/归档「出集」改为「上游无测/配置 skip,不以 100% 声称」;N5/A5-1 门禁改为自有集成测试为权威
 - [ ] F9-7 STS/Inventory smoke:无 boto3 **不得 exit 0 当过**(fail 或 skip 非零/明确 SKIP 计数);T3 补 boto3 STS client 或改 TODO 措辞为「Query API 兼容」
 - [ ] F9-8 补 `docs/perf-M15.md`(或 CHANGELOG 声明 M15 perf 以 M16 报告为承接、作废独立文件);门禁数字与仓内报告一致
 
@@ -207,7 +207,7 @@ F0 ADR-22
 - [x] N2 持久化事件队列(新键前缀 `e:`;复用审计环形底座模式:批量截断删最旧、崩溃零漂移;事件集 = ObjectCreated:*/ObjectRemoved:*/Restore*/Lifecycle* 起步;三处同步:keys.rs 前缀表、meta-export/import DTO、check 可达性扫描)
 - [x] N3 投递 worker(BackgroundWorker 实例:节流/暂停/批额度;Webhook = HTTP POST + HMAC 签名;重试指数退避 + 死信留存;指标 `fasts3_notification_*` + 告警 FastS3NotificationDeliveryStalled)
 - [x] N4 集成测试(配置→写对象→投递→载荷/签名断言;失败重试与死信;重启后队列继续;投递失败不影响数据面请求语义)
-- [x] N5 s3-tests notification 族出排除集且 100%(EXCLUDE 移除 `notification` token)+ 关闭态 perf 零回退对照
+- [x] N5 s3-tests `notification` token 已移除(上游无专测,失败不再豁免 ≠ 100% 出集);**权威 = N4 自有集成测试** + 关闭态 perf 零回退对照
 
 ### T. STS 临时凭证(NEXT-ROUND §5 T1~T3,≈3.5 pw)
 - [x] T1 Node 管理面 STS 兼容端点(Query API:GetSessionToken/AssumeRole 最小集;基于 admin 身份对既有密钥签发会话;会话策略与密钥策略求交;TTL 默认 1h,上限对齐 AWS;secret 仅签发时一次回显,沿用 G1-3 语义不落盘)
@@ -276,7 +276,7 @@ F0 ADR-22
 - [x] A4-1 控制台/审计:存储类分布与 restore 状态展示、手动 restore 操作、归档审计过滤(web/server 桥接端点)
 
 #### A5 测试与门禁(≈1.3 pw)
-- [x] A5-1 s3-tests transition/restore/storage-class 族出排除集且 100%(test_lifecycle_transition_* 出集;test_restore_object* 按实现口径出集或逐名记录;EXCLUDE 正则与 README 矩阵同步)
+- [x] A5-1 s3-tests 归档用例多为配置 skip/上游无测(**不以 100% 出集声称**);**权威 = 自有集成测试**(m16_archive_smoke + service_integration);EXCLUDE 无归档专 token
 - [x] A5-2 崩溃 ≥500 轮(归档写/transition/restore/GC 混载)零撕裂/零泄漏/账目零漂移;transition×压缩 worker 并发回归(**F8 已复核**:`streaming_get_during_compaction_stable` + gate `compaction_enabled=true`;崩溃混载开压缩见 G2)
 - [x] A5-3 升级演练 v2.1→v2.2(含 ObjectMeta v6→v7 在线重写 + 回滚实测);归档读带宽/恢复耗时基准写入发布报告(§9.1 口径)
 - [x] A5-4 客户端矩阵:aws cli RestoreObject/存储类往返 + mc/rclone 归档对象行为;compat.md 存储类矩阵从「M15 映射 STANDARD」升版为真实归档语义

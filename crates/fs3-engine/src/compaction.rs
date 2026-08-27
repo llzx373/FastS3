@@ -1077,6 +1077,52 @@ mod tests {
         );
     }
 
+    /// F9-6:notification/归档不以 s3-tests 100% 出集声称;权威为自有集成测试。
+    #[test]
+    fn s3tests_readme_notification_archive_not_claimed_100() {
+        let readme = include_str!("../../../tests/s3-tests/README.md");
+        let archive = readme
+            .lines()
+            .find(|l| l.contains("归档族") && l.contains("RestoreObject"))
+            .expect("archive row");
+        assert!(
+            archive.contains("不以") && archive.contains("100%"),
+            "归档行须明确不以 100% 声称: {archive}"
+        );
+        assert!(
+            archive.contains("自有集成测试"),
+            "归档权威须为自有集成测试"
+        );
+        let notify = readme
+            .lines()
+            .find(|l| l.contains("通知(Notification)") || l.contains("Notification"))
+            .expect("notification row");
+        assert!(
+            notify.contains("不以") && notify.contains("100%"),
+            "通知行须明确不以 100% 声称: {notify}"
+        );
+        assert!(
+            notify.contains("自有集成测试") || notify.contains("N4"),
+            "通知权威须为自有集成测试"
+        );
+        let n5 = include_str!("../../../TODO.md")
+            .lines()
+            .find(|l| l.contains("N5 s3-tests"))
+            .expect("N5");
+        assert!(
+            !n5.contains("且 100%"),
+            "N5 不得再写 s3-tests 100%: {n5}"
+        );
+        let a51 = include_str!("../../../TODO.md")
+            .lines()
+            .find(|l| l.contains("A5-1 s3-tests"))
+            .expect("A5-1");
+        assert!(
+            !a51.contains("且 100%"),
+            "A5-1 不得再写 s3-tests 100%: {a51}"
+        );
+    }
+
     #[test]
     fn compaction_migrates_locked_object_keeps_retention() {
         // W4-1:压缩可搬锁定版本数据,不可当泄漏回收。
