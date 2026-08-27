@@ -190,7 +190,8 @@ F0 ADR-22
   - 用例:`g2_mixed_crash_reopen_200_rounds`;脚本 `tests/crash/run_crash_v221.sh`
 - [x] G3 明文 HTTP 长跑(或集成循环 accept/GET/close ≥1000):进程 fd 计数相对基线稳态(允许 keep-alive 常驻,禁止线性涨)
   - 用例:`g3_http_get_close_1000_fd_steady`(in_flight==0, fd 相对基线 ≤+16)
-- [ ] G4 s3-tests 全量:意外失败 0;F8 后 gate 开压缩复跑一次
+- [x] G4 s3-tests 全量:意外失败 0;F8 后 gate 开压缩复跑一次
+  - 用例:`bash tests/s3-tests/run_g4.sh`(`compaction_enabled=true`,4 路 xdist + 全局 ListBuckets 串行补跑);`passed=487 skipped=94 excluded_failures=236 unexpected_failures=0`;诚实断言 `g4_s3tests_gate_enables_compaction`
 - [ ] G5 clippy -D warnings;覆盖率不回退 >1pt(相对 perf-M16 83.89% 口径);cargo audit 清零
 - [ ] G6 发布 v2.2.1:CHANGELOG/RELEASES 记本审查修复(不打 tag,与既有口径一致);D1 勾选
 

@@ -1236,6 +1236,18 @@ mod tests {
         );
         let runner = include_str!("../../../tests/s3-tests/run_s3tests.sh");
         assert!(
+            runner.contains("NO_PROXY"),
+            "boto3 须绕过 HTTP_PROXY,否则 ListBuckets 502"
+        );
+        assert!(
+            runner.contains("test_list_buckets_anonymous"),
+            "全局 ListBuckets 须从 xdist 抽出串行补跑"
+        );
+        assert!(
+            runner.contains("serial retry"),
+            "意外失败须串行重跑一次以滤 xdist+压缩抖动"
+        );
+        assert!(
             runner.contains("--dist load"),
             "run_s3tests.sh 须 --dist load"
         );
