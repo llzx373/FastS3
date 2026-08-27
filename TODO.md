@@ -153,7 +153,7 @@
 > Hadoop 环境本机已具备(AGENT §9.1:JDK 21 + Hadoop 3.4.1)。Veeam/Commvault 授权环境、
 > Spark/Trino 发行版 **不阻塞本里程碑门禁**;无环境必须诚实 skip(非零 SKIP 计数),禁止 exit 0 当过。
 
-- [ ] C1 Hadoop S3A 冒烟脚本 `tests/lakehouse/s3a_smoke.sh`:建桶、put/get/list、overwrite、
+- [x] C1 Hadoop S3A 冒烟脚本 `tests/lakehouse/s3a_smoke.sh`:建桶、put/get/list、overwrite、
   条件写(If-None-Match)至少一条;失败即非 0。文档写 `JAVA_HOME`/`HADOOP_HOME`
   - 用例:本机按 AGENT 环境跑通;compat.md Hadoop 从「规划」改为「冒烟通过」并记版本
 - [ ] C2 Spark / Trino:脚本骨架 + 版本钉死(文档写明发行版);环境缺则打印 SKIP 并以非 0

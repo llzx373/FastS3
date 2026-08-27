@@ -12,7 +12,8 @@
 | mc(MinIO Client) | ★★★ | mirror 同步、mb/cp/cat/ls/rm | 同上 |
 | rclone | ★★★ | 分片上传、check 对账、迁移 | 同上 + `tests/m7/migrate-drill.sh` |
 | s3cmd | ★★ | SigV2 场景可选开启(SigV2 未实现,默认等价关闭) | — |
-| Hadoop S3A / Spark | ★★ | 依赖 multipart + 列表一致性(条件写 v1.1 已解锁) | 规划(v2.1 D3 环境补齐后实测) |
+| Hadoop S3A | ★★ | JDK 21(Temurin 21.0.12.1)+ Hadoop 3.4.1(`hadoop-aws` + AWS SDK v2 bundle-2.24.6);path-style 建桶、put/get/list、`-put -f` overwrite、If-None-Match:* 412 | 冒烟通过 `tests/lakehouse/s3a_smoke.sh`(`JAVA_HOME=$HOME/.local/jdk-21` `HADOOP_HOME=$HOME/.local/hadoop-3.4.1`) |
+| Spark / Trino | ★★ | 发行版钉死见 C2 骨架;无环境须 SKIP 计数 | 规划(C2) |
 | 浏览器 SDK(aws-sdk-js) | ★★★ | 控制台直传路径(预签名直连) | 控制台实测 |
 | Cyberduck / Mountain Duck | ★★ | 桌面客户端 | 规划 |
 | DVC | ★★ | ML 数据版本管理场景 | 规划 |

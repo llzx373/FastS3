@@ -1016,7 +1016,7 @@ mod tests {
         );
     }
 
-    /// F9-3:README 当前状态含 M13–M16;不以「完整 S3」声称;Hadoop 保持未测/规划。
+    /// F9-3:README 当前状态含 M13–M16;不以「完整 S3」声称;Hadoop S3A 冒烟通过。
     #[test]
     fn readme_status_m13_m16_compat_caliber() {
         let readme = include_str!("../../../README.md");
@@ -1042,9 +1042,8 @@ mod tests {
             "S3 口径须指向兼容矩阵"
         );
         assert!(
-            features.contains("Hadoop")
-                && (features.contains("未测") || features.contains("规划")),
-            "Hadoop 须保持未测/规划"
+            features.contains("Hadoop") && features.contains("冒烟"),
+            "Hadoop S3A 须记冒烟通过(M17/C1)"
         );
     }
 

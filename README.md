@@ -23,7 +23,7 @@ FastS3 的对策:**不做底层已经做过的事**。工程力量全部投入�
 - **崩溃安全**:进程任意时刻 kill -9 / 断电,不撕裂对象、不丢已应答数据、空间账目不漂移
 - **极低资源**:空载内存 < 256MiB,单一二进制(glibc 动态链接;C 运行时依赖见容器文档),无 GC 停顿,边缘设备可用
 - **开箱即用**:systemd / 容器双形态,Web 控制台,`fasts3 init` 交互向导 5 分钟内装好配好用起来
-- **兼容主流客户端**:aws cli、boto3、mc、rclone 零配置对接;浏览器 SDK 走预签名直传(分体部署需配置数据面 `cors_allow_origins`);s3cmd(SigV2 未实现)与 **Hadoop S3A 未测/规划**(兼容矩阵 D3),详见兼容性矩阵
+- **兼容主流客户端**:aws cli、boto3、mc、rclone 零配置对接;浏览器 SDK 走预签名直传(分体部署需配置数据面 `cors_allow_origins`);s3cmd(SigV2 未实现);**Hadoop S3A 冒烟通过**(JDK 21 + Hadoop 3.4.1,`tests/lakehouse/s3a_smoke.sh`),详见兼容性矩阵
 
 ## 架构一览
 
