@@ -1123,6 +1123,46 @@ mod tests {
         );
     }
 
+    /// F9-7:STS/Inventory smoke 无 boto3 不得 exit 0;T3 口径为 Query API。
+    #[test]
+    fn sts_inventory_smoke_no_boto3_not_pass() {
+        for (path, label) in [
+            (
+                include_str!("../../../tests/smoke/client_sts_smoke.sh"),
+                "client_sts_smoke.sh",
+            ),
+            (
+                include_str!("../../../tests/smoke/client_inventory_smoke.sh"),
+                "client_inventory_smoke.sh",
+            ),
+        ] {
+            let start = path
+                .find("if ! python3 -c \"import boto3\"")
+                .expect("boto3 probe");
+            let rest = &path[start..];
+            let end = rest.find("\nfi").expect("probe fi");
+            let probe = &rest[..end];
+            assert!(
+                !probe.contains("exit 0"),
+                "{label} 无 boto3 不得 exit 0 当过:\n{probe}"
+            );
+            assert!(
+                probe.contains("exit 77")
+                    || probe.contains("exit 1")
+                    || probe.contains("SKIP_COUNT"),
+                "{label} 无 boto3 须非零退出或明确 SKIP 计数"
+            );
+        }
+        let t3 = include_str!("../../../TODO.md")
+            .lines()
+            .find(|l| l.contains("T3 会话审计"))
+            .expect("T3");
+        assert!(
+            t3.contains("Query API"),
+            "T3 须标明 Query API 兼容而非暗示 boto3 STS client: {t3}"
+        );
+    }
+
     #[test]
     fn compaction_migrates_locked_object_keeps_retention() {
         // W4-1:压缩可搬锁定版本数据,不可当泄漏回收。

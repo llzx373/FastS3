@@ -9,8 +9,8 @@
 #           FS3_ACCESS / FS3_SECRET(常驻密钥)
 #           FS3_WEB_USER / FS3_WEB_PASS(管理面登录;默认 admin/admin123)
 #           FS3_STS_POLICY_BUCKET(可选;默认 sts-bucket)
-# 流程:登录管理面拿 JWT → POST /api/sts GetSessionToken(带会话策略
-# 仅 GetObject)→ boto3 sts client 用返回的临时凭证 → S3 GetObject 成功、
+# 流程:登录管理面拿 JWT → POST /api/sts GetSessionToken(AWS Query API)
+# 仅 GetObject)→ boto3 S3 client 用返回的临时凭证 → S3 GetObject 成功、
 # PutObject 被会话策略 Deny → 撤销会话 → GetObject 也被拒。
 # 单独存在的理由:STS 签发在 Node 管理面,数据面吃 token;这是
 # 管理面 × 数据面跨进程的端到端契约(ADR-18 D-E2)。
@@ -30,8 +30,8 @@ step() { echo "── $*"; }
 step "前端检查"
 [ -r fasts3.toml ] && : || :
 if ! python3 -c "import boto3" 2>/dev/null; then
-    echo "  skip: boto3 not installed"
-    exit 0
+    echo "SKIP: boto3 not installed (STS smoke is not a pass)"
+    exit 77
 fi
 
 python3 - "$ENDPOINT" "$WEB" "$ACCESS" "$SECRET" "$WEB_USER" "$WEB_PASS" "$BUCKET" <<'PYEOF' || exit 1

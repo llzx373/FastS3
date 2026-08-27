@@ -179,7 +179,7 @@ F0 ADR-22
 - [x] F9-4 DESIGN §1.3 V1 非目标加「已被后续 ADR 取代」指向;§4.3 位图权威 / §4.4 键前缀 / 检查点指针 / ETag hex 拼接与 ADR-5/9/14/22 对齐
 - [x] F9-5 CHANGELOG v2.1 C1「统一 STANDARD」加勘误(被 M16 真实归档覆盖);compat.md Webhook HTTPS 与 F6-1 最终选择一致
 - [x] F9-6 s3-tests README:notification/归档「出集」改为「上游无测/配置 skip,不以 100% 声称」;N5/A5-1 门禁改为自有集成测试为权威
-- [ ] F9-7 STS/Inventory smoke:无 boto3 **不得 exit 0 当过**(fail 或 skip 非零/明确 SKIP 计数);T3 补 boto3 STS client 或改 TODO 措辞为「Query API 兼容」
+- [x] F9-7 STS/Inventory smoke:无 boto3 **不得 exit 0 当过**(fail 或 skip 非零/明确 SKIP 计数);T3 补 boto3 STS client 或改 TODO 措辞为「Query API 兼容」
 - [ ] F9-8 补 `docs/perf-M15.md`(或 CHANGELOG 声明 M15 perf 以 M16 报告为承接、作废独立文件);门禁数字与仓内报告一致
 
 ### G. 本里程碑门禁(退出条件)
@@ -212,7 +212,7 @@ F0 ADR-22
 ### T. STS 临时凭证(NEXT-ROUND §5 T1~T3,≈3.5 pw)
 - [x] T1 Node 管理面 STS 兼容端点(Query API:GetSessionToken/AssumeRole 最小集;基于 admin 身份对既有密钥签发会话;会话策略与密钥策略求交;TTL 默认 1h,上限对齐 AWS;secret 仅签发时一次回显,沿用 G1-3 语义不落盘)
 - [x] T2 数据面 `x-amz-security-token` 解析与校验(会话 → 基密钥 + 会话策略求交 + 过期判定;InvalidToken 显式错误码;SigV4 含 token 按 AWS 语义;匿名路径不受影响)
-- [x] T3 会话审计(签发/过期/使用六维检索扩展)+ 集成测试(boto3 sts 指向 FastS3 端点 → 临时凭证 → S3 数据面往返;会话策略 Deny 生效;过期后拒绝)
+- [x] T3 会话审计(签发/过期/使用六维检索扩展)+ 集成测试(**Query API** GetSessionToken/AssumeRole 签发 → 临时凭证 → S3 数据面往返;会话策略 Deny 生效;过期后拒绝;无 boto3 不得当过)
 
 ### I. S3 Inventory(CSV;NEXT-ROUND §5 I1~I3,≈1 pw)
 - [x] I1 Put/Get/Delete/ListBucketInventoryConfigurations(?inventory;CSV 起步,ORC/Parquet 显式不支持)+ 配置校验

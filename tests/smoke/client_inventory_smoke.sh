@@ -24,8 +24,8 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 step() { echo "── $*"; }
 
 if ! python3 -c "import boto3" 2>/dev/null; then
-    echo "  skip: boto3 not installed"
-    exit 0
+    echo "SKIP: boto3 not installed (Inventory smoke is not a pass)"
+    exit 77
 fi
 
 python3 - "$ENDPOINT" "$ACCESS" "$SECRET" "$SRC" "$DEST" <<'PYEOF' || exit 1
