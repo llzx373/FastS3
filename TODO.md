@@ -128,7 +128,7 @@ F0 ADR-22
 
 - [x] F5-1 检查点 tick 改 `sync_channel(1)`(或原子标志);满则跳过;引擎 `close()` **join** 该线程
   - 用例:`checkpoint_tick_bounded_idle`——空闲 10 个 interval,队列长度 ≤1;drop Engine 后线程退出(可 join 或 `thread::is_finished`)
-- [ ] F5-2 STS:校验过期时 `delete_session`;后台扫 `s:session`(可挂现有 `sweep_expired_sessions` **旁路**,不要复用 multipart 函数名造成误解)周期删除;管理面 DELETE 保持
+- [x] F5-2 STS:校验过期时 `delete_session`;后台扫 `s:session`(可挂现有 `sweep_expired_sessions` **旁路**,不要复用 multipart 函数名造成误解)周期删除;管理面 DELETE 保持
   - 用例:`expired_sts_session_is_deleted_from_meta`——签发 TTL=1s → 睡 2s → 鉴权 InvalidToken → 扫描无该 `s:session` 键;未过期会话仍在
 - [ ] F5-3 通知 `retry` HashMap: `truncate_events` 后 `retain` 仍存在的 seq;成功/死信/无目标已 `remove` 保持;worker 关闭时若仍有桶规则,主循环或独立 tick 仍截断 `e:`(或配置互斥:关 worker 则拒绝 PutNotification)
   - 用例:`notification_retry_map_does_not_grow_after_truncate`;`notification_disabled_does_not_unbounded_enqueue`(关 worker 后写入不堆积或显式拒绝)

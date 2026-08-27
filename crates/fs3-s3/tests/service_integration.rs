@@ -11303,6 +11303,105 @@ fn sts_session_data_plane_roundtrip() {
     assert!(svc.issue_session("ghost", None, None, "admin").is_err());
 }
 
+/// F5-2:过期 STS 会话鉴权删键 + 后台扫 `s:session` 旁路(与 multipart
+/// `sweep_expired_sessions` 分轨);未过期会话保留。
+///
+/// 生产签发 TTL 下限 300s(AWS DurationSeconds);本测写入 `expires_at =
+/// now+1` 模拟 TTL=1s,睡 2s 后走真实鉴权路径。
+#[test]
+fn expired_sts_session_is_deleted_from_meta() {
+    use fs3_core::SessionRecord;
+    let (_d, svc) = setup();
+    svc.add_key("test", "secret123", None).unwrap();
+    svc.handle(&req("PUT", "/sts-ttl", vec![])).unwrap();
+    svc.handle(&req_q("PUT", "/sts-ttl/o.txt", &[], b"ok".to_vec()))
+        .unwrap();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    // 未过期:走真实签发路径,键必须一直存在。
+    let (_ak, _sec, live_rec) = svc
+        .issue_session("test", None, Some(3600), "admin")
+        .unwrap();
+    let live_id = live_rec.session_id.clone();
+
+    // TTL=1s:直接落盘(签发 API 拒绝 <300s)。
+    let short_id = "ttl1s-expired";
+    let short_secret = "short-secret";
+    let short = SessionRecord {
+        session_id: short_id.into(),
+        temporary_access_key: "FSSTTTL1S0000".into(),
+        base_access_key: "test".into(),
+        session_policy: None,
+        expires_at: now + 1,
+        secret_hash: SessionRecord::hash_secret(short_secret),
+        issued_at: now,
+        issued_by: "admin".into(),
+    };
+    svc.engine().read().meta().put_session(&short).unwrap();
+    assert!(svc
+        .engine()
+        .read()
+        .meta()
+        .get_session(short_id)
+        .unwrap()
+        .is_some());
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let r = svc.handle(&req_creds(
+        "GET",
+        "/sts-ttl/o.txt",
+        &Credentials {
+            access_key: "FSSTTTL1S0000".into(),
+            secret_key: short_secret.into(),
+        },
+        &[("x-amz-security-token", short_id)],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "InvalidToken", "{r:?}");
+    assert!(
+        svc.engine()
+            .read()
+            .meta()
+            .get_session(short_id)
+            .unwrap()
+            .is_none(),
+        "expired session must be deleted from meta on auth"
+    );
+    assert!(
+        svc.engine()
+            .read()
+            .meta()
+            .get_session(&live_id)
+            .unwrap()
+            .is_some(),
+        "unexpired session must remain"
+    );
+
+    // 后台扫旁路:再造一条过期键,sweep 删除且不影响 live。
+    let stale = SessionRecord {
+        session_id: "sweep-stale".into(),
+        temporary_access_key: "FSSTSWEEP0000".into(),
+        base_access_key: "test".into(),
+        session_policy: None,
+        expires_at: 1,
+        secret_hash: SessionRecord::hash_secret("z"),
+        issued_at: 0,
+        issued_by: "admin".into(),
+    };
+    {
+        let e = svc.engine().read();
+        e.meta().put_session(&stale).unwrap();
+        e.sweep_expired_sts_sessions(now + 10).unwrap();
+        assert!(e.meta().get_session("sweep-stale").unwrap().is_none());
+        assert!(e.meta().get_session(&live_id).unwrap().is_some());
+    }
+}
+
 // ───────────────────── M15 I1:桶级 S3 Inventory(CSV 起步)─────────────────────
 
 /// ?inventory 请求构建 helper(闭包签名生命周期问题回避:显式函数)。
