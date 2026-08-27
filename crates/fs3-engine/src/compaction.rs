@@ -891,6 +891,53 @@ mod tests {
         );
     }
 
+    /// F9-1:总览 M16 = 主力完成;A/R/L 与 A5 全勾;A5-2 不再写「压缩并发未复核」。
+    #[test]
+    fn todo_overview_m16_matches_body() {
+        let todo = include_str!("../../../TODO.md");
+        let overview = todo
+            .split("## 里程碑总览")
+            .nth(1)
+            .and_then(|s| s.split("## 审查修复").next())
+            .expect("overview section");
+        let m16_row = overview
+            .lines()
+            .find(|l| l.contains("M16 归档与复制"))
+            .expect("M16 overview row");
+        assert!(
+            m16_row.contains("主力完成"),
+            "总览 M16 须与正文主力组已交付一致, got: {m16_row}"
+        );
+        let m16_body = todo
+            .split("## M16 v2.2.0 归档与复制")
+            .nth(1)
+            .and_then(|s| s.split("\n## ").next())
+            .expect("M16 body");
+        for id in [
+            "A0-1", "A1-1", "A1-2", "A1-3", "A2-1", "A2-2", "A2-3", "A2-4", "A3-1", "A3-2",
+            "A3-3", "A4-1", "A5-1", "A5-2", "A5-3", "A5-4", "R1-1", "R1-2", "R1-3", "R1-4",
+            "R1-5", "L1-1", "L1-2", "L1-3", "L1-4",
+        ] {
+            let line = m16_body
+                .lines()
+                .find(|l| l.contains(id))
+                .unwrap_or_else(|| panic!("missing {id}"));
+            assert!(
+                line.contains("- [x]"),
+                "主力项 {id} 须已勾选: {line}"
+            );
+        }
+        let a52 = m16_body
+            .lines()
+            .find(|l| l.contains("A5-2"))
+            .expect("A5-2");
+        assert!(
+            !a52.contains("未复核"),
+            "F8 完成后 A5-2 不得再写压缩并发未复核: {a52}"
+        );
+        assert!(a52.contains("F8 已复核") || a52.contains("compaction_enabled=true"));
+    }
+
     #[test]
     fn compaction_migrates_locked_object_keeps_retention() {
         // W4-1:压缩可搬锁定版本数据,不可当泄漏回收。
