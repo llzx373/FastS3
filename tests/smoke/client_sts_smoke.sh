@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# FastS3 M15 门禁(T3):boto3 STS → S3 数据面会话往返。
+# FastS3 M15 门禁(T3):Query API 签发 STS → boto3 S3 数据面会话往返。
 # 前置:
 #   1) fasts3d serve 运行中(数据面端点,如 127.0.0.1:9000);
 #   2) web-server(fasts3-web)运行中(管理面端点,如 127.0.0.1:9090,
@@ -9,8 +9,8 @@
 #           FS3_ACCESS / FS3_SECRET(常驻密钥)
 #           FS3_WEB_USER / FS3_WEB_PASS(管理面登录;默认 admin/admin123)
 #           FS3_STS_POLICY_BUCKET(可选;默认 sts-bucket)
-# 流程:登录管理面拿 JWT → POST /api/sts GetSessionToken(AWS Query API)
-# 仅 GetObject)→ boto3 S3 client 用返回的临时凭证 → S3 GetObject 成功、
+# 流程:登录管理面拿 JWT → POST /api/sts GetSessionToken(AWS Query API,
+# 会话策略仅 GetObject)→ boto3 S3 client 用返回的临时凭证 → GetObject 成功、
 # PutObject 被会话策略 Deny → 撤销会话 → GetObject 也被拒。
 # 单独存在的理由:STS 签发在 Node 管理面,数据面吃 token;这是
 # 管理面 × 数据面跨进程的端到端契约(ADR-18 D-E2)。
