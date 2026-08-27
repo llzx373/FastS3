@@ -877,3 +877,28 @@ fn admin_object_restore_and_class_distribution() {
     // 200 + accepted:true = 恢复作业已入队(restore_enqueue 失败会 400)
     let _ = handle;
 }
+
+/// F6-2:alerts.yml 含通知/Inventory 停滞规则,且 admin /metrics 渲染源含同名。
+#[test]
+fn alerts_yml_stalled_rules_match_exported_metrics() {
+    let yml = include_str!("../../../deploy/grafana/alerts.yml");
+    assert!(
+        yml.contains("alert: FastS3NotificationDeliveryStalled"),
+        "missing FastS3NotificationDeliveryStalled"
+    );
+    assert!(
+        yml.contains("fasts3_notification_delivery_stalled"),
+        "alert must use exported notification stalled gauge"
+    );
+    assert!(
+        yml.contains("alert: FastS3InventoryGenerationStalled"),
+        "missing FastS3InventoryGenerationStalled"
+    );
+    assert!(
+        yml.contains("fasts3_inventory_last_run_timestamp"),
+        "alert must use exported inventory last_run gauge"
+    );
+    let admin = include_str!("../src/lib.rs");
+    assert!(admin.contains("fasts3_notification_delivery_stalled"));
+    assert!(admin.contains("fasts3_inventory_last_run_timestamp"));
+}

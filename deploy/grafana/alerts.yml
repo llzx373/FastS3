@@ -161,3 +161,28 @@ groups:
         annotations:
           summary: "生命周期 1h 删除对象数突增(>10000)"
           description: "信息级:核对近期生命周期规则变更是否符合预期;阈值按部署规模调整"
+
+      # 通知投递停滞(M15 N3 / F6-2):队首超 stall_after 且零进展。
+      # 指标缺席 = worker 未启用(notification.enabled=false / 只读),不告警。
+      - alert: FastS3NotificationDeliveryStalled
+        expr: |
+          fasts3_notification_delivery_stalled == 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "事件通知投递停滞(队首超窗口零进展)"
+          description: "fasts3_notification_delivery_stalled=1;检查 Webhook 目标可达性与 fs3-notify worker 日志(失败将指数退避直至死信)"
+
+      # Inventory 生成停滞(M15 I2 / F6-2):超过 2×默认间隔(3600s)未跑完一轮。
+      # 指标缺席 = worker 未启用;last_run=0 排除启动后首轮窗口。
+      - alert: FastS3InventoryGenerationStalled
+        expr: |
+          (time() - fasts3_inventory_last_run_timestamp > 7200)
+          and (fasts3_inventory_last_run_timestamp > 0)
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "S3 Inventory 生成超过 2 个周期未运行"
+          description: "fasts3_inventory_last_run_timestamp 停滞;检查 inventory worker 与目标桶可写性"

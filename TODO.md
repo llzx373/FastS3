@@ -141,7 +141,7 @@ F0 ADR-22
 
 - [x] F6-1 Webhook HTTPS:用已有 rustls 栈实现 `https://` POST(或 compat/CHANGELOG **降级为「仅 http,https 须前置 TLS 终结」并改 XML 校验拒绝 https**)。二选一必须文档与代码一致;推荐实现 HTTPS
   - 用例:`webhook_https_posts_signed_body`(自签/测试 listener);失败重试/死信仍有效;`http` 回归不破
-- [ ] F6-2 Grafana `alerts.yml` 增加 `FastS3NotificationDeliveryStalled`、`InventoryGenerationStalled`(表达式对准已有 `fasts3_notification_*` / inventory 指标;无指标则先加 counter 再加告警)
+- [x] F6-2 Grafana `alerts.yml` 增加 `FastS3NotificationDeliveryStalled`、`InventoryGenerationStalled`(表达式对准已有 `fasts3_notification_*` / inventory 指标;无指标则先加 counter 再加告警)
   - 用例:规则文件静态检查(promtool 或 yaml 含表达式 + 对应 metrics 名在 admin 导出字符串测试中出现)
 - [ ] F6-3 实现 `fasts3_archive_*` 指标组(对象数/字节按存储类、transition 次数已有则别重复命名)并进 admin `/metrics`
   - 用例:`archive_metrics_exported_after_glacier_put`(prometheus 文本含 `fasts3_archive_`)

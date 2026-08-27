@@ -26,7 +26,6 @@
 //! 注入测试根)。
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::net::ToSocketAddrs;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -223,9 +222,8 @@ fn http_post(
         req.push_str(&format!("{k}: {v}\r\n"));
     }
     req.push_str("\r\n");
-    stream
-        .write_all(req.as_bytes())
-        .and_then(|_| stream.write_all(body))
+    std::io::Write::write_all(stream, req.as_bytes())
+        .and_then(|_| std::io::Write::write_all(stream, body))
         .map_err(|e| format!("write request: {e}"))?;
     let mut buf = [0u8; 4096];
     let mut acc = Vec::new();
