@@ -119,11 +119,11 @@
 > (全线程 futex)。现状靠 ADR-20 串行档(`--max-workers 1`)当产品,迁入/站点同步不可用。
 > 修复 = 引擎锁序,不是继续调低客户端。
 
-- [ ] D1 复现 harness:`tests/repro/mc_mirror_concurrency.sh`(或集成测试)对本地 FastS3
+- [x] D1 复现 harness:`tests/repro/mc_mirror_concurrency.sh`(或集成测试)对本地 FastS3
   跑 `mc mirror --max-workers 8`(对象数 ≥200、含 List 交错),超时(默认 120s)内必须结束;
   复现失败(挂死)时本条先红,作为防复发基线,禁止用 workers=1 让它绿
   - 用例:harness 在修复前可红(记录);修复后必绿;注释写清复现签名(futex/端口无响应)
-- [ ] D2 根治:查清 io_uring 完成回调 × meta/引擎锁顺序;禁止在完成回调里拿会与提交路径
+- [x] D2 根治:查清 io_uring 完成回调 × meta/引擎锁顺序;禁止在完成回调里拿会与提交路径
   互等的锁;补单测或内部探针覆盖「并发 PUT + List + Head」
   - 用例:`concurrent_put_list_no_deadlock`(线程或 HTTP 级,≥32 并发,跑完 `in_flight==0`
     且后续 ListBuckets 仍 200);D1 harness 转绿

@@ -404,6 +404,9 @@ impl IoUringEngine {
         }
         self.last_inflight
             .store(pending as u64, std::sync::atomic::Ordering::Relaxed);
+        // 锁序(M17/D2):调用方已持 IoEngine Mutex(常在 Engine 写锁内)。
+        // submit_and_wait 同步收割;CQE 路径只读 result,禁止再拿
+        // Engine/MetaStore 锁(与「引擎写锁 → io.lock → submit」ABBA)。
         self.ring.submit_and_wait(pending)?;
         let cq = self.ring.completion();
         let mut results = Vec::with_capacity(pending);
@@ -416,6 +419,7 @@ impl IoUringEngine {
 }
 
 /// 收完本批全部 CQE 后再返回首个错误(避免 CQ 残留污染下一批)。
+/// 纯结果折叠,不触及 Engine/Meta 锁(完成回调不得与提交路径互等)。
 fn drain_cqe_results(results: &[i32]) -> io::Result<()> {
     let mut first_err = None;
     for &res in results {

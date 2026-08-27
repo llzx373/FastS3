@@ -3,6 +3,13 @@
 //! - 小 PUT(Content-Length ≤ 阈值)缓冲后走 `handle`(可先验载荷哈希);
 //! - 大 PUT / aws-chunked 走 `put_object_stream`(通道泵 + 同步读);
 //! - GET/HEAD 走 `handle`;未加密流式 GET 走 `tokio::spawn`(v1.1);SSE 走 `spawn_blocking`(M11 G-2)。
+//!
+//! 锁序(M17/D2):引擎 `RwLock` / `IoEngine` Mutex **不得**在 tokio reactor
+//! 线程上获取。流式 PUT 的 body 泵与 hyper 同 runtime;`handle` 若在
+//! reactor 上阻塞等写锁,泵无法推进 → 写锁持有者(submit/`submit_and_wait`)
+//! 永远等不到 chunk,全线程 futex(S3-GAP §9)。所有 `service.handle` 与
+//! 会拿引擎锁的短读(web_root 探桶)走 `spawn_blocking`。io_uring CQE
+//! 收割见 `fs3_engine::io`——禁止在完成路径再拿 meta/引擎锁。
 
 use std::io::Read;
 use std::sync::Arc;
@@ -567,14 +574,23 @@ where
             .split('/')
             .next()
             .unwrap_or("");
-        let bucket_path = !first_seg.is_empty()
-            && service
-                .engine()
-                .read()
-                .meta()
-                .get_bucket(first_seg)
-                .map(|m| m.is_some())
-                .unwrap_or(false);
+        // 探桶拿读锁:必须离开 reactor,否则与流式 PUT 写锁 × body 泵互等
+        let bucket_path = if first_seg.is_empty() {
+            false
+        } else {
+            let svc = service.clone();
+            let name = first_seg.to_string();
+            tokio::task::spawn_blocking(move || {
+                svc.engine()
+                    .read()
+                    .meta()
+                    .get_bucket(&name)
+                    .map(|m| m.is_some())
+                    .unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false)
+        };
         let s3_style = bucket_path
             || req.headers().contains_key("authorization")
             || req.headers().contains_key("x-amz-date")
@@ -748,7 +764,14 @@ where
     let body_bytes = acc;
     let mut s3req = s3req;
     s3req.body = body_bytes;
-    let result = service.handle(&s3req);
+    // List/Head/缓冲 PUT 与流式 PUT 共用引擎锁:不得在 reactor 上
+    // `handle`(会阻塞 parking_lot),否则 body 泵饿死(M17/D2)。
+    let service2 = service.clone();
+    let result = tokio::task::spawn_blocking(move || service2.handle(&s3req))
+        .await
+        .unwrap_or_else(|e| {
+            Err(S3Error::new(fs3_s3::S3ErrorCode::InternalError).with_message(e.to_string()))
+        });
     let mut resp = render_with(
         service.clone(),
         result,

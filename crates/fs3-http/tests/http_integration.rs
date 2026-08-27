@@ -1347,3 +1347,147 @@ async fn g3_http_get_close_1000_fd_steady() {
     );
 }
 
+fn sigv4_headers_unsigned(
+    host: &str,
+    method: &str,
+    path: &str,
+    extra: &[(&str, &str)],
+) -> Vec<(String, String)> {
+    let amz_date = auth::now_amz();
+    let mut headers: Vec<(String, String)> = vec![
+        ("host".into(), host.to_string()),
+        ("x-amz-date".into(), amz_date.clone()),
+        ("x-amz-content-sha256".into(), "UNSIGNED-PAYLOAD".into()),
+    ];
+    for (k, v) in extra {
+        headers.push((k.to_string(), v.to_string()));
+    }
+    let cred = auth::Credentials {
+        access_key: "test".into(),
+        secret_key: "secret123".into(),
+    };
+    let auth_hdr = auth::sign_request(
+        &cred,
+        "us-east-1",
+        method,
+        path,
+        &[],
+        &headers,
+        &amz_date,
+        &auth::PayloadHash::Unsigned,
+    )
+    .unwrap();
+    headers.push(("authorization".into(), auth_hdr));
+    headers
+}
+
+/// 无 Content-Length 的 chunked PUT,迫使 HTTP 层走流式泵(与 mc 交错 List 同形)。
+fn render_chunked_put(path: &str, headers: &[(String, String)], body: &[u8]) -> Vec<u8> {
+    let mut req = format!("PUT {path} HTTP/1.1\r\n");
+    for (k, v) in headers {
+        if k.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        if k == "host" {
+            req.push_str(&format!("Host: {v}\r\n"));
+        } else {
+            req.push_str(&format!("{k}: {v}\r\n"));
+        }
+    }
+    req.push_str("Transfer-Encoding: chunked\r\n\r\n");
+    let mut out = req.into_bytes();
+    out.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
+    out.extend_from_slice(body);
+    out.extend_from_slice(b"\r\n0\r\n\r\n");
+    out
+}
+
+/// M17/D2:≥32 并发流式 PUT + List + Head;current_thread runtime 上不得
+/// 因 reactor 阻塞拿引擎锁而与 body 泵互等。结束后 in_flight==0 且
+/// ListBuckets 仍 200。
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_put_list_no_deadlock() {
+    let (_d, service) = setup();
+    // 流式 PUT 无 Content-Length 时按 64MiB 窗口准入;32 并发需 ≥2GiB。
+    let admission = fs3_http::Admission::new(16 * 1024 * 1024 * 1024);
+    let adm_for_server = admission.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let svc = service.clone();
+            let adm = adm_for_server.clone();
+            tokio::spawn(async move {
+                let _ = fs3_http::serve_connection(
+                    svc,
+                    adm,
+                    stream,
+                    std::time::Duration::from_secs(15),
+                    std::time::Duration::from_secs(15),
+                    None,
+                    Arc::new(Vec::new()),
+                )
+                .await;
+            });
+        }
+    });
+
+    let host = format!("{addr}");
+    {
+        let mut client = RawClient::connect(addr).await;
+        let h = sigv4_headers(&host, "PUT", "/dl-bucket", &[], &[], b"");
+        let (status, _, body) = client
+            .send(render_request("PUT", "/dl-bucket", &h, b""))
+            .await;
+        assert_eq!(status, 200, "create bucket: {body:?}");
+    }
+
+    const N: usize = 32;
+    let run = async {
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..N {
+            let host = host.clone();
+            set.spawn(async move {
+                let mut c = RawClient::connect(addr).await;
+                let key_path = format!("/dl-bucket/k-{i}");
+                let payload = format!("concurrent-payload-{i}").into_bytes();
+                let h = sigv4_headers_unsigned(&host, "PUT", &key_path, &[("content-type", "text/plain")]);
+                let (sp, _, pb) = c.send(render_chunked_put(&key_path, &h, &payload)).await;
+                let h = sigv4_headers(&host, "GET", "/dl-bucket", &[], &[], b"");
+                let (sl, _, _) = c.send(render_request("GET", "/dl-bucket", &h, b"")).await;
+                let h = sigv4_headers(&host, "HEAD", &key_path, &[], &[], b"");
+                let (sh, _, _) = c
+                    .send_with(render_request("HEAD", &key_path, &h, b""), false)
+                    .await;
+                (sp, sl, sh, pb)
+            });
+        }
+        let mut n = 0usize;
+        while let Some(res) = set.join_next().await {
+            let (sp, sl, sh, pb) = res.expect("worker join");
+            assert_eq!(sp, 200, "PUT: {pb:?}");
+            assert_eq!(sl, 200, "ListObjects");
+            assert_eq!(sh, 200, "HeadObject");
+            n += 1;
+        }
+        n
+    };
+    let n = tokio::time::timeout(std::time::Duration::from_secs(30), run)
+        .await
+        .expect("deadlock: concurrent PUT+List+Head did not finish in 30s");
+    assert_eq!(n, N);
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        admission.in_flight(),
+        0,
+        "in_flight must drain after concurrent PUT+List+Head"
+    );
+
+    let mut client = RawClient::connect(addr).await;
+    let h = sigv4_headers(&host, "GET", "/", &[], &[], b"");
+    let (status, _, body) = client.send(render_request("GET", "/", &h, b"")).await;
+    assert_eq!(status, 200, "ListBuckets after mix: {body:?}");
+}
+
