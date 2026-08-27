@@ -23,13 +23,13 @@ FastS3 是面向**裸块设备 / 磁盘镜像文件**的单机高性能 S3 服�
 
 ## 快速上手
 
-- 快速上手:
-  - [内网一天跑起来](getting-started/quickstart.md):compose poc / 单二进制 `--web-root`
+- [内网一天跑起来](getting-started/quickstart.md):compose poc / 单二进制 `--web-root`
 - [systemd 部署](deployment/systemd.md):加固单元、目录与权限、安装脚本
 - [容器部署](deployment/container.md):多阶段镜像、compose、特权/TLS/升级
 - [升级与回滚](operations/upgrade.md):N-1 保证、迁移失败自动回滚
 - [管理员指南](operations/admin-guide.md):健康/体检/密钥与桶治理/监控/多实例
 - [备份/恢复](operations/backup-restore.md):meta-export + 卷快照,演练脚本
+- [退出路径](operations/exit.md):rclone/mc 迁出 · 卷快照+meta-import · 裸盘不可 mount
 - [迁移](operations/migration.md):MinIO(mc mirror)/ 公有云(rclone)脚本化
 - [性能调优](operations/tuning.md):IRQ 亲和/调度器/内存锁清单
 - [安全基线与 CVE 响应](operations/security.md):默认基线、部署检查单、≤7 天通告流程

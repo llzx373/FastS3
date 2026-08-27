@@ -78,5 +78,5 @@ bash deploy/migrate/migrate-s3.sh my-aws http://fasts3:9000 fasts3dev:fasts3dev 
 - [ ] 演练记录归档(日期/桶数/对象数/耗时/异常)→ Beta 评审文档覆盖率检查
       勾选。
 
-相关:备份基线 [备份/恢复指南](backup-restore.md);容量规划见
-[调优](tuning.md) §5。
+相关:备份基线 [备份/恢复指南](backup-restore.md);停用产品时把数据拿出来见
+[退出路径](exit.md);容量规划见 [调优](tuning.md) §5。

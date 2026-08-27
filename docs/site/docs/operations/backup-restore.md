@@ -84,4 +84,4 @@ bash tests/backup/backup-restore-drill.sh target/release/fasts3d
 
 > 底层设备的可靠性是 FastS3 的设计前提(不做副本):
 > 真正需要防「设备丢失」时,在底层做(RAID/云盘快照/双活卷),而不是在
-> 应用层。
+> 应用层。停用产品、把对象拷走见 [退出路径](exit.md)。
