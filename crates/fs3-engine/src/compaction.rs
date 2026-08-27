@@ -1191,6 +1191,28 @@ mod tests {
         );
     }
 
+    /// G2:崩溃混载脚本与引擎 200 轮用例四面(COW/restore/multipart/压缩 GET)对齐。
+    #[test]
+    fn g2_crash_harness_covers_four_mix_surfaces() {
+        let sh = include_str!("../../../tests/crash/run_crash_v221.sh");
+        for needle in [
+            "COW",
+            "restore",
+            "multipart",
+            "compaction_enabled",
+            "g2_mixed_crash_reopen_200_rounds",
+            "200",
+        ] {
+            assert!(sh.contains(needle), "run_crash_v221.sh 须含 {needle}");
+        }
+        let tests = include_str!("tests.rs");
+        assert!(
+            tests.contains("fn g2_mixed_crash_reopen_200_rounds"),
+            "G2 须有 200 轮混载崩溃恢复用例"
+        );
+        assert!(tests.contains("const ROUNDS: u32 = 200"));
+    }
+
     #[test]
     fn compaction_migrates_locked_object_keeps_retention() {
         // W4-1:压缩可搬锁定版本数据,不可当泄漏回收。

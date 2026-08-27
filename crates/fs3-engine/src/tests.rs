@@ -2429,6 +2429,175 @@ fn pending_checkpoint_tick_truncates_alloc_log_on_first_put() {
     e.close().unwrap();
 }
 
+/// G2:200 轮混载崩溃恢复——每轮 close/Drop 后二次 open。
+/// 四面:COW 复制+删副本、大对象 restore+check+GET 副本、multipart 重传+subset
+/// complete、压缩开启下大对象 GET。零撕裂、leaks 空。
+#[test]
+fn g2_mixed_crash_reopen_200_rounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("disk.img");
+    std::fs::File::create(&img)
+        .unwrap()
+        .set_len(256 * 1024 * 1024)
+        .unwrap();
+    fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
+    let mut cfg = test_cfg(&img, &dir.path().join("meta"));
+    // 前台 compact_once 覆盖压缩路径;关 worker 避免与本测叠跑造成瞬时 leaks 假阳。
+    cfg.compaction.enabled = false;
+
+    const ROUNDS: u32 = 200;
+    const COW: usize = 96 * 1024;
+    const GLAC: usize = 128 * 1024;
+    const PART_MIN: usize = 5 * 1024 * 1024; // 非末片 ≥ 5MiB
+    const PART_TAIL: usize = 64 * 1024;
+    const BIG: usize = 256 * 1024;
+
+    for round in 0..ROUNDS {
+        let cow = vec![(round % 251) as u8; COW];
+        let glac = vec![0xABu8.wrapping_add(round as u8); GLAC];
+        let p1b = vec![0x11u8; PART_MIN];
+        let p2old = vec![0x22u8; PART_TAIL];
+        let p2new = vec![0x33u8; PART_TAIL];
+        let p3b = vec![0x44u8; PART_TAIL];
+        let big = vec![0xCDu8; BIG];
+
+        {
+            let mut e = open_engine(&cfg);
+            e.put("b1", "cow-src", &mut Cursor::new(cow.clone()))
+                .unwrap();
+            e.copy_object("b1", "cow-src", "b1", "cow-dst", None, None, None)
+                .unwrap();
+            e.delete("b1", "cow-dst").unwrap();
+
+            e.put_with_lock_ev(
+                "b1",
+                "glac",
+                &mut Cursor::new(glac.clone()),
+                None,
+                vec![],
+                vec![],
+                vec![],
+                None,
+                None,
+                None,
+                ObjectLockWrite::default(),
+                None,
+                Some("GLACIER".into()),
+                fs3_core::promote_storage_class(Some("GLACIER")),
+            )
+            .unwrap();
+            let now = e.lock_now();
+            e.restore_enqueue("b1", "glac", None, 3, "Standard")
+                .unwrap();
+            let (done, _) = e.restore_worker_tick(now + 1, 8).unwrap();
+            assert_eq!(done, 1, "round {round}: restore must materialize");
+            assert!(
+                e.check_report().unwrap().leaks.is_empty(),
+                "round {round}: restore check leaks"
+            );
+
+            let uid = e
+                .create_multipart(
+                    "b1", "mp", None, vec![], vec![], vec![], None, None, None,
+                )
+                .unwrap();
+            let up1 = e
+                .upload_part(&uid, 1, &mut Cursor::new(p1b.clone()), None, None)
+                .unwrap();
+            let _ = e
+                .upload_part(&uid, 2, &mut Cursor::new(p2old.clone()), None, None)
+                .unwrap();
+            let _ = e
+                .upload_part(&uid, 2, &mut Cursor::new(p2new.clone()), None, None)
+                .unwrap();
+            let up3 = e
+                .upload_part(&uid, 3, &mut Cursor::new(p3b.clone()), None, None)
+                .unwrap();
+            e.complete_multipart(
+                "b1",
+                "mp",
+                &uid,
+                &[cp(1, up1.etag_hex()), cp(3, up3.etag_hex())],
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(
+                e.leaks().unwrap().is_empty(),
+                "round {round}: after subset complete leaks {:?}",
+                e.leaks().unwrap()
+            );
+
+            e.put("b1", "big", &mut Cursor::new(big.clone())).unwrap();
+            e.put("b1", "frag0", &mut Cursor::new(vec![1u8; 80 * 1024]))
+                .unwrap();
+            e.put("b1", "frag1", &mut Cursor::new(vec![2u8; 80 * 1024]))
+                .unwrap();
+            e.delete("b1", "frag1").unwrap();
+            assert!(
+                e.leaks().unwrap().is_empty(),
+                "round {round}: after frag delete leaks {:?}",
+                e.leaks().unwrap()
+            );
+            let _ = e.compact_once().unwrap();
+            let mut got_big = Vec::new();
+            e.get_to("b1", "big", 0..BIG as u64, &mut got_big).unwrap();
+            assert_eq!(got_big, big, "round {round}: GET during compaction");
+            assert!(
+                e.leaks().unwrap().is_empty(),
+                "round {round}: pre-crash leaks {:?}",
+                e.leaks().unwrap()
+            );
+            e.close().unwrap();
+            drop(e);
+        }
+
+        {
+            let mut e = Engine::open(&cfg).unwrap();
+            e.debug_wait_drain_open_tick();
+            assert!(
+                e.leaks().unwrap().is_empty(),
+                "round {round}: post-reopen leaks {:?}",
+                e.leaks().unwrap()
+            );
+
+            let mut out = Vec::new();
+            e.get_to("b1", "cow-src", 0..COW as u64, &mut out).unwrap();
+            assert_eq!(out, cow, "round {round}: COW source torn after delete clone");
+
+            out.clear();
+            e.get_to("b1", "glac", 0..GLAC as u64, &mut out).unwrap();
+            assert_eq!(out, glac, "round {round}: restore copy GET");
+
+            out.clear();
+            e.get_to("b1", "mp", 0..(PART_MIN + PART_TAIL) as u64, &mut out)
+                .unwrap();
+            assert_eq!(&out[..PART_MIN], p1b.as_slice(), "round {round}: mp part1");
+            assert_eq!(&out[PART_MIN..], p3b.as_slice(), "round {round}: mp part3");
+            assert!(
+                !out.windows(PART_TAIL)
+                    .any(|w| w == p2old.as_slice() || w == p2new.as_slice()),
+                "round {round}: unlisted/resend part must not appear"
+            );
+
+            out.clear();
+            e.get_to("b1", "big", 0..BIG as u64, &mut out).unwrap();
+            assert_eq!(out, big, "round {round}: large GET after reopen");
+
+            for k in ["cow-src", "glac", "mp", "big", "frag0"] {
+                let _ = e.delete("b1", k);
+            }
+            assert!(
+                e.leaks().unwrap().is_empty(),
+                "round {round}: cleanup leaks {:?}",
+                e.leaks().unwrap()
+            );
+            e.close().unwrap();
+            drop(e);
+        }
+    }
+}
+
 /// COW 段级共享(ADR-9 §5.5):打包 extent 内只共享部分段;
 /// 删除一个持有者不释放;全部释放才回收。
 #[test]
