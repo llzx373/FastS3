@@ -682,7 +682,7 @@ mod tests {
         e.get_to("b1", "k2", 0..u64::MAX, &mut out).unwrap();
         assert_eq!(out, data);
         // 无泄漏;再次压缩无候选
-        assert!(e.allocator().leaks().is_empty());
+        assert!(e.leaks().unwrap().is_empty());
         let r2 = e.compact_once().unwrap();
         assert_eq!(r2.candidates, 0);
         // 新 extent 打包(含迁移段)
@@ -729,7 +729,7 @@ mod tests {
         assert_eq!(out, data);
         let m = e.head("b1", "k2").unwrap().unwrap();
         assert!(m.legal_hold, "压缩不得丢掉 legal hold");
-        assert!(e.allocator().leaks().is_empty());
+        assert!(e.leaks().unwrap().is_empty());
         e.close().unwrap();
     }
 
@@ -792,7 +792,7 @@ mod tests {
             }
         }
         // 无泄漏;再次压缩可继续迁移剩余候选(不 panic)
-        assert!(e.allocator().leaks().is_empty());
+        assert!(e.leaks().unwrap().is_empty());
         let r2 = e.compact_once().unwrap();
         assert!(r2.copied_bytes <= cap);
         e.close().unwrap();
@@ -889,7 +889,7 @@ mod tests {
         }
         assert!(e.head("b1", "k0").unwrap().is_none());
         assert!(e.head("b1", "k1").unwrap().is_none());
-        assert!(e.allocator().leaks().is_empty());
+        assert!(e.leaks().unwrap().is_empty());
         e.close().unwrap();
     }
 
@@ -1030,7 +1030,7 @@ mod tests {
         assert_eq!(out, payload);
         // 无泄漏
         assert!(
-            e.allocator().leaks().is_empty(),
+            e.leaks().unwrap().is_empty(),
             "no leaks after part migration"
         );
         e.close().unwrap();
@@ -1109,7 +1109,7 @@ mod tests {
             "part data intact via old segments"
         );
         assert!(
-            e.allocator().leaks().is_empty(),
+            e.leaks().unwrap().is_empty(),
             "no leaks after phase-2 crash"
         );
         assert_eq!(e.allocator().live_bytes_of(0), 1024 * 1024);
@@ -1227,7 +1227,7 @@ mod tests {
         e.get_to("b1", "glac", 0..rdata.len() as u64, &mut out)
             .unwrap();
         assert_eq!(out, rdata, "restore plaintext intact after compaction");
-        assert!(e.allocator().leaks().is_empty());
+        assert!(e.leaks().unwrap().is_empty());
         e.close().unwrap();
     }
 }

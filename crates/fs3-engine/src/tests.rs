@@ -469,7 +469,7 @@ fn recovery_after_clean_close() {
     e.get_to("b1", "a", 0..u64::MAX, &mut out).unwrap();
     assert_eq!(out, data);
     assert_eq!(e.allocator().allocated_count(), 1);
-    assert!(e.allocator().leaks().is_empty());
+    assert!(e.leaks().unwrap().is_empty());
     e.close().unwrap();
 }
 
@@ -486,7 +486,7 @@ fn recovery_without_close_resumes_open_extent() {
     }
     let mut e = Engine::open(&cfg).unwrap();
     assert_eq!(e.allocator().allocated_count(), 1);
-    assert!(e.allocator().leaks().is_empty());
+    assert!(e.leaks().unwrap().is_empty());
     // 开放 extent 被续写:watermark = 活段最大 end
     e.put("b1", "b", &mut Cursor::new(vec![7u8; 100_000]))
         .unwrap();
@@ -557,7 +557,7 @@ fn checkpoint_rolls_bitmap() {
     }
     let mut e = Engine::open(&cfg).unwrap();
     assert_eq!(e.allocator().allocated_count(), 1);
-    assert!(e.allocator().leaks().is_empty());
+    assert!(e.leaks().unwrap().is_empty());
     e.close().unwrap();
 }
 
@@ -590,7 +590,7 @@ fn checkpoint_truncates_old_alloc_keys() {
     drop(e);
     let mut e2 = Engine::open(&cfg).unwrap();
     assert!(e2.allocator().allocated_count() >= 1);
-    assert!(e2.allocator().leaks().is_empty());
+    assert!(e2.leaks().unwrap().is_empty());
     let mut out = Vec::new();
     e2.get_to("b1", "k0", 0..u64::MAX, &mut out).unwrap();
     assert_eq!(out.len(), 512 * 1024);
@@ -979,7 +979,7 @@ fn upload_part_resend_releases_old_extents() {
         .upload_part(&uid, 1, &mut Cursor::new(second.clone()), None, None)
         .unwrap();
     assert_ne!(p1.etag, p2.etag);
-    assert!(e.allocator().leaks().is_empty());
+    assert!(e.leaks().unwrap().is_empty());
     for id in &old_ids {
         let held = p2.extents.iter().any(|s| s.extent_id == *id);
         if !held {
@@ -1000,8 +1000,134 @@ fn upload_part_resend_releases_old_extents() {
     let stored = e2.list_parts(&uid).unwrap();
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].1.etag, p2.etag);
-    assert!(e2.allocator().leaks().is_empty());
+    assert!(e2.leaks().unwrap().is_empty());
     e2.close().unwrap();
+}
+
+/// F7-1:COW 共享段与 restore 副本即使 live_bytes 被清零,只要元数据可达就不算泄漏。
+#[test]
+fn leaks_mark_sweep_ignores_live_restore_and_cow() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let cow_data = rnd(128 * 1024, 3);
+    e.put("b1", "src", &mut Cursor::new(cow_data.clone()))
+        .unwrap();
+    e.copy_object("b1", "src", "b1", "dst", None, None, None)
+        .unwrap();
+    let cow_ids: Vec<u64> = e
+        .head("b1", "src")
+        .unwrap()
+        .unwrap()
+        .extents
+        .iter()
+        .map(|s| u64::from(s.extent_id))
+        .collect();
+    assert!(!cow_ids.is_empty());
+
+    let rest_data = rnd(128 * 1024, 9);
+    e.put_with_lock_ev(
+        "b1",
+        "g1",
+        &mut Cursor::new(rest_data.clone()),
+        None,
+        vec![],
+        vec![],
+        vec![],
+        None,
+        None,
+        None,
+        ObjectLockWrite::default(),
+        None,
+        Some("GLACIER".into()),
+        fs3_core::promote_storage_class(Some("GLACIER")),
+    )
+    .unwrap();
+    let now = e.lock_now();
+    e.restore_enqueue("b1", "g1", None, 3, "Standard").unwrap();
+    let (done, _) = e.restore_worker_tick(now + 1, 8).unwrap();
+    assert_eq!(done, 1);
+    let restore_ids: Vec<u64> = e
+        .meta()
+        .get_object("b1", "g1")
+        .unwrap()
+        .unwrap()
+        .restore_state
+        .unwrap()
+        .restored_extents
+        .iter()
+        .map(|s| u64::from(s.extent_id))
+        .collect();
+    assert!(!restore_ids.is_empty(), "restore copy must occupy extents");
+
+    for &id in cow_ids.iter().chain(restore_ids.iter()) {
+        e.allocator().restore_occupancy(id, 0, 0);
+    }
+    assert!(
+        e.leaks().unwrap().is_empty(),
+        "reachable COW/restore extents must not be leaks: {:?}",
+        e.leaks().unwrap()
+    );
+
+    let genuine = {
+        use fs3_alloc::Staged;
+        let mut draft = Staged::default();
+        let ids = e.allocator().allocate(&mut draft, 1).unwrap();
+        e.meta()
+            .commit(&[Op::Alloc {
+                draft: fs3_meta::AllocDraft {
+                    alloc: draft.alloc.clone(),
+                    ref_inc: vec![],
+                    ref_dec: vec![],
+                },
+            }])
+            .unwrap();
+        ids[0]
+    };
+    let leaks = e.leaks().unwrap();
+    assert_eq!(
+        leaks,
+        vec![genuine],
+        "unreferenced allocated extent is a leak"
+    );
+
+    let mut out = Vec::new();
+    e.get_to("b1", "src", 0..cow_data.len() as u64, &mut out)
+        .unwrap();
+    assert_eq!(out, cow_data);
+    out.clear();
+    e.get_to("b1", "dst", 0..cow_data.len() as u64, &mut out)
+        .unwrap();
+    assert_eq!(out, cow_data);
+    out.clear();
+    e.get_to("b1", "g1", 0..rest_data.len() as u64, &mut out)
+        .unwrap();
+    assert_eq!(out, rest_data);
+    e.close().unwrap();
+}
+
+/// F7-1:multipart 分片重传后无需重启即可 mark-sweep;F4-1 已释放旧段 → 泄漏为 0。
+#[test]
+fn leaks_detects_unreferenced_after_part_resend_without_restart() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let uid = e
+        .create_multipart("b1", "k", None, vec![], vec![], vec![], None, None, None)
+        .unwrap();
+    let first = rnd(64 * 1024, 1);
+    let p1 = e
+        .upload_part(&uid, 1, &mut Cursor::new(first), None, None)
+        .unwrap();
+    assert!(p1.inline.is_none() && !p1.extents.is_empty());
+    let second = rnd(64 * 1024, 2);
+    let _p2 = e
+        .upload_part(&uid, 1, &mut Cursor::new(second), None, None)
+        .unwrap();
+    assert!(
+        e.leaks().unwrap().is_empty(),
+        "part resend must not leave runtime leaks: {:?}",
+        e.leaks().unwrap()
+    );
+    e.close().unwrap();
 }
 
 #[test]
@@ -1053,7 +1179,7 @@ fn complete_subset_releases_unlisted_parts() {
         }
     }
     assert!(e.list_parts(&uid).unwrap().is_empty());
-    assert!(e.allocator().leaks().is_empty());
+    assert!(e.leaks().unwrap().is_empty());
     e.close().unwrap();
 }
 
@@ -1103,7 +1229,7 @@ fn mixed_complete_after_release_seals_open_extent() {
     e.get_to("b1", "after-mix", 0..more.len() as u64, &mut out2)
         .unwrap();
     assert_eq!(out2, more);
-    assert!(e.allocator().leaks().is_empty());
+    assert!(e.leaks().unwrap().is_empty());
     e.close().unwrap();
 }
 
@@ -1763,7 +1889,7 @@ fn multipart_parts_pack_with_objects() {
     let mut out = Vec::new();
     e.get_to("b1", "plain", 0..u64::MAX, &mut out).unwrap();
     assert_eq!(out, vec![2u8; 100_000]);
-    assert!(e.allocator().leaks().is_empty());
+    assert!(e.leaks().unwrap().is_empty());
     e.close().unwrap();
 }
 
@@ -1993,9 +2119,9 @@ fn copy_restart_delete_clone_source_intact() {
     let data = vec![9u8; 5 * 1024 * 1024];
     let mut e = Engine::open(&cfg).unwrap();
     assert!(
-        e.alloc.leaks().is_empty(),
+        e.leaks().unwrap().is_empty(),
         "rebuild leaks: {:?}",
-        e.alloc.leaks()
+        e.leaks().unwrap()
     );
     assert_eq!(
         e.alloc.shared_count(seg.extent_id, seg.offset, seg.len),
@@ -2009,11 +2135,11 @@ fn copy_restart_delete_clone_source_intact() {
     e.get_to("b1", "src", 0..data.len() as u64, &mut out)
         .unwrap();
     assert_eq!(out, data, "删副本后源不得被覆写");
-    assert!(e.alloc.leaks().is_empty());
+    assert!(e.leaks().unwrap().is_empty());
     e.delete("b1", "src").unwrap();
     assert_eq!(e.alloc.refcount(ext_id), 0);
     assert!(!e.alloc.test_bit(ext_id));
-    assert!(e.alloc.leaks().is_empty());
+    assert!(e.leaks().unwrap().is_empty());
     e.close().unwrap();
 }
 
@@ -2156,7 +2282,7 @@ fn seal_conditions_and_types() {
         e.get_to("b1", k, 0..u64::MAX, &mut out).unwrap();
         assert!(!out.is_empty());
     }
-    assert!(e.allocator().leaks().is_empty());
+    assert!(e.leaks().unwrap().is_empty());
     e.close().unwrap();
 }
 
@@ -2263,7 +2389,7 @@ fn recovery_resumes_open_extent_and_overwrites_orphans() {
     // 重启:watermark = 活段最大 end(300K),孤儿区 [300K, 304K) 无活段
     let mut e = Engine::open(&cfg).unwrap();
     assert_eq!(e.allocator().allocated_count(), 1);
-    assert!(e.allocator().leaks().is_empty());
+    assert!(e.leaks().unwrap().is_empty());
     // 继续写入:孤儿数据被自然覆盖,不残留
     e.put("b1", "b", &mut Cursor::new(d2.clone())).unwrap();
     let mut out = Vec::new();
@@ -2272,7 +2398,7 @@ fn recovery_resumes_open_extent_and_overwrites_orphans() {
     let mut out = Vec::new();
     e.get_to("b1", "b", 0..u64::MAX, &mut out).unwrap();
     assert_eq!(out, d2);
-    assert!(e.allocator().leaks().is_empty());
+    assert!(e.leaks().unwrap().is_empty());
     e.close().unwrap();
 }
 
@@ -2295,7 +2421,7 @@ fn recovery_seals_headerless_full_extent() {
     }
     // 重启:识别为"写满未封口" → 补独占头(重算 CRC 表)
     let mut e = Engine::open(&cfg).unwrap();
-    assert!(e.allocator().leaks().is_empty());
+    assert!(e.leaks().unwrap().is_empty());
     let h = e.read_extent_header(0).unwrap().unwrap();
     assert!(!h.is_packed());
     let units = (fs3_core::DEFAULT_EXTENT_SIZE - 4096).div_ceil(65536);
@@ -2471,7 +2597,7 @@ proptest::proptest! {
                 prop_assert_eq!(&out, d);
             }
         }
-        prop_assert!(e.allocator().leaks().is_empty());
+        prop_assert!(e.leaks().unwrap().is_empty());
         e.close().unwrap();
         drop(e); // 释放 rocksdb 锁后重启
         // 重启:状态完整、零泄漏
@@ -2481,7 +2607,7 @@ proptest::proptest! {
             e2.get_to("b1", k, 0..u64::MAX, &mut out).unwrap();
             prop_assert_eq!(&out, d);
         }
-        prop_assert!(e2.allocator().leaks().is_empty());
+        prop_assert!(e2.leaks().unwrap().is_empty());
         e2.close().unwrap();
     }
 }
@@ -2762,10 +2888,16 @@ fn repair_leaks_skips_locked_referenced_extents() {
     let r = e.check_report().unwrap();
     assert!(r.leaks.contains(&genuine));
     for &id in &locked_ids {
-        assert!(r.leaks.contains(&id), "zeroed live_bytes → leak candidate");
+        assert!(
+            !r.leaks.contains(&id),
+            "F7-1:元数据仍可达的锁定对象不得因 live_bytes 被清零而记泄漏"
+        );
     }
     let rep = e.repair_leaks().unwrap();
-    assert!(rep.skipped_locked >= locked_ids.len() as u64);
+    assert_eq!(
+        rep.skipped_locked, 0,
+        "reachable locked extents are not leak candidates"
+    );
     assert_eq!(rep.freed_extents, 1);
     assert!(!e.allocator().test_bit(genuine), "genuine leak reclaimed");
     for &id in &locked_ids {

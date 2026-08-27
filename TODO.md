@@ -153,7 +153,7 @@ F0 ADR-22
 
 ### F7 `check` / `--fix` 覆盖缺口(依赖 F2、F4)
 
-- [ ] F7-1 `leaks()` 改为「位图已分配 ∧ 元数据不可达」(mark-sweep: o:+p:+restore 段集合),不再单独信派生 `live_bytes==0`;`heal_bitmap` 仍处理反方向
+- [x] F7-1 `leaks()` 改为「位图已分配 ∧ 元数据不可达」(mark-sweep: o:+p:+restore 段集合),不再单独信派生 `live_bytes==0`;`heal_bitmap` 仍处理反方向
   - 用例:`leaks_mark_sweep_ignores_live_restore_and_cow`;`leaks_detects_unreferenced_after_part_resend_without_restart`(F4-1 修好后运行期就能看见旧语义下的泄漏,本项应断言为 0)
 - [ ] F7-2 `check_report` 的 objects/bytes 含版本条目口径或明确标注「仅当前版本」;历史版本不计入时文档与 JSON 字段名一致
   - 用例:版本化桶 1 key × 2 版本,报告数字与所选口径一致(钉死一种,禁止静默漏计)

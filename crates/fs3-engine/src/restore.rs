@@ -768,9 +768,9 @@ mod tests {
         drop(e);
         let mut e = Engine::open(&cfg)?;
         assert!(
-            e.allocator().leaks().is_empty(),
+            e.leaks().unwrap().is_empty(),
             "重启扫描必须纳入 restored_extents: {:?}",
-            e.allocator().leaks()
+            e.leaks().unwrap()
         );
         let mut out = Vec::new();
         e.get_to("b1", "big", 0..data.len() as u64, &mut out)?;

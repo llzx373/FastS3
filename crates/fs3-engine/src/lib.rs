@@ -6863,9 +6863,15 @@ impl Engine {
 
     // ─────────────────────────── CHECK ───────────────────────────
 
+    /// 运行期 mark-sweep(F7-1):位图已分配 ∧ o:/p:/restore 元数据不可达。
+    pub fn leaks(&self) -> Result<Vec<u64>> {
+        let reachable = collect_reachable_extents(self.meta.as_ref())?;
+        Ok(self.alloc.leaks(&reachable))
+    }
+
     /// 只读一致性摘要(位图 vs 元数据核对;泄漏修复留 M3 check 工具)。
     pub fn check_report(&self) -> Result<CheckReport> {
-        let leaks = self.alloc.leaks();
+        let leaks = self.leaks()?;
         let buckets = self.meta.list_buckets()?;
         let mut objects = 0usize;
         let mut total_bytes = 0u64;
@@ -6911,7 +6917,7 @@ impl Engine {
         }
         let locked = locked_referenced_extents(self.meta.as_ref(), self.lock_now())?;
         let restored = restore_referenced_extents(self.meta.as_ref())?;
-        let leaks = self.alloc.leaks();
+        let leaks = self.leaks()?;
         let mut draft = Staged::default();
         let mut freed = 0u64;
         let mut skipped_locked = 0u64;
@@ -6953,6 +6959,27 @@ impl Engine {
             }
         }
     }
+}
+
+/// o: 当前/历史版本段 + restore 副本 + p: 分片段(F7-1 mark 集)。
+fn collect_reachable_extents(meta: &MetaStore) -> Result<HashSet<u64>> {
+    let mut out = HashSet::new();
+    for (_, _, _, m) in meta.snapshot_all_objects()? {
+        for s in &m.extents {
+            out.insert(u64::from(s.extent_id));
+        }
+        if let Some(st) = &m.restore_state {
+            for s in &st.restored_extents {
+                out.insert(u64::from(s.extent_id));
+            }
+        }
+    }
+    for (_, _, p) in meta.snapshot_all_parts()? {
+        for s in &p.extents {
+            out.insert(u64::from(s.extent_id));
+        }
+    }
+    Ok(out)
 }
 
 /// 未到期 retention / legal_hold 版本仍引用的 extent(W4-2 防御集)。
@@ -8037,7 +8064,8 @@ fn rebuild_segment_state(
             "recovery healed {healed} extent(s) with live data but clear bitmap (overwrite-free bug residue)"
         );
     }
-    let leaks = alloc.leaks();
+    let reachable = collect_reachable_extents(meta)?;
+    let leaks = alloc.leaks(&reachable);
     Ok((leaks, max_end))
 }
 

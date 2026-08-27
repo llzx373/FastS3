@@ -1392,6 +1392,7 @@ fn cmd_compact(cfg: &EngineConfig, rounds: u32) -> fs3_core::Result<()> {
             break;
         }
     }
+    let leaks = e.leaks()?;
     e.close()?;
     println!("compact: {round} round(s)");
     println!("  candidates:     {}", total.candidates);
@@ -1404,7 +1405,6 @@ fn cmd_compact(cfg: &EngineConfig, rounds: u32) -> fs3_core::Result<()> {
     println!("  skipped shared: {}", total.skipped_shared);
     println!("  conflicts:      {} (下轮重试)", total.conflicts);
     println!("  errors:         {}", total.errors);
-    let leaks = e.allocator().leaks();
     if !leaks.is_empty() {
         return Err(fs3_core::Error::Corrupt(format!(
             "{} leaked extents",

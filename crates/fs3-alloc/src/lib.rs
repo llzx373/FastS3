@@ -19,7 +19,7 @@ pub mod checkpointer;
 pub use bitmap::Bitmap;
 pub use checkpointer::Checkpointer;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
 
@@ -611,8 +611,8 @@ impl Allocator {
     ///
     /// `dec_live` 在 live_bytes 归零时清位图,即使另有对象仍持有该
     /// extent(账目与快照不一致)。随后 `allocate` 会把同一 id 当成空
-    /// extent 交出;引擎按快照垫高水位续写,本方法避免 `leaks()` 把
-    /// 「位图已置位但 live_bytes 仍为 0」误报成泄漏。
+    /// extent 交出;引擎按快照垫高水位续写。F7-1 `leaks(reachable)`
+    /// 以元数据为准,不再把「位图已置位但 live_bytes==0」误报成泄漏。
     pub fn restore_occupancy(&self, id: u64, live: u32, refcount: u32) {
         self.live_bytes[id as usize].store(live, Ordering::Release);
         self.refcounts[id as usize].store(refcount, Ordering::Release);
@@ -680,10 +680,12 @@ impl Allocator {
         }
     }
 
-    /// 泄漏检测:位图已分配但 `live_bytes == 0` 的 extent(ADR-9 §5.7 第 4 步)。
-    pub fn leaks(&self) -> Vec<u64> {
+    /// 泄漏检测(F7-1 mark-sweep):位图已分配且**元数据不可达**的 extent。
+    /// `reachable` = o: 对象段 + 版本 + restore 副本 + p: 分片段。
+    /// 不再单独信派生 `live_bytes==0`(COW/restore 账目漂移会假阳/假阴)。
+    pub fn leaks(&self, reachable: &HashSet<u64>) -> Vec<u64> {
         (0..self.n)
-            .filter(|&id| self.bitmap.test(id) && self.live_bytes_of(id) == 0)
+            .filter(|&id| self.bitmap.test(id) && !reachable.contains(&id))
             .collect()
     }
 
@@ -705,10 +707,10 @@ impl Allocator {
     /// 释放一个泄漏 extent(C4 修复):位图清位 + 记账,记入 draft
     /// (ref_dec → 随事务写 `a:` 记录,崩溃重放幂等)。
     ///
-    /// 前提:调用方已确认该 extent 无任何元数据可达(泄漏扫描结论);
-    /// 若位图未置位或 live_bytes > 0(防御性,状态已漂移)则跳过。
+    /// 前提:调用方已确认该 extent 无任何元数据可达(mark-sweep 结论);
+    /// 位图未置位则跳过。派生 `live_bytes` 可能仍 >0(账目漂移),一并清零。
     pub fn release_leaked(&self, draft: &mut Staged, id: u64) -> bool {
-        if !self.bitmap.test(id) || self.live_bytes_of(id) != 0 {
+        if !self.bitmap.test(id) {
             return false;
         }
         self.bitmap.clear_bit(id);
@@ -774,6 +776,11 @@ mod tests {
             len,
             crcs: vec![],
         }
+    }
+
+    /// 分配器单测用 mark 集:live_bytes>0 的 extent(与 rebuild 后元数据对齐)。
+    fn live_mark(a: &Allocator) -> HashSet<u64> {
+        (0..a.len()).filter(|&id| a.live_bytes_of(id) > 0).collect()
     }
 
     #[test]
@@ -882,7 +889,7 @@ mod tests {
         assert!(!a.test_bit(id));
         assert_eq!(d.ref_dec.len(), n_before + 1);
         assert_eq!(a.state_of(id), ExtentState::Free);
-        assert_eq!(a.leaks(), vec![]);
+        assert_eq!(a.leaks(&live_mark(&a)), vec![]);
         Ok(())
     }
 
@@ -1017,7 +1024,7 @@ mod tests {
         };
         b.apply_record(&release);
         assert_eq!(b.allocated_count(), 0);
-        assert_eq!(b.leaks(), vec![]);
+        assert_eq!(b.leaks(&live_mark(&b)), vec![]);
         Ok(())
     }
 
@@ -1041,7 +1048,11 @@ mod tests {
             Some(2),
             "ADR-22:重建后共享表 = 持有者总数"
         );
-        assert_eq!(a.leaks(), vec![ids[2]], "无活段的已分配 extent = 泄漏");
+        assert_eq!(
+            a.leaks(&live_mark(&a)),
+            vec![ids[2]],
+            "无活段的已分配 extent = 泄漏"
+        );
         Ok(())
     }
 
@@ -1064,14 +1075,14 @@ mod tests {
         let _ = a.to_alloc_draft(&d2);
         assert_eq!(a.live_bytes_of(id), 4096, "另一持有者仍在");
         assert!(a.test_bit(id), "位图不得提前清");
-        assert_eq!(a.leaks(), vec![]);
+        assert_eq!(a.leaks(&live_mark(&a)), vec![]);
         assert_eq!(a.shared_count(s.extent_id, s.offset, s.len), Some(1));
         let mut d3 = Staged::default();
         a.release_object(&mut d3, std::slice::from_ref(&s));
         let _ = a.to_alloc_draft(&d3);
         assert_eq!(a.live_bytes_of(id), 0);
         assert!(!a.test_bit(id));
-        assert_eq!(a.leaks(), vec![]);
+        assert_eq!(a.leaks(&live_mark(&a)), vec![]);
         Ok(())
     }
 
@@ -1094,7 +1105,7 @@ mod tests {
         let _ = a.to_alloc_draft(&d2);
         assert_eq!(a.live_bytes_of(id), 8192);
         assert!(a.test_bit(id));
-        assert_eq!(a.leaks(), vec![]);
+        assert_eq!(a.leaks(&live_mark(&a)), vec![]);
         let mut d3 = Staged::default();
         a.release_object(&mut d3, std::slice::from_ref(&s));
         let _ = a.to_alloc_draft(&d3);
@@ -1118,7 +1129,7 @@ mod tests {
         let _ = a.to_alloc_draft(&d2);
         assert_eq!(a.live_bytes_of(id), 0);
         assert!(!a.test_bit(id));
-        assert_eq!(a.leaks(), vec![]);
+        assert_eq!(a.leaks(&live_mark(&a)), vec![]);
         Ok(())
     }
 
