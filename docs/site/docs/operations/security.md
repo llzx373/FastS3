@@ -62,7 +62,6 @@
     "enabled": true,
     "url": "ldaps://ldap.corp:636",
     "bind_dn": "cn=fasts3-sync,ou=service,dc=corp",
-    "bind_password": "来自环境变量 FS3_LDAP_BIND_PASSWORD(推荐)",
     "base_dn": "ou=groups,dc=corp",
     "group_filter": "(objectClass=groupOfNames)",
     "groups": ["s3-admin", "s3-backup"],
@@ -72,11 +71,13 @@
 }
 ```
 
+- **bind 密码只允许环境变量 `FS3_LDAP_BIND_PASSWORD`**:配置文件若含
+  `bind_password` 字段则加载时忽略并告警,落盘序列化会剥掉该字段。
 - 每个配置组对应一个数据面 access key(`<key_prefix><组名>`);
   组存在且有成员 → 自动创建/启用密钥;组消失或无成员 → 禁用密钥
   (不删除);组从配置移除 → 删除密钥。
 - **bind 密码仅进程内存持有**,不落盘、不进数据面、不进审计
-  (G1-3 同构);配置文件中明文 = 运维责任,生产用环境变量注入。
+  (G1-3 同构)。
 - 目录不可达/绑定失败 → 本轮跳过(不动任何密钥,防误删),状态见
   `GET /api/ldap/status`,事件见 `GET /api/identity-events`。
 

@@ -83,24 +83,52 @@ function loadJson<T>(p: string): Partial<T> | undefined {
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 // dev: src/..;dist 布局下 config.json 在 web/server/ 根
-const configPath = process.env.FS3_WEB_CONFIG ?? path.resolve(here, "../config.json");
-const file = loadJson<WebConfig>(configPath);
+export function defaultConfigPath(env: NodeJS.Dict<string> = process.env): string {
+  return env.FS3_WEB_CONFIG ?? path.resolve(here, "../config.json");
+}
 
-const env = process.env;
+export interface LoadConfigOpts {
+  /** 覆盖默认 config.json 路径(测试用) */
+  path?: string;
+  env?: NodeJS.Dict<string>;
+}
 
-function pick<T>(envKey: string, fileVal: T | undefined, def: T): T {
+function pick<T>(env: NodeJS.Dict<string>, envKey: string, fileVal: T | undefined, def: T): T {
   const v = env[envKey];
   if (v !== undefined && v !== "") return v as unknown as T;
   return fileVal ?? def;
 }
 
-function boolPick(envKey: string, fileVal: boolean | undefined, def: boolean): boolean {
+function boolPick(
+  env: NodeJS.Dict<string>,
+  envKey: string,
+  fileVal: boolean | undefined,
+  def: boolean,
+): boolean {
   const v = env[envKey];
   if (v !== undefined && v !== "") return v === "true" || v === "1";
   return fileVal ?? def;
 }
 
-export function loadConfig(): WebConfig {
+/** 落盘视图:剥掉 ldap.bind_password,只允许 env 注入。 */
+export function webConfigForDisk(cfg: WebConfig): Omit<WebConfig, "ldap"> & {
+  ldap: Omit<LdapConfig, "bind_password">;
+} {
+  const { bind_password: _omit, ...ldap } = cfg.ldap;
+  void _omit;
+  return { ...cfg, ldap };
+}
+
+export function loadConfig(opts?: LoadConfigOpts): WebConfig {
+  const env = opts?.env ?? process.env;
+  const configPath = opts?.path ?? defaultConfigPath(env);
+  const file = loadJson<WebConfig>(configPath);
+  const fileBind = (file?.ldap as { bind_password?: string } | undefined)?.bind_password;
+  if (typeof fileBind === "string" && fileBind.length > 0) {
+    console.warn(
+      "ldap.bind_password in config file is ignored and must not be persisted; use FS3_LDAP_BIND_PASSWORD",
+    );
+  }
   const users: UserConfig[] =
     file?.users && file.users.length > 0
       ? file.users
@@ -112,41 +140,42 @@ export function loadConfig(): WebConfig {
           },
         ];
   return {
-    listen: pick("FS3_WEB_LISTEN", file?.listen, "0.0.0.0:9090"),
-    staticDir: pick("FS3_WEB_STATIC", file?.staticDir, undefined),
-    jwtSecret: pick("FS3_WEB_JWT_SECRET", file?.jwtSecret, "dev-secret-change-me"),
+    listen: pick(env, "FS3_WEB_LISTEN", file?.listen, "0.0.0.0:9090"),
+    staticDir: pick(env, "FS3_WEB_STATIC", file?.staticDir, undefined),
+    jwtSecret: pick(env, "FS3_WEB_JWT_SECRET", file?.jwtSecret, "dev-secret-change-me"),
     users,
     admin: {
-      listen: pick("FS3_ADMIN_LISTEN", file?.admin?.listen, "unix:///run/fasts3/admin.sock"),
-      token: pick("FS3_ADMIN_TOKEN", file?.admin?.token, ""),
+      listen: pick(env, "FS3_ADMIN_LISTEN", file?.admin?.listen, "unix:///run/fasts3/admin.sock"),
+      token: pick(env, "FS3_ADMIN_TOKEN", file?.admin?.token, ""),
     },
     s3: {
-      endpoint: pick("FS3_S3_ENDPOINT", file?.s3?.endpoint, "http://127.0.0.1:9000"),
-      region: pick("FS3_S3_REGION", file?.s3?.region, "us-east-1"),
-      accessKey: pick("FS3_S3_ACCESS_KEY", file?.s3?.accessKey, "fasts3dev"),
-      secretKey: pick("FS3_S3_SECRET_KEY", file?.s3?.secretKey, "fasts3dev"),
+      endpoint: pick(env, "FS3_S3_ENDPOINT", file?.s3?.endpoint, "http://127.0.0.1:9000"),
+      region: pick(env, "FS3_S3_REGION", file?.s3?.region, "us-east-1"),
+      accessKey: pick(env, "FS3_S3_ACCESS_KEY", file?.s3?.accessKey, "fasts3dev"),
+      secretKey: pick(env, "FS3_S3_SECRET_KEY", file?.s3?.secretKey, "fasts3dev"),
     },
     ldap: {
-      enabled: boolPick("FS3_LDAP_ENABLED", file?.ldap?.enabled, false),
-      url: pick("FS3_LDAP_URL", file?.ldap?.url, ""),
-      bind_dn: pick("FS3_LDAP_BIND_DN", file?.ldap?.bind_dn, ""),
-      bind_password: pick("FS3_LDAP_BIND_PASSWORD", file?.ldap?.bind_password, ""),
-      base_dn: pick("FS3_LDAP_BASE_DN", file?.ldap?.base_dn, ""),
-      group_filter: pick("FS3_LDAP_GROUP_FILTER", file?.ldap?.group_filter, "(objectClass=groupOfNames)"),
+      enabled: boolPick(env, "FS3_LDAP_ENABLED", file?.ldap?.enabled, false),
+      url: pick(env, "FS3_LDAP_URL", file?.ldap?.url, ""),
+      bind_dn: pick(env, "FS3_LDAP_BIND_DN", file?.ldap?.bind_dn, ""),
+      // F6-5:bind 密码只允许环境变量,文件字段忽略(防落盘明文)
+      bind_password: env.FS3_LDAP_BIND_PASSWORD ?? "",
+      base_dn: pick(env, "FS3_LDAP_BASE_DN", file?.ldap?.base_dn, ""),
+      group_filter: pick(env, "FS3_LDAP_GROUP_FILTER", file?.ldap?.group_filter, "(objectClass=groupOfNames)"),
       groups: file?.ldap?.groups ?? [],
-      key_prefix: pick("FS3_LDAP_KEY_PREFIX", file?.ldap?.key_prefix, "ldap-"),
-      sync_interval_secs: Number(pick("FS3_LDAP_SYNC_INTERVAL", file?.ldap?.sync_interval_secs, 300)) || 300,
+      key_prefix: pick(env, "FS3_LDAP_KEY_PREFIX", file?.ldap?.key_prefix, "ldap-"),
+      sync_interval_secs: Number(pick(env, "FS3_LDAP_SYNC_INTERVAL", file?.ldap?.sync_interval_secs, 300)) || 300,
     },
     oidc: {
-      enabled: boolPick("FS3_OIDC_ENABLED", file?.oidc?.enabled, false),
-      issuer: pick("FS3_OIDC_ISSUER", file?.oidc?.issuer, ""),
-      client_id: pick("FS3_OIDC_CLIENT_ID", file?.oidc?.client_id, ""),
-      client_secret: pick("FS3_OIDC_CLIENT_SECRET", file?.oidc?.client_secret, ""),
-      redirect_uri: pick("FS3_OIDC_REDIRECT_URI", file?.oidc?.redirect_uri, ""),
-      role_claim: pick("FS3_OIDC_ROLE_CLAIM", file?.oidc?.role_claim, "roles"),
+      enabled: boolPick(env, "FS3_OIDC_ENABLED", file?.oidc?.enabled, false),
+      issuer: pick(env, "FS3_OIDC_ISSUER", file?.oidc?.issuer, ""),
+      client_id: pick(env, "FS3_OIDC_CLIENT_ID", file?.oidc?.client_id, ""),
+      client_secret: pick(env, "FS3_OIDC_CLIENT_SECRET", file?.oidc?.client_secret, ""),
+      redirect_uri: pick(env, "FS3_OIDC_REDIRECT_URI", file?.oidc?.redirect_uri, ""),
+      role_claim: pick(env, "FS3_OIDC_ROLE_CLAIM", file?.oidc?.role_claim, "roles"),
       admin_values: file?.oidc?.admin_values ?? ["admin", "fasts3-admin"],
       readonly_values: file?.oidc?.readonly_values ?? ["readonly", "viewer"],
-      fallback_role: (pick("FS3_OIDC_FALLBACK_ROLE", file?.oidc?.fallback_role, "") as "" | "admin" | "readonly") ?? "",
+      fallback_role: (pick(env, "FS3_OIDC_FALLBACK_ROLE", file?.oidc?.fallback_role, "") as "" | "admin" | "readonly") ?? "",
     },
   };
 }
