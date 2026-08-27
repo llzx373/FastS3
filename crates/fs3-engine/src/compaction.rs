@@ -745,6 +745,117 @@ mod tests {
         e.close().unwrap();
     }
 
+    fn pattern_bytes(len: usize, seed: u8) -> Vec<u8> {
+        let mut v = vec![0u8; len];
+        for (i, b) in v.iter_mut().enumerate() {
+            *b = seed.wrapping_add((i % 251) as u8);
+        }
+        v
+    }
+
+    /// F8-3:碎片布局下 GET 与 compact_once 并发,字节与写入一致;
+    /// ≥30MiB multipart 分片重传在 compaction_enabled=true 下稳定。
+    #[test]
+    fn streaming_get_during_compaction_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("disk.img");
+        std::fs::File::create(&img)
+            .unwrap()
+            .set_len(256 * 1024 * 1024)
+            .unwrap();
+        fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
+        let cfg = crate::EngineConfig {
+            devices: vec![img],
+            meta_dir: dir.path().join("meta"),
+            compaction: CompactionConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut e = crate::Engine::open(&cfg).unwrap();
+        e.ensure_bucket("b1").unwrap();
+
+        let fill = vec![0x11u8; 1024 * 1024];
+        let live = pattern_bytes(2 * 1024 * 1024, 0x5A);
+        e.put("b1", "fill0", &mut Cursor::new(fill.clone()))
+            .unwrap();
+        e.put("b1", "fill1", &mut Cursor::new(fill))
+            .unwrap();
+        e.put("b1", "live", &mut Cursor::new(live.clone()))
+            .unwrap();
+        e.delete("b1", "fill0").unwrap();
+        e.delete("b1", "fill1").unwrap();
+        let segs = e
+            .object_segments("b1", "live", 0, live.len() as u64)
+            .unwrap()
+            .expect("extent object is zero-copy eligible");
+        assert!(!segs.is_empty());
+
+        let engine = std::sync::Arc::new(parking_lot::RwLock::new(e));
+        for _ in 0..4 {
+            let expected = live.clone();
+            let reader = std::sync::Arc::clone(&engine);
+            let t = std::thread::spawn(move || {
+                let e = reader.read();
+                let mut out = Vec::new();
+                e.get_to("b1", "live", 0..u64::MAX, &mut out).unwrap();
+                out
+            });
+            {
+                let e = engine.read();
+                e.compact_once().unwrap();
+            }
+            let out = t.join().unwrap();
+            assert_eq!(out, expected, "GET during compact must match written bytes");
+        }
+
+        let part_len = 30 * 1024 * 1024;
+        let part_a = pattern_bytes(part_len, 0x21);
+        let part_b = pattern_bytes(part_len, 0x43);
+        let p2_etag = {
+            let mut e = engine.write();
+            let uid = e
+                .create_multipart("b1", "big", None, vec![], vec![], vec![], None, None, None)
+                .unwrap();
+            e.upload_part(&uid, 1, &mut Cursor::new(part_a), None, None)
+                .unwrap();
+            let p2 = e
+                .upload_part(&uid, 1, &mut Cursor::new(part_b.clone()), None, None)
+                .unwrap();
+            let etag = p2.etag_hex();
+            e.complete_multipart("b1", "big", &uid, &[cp(1, etag.clone())], None, None)
+                .unwrap();
+            etag
+        };
+        let _ = p2_etag;
+        {
+            let expected = part_b.clone();
+            let reader = std::sync::Arc::clone(&engine);
+            let t = std::thread::spawn(move || {
+                let e = reader.read();
+                let mut out = Vec::new();
+                e.get_to("b1", "big", 0..u64::MAX, &mut out).unwrap();
+                out
+            });
+            {
+                let e = engine.read();
+                e.compact_once().unwrap();
+            }
+            let out = t.join().unwrap();
+            assert_eq!(
+                out, expected,
+                "30MiB resend GET during compact must match last part"
+            );
+        }
+
+        let mut e = std::sync::Arc::try_unwrap(engine)
+            .unwrap_or_else(|_| panic!("engine Arc still shared"))
+            .into_inner();
+        assert!(e.leaks().unwrap().is_empty());
+        e.close().unwrap();
+    }
+
     #[test]
     fn compaction_migrates_locked_object_keeps_retention() {
         // W4-1:压缩可搬锁定版本数据,不可当泄漏回收。

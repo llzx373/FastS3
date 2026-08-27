@@ -166,7 +166,7 @@ F0 ADR-22
   - 用例:`pin_drop_unpins` RAII;panic/unwind 也 unpin
 - [x] F8-2 Compactor / lifecycle transition / restore GC:`release_object` 若 `pin_count>0` 则进入隔离队列,unpin 到 0 再清位;禁止把 pin 中的 extent 交给 `allocate`
   - 用例:`compaction_skips_pinned_extent`;`allocate_does_not_reuse_pinned`
-- [ ] F8-3 集成:大对象 GET 零拷贝进行中触发 compact_once(碎片布局),GET 字节与写入一致;复现原先 ~50% 失败的 `multipart_upload_resend_part` 量级(≥30MiB)在 **compaction_enabled=true** 下稳定
+- [x] F8-3 集成:大对象 GET 零拷贝进行中触发 compact_once(碎片布局),GET 字节与写入一致;复现原先 ~50% 失败的 `multipart_upload_resend_part` 量级(≥30MiB)在 **compaction_enabled=true** 下稳定
   - 用例:`streaming_get_during_compaction_stable`(engine 或 http 集成);s3-tests 门禁配置改为允许压缩(或双跑:关/开各一次)
 - [ ] F8-4 TODO 债务轨道 D1 勾选;s3-tests README 删除「必须关压缩才能绿」;A5-2 压缩并发补跑(可并入 G1)
   - 用例:README/gate 脚本与实现一致(CI 或本地脚本断言 `compaction_enabled` 在 gate toml 为 true)

@@ -152,9 +152,8 @@ listen = "127.0.0.1:$SPORT"
 devices = ["$IMG"]
 meta_dir = "$META"
 sync_mode = "full"
-# M10 S5:协议门禁需确定性环境——压缩迁移与大对象流式读存在已跟踪并发竞态
-# (tests/s3-tests/README.md「运行」节);gate/冒烟矩阵关闭后台压缩。
-compaction_enabled = false
+# F8-3:读钉扎落地后协议门禁允许后台压缩(与生产默认一致)。
+compaction_enabled = true
 EOF
     if "$BIN" doctor --config "$CONF" --json > "$WORK/doctor.json" 2>/dev/null \
         && grep -q "kernel\|io_uring\|device" "$WORK/doctor.json"; then

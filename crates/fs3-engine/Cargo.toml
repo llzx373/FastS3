@@ -25,3 +25,4 @@ zstd.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 proptest.workspace = true
+parking_lot.workspace = true
