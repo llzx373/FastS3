@@ -300,6 +300,11 @@ impl NotificationWorker {
         self.stats.clone()
     }
 
+    #[cfg(test)]
+    fn debug_retry_len(&self) -> usize {
+        self.retry.len()
+    }
+
     /// 一轮投递批(worker run_batch 与手动共用的核心)。
     fn deliver_batch(&mut self) -> fs3_core::Result<()> {
         // 有界环形(ADR-18 D-E1.2):超上限 + slack 批量截断最旧(投递停滞
@@ -721,6 +726,52 @@ mod tests {
         assert_eq!(v["Records"][0]["s3"]["object"]["key"], "logs/k");
         // worker 每轮刷新队列深度
         assert_eq!(stats.snapshot().queue, 0);
+    }
+
+    /// F5-3:truncate_events 后 retry HashMap 只保留仍存在的 seq。
+    #[test]
+    fn notification_retry_map_does_not_grow_after_truncate() {
+        let rule = fs3_core::NotificationRule {
+            id: "rule-1".into(),
+            events: vec!["s3:ObjectCreated:*".into()],
+            kind: fs3_core::NotificationTargetKind::Queue,
+            url: "http://127.0.0.1:1/x".into(),
+            hmac_key: None,
+            enabled: true,
+            filter: fs3_core::NotificationKeyFilter::default(),
+        };
+        let (_d, meta) = meta_with_rule(rule);
+        let sender = Arc::new(MockSender {
+            calls: std::sync::Mutex::new(Vec::new()),
+            fail_first: usize::MAX,
+            fail_with: 500,
+        });
+        let (mut w, _stats) = worker_with(meta.clone(), sender, 16);
+        for i in 0..8u64 {
+            meta.commit_with_event(
+                &[fs3_meta::Op::ObjectPut {
+                    bucket: "b1".into(),
+                    key: format!("k{i}"),
+                    meta: sample_object_meta(),
+                }],
+                &sample_event(0),
+            )
+            .unwrap();
+        }
+        w.run_round_blocking().unwrap();
+        assert_eq!(w.debug_retry_len(), 8, "each failed event is tracked");
+        meta.truncate_events(3).unwrap();
+        assert_eq!(meta.event_count().unwrap(), 3);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        w.run_round_blocking().unwrap();
+        let live = meta.event_seqs().unwrap();
+        assert!(
+            w.debug_retry_len() <= live.len(),
+            "retry map must not retain truncated seqs ({} vs live {})",
+            w.debug_retry_len(),
+            live.len()
+        );
+        assert!(w.debug_retry_len() <= 3);
     }
 
     /// 失败 → 退避重试 → 成功:事件最终删除,retried/failed 计数可见。

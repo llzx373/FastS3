@@ -47,6 +47,8 @@ pub struct MetaConfig {
     pub sync_mode: SyncMode,
     /// rocksdb block cache 容量(字节);None = rocksdb 默认。
     pub cache_capacity: Option<u64>,
+    /// 事件队列环形上限(F5-3:worker 关闭时入队路径仍截断 `e:`;默认 10 万)。
+    pub event_queue_max: usize,
 }
 
 impl Default for MetaConfig {
@@ -55,6 +57,7 @@ impl Default for MetaConfig {
             flush_every_ms: fs3_core::DEFAULT_GROUP_COMMIT_MS,
             sync_mode: SyncMode::Group,
             cache_capacity: None,
+            event_queue_max: 100_000,
         }
     }
 }
@@ -678,6 +681,8 @@ pub struct MetaStore {
     /// 需快查桶订阅;无规则桶避免反复 prefix scan。put/delete 随 commit
     /// 失效,同 lifecycle_cache 口径)。
     notification_cache: Mutex<HashMap<String, Vec<fs3_core::NotificationRule>>>,
+    /// 事件队列环形上限(F5-3;入队路径截断,不依赖投递 worker)。
+    event_queue_max: usize,
 }
 
 /// rocksdb 错误 → fs3 Error。
@@ -1342,6 +1347,7 @@ impl MetaStore {
             flusher,
             lifecycle_cache: Mutex::new(HashMap::new()),
             notification_cache: Mutex::new(HashMap::new()),
+            event_queue_max: cfg.event_queue_max.max(1),
         })
     }
 
@@ -2167,8 +2173,8 @@ impl MetaStore {
                         }
                     }
                     if ops.iter().any(|o| matches!(o, Op::EventEnqueue { .. })) {
-                        // worker 关闭时仍截断,防 e: 无界堆积
-                        let _ = self.truncate_events(100_000);
+                        // F5-3:worker 关闭时入队路径仍截断,防 e: 无界堆积
+                        let _ = self.truncate_events(self.event_queue_max);
                     }
                     return Ok(seq);
                 }
@@ -4692,6 +4698,39 @@ mod tests {
         assert_eq!(tail[0].key, "bulk4");
     }
 
+    /// F5-3:worker 关闭时入队路径仍按 event_queue_max 截断,e: 不无界堆积。
+    #[test]
+    fn notification_disabled_does_not_unbounded_enqueue() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MetaConfig {
+            event_queue_max: 8,
+            ..Default::default()
+        };
+        let meta = MetaStore::open(dir.path(), &cfg).unwrap();
+        meta.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        for i in 0..30u64 {
+            let rec = fs3_core::EventRecord {
+                seq: 0,
+                ts: 1_700_000_000,
+                bucket: "b1".into(),
+                key: format!("k{i}"),
+                event: "s3:ObjectCreated:Put".into(),
+                etag: None,
+                size: Some(1),
+                version_id: None,
+                delete_marker: false,
+                dead: false,
+            };
+            meta.commit_with_event(&[], &rec).unwrap();
+        }
+        let n = meta.event_count().unwrap();
+        assert!(
+            n <= 8 + 1,
+            "worker-off enqueue must stay within max+slack, got {n}"
+        );
+        assert!(n >= 8, "truncate retains the max window, got {n}");
+    }
+
     /// M15 N2:EventRecord 尾部 `dead` 字段——新格式往返 + 初版格式字节
     /// 直写回退(dead=false,零迁移;照双读先例)。
     #[test]
@@ -5011,6 +5050,7 @@ mod tests {
                 flush_every_ms: 1,
                 sync_mode: mode,
                 cache_capacity: None,
+                ..Default::default()
             };
             let s = MetaStore::open(dir.path(), &cfg).unwrap();
             assert_eq!(s.sync_mode(), mode);

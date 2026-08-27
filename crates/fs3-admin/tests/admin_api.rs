@@ -751,6 +751,7 @@ fn admin_pool_device_views_and_usage_metrics() {
                 flush_every_ms: 2,
                 sync_mode: fs3_meta::SyncMode::Group,
                 cache_capacity: None,
+                ..Default::default()
             },
         )
         .unwrap();

@@ -130,7 +130,7 @@ F0 ADR-22
   - 用例:`checkpoint_tick_bounded_idle`——空闲 10 个 interval,队列长度 ≤1;drop Engine 后线程退出(可 join 或 `thread::is_finished`)
 - [x] F5-2 STS:校验过期时 `delete_session`;后台扫 `s:session`(可挂现有 `sweep_expired_sessions` **旁路**,不要复用 multipart 函数名造成误解)周期删除;管理面 DELETE 保持
   - 用例:`expired_sts_session_is_deleted_from_meta`——签发 TTL=1s → 睡 2s → 鉴权 InvalidToken → 扫描无该 `s:session` 键;未过期会话仍在
-- [ ] F5-3 通知 `retry` HashMap: `truncate_events` 后 `retain` 仍存在的 seq;成功/死信/无目标已 `remove` 保持;worker 关闭时若仍有桶规则,主循环或独立 tick 仍截断 `e:`(或配置互斥:关 worker 则拒绝 PutNotification)
+- [x] F5-3 通知 `retry` HashMap: `truncate_events` 后 `retain` 仍存在的 seq;成功/死信/无目标已 `remove` 保持;worker 关闭时若仍有桶规则,主循环或独立 tick 仍截断 `e:`(或配置互斥:关 worker 则拒绝 PutNotification)
   - 用例:`notification_retry_map_does_not_grow_after_truncate`;`notification_disabled_does_not_unbounded_enqueue`(关 worker 后写入不堆积或显式拒绝)
 - [ ] F5-4 热缓存超 `max_bytes` 淘汰的槽 **push 回 `free`**;单对象 `len > max_bytes` 拒绝插入(不 panic)
   - 用例:`cache_evict_returns_slot_to_free`;`cache_object_larger_than_max_bytes_rejected_no_panic`;插满再插触发淘汰后仍可插入

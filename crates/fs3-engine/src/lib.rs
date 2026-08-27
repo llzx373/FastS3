@@ -395,6 +395,7 @@ impl Engine {
             flush_every_ms: cfg.group_commit_ms,
             sync_mode: cfg.sync_mode,
             cache_capacity: None,
+            ..Default::default()
         };
         let meta = Arc::new(MetaStore::open(&cfg.meta_dir, &meta_cfg)?);
 

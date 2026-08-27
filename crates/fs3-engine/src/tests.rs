@@ -72,6 +72,7 @@ fn seed_pool_manifest(meta_dir: &std::path::Path, devices: &[std::path::PathBuf]
             flush_every_ms: fs3_core::DEFAULT_GROUP_COMMIT_MS,
             sync_mode: fs3_meta::SyncMode::Group,
             cache_capacity: None,
+            ..Default::default()
         },
     )
     .unwrap();
