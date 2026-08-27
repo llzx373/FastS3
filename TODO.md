@@ -86,7 +86,7 @@
 > 演示用第二 web 实例;镜像标签仍写 1.0.0。POC 输给「一条命令起来」的竞品。
 > 生产仍允许拆分,不强迫理解裸设备。
 
-- [ ] T1 entrypoint 首启:`/var/lib/fasts3/disk.img` 不存在则 `fasts3d init --yes`
+- [x] T1 entrypoint 首启:`/var/lib/fasts3/disk.img` 不存在则 `fasts3d init --yes`
   (默认镜像文件,大小可配 `FASTS3_INIT_SIZE` 默认 20GiB)+ 写 meta 目录;
   已 init 则跳过;失败容器非 0 退出并打明确日志。禁止再要求用户 exec init 才能 POC
   - 用例:`tests/container/poc_first_boot.sh`——空数据卷 `docker run` 后 `/health` 200、

@@ -35,16 +35,12 @@ mkdir -p ./data
 docker run -d --name fasts3 \
   -p 9000:9000 -p 8080:8080 \
   -v "$(pwd)/data:/var/lib/fasts3" \
-  -v "$(pwd)/fasts3.toml:/etc/fasts3/fasts3.toml:ro" \
   --ulimit memlock=-1:-1 \
   fasts3:1.0.0
 
-# 3) 初始化(在容器内跑一次 init;镜像文件在数据卷里):
-docker exec -it fasts3 fasts3d init --config /etc/fasts3/fasts3.toml \
-  --device /var/lib/fasts3/disk.img --size 20GiB --extent-size 4MiB
-
-# 4) 验证:
-curl -s http://127.0.0.1:9000/   # S3 根(匿名关闭时返回签名错误或 403 属正常)
+# 3) 验证(首启 entrypoint 自动 init,无需 docker exec init):
+curl -s http://127.0.0.1:9000/health
+# 开发默认密钥 fasts3dev/fasts3dev 即可 ListBuckets
 docker logs -f fasts3
 ```
 
