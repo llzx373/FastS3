@@ -212,7 +212,7 @@ UploadPartCopy 源版本寻址、expected-bucket-owner 显式语义)**,随后 M1
 | 审计 | v2.0 外部安全审计**执行**(M14 已立项:agent mTLS/中心 SQLite/0-RTT/缓存范围) | 执行期项 |
 | 生态 | Hadoop S3A 冒烟(补齐 java/hadoop 环境后跑;条件写已就绪);HTTP/3 netem 弱网对照 | ≈0.5 pw |
 | 发布 | git tag / `tools/package/` / release 流水线首次实跑(历版本执行期项收敛) | 执行期项 |
-| N3 | 设备内 mini-FS + rocksdb 挂载(BlueFS 路线)——**不进入 M15**;维持持有,与归档/底座诉求挂钩再评估(5~7 pw) | 持有 |
+| N3 | 设备内 mini-FS + rocksdb 挂载(BlueFS)——**不进入 M15–M19**;门槛 = 裸盘无根分区可挂 **或** 元数据 I/O 实测成瓶颈(与归档脱钩,见 docs/bluefs-reeval.md);5~7 pw | 持有 |
 
 ---
 

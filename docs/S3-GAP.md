@@ -256,7 +256,7 @@
 | 版本控制、条件写入、?versionId 寻址、ListObjectVersions | v1.1(DESIGN-FUTURE §3) | ✅ 已交付(v1.1.0,2026-08-23) |
 | Lifecycle、SSE-C/SSE-S3、桶默认加密、checksum 家族、GetObjectAttributes、审计持久化 | v1.2(§4) | ✅ 已交付(v1.2.0,2026-08-25) |
 | Object Lock、可信时钟、治理 bypass | v1.3(§5) | ✅ 已交付(v1.3.0,2026-08-25) |
-| 多设备扩容/再平衡、设备内元数据、zstd | v1.4(§6) | ✅ 已交付(v1.4.0,2026-08-26;BlueFS N3 持有) |
+| 多设备扩容/再平衡、设备内元数据、zstd | v1.4(§6) | ✅ 已交付(v1.4.0,2026-08-26;BlueFS N3 持有,M17/F3 与归档脱钩) |
 | 纳管 agent、HTTP/3、热缓存、Terraform/Operator 评估 | v2.0(§7) | ✅ 已交付(v2.0.0,2026-08-26) |
 | 桶策略(桶级)、CORS、对象标签、POST 表单 | v1.1(§7 建议 1 已采纳) | ✅ 已交付(M10 S1~S4) |
 | 事件通知(Webhook 起步)、STS 临时凭证、Inventory、存储类头矩阵、UploadPartCopy 源版本寻址 | v2.1(NEXT-ROUND §5) | ✅ 已交付(v2.1.0,2026-08-26) |
