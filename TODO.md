@@ -96,7 +96,7 @@
   版本一致(现 2.2.1 → 随本版本 bump)。去掉默认拉起的第二 web 演示实例(移到 docs 示例)
   - 用例:文档中的一条命令 `docker compose -f deploy/container/docker-compose.yml up -d --build`
     对应 poc;prod 文件单独可 `config` 校验
-- [ ] T3 文档:Quickstart「内网一天跑起来」(compose poc / 单二进制 `--web-root` 两条);
+- [x] T3 文档:Quickstart「内网一天跑起来」(compose poc / 单二进制 `--web-root` 两条);
   生产拆分、裸设备、升级 N-1 链到既有 operations 页。容器 README 镜像版本与 init 步骤与 T1 一致
   - 用例:文档无「请先 docker exec init」作为 POC 必经步骤
 

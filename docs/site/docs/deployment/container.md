@@ -1,58 +1,62 @@
-# 容器部署(M6/K2)
+# 容器部署(M17/T1–T3)
 
-源文件:`deploy/container/`(Dockerfile / entrypoint.sh / docker-compose.yml /
-.dockerignore / README.md);完整说明见该目录 README.md,本页是文档站入口。
+源文件:`deploy/container/`(Dockerfile / entrypoint.sh /
+`docker-compose.yml` poc / `docker-compose.prod.yml` /
+.dockerignore / README.md);完整说明见该目录 README.md。
 
 ## 镜像内容与形态
 
-镜像把**数据面(Rust)+ 管理面(Node)**打包在一起(Rust release 二进制 +
-`web/server/dist` + `web/console/dist`):
+镜像把**数据面(Rust)+ 管理面(Node)**打包在一起。镜像标签与
+`Cargo.toml` workspace 版本一致(现 `fasts3:2.2.1`)。
 
-- 默认 ENTRYPOINT 双进程:后台起 Node,前台跑 `fasts3d serve`;
-  SIGTERM 时**先停数据面**(优雅排空)再停 Node;
-- compose 可拆分两个服务共享同一镜像,独立扩缩容。
+| 形态 | 命令 | 端口 |
+| --- | --- | --- |
+| POC 单容器(默认) | `docker compose -f deploy/container/docker-compose.yml up -d --build` | 9000 S3 + 8080 控制台 |
+| 生产拆分 | `docker compose -f deploy/container/docker-compose.prod.yml up -d --build` | 同上,进程拆开 |
+| `docker run` | 与 poc 相同 ENTRYPOINT | 映射 9000+8080 |
+
+首启:**空数据卷自动 `fasts3d init --yes`**(默认 `/var/lib/fasts3/disk.img`,
+大小 `FASTS3_INIT_SIZE` 默认 20GiB)。POC **不必** `docker exec init`。
 
 ## 为什么用 debian:bookworm-slim 而不是 scratch/distroless
 
-`fasts3d` 并非全静态链接:`ldd target/release/fasts3d` 显示动态依赖
-`libstdc++.so.6`、`libgcc_s.so.1`(rocksdb 的 C++ 运行时)、`libm`/`libc` 与
-`ld-linux`,运行镜像至少需要这些 + CA 证书(TLS)。debian:bookworm-slim +
-最小运行库即满足;全静态改造后可再评估 distroless。
+`fasts3d` 并非全静态链接:`ldd` 显示依赖 `libstdc++.so.6`、`libgcc_s.so.1`、
+`libm`/`libc` 与 `ld-linux`,另需 CA 证书。debian:bookworm-slim + 最小运行库
+即满足。
 
 ## 构建与运行
 
 ```bash
-docker build -f deploy/container/Dockerfile -t fasts3:1.0.0 .
+# 仓库根,镜像标签与 workspace 版本对齐:
+docker build -f deploy/container/Dockerfile -t fasts3:2.2.1 .
 docker run -d --name fasts3 \
   -p 9000:9000 -p 8080:8080 \
   -v "$(pwd)/data:/var/lib/fasts3" \
-  -v "$(pwd)/fasts3.toml:/etc/fasts3/fasts3.toml:ro" \
   --ulimit memlock=-1:-1 \
-  fasts3:1.0.0
-# 初始化(镜像文件): docker exec -it fasts3 fasts3d init \
-#   --config /etc/fasts3/fasts3.toml --device /var/lib/fasts3/disk.img --size 20GiB
+  fasts3:2.2.1
+curl -sf http://127.0.0.1:9000/health
+# 开发密钥 fasts3dev/fasts3dev
 ```
 
-compose(双服务:fasts3 9000 + fasts3-web 8080):
+compose poc(文档站一条命令,与 T2 默认文件一致):
 
 ```bash
-cd deploy/container && docker compose up -d --build
+docker compose -f deploy/container/docker-compose.yml up -d --build
 ```
 
-细节(环境变量、healthcheck、depends_on)见 `docker-compose.yml` 注释。
+生产拆分、第二 web 实例示例见 `deploy/container/README.md`。
 
-## 特权与 mlock(注释已展开,要点)
+## 特权与 mlock
 
-- **mlock / io_uring 注册缓冲**:`--ulimit memlock=-1:-1`(等价 systemd
-  `LimitMEMLOCK=infinity`);
-- **裸设备 + 全功能 io_uring(IORING_SETUP_SQPOLL)**:`--cap-add SYS_ADMIN`
-  (或 `--privileged`;只用镜像文件时可去掉,自动降级);
-- **非 root**:仅「镜像文件 + 关 sqpoll」场景支持(Dockerfile 有注释掉的
-  `USER fasts3` 形态,需 chown 数据卷)。
+- **mlock**:`--ulimit memlock=-1:-1`;
+- **裸设备 + SQPOLL**:`--cap-add SYS_ADMIN`(或 `--privileged`;只用镜像文件可去掉);
+- **非 root**:仅「镜像文件 + 关 sqpoll」;见 Dockerfile `USER fasts3` 注释。
+
+裸设备生产路径见 [systemd](systemd.md) 与容器 README;init 向导 R7 强校验。
 
 ## TLS 挂载
 
-证书热加载内置(替换 PEM 即生效,无需重启):
+证书热加载内置(替换 PEM 即生效):
 
 ```ini
 [server]
@@ -60,33 +64,29 @@ tls_cert = "/etc/fasts3/tls/fullchain.pem"
 tls_key  = "/etc/fasts3/tls/privkey.pem"
 ```
 
-签发(ACME/自签)见 `deploy/tls/`。
+签发见 `deploy/tls/`。
 
 ## 多实例管理面(M7/I5)
 
-`docker compose up` 默认起 `fasts3`(数据面)+ `fasts3-web`;compose 文件另含
-`fasts3-web2` 示范——管理面无状态(JWT 共享密钥 + 权威状态在 Rust 侧),
-任意实例可增删/重启,会话令牌跨实例有效。实测脚本:
-`tests/m7/multi-web-drill.sh`。
+默认 poc **不**拉起第二 web。无状态演示 YAML 在
+`deploy/container/README.md`。演练:`tests/m7/multi-web-drill.sh`。
 
-## 内嵌控制台(M7/I5)
-
-无 Node 管理面时,数据面可直接托管控制台静态产物:
+## 内嵌控制台(单二进制,无 Docker)
 
 ```bash
-docker run -d --name fasts3 -p 9000:9000 \
-  -v $PWD/data:/var/lib/fasts3 fasts3:1.0.0 \
-  ... --web-root /opt/fasts3/web/console/dist
-# 浏览器访问 http://host:9000/(大对象仍走预签名直连数据面)
+fasts3d serve --config fasts3.toml --web-root web/console/dist --listen 127.0.0.1:9000
+# 浏览器 http://127.0.0.1:9000/ ;大对象仍走预签名直连数据面
 ```
 
-## 升级
+Quickstart 路径 B 逐步命令见 [内网一天跑起来](../getting-started/quickstart.md)。
+
+## 升级(N-1)
 
 ```bash
-# 换镜像标签即可,数据卷不动(N-1 原地升级保证):
-docker build -f deploy/container/Dockerfile -t fasts3:1.0.0 .
+docker build -f deploy/container/Dockerfile -t fasts3:2.2.1 .
 docker stop fasts3 && docker rm fasts3
-docker run -d --name fasts3 ... fasts3:1.0.0    # 同一组 -v 数据卷
-docker exec fasts3 fasts3d upgrade --config /etc/fasts3/fasts3.toml   # 布局迁移
-# 回滚:退回旧镜像标签;布局迁移失败自动回滚
+docker run -d --name fasts3 ... fasts3:2.2.1    # 同一组 -v 数据卷
+docker exec fasts3 fasts3d upgrade --config /etc/fasts3/fasts3.toml
 ```
+
+布局迁移失败自动回滚;完整口径见 [升级与回滚](../operations/upgrade.md)。

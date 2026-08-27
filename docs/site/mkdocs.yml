@@ -23,7 +23,7 @@ theme:
 nav:
   - 首页: index.md
   - 快速开始:
-      - 5 分钟开箱: getting-started/quickstart.md
+      - 内网一天跑起来: getting-started/quickstart.md
   - 部署:
       - systemd: deployment/systemd.md
       - 容器: deployment/container.md

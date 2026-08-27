@@ -1,75 +1,105 @@
-# 5 分钟开箱(M6 门禁)
+# 内网一天跑起来(M17/T3)
 
-> 目标:空白 VM 上 **5 分钟内**完成 安装 → init → 建桶 → 上传下载 → 升级演练。
-> 本页命令逐条可照做;例子里桶名 `drill-demo`、访问密钥 `fasts3dev/fasts3dev`
-> (开发默认,生产必须修改)。
+> 私有化 POC:当天能装能跑、能建桶上传。两条主路径——**compose poc** 与
+> **单二进制 `--web-root`**。生产拆分、裸设备、升级 N-1 链到既有运维页,
+> 不在本页展开。
+>
+> 开发默认密钥 `fasts3dev` / `fasts3dev`(生产必须改)。容器 POC **无需**
+> `docker exec init`(entrypoint 空卷首启自动 `fasts3d init --yes`)。
 
-## 0) 前置
+## A) Compose POC(一条命令)
 
-- 一台 Debian/Ubuntu LTS 或 Rocky/Alma/ARM64 机器(root 或 sudo)
-- 数据设备二选一:
-  - 裸盘(如 `/dev/nvme0n1`,io_uring + O_DIRECT 全性能);
-  - 镜像文件(演练用 `/var/lib/fasts3/disk.img`,稀疏文件即可)；
-- 客户端(可选):`aws` CLI(或 boto3 / fasts3d 自带命令,见演练脚本降级路径)
-
-## 1) 一条命令安装
+仓库根:
 
 ```bash
-# ⚠️ 占位宿主 download.example.com —— 发布后替换为真实站(get.fasts3.dev 等)
+docker compose -f deploy/container/docker-compose.yml up -d --build
+# S3 http://127.0.0.1:9000   控制台 http://127.0.0.1:8080
+curl -sf http://127.0.0.1:9000/health
+export AWS_ACCESS_KEY_ID=fasts3dev AWS_SECRET_ACCESS_KEY=fasts3dev
+export AWS_DEFAULT_REGION=us-east-1 AWS_EC2_METADATA_DISABLED=true
+aws --endpoint-url http://127.0.0.1:9000 s3api list-buckets
+```
+
+镜像标签与 workspace 版本一致(现 `fasts3:2.2.1`)。数据卷
+`deploy/container/data`。镜像大小默认 20GiB 稀疏文件,可用
+`FASTS3_INIT_SIZE=64MiB` 缩小试用。细节见 [容器部署](../deployment/container.md)
+与 `deploy/container/README.md`。
+
+## B) 单二进制 `--web-root`
+
+适合不跑 Docker、本机一条进程同时提供 S3 与控制台(静态资源同源):
+
+```bash
+cargo build --release -p fs3d
+# 控制台静态产物(一次性)
+cd web && pnpm install && pnpm --filter @fasts3/console build && cd ..
+
+mkdir -p ./data
+./target/release/fasts3d init --yes --no-tls \
+  --device ./data/disk.img --size 20GiB --meta-dir ./data/meta \
+  --config ./fasts3.toml --listen 127.0.0.1:9000
+
+./target/release/fasts3d serve --config ./fasts3.toml \
+  --web-root web/console/dist --listen 127.0.0.1:9000
+# 另一终端:
+curl -sf http://127.0.0.1:9000/health
+# 浏览器打开 http://127.0.0.1:9000/ (控制台);S3 仍是同一端口
+```
+
+`serve --web-root` 语义见 [CLI 速查](../reference/cli.md)。无 Node 管理面时
+大对象仍走预签名直连数据面。
+
+## 生产拆分 / 裸设备 / 升级
+
+| 场景 | 去哪 |
+| --- | --- |
+| 数据面与管理面拆容器 | [容器部署](../deployment/container.md) · `docker-compose.prod.yml` |
+| systemd 双单元 | [systemd 部署](../deployment/systemd.md) |
+| 裸块设备(`/dev/nvme0n1`) | 容器 README「特权与裸设备」;init 向导 R7 强校验 |
+| 升级 N-1 / 自动回滚 | [升级与回滚](../operations/upgrade.md) |
+
+## 备选:systemd 5 分钟开箱(M6 门禁原稿)
+
+空白 VM 上安装 → init → 建桶 → 升级演练。例子桶名 `drill-demo`。
+
+### 0) 前置
+
+- 一台 Debian/Ubuntu LTS 或 Rocky/Alma/ARM64 机器(root 或 sudo)
+- 数据设备二选一:裸盘(如 `/dev/nvme0n1`)或镜像文件 `/var/lib/fasts3/disk.img`
+- 客户端(可选):`aws` CLI(或 boto3 / `fasts3d` 自带命令)
+
+### 1) 一条命令安装
+
+```bash
+# ⚠️ 占位宿主 download.example.com —— 发布后替换为真实站
 curl -fsSL https://download.example.com/fasts3/install.sh | sh
 ```
 
-脚本行为:探测 OS(Debian/Ubuntu → deb 提示;RHEL 系 → rpm 提示)与架构
-(amd64/arm64)→ 下载 tarball 直装到 `/opt/fasts3` → 写 systemd 单元 →
-创建 `/var/lib/fasts3/meta` 与 `/etc/fasts3` → 打印下一步。
+备选:`dpkg -i` / `rpm -ivh` / 容器见上文 A。
 
-备选形态:
+### 2) 初始化(二进制/systemd;容器 POC 走 A,不要 docker exec)
 
 ```bash
-# apt(本地/仓库形态):  sudo dpkg -i fasts3_1.0.0_amd64.deb
-# dnf(仓库形态):        sudo rpm -ivh fasts3-1.0.0-1.el9.x86_64.rpm
-# 容器:                 docker run ... fasts3:1.0.0(见 deployment/container.md)
-```
-
-## 2) 初始化(init 向导,v0.7 已实现)
-
-```bash
-# 交互向导:探测设备 → 强校验(文件系统签名/残留数据,R7 红线)→ 确认 →
-# 布局初始化 → 管理员账号 + 首对 S3 密钥 → 自签 TLS 引导 → 配置落盘
 sudo fasts3d init --config /etc/fasts3/fasts3.toml \
      --device /var/lib/fasts3/disk.img --size 20GiB
 
-# 非交互(CI/脚本):--yes + --device 必填;危险信号需 --force 显式声明
-sudo truncate -s 20G /var/lib/fasts3/disk.img      # 镜像文件;裸盘跳过本行
 sudo fasts3d init --yes --no-tls --config /etc/fasts3/fasts3.toml \
      --device /var/lib/fasts3/disk.img --size 20GiB --extent-size 4MiB
 ```
 
-向导会打印 **首对 S3 密钥**(只显示一次,请立即保存)与 Web 管理员口令,
-并写 `/etc/fasts3/fasts3.toml` 与 `/etc/fasts3/web.json`。初始化前强制校验
-块设备类型/文件系统签名,**绝不无确认自动初始化**(风险 R7)。
+向导打印首对 S3 密钥(只一次)。裸设备强校验(R7),非交互遇危险信号须 `--force`。
+
+### 3) 启动
 
 ```bash
-# 自检(可选):确认布局与内核能力
-sudo fasts3d doctor --config /etc/fasts3/fasts3.toml
-```
-
-## 3) 启动服务
-
-```bash
-sudo systemctl enable --now fasts3        # 数据面:S3 9000 + admin unix socket
-sudo systemctl enable --now fasts3-web    # 管理面:仅回环 127.0.0.1:9090
-
-# 验证探针:/health 存活;/ready 就绪(含设备可写探测,K2)
+sudo systemctl enable --now fasts3
+sudo systemctl enable --now fasts3-web
 curl -sf http://127.0.0.1:9000/health && echo
-curl -sf http://127.0.0.1:9000/ready && echo
-sudo systemctl status fasts3 --no-pager | head -5
 ```
 
-## 4) 建桶 + 上传下载
+### 4) 建桶 + 上传下载
 
 ```bash
-# 配置 aws cli(开发默认密钥;生产用 init 向导生成的密钥)
 export AWS_ACCESS_KEY_ID=fasts3dev AWS_SECRET_ACCESS_KEY=fasts3dev
 export AWS_DEFAULT_REGION=us-east-1 AWS_EC2_METADATA_DISABLED=true
 EP="--endpoint-url http://127.0.0.1:9000"
@@ -78,39 +108,11 @@ aws $EP s3api create-bucket --bucket drill-demo
 echo "hello fasts3" > /tmp/hello.txt
 aws $EP s3api put-object --bucket drill-demo --key hello.txt --body /tmp/hello.txt
 aws $EP s3api get-object  --bucket drill-demo --key hello.txt /tmp/hello.out
-md5sum /tmp/hello.txt /tmp/hello.out        # 两个值应一致
-
-# 或不用 aws cli(引擎命令,降级路径):
-#   fasts3d put --config /etc/fasts3/fasts3.toml --bucket drill-demo hello.txt /tmp/hello.txt
-#   fasts3d get --config /etc/fasts3/fasts3.toml --bucket drill-demo hello.txt /tmp/hello.out
+md5sum /tmp/hello.txt /tmp/hello.out
 ```
 
-管理面:`http://127.0.0.1:9090`(登录口令见 /etc/fasts3/web.json —— init 向导生成,
-只显示一次)。
+管理面:`http://127.0.0.1:9090`(口令见 init 打印的 web.json)。
 
-## 5) 升级演练(N-1 保证)
+### 5) 升级演练(N-1)
 
-```bash
-# 5.1 安装新版本(升级 = 覆盖安装;数据 /var/lib/fasts3 与配置 /etc/fasts3
-#     一律保留)后,运行布局迁移:
-sudo fasts3d upgrade --config /etc/fasts3/fasts3.toml --yes
-#     (优雅关闭 → 布局版本迁移 → 启动自检;失败自动回滚,见 operations/upgrade.md)
-
-# 5.2 重启并验证对象仍在(对象校验:md5 与升级前一致)
-sudo systemctl restart fasts3
-aws $EP s3api get-object --bucket drill-demo --key hello.txt /tmp/hello.out2
-md5sum /tmp/hello.txt /tmp/hello.out2       # 仍一致 → 升级演练通过
-
-# 回滚(如需):重装旧包;迁移失败框架已自动回滚,直接旧版本启动即可
-```
-
-## 自动化演练
-
-以上全部步骤可用脚本一键跑完并断言 < 300 秒:
-
-```bash
-# WSL/无 systemd 环境亦可(自动降级 nohup):
-UPGRADE_BIN=/tmp/fasts3-v06/target/release/fasts3d tests/install/vm-drill.sh
-```
-
-见仓库 `tests/install/vm-drill.sh` 与 `tests/install/README.md`(CI 接入方式)。
+完整命令见 [升级与回滚](../operations/upgrade.md)。自动化:`tests/install/vm-drill.sh`。
