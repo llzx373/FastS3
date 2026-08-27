@@ -853,7 +853,7 @@ fn render_with(
                 let zbody = StreamBody::new(ZcBodyStream {
                     inner: Some(body),
                     guard,
-                    read_pin,
+                    _read_pin: read_pin,
                 })
                 .boxed();
                 return builder.body(zbody).unwrap_or_else(|_| {
@@ -1116,8 +1116,8 @@ struct ZcBodyStream {
     inner: Option<ZcBody>,
     /// (准入, 字节数):流结束/丢弃时释放。
     guard: Option<(Arc<crate::Admission>, u64)>,
-    /// ADR-22 (c):零拷贝发送期间钉扎,Drop/客户端断开 unpin。
-    read_pin: fs3_engine::ReadPin,
+    /// ADR-22 (c):零拷贝发送期间钉扎,字段仅以 Drop unpin,不读值。
+    _read_pin: fs3_engine::ReadPin,
 }
 
 impl Drop for ZcBodyStream {
@@ -1126,7 +1126,7 @@ impl Drop for ZcBodyStream {
             a.release(*n);
         }
         self.inner = None;
-        // read_pin Drop → unpin
+        // _read_pin Drop → unpin
     }
 }
 

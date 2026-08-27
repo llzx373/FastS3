@@ -192,7 +192,8 @@ F0 ADR-22
   - 用例:`g3_http_get_close_1000_fd_steady`(in_flight==0, fd 相对基线 ≤+16)
 - [x] G4 s3-tests 全量:意外失败 0;F8 后 gate 开压缩复跑一次
   - 用例:`bash tests/s3-tests/run_g4.sh`(`compaction_enabled=true`,4 路 xdist + 全局 ListBuckets 串行补跑);`passed=487 skipped=94 excluded_failures=236 unexpected_failures=0`;诚实断言 `g4_s3tests_gate_enables_compaction`
-- [ ] G5 clippy -D warnings;覆盖率不回退 >1pt(相对 perf-M16 83.89% 口径);cargo audit 清零
+- [x] G5 clippy -D warnings;覆盖率不回退 >1pt(相对 perf-M16 83.89% 口径);cargo audit 清零
+  - 用例:`cargo clippy --workspace --all-targets -- -D warnings`;`cargo llvm-cov --workspace --summary-only` 行 **84.41%**(相对 83.89% +0.52pt);`cargo audit` 0 漏洞(2 条 allowed unmaintained,与 M16 同集);诚实断言 `g5_clippy_pin_and_coverage_baseline`
 - [ ] G6 发布 v2.2.1:CHANGELOG/RELEASES 记本审查修复(不打 tag,与既有口径一致);D1 勾选
 
 ---

@@ -1267,6 +1267,27 @@ mod tests {
         );
     }
 
+    /// G5:clippy 钉扎字段(否则 -D dead_code);覆盖率对照基线仍是 perf-M16 83.89%。
+    #[test]
+    fn g5_clippy_pin_and_coverage_baseline() {
+        let h = include_str!("../../fs3-http/src/handler.rs");
+        assert!(
+            h.contains("_read_pin: fs3_engine::ReadPin"),
+            "ZcBodyStream 须持有 ReadPin 至 Drop,字段名 _ 前缀过 clippy -D warnings"
+        );
+        let m16 = include_str!("../../../docs/perf-M16.md");
+        assert!(m16.contains("83.89%"), "G5 覆盖率对照基线 83.89%");
+        let todo = include_str!("../../../TODO.md");
+        assert!(
+            todo.contains("- [x] G5 clippy"),
+            "G5 须勾选且含 clippy 门禁"
+        );
+        assert!(
+            todo.contains("84.41%"),
+            "G5 用例须记录本次 llvm-cov 行覆盖率"
+        );
+    }
+
     #[test]
     fn compaction_migrates_locked_object_keeps_retention() {
         // W4-1:压缩可搬锁定版本数据,不可当泄漏回收。
