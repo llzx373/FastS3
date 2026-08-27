@@ -82,8 +82,12 @@ pub fn run_device_remove(
 
     let mut engine =
         fs3_engine::Engine::open(&crate::engine_config_inner_multi(devices, &meta_dir)?)?;
+    let removed_zc = engine.zc_fds().last().copied().flatten();
     match engine.device_remove(&args.remove_device) {
         Ok(report) => {
+            if let Some(fd) = removed_zc {
+                fs3_http::unregister_trusted_fd(fd);
+            }
             println!(
                 "removed: {} (uuid {}) — {} extents, base {}; pool now {} device(s)",
                 report.path,

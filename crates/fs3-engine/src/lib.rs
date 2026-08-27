@@ -63,6 +63,9 @@ pub struct EngineConfig {
     pub group_commit_ms: u64,
     /// 检查点时间触发间隔(秒)。
     pub checkpoint_interval_secs: u64,
+    /// 检查点 tick 间隔(毫秒);0 = 使用 `checkpoint_interval_secs`(测试加速)。
+    #[doc(hidden)]
+    pub checkpoint_tick_ms: u64,
     /// 读校验开关(默认关)。
     pub verify_reads: bool,
     /// 优先 io_uring(失败自动降级 pread/pwrite)。
@@ -100,6 +103,7 @@ impl Default for EngineConfig {
             sync_mode: SyncMode::Group,
             group_commit_ms: fs3_core::DEFAULT_GROUP_COMMIT_MS,
             checkpoint_interval_secs: fs3_core::DEFAULT_CHECKPOINT_INTERVAL_SECS,
+            checkpoint_tick_ms: 0,
             verify_reads: false,
             io_uring: true,
             read_only: false,
@@ -338,6 +342,7 @@ pub struct Engine {
     checkpoint: std::sync::Mutex<CheckpointState>,
     checkpoint_tick: std::sync::Mutex<Receiver<()>>,
     _checkpoint_thread: Option<std::thread::JoinHandle<()>>,
+    checkpoint_stop: Arc<std::sync::atomic::AtomicBool>,
     /// Tier 2 压缩核心(前台 compact_once 与后台 worker 共用)。
     compactor: Option<Arc<Compactor>>,
     /// 压缩配置存档(M13 M3-1 device-add 重建压缩器用;open 时快照)。
@@ -685,14 +690,29 @@ impl Engine {
                 .collect::<Result<Vec<_>>>()?
         };
 
-        // 6. 检查点定时线程(时间触发策略)
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
-        let interval = std::time::Duration::from_secs(cfg.checkpoint_interval_secs.max(1));
-        let thread = std::thread::spawn(move || loop {
-            if tx.send(()).is_err() {
-                break;
+        // 6. 检查点定时线程(时间触发策略;有界队列,满则跳过本拍)
+        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let interval = if cfg.checkpoint_tick_ms > 0 {
+            std::time::Duration::from_millis(cfg.checkpoint_tick_ms)
+        } else {
+            std::time::Duration::from_secs(cfg.checkpoint_interval_secs.max(1))
+        };
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_t = stop.clone();
+        let thread = std::thread::spawn(move || {
+            while !stop_t.load(std::sync::atomic::Ordering::Relaxed) {
+                match tx.try_send(()) {
+                    Ok(()) | Err(std::sync::mpsc::TrySendError::Full(())) => {}
+                    Err(std::sync::mpsc::TrySendError::Disconnected(())) => break,
+                }
+                let start = std::time::Instant::now();
+                while start.elapsed() < interval {
+                    if stop_t.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10).min(interval));
+                }
             }
-            std::thread::sleep(interval);
         });
 
         // 7. Tier 2 压缩核心 + 后台 worker(ADR-9 §6;`enabled` 只门控 worker,
@@ -788,6 +808,7 @@ impl Engine {
             }),
             checkpoint_tick: std::sync::Mutex::new(rx),
             _checkpoint_thread: Some(thread),
+            checkpoint_stop: stop,
             compactor,
             compaction_cfg: cfg.compaction.clone(),
             _compactor_thread: compactor_thread,
@@ -1092,7 +1113,10 @@ impl Engine {
         slots.pop();
         self.devices = Arc::new(slots);
         self.open_extents.pop();
-        self.zc_fds.pop();
+        if let Some(Some(fd)) = self.zc_fds.pop() {
+            // SAFETY: fd 由 open_zerocopy_fd 打开,弹出后本引擎不再持有。
+            unsafe { libc::close(fd) };
+        }
         // 活动设备收敛(尾部即当前轮转落点;越界防御)
         self.cur_device = self.cur_device.min(self.devices.len().saturating_sub(1));
         self.restart_background(had_compactor, had_rebalance);
@@ -1179,6 +1203,16 @@ impl Engine {
         for oe in self.open_extents.iter_mut() {
             *oe = None;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_drain_checkpoint_ticks(&self) -> usize {
+        let rx = self.checkpoint_tick.lock().unwrap();
+        let mut n = 0usize;
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
+        n
     }
 
     pub fn io_engine_name(&self) -> &'static str {
@@ -1327,6 +1361,7 @@ impl Engine {
         };
         if due {
             self.checkpoint()?;
+            let _ = self.meta.sweep_expired_sts_sessions(now_ts());
         }
         Ok(())
     }
@@ -1350,6 +1385,10 @@ impl Engine {
             let checkpointer = Checkpointer::new(slot.dev.as_ref(), &slot.sb);
             let gen = checkpointer.save(&cp)?;
             tracing::debug!("checkpoint saved: device {di} gen {gen}, seq {seq}");
+        }
+        let truncated = self.meta.truncate_alloc_records(seq)?;
+        if truncated > 0 {
+            tracing::debug!("checkpoint truncated {truncated} alloc/txn keys through seq {seq}");
         }
         let mut st = self.checkpoint.lock().unwrap();
         st.seq = seq;
@@ -1434,8 +1473,17 @@ impl Engine {
     /// rocksdb WAL 按组提交窗口落盘;位图恢复依赖 a: 重放;开放 extent 由
     /// 下次启动按"无有效头"识别并续写。后台 worker 停止(测试中避免
     /// 线程跨引擎残留;真实 kill -9 无需任何清理)。
+    fn stop_checkpoint_thread(&mut self) {
+        self.checkpoint_stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self._checkpoint_thread.take() {
+            let _ = h.join();
+        }
+    }
+
     pub fn abort(mut self) {
         self.closed = true;
+        self.stop_checkpoint_thread();
         if let Some(mut h) = self._compactor_thread.take() {
             h.stop();
         }
@@ -1447,6 +1495,7 @@ impl Engine {
             return Ok(());
         }
         self.closed = true;
+        self.stop_checkpoint_thread();
         if let Some(mut h) = self._compactor_thread.take() {
             h.stop();
         }
@@ -2331,6 +2380,7 @@ impl Engine {
             // M13 修复:仅释放与新段不重合的旧段(见 release_non_overlapping)
             let old_no_overlap = release_non_overlapping(&old_segments, &meta.extents);
             self.alloc.release_object(&mut draft, &old_no_overlap);
+            self.after_release(&old_no_overlap)?;
         }
         // M16 A2-4:旧版本恢复副本段一并释放(put_stream 的 old 字段在
         // 上文已局部取出,恢复副本段经 old_restored 传递)
@@ -2635,7 +2685,12 @@ impl Engine {
         let mut holders = 0u32;
         for (_, _, _, m) in self.meta.snapshot_all_objects()? {
             let mut hit = false;
-            for s in &m.extents {
+            let restore = m
+                .restore_state
+                .as_ref()
+                .map(|st| st.restored_extents.as_slice())
+                .unwrap_or(&[]);
+            for s in m.extents.iter().chain(restore.iter()) {
                 if s.extent_id == extent_id {
                     max_end = max_end.max(s.offset.saturating_add(s.len));
                     uniq.insert((s.offset, s.len));
@@ -2738,6 +2793,23 @@ impl Engine {
         Ok(())
     }
 
+    /// 主段 + 恢复副本段一并封口(ADR-22;delete/覆盖不得漏副本所在开放 extent)。
+    fn after_release_object(&mut self, meta: &ObjectMeta) -> Result<()> {
+        self.after_release(&meta.extents)?;
+        if let Some(st) = &meta.restore_state {
+            self.after_release(&st.restored_extents)?;
+        }
+        Ok(())
+    }
+
+    fn release_extents(&mut self, draft: &mut Staged, segs: &[Segment]) -> Result<()> {
+        if segs.is_empty() {
+            return Ok(());
+        }
+        self.alloc.release_object(draft, segs);
+        self.after_release(segs)
+    }
+
     /// 批量读设备区间 `[dev_off, dev_off+len)`:4KiB 对齐裁剪,每批 ≤16×64KiB
     /// 一次 submit(io_uring 单次 enter + 单次 io 锁);逐块回调 `emit`。
     ///
@@ -2823,6 +2895,24 @@ impl Engine {
         self.get_to_meta(&meta, range, out, None)
     }
 
+    /// ADR-22:restore_valid 时读明文副本(内联或 extents),不走归档压缩流。
+    fn restore_plaintext_view(&self, meta: &ObjectMeta) -> Option<ObjectMeta> {
+        if !meta.restore_valid(self.lock_now()) {
+            return None;
+        }
+        let st = meta.restore_state.as_ref()?;
+        if st.restored_inline.is_none() && st.restored_extents.is_empty() {
+            return None;
+        }
+        let mut v = meta.clone();
+        v.extents = st.restored_extents.clone();
+        v.inline = st.restored_inline.clone();
+        v.compressed = None;
+        v.sse = None;
+        v.size = st.restored_size;
+        Some(v)
+    }
+
     /// 读已解析对象版本的内容到 out(支持 Range;verify_reads 逐段校验)。
     /// SSE-C(M11 E1-3):`sse_key` 非空时逐 chunk 解密;为 None 遇 SSE
     /// 对象 → 显式报错(密钥必需,不返回密文)。
@@ -2833,6 +2923,14 @@ impl Engine {
         out: &mut dyn Write,
         sse_key: Option<&fs3_core::SseCKey>,
     ) -> Result<u64> {
+        let restored_view;
+        let meta = match self.restore_plaintext_view(meta) {
+            Some(v) => {
+                restored_view = v;
+                &restored_view
+            }
+            None => meta,
+        };
         let start = range.start.min(meta.size);
         let end = range.end.min(meta.size);
         if start >= end {
@@ -3722,7 +3820,7 @@ impl Engine {
         let mut draft = Staged::default();
         self.release_all_segments(&mut draft, &meta);
         // seal-on-delete:开放 extent 内出现死段 → 封口(保持"开放 extent 无洞")
-        self.after_release(&meta.extents)?;
+        self.after_release_object(&meta)?;
         let delta = if meta.is_delete_marker {
             StatsDelta::default()
         } else {
@@ -3790,7 +3888,7 @@ impl Engine {
                 // 旧 null 族数据版本:既有 release + 扣减(同事务;恢复
                 // 副本段随主段一并释放,A2-4)
                 self.release_all_segments(&mut draft, o);
-                self.after_release(&o.extents)?;
+                self.after_release_object(o)?;
                 delta = StatsDelta {
                     objects: -1,
                     bytes: -(o.size as i64),
@@ -3852,7 +3950,7 @@ impl Engine {
         let mut delta = StatsDelta::default();
         if !meta.is_delete_marker {
             self.release_all_segments(&mut draft, &meta);
-            self.after_release(&meta.extents)?;
+            self.after_release_object(&meta)?;
             delta = StatsDelta {
                 objects: -1,
                 bytes: -(meta.size as i64),
@@ -4051,7 +4149,7 @@ impl Engine {
         for (key, vk, meta) in entries {
             let mut draft = Staged::default();
             self.release_all_segments(&mut draft, &meta);
-            self.after_release(&meta.extents)?;
+            self.after_release_object(&meta)?;
             // 删除标记零 delta(本就未入账);数据版本按 size 扣减
             let delta = if meta.is_delete_marker {
                 StatsDelta::default()
@@ -4288,6 +4386,7 @@ impl Engine {
             (None, None) => None,
             (Some(_), Some(_)) => unreachable!("SSE-C/SSE-S3 会话互斥已在上方判定"),
         };
+        let old_part = self.meta.get_part(upload_id, part_no)?;
         // D-E6:分片 nonce_base 确定性派生(仅加密会话;明文分片为 None)
         let part_nonce_base = write_key
             .as_ref()
@@ -4398,6 +4497,9 @@ impl Engine {
             );
             debug_assert_eq!(sse.is_some(), write_key.is_some());
             self.alloc.add_object(&mut draft, &extents);
+            if let Some(old) = &old_part {
+                self.release_extents(&mut draft, &old.extents)?;
+            }
             let part = PartMeta {
                 size,
                 etag,
@@ -4434,11 +4536,15 @@ impl Engine {
                 }
             };
         };
+        let mut release_draft = Staged::default();
+        if let Some(old) = &old_part {
+            self.release_extents(&mut release_draft, &old.extents)?;
+        }
         let seq = self.meta.put_part(
             upload_id,
             part_no,
             &part,
-            self.alloc.to_alloc_draft(&Staged::default()),
+            self.alloc.to_alloc_draft(&release_draft),
         );
         match seq {
             Ok(_) => {
@@ -4454,7 +4560,10 @@ impl Engine {
                 self.maybe_checkpoint()?;
                 Ok(part)
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                self.abort_draft(&release_draft);
+                Err(e)
+            }
         }
     }
 
@@ -4555,6 +4664,7 @@ impl Engine {
             return Err(Error::InvalidArgument("copy source range is empty".into()));
         }
         let len = end - start;
+        let old_part = self.meta.get_part(upload_id, part_no)?;
         let mut draft = Staged::default();
         let result = (|| -> Result<PartMeta> {
             // E1-5:源按 range 读(源加密则 read_sse 逐窗解密,密钥按 kind
@@ -4599,6 +4709,9 @@ impl Engine {
             );
             debug_assert_eq!(sse.is_some(), write_key.is_some());
             self.alloc.add_object(&mut draft, &extents);
+            if let Some(old) = &old_part {
+                self.release_extents(&mut draft, &old.extents)?;
+            }
             let part = PartMeta {
                 size,
                 etag,
@@ -4951,8 +5064,16 @@ impl Engine {
         // null_family_mtime);Enabled/Off = 当前秒
         let mtime = self.write_mtime(&target, bucket, key)?;
 
+        let listed: HashSet<u32> = combined.iter().map(|(no, _)| *no).collect();
+        let unlisted_extents: Vec<Segment> = stored
+            .iter()
+            .filter(|(no, _)| !listed.contains(no))
+            .flat_map(|(_, p)| p.extents.iter().cloned())
+            .collect();
+
         let mut draft = Staged::default();
         let result = (|| -> Result<ObjectMeta> {
+            self.release_extents(&mut draft, &unlisted_extents)?;
             // M11 E1-4/K1-1 防御:加密会话 ⇒ 全部分片必须带加密产物
             // (upload_part/upload_part_copy 已保证一致;此处兜底防元数据
             // 异常时静默把未加密分片拼进加密对象)
@@ -5313,6 +5434,7 @@ impl Engine {
                 }
                 self.alloc.add_object(&mut draft, &extents);
                 self.alloc.release_object(&mut draft, &part_segments);
+                self.after_release(&part_segments)?;
                 ObjectMeta {
                     size: total_size,
                     etag,
@@ -5508,6 +5630,11 @@ impl Engine {
             }
         }
         Ok(n)
+    }
+
+    /// 删除已过期 STS 会话(与 multipart `sweep_expired_sessions` 分轨)。
+    pub fn sweep_expired_sts_sessions(&self, now: i64) -> Result<u64> {
+        self.meta.sweep_expired_sts_sessions(now)
     }
 
     /// 分片数据读出(内联直接拷贝;extent 按段读取)。
@@ -6568,6 +6695,14 @@ impl Engine {
         offset: u64,
         length: u64,
     ) -> Result<Option<Vec<DevSegment>>> {
+        let restored_view;
+        let meta = match self.restore_plaintext_view(meta) {
+            Some(v) => {
+                restored_view = v;
+                &restored_view
+            }
+            None => meta,
+        };
         // M11 E1-3(DE1):SSE 对象读路径必须过 CPU 解密,**禁零拷贝**
         // (sendfile/splice 只能发密文)——返回 None 强制走缓冲解密路径
         // (文档化见 docs/perf-M10.md §6;按字节计 fasts3_sse_decrypt_bytes_total)
@@ -6768,15 +6903,16 @@ impl Engine {
             ));
         }
         let locked = locked_referenced_extents(self.meta.as_ref(), self.lock_now())?;
+        let restored = restore_referenced_extents(self.meta.as_ref())?;
         let leaks = self.alloc.leaks();
         let mut draft = Staged::default();
         let mut freed = 0u64;
         let mut skipped_locked = 0u64;
         for &id in &leaks {
-            if locked.contains(&id) {
+            if locked.contains(&id) || restored.contains(&id) {
                 tracing::warn!(
                     extent_id = id,
-                    "check --fix refused to reclaim extent referenced by Object Lock retention or legal hold (implementation defect signal; DESIGN W4-2)"
+                    "check --fix refused to reclaim extent referenced by Object Lock or a live restore copy (ADR-22)"
                 );
                 skipped_locked += 1;
                 continue;
@@ -6818,6 +6954,24 @@ fn locked_referenced_extents(meta: &MetaStore, now: i64) -> Result<HashSet<u64>>
     for (_, _, _, m) in meta.snapshot_all_objects()? {
         if crate::lifecycle::is_locked(&m, now) {
             for s in &m.extents {
+                out.insert(u64::from(s.extent_id));
+            }
+            if let Some(st) = &m.restore_state {
+                for s in &st.restored_extents {
+                    out.insert(u64::from(s.extent_id));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 仍被 restore_state.restored_extents 引用的 extent(ADR-22:--fix 不得当泄漏回收)。
+fn restore_referenced_extents(meta: &MetaStore) -> Result<HashSet<u64>> {
+    let mut out = HashSet::new();
+    for (_, _, _, m) in meta.snapshot_all_objects()? {
+        if let Some(st) = &m.restore_state {
+            for s in &st.restored_extents {
                 out.insert(u64::from(s.extent_id));
             }
         }
@@ -7832,6 +7986,25 @@ fn monotonic_ns() -> i64 {
 
 /// 段级可达性扫描:重建 live_bytes/引用计数/共享段表;返回
 /// (泄漏列表, 每 extent 活段最大 end)。泄漏 = 位图已分配但无活段。
+fn acc_scan_segments(
+    segs: &[Segment],
+    lists: &mut Vec<Vec<Segment>>,
+    max_end: &mut HashMap<u64, u32>,
+) {
+    if segs.is_empty() {
+        return;
+    }
+    for s in segs {
+        let e = s.extent_id as u64;
+        let end = s.offset + s.len;
+        max_end
+            .entry(e)
+            .and_modify(|v| *v = (*v).max(end))
+            .or_insert(end);
+    }
+    lists.push(segs.to_vec());
+}
+
 fn rebuild_segment_state(
     meta: &MetaStore,
     alloc: &Allocator,
@@ -7839,26 +8012,13 @@ fn rebuild_segment_state(
     let mut lists: Vec<Vec<Segment>> = Vec::new();
     let mut max_end: HashMap<u64, u32> = HashMap::new();
     for (_, _, _, m) in meta.snapshot_all_objects()? {
-        for s in &m.extents {
-            let e = s.extent_id as u64;
-            let end = s.offset + s.len;
-            max_end
-                .entry(e)
-                .and_modify(|v| *v = (*v).max(end))
-                .or_insert(end);
+        acc_scan_segments(&m.extents, &mut lists, &mut max_end);
+        if let Some(st) = &m.restore_state {
+            acc_scan_segments(&st.restored_extents, &mut lists, &mut max_end);
         }
-        lists.push(m.extents);
     }
     for (_, _, p) in meta.snapshot_all_parts()? {
-        for s in &p.extents {
-            let e = s.extent_id as u64;
-            let end = s.offset + s.len;
-            max_end
-                .entry(e)
-                .and_modify(|v| *v = (*v).max(end))
-                .or_insert(end);
-        }
-        lists.push(p.extents);
+        acc_scan_segments(&p.extents, &mut lists, &mut max_end);
     }
     alloc.rebuild_derived(lists);
     // M13 修复(自愈):有活段但位图未置位(历史 ref_dec 误清感染)→ 置位;

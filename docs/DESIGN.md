@@ -1373,6 +1373,46 @@ s3-tests 零新增 API(管理面特性,数据面无新端点);mock LDAP/OIDC
 身份事件与状态端点可检索;崩溃/覆盖率/audit 门禁沿用 M16 总
 口径。
 
+#### ADR-22(v2.2.1 审查修复):共享表语义 / Restore 入账 / 读钉扎
+
+**背景**:2026-08-27 对 v2.2.0 的只读审查发现三处正确性缺口:
+共享表启动重建 off-by-one(CopyObject 后重启再删副本可覆写存活
+数据);Restore 大对象副本未 `add_object` 且 GET 仍解压归档流;
+压缩迁移与零拷贝流式读无钉扎(S8)。本 ADR 写死语义,实现偏离
+必须再走 ADR。
+
+**(a) 共享表值 = 持有者总数**:
+
+- 稀疏表 `(extent_id, offset, len) → u32`;**仅 ≥2 名持有者占条目**。
+- 运行时 `share_object`:`or_insert(1) += 1`(第一次 COW 后 = 2)。
+- `release_object`:`n > 1` 只减计数;`n == 1` 删除条目并 `dec_live`
+  (最后持有者);无条目 = 独占段,直接 `dec_live`。
+- **启动 `rebuild_derived` 对 `cnt > 1` 写入 `cnt`(不是 `cnt - 1`)**。
+  模块头「额外持有者数」作废。回滚簿记(`> 2` 减一 / 出表插 `1`)
+  与总数语义对齐,不得改成 extra 口径。
+
+**(b) Restore 副本必须入账,GET 读明文副本**:
+
+- 大对象物化后对 `restored_extents` 调用 `add_object`(与 transition
+  / Copy 数据臂同口径);提交失败 `abort_draft`。
+- 启动扫描、`live_extent_occupancy`、`repair_leaks` 锁集纳入
+  `restore_state.restored_extents`(与 `m.extents` / `p.extents` 并列)。
+- GET/HEAD/Copy 源/零拷贝快照: `restore_valid` 时读
+  `restored_inline` / `restored_extents`(明文,`compressed=None`,
+  `sse=None`);未恢复仍 403;GLACIER_IR 仍直接读归档流。
+- `check --fix` 不得回收仍被恢复副本引用的 extent。
+
+**(c) 读钉扎(S8)**:
+
+- GET/Range/零拷贝在快照段列表时对涉及 extent `pin_count += 1`,
+  Drop/完成/客户端断开时 unpin。
+- 压缩 / lifecycle transition / restore GC:`pin_count > 0` 的
+  extent 不得 `allocate` 重用;隔离期 = pin 寿命,不做定时猜测。
+- 完成前 s3-tests 门禁可关压缩;完成后生产默认压缩与门禁均开启。
+
+**门禁**:TODO 审查修复 v2.2.1 F1–F8 定向用例 + G 门禁;每条含
+`leaks().is_empty()` / 准入归零 / fd 不线性涨。
+
 ---
 
 ## 4. 存储引擎设计(Rust)

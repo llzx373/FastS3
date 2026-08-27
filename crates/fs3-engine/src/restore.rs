@@ -252,6 +252,8 @@ impl Engine {
             self.feed_object_plaintext(&mut writer, &mut draft, &meta, 0..meta.size, None)?;
             let outcome = writer.finish(self, &mut draft)?;
             debug_assert_eq!(outcome.size, meta.size);
+            // ADR-22:恢复副本段必须入 live_bytes,否则 leaks()/--fix 当孤儿回收
+            self.alloc.add_object(&mut draft, &outcome.segments);
             (outcome.segments, None)
         };
         let until = now + (job.days as i64).saturating_mul(86_400);
@@ -691,6 +693,135 @@ mod tests {
         w.run_cycle_blocking(1_800_000_000)?;
         assert_eq!(w.stats().snapshot().completed, 1);
         assert_eq!(e.meta().restore_job_count()?, 0);
+        e.abort();
+        Ok(())
+    }
+
+    fn restore_large_glacier(e: &mut Engine, key: &str, data: &[u8]) -> Result<ObjectMeta> {
+        e.put_with_lock_ev(
+            "b1",
+            key,
+            &mut Cursor::new(data.to_vec()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            ObjectLockWrite::default(),
+            None,
+            Some("GLACIER".into()),
+            fs3_core::promote_storage_class(Some("GLACIER")),
+        )?;
+        let now = e.lock_now();
+        e.restore_enqueue("b1", key, None, 3, "Standard")?;
+        let (done, _) = e.restore_worker_tick(now + 1, 8)?;
+        assert_eq!(done, 1);
+        Ok(e.meta().get_object("b1", key)?.unwrap())
+    }
+
+    /// ADR-22 F2-1/F2-3:大对象 restore 走 extent 臂,必须 add_object;GET 读明文副本
+    /// (压缩对象零拷贝本为 None,恢复后 object_segments 非空 ⇒ 走的是副本)。
+    #[test]
+    fn restore_large_object_add_object_no_leak() -> Result<()> {
+        let (_d, cfg) = setup();
+        let mut e = open_engine(&cfg);
+        let data = vec![b'R'; 128 * 1024];
+        let m = restore_large_glacier(&mut e, "big", &data)?;
+        assert!(m.compressed.is_some(), "归档流仍压缩");
+        let st = m.restore_state.as_ref().unwrap();
+        assert!(
+            st.restored_inline.is_none() && !st.restored_extents.is_empty(),
+            "必须走 extent 臂,禁止内联"
+        );
+        assert!(
+            e.check_report()?.leaks.is_empty(),
+            "入账后不得报泄漏: {:?}",
+            e.check_report()?.leaks
+        );
+        let segs = e
+            .object_segments_version_for(
+                "b1",
+                "big",
+                None,
+                0,
+                data.len() as u64,
+                fs3_core::VersioningState::Off,
+            )?
+            .expect("恢复副本明文可零拷贝");
+        assert!(!segs.is_empty(), "GET 不得仍走压缩臂(会返回 None)");
+        let mut out = Vec::new();
+        e.get_to("b1", "big", 0..data.len() as u64, &mut out)?;
+        assert_eq!(out, data);
+        e.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_includes_restored_extents_after_restart() -> Result<()> {
+        let (_d, cfg) = setup();
+        let mut e = open_engine(&cfg);
+        let data = vec![b'S'; 128 * 1024];
+        restore_large_glacier(&mut e, "big", &data)?;
+        e.close()?;
+        drop(e);
+        let mut e = Engine::open(&cfg)?;
+        assert!(
+            e.allocator().leaks().is_empty(),
+            "重启扫描必须纳入 restored_extents: {:?}",
+            e.allocator().leaks()
+        );
+        let mut out = Vec::new();
+        e.get_to("b1", "big", 0..data.len() as u64, &mut out)?;
+        assert_eq!(out, data);
+        e.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn check_fix_does_not_reclaim_live_restore_copy() -> Result<()> {
+        let (_d, cfg) = setup();
+        let mut e = open_engine(&cfg);
+        let data = vec![b'T'; 128 * 1024];
+        restore_large_glacier(&mut e, "big", &data)?;
+        assert!(e.check_report()?.leaks.is_empty());
+        let rep = e.repair_leaks()?;
+        assert_eq!(rep.freed_extents, 0);
+        let mut out = Vec::new();
+        e.get_to("b1", "big", 0..data.len() as u64, &mut out)?;
+        assert_eq!(out, data);
+        e.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn overwrite_restored_object_seals_and_no_leak() -> Result<()> {
+        let (_d, cfg) = setup();
+        let mut e = open_engine(&cfg);
+        let data = vec![b'U'; 128 * 1024];
+        restore_large_glacier(&mut e, "big", &data)?;
+        e.put("b1", "big", &mut Cursor::new(vec![1u8; 64]))?;
+        assert!(e.check_report()?.leaks.is_empty());
+        let mut out = Vec::new();
+        e.get_to("b1", "big", 0..64, &mut out)?;
+        assert_eq!(out, vec![1u8; 64]);
+        e.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn delete_restored_object_releases_both_extent_sets() -> Result<()> {
+        let (_d, cfg) = setup();
+        let mut e = open_engine(&cfg);
+        let data = vec![b'V'; 128 * 1024];
+        restore_large_glacier(&mut e, "big", &data)?;
+        e.delete("b1", "big")?;
+        assert!(
+            e.check_report()?.leaks.is_empty(),
+            "删除必须释放归档流+副本: {:?}",
+            e.check_report()?.leaks
+        );
         e.abort();
         Ok(())
     }

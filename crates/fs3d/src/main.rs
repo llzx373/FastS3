@@ -1154,6 +1154,7 @@ pub(crate) fn engine_config_inner_multi(
         sync_mode: fs3_meta::SyncMode::Group,
         group_commit_ms: fs3_core::DEFAULT_GROUP_COMMIT_MS,
         checkpoint_interval_secs: fs3_core::DEFAULT_CHECKPOINT_INTERVAL_SECS,
+        checkpoint_tick_ms: 0,
         verify_reads: false,
         io_uring: true,
         read_only: false,
@@ -1200,6 +1201,7 @@ fn engine_config(
         group_commit_ms: group_commit_ms.unwrap_or(fs3_core::DEFAULT_GROUP_COMMIT_MS),
         checkpoint_interval_secs: checkpoint_interval
             .unwrap_or(fs3_core::DEFAULT_CHECKPOINT_INTERVAL_SECS),
+        checkpoint_tick_ms: 0,
         verify_reads,
         io_uring: !no_uring,
         read_only: false,

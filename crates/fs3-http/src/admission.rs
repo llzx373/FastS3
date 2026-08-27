@@ -64,6 +64,18 @@ impl Admission {
     pub fn limit(&self) -> u64 {
         self.limit
     }
+
+    pub fn in_flight(&self) -> u64 {
+        self.in_flight.load(Ordering::Relaxed)
+    }
+
+    /// 按块占用且累计不超过 `cap`(HTTP/3 整包硬上限;超 cap 不 acquire)。
+    pub fn try_acquire_capped(&self, body_len: u64, chunk: u64, cap: u64) -> bool {
+        if body_len.saturating_add(chunk) > cap {
+            return false;
+        }
+        self.try_acquire(chunk)
+    }
 }
 
 #[cfg(test)]
@@ -79,8 +91,28 @@ mod tests {
         a.release(60);
         assert!(a.try_acquire(50));
         a.release(90);
-        assert_eq!(a.in_flight.load(Ordering::Relaxed), 0);
+        assert_eq!(a.in_flight(), 0);
         assert!(a.try_acquire(0));
+    }
+
+    #[test]
+    fn h3_body_respects_global_admission() {
+        let a = Admission::new(100);
+        assert!(a.try_acquire_capped(0, 40, 8 * 1024 * 1024));
+        assert!(!a.try_acquire_capped(40, 70, 8 * 1024 * 1024));
+        a.release(40);
+        assert_eq!(a.in_flight(), 0);
+        assert!(a.try_acquire_capped(0, 100, 8 * 1024 * 1024));
+    }
+
+    #[test]
+    fn h3_body_hard_cap_rejects_without_allocating_limit() {
+        let a = Admission::new(1 << 40);
+        let cap = fs3_s3::BUFFERED_PUT_LIMIT as u64;
+        assert!(!a.try_acquire_capped(cap, 1, cap));
+        assert_eq!(a.in_flight(), 0, "must not acquire when over hard cap");
+        assert!(a.try_acquire_capped(cap - 8, 8, cap));
+        assert_eq!(a.in_flight(), 8);
     }
 
     #[test]

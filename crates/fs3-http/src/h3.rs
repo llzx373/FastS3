@@ -85,13 +85,14 @@ pub fn serve(
         cfg.workers
     };
     let shutdown = shutdown.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let admission = Admission::new(cfg.max_inflight_bytes);
     let mut handles = Vec::new();
     for i in 0..workers {
         let service = service.clone();
         let server_config = server_config.clone();
         let shutdown = shutdown.clone();
         let listen = cfg.listen;
-        let admission = Admission::new(cfg.max_inflight_bytes); // 已是 Arc
+        let admission = admission.clone();
         let web_root = cfg.web_root.clone();
         let corl = Arc::new(cfg.cors_allow_origins.clone());
         let h = std::thread::Builder::new()
@@ -167,6 +168,12 @@ async fn worker(
     loop {
         let shutdown = shutdown.clone();
         if shutdown.load(Ordering::Relaxed) {
+            endpoint.close(quinn::VarInt::from_u32(0), b"shutdown");
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                endpoint.wait_idle(),
+            )
+            .await;
             break;
         }
         // accept 可能长期无新连接:周期唤醒检查 shutdown(quinn Endpoint
@@ -275,15 +282,22 @@ where
     S: h3::quic::SendStream<Bytes> + h3::quic::RecvStream + Unpin,
 {
     let mut body: Vec<u8> = Vec::new();
-    let cap = admission.limit();
+    let cap = fs3_s3::BUFFERED_PUT_LIMIT as u64;
+    let mut acquired = 0u64;
+    struct Rel(Arc<Admission>, u64);
+    impl Drop for Rel {
+        fn drop(&mut self) {
+            self.0.release(self.1);
+        }
+    }
+    let mut rel = Rel(admission.clone(), 0);
     while let Some(chunk) = stream
         .recv_data()
         .await
         .map_err(|e| format!("recv body: {e}"))?
     {
-        body.extend_from_slice(chunk.chunk());
-        if body.len() as u64 > cap {
-            // 与 G3 503 SlowDown 语义一致(入账前超限)
+        let n = chunk.chunk().len() as u64;
+        if !admission.try_acquire_capped(body.len() as u64, n, cap) {
             let resp = http::Response::builder()
                 .status(503)
                 .header("retry-after", "1")
@@ -293,6 +307,9 @@ where
             let _ = stream.finish().await;
             return Ok(());
         }
+        acquired += n;
+        rel.1 = acquired;
+        body.extend_from_slice(chunk.chunk());
     }
 
     let mut hreq = hyper::Request::builder()

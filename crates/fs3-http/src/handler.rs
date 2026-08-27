@@ -38,7 +38,7 @@ pub async fn serve_connection(
 ) -> std::io::Result<()> {
     // 零拷贝(B3/D2):注册设备 fd 白名单,包裹 socket 识别标记帧
     crate::zero_copy::register_trusted_fd(service.device_fd());
-    if let Some(fd) = service.zc_fd() {
+    for fd in service.zc_fds().into_iter().flatten() {
         crate::zero_copy::register_trusted_fd(fd);
     }
     // 审计用客户端地址(H2)
@@ -662,9 +662,21 @@ where
                 match body.frame().await {
                     Some(Ok(frame)) => {
                         if let Ok(data) = frame.into_data() {
-                            // 有界通道:满则让出(不阻塞 runtime worker)
-                            while tx.try_send(Ok(data.to_vec())).is_err() {
-                                tokio::task::yield_now().await;
+                            let mut chunk = data.to_vec();
+                            loop {
+                                match tx.try_send(Ok(chunk)) {
+                                    Ok(()) => break,
+                                    Err(std::sync::mpsc::TrySendError::Full(v)) => {
+                                        chunk = match v {
+                                            Ok(c) => c,
+                                            Err(_) => return,
+                                        };
+                                        tokio::task::yield_now().await;
+                                    }
+                                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                        return;
+                                    }
+                                }
                             }
                         }
                     }
@@ -710,15 +722,30 @@ where
         return Ok(resp);
     }
 
-    // 缓冲路径
-    let body_bytes = match req.into_body().collect().await {
-        Ok(b) => b.to_bytes().to_vec(),
-        Err(e) => {
-            let err = S3Error::new(fs3_s3::S3ErrorCode::IncompleteBody)
-                .with_message(format!("failed to read request body: {e}"));
-            return Ok(error_response(&err, &host_id, &request_id));
+    // 缓冲路径(硬上限 = 缓冲 PUT,防非 PUT 大 POST 堆到 OOM)
+    let mut acc = Vec::new();
+    let mut body = req.into_body();
+    loop {
+        match body.frame().await {
+            Some(Ok(frame)) => {
+                if let Ok(data) = frame.into_data() {
+                    if acc.len().saturating_add(data.len()) > fs3_s3::BUFFERED_PUT_LIMIT {
+                        let err = S3Error::new(fs3_s3::S3ErrorCode::EntityTooLarge)
+                            .with_message("Request body exceeds buffered request limit.");
+                        return Ok(error_response(&err, &host_id, &request_id));
+                    }
+                    acc.extend_from_slice(&data);
+                }
+            }
+            Some(Err(e)) => {
+                let err = S3Error::new(fs3_s3::S3ErrorCode::IncompleteBody)
+                    .with_message(format!("failed to read request body: {e}"));
+                return Ok(error_response(&err, &host_id, &request_id));
+            }
+            None => break,
         }
-    };
+    }
+    let body_bytes = acc;
     let mut s3req = s3req;
     s3req.body = body_bytes;
     let result = service.handle(&s3req);
@@ -842,6 +869,7 @@ fn render_with(
             // 否则缓冲 GET(zipf 小对象、低于零拷贝阈值)吞吐回退约 30%。
             if sse_key.is_some() {
                 tokio::task::spawn_blocking(move || {
+                    let _admit_guard = admit.map(|(a, n)| AdmitGuard::new(a, n));
                     let mut pos = 0u64;
                     let mut buf = vec![0u8; 4 * 1024 * 1024];
                     loop {
@@ -874,12 +902,10 @@ fn render_with(
                             break;
                         }
                     }
-                    if let Some((a, n)) = &admit {
-                        a.release(*n);
-                    }
                 });
             } else {
                 tokio::spawn(async move {
+                    let _admit_guard = admit.map(|(a, n)| AdmitGuard::new(a, n));
                     let mut pos = 0u64;
                     let mut buf = vec![0u8; 4 * 1024 * 1024];
                     loop {
@@ -912,9 +938,6 @@ fn render_with(
                         {
                             break;
                         }
-                    }
-                    if let Some((a, n)) = &admit {
-                        a.release(*n);
                     }
                 });
             }
@@ -959,6 +982,7 @@ fn render_with(
             let svc = service.clone();
             if sse_key.is_some() {
                 tokio::task::spawn_blocking(move || {
+                    let _admit_guard = admit.map(|(a, n)| AdmitGuard::new(a, n));
                     let mut buf = vec![0u8; 4 * 1024 * 1024];
                     for (s, e) in &ranges {
                         let header = format!(
@@ -1005,12 +1029,10 @@ fn render_with(
                     }
                     let tail = format!("--{boundary}--\r\n");
                     let _ = send_range_bytes_blocking(&tx, tail.as_bytes());
-                    if let Some((a, n)) = &admit {
-                        a.release(*n);
-                    }
                 });
             } else {
                 tokio::spawn(async move {
+                    let _admit_guard = admit.map(|(a, n)| AdmitGuard::new(a, n));
                     let mut buf = vec![0u8; 4 * 1024 * 1024];
                     for (s, e) in &ranges {
                         let header = format!(
@@ -1058,9 +1080,6 @@ fn render_with(
                     }
                     let tail = format!("--{boundary}--\r\n");
                     let _ = send_range_bytes(&tx, tail.as_bytes()).await;
-                    if let Some((a, n)) = &admit {
-                        a.release(*n);
-                    }
                 });
             }
             let stream = ReceiverStream::new(rx).map(|r| r.map(hyper::body::Frame::data));
@@ -1274,5 +1293,62 @@ mod tests {
         assert_eq!(strip_port("localhost:9000"), "localhost");
         assert_eq!(strip_port("example.com"), "example.com");
         assert_eq!(strip_port("[::1]:9000"), "[::1]");
+    }
+
+    #[test]
+    fn admit_guard_drop_releases() {
+        let a = crate::Admission::new(100);
+        assert!(a.try_acquire(40));
+        {
+            let _g = AdmitGuard::new(a.clone(), 40);
+        }
+        assert!(
+            a.try_acquire(80),
+            "Drop must release so subsequent acquire succeeds"
+        );
+        assert_eq!(a.in_flight(), 80);
+        a.release(80);
+    }
+
+    #[tokio::test]
+    async fn buffered_get_abort_releases_admission() {
+        let a = crate::Admission::new(100);
+        assert!(a.try_acquire(80));
+        let guard = AdmitGuard::new(a.clone(), 80);
+        let handle = tokio::spawn(async move {
+            let _g = guard;
+            std::future::pending::<()>().await;
+        });
+        handle.abort();
+        let _ = handle.await;
+        assert_eq!(a.in_flight(), 0);
+        assert!(a.try_acquire(90), "abort must Drop AdmitGuard");
+    }
+
+    #[test]
+    fn buffered_put_limit_is_8mib() {
+        assert_eq!(fs3_s3::BUFFERED_PUT_LIMIT, 8 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn streaming_put_pump_exits_when_reader_dropped() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(1);
+        drop(rx);
+        let mut chunk = vec![1u8; 8];
+        let start = std::time::Instant::now();
+        loop {
+            match tx.try_send(Ok(chunk)) {
+                Ok(()) => panic!("send on dropped receiver"),
+                Err(std::sync::mpsc::TrySendError::Full(v)) => {
+                    chunk = v.unwrap();
+                    tokio::task::yield_now().await;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(1),
+                "must not busy-spin after Disconnected"
+            );
+        }
     }
 }

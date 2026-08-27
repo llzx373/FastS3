@@ -11241,6 +11241,45 @@ fn sts_session_data_plane_roundtrip() {
         vec![],
     ));
     assert_eq!(err_code(&r), "InvalidToken", "{r:?}");
+    assert!(
+        svc.engine()
+            .read()
+            .meta()
+            .get_session("deadbeef")
+            .unwrap()
+            .is_none(),
+        "expired STS session must be deleted from meta on auth"
+    );
+
+    // ⑤b 后台扫:过期键删除,未过期保留
+    let live = SessionRecord {
+        session_id: "cafebabe".into(),
+        temporary_access_key: "FSSTLIVE0000".into(),
+        base_access_key: "test".into(),
+        session_policy: None,
+        expires_at: 2_000_000_000,
+        secret_hash: SessionRecord::hash_secret("y"),
+        issued_at: 1,
+        issued_by: "admin".into(),
+    };
+    let stale = SessionRecord {
+        session_id: "feedface".into(),
+        temporary_access_key: "FSSTSTALE000".into(),
+        base_access_key: "test".into(),
+        session_policy: None,
+        expires_at: 1,
+        secret_hash: SessionRecord::hash_secret("z"),
+        issued_at: 0,
+        issued_by: "admin".into(),
+    };
+    {
+        let e = svc.engine().read();
+        e.meta().put_session(&live).unwrap();
+        e.meta().put_session(&stale).unwrap();
+        e.sweep_expired_sts_sessions(1_700_000_000).unwrap();
+        assert!(e.meta().get_session("cafebabe").unwrap().is_some());
+        assert!(e.meta().get_session("feedface").unwrap().is_none());
+    }
 
     // ⑥ 撤销 → InvalidToken
     svc.revoke_session(&rec.session_id).unwrap();

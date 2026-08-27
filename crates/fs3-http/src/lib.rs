@@ -28,7 +28,9 @@ pub use admission::Admission;
 pub use notify::{NotificationConfig, NotificationStats, NotificationWorker, WebhookSender};
 pub use timeout_io::DeadlinedIo;
 pub use tls::{TlsConfig, TlsState};
-pub use zero_copy::{probe_fd_capability, ZeroCopyIo, ZeroCtx};
+pub use zero_copy::{
+    probe_fd_capability, register_trusted_fd, unregister_trusted_fd, ZeroCopyIo, ZeroCtx,
+};
 
 #[cfg(feature = "http3")]
 pub use h3::Http3Config;
@@ -136,6 +138,7 @@ pub fn serve_with_shutdown(
             .map_err(std::io::Error::other)?;
     }
 
+    register_device_fds(&service);
     let admission = Admission::new(cfg.max_inflight_bytes);
     let header_timeout = cfg.header_timeout;
     let idle_timeout = cfg.idle_timeout;
@@ -167,7 +170,22 @@ pub fn serve_with_shutdown(
     for h in handles {
         let _ = h.join();
     }
+    unregister_device_fds(&service);
     Ok(())
+}
+
+fn register_device_fds(service: &S3Service) {
+    register_trusted_fd(service.device_fd());
+    for fd in service.zc_fds().into_iter().flatten() {
+        register_trusted_fd(fd);
+    }
+}
+
+fn unregister_device_fds(service: &S3Service) {
+    unregister_trusted_fd(service.device_fd());
+    for fd in service.zc_fds().into_iter().flatten() {
+        unregister_trusted_fd(fd);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

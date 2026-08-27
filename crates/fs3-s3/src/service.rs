@@ -913,6 +913,7 @@ impl S3Service {
                     .with_message("The security token included in the request is invalid.")
             })?;
         if rec.expired(unix_now() as i64) {
+            let _ = engine.meta().delete_session(&rec.session_id);
             return Err(S3Error::new(S3ErrorCode::InvalidToken)
                 .with_message("The provided security token has expired."));
         }
@@ -1011,6 +1012,11 @@ impl S3Service {
     /// 零拷贝 fd(无 O_DIRECT;sendfile/splice 用)。
     pub fn zc_fd(&self) -> Option<i32> {
         self.engine.read().zc_fd()
+    }
+
+    /// 全部设备零拷贝 fd(白名单注册/摘除)。
+    pub fn zc_fds(&self) -> Vec<Option<i32>> {
+        self.engine.read().zc_fds()
     }
 
     /// 就绪探针(M6 / K2,`/ready` 用):廉价检查引擎/元数据/设备可写性。
@@ -1191,6 +1197,7 @@ impl S3Service {
                     ));
                 }
                 if rec.expired(unix_now() as i64) {
+                    let _ = engine.meta().delete_session(&rec.session_id);
                     return Err(S3Error::new(S3ErrorCode::InvalidToken)
                         .with_message("The provided security token has expired."));
                 }
@@ -5097,6 +5104,7 @@ impl S3Service {
         }
         // 惰性过期回收(每次创建顺带扫一遍,成本可忽略的规模)
         let _ = engine.sweep_expired_sessions(fs3_core::MULTIPART_TTL_SECS);
+        let _ = engine.sweep_expired_sts_sessions(unix_now() as i64);
         let uid = engine
             .create_multipart_lock(
                 bucket,

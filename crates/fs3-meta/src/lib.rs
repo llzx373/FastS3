@@ -2081,6 +2081,43 @@ impl MetaStore {
         }
         Ok(out)
     }
+
+    /// `a:` 记录条数(检查点截断回归)。
+    pub fn count_alloc_records(&self) -> Result<u64> {
+        let mut n = 0u64;
+        for item in scan_prefix(&self.db, PREFIX_ALLOC) {
+            let _ = item?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// 检查点成功后截断 `seq <= through_seq` 的 `a:` / `t:`。
+    /// 恢复仍只重放 `seq > checkpoint`(与设备检查点 seq 对齐)。
+    pub fn truncate_alloc_records(&self, through_seq: u64) -> Result<u64> {
+        let mut batch = WriteBatchWithTransaction::<true>::default();
+        let mut n = 0u64;
+        for item in scan_prefix(&self.db, PREFIX_ALLOC) {
+            let (k, _v) = item?;
+            let seq = parse_alloc_seq(&k)?;
+            if seq <= through_seq {
+                batch.delete(alloc_key(seq));
+                batch.delete(txn_key(seq));
+                n += 1;
+            }
+        }
+        if n == 0 {
+            return Ok(0);
+        }
+        self.db
+            .write_opt(batch, &self.write_opts)
+            .map_err(rocks_err)?;
+        if self.sync_mode == SyncMode::Full {
+            self.db.flush_wal(true).map_err(rocks_err)?;
+        }
+        Ok(n)
+    }
+
     /// 最新事务序号(s:seq)。
     pub fn last_seq(&self) -> Result<u64> {
         Ok(self
@@ -2122,13 +2159,16 @@ impl MetaStore {
                             | Op::LifecycleRulesDelete { bucket } => {
                                 self.lifecycle_cache.lock().unwrap().remove(bucket);
                             }
-                            // M15 N1(ADR-18 D-E4):通知规则缓存随 commit 失效
                             Op::NotificationRulesReplace { bucket, .. }
                             | Op::NotificationRulesDelete { bucket } => {
                                 self.notification_cache.lock().unwrap().remove(bucket);
                             }
                             _ => {}
                         }
+                    }
+                    if ops.iter().any(|o| matches!(o, Op::EventEnqueue { .. })) {
+                        // worker 关闭时仍截断,防 e: 无界堆积
+                        let _ = self.truncate_events(100_000);
                     }
                     return Ok(seq);
                 }
@@ -2535,6 +2575,22 @@ impl MetaStore {
         Ok(n)
     }
 
+    /// 当前 `e:` 队列全部 seq(含死信;投递重试表截断对齐)。
+    pub fn event_seqs(&self) -> Result<std::collections::HashSet<u64>> {
+        let mut s = std::collections::HashSet::new();
+        for item in self
+            .db
+            .iterator(IteratorMode::From(PREFIX_EVENT, Direction::Forward))
+        {
+            let (k, _v) = item.map_err(rocks_err)?;
+            if !k.starts_with(PREFIX_EVENT) {
+                break;
+            }
+            s.insert(parse_event_seq(&k)?);
+        }
+        Ok(s)
+    }
+
     /// 归档恢复作业队列读取(M16 A2,ADR-19 DA2.3):从 `after_seq` 之后
     /// 起取至多 `limit` 条(队首续跑;None = 从头)。
     pub fn restore_jobs(
@@ -2657,6 +2713,18 @@ impl MetaStore {
             out.push(decode_sts_session(&v)?);
         }
         Ok(out)
+    }
+
+    /// 删除已过期的 STS 会话(`s:session`;与 multipart `u:` 清理分轨)。
+    pub fn sweep_expired_sts_sessions(&self, now: i64) -> Result<u64> {
+        let mut n = 0u64;
+        for rec in self.list_sessions()? {
+            if rec.expired(now) {
+                self.delete_session(&rec.session_id)?;
+                n += 1;
+            }
+        }
+        Ok(n)
     }
 
     // ── M15 I1:S3 Inventory 配置(ADR-18;`iv:` 前缀) ──

@@ -305,6 +305,8 @@ impl NotificationWorker {
         // 有界环形(ADR-18 D-E1.2):超上限 + slack 批量截断最旧(投递停滞
         // 也受此约束,防无限堆积;与审计环形同口径)
         let _ = self.meta.truncate_events(self.cfg.max_queued);
+        let live = self.meta.event_seqs()?;
+        self.retry.retain(|seq, _| live.contains(seq));
         // 队列深度指标(含死信;worker 每次轮询刷新)
         let depth = self.meta.event_count()?;
         self.stats.queue.store(depth as u64, Ordering::Relaxed);

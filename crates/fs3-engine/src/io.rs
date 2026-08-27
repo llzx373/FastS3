@@ -406,16 +406,26 @@ impl IoUringEngine {
             .store(pending as u64, std::sync::atomic::Ordering::Relaxed);
         self.ring.submit_and_wait(pending)?;
         let cq = self.ring.completion();
-        let mut count = 0usize;
+        let mut results = Vec::with_capacity(pending);
         for cqe in cq {
-            count += 1;
-            let res = cqe.result();
-            if res < 0 {
-                return Err(io::Error::from_raw_os_error(-res));
-            }
+            results.push(cqe.result());
         }
-        debug_assert_eq!(count, pending, "io_uring completed count mismatch");
-        Ok(())
+        debug_assert_eq!(results.len(), pending, "io_uring completed count mismatch");
+        drain_cqe_results(&results)
+    }
+}
+
+/// 收完本批全部 CQE 后再返回首个错误(避免 CQ 残留污染下一批)。
+fn drain_cqe_results(results: &[i32]) -> io::Result<()> {
+    let mut first_err = None;
+    for &res in results {
+        if res < 0 && first_err.is_none() {
+            first_err = Some(res);
+        }
+    }
+    match first_err {
+        Some(res) => Err(io::Error::from_raw_os_error(-res)),
+        None => Ok(()),
     }
 }
 
@@ -588,5 +598,14 @@ mod tests {
             Ok(mut e) => roundtrip_on(&mut e),
             Err(_) => eprintln!("io_uring unavailable, skipping"),
         }
+    }
+
+    #[test]
+    fn uring_error_cqe_drains_rest_of_batch() {
+        assert!(drain_cqe_results(&[0, 8, 16]).is_ok());
+        let e = drain_cqe_results(&[-5, 0, 32]).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(5));
+        let e = drain_cqe_results(&[4, -11, -22]).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(11), "must keep first error after draining rest");
     }
 }

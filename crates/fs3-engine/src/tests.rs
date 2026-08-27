@@ -561,6 +561,53 @@ fn checkpoint_rolls_bitmap() {
 }
 
 #[test]
+fn checkpoint_truncates_old_alloc_keys() {
+    let (_d, mut cfg) = setup();
+    cfg.compression.enabled = false;
+    let mut e = open_engine(&cfg);
+    for i in 0..8 {
+        e.put(
+            "b1",
+            &format!("k{i}"),
+            &mut Cursor::new(rnd(512 * 1024, i as u8 + 1)),
+        )
+        .unwrap();
+    }
+    let before = e.meta().count_alloc_records().unwrap();
+    assert!(
+        before >= 1,
+        "extent PUTs must leave a: records before checkpoint"
+    );
+    e.checkpoint().unwrap();
+    let after = e.meta().count_alloc_records().unwrap();
+    assert!(
+        after < before,
+        "checkpoint must drop a: keys seq <= checkpoint ({after} vs {before})"
+    );
+    assert_eq!(after, 0, "retain window 0 deletes all records through seq");
+    e.close().unwrap();
+    drop(e);
+    let mut e2 = Engine::open(&cfg).unwrap();
+    assert!(e2.allocator().allocated_count() >= 1);
+    assert!(e2.allocator().leaks().is_empty());
+    let mut out = Vec::new();
+    e2.get_to("b1", "k0", 0..u64::MAX, &mut out).unwrap();
+    assert_eq!(out.len(), 512 * 1024);
+    e2.close().unwrap();
+}
+
+#[test]
+fn checkpoint_tick_bounded_idle() {
+    let (_d, mut cfg) = setup();
+    cfg.checkpoint_tick_ms = 20;
+    let mut e = open_engine(&cfg);
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    let n = e.debug_drain_checkpoint_ticks();
+    assert!(n <= 1, "idle tick queue must stay ≤1, got {n}");
+    e.close().unwrap();
+}
+
+#[test]
 fn trusted_clock_persists_high_water_across_reopen() {
     // M12 W1-1:启动落盘;检查点刷新后重开 last_wall 不回退。
     let (_d, cfg) = setup();
@@ -903,7 +950,151 @@ fn multipart_upload_complete_roundtrip() {
     e.close().unwrap();
 }
 
-// ─────────────────── M11 C1-4:分片 checksum 落值与 Complete 复合验算 ───────────────────
+#[test]
+fn upload_part_resend_releases_old_extents() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let uid = e
+        .create_multipart("b1", "k", None, vec![], vec![], vec![], None, None, None)
+        .unwrap();
+    let first = rnd(64 * 1024, 1);
+    let p1 = e
+        .upload_part(&uid, 1, &mut Cursor::new(first), None, None)
+        .unwrap();
+    assert!(p1.inline.is_none() && !p1.extents.is_empty());
+    let old_ids: Vec<u32> = p1.extents.iter().map(|s| s.extent_id).collect();
+    let second = rnd(64 * 1024, 2);
+    let p2 = e
+        .upload_part(&uid, 1, &mut Cursor::new(second.clone()), None, None)
+        .unwrap();
+    assert_ne!(p1.etag, p2.etag);
+    assert!(e.allocator().leaks().is_empty());
+    for id in &old_ids {
+        let held = p2.extents.iter().any(|s| s.extent_id == *id);
+        if !held {
+            assert_eq!(
+                e.allocator().live_bytes_of(*id as u64),
+                0,
+                "resend must release previous part extents"
+            );
+            assert!(
+                !e.allocator().test_bit(*id as u64),
+                "released exclusive extent must clear bitmap"
+            );
+        }
+    }
+    e.close().unwrap();
+    drop(e);
+    let mut e2 = open_engine(&cfg);
+    let stored = e2.list_parts(&uid).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].1.etag, p2.etag);
+    assert!(e2.allocator().leaks().is_empty());
+    e2.close().unwrap();
+}
+
+#[test]
+fn complete_subset_releases_unlisted_parts() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let uid = e
+        .create_multipart("b1", "sub", None, vec![], vec![], vec![], None, None, None)
+        .unwrap();
+    let part1 = vec![0x11u8; 5 * 1024 * 1024];
+    let part2 = rnd(64 * 1024, 7);
+    let part3 = rnd(64 * 1024, 9);
+    let p1 = e
+        .upload_part(&uid, 1, &mut Cursor::new(part1.clone()), None, None)
+        .unwrap();
+    let p2 = e
+        .upload_part(&uid, 2, &mut Cursor::new(part2.clone()), None, None)
+        .unwrap();
+    let p3 = e
+        .upload_part(&uid, 3, &mut Cursor::new(part3.clone()), None, None)
+        .unwrap();
+    assert!(p2.inline.is_none() && !p2.extents.is_empty());
+    let unlisted: Vec<u32> = p2.extents.iter().map(|s| s.extent_id).collect();
+    let m = e
+        .complete_multipart(
+            "b1",
+            "sub",
+            &uid,
+            &[cp(1, p1.etag_hex()), cp(3, p3.etag_hex())],
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(m.size, (part1.len() + part3.len()) as u64);
+    assert_eq!(m.parts, vec![part1.len() as u64, part3.len() as u64]);
+    let mut out = Vec::new();
+    e.get_to("b1", "sub", 0..m.size, &mut out).unwrap();
+    assert_eq!(&out[..part1.len()], &part1[..]);
+    assert_eq!(&out[part1.len()..], &part3[..]);
+    assert!(
+        !out.windows(part2.len()).any(|w| w == part2.as_slice()),
+        "unlisted part must not appear in object"
+    );
+    for id in &unlisted {
+        let held = m.extents.iter().any(|s| s.extent_id == *id);
+        if !held {
+            assert_eq!(e.allocator().live_bytes_of(*id as u64), 0);
+            assert!(!e.allocator().test_bit(*id as u64));
+        }
+    }
+    assert!(e.list_parts(&uid).unwrap().is_empty());
+    assert!(e.allocator().leaks().is_empty());
+    e.close().unwrap();
+}
+
+#[test]
+fn mixed_complete_after_release_seals_open_extent() {
+    let (_d, cfg) = setup();
+    let mut e = open_engine(&cfg);
+    let uid = e
+        .create_multipart("b1", "mix", None, vec![], vec![], vec![], None, None, None)
+        .unwrap();
+    let part1 = vec![0xAAu8; 5 * 1024 * 1024];
+    let part2 = vec![0xBBu8; 1000];
+    let p1 = e
+        .upload_part(&uid, 1, &mut Cursor::new(part1.clone()), None, None)
+        .unwrap();
+    let p2 = e
+        .upload_part(&uid, 2, &mut Cursor::new(part2.clone()), None, None)
+        .unwrap();
+    let before = e.open_extent_snapshot();
+    let m = e
+        .complete_multipart(
+            "b1",
+            "mix",
+            &uid,
+            &[cp(1, p1.etag_hex()), cp(2, p2.etag_hex())],
+            None,
+            None,
+        )
+        .unwrap();
+    let after = e.open_extent_snapshot();
+    for (b, a) in before.iter().zip(&after) {
+        if let (Some((old_id, _)), Some((new_id, _))) = (b, a) {
+            assert_ne!(
+                old_id, new_id,
+                "mixed complete must seal the open extent that held released part segments"
+            );
+        }
+    }
+    let more = rnd(200_000, 3);
+    e.put("b1", "after-mix", &mut Cursor::new(more.clone()))
+        .unwrap();
+    let mut out = Vec::new();
+    e.get_to("b1", "mix", 0..m.size, &mut out).unwrap();
+    assert_eq!(&out[..part1.len()], &part1[..]);
+    assert_eq!(&out[part1.len()..], &part2[..]);
+    let mut out2 = Vec::new();
+    e.get_to("b1", "after-mix", 0..more.len() as u64, &mut out2)
+        .unwrap();
+    assert_eq!(out2, more);
+    assert!(e.allocator().leaks().is_empty());
+    e.close().unwrap();
+}
 
 #[test]
 fn upload_part_stores_checksum_inline_and_extent() {
@@ -1771,7 +1962,50 @@ fn copy_object_cow_share_and_release() {
     e.close().unwrap();
 }
 
-/// 会话过期回收(TTL=0 → 立即过期)。
+#[test]
+fn copy_restart_delete_clone_source_intact() {
+    let (_d, cfg) = setup();
+    let ext_id;
+    let seg;
+    {
+        let mut e = open_engine(&cfg);
+        let data = vec![9u8; 5 * 1024 * 1024];
+        e.put("b1", "src", &mut Cursor::new(data.clone())).unwrap();
+        let src = e.head("b1", "src").unwrap().unwrap();
+        ext_id = src.extents[0].extent_id as u64;
+        seg = src.extents[0].clone();
+        e.copy_object("b1", "src", "b1", "dst", None, None, None)
+            .unwrap();
+        assert_eq!(e.alloc.refcount(ext_id), 2);
+        e.close().unwrap();
+    }
+    let data = vec![9u8; 5 * 1024 * 1024];
+    let mut e = Engine::open(&cfg).unwrap();
+    assert!(
+        e.alloc.leaks().is_empty(),
+        "rebuild leaks: {:?}",
+        e.alloc.leaks()
+    );
+    assert_eq!(
+        e.alloc.shared_count(seg.extent_id, seg.offset, seg.len),
+        Some(2),
+        "ADR-22:重启后共享表仍为持有者总数"
+    );
+    e.delete("b1", "dst").unwrap();
+    assert_eq!(e.alloc.refcount(ext_id), 1);
+    assert!(e.alloc.test_bit(ext_id));
+    let mut out = Vec::new();
+    e.get_to("b1", "src", 0..data.len() as u64, &mut out)
+        .unwrap();
+    assert_eq!(out, data, "删副本后源不得被覆写");
+    assert!(e.alloc.leaks().is_empty());
+    e.delete("b1", "src").unwrap();
+    assert_eq!(e.alloc.refcount(ext_id), 0);
+    assert!(!e.alloc.test_bit(ext_id));
+    assert!(e.alloc.leaks().is_empty());
+    e.close().unwrap();
+}
+
 #[test]
 fn multipart_sweep_expired() {
     let (_d, cfg) = setup();
@@ -6508,7 +6742,12 @@ fn device_remove_drained_tail_device() -> Result<()> {
     // manifest ⊆ cfg,cfg 含双盘 ✓;移除后再校验)
     {
         let mut e2 = open_engine(&cfg);
+        let tail_zc = e2.zc_fds().last().copied().flatten();
         let report = e2.device_remove(&img1).unwrap();
+        if let Some(fd) = tail_zc {
+            let rc = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert_eq!(rc, -1, "removed device zc fd must be closed");
+        }
         assert_eq!(report.total_devices, 1);
         assert_eq!(e2.device_count(), 1);
         // 清单收缩

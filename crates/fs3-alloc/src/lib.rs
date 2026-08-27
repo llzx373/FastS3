@@ -2,8 +2,8 @@
 //!
 //! - 内存位图(每 extent 1 bit)+ 引用计数数组(u32)(DESIGN §4.3);
 //! - 段级派生状态(ADR-9 §4.4):`live_bytes`(每 extent 活字节数)、
-//!   `state`(Free/Open/Sealed)、稀疏共享段表(COW,`(ext,off,len) → 额外持有者数`);
-//!   三者**不持久化**,由启动可达性扫描重建(D3);
+//!   `state`(Free/Open/Sealed)、稀疏共享段表(COW,`(ext,off,len) → 持有者总数`,
+//!   ≥2 才占条目;ADR-22);三者**不持久化**,由启动可达性扫描重建(D3);
 //! - 每核私有 hint 游标,位操作走 CAS(无锁近似);真正的原子性靠 rocksdb 事务
 //!   (ADR-4):变更先落内存并记入调用方持有的 `Staged` 草稿,随对象元数据同一
 //!   事务提交;事务失败则 `rollback`;
@@ -89,8 +89,8 @@ pub struct Allocator {
     /// 每 extent 生命周期状态(ADR-9 §4.4;启动重建)。
     state: Vec<AtomicU8>,
     /// 稀疏共享段表:`(extent_id, offset, len) → 持有者总数`(≥2 才占条目;
-    /// 仅 COW 复制段,ADR-9 §5.5)。`release_object` 在总数降为 1 时删除
-    /// 条目且不递减 live_bytes(仍有一名持有者);降为 0(条目消失)才递减。
+    /// 仅 COW 复制段,ADR-22)。`release_object`:`n > 1` 只减计数;`n == 1`
+    /// 删除条目并 `dec_live`(最后持有者);无条目 = 独占段,直接 `dec_live`。
     shared: Mutex<HashMap<(u32, u32, u32), u32>>,
     total_alloc: AtomicU64,
     total_free: AtomicU64,
@@ -581,12 +581,22 @@ impl Allocator {
         }
         let mut shared = self.shared.lock().unwrap();
         shared.clear();
-        for ((e, _o, l), cnt) in uniq {
+        for ((e, o, l), cnt) in uniq {
             self.live_bytes[e as usize].fetch_add(l, Ordering::AcqRel);
+            // ADR-22:表值 = 持有者总数(与 share_object 的 or_insert(1)+=1 对齐)
             if cnt > 1 {
-                shared.insert((e, _o, l), cnt - 1);
+                shared.insert((e, o, l), cnt);
             }
         }
+    }
+
+    /// 测试/诊断:共享表持有者总数(独占段 = None)。
+    pub fn shared_count(&self, extent_id: u32, offset: u32, len: u32) -> Option<u32> {
+        self.shared
+            .lock()
+            .unwrap()
+            .get(&(extent_id, offset, len))
+            .copied()
     }
 
     pub fn refcount(&self, id: u64) -> u32 {
@@ -1026,7 +1036,89 @@ mod tests {
         assert_eq!(a.live_bytes_of(ids[1]), 8192);
         assert_eq!(a.live_bytes_of(ids[2]), 0, "孤儿 extent");
         assert_eq!(a.refcount(ids[0]), 2);
+        assert_eq!(
+            a.shared_count(ids[0] as u32, 0, 4096),
+            Some(2),
+            "ADR-22:重建后共享表 = 持有者总数"
+        );
         assert_eq!(a.leaks(), vec![ids[2]], "无活段的已分配 extent = 泄漏");
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_then_release_one_of_two_cow_holders() -> Result<()> {
+        let a = Allocator::new(16);
+        let mut d = Staged::default();
+        let id = a.allocate(&mut d, 1)?[0];
+        a.mark_sealed(id);
+        let s = seg(id as u32, 0, 4096);
+        a.add_object(&mut d, std::slice::from_ref(&s));
+        a.share_object(&mut d, std::slice::from_ref(&s));
+        assert_eq!(a.shared_count(s.extent_id, s.offset, s.len), Some(2));
+        // 模拟重启:只重建派生状态(位图仍置位)
+        a.rebuild_derived(vec![vec![s.clone()], vec![s.clone()]]);
+        assert_eq!(a.shared_count(s.extent_id, s.offset, s.len), Some(2));
+        assert_eq!(a.live_bytes_of(id), 4096);
+        let mut d2 = Staged::default();
+        a.release_object(&mut d2, std::slice::from_ref(&s));
+        let _ = a.to_alloc_draft(&d2);
+        assert_eq!(a.live_bytes_of(id), 4096, "另一持有者仍在");
+        assert!(a.test_bit(id), "位图不得提前清");
+        assert_eq!(a.leaks(), vec![]);
+        assert_eq!(a.shared_count(s.extent_id, s.offset, s.len), Some(1));
+        let mut d3 = Staged::default();
+        a.release_object(&mut d3, std::slice::from_ref(&s));
+        let _ = a.to_alloc_draft(&d3);
+        assert_eq!(a.live_bytes_of(id), 0);
+        assert!(!a.test_bit(id));
+        assert_eq!(a.leaks(), vec![]);
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_then_release_two_of_three_cow_holders() -> Result<()> {
+        let a = Allocator::new(16);
+        let mut d = Staged::default();
+        let id = a.allocate(&mut d, 1)?[0];
+        a.mark_sealed(id);
+        let s = seg(id as u32, 0, 8192);
+        a.add_object(&mut d, std::slice::from_ref(&s));
+        a.share_object(&mut d, std::slice::from_ref(&s));
+        a.share_object(&mut d, std::slice::from_ref(&s));
+        assert_eq!(a.shared_count(s.extent_id, s.offset, s.len), Some(3));
+        a.rebuild_derived(vec![vec![s.clone()], vec![s.clone()], vec![s.clone()]]);
+        assert_eq!(a.shared_count(s.extent_id, s.offset, s.len), Some(3));
+        let mut d2 = Staged::default();
+        a.release_object(&mut d2, std::slice::from_ref(&s));
+        a.release_object(&mut d2, std::slice::from_ref(&s));
+        let _ = a.to_alloc_draft(&d2);
+        assert_eq!(a.live_bytes_of(id), 8192);
+        assert!(a.test_bit(id));
+        assert_eq!(a.leaks(), vec![]);
+        let mut d3 = Staged::default();
+        a.release_object(&mut d3, std::slice::from_ref(&s));
+        let _ = a.to_alloc_draft(&d3);
+        assert_eq!(a.live_bytes_of(id), 0);
+        assert!(!a.test_bit(id));
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_exclusive_segment_release_clears_bitmap() -> Result<()> {
+        let a = Allocator::new(16);
+        let mut d = Staged::default();
+        let id = a.allocate(&mut d, 1)?[0];
+        a.mark_sealed(id);
+        let s = seg(id as u32, 0, 4096);
+        a.add_object(&mut d, std::slice::from_ref(&s));
+        a.rebuild_derived(vec![vec![s.clone()]]);
+        assert_eq!(a.shared_count(s.extent_id, s.offset, s.len), None);
+        let mut d2 = Staged::default();
+        a.release_object(&mut d2, std::slice::from_ref(&s));
+        let _ = a.to_alloc_draft(&d2);
+        assert_eq!(a.live_bytes_of(id), 0);
+        assert!(!a.test_bit(id));
+        assert_eq!(a.leaks(), vec![]);
         Ok(())
     }
 

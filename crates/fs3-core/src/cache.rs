@@ -130,7 +130,10 @@ impl ObjectCache {
 
     /// 插入(整对象字节);超出额度惰性淘汰最久未用。
     pub fn insert(&self, bucket: &str, key: &str, version: Option<&[u8; 16]>, bytes: Vec<u8>) {
-        if bytes.is_empty() || bytes.len() as u64 > self.config.max_object_size {
+        if bytes.is_empty()
+            || bytes.len() as u64 > self.config.max_object_size
+            || bytes.len() as u64 > self.config.max_bytes
+        {
             return;
         }
         let k = obj_key(bucket, key, version, bytes.len() as u64);

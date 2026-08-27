@@ -271,6 +271,18 @@ impl ZeroCopyIo {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn dup_fd(&self) -> Option<i32> {
+        self.zfd
+    }
+
+    fn close_dup(&mut self) {
+        if let Some(fd) = self.zfd.take() {
+            // SAFETY: fd 由 dup() 得到,仅本结构持有。
+            unsafe { libc::close(fd) };
+        }
+    }
+
     /// 派发零拷贝任务并等待完成(阻塞 sendfile 线程执行;此处仅挂起)。
     /// receiver 必须存入 self(跨 Pending 存活),否则唤醒丢失。
     fn dispatch_zc(
@@ -480,6 +492,12 @@ impl ZeroCopyIo {
     }
 }
 
+impl Drop for ZeroCopyIo {
+    fn drop(&mut self) {
+        self.close_dup();
+    }
+}
+
 impl AsyncRead for ZeroCopyIo {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -602,6 +620,50 @@ pub fn register_trusted_fd(fd: i32) {
     }
 }
 
+/// 设备移除/关闭后摘除,避免内核复用 fd 号被当成 sendfile 源。
+pub fn unregister_trusted_fd(fd: i32) {
+    TRUSTED_FDS.lock().unwrap().retain(|&x| x != fd);
+}
+
+#[cfg(test)]
+pub(crate) fn is_trusted_fd_for_test(fd: i32) -> bool {
+    is_trusted_fd(fd)
+}
+
 fn is_trusted_fd(fd: i32) -> bool {
     TRUSTED_FDS.lock().unwrap().contains(&fd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[tokio::test]
+    async fn zero_copy_io_drop_closes_dup_fd() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let ctx = ZeroCtx::new();
+        let zc = ZeroCopyIo::new(server, &ctx);
+        let fd = zc.dup_fd().expect("dup");
+        drop(zc);
+        let rc = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_eq!(rc, -1, "dup fd must be closed on Drop");
+        drop(client);
+    }
+
+    #[test]
+    fn trusted_fds_deregister_on_connection_drop() {
+        let fd = 424242;
+        register_trusted_fd(fd);
+        assert!(is_trusted_fd_for_test(fd));
+        unregister_trusted_fd(fd);
+        assert!(!is_trusted_fd_for_test(fd));
+        register_trusted_fd(fd);
+        unregister_trusted_fd(fd);
+        // 复用同号:摘除后不得仍信任
+        assert!(!is_trusted_fd_for_test(fd));
+    }
 }
