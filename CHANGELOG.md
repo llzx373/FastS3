@@ -5,6 +5,24 @@
 > 详细发布记录见 [RELEASES.md](./RELEASES.md);RC/GA 候选流程见
 > [docs/ga/rc-flow.md](./docs/ga/rc-flow.md)。
 
+## v2.2.1 — 审查修复:数据正确性与资源生命周期(2026-08-27)
+
+对 v2.2.0 的只读审查修复(TODO 审查修复 F0–G 全勾选);决策落盘 ADR-22
+(DESIGN.md §3.3);workspace + web 三件套版本 **2.2.1**。git tag /
+`tools/package/` 属执行期步骤(与 v1.x/v2.0/v2.2.0 同口径,**本版本不打 tag**)。
+
+- **ADR-22**:共享表值 = 持有者总数;Restore 大对象副本必须 `add_object` 入账,
+  GET 读明文副本;读钉扎 pin/unpin,压缩不得释放 pin>0 的 extent。
+- **账目**:COW 重建 off-by-one;multipart 分片重传/Complete 子集释放;
+  检查点截断 `a:`/`t:`;leaks 改为 mark-sweep。
+- **生命周期**:ZeroCopyIo Drop 关 dup fd;流式泵 Disconnected 退出;
+  GET/H3 准入 RAII;检查点 tick 有界且 `close` join;STS 过期删会话。
+- **半成品对齐**:Webhook HTTPS;归档/通知 Grafana 指标;LDAP bind 密码仅 env。
+- **S8 读钉扎(原债务 D1)**:生产默认与 s3-tests gate 开启压缩。
+- **门禁**:`cargo test --workspace` 全绿;崩溃 200 轮混载零撕裂;HTTP GET/close
+  1000 轮 fd 稳态;s3-tests 开压缩 `487/0/236`;clippy `-D warnings`;
+  llvm-cov 行 **84.41%**(相对 perf-M16 83.89% +0.52pt);cargo audit 0 漏洞。
+
 ## v2.2.0 — M16 归档与复制(2026-08-26)
 
 M16 全部任务与门禁完成(TODO.md M16 全勾选);决策落盘 ADR-19/ADR-20/ADR-21

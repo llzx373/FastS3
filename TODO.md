@@ -28,7 +28,7 @@
 
 | 里程碑 | 版本 | 工期(2 人并行) | 核心交付 | 状态 |
 | --- | --- | --- | --- | --- |
-| [审查修复 v2.2.1](#审查修复-v221-数据正确性与资源生命周期) | v2.2.1 | ≈2.5 周 | P0 损坏窗口 + fd/任务泄漏 + 账目泄漏 + S8 钉扎 + 半成品/门禁诚实化 | ⬜ 执行中 |
+| [审查修复 v2.2.1](#审查修复-v221-数据正确性与资源生命周期) | v2.2.1 | ≈2.5 周 | P0 损坏窗口 + fd/任务泄漏 + 账目泄漏 + S8 钉扎 + 半成品/门禁诚实化 | ✅ 完成(v2.2.1,2026-08-27) |
 | [M15 迁移即插即用](#m15-v210-迁移即插即用) | v2.1.0 | ≈6 周 | 事件通知(Webhook)+ STS 临时凭证 + Inventory + 存储类头矩阵 + 协议补完 | ✅ 完成(v2.1.0,2026-08-26) |
 | [M16 归档与复制](#m16-v220-归档与复制) | v2.2.0 | ≈5 周(主力组) | 归档存储类 + RestoreObject / 复制策略化 / LDAP·OpenID | ✅ 主力完成(2026-08-26);审查债务见 v2.2.1 |
 
@@ -194,7 +194,8 @@ F0 ADR-22
   - 用例:`bash tests/s3-tests/run_g4.sh`(`compaction_enabled=true`,4 路 xdist + 全局 ListBuckets 串行补跑);`passed=487 skipped=94 excluded_failures=236 unexpected_failures=0`;诚实断言 `g4_s3tests_gate_enables_compaction`
 - [x] G5 clippy -D warnings;覆盖率不回退 >1pt(相对 perf-M16 83.89% 口径);cargo audit 清零
   - 用例:`cargo clippy --workspace --all-targets -- -D warnings`;`cargo llvm-cov --workspace --summary-only` 行 **84.41%**(相对 83.89% +0.52pt);`cargo audit` 0 漏洞(2 条 allowed unmaintained,与 M16 同集);诚实断言 `g5_clippy_pin_and_coverage_baseline`
-- [ ] G6 发布 v2.2.1:CHANGELOG/RELEASES 记本审查修复(不打 tag,与既有口径一致);D1 勾选
+- [x] G6 发布 v2.2.1:CHANGELOG/RELEASES 记本审查修复(不打 tag,与既有口径一致);D1 勾选
+  - 用例:CHANGELOG/RELEASES `## v2.2.1`;workspace + console/server **2.2.1**;债务轨道 `- [x] D1 S8`;诚实断言 `g6_changelog_releases_v221_d1_no_tag`;`git tag` 无 v2.2.1
 
 ---
 

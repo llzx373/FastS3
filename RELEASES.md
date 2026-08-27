@@ -1,5 +1,28 @@
 # FastS3 发布记录
 
+## v2.2.1 — 审查修复:数据正确性与资源生命周期(2026-08-27)
+
+> 发布状态:与审查修复交付同步;git tag/发布流水线属执行期步骤(与 v2.2.0
+> 同口径,**本版本不打 tag**)。决策记录:ADR-22(docs/DESIGN.md §3.3)。
+
+### 变更(TODO 审查修复 F0–G 全项)
+
+- **ADR-22**:共享表持有者总数;Restore 副本入账 + GET 读副本;读钉扎
+  (pin 寿命 = 隔离期)。
+- **P0 损坏/泄漏窗口关闭**:COW 重建、Restore 账目、套接字/任务/准入、
+  multipart 重传与 Complete 子集、检查点截断、mark-sweep leaks、S8 压缩
+  × 流式读钉扎(原债务轨道 D1,F8-4 已勾选)。
+- **半成品对齐**:Webhook HTTPS、Grafana 指标、LDAP bind 仅环境变量。
+- **门禁实测**:
+  - `cargo test --workspace` 全绿(含泄漏/`in_flight` 断言);
+  - 崩溃 ≥200 轮混载(COW/restore/multipart/压缩 GET)零撕裂、leaks 空;
+  - HTTP GET/close 1000 轮 fd 相对基线稳态、`in_flight==0`;
+  - s3-tests:`bash tests/s3-tests/run_g4.sh` compaction_enabled=true,
+    487 passed / 0 unexpected / 236 文档化排除;
+  - clippy `-D warnings`;llvm-cov workspace 行 84.41%(相对 M16 83.89%
+    回退门禁 ≤1pt,实测 +0.52pt);cargo audit 0 漏洞(2 条 allowed
+    unmaintained,与 M16 同集)。
+
 ## v2.2.0 — M16 归档与复制(2026-08-26)
 
 > 发布状态:与 M16 交付同步;git tag/发布流水线属执行期步骤(与 v2.1.0

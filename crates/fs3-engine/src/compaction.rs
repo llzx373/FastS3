@@ -1288,6 +1288,34 @@ mod tests {
         );
     }
 
+    /// G6:CHANGELOG/RELEASES 记 v2.2.1;债务 D1 已勾;workspace 版本 bump;不在本仓库打 tag。
+    #[test]
+    fn g6_changelog_releases_v221_d1_no_tag() {
+        let cl = include_str!("../../../CHANGELOG.md");
+        assert!(
+            cl.contains("## v2.2.1 — 审查修复"),
+            "CHANGELOG 须有 v2.2.1 节"
+        );
+        assert!(
+            cl.contains("本版本不打 tag"),
+            "v2.2.1 须声明不打 tag"
+        );
+        let rel = include_str!("../../../RELEASES.md");
+        assert!(rel.contains("## v2.2.1 — 审查修复"));
+        assert!(rel.contains("本版本不打 tag"));
+        let cargo = include_str!("../../../Cargo.toml");
+        assert!(
+            cargo.contains("version = \"2.2.1\""),
+            "workspace.package.version = 2.2.1"
+        );
+        let todo = include_str!("../../../TODO.md");
+        assert!(
+            todo.contains("- [x] D1 S8"),
+            "G6 要求债务轨道 D1 保持勾选"
+        );
+        assert!(todo.contains("- [x] G6 发布 v2.2.1"));
+    }
+
     #[test]
     fn compaction_migrates_locked_object_keeps_retention() {
         // W4-1:压缩可搬锁定版本数据,不可当泄漏回收。
