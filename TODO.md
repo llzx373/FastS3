@@ -188,7 +188,8 @@ F0 ADR-22
   - 用例:`alloc_records_visible_until_explicit_checkpoint`;`pending_checkpoint_tick_truncates_alloc_log_on_first_put`(open tick 与首写 checkpoint 竞态);`zero_copy_io_drop_closes_dup_fd` 不以并行 F_GETFD 当权威
 - [x] G2 崩溃 ≥200 轮混载:**COW 复制+删副本+重启**、**大对象 restore+check+GET 副本**、**multipart 重传+subset complete**、压缩开启下大对象 GET(F8 后);零撕裂、`leaks` 空、账目零漂移
   - 用例:`g2_mixed_crash_reopen_200_rounds`;脚本 `tests/crash/run_crash_v221.sh`
-- [ ] G3 明文 HTTP 长跑(或集成循环 accept/GET/close ≥1000):进程 fd 计数相对基线稳态(允许 keep-alive 常驻,禁止线性涨)
+- [x] G3 明文 HTTP 长跑(或集成循环 accept/GET/close ≥1000):进程 fd 计数相对基线稳态(允许 keep-alive 常驻,禁止线性涨)
+  - 用例:`g3_http_get_close_1000_fd_steady`(in_flight==0, fd 相对基线 ≤+16)
 - [ ] G4 s3-tests 全量:意外失败 0;F8 后 gate 开压缩复跑一次
 - [ ] G5 clippy -D warnings;覆盖率不回退 >1pt(相对 perf-M16 83.89% 口径);cargo audit 清零
 - [ ] G6 发布 v2.2.1:CHANGELOG/RELEASES 记本审查修复(不打 tag,与既有口径一致);D1 勾选

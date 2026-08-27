@@ -1213,6 +1213,16 @@ mod tests {
         assert!(tests.contains("const ROUNDS: u32 = 200"));
     }
 
+    /// G3:明文 HTTP GET/close ≥1000 且 fd 稳态、in_flight==0。
+    #[test]
+    fn g3_http_fd_steady_case_exists() {
+        let t = include_str!("../../fs3-http/tests/http_integration.rs");
+        assert!(t.contains("fn g3_http_get_close_1000_fd_steady"));
+        assert!(t.contains("const N: usize = 1000"));
+        assert!(t.contains("in_flight"));
+        assert!(t.contains("proc_fd_count"));
+    }
+
     #[test]
     fn compaction_migrates_locked_object_keeps_retention() {
         // W4-1:压缩可搬锁定版本数据,不可当泄漏回收。

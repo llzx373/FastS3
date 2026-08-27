@@ -1259,3 +1259,91 @@ async fn notification_delivery_e2e() {
     }
     assert!(stats.snapshot().retried >= 1, "至少一次重试");
 }
+
+fn proc_fd_count() -> usize {
+    std::fs::read_dir("/proc/self/fd")
+        .map(|it| it.count())
+        .unwrap_or(0)
+}
+
+/// G3:明文 HTTP accept/GET/close ≥1000,fd 相对基线稳态,准入 in_flight==0。
+#[tokio::test]
+async fn g3_http_get_close_1000_fd_steady() {
+    let (_d, service) = setup();
+    let admission = fs3_http::Admission::new(1 << 30);
+    let adm_for_server = admission.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let svc = service.clone();
+            let adm = adm_for_server.clone();
+            tokio::spawn(async move {
+                let _ = fs3_http::serve_connection(
+                    svc,
+                    adm,
+                    stream,
+                    std::time::Duration::from_secs(5),
+                    std::time::Duration::from_secs(5),
+                    None,
+                    Arc::new(Vec::new()),
+                )
+                .await;
+            });
+        }
+    });
+
+    let host = format!("{addr}");
+    let hdrs = |method: &str, path: &str, extra: &[(&str, &str)], body: &[u8]| {
+        sigv4_headers(&host, method, path, &[], extra, body)
+    };
+
+    {
+        let mut client = RawClient::connect(addr).await;
+        let h = hdrs("PUT", "/g3-bucket", &[], b"");
+        let (status, _, body) = client
+            .send(render_request("PUT", "/g3-bucket", &h, b""))
+            .await;
+        assert_eq!(status, 200, "create bucket: {body:?}");
+        let data = b"g3-payload";
+        let h = hdrs(
+            "PUT",
+            "/g3-bucket/k",
+            &[("content-type", "text/plain")],
+            data,
+        );
+        let (status, _, _) = client
+            .send(render_request("PUT", "/g3-bucket/k", &h, data))
+            .await;
+        assert_eq!(status, 200);
+    }
+
+    let baseline = proc_fd_count();
+    const N: usize = 1000;
+    for i in 0..N {
+        let mut client = RawClient::connect(addr).await;
+        let mut h = hdrs("GET", "/g3-bucket/k", &[], b"");
+        // hop-by-hop,不得进 SigV4 签名头,否则 403。
+        h.push(("connection".into(), "close".into()));
+        let (status, _, body) = client
+            .send(render_request("GET", "/g3-bucket/k", &h, b""))
+            .await;
+        assert_eq!(status, 200, "GET {i}");
+        assert_eq!(body, b"g3-payload", "GET {i} body");
+        drop(client);
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let after = proc_fd_count();
+    assert_eq!(
+        admission.in_flight(),
+        0,
+        "in_flight must drain after {N} GET/close"
+    );
+    assert!(
+        after <= baseline + 16,
+        "fd must not grow linearly: baseline={baseline} after={after} delta={}",
+        after as i64 - baseline as i64
+    );
+}
+
