@@ -52,6 +52,19 @@ export interface Dashboard {
   healthy: boolean;
   alerts: string[];
   updatedAt: string;
+  /** Prometheus 附加组(缺席即未启用)。 */
+  extras: DashboardExtras;
+}
+
+export interface DashboardExtras {
+  lifecycleLastCycle?: number;
+  lifecycleDeleted?: number;
+  notificationQueue?: number;
+  notificationStalled?: boolean;
+  inventoryLastRun?: number;
+  restoreQueue?: number;
+  cacheHits?: number;
+  cacheMisses?: number;
 }
 
 export async function buildDashboard(admin: AdminClient): Promise<Dashboard> {
@@ -63,9 +76,17 @@ async function fetchStatusAndMetrics(admin: AdminClient): Promise<{
   status: Record<string, unknown>;
   metricsText: string;
 }> {
-  const status = (await admin.status()) as Record<string, unknown>;
-  const metricsText = await admin.metrics();
-  return { status, metricsText };
+  const [status, metricsText] = await Promise.all([admin.status(), admin.metrics()]);
+  return { status: status as Record<string, unknown>, metricsText };
+}
+
+/** 浏览器 WS 连上时立刻推最近一帧,避免空等 Rust 5s snapshot。 */
+export function lastDashboardFrame(history: {
+  latest(): MetricsSnapshot | null;
+}): string | null {
+  const last = history.latest();
+  if (!last) return null;
+  return JSON.stringify({ type: "dashboard", data: dashboardFromSnapshot(last) });
 }
 
 /** M13 M4-2:单盘容量视图(统一视图;控制台渲染 + >85% 告警)。 */
@@ -111,10 +132,12 @@ export function aggregateDashboard(
     }
   }
   const leaks = Number(status.leaks ?? 0);
-  if (leaks > 0) alerts.push(`泄漏扫描发现 ${leaks} 个孤儿 extent(运行 fasts3d check --fix)`);
-  if (Number(status.errors_total ?? 0) > 0) {
-    const rate = totalErrorRate(status, metricsText);
-    if (rate > 0.05) alerts.push(`错误率 ${(rate * 100).toFixed(1)}% > 5%`);
+  if (leaks > 0) alerts.push(`泄漏扫描发现 ${leaks} 个孤儿 extent(可在设置页执行修复)`);
+  const degraded = Boolean(status.degraded ?? false);
+  if (degraded) alerts.push("存储降级(degraded,只读)");
+  const rate5xx = serverErrorRate(status, metricsText);
+  if (rate5xx > 0.05) {
+    alerts.push(`5xx 占比 ${(rate5xx * 100).toFixed(1)}% > 5%`);
   }
 
   return {
@@ -139,7 +162,7 @@ export function aggregateDashboard(
     requests: {
       total: Number(status.requests_total ?? 0),
       errors: Number(status.errors_total ?? 0),
-      errorRate: totalErrorRate(status, metricsText),
+      errorRate: rate5xx,
       bytesRead: Number(status.bytes_read ?? 0),
       bytesWritten: Number(status.bytes_written ?? 0),
     },
@@ -156,22 +179,56 @@ export function aggregateDashboard(
       },
     },
     leaks,
-    healthy: leaks === 0 && Number(status.requests_total ?? 0) >= 0,
+    healthy: leaks === 0 && !degraded,
     alerts,
     updatedAt: new Date().toISOString(),
     devices,
-    degraded: Boolean(status.degraded ?? false),
+    degraded,
     poolCapacity: Number(status.pool_capacity ?? 0),
     poolLiveBytes: Number(status.pool_live_bytes ?? 0),
     poolUsage: Number(status.pool_usage ?? 0),
+    extras: parseDashboardExtras(metricsText),
   };
 }
 
-function totalErrorRate(status: Record<string, unknown>, metricsText: string): number {
+function parseDashboardExtras(text: string): DashboardExtras {
+  const num = (name: string): number | undefined => {
+    const m = new RegExp(`^${name}(?:\\{[^}]*\\})? (\\S+)`, "m").exec(text);
+    if (!m) return undefined;
+    const n = Number(m[1]);
+    return Number.isFinite(n) ? n : undefined;
+  };
+  const extras: DashboardExtras = {};
+  extras.lifecycleLastCycle = num("fasts3_lifecycle_last_cycle_timestamp");
+  extras.lifecycleDeleted = num("fasts3_lifecycle_deleted_objects_total");
+  extras.notificationQueue = num("fasts3_notification_queue_depth");
+  const stalled = num("fasts3_notification_delivery_stalled");
+  if (stalled !== undefined) extras.notificationStalled = stalled >= 1;
+  extras.inventoryLastRun = num("fasts3_inventory_last_run_timestamp");
+  extras.restoreQueue = num("fasts3_restore_queue_depth");
+  extras.cacheHits = num("fasts3_cache_hits_total");
+  extras.cacheMisses = num("fasts3_cache_misses_total");
+  return extras;
+}
+
+function countClass(metricsText: string, cls: "4xx" | "5xx"): number {
+  const re = new RegExp(
+    String.raw`fasts3_requests_total\{op="[^"]+",class="${cls}"\} (\d+)`,
+    "g"
+  );
+  let n = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(metricsText)) !== null) {
+    n += Number(m[1]);
+  }
+  return n;
+}
+
+/** 可用性错误率 = 5xx / 总请求(与 Grafana FastS3High5xxRate 同口径;4xx 如 NoSuchKey 不计)。 */
+function serverErrorRate(status: Record<string, unknown>, metricsText: string): number {
   const total = Number(status.requests_total ?? 0);
   if (total === 0) return 0;
-  const errs = Number(status.errors_total ?? 0);
-  return errs / total;
+  return countClass(metricsText, "5xx") / total;
 }
 
 /** 从 Prometheus 直方图文本解析 op= get/put 的 p50/p99/p999。 */
@@ -239,6 +296,7 @@ export function aggregateSnapshot(
   data.buckets = Number(status.buckets ?? 0);
   data.objects = Number(status.objects ?? 0);
   data.errors = Number(status.errors_total ?? 0);
+  data.errors_5xx = countClass(metricsText, "5xx");
   const ops = parseOpCounts(metricsText);
   data.ops = {
     put: ops.put ?? 0,
@@ -251,6 +309,11 @@ export function aggregateSnapshot(
   // 轮询拿不到分位 op 维度,快照延迟用 get 分位近似(WS 快照为单组分位)
   const lat = parseLatency(metricsText);
   data.latency = { p50: lat.get.p50, p99: lat.get.p99, p999: lat.get.p999 };
+  data.degraded = Boolean(status.degraded ?? false);
+  if (Array.isArray(status.devices)) data.devices = status.devices as Array<Record<string, unknown>>;
+  if (status.pool_capacity !== undefined) data.pool_capacity = Number(status.pool_capacity);
+  if (status.pool_live_bytes !== undefined) data.pool_live_bytes = Number(status.pool_live_bytes);
+  if (status.pool_usage !== undefined) data.pool_usage = Number(status.pool_usage);
   // ring_depth / group_commit / pools 仅 Rust WS snapshot 提供;轮询回退填 0/空
   return { t, data };
 }
@@ -260,15 +323,27 @@ export function dashboardFromSnapshot(s: MetricsSnapshot): Dashboard {
   const d: MetricsSnapshotData = s.data;
   const total = d.ops.put + d.ops.get + d.ops.del + d.ops.list + d.ops.multipart;
   const watermark = d.device_capacity > 0 ? d.device_used / d.device_capacity : 0;
+  const devices: DeviceView[] = Array.isArray(d.devices)
+    ? d.devices.map((raw) => ({
+        path: String(raw.path ?? ""),
+        capacity: Number(raw.capacity ?? 0),
+        extentSize: Number(raw.extent_size ?? 0),
+        extentCount: Number(raw.extent_count ?? 0),
+        allocatedExtents: Number(raw.allocated_extents ?? 0),
+        liveBytes: Number(raw.live_bytes ?? 0),
+        usage: Number(raw.usage ?? 0),
+        usagePercent: Number(raw.usage_percent ?? 0),
+        base: Number(raw.base ?? 0),
+      }))
+    : [];
   return {
     version: "ws",
     uptimeSecs: d.uptime,
-    // M13 M4-2:WS 快照不含逐盘视图;退化为空列表 + 单盘口径
-    devices: [],
+    devices,
     degraded: d.degraded,
-    poolCapacity: d.device_capacity,
-    poolLiveBytes: d.device_used,
-    poolUsage: Math.round(watermark * 10000) / 10000,
+    poolCapacity: Number(d.pool_capacity ?? d.device_capacity),
+    poolLiveBytes: Number(d.pool_live_bytes ?? d.device_used),
+    poolUsage: Number(d.pool_usage ?? Math.round(watermark * 10000) / 10000),
     node: {
       device: "",
       ioEngine: "ws",
@@ -288,7 +363,7 @@ export function dashboardFromSnapshot(s: MetricsSnapshot): Dashboard {
     requests: {
       total,
       errors: d.errors,
-      errorRate: total > 0 ? d.errors / total : 0,
+      errorRate: total > 0 ? (d.errors_5xx ?? 0) / total : 0,
       bytesRead: d.bytes.in,
       bytesWritten: d.bytes.out,
     },
@@ -300,5 +375,6 @@ export function dashboardFromSnapshot(s: MetricsSnapshot): Dashboard {
     healthy: !d.degraded,
     alerts: d.degraded ? ["存储降级(degraded)"] : [],
     updatedAt: new Date(s.t * 1000).toISOString(),
+    extras: {},
   };
 }

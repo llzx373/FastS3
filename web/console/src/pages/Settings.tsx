@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, type AdminConfig, type ConfigPatchResult } from "../api";
+import { api, fmtTime, type AdminConfig, type ConfigPatchResult, type IdentityEvent, type LdapStatus } from "../api";
 
 const SYNC_MODES = ["group", "full", "none"] as const;
 const ETAG_MODES = ["md5", "crc32c"] as const;
@@ -17,6 +17,7 @@ interface Draft {
   tls_key: string;
   key_rps: string;
   log_level: string;
+  allow_anonymous: boolean;
 }
 
 const emptyDraft = (): Draft => ({
@@ -30,6 +31,7 @@ const emptyDraft = (): Draft => ({
   tls_key: "",
   key_rps: "0",
   log_level: "info",
+  allow_anonymous: false,
 });
 
 /** 展示校验错误,返回是否可提交。 */
@@ -72,6 +74,7 @@ export default function Settings() {
         tls_key: c.server?.tls_key ?? "",
         key_rps: String(c.limits?.key_rps ?? 0),
         log_level: c.log_level ?? "info",
+        allow_anonymous: c.auth?.allow_anonymous ?? false,
       });
       setValidErr([]);
       setError(null);
@@ -107,6 +110,7 @@ export default function Settings() {
         },
         limits: { key_rps: Number(draft.key_rps) },
         log_level: draft.log_level,
+        auth: { allow_anonymous: draft.allow_anonymous },
       };
       const r = await api.updateConfig(patch);
       setResult(r);
@@ -302,10 +306,19 @@ export default function Settings() {
                 </select>
               </div>
               {config.auth && (
-                <p className="muted" style={{ fontSize: 12, marginTop: 10 }}>
-                  region = {config.auth.region ?? "us-east-1"} · allow_anonymous ={" "}
-                  {String(config.auth.allow_anonymous ?? false)}(只读展示)
-                </p>
+                <div className="form-row" style={{ marginTop: 10, marginBottom: 0 }}>
+                  <label style={{ display: "flex", alignItems: "center", gap: 6, margin: 0 }}>
+                    <input
+                      type="checkbox"
+                      checked={draft.allow_anonymous}
+                      onChange={(e) => set("allow_anonymous", e.target.checked)}
+                    />
+                    allow_anonymous(匿名读;热生效)
+                  </label>
+                  <p className="muted" style={{ fontSize: 12, margin: "6px 0 0" }}>
+                    region = {config.auth.region ?? "us-east-1"}
+                  </p>
+                </div>
               )}
             </div>
           </div>
@@ -315,8 +328,150 @@ export default function Settings() {
               设备:{config.storage!.devices!.join(", ")} · 元数据目录:{config.storage!.meta_dir ?? "—"}(只读展示)
             </p>
           )}
+
+          <OpsPanels />
         </>
       )}
+    </div>
+  );
+}
+
+function OpsPanels() {
+  const [sse, setSse] = useState<Record<string, unknown> | null>(null);
+  const [sseErr, setSseErr] = useState<string | null>(null);
+  const [devicePath, setDevicePath] = useState("");
+  const [deviceForce, setDeviceForce] = useState(false);
+  const [deviceMsg, setDeviceMsg] = useState<string | null>(null);
+  const [repairMsg, setRepairMsg] = useState<string | null>(null);
+  const [ldap, setLdap] = useState<LdapStatus | null>(null);
+  const [events, setEvents] = useState<IdentityEvent[]>([]);
+  const [busy, setBusy] = useState(false);
+
+  const loadOps = useCallback(async () => {
+    try {
+      const [s, l, ev] = await Promise.all([
+        api.sseStatus().catch(() => null),
+        api.ldapStatus().catch(() => null),
+        api.identityEvents(50).catch(() => ({ events: [] as IdentityEvent[] })),
+      ]);
+      setSse(s);
+      setLdap(l);
+      setEvents(ev.events ?? []);
+    } catch (e) {
+      setSseErr((e as Error).message);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadOps();
+  }, [loadOps]);
+
+  return (
+    <div className="grid" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))", marginTop: 16 }}>
+      <div className="card">
+        <div className="title">泄漏修复</div>
+        <p className="muted" style={{ fontSize: 12 }}>
+          扫描并回收孤儿 extent;进行中的写入占用会被跳过。
+        </p>
+        <button
+          disabled={busy}
+          onClick={async () => {
+            if (!confirm("确认执行泄漏修复?")) return;
+            setBusy(true);
+            try {
+              const r = await api.repair();
+              setRepairMsg(
+                `回收 ${r.freed_extents} extents / ${r.bytes_reclaimed} 字节(发现 ${r.leaks_found},跳过 ${r.skipped_locked})`
+              );
+            } catch (e) {
+              setRepairMsg((e as Error).message);
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          执行 repair
+        </button>
+        {repairMsg && <p className="muted" style={{ fontSize: 12, marginTop: 8 }}>{repairMsg}</p>}
+      </div>
+
+      <div className="card">
+        <div className="title">SSE 密钥</div>
+        {sseErr && <div className="alert">{sseErr}</div>}
+        <pre className="muted" style={{ fontSize: 12, whiteSpace: "pre-wrap" }}>
+          {sse ? JSON.stringify(sse, null, 2) : "加载中或不可用"}
+        </pre>
+        <button
+          className="ghost"
+          disabled={busy}
+          onClick={async () => {
+            if (!confirm("轮换 SSE 主密钥?新写入使用新密钥,旧对象仍用旧密钥解密。")) return;
+            setBusy(true);
+            try {
+              setSse(await api.sseRotate());
+              setSseErr(null);
+            } catch (e) {
+              setSseErr((e as Error).message);
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          轮换密钥
+        </button>
+      </div>
+
+      <div className="card">
+        <div className="title">在线加盘</div>
+        <div className="form-row">
+          <label>设备路径</label>
+          <input value={devicePath} onChange={(e) => setDevicePath(e.target.value)} placeholder="/dev/nvme1n1" />
+        </div>
+        <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+          <input type="checkbox" checked={deviceForce} onChange={(e) => setDeviceForce(e.target.checked)} />
+          force(忽略非空盘检查)
+        </label>
+        <button
+          disabled={busy || !devicePath.trim()}
+          onClick={async () => {
+            setBusy(true);
+            try {
+              const r = await api.deviceAdd(devicePath.trim(), deviceForce);
+              setDeviceMsg(JSON.stringify(r));
+            } catch (e) {
+              setDeviceMsg((e as Error).message);
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          添加设备
+        </button>
+        {deviceMsg && <p className="muted" style={{ fontSize: 12, marginTop: 8 }}>{deviceMsg}</p>}
+      </div>
+
+      <div className="card">
+        <div className="title">LDAP / 身份事件</div>
+        {ldap ? (
+          <p className="muted" style={{ fontSize: 12 }}>
+            {ldap.enabled ? "已启用" : "未启用"} · 上次同步 {ldap.last_sync_at ? fmtTime(ldap.last_sync_at) : "—"} ·{" "}
+            {ldap.last_ok ? "成功" : ldap.last_error || "失败"} · 组 {ldap.groups?.length ?? 0} · 密钥 {ldap.keys_total}
+          </p>
+        ) : (
+          <p className="muted" style={{ fontSize: 12 }}>LDAP 状态不可用</p>
+        )}
+        <div className="toolbar">
+          <button className="ghost" onClick={() => void loadOps()}>
+            刷新
+          </button>
+        </div>
+        {events.slice(0, 12).map((ev, i) => (
+          <div key={i} className="muted" style={{ fontSize: 12 }}>
+            {fmtTime(ev.ts)} {ev.source} {ev.action} {ev.detail}
+          </div>
+        ))}
+        {events.length === 0 && <p className="muted" style={{ fontSize: 12 }}>暂无身份事件</p>}
+      </div>
     </div>
   );
 }

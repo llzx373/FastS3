@@ -24,6 +24,8 @@ export default function Dashboard() {
   const [dash, setDash] = useState<Dash | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [wsMode, setWsMode] = useState<boolean | null>(null);
+  const [repairing, setRepairing] = useState(false);
+  const [repairMsg, setRepairMsg] = useState<string | null>(null);
   const chartRef = useRef<HTMLDivElement>(null);
   const plotRef = useRef<uPlot | null>(null);
 
@@ -98,6 +100,9 @@ export default function Dashboard() {
       }
     };
 
+    // 首屏立刻走 REST:浏览器 WS 只转发 Rust 5s 快照,连上后可能空等一整拍。
+    void load();
+
     // REVIEW §4.15:优先 WebSocket /api/ws(推帧形状 {"type":"dashboard",
     // "data":Dashboard});未连接/断开时回退 5s 轮询(与 Node 侧回退一致)。
     try {
@@ -112,7 +117,7 @@ export default function Dashboard() {
         try {
           const frame = JSON.parse(ev.data as string) as { type?: string; data?: Dash };
           if (frame.type === "dashboard" && frame.data) {
-            setDash(frame.data);
+            setDash((prev) => mergeWsDashboard(prev, frame.data as Dash));
             setError(null);
             append(Date.now() / 1000, frame.data, true);
           }
@@ -131,7 +136,6 @@ export default function Dashboard() {
     }
 
     if (!ws) {
-      load();
       const iv = setInterval(load, 5000);
       return () => {
         alive = false;
@@ -183,6 +187,23 @@ export default function Dashboard() {
     }
   };
 
+  const doRepair = async () => {
+    if (!confirm("确认扫描并回收孤儿 extent?进行中的写入占用的 extent 会被跳过。")) return;
+    setRepairing(true);
+    try {
+      const r = await api.repair();
+      setRepairMsg(
+        `回收 ${r.freed_extents} extents / ${fmtBytes(r.bytes_reclaimed)}(发现 ${r.leaks_found},跳过锁定 ${r.skipped_locked})`
+      );
+      setDash(await api.dashboard());
+      setError(null);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setRepairing(false);
+    }
+  };
+
   if (error && !dash) {
     return (
       <div>
@@ -217,14 +238,31 @@ export default function Dashboard() {
       {dash.alerts.map((a, i) => (
         <div key={i} className="alert warn">
           ⚠ {a}
+          {a.includes("孤儿") && (
+            <>
+              {" "}
+              <button
+                className="ghost small"
+                disabled={repairing}
+                onClick={() => void doRepair()}
+              >
+                {repairing ? "修复中…" : "立即修复"}
+              </button>
+            </>
+          )}
         </div>
       ))}
+      {repairMsg && (
+        <div className="alert" style={{ color: "#4ade80", borderColor: "#4ade80" }}>
+          ✓ {repairMsg}
+        </div>
+      )}
       <div className="grid">
         <div className="card">
           <div className="title">健康状态</div>
           <div className="big">
             <span className={`dot ${dash.healthy ? "ok" : "bad"}`} />
-            {dash.healthy ? "正常" : "异常"}
+            {dash.healthy ? "正常" : dash.degraded ? "降级" : "异常"}
           </div>
           <div className="sub">v{dash.version} · 运行 {uptime}</div>
         </div>
@@ -233,6 +271,7 @@ export default function Dashboard() {
           <div className="big">{wmPct}%</div>
           <div className="sub">
             {fmtBytes(dash.node.liveBytes)} / {fmtBytes(dash.node.deviceCapacity)}
+            {dash.poolCapacity ? ` · 池 ${fmtBytes(dash.poolLiveBytes ?? 0)} / ${fmtBytes(dash.poolCapacity)}` : ""}
           </div>
         </div>
         <div className="card">
@@ -243,7 +282,7 @@ export default function Dashboard() {
         <div className="card">
           <div className="title">请求 / 错误</div>
           <div className="big">{dash.requests.total.toLocaleString()}</div>
-          <div className="sub">错误率 {rate}% · 泄漏 {dash.leaks}</div>
+          <div className="sub">5xx {rate}% · 4xx/5xx {dash.requests.errors} · 泄漏 {dash.leaks}</div>
         </div>
       </div>
       <div className="grid">
@@ -270,11 +309,111 @@ export default function Dashboard() {
           <div className="sub">读 {fmtBytes(dash.requests.bytesRead)} · 写 {fmtBytes(dash.requests.bytesWritten)}</div>
         </div>
       </div>
+      {(dash.devices?.length ?? 0) > 0 && (
+        <>
+          <h2>设备水位</h2>
+          <div className="grid">
+            {dash.devices!.map((d) => (
+              <div className="card" key={`${d.path}:${d.base}`}>
+                <div className="title mono" style={{ fontSize: 13 }}>
+                  {d.path}
+                </div>
+                <div className="big">{d.usagePercent.toFixed(1)}%</div>
+                <div className="sub">
+                  {fmtBytes(d.liveBytes)} / {fmtBytes(d.capacity)} · {d.allocatedExtents}/{d.extentCount} extents
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+      {dash.extras && hasDashboardExtras(dash.extras) && (
+        <>
+          <h2>后台作业</h2>
+          <div className="grid">
+            {dash.extras.lifecycleLastCycle !== undefined && (
+              <div className="card">
+                <div className="title">生命周期</div>
+                <div className="sub">
+                  上次周期 {dash.extras.lifecycleLastCycle > 0 ? new Date(dash.extras.lifecycleLastCycle * 1000).toLocaleString() : "尚未运行"}
+                  {dash.extras.lifecycleDeleted !== undefined ? ` · 已删 ${dash.extras.lifecycleDeleted}` : ""}
+                </div>
+              </div>
+            )}
+            {dash.extras.notificationQueue !== undefined && (
+              <div className="card">
+                <div className="title">通知队列</div>
+                <div className="big">{dash.extras.notificationQueue}</div>
+                <div className="sub">{dash.extras.notificationStalled ? "投递停滞" : "正常"}</div>
+              </div>
+            )}
+            {dash.extras.restoreQueue !== undefined && (
+              <div className="card">
+                <div className="title">归档恢复队列</div>
+                <div className="big">{dash.extras.restoreQueue}</div>
+              </div>
+            )}
+            {(dash.extras.cacheHits !== undefined || dash.extras.cacheMisses !== undefined) && (
+              <div className="card">
+                <div className="title">读缓存</div>
+                <div className="sub">
+                  hit {dash.extras.cacheHits ?? 0} · miss {dash.extras.cacheMisses ?? 0}
+                </div>
+              </div>
+            )}
+            {dash.extras.inventoryLastRun !== undefined && (
+              <div className="card">
+                <div className="title">清单</div>
+                <div className="sub">
+                  上次 {dash.extras.inventoryLastRun > 0 ? new Date(dash.extras.inventoryLastRun * 1000).toLocaleString() : "尚未运行"}
+                </div>
+              </div>
+            )}
+          </div>
+        </>
+      )}
       <h2>实时吞吐(5s 采样,最近 10 分钟)</h2>
       <div className="card">
         <div ref={chartRef} />
       </div>
     </div>
+  );
+}
+
+function mergeWsDashboard(prev: Dash | null, next: Dash): Dash {
+  if (!prev) return next;
+  // WS 快照(尤其旧 fasts3d)常缺 devices/extras,且把 node.device 置空;
+  // 整页替换会让「设备水位」闪一下再消失。缺字段时保留 REST 首屏。
+  const devices = next.devices && next.devices.length > 0 ? next.devices : prev.devices;
+  const extras =
+    next.extras && hasDashboardExtras(next.extras) ? next.extras : prev.extras;
+  const sparseNode = !next.node.device || next.node.ioEngine === "ws";
+  const node = sparseNode
+    ? {
+        ...prev.node,
+        liveBytes: next.node.liveBytes || prev.node.liveBytes,
+        deviceCapacity: next.node.deviceCapacity || prev.node.deviceCapacity,
+        watermark: next.node.watermark || prev.node.watermark,
+      }
+    : next.node;
+  return {
+    ...next,
+    version: next.version === "ws" ? prev.version : next.version,
+    devices,
+    extras,
+    node,
+  };
+}
+
+function hasDashboardExtras(e: NonNullable<Dash["extras"]>): boolean {
+  return (
+    e.lifecycleLastCycle !== undefined ||
+    e.lifecycleDeleted !== undefined ||
+    e.notificationQueue !== undefined ||
+    e.restoreQueue !== undefined ||
+    e.cacheHits !== undefined ||
+    e.cacheMisses !== undefined ||
+    e.inventoryLastRun !== undefined
   );
 }
 

@@ -14,6 +14,8 @@ const KIND_LABEL: Record<string, string> = {
 
 export default function CenterDashboard({ onError }: { onError: (e: string) => void }) {
   const [nodes, setNodes] = useState<CenterNode[] | null>(null);
+  const [detailId, setDetailId] = useState<string | null>(null);
+  const [metrics, setMetrics] = useState<string | null>(null);
 
   const load = async () => {
     try {
@@ -21,6 +23,17 @@ export default function CenterDashboard({ onError }: { onError: (e: string) => v
       setNodes(r.nodes);
     } catch (e) {
       onError((e as Error).message);
+    }
+  };
+
+  const openNode = async (id: string) => {
+    setDetailId(id);
+    setMetrics(null);
+    try {
+      const n = await centerApi.node(id);
+      setMetrics(n.metrics_text || "(无 metrics_text)");
+    } catch (e) {
+      setMetrics((e as Error).message);
     }
   };
   useEffect(() => {
@@ -48,7 +61,7 @@ export default function CenterDashboard({ onError }: { onError: (e: string) => v
             n.apply_state.pending > 0 ? 0 : 0; // 占位;账本视图在「下发管理」
           void kindCount;
           return (
-            <div className="card" key={n.node_id}>
+            <div className="card" key={n.node_id} onClick={() => void openNode(n.node_id)} style={{ cursor: "pointer" }}>
               <div className="title" style={{ display: "flex", justifyContent: "space-between" }}>
                 <span>{n.node_id}</span>
                 <span>
@@ -90,6 +103,18 @@ export default function CenterDashboard({ onError }: { onError: (e: string) => v
           );
         })}
       </div>
+      {detailId && (
+        <div className="card" style={{ marginTop: 12 }}>
+          <div className="title">节点 {detailId} · Prometheus 文本</div>
+          <button className="ghost small" onClick={() => { setDetailId(null); setMetrics(null); }}>
+            关闭
+          </button>
+          <pre style={{ maxHeight: 320, overflow: "auto", fontSize: 11, whiteSpace: "pre-wrap" }}>
+            {(metrics ?? "加载中…").slice(0, 8000)}
+            {(metrics?.length ?? 0) > 8000 ? "\n…(已截断)" : ""}
+          </pre>
+        </div>
+      )}
       <div className="card" style={{ marginTop: 12 }}>
         <div className="title">下发类型</div>
         <div className="sub">

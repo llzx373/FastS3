@@ -123,4 +123,12 @@ redirect = http://localhost:8080
 EOF
 
 echo "serve pid=$SVC_PID listen=127.0.0.1:$SPORT compaction_enabled=true"
-S3TEST_CONF="$S3TESTS/s3tests.conf" bash "$ROOT/tests/s3-tests/run_s3tests.sh"
+GATE_RC=0
+S3TEST_CONF="$S3TESTS/s3tests.conf" bash "$ROOT/tests/s3-tests/run_s3tests.sh" || GATE_RC=$?
+if [ -n "${S3TESTS_ARTIFACT_DIR:-}" ]; then
+    mkdir -p "$S3TESTS_ARTIFACT_DIR"
+    cp -f "$WORK/serve.log" "$S3TESTS_ARTIFACT_DIR/serve.log" 2>/dev/null || true
+    printf 'gate_rc=%s\nlisten=127.0.0.1:%s\ncompaction_enabled=true\n' "$GATE_RC" "$SPORT" \
+        > "$S3TESTS_ARTIFACT_DIR/gate.env"
+fi
+exit "$GATE_RC"

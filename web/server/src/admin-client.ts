@@ -41,6 +41,12 @@ export interface AdminApi {
   }>;
   sessions(): Promise<{ sessions: SessionInfo[] }>;
   revokeSession(sessionId: string): Promise<Record<string, unknown>>;
+  /** SSE-S3 KEK 状态(零密钥材料)。 */
+  sseStatus(): Promise<Record<string, unknown>>;
+  /** SSE-S3 KEK 轮换 + 后台重包裹。 */
+  sseRotate(): Promise<Record<string, unknown>>;
+  /** 在线加盘。 */
+  deviceAdd(path: string, force?: boolean): Promise<Record<string, unknown>>;
 }
 
 /** 审计查询过滤(J5:与 limit 并存的 query 参数,全部转发 Rust 侧)。 */
@@ -344,6 +350,18 @@ export class AdminClient implements AdminApi {
 
   revokeSession(sessionId: string): Promise<Record<string, unknown>> {
     return this.expect("DELETE", `/v1/admin/sessions/${encodeURIComponent(sessionId)}`);
+  }
+
+  sseStatus(): Promise<Record<string, unknown>> {
+    return this.expect("GET", "/v1/admin/sse/status");
+  }
+
+  sseRotate(): Promise<Record<string, unknown>> {
+    return this.expect("POST", "/v1/admin/sse/rotate");
+  }
+
+  deviceAdd(path: string, force = false): Promise<Record<string, unknown>> {
+    return this.expect("POST", "/v1/admin/devices/add", { path, force });
   }
 }
 

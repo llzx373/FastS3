@@ -178,9 +178,17 @@ impl Metrics {
         self.total.load(Ordering::Relaxed)
     }
 
-    /// 总错误量。
+    /// 总错误量(4xx+5xx;仪表盘可用性请用 5xx 计数)。
     pub fn total_errors(&self) -> u64 {
         self.total_errors.load(Ordering::Relaxed)
+    }
+
+    /// 5xx 请求量(与 Grafana FastS3High5xxRate 同口径)。
+    pub fn total_5xx(&self) -> u64 {
+        Op::ALL
+            .iter()
+            .map(|op| self.request_count(*op, StatusClass::Server))
+            .sum()
     }
 
     pub fn bytes_read(&self) -> u64 {
@@ -327,6 +335,7 @@ mod tests {
         assert_eq!(m.request_count(Op::Get, StatusClass::Client), 1);
         assert_eq!(m.total_requests(), 4);
         assert_eq!(m.total_errors(), 1);
+        assert_eq!(m.total_5xx(), 0);
         // p50 ≤ 4ms(两个 1ms/3ms 请求)
         assert!(m.latency_quantile(Op::Get, 0.5) <= 0.004);
         // p100 = 16ms 桶(10ms 落 16ms 桶)

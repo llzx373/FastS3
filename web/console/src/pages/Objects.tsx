@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, fmtBytes, type ListResult, type BucketInfo, type ObjectVersion, type S3Tag, type ObjectRetention } from "../api";
+import { api, fmtBytes, type ListResult, type BucketInfo, type ObjectVersion, type S3Tag, type ObjectRetention, type ObjectHead } from "../api";
 
 const PART_SIZE = 8 * 1024 * 1024; // 8MiB/片(>5MiB 下限)
+const STORAGE_CLASSES = ["STANDARD", "GLACIER_IR", "GLACIER", "DEEP_ARCHIVE"] as const;
 
 interface UploadTask {
   name: string;
@@ -30,14 +31,31 @@ export default function Objects() {
   } | null>(null);
   const [copyKey, setCopyKey] = useState<string | null>(null);
   const [copyDest, setCopyDest] = useState("");
+  const [copyDestBucket, setCopyDestBucket] = useState("");
+  const [selected, setSelected] = useState<string[]>([]);
+  const [uploadClass, setUploadClass] = useState("STANDARD");
+  const [sseKey, setSseKey] = useState("");
+  const [restoreKey, setRestoreKey] = useState<string | null>(null);
+  const [restoreDays, setRestoreDays] = useState("1");
+  const [restoreTier, setRestoreTier] = useState("Standard");
   const fileInput = useRef<HTMLInputElement>(null);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (token?: string) => {
     if (!bucket) return;
     setBusy(true);
     try {
-      const r = await api.listObjects(bucket, prefix);
-      setList(r);
+      const r = await api.listObjects(bucket, prefix, token);
+      setList((prev) => {
+        if (!token || !prev) return r;
+        const seen = new Set(prev.objects.map((o) => o.key));
+        const seenP = new Set(prev.prefixes);
+        return {
+          ...r,
+          objects: [...prev.objects, ...r.objects.filter((o) => !seen.has(o.key))],
+          prefixes: [...prev.prefixes, ...r.prefixes.filter((p) => !seenP.has(p))],
+        };
+      });
+      if (!token) setSelected([]);
       setError(null);
     } catch (e) {
       setError((e as Error).message);
@@ -65,13 +83,17 @@ export default function Objects() {
       setTasks((ts) => ts.map((t) => (t === task ? { ...t, progress: p, ...s } : t)));
     try {
       const key = prefix + file.name;
+      const extra = {
+        storageClass: uploadClass !== "STANDARD" ? uploadClass : undefined,
+        sseCustomerKey: sseKey.trim() || undefined,
+      };
       if (file.size <= PART_SIZE) {
-        const u = await api.presign(bucket, key, "PUT", 3600, file.type || "application/octet-stream");
+        const u = await api.presign(bucket, key, "PUT", 3600, file.type || "application/octet-stream", undefined, undefined, extra);
         await fetch(u.url, { method: "PUT", body: file, headers: u.headers });
         update(100, { status: "done" });
       } else {
         // multipart:init → 每片预签名(带 uploadId/partNumber,命中 UploadPart)直传 → complete
-        const { uploadId } = await api.multipartInit(bucket, key);
+        const { uploadId } = await api.multipartInit(bucket, key, extra.storageClass);
         const partCount = Math.ceil(file.size / PART_SIZE);
         const parts: { etag: string; partNumber: number }[] = [];
         for (let i = 1; i <= partCount; i++) {
@@ -113,14 +135,18 @@ export default function Objects() {
     }
   };
 
-  /** M16 A4-1:归档对象手动恢复(默认 1 天 Standard;后台作业,ongoing/
-   * expiry 由后续列表/详情中的 x-amz-restore 回显)。 */
-  const restoreArchive = async (key: string) => {
-    if (!bucket) return;
-    if (!window.confirm(`恢复归档对象 ${key}?(1 天,Standard 档)`)) return;
+  /** 归档对象手动恢复(Days 1–365,Tier Expedited/Standard/Bulk)。 */
+  const restoreArchive = async () => {
+    if (!bucket || !restoreKey) return;
+    const days = Number(restoreDays);
+    if (!Number.isInteger(days) || days < 1 || days > 365) {
+      setError("恢复天数须为 1–365 的整数");
+      return;
+    }
     setBusy(true);
     try {
-      await api.restoreObject(bucket, key, 1, "Standard");
+      await api.restoreObject(bucket, restoreKey, days, restoreTier);
+      setRestoreKey(null);
       setError(null);
       await load();
     } catch (e) {
@@ -143,9 +169,25 @@ export default function Objects() {
   const doCopy = async () => {
     if (!copyKey || !copyDest) return;
     try {
-      await api.objectAction(bucket, "copy", copyKey, copyDest);
+      await api.objectAction(bucket, "copy", copyKey, copyDest, copyDestBucket || bucket);
       setCopyKey(null);
       setCopyDest("");
+      setCopyDestBucket("");
+      await load();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
+
+  const toggleSel = (key: string) => {
+    setSelected((s) => (s.includes(key) ? s.filter((k) => k !== key) : [...s, key]));
+  };
+
+  const deleteSelected = async () => {
+    if (selected.length === 0) return;
+    if (!confirm(`批量删除 ${selected.length} 个对象?`)) return;
+    try {
+      await api.objectAction(bucket, "deleteMany", "", undefined, undefined, selected);
       await load();
     } catch (e) {
       setError((e as Error).message);
@@ -170,10 +212,29 @@ export default function Objects() {
             </option>
           ))}
         </select>
-        <button className="ghost" onClick={load} disabled={!bucket || busy}>
+        <button className="ghost" onClick={() => void load()} disabled={!bucket || busy}>
           刷新
         </button>
+        {selected.length > 0 && (
+          <button className="danger" onClick={() => void deleteSelected()}>
+            删除所选({selected.length})
+          </button>
+        )}
         <div className="spacer" />
+        <select value={uploadClass} onChange={(e) => setUploadClass(e.target.value)} title="上传存储类">
+          {STORAGE_CLASSES.map((c) => (
+            <option key={c} value={c}>
+              {c}
+            </option>
+          ))}
+        </select>
+        <input
+          value={sseKey}
+          onChange={(e) => setSseKey(e.target.value)}
+          placeholder="SSE-C 密钥(32B base64,可选)"
+          style={{ width: 220 }}
+          spellCheck={false}
+        />
         <button onClick={() => fileInput.current?.click()}>上传文件</button>
         <input
           ref={fileInput}
@@ -238,6 +299,15 @@ export default function Objects() {
             <table>
               <thead>
                 <tr>
+                  <th style={{ width: 32 }}>
+                    <input
+                      type="checkbox"
+                      checked={!!list && list.objects.length > 0 && selected.length === list.objects.length}
+                      onChange={(e) =>
+                        setSelected(e.target.checked ? (list?.objects.map((o) => o.key) ?? []) : [])
+                      }
+                    />
+                  </th>
                   <th>名称</th>
                   <th>大小</th>
                   <th>ETag</th>
@@ -249,6 +319,7 @@ export default function Objects() {
               <tbody>
                 {list?.prefixes.map((p) => (
                   <tr key={p}>
+                    <td />
                     <td>
                       <a onClick={() => navTo(p)}>📁 {p.replace(prefix, "")}</a>
                     </td>
@@ -256,10 +327,14 @@ export default function Objects() {
                     <td className="muted">—</td>
                     <td className="muted">—</td>
                     <td />
+                    <td />
                   </tr>
                 ))}
                 {list?.objects.map((o) => (
                   <tr key={o.key}>
+                    <td>
+                      <input type="checkbox" checked={selected.includes(o.key)} onChange={() => toggleSel(o.key)} />
+                    </td>
                     <td className="mono">{o.key.replace(prefix, "")}</td>
                     <td>{fmtBytes(o.size)}</td>
                     <td className="mono muted" style={{ fontSize: 12 }}>
@@ -282,11 +357,25 @@ export default function Objects() {
                       {o.storageClass === "GLACIER" ||
                       o.storageClass === "DEEP_ARCHIVE" ||
                       o.storageClass === "GLACIER_IR" ? (
-                        <button className="ghost small" onClick={() => restoreArchive(o.key)}>
+                        <button
+                          className="ghost small"
+                          onClick={() => {
+                            setRestoreKey(o.key);
+                            setRestoreDays("1");
+                            setRestoreTier("Standard");
+                          }}
+                        >
                           恢复
                         </button>
                       ) : null}{" "}
-                      <button className="ghost small" onClick={() => setCopyKey(o.key)}>
+                      <button
+                        className="ghost small"
+                        onClick={() => {
+                          setCopyKey(o.key);
+                          setCopyDest(o.key);
+                          setCopyDestBucket(bucket);
+                        }}
+                      >
                         复制
                       </button>{" "}
                       <button className="ghost small" onClick={() => setMetaObj({ bucket, key: o.key, size: o.size, etag: o.etag, lastModified: o.lastModified })}>
@@ -300,17 +389,17 @@ export default function Objects() {
                 ))}
                 {list && list.objects.length === 0 && list.prefixes.length === 0 && (
                   <tr>
-                    <td colSpan={5} className="muted">
+                    <td colSpan={7} className="muted">
                       空目录
                     </td>
                   </tr>
                 )}
               </tbody>
             </table>
-            {list?.isTruncated && (
+            {list?.isTruncated && list.nextContinuationToken && (
               <div className="toolbar" style={{ marginTop: 10 }}>
-                <button className="ghost" onClick={() => setList(null)}>
-                  <span className="muted">列表已截断(当前目录含更多条目)</span>
+                <button className="ghost" disabled={busy} onClick={() => void load(list.nextContinuationToken ?? undefined)}>
+                  加载更多
                 </button>
               </div>
             )}
@@ -327,6 +416,16 @@ export default function Objects() {
               <input value={copyKey} disabled />
             </div>
             <div className="form-row">
+              <label>目标桶</label>
+              <select value={copyDestBucket || bucket} onChange={(e) => setCopyDestBucket(e.target.value)}>
+                {buckets.map((b) => (
+                  <option key={b.name} value={b.name}>
+                    {b.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="form-row">
               <label>目标键(可含目录)</label>
               <input value={copyDest} onChange={(e) => setCopyDest(e.target.value)} autoFocus />
             </div>
@@ -336,6 +435,38 @@ export default function Objects() {
               </button>
               <button onClick={doCopy} disabled={!copyDest}>
                 复制
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {restoreKey && (
+        <div className="modal-backdrop" onClick={() => setRestoreKey(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h3>恢复归档对象</h3>
+            <div className="form-row">
+              <label>键</label>
+              <input value={restoreKey} disabled />
+            </div>
+            <div className="form-row">
+              <label>可用天数(1–365)</label>
+              <input type="number" min={1} max={365} value={restoreDays} onChange={(e) => setRestoreDays(e.target.value)} />
+            </div>
+            <div className="form-row">
+              <label>档位</label>
+              <select value={restoreTier} onChange={(e) => setRestoreTier(e.target.value)}>
+                <option value="Expedited">Expedited</option>
+                <option value="Standard">Standard</option>
+                <option value="Bulk">Bulk</option>
+              </select>
+            </div>
+            <div className="actions">
+              <button className="ghost" onClick={() => setRestoreKey(null)}>
+                取消
+              </button>
+              <button onClick={() => void restoreArchive()} disabled={busy}>
+                提交恢复
               </button>
             </div>
           </div>
@@ -373,6 +504,15 @@ function ObjectMeta({
 }) {
   const [presign, setPresign] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [head, setHead] = useState<ObjectHead | null>(null);
+  const [attrs, setAttrs] = useState<string | null>(null);
+
+  useEffect(() => {
+    api
+      .objectHead(bucket, key)
+      .then(setHead)
+      .catch((e) => setError((e as Error).message));
+  }, [bucket, key]);
 
   const gen = async () => {
     try {
@@ -411,14 +551,65 @@ function ObjectMeta({
             readOnly
           />
         </div>
+        {head && (
+          <>
+            <div className="form-row">
+              <label>HEAD 存储类 / SSE</label>
+              <input value={`${head.storageClass || "STANDARD"} · ${head.sse || "无"}`} readOnly />
+            </div>
+            {head.restore && (
+              <div className="form-row">
+                <label>x-amz-restore</label>
+                <input value={head.restore} readOnly />
+              </div>
+            )}
+            {head.checksum && Object.keys(head.checksum).length > 0 && (
+              <div className="form-row">
+                <label>Checksum</label>
+                <input value={Object.entries(head.checksum).map(([k, v]) => `${k}=${v}`).join(" ")} readOnly />
+              </div>
+            )}
+            {head.metadata && Object.keys(head.metadata).length > 0 && (
+              <div className="form-row">
+                <label>用户元数据</label>
+                <textarea
+                  rows={3}
+                  readOnly
+                  value={Object.entries(head.metadata)
+                    .map(([k, v]) => `${k}=${v}`)
+                    .join("\n")}
+                  style={{ width: "100%" }}
+                />
+              </div>
+            )}
+          </>
+        )}
         <button className="ghost" onClick={gen}>
           生成预签名下载链接(1 小时)
+        </button>
+        <button
+          className="ghost"
+          style={{ marginLeft: 8 }}
+          onClick={() => {
+            api
+              .objectAttributes(bucket, key)
+              .then((r) => setAttrs(r.xml))
+              .catch((e) => setError((e as Error).message));
+          }}
+        >
+          GetObjectAttributes
         </button>
         {error && <div className="alert">{error}</div>}
         {presign && (
           <div className="form-row" style={{ marginTop: 10 }}>
             <label>预签名 URL(复制到浏览器/命令行)</label>
             <textarea rows={3} readOnly value={presign} style={{ width: "100%" }} />
+          </div>
+        )}
+        {attrs && (
+          <div className="form-row" style={{ marginTop: 10 }}>
+            <label>Attributes XML</label>
+            <textarea rows={6} readOnly value={attrs} style={{ width: "100%" }} />
           </div>
         )}
         {/* M10:版本列表(恢复/永久删除)与对象标签编辑 */}

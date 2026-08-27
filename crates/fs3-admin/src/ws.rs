@@ -89,6 +89,28 @@ fn snapshot_json(engine: &RwLock<Engine>, service: &S3Service) -> serde_json::Va
         "multipart": sum_of(fs3_core::metrics::Op::Multipart),
     });
     let degraded = e.degraded();
+    let pool = e.pool_status().ok();
+    let devices = pool
+        .as_ref()
+        .map(|p| {
+            p.devices
+                .iter()
+                .map(|d| {
+                    json!({
+                        "path": d.path,
+                        "capacity": d.capacity,
+                        "extent_size": d.extent_size,
+                        "extent_count": d.extent_count,
+                        "allocated_extents": d.allocated_extents,
+                        "live_bytes": d.live_bytes,
+                        "usage": (d.usage * 10000.0).round() / 10000.0,
+                        "usage_percent": (d.usage * 10000.0).round() / 100.0,
+                        "base": d.base,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     json!({
         "uptime": metrics.uptime_secs(),
         "degraded": degraded,
@@ -106,8 +128,13 @@ fn snapshot_json(engine: &RwLock<Engine>, service: &S3Service) -> serde_json::Va
             "p999": latency_of(0.999),
         },
         "errors": metrics.total_errors(),
+        "errors_5xx": metrics.total_5xx(),
         "rate_limit_rps": service.rate_limit_rps(),
         "rate_limit_rejected": service.rate_limit_rejected(),
+        "devices": devices,
+        "pool_capacity": pool.as_ref().map(|p| p.pool_capacity).unwrap_or(capacity),
+        "pool_live_bytes": pool.as_ref().map(|p| p.pool_live_bytes).unwrap_or(used),
+        "pool_usage": pool.as_ref().map(|p| (p.pool_usage * 10000.0).round() / 10000.0).unwrap_or(watermark),
     })
 }
 

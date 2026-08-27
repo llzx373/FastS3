@@ -14,6 +14,7 @@
 # 用法:
 #   S3TEST_CONF=... ./run_s3tests.sh            # 全量 + 排除集校验(默认 xdist ≤4 路)
 #   S3TESTS_N=0 ./run_s3tests.sh               # 强制串行
+#   S3TESTS_ARTIFACT_DIR=... ./run_s3tests.sh  # 保留 junit/pytest.log/failed 供评估报告
 #   ./run_s3tests.sh --list-failed              # 只列出失败(分析用)
 #   前置:fasts3d 已 serve;s3tests.conf fixtures.bucket prefix 含 {random};
 #        /tmp/s3-tests/venv 有 pytest + boto3 + pytest-xdist。
@@ -146,7 +147,18 @@ else
 fi
 JUNIT="$OUT.junit.xml"
 JUNIT_SERIAL="$OUT.junit.serial.xml"
-trap 'rm -f "$OUT" "$OUT.failed" "$JUNIT" "$JUNIT_SERIAL" "$OUT.junit.retry.xml" "$OUT.unexpected"' EXIT
+copy_artifacts() {
+    [ -z "${S3TESTS_ARTIFACT_DIR:-}" ] && return 0
+    mkdir -p "$S3TESTS_ARTIFACT_DIR"
+    [ -f "$OUT" ] && cp -f "$OUT" "$S3TESTS_ARTIFACT_DIR/pytest.log"
+    [ -s "$JUNIT" ] && cp -f "$JUNIT" "$S3TESTS_ARTIFACT_DIR/junit.xml"
+    [ -s "$JUNIT_SERIAL" ] && cp -f "$JUNIT_SERIAL" "$S3TESTS_ARTIFACT_DIR/junit.serial.xml"
+    [ -s "$OUT.junit.retry.xml" ] && cp -f "$OUT.junit.retry.xml" "$S3TESTS_ARTIFACT_DIR/junit.retry.xml"
+    [ -f "$OUT.failed" ] && cp -f "$OUT.failed" "$S3TESTS_ARTIFACT_DIR/failed.txt"
+    [ -f "$OUT.unexpected" ] && cp -f "$OUT.unexpected" "$S3TESTS_ARTIFACT_DIR/unexpected.txt"
+    printf '%s\n' "$EXCLUDE" > "$S3TESTS_ARTIFACT_DIR/exclude.regex"
+}
+trap 'copy_artifacts; rm -f "$OUT" "$OUT.failed" "$JUNIT" "$JUNIT_SERIAL" "$OUT.junit.retry.xml" "$OUT.unexpected"' EXIT
 PYTEST_ARGS=(-q --tb=line --junitxml="$JUNIT")
 SERIAL_GLOBAL=0
 if "$PY" -c "import xdist" 2>/dev/null; then
@@ -301,6 +313,15 @@ PY
 fi
 
 echo "passed=$NPASS skipped=$NSKIP excluded_failures=$NFAIL unexpected_failures=$NEXTRA"
+if [ -n "${S3TESTS_ARTIFACT_DIR:-}" ]; then
+    mkdir -p "$S3TESTS_ARTIFACT_DIR"
+    {
+        echo "passed=$NPASS"
+        echo "skipped=$NSKIP"
+        echo "excluded_failures=$NFAIL"
+        echo "unexpected_failures=$NEXTRA"
+    } > "$S3TESTS_ARTIFACT_DIR/summary.txt"
+fi
 if [ -n "$UNEXPECTED" ]; then
     echo "── UNEXPECTED (in-scope) failures(需修复或补文档) ──"
     echo "$UNEXPECTED"

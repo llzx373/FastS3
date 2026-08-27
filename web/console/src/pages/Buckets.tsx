@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, fmtBytes, fmtTime, type BucketInfo, type BucketCorsRule, type LifecycleRule, type ObjectLockConfig } from "../api";
+import { InventoryPane, NotificationPane, OwnershipPane, TagsPane } from "./BucketExtras";
 import { validatePolicy } from "./Keys";
 
 /** M16 A1:存储类分布紧凑展示("G:2/1.2KB D:1/4B";空 = "—")。 */
@@ -90,7 +91,15 @@ export default function Buckets() {
             {buckets.map((b) => (
               <tr key={b.name}>
                 <td>
-                  <a href={`#/objects?bucket=${encodeURIComponent(b.name)}`}>{b.name}</a>
+                  <a
+                    href={`#/objects?bucket=${encodeURIComponent(b.name)}`}
+                    onClick={(e) => {
+                      e.preventDefault();
+                      window.location.hash = `/objects?bucket=${encodeURIComponent(b.name)}`;
+                    }}
+                  >
+                    {b.name}
+                  </a>
                 </td>
                 <td>{b.objects}</td>
                 <td>{fmtBytes(b.bytes)}</td>
@@ -159,7 +168,18 @@ export default function Buckets() {
   );
 }
 
-type SettingsTab = "quota" | "versioning" | "cors" | "policy" | "lifecycle" | "encryption" | "lock";
+type SettingsTab =
+  | "quota"
+  | "versioning"
+  | "cors"
+  | "policy"
+  | "lifecycle"
+  | "encryption"
+  | "lock"
+  | "tags"
+  | "ownership"
+  | "notify"
+  | "inventory";
 
 const TAB_LABELS: { id: SettingsTab; label: string }[] = [
   { id: "quota", label: "配额" },
@@ -169,6 +189,10 @@ const TAB_LABELS: { id: SettingsTab; label: string }[] = [
   { id: "lifecycle", label: "生命周期" },
   { id: "encryption", label: "加密" },
   { id: "lock", label: "对象锁" },
+  { id: "tags", label: "桶标签" },
+  { id: "ownership", label: "所有权" },
+  { id: "notify", label: "通知" },
+  { id: "inventory", label: "清单" },
 ];
 
 /** M10:桶设置弹窗(配额 / 版本化 / CORS / 桶策略;M11 加生命周期 / 加密 两个 Tab)。 */
@@ -186,7 +210,7 @@ function BucketSettings({
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()} style={{ width: 680 }}>
         <h3>桶设置:{bucket.name}</h3>
-        <div className="toolbar" style={{ marginBottom: 12 }}>
+        <div className="toolbar" style={{ marginBottom: 12, flexWrap: "wrap" }}>
           {TAB_LABELS.map((t) => (
             <button
               key={t.id}
@@ -204,6 +228,10 @@ function BucketSettings({
         {tab === "lifecycle" && <LifecyclePane bucket={bucket} />}
         {tab === "encryption" && <EncryptionPane bucket={bucket} />}
         {tab === "lock" && <ObjectLockPane bucket={bucket} />}
+        {tab === "tags" && <TagsPane bucket={bucket} />}
+        {tab === "ownership" && <OwnershipPane bucket={bucket} />}
+        {tab === "notify" && <NotificationPane bucket={bucket} />}
+        {tab === "inventory" && <InventoryPane bucket={bucket} />}
         <div className="actions">
           <button className="ghost" onClick={onClose}>
             关闭
@@ -583,6 +611,11 @@ function lifecycleActionSummary(r: LifecycleRule): string {
   if (r.AbortIncompleteMultipartUpload?.DaysAfterInitiation !== undefined) {
     parts.push(`未完成分片 ${r.AbortIncompleteMultipartUpload.DaysAfterInitiation} 天后中止`);
   }
+  if (r.Transition?.StorageClass) {
+    const when =
+      r.Transition.Days !== undefined ? `${r.Transition.Days} 天后` : r.Transition.Date?.slice(0, 10) ?? "";
+    parts.push(`转换 ${r.Transition.StorageClass}(${when})`);
+  }
   return parts.join(";");
 }
 
@@ -667,7 +700,8 @@ function LifecyclePane({ bucket }: { bucket: BucketInfo }) {
     <div>
       {error && <div className="alert">{error}</div>}
       <p className="muted" style={{ fontSize: 12, marginTop: 0 }}>
-        过期/清理规则按桶整体保存;删除全部规则即清除配置。不支持存储层转移(Transition)。
+        过期/清理/归档转换按桶整体保存;删除全部规则即清除配置。Transition 目标类:
+        GLACIER / GLACIER_IR / DEEP_ARCHIVE。
       </p>
       <div className="toolbar">
         <button onClick={() => setEditing({ index: null })}>新建规则</button>
@@ -758,6 +792,10 @@ function LifecycleRuleForm({
       ? String(initial.AbortIncompleteMultipartUpload.DaysAfterInitiation)
       : ""
   );
+  const [transClass, setTransClass] = useState(initial?.Transition?.StorageClass ?? "");
+  const [transDays, setTransDays] = useState(
+    initial?.Transition?.Days !== undefined ? String(initial.Transition.Days) : ""
+  );
   const [formError, setFormError] = useState<string | null>(null);
 
   const positiveInt = (v: string): number | null => {
@@ -814,8 +852,25 @@ function LifecycleRuleForm({
       }
       rule.AbortIncompleteMultipartUpload = { DaysAfterInitiation: d };
     }
-    if (!rule.Expiration && !rule.NoncurrentVersionExpiration && !rule.AbortIncompleteMultipartUpload) {
-      setFormError("至少配置一个动作(过期 / 非当前版本过期 / 分片中止)");
+    if (transClass) {
+      const d = positiveInt(transDays);
+      if (d === null) {
+        setFormError("转换天数须为正整数");
+        return;
+      }
+      if (!["GLACIER", "GLACIER_IR", "DEEP_ARCHIVE"].includes(transClass)) {
+        setFormError("转换目标须为 GLACIER / GLACIER_IR / DEEP_ARCHIVE");
+        return;
+      }
+      rule.Transition = { Days: d, StorageClass: transClass };
+    }
+    if (
+      !rule.Expiration &&
+      !rule.NoncurrentVersionExpiration &&
+      !rule.AbortIncompleteMultipartUpload &&
+      !rule.Transition
+    ) {
+      setFormError("至少配置一个动作(过期 / 转换 / 非当前版本过期 / 分片中止)");
       return;
     }
     setFormError(null);
@@ -888,6 +943,25 @@ function LifecycleRuleForm({
       <div className="form-row">
         <label>未完成分片中止天数(可选)</label>
         <input type="number" min={1} value={abortDays} onChange={(e) => setAbortDays(e.target.value)} />
+      </div>
+      <div className="form-row">
+        <label>归档转换(可选;当前版本)</label>
+        <select value={transClass} onChange={(e) => setTransClass(e.target.value)}>
+          <option value="">不转换</option>
+          <option value="GLACIER_IR">GLACIER_IR(在线可读)</option>
+          <option value="GLACIER">GLACIER(需 restore)</option>
+          <option value="DEEP_ARCHIVE">DEEP_ARCHIVE(需 restore)</option>
+        </select>
+        {transClass && (
+          <input
+            type="number"
+            min={1}
+            value={transDays}
+            onChange={(e) => setTransDays(e.target.value)}
+            placeholder="天数"
+            style={{ marginTop: 6 }}
+          />
+        )}
       </div>
       <div className="actions" style={{ marginTop: 0 }}>
         <button className="ghost" onClick={onCancel}>

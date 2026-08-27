@@ -29,6 +29,35 @@ export interface Dashboard {
   healthy: boolean;
   alerts: string[];
   updatedAt: string;
+  devices?: DeviceView[];
+  degraded?: boolean;
+  poolCapacity?: number;
+  poolLiveBytes?: number;
+  poolUsage?: number;
+  extras?: DashboardExtras;
+}
+
+export interface DeviceView {
+  path: string;
+  capacity: number;
+  extentSize: number;
+  extentCount: number;
+  allocatedExtents: number;
+  liveBytes: number;
+  usage: number;
+  usagePercent: number;
+  base: number;
+}
+
+export interface DashboardExtras {
+  lifecycleLastCycle?: number;
+  lifecycleDeleted?: number;
+  notificationQueue?: number;
+  notificationStalled?: boolean;
+  inventoryLastRun?: number;
+  restoreQueue?: number;
+  cacheHits?: number;
+  cacheMisses?: number;
 }
 
 export interface BucketInfo {
@@ -207,6 +236,7 @@ export interface LifecycleRule {
   Status: "Enabled" | "Disabled";
   Filter?: { Prefix?: string; Tag?: { Key: string; Value: string } };
   Expiration?: { Days?: number; Date?: string; ExpiredObjectDeleteMarker?: boolean };
+  Transition?: { Days?: number; Date?: string; StorageClass: string };
   NoncurrentVersionExpiration?: { NoncurrentDays?: number };
   AbortIncompleteMultipartUpload?: { DaysAfterInitiation?: number };
 }
@@ -234,6 +264,67 @@ export interface ListResult {
   isTruncated: boolean;
   nextContinuationToken: string | null;
   keyCount: number;
+}
+
+export interface SessionInfo {
+  session_id: string;
+  temporary_access_key: string;
+  base_access_key: string;
+  session_policy: string | null;
+  expires_at: number;
+  issued_at: number;
+  issued_by: string;
+  expired: boolean;
+}
+
+export interface NotificationRule {
+  Id: string;
+  Events: string[];
+  Url: string;
+  HmacKey?: string;
+  Prefix?: string;
+  Suffix?: string;
+}
+
+export interface InventoryRule {
+  Id: string;
+  DestinationBucket: string;
+  DestinationPrefix?: string;
+  Enabled: boolean;
+  IncludedObjectVersions: "All" | "Current";
+  Frequency: "Daily" | "Weekly";
+  FilterPrefix?: string;
+}
+
+export interface ObjectHead {
+  status: number;
+  contentType: string;
+  contentLength: number;
+  etag: string;
+  lastModified: string;
+  storageClass: string;
+  restore: string;
+  sse: string;
+  versionId: string;
+  metadata: Record<string, string>;
+  checksum: Record<string, string>;
+}
+
+export interface LdapStatus {
+  enabled: boolean;
+  last_sync_at: number;
+  last_ok: boolean;
+  last_error: string;
+  fail_streak: number;
+  groups: { name: string; members: number; key: string; state: string }[];
+  keys_total: number;
+}
+
+export interface IdentityEvent {
+  ts: number;
+  source: string;
+  action: string;
+  detail: string;
 }
 
 const TOKEN_KEY = "fasts3_token";
@@ -306,15 +397,28 @@ export const api = {
     expires = 3600,
     contentType?: string,
     uploadId?: string,
-    partNumber?: number
+    partNumber?: number,
+    extra?: { storageClass?: string; sseCustomerKey?: string }
   ) =>
     request<{ url: string; headers: Record<string, string>; expiresAt: number }>(
       "POST",
       `/api/buckets/${encodeURIComponent(bucket)}/presign`,
-      { key, method, expires, contentType, uploadId, partNumber }
+      {
+        key,
+        method,
+        expires,
+        contentType,
+        uploadId,
+        partNumber,
+        storageClass: extra?.storageClass,
+        sseCustomerKey: extra?.sseCustomerKey,
+      }
     ),
-  multipartInit: (bucket: string, key: string) =>
-    request<{ uploadId: string }>("POST", `/api/buckets/${encodeURIComponent(bucket)}/multipart/init`, { key }),
+  multipartInit: (bucket: string, key: string, storageClass?: string) =>
+    request<{ uploadId: string }>("POST", `/api/buckets/${encodeURIComponent(bucket)}/multipart/init`, {
+      key,
+      storageClass,
+    }),
   multipartComplete: (bucket: string, key: string, uploadId: string, parts: { etag: string; partNumber: number }[]) =>
     request<{ etag: string }>("POST", `/api/buckets/${encodeURIComponent(bucket)}/multipart/complete`, {
       key,
@@ -326,11 +430,13 @@ export const api = {
       key,
       uploadId,
     }),
-  objectAction: (bucket: string, action: "delete" | "copy", key: string, destKey?: string) =>
+  objectAction: (bucket: string, action: "delete" | "copy" | "deleteMany", key: string, destKey?: string, destBucket?: string, keys?: string[]) =>
     request<Record<string, unknown>>("POST", `/api/buckets/${encodeURIComponent(bucket)}/objects/action`, {
       action,
       key,
       destKey,
+      destBucket,
+      keys,
     }),
 
   // ── M10:版本化 / 标签 / CORS / 桶策略 ──
@@ -504,6 +610,69 @@ export const api = {
     "/api/repair",
     { confirm: true }
   ),
+
+  sessions: () => request<{ sessions: SessionInfo[] }>("GET", "/api/sessions"),
+  createSession: (base_access_key: string, session_policy?: string | null, ttl_secs?: number) =>
+    request<{
+      session_id: string;
+      temporary_access_key: string;
+      secret_key: string;
+      session_token: string;
+      expires_at: number;
+      issued_at: number;
+    }>("POST", "/api/sessions", { base_access_key, session_policy, ttl_secs }),
+  revokeSession: (id: string) => request<{ revoked: string }>("DELETE", `/api/sessions/${encodeURIComponent(id)}`),
+
+  sseStatus: () => request<Record<string, unknown>>("GET", "/api/sse/status"),
+  sseRotate: () => request<Record<string, unknown>>("POST", "/api/sse/rotate"),
+  deviceAdd: (path: string, force = false) =>
+    request<Record<string, unknown>>("POST", "/api/devices/add", { path, force }),
+
+  ldapStatus: () => request<LdapStatus>("GET", "/api/ldap/status"),
+  identityEvents: (limit = 100) =>
+    request<{ total: number; events: IdentityEvent[] }>("GET", `/api/identity-events?limit=${limit}`),
+
+  getBucketTags: (bucket: string) =>
+    request<{ tags: S3Tag[] }>("GET", `/api/buckets/${encodeURIComponent(bucket)}/bucket-tags`),
+  putBucketTags: (bucket: string, tags: S3Tag[]) =>
+    request<{ tags: S3Tag[] }>("PUT", `/api/buckets/${encodeURIComponent(bucket)}/bucket-tags`, { tags }),
+  deleteBucketTags: (bucket: string) =>
+    request<Record<string, unknown>>("DELETE", `/api/buckets/${encodeURIComponent(bucket)}/bucket-tags`),
+
+  getOwnership: (bucket: string) =>
+    request<{ ObjectOwnership: string }>("GET", `/api/buckets/${encodeURIComponent(bucket)}/ownership`),
+  putOwnership: (bucket: string, ObjectOwnership: string) =>
+    request<{ ObjectOwnership: string }>("PUT", `/api/buckets/${encodeURIComponent(bucket)}/ownership`, {
+      ObjectOwnership,
+    }),
+
+  getNotification: (bucket: string) =>
+    request<{ rules: NotificationRule[] }>("GET", `/api/buckets/${encodeURIComponent(bucket)}/notification`),
+  putNotification: (bucket: string, rules: NotificationRule[]) =>
+    request<{ rules: NotificationRule[] }>("PUT", `/api/buckets/${encodeURIComponent(bucket)}/notification`, { rules }),
+  deleteNotification: (bucket: string) =>
+    request<Record<string, unknown>>("DELETE", `/api/buckets/${encodeURIComponent(bucket)}/notification`),
+
+  listInventory: (bucket: string) =>
+    request<{ rules: InventoryRule[] }>("GET", `/api/buckets/${encodeURIComponent(bucket)}/inventory`),
+  putInventory: (bucket: string, rule: InventoryRule) =>
+    request<{ rule: InventoryRule }>("PUT", `/api/buckets/${encodeURIComponent(bucket)}/inventory`, rule),
+  deleteInventory: (bucket: string, id: string) =>
+    request<Record<string, unknown>>(
+      "DELETE",
+      `/api/buckets/${encodeURIComponent(bucket)}/inventory?id=${encodeURIComponent(id)}`
+    ),
+
+  objectHead: (bucket: string, key: string) =>
+    request<ObjectHead>(
+      "GET",
+      `/api/buckets/${encodeURIComponent(bucket)}/object-head?key=${encodeURIComponent(key)}`
+    ),
+  objectAttributes: (bucket: string, key: string) =>
+    request<{ xml: string }>(
+      "GET",
+      `/api/buckets/${encodeURIComponent(bucket)}/object-attributes?key=${encodeURIComponent(key)}`
+    ),
 };
 
 /** 字节/容量格式化。 */

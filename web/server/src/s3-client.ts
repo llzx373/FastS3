@@ -212,9 +212,9 @@ export class S3Client {
   }
 
   /** CreateMultipartUpload → uploadId。 */
-  async createMultipart(bucket: string, key: string): Promise<string> {
+  async createMultipart(bucket: string, key: string, extraHeaders: Record<string, string> = {}): Promise<string> {
     const path = `/${bucket}/${this.encodeKey(key)}?uploads`;
-    const signed = signRequest(this.cfg, "POST", path, Buffer.alloc(0), {});
+    const signed = signRequest(this.cfg, "POST", path, Buffer.alloc(0), extraHeaders);
     const res = await doRequest(this.cfg, signed);
     if (res.status !== 200) {
       throw new Error(`CreateMultipartUpload: HTTP ${res.status} ${res.body.toString().slice(0, 300)}`);
@@ -289,6 +289,80 @@ export class S3Client {
       throw new Error(`CopyObject: HTTP ${res.status} ${res.body.toString().slice(0, 300)}`);
     }
   }
+
+  /** DeleteObjects(Quiet;最多 1000 键)。 */
+  async deleteObjects(bucket: string, keys: string[]): Promise<void> {
+    const xml =
+      "<Delete><Quiet>true</Quiet>" +
+      keys.map((k) => `<Object><Key>${escapeXml(k)}</Key></Object>`).join("") +
+      "</Delete>";
+    await this.callSigned("POST", `/${bucket}?delete`, Buffer.from(xml), { "content-type": "application/xml" });
+  }
+
+  /** HEAD Object:元数据/存储类/restore 状态/checksum。 */
+  async headObject(bucket: string, key: string): Promise<ObjectHead> {
+    const path = `/${bucket}/${this.encodeKey(key)}`;
+    const signed = signRequest(this.cfg, "HEAD", path, Buffer.alloc(0), {});
+    const res = await doRequest(this.cfg, signed);
+    if (res.status !== 200 && res.status !== 403) {
+      throw new Error(`HeadObject ${bucket}/${key}: HTTP ${res.status}`);
+    }
+    const h = (n: string) => {
+      const v = res.headers[n] ?? res.headers[n.toLowerCase()];
+      return Array.isArray(v) ? v[0] : v;
+    };
+    const meta: Record<string, string> = {};
+    for (const [k, v] of Object.entries(res.headers)) {
+      if (k.toLowerCase().startsWith("x-amz-meta-") && v) {
+        meta[k.slice("x-amz-meta-".length)] = Array.isArray(v) ? v[0] : String(v);
+      }
+    }
+    const checksum: Record<string, string> = {};
+    for (const alg of ["crc32", "crc32c", "sha1", "sha256", "crc64nvme"]) {
+      const v = h(`x-amz-checksum-${alg}`);
+      if (v) checksum[alg] = v;
+    }
+    return {
+      status: res.status,
+      contentType: h("content-type") ?? "",
+      contentLength: Number(h("content-length") ?? 0),
+      etag: (h("etag") ?? "").replace(/^"|"$/g, ""),
+      lastModified: h("last-modified") ?? "",
+      storageClass: h("x-amz-storage-class") ?? "STANDARD",
+      restore: h("x-amz-restore") ?? "",
+      sse: h("x-amz-server-side-encryption") ?? "",
+      versionId: h("x-amz-version-id") ?? "",
+      metadata: meta,
+      checksum,
+    };
+  }
+
+  private async callSigned(
+    method: string,
+    path: string,
+    body: Buffer,
+    extraHeaders: Record<string, string>
+  ): Promise<void> {
+    const signed = signRequest(this.cfg, method, path, body, extraHeaders);
+    const res = await doRequest(this.cfg, signed);
+    if (res.status !== 200 && res.status !== 204) {
+      throw new Error(`${method} ${path}: HTTP ${res.status} ${res.body.toString().slice(0, 300)}`);
+    }
+  }
+}
+
+export interface ObjectHead {
+  status: number;
+  contentType: string;
+  contentLength: number;
+  etag: string;
+  lastModified: string;
+  storageClass: string;
+  restore: string;
+  sse: string;
+  versionId: string;
+  metadata: Record<string, string>;
+  checksum: Record<string, string>;
 }
 
 // ─────────────────────────── M10:版本化/标签/CORS/桶策略 ───────────────────────────
@@ -540,6 +614,8 @@ export interface LifecycleRule {
   Filter?: { Prefix?: string; Tag?: { Key: string; Value: string } };
   /** Days/Date(ISO8601)/ExpiredObjectDeleteMarker 互斥,恰选其一 */
   Expiration?: { Days?: number; Date?: string; ExpiredObjectDeleteMarker?: boolean };
+  /** 当前版本归档转换(GLACIER / GLACIER_IR / DEEP_ARCHIVE;Days 与 Date 互斥)。 */
+  Transition?: { Days?: number; Date?: string; StorageClass: string };
   NoncurrentVersionExpiration?: { NoncurrentDays?: number };
   AbortIncompleteMultipartUpload?: { DaysAfterInitiation?: number };
 }
@@ -582,6 +658,17 @@ export function parseLifecycleXml(xml: string): LifecycleRule[] {
       }
       rule.Expiration = exp;
     }
+    const tr = /<Transition>([\s\S]*?)<\/Transition>/.exec(block);
+    if (tr) {
+      const days = /<Days>(\d+)<\/Days>/.exec(tr[1]);
+      const date = pick("Date", tr[1]);
+      const sc = pick("StorageClass", tr[1]);
+      rule.Transition = {
+        StorageClass: sc,
+        ...(days ? { Days: Number(days[1]) } : {}),
+        ...(date ? { Date: date } : {}),
+      };
+    }
     const nm = /<NoncurrentVersionExpiration>([\s\S]*?)<\/NoncurrentVersionExpiration>/.exec(block);
     if (nm) {
       const nd = /<NoncurrentDays>(\d+)<\/NoncurrentDays>/.exec(nm[1]);
@@ -600,7 +687,7 @@ export function parseLifecycleXml(xml: string): LifecycleRule[] {
 /**
  * 渲染 LifecycleConfiguration 请求体(与数据面渲染口径同形:元素序
  * ID/Filter/Status/动作;规则语义——ID 唯一、动作非空、Expiration 三选一——
- * 由数据面路由层校验;Transition 不支持,数据面 501)。
+ * 由数据面路由层校验;Transition 目标类限定归档三值)。
  */
 export function renderLifecycleXml(rules: LifecycleRule[]): string {
   const inner = rules
@@ -639,6 +726,12 @@ export function renderLifecycleXml(rules: LifecycleRule[]): string {
         s +=
           `<AbortIncompleteMultipartUpload><DaysAfterInitiation>${r.AbortIncompleteMultipartUpload.DaysAfterInitiation}` +
           "</DaysAfterInitiation></AbortIncompleteMultipartUpload>";
+      }
+      if (r.Transition?.StorageClass) {
+        s += "<Transition>";
+        if (r.Transition.Days !== undefined) s += `<Days>${r.Transition.Days}</Days>`;
+        if (r.Transition.Date) s += `<Date>${escapeXml(r.Transition.Date)}</Date>`;
+        s += `<StorageClass>${escapeXml(r.Transition.StorageClass)}</StorageClass></Transition>`;
       }
       return s + "</Rule>";
     })
@@ -967,4 +1060,183 @@ export class S3M10Client {
     if (versionId) path += `&versionId=${encodeURIComponent(versionId)}`;
     return path;
   }
+
+  async getBucketOwnership(bucket: string): Promise<string> {
+    const signed = signRequest(this.cfg, "GET", `/${bucket}?ownershipControls`, Buffer.alloc(0), {});
+    const res = await doRequest(this.cfg, signed);
+    if (res.status === 404) return "BucketOwnerEnforced";
+    if (res.status !== 200) {
+      throw new Error(`GetBucketOwnershipControls ${bucket}: HTTP ${res.status} ${res.body.toString().slice(0, 300)}`);
+    }
+    const m = /<ObjectOwnership>([^<]*)<\/ObjectOwnership>/.exec(res.body.toString("utf8"));
+    return m ? m[1] : "BucketOwnerEnforced";
+  }
+
+  async putBucketOwnership(bucket: string, ownership: string): Promise<void> {
+    const xml =
+      `<OwnershipControls xmlns="${S3_XMLNS}"><Rule><ObjectOwnership>${escapeXml(ownership)}</ObjectOwnership></Rule></OwnershipControls>`;
+    await this.call("PUT", `/${bucket}?ownershipControls`, Buffer.from(xml), { "content-type": "application/xml" });
+  }
+
+  async getBucketNotification(bucket: string): Promise<NotificationRule[]> {
+    const signed = signRequest(this.cfg, "GET", `/${bucket}?notification`, Buffer.alloc(0), {});
+    const res = await doRequest(this.cfg, signed);
+    if (res.status !== 200) {
+      throw new Error(`GetBucketNotification ${bucket}: HTTP ${res.status} ${res.body.toString().slice(0, 300)}`);
+    }
+    return parseNotificationXml(res.body.toString("utf8"));
+  }
+
+  async putBucketNotification(bucket: string, rules: NotificationRule[]): Promise<void> {
+    await this.call("PUT", `/${bucket}?notification`, Buffer.from(renderNotificationXml(rules)), {
+      "content-type": "application/xml",
+    });
+  }
+
+  async deleteBucketNotification(bucket: string): Promise<void> {
+    await this.call("DELETE", `/${bucket}?notification`);
+  }
+
+  async listInventory(bucket: string): Promise<InventoryRule[]> {
+    const signed = signRequest(this.cfg, "GET", `/${bucket}?inventory`, Buffer.alloc(0), {});
+    const res = await doRequest(this.cfg, signed);
+    if (res.status !== 200) {
+      throw new Error(`ListBucketInventory ${bucket}: HTTP ${res.status} ${res.body.toString().slice(0, 300)}`);
+    }
+    return parseInventoryListXml(res.body.toString("utf8"));
+  }
+
+  async putInventory(bucket: string, rule: InventoryRule): Promise<void> {
+    await this.call(
+      "PUT",
+      `/${bucket}?inventory&id=${encodeURIComponent(rule.Id)}`,
+      Buffer.from(renderInventoryXml(rule)),
+      { "content-type": "application/xml" }
+    );
+  }
+
+  async deleteInventory(bucket: string, id: string): Promise<void> {
+    await this.call("DELETE", `/${bucket}?inventory&id=${encodeURIComponent(id)}`);
+  }
+
+  async getObjectAttributes(bucket: string, key: string): Promise<string> {
+    const signed = signRequest(
+      this.cfg,
+      "GET",
+      `/${bucket}/${this.encodeKey(key)}?attributes`,
+      Buffer.alloc(0),
+      { "x-amz-object-attributes": "ETag,Checksum,ObjectSize,ObjectParts,StorageClass" }
+    );
+    const res = await doRequest(this.cfg, signed);
+    if (res.status !== 200) {
+      throw new Error(`GetObjectAttributes ${bucket}/${key}: HTTP ${res.status} ${res.body.toString().slice(0, 300)}`);
+    }
+    return res.body.toString("utf8");
+  }
+}
+
+export interface NotificationRule {
+  Id: string;
+  Events: string[];
+  Url: string;
+  HmacKey?: string;
+  Prefix?: string;
+  Suffix?: string;
+}
+
+export interface InventoryRule {
+  Id: string;
+  DestinationBucket: string;
+  DestinationPrefix?: string;
+  Enabled: boolean;
+  IncludedObjectVersions: "All" | "Current";
+  Frequency: "Daily" | "Weekly";
+  FilterPrefix?: string;
+}
+
+export function parseNotificationXml(xml: string): NotificationRule[] {
+  const rules: NotificationRule[] = [];
+  const re = /<(Topic|Queue|CloudFunction)Configuration>([\s\S]*?)<\/\1Configuration>/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(xml)) !== null) {
+    const block = m[2];
+    const destTag = m[1] === "Topic" ? "Topic" : m[1] === "Queue" ? "Queue" : "CloudFunction";
+    const id = /<Id>([^<]*)<\/Id>/.exec(block)?.[1] ?? "";
+    const events = [...block.matchAll(/<Event>([^<]*)<\/Event>/g)].map((x) => x[1]);
+    const url = new RegExp(`<${destTag}>([^<]*)</${destTag}>`).exec(block)?.[1] ?? "";
+    const hmac = /<FastS3WebhookSecretKey>([^<]*)<\/FastS3WebhookSecretKey>/.exec(block)?.[1];
+    const prefix = /<Name>prefix<\/Name>\s*<Value>([^<]*)<\/Value>/.exec(block)?.[1];
+    const suffix = /<Name>suffix<\/Name>\s*<Value>([^<]*)<\/Value>/.exec(block)?.[1];
+    rules.push({
+      Id: unescapeXml(id),
+      Events: events.map(unescapeXml),
+      Url: unescapeXml(url),
+      ...(hmac ? { HmacKey: hmac } : {}),
+      ...(prefix ? { Prefix: unescapeXml(prefix) } : {}),
+      ...(suffix ? { Suffix: unescapeXml(suffix) } : {}),
+    });
+  }
+  return rules;
+}
+
+export function renderNotificationXml(rules: NotificationRule[]): string {
+  const inner = rules
+    .map((r) => {
+      let s = `<TopicConfiguration><Id>${escapeXml(r.Id)}</Id>`;
+      for (const ev of r.Events) s += `<Event>${escapeXml(ev)}</Event>`;
+      s += `<Topic>${escapeXml(r.Url)}</Topic>`;
+      if (r.HmacKey) s += `<FastS3WebhookSecretKey>${escapeXml(r.HmacKey)}</FastS3WebhookSecretKey>`;
+      if (r.Prefix || r.Suffix) {
+        s += "<Filter><S3Key>";
+        if (r.Prefix) s += `<FilterRule><Name>prefix</Name><Value>${escapeXml(r.Prefix)}</Value></FilterRule>`;
+        if (r.Suffix) s += `<FilterRule><Name>suffix</Name><Value>${escapeXml(r.Suffix)}</Value></FilterRule>`;
+        s += "</S3Key></Filter>";
+      }
+      return s + "</TopicConfiguration>";
+    })
+    .join("");
+  return `<NotificationConfiguration xmlns="${S3_XMLNS}">${inner}</NotificationConfiguration>`;
+}
+
+export function parseInventoryListXml(xml: string): InventoryRule[] {
+  const rules: InventoryRule[] = [];
+  const re = /<InventoryConfiguration>([\s\S]*?)<\/InventoryConfiguration>/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(xml)) !== null) {
+    const b = m[1];
+    const pick = (tag: string) => new RegExp(`<${tag}>([^<]*)</${tag}>`).exec(b)?.[1] ?? "";
+    const dest = /<S3BucketDestination>([\s\S]*?)<\/S3BucketDestination>/.exec(b)?.[1] ?? "";
+    const destBucket = /<Bucket>([^<]*)<\/Bucket>/.exec(dest)?.[1] ?? "";
+    const destPrefix = /<Prefix>([^<]*)<\/Prefix>/.exec(dest)?.[1];
+    const arn = destBucket.replace(/^arn:aws:s3:::/, "");
+    rules.push({
+      Id: pick("Id"),
+      DestinationBucket: arn,
+      DestinationPrefix: destPrefix,
+      Enabled: /<IsEnabled>true<\/IsEnabled>/.test(b),
+      IncludedObjectVersions: pick("IncludedObjectVersions") === "All" ? "All" : "Current",
+      Frequency: /<Frequency>Weekly<\/Frequency>/.test(b) ? "Weekly" : "Daily",
+      FilterPrefix: /<Filter>[\s\S]*?<Prefix>([^<]*)<\/Prefix>/.exec(b)?.[1],
+    });
+  }
+  return rules;
+}
+
+export function renderInventoryXml(rule: InventoryRule): string {
+  const destBucket = rule.DestinationBucket.startsWith("arn:")
+    ? rule.DestinationBucket
+    : `arn:aws:s3:::${rule.DestinationBucket}`;
+  const prefix = rule.DestinationPrefix
+    ? `<Prefix>${escapeXml(rule.DestinationPrefix)}</Prefix>`
+    : "";
+  const filter = rule.FilterPrefix
+    ? `<Filter><Prefix>${escapeXml(rule.FilterPrefix)}</Prefix></Filter>`
+    : "";
+  return (
+    `<InventoryConfiguration><Id>${escapeXml(rule.Id)}</Id>` +
+    `<Destination><S3BucketDestination><Bucket>${escapeXml(destBucket)}</Bucket><Format>CSV</Format>${prefix}</S3BucketDestination></Destination>` +
+    `<IsEnabled>${rule.Enabled ? "true" : "false"}</IsEnabled>${filter}` +
+    `<IncludedObjectVersions>${rule.IncludedObjectVersions}</IncludedObjectVersions>` +
+    `<Schedule><Frequency>${rule.Frequency}</Frequency></Schedule></InventoryConfiguration>`
+  );
 }

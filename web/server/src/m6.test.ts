@@ -111,6 +111,15 @@ class FakeAdmin implements AdminApi {
   async revokeSession(): Promise<never> {
     throw new Error("not used");
   }
+  async sseStatus(): Promise<never> {
+    throw new Error("not used");
+  }
+  async sseRotate(): Promise<never> {
+    throw new Error("not used");
+  }
+  async deviceAdd(): Promise<never> {
+    throw new Error("not used");
+  }
 }
 
 const cfg = loadConfig();

@@ -1438,7 +1438,14 @@ impl AdminServer {
     fn handle_uploads(&self) -> Response<String> {
         let engine = self.engine.read();
         match engine.meta().list_all_sessions() {
-            Ok(sessions) => json::ok(serde_json::json!({
+            Ok(sessions) => {
+                let mut part_counts: BTreeMap<String, u32> = BTreeMap::new();
+                if let Ok(parts) = engine.meta().snapshot_all_parts() {
+                    for (uid, _, _) in parts {
+                        *part_counts.entry(uid).or_insert(0) += 1;
+                    }
+                }
+                json::ok(serde_json::json!({
                 "uploads": sessions.iter().map(|(id, s)| {
                     serde_json::json!({
                         "upload_id": id,
@@ -1446,9 +1453,11 @@ impl AdminServer {
                         "key": s.key,
                         "created": s.created,
                         "completed": s.completed,
+                        "parts": part_counts.get(id).copied().unwrap_or(0),
                     })
                 }).collect::<Vec<_>>(),
-            })),
+            }))
+            }
             Err(e) => json::err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",

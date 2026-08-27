@@ -38,10 +38,12 @@ import { IdentityEvents, LdapSync, type LdapSyncConfig } from "./ldap-sync.js";
 import { OidcVerifier, OidcError, type OidcConfig } from "./oidc.js";
 import { AdminClient } from "./admin-client.js";
 import { AdminWsClient } from "./admin-ws.js";
-import { S3Client, S3M10Client, type BucketCorsRule, type LifecycleRule, type ObjectLockConfig, type S3Tag } from "./s3-client.js";
+import { S3Client, S3M10Client, type BucketCorsRule, type LifecycleRule, type ObjectLockConfig, type S3Tag, type NotificationRule, type InventoryRule } from "./s3-client.js";
+import { createHash } from "node:crypto";
 import { presignUrl } from "./presign.js";
-import { buildDashboard, buildSnapshot, dashboardFromSnapshot } from "./dashboard.js";
+import { buildDashboard, buildSnapshot, dashboardFromSnapshot, lastDashboardFrame } from "./dashboard.js";
 import { MetricsHistory } from "./metrics-history.js";
+import { mountStatic } from "./static.js";
 
 export interface ServerDeps {
   admin: AdminClient;
@@ -307,10 +309,13 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       contentType?: string;
       uploadId?: string;
       partNumber?: number;
+      storageClass?: string;
+      sseCustomerKey?: string;
     };
   }>("/api/buckets/:name/presign", async (req, reply) => {
     const { name } = req.params;
-    const { key, method = "PUT", expires = 3600, contentType, uploadId, partNumber } = req.body ?? {};
+    const { key, method = "PUT", expires = 3600, contentType, uploadId, partNumber, storageClass, sseCustomerKey } =
+      req.body ?? {};
     if (!key) {
       return reply.code(400).send({ error: { code: "bad_request", message: "missing key" } });
     }
@@ -322,8 +327,16 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     try {
       const headers: Record<string, string> = {};
       if (contentType) headers["content-type"] = contentType;
-      // 附加 query 参与 SigV4 签名(presign.ts extraQuery),数据面按
-      // ?partNumber=&uploadId= 路由到 UploadPart。
+      if (storageClass) headers["x-amz-storage-class"] = storageClass;
+      if (sseCustomerKey) {
+        const buf = Buffer.from(sseCustomerKey, "base64");
+        if (buf.length !== 32) {
+          return reply.code(400).send({ error: { code: "bad_request", message: "sseCustomerKey must be 32-byte base64" } });
+        }
+        headers["x-amz-server-side-encryption-customer-algorithm"] = "AES256";
+        headers["x-amz-server-side-encryption-customer-key"] = sseCustomerKey;
+        headers["x-amz-server-side-encryption-customer-key-md5"] = createHash("md5").update(buf).digest("base64");
+      }
       const extraQuery: Record<string, string> = {};
       if (partNumber !== undefined) extraQuery["partNumber"] = String(partNumber);
       if (uploadId !== undefined) extraQuery["uploadId"] = uploadId;
@@ -344,14 +357,16 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // ── multipart 编排(I3:大文件分片直传) ──
   app.post<{
     Params: { name: string; action: string };
-    Body: { key: string; uploadId?: string; partSize?: number; parts?: { etag: string; partNumber: number }[] };
+    Body: { key: string; uploadId?: string; partSize?: number; parts?: { etag: string; partNumber: number }[]; storageClass?: string };
   }>("/api/buckets/:name/multipart/:action", async (req, reply) => {
     const { name, action } = req.params;
     const body = req.body ?? {};
     try {
       if (action === "init") {
         if (!body.key) return reply.code(400).send({ error: { code: "bad_request", message: "missing key" } });
-        const uploadId = await s3.createMultipart(name, body.key);
+        const extra: Record<string, string> = {};
+        if (body.storageClass) extra["x-amz-storage-class"] = body.storageClass;
+        const uploadId = await s3.createMultipart(name, body.key, extra);
         return { uploadId };
       }
       if (action === "complete") {
@@ -377,20 +392,32 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   });
 
   // ── 对象操作(删除/复制;经数据面) ──
-  app.post<{ Params: { name: string }; Body: { action: string; key: string; destKey?: string } }>(
+  app.post<{
+    Params: { name: string };
+    Body: { action: string; key?: string; destKey?: string; destBucket?: string; keys?: string[] };
+  }>(
     "/api/buckets/:name/objects/action",
     async (req, reply) => {
       const { name } = req.params;
-      const { action, key, destKey } = req.body ?? {};
-      if (!key) return reply.code(400).send({ error: { code: "bad_request", message: "missing key" } });
+      const { action, key, destKey, destBucket, keys } = req.body ?? {};
       try {
         if (action === "delete") {
+          if (!key) return reply.code(400).send({ error: { code: "bad_request", message: "missing key" } });
           await s3.deleteObject(name, key);
           return { deleted: key };
         }
+        if (action === "deleteMany") {
+          if (!Array.isArray(keys) || keys.length === 0) {
+            return reply.code(400).send({ error: { code: "bad_request", message: "keys[] required" } });
+          }
+          await s3.deleteObjects(name, keys.slice(0, 1000));
+          return { deleted: keys.length };
+        }
         if (action === "copy" && destKey) {
-          await s3.copyObject(name, key, name, destKey);
-          return { copied: { from: key, to: destKey } };
+          if (!key) return reply.code(400).send({ error: { code: "bad_request", message: "missing key" } });
+          const dest = destBucket && destBucket !== "" ? destBucket : name;
+          await s3.copyObject(name, key, dest, destKey);
+          return { copied: { from: key, to: destKey, destBucket: dest } };
         }
         return reply.code(400).send({ error: { code: "bad_request", message: "bad action" } });
       } catch (e) {
@@ -897,6 +924,174 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         return reply.code(400).send({ error: { code: "bad_request", message: "bad action" } });
       }
     );
+
+    app.get<{ Params: { name: string } }>("/api/buckets/:name/bucket-tags", async (req, reply) => {
+      try {
+        return { tags: await m10.getBucketTagging(req.params.name) };
+      } catch (e) {
+        return m10Error(e, reply, req.params.name);
+      }
+    });
+    app.put<{ Params: { name: string }; Body: { tags?: S3Tag[] } }>(
+      "/api/buckets/:name/bucket-tags",
+      { preHandler: requireRole("admin") },
+      async (req, reply) => {
+        const tags = req.body?.tags;
+        if (!Array.isArray(tags)) {
+          return reply.code(400).send({ error: { code: "bad_request", message: "tags[] required" } });
+        }
+        try {
+          await m10.putBucketTagging(req.params.name, tags);
+          return { tags };
+        } catch (e) {
+          return m10Error(e, reply, req.params.name);
+        }
+      }
+    );
+    app.delete<{ Params: { name: string } }>(
+      "/api/buckets/:name/bucket-tags",
+      { preHandler: requireRole("admin") },
+      async (req, reply) => {
+        try {
+          await m10.deleteBucketTagging(req.params.name);
+          return { deleted: req.params.name };
+        } catch (e) {
+          return m10Error(e, reply, req.params.name);
+        }
+      }
+    );
+
+    app.get<{ Params: { name: string } }>("/api/buckets/:name/ownership", async (req, reply) => {
+      try {
+        return { ObjectOwnership: await m10.getBucketOwnership(req.params.name) };
+      } catch (e) {
+        return m10Error(e, reply, req.params.name);
+      }
+    });
+    app.put<{ Params: { name: string }; Body: { ObjectOwnership?: string } }>(
+      "/api/buckets/:name/ownership",
+      { preHandler: requireRole("admin") },
+      async (req, reply) => {
+        const o = req.body?.ObjectOwnership;
+        if (o !== "BucketOwnerEnforced" && o !== "BucketOwnerPreferred" && o !== "ObjectWriter") {
+          return reply.code(400).send({ error: { code: "bad_request", message: "invalid ObjectOwnership" } });
+        }
+        try {
+          await m10.putBucketOwnership(req.params.name, o);
+          return { ObjectOwnership: o };
+        } catch (e) {
+          return m10Error(e, reply, req.params.name);
+        }
+      }
+    );
+
+    app.get<{ Params: { name: string } }>("/api/buckets/:name/notification", async (req, reply) => {
+      try {
+        return { rules: await m10.getBucketNotification(req.params.name) };
+      } catch (e) {
+        return m10Error(e, reply, req.params.name);
+      }
+    });
+    app.put<{ Params: { name: string }; Body: { rules?: NotificationRule[] } }>(
+      "/api/buckets/:name/notification",
+      { preHandler: requireRole("admin") },
+      async (req, reply) => {
+        const rules = req.body?.rules;
+        if (!Array.isArray(rules)) {
+          return reply.code(400).send({ error: { code: "bad_request", message: "rules[] required" } });
+        }
+        try {
+          if (rules.length === 0) await m10.deleteBucketNotification(req.params.name);
+          else await m10.putBucketNotification(req.params.name, rules);
+          return { rules };
+        } catch (e) {
+          return m10Error(e, reply, req.params.name);
+        }
+      }
+    );
+    app.delete<{ Params: { name: string } }>(
+      "/api/buckets/:name/notification",
+      { preHandler: requireRole("admin") },
+      async (req, reply) => {
+        try {
+          await m10.deleteBucketNotification(req.params.name);
+          return { deleted: req.params.name };
+        } catch (e) {
+          return m10Error(e, reply, req.params.name);
+        }
+      }
+    );
+
+    app.get<{ Params: { name: string } }>("/api/buckets/:name/inventory", async (req, reply) => {
+      try {
+        return { rules: await m10.listInventory(req.params.name) };
+      } catch (e) {
+        return m10Error(e, reply, req.params.name);
+      }
+    });
+    app.put<{ Params: { name: string }; Body: InventoryRule }>(
+      "/api/buckets/:name/inventory",
+      { preHandler: requireRole("admin") },
+      async (req, reply) => {
+        const rule = req.body;
+        if (!rule?.Id || !rule.DestinationBucket) {
+          return reply.code(400).send({ error: { code: "bad_request", message: "Id + DestinationBucket required" } });
+        }
+        try {
+          await m10.putInventory(req.params.name, {
+            Id: rule.Id,
+            DestinationBucket: rule.DestinationBucket,
+            DestinationPrefix: rule.DestinationPrefix,
+            Enabled: rule.Enabled !== false,
+            IncludedObjectVersions: rule.IncludedObjectVersions === "All" ? "All" : "Current",
+            Frequency: rule.Frequency === "Weekly" ? "Weekly" : "Daily",
+            FilterPrefix: rule.FilterPrefix,
+          });
+          return { rule };
+        } catch (e) {
+          return m10Error(e, reply, req.params.name);
+        }
+      }
+    );
+    app.delete<{ Params: { name: string }; Querystring: { id?: string } }>(
+      "/api/buckets/:name/inventory",
+      { preHandler: requireRole("admin") },
+      async (req, reply) => {
+        const id = req.query.id;
+        if (!id) return reply.code(400).send({ error: { code: "bad_request", message: "id required" } });
+        try {
+          await m10.deleteInventory(req.params.name, id);
+          return { deleted: id };
+        } catch (e) {
+          return m10Error(e, reply, req.params.name);
+        }
+      }
+    );
+
+    app.get<{ Params: { name: string }; Querystring: { key?: string } }>(
+      "/api/buckets/:name/object-head",
+      async (req, reply) => {
+        const key = req.query.key;
+        if (!key) return reply.code(400).send({ error: { code: "bad_request", message: "missing key" } });
+        try {
+          return await s3.headObject(req.params.name, key);
+        } catch (e) {
+          return m10Error(e, reply, req.params.name);
+        }
+      }
+    );
+    app.get<{ Params: { name: string }; Querystring: { key?: string } }>(
+      "/api/buckets/:name/object-attributes",
+      async (req, reply) => {
+        const key = req.query.key;
+        if (!key) return reply.code(400).send({ error: { code: "bad_request", message: "missing key" } });
+        try {
+          return { xml: await m10.getObjectAttributes(req.params.name, key) };
+        } catch (e) {
+          return m10Error(e, reply, req.params.name);
+        }
+      }
+    );
   }
 
   // ── 密钥管理 ──
@@ -970,6 +1165,19 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
     }
   });
+
+  app.post<{ Body: { base_access_key?: string; session_policy?: string | null; ttl_secs?: number } }>(
+    "/api/sessions",
+    { preHandler: requireRole("admin") },
+    async (req, reply) => {
+      const base = req.body?.base_access_key || sessionBaseKey(cfg);
+      try {
+        return await admin.createSession(base, req.body?.session_policy ?? null, req.body?.ttl_secs);
+      } catch (e) {
+        return reply.code(400).send({ error: { code: "session_error", message: (e as Error).message } });
+      }
+    }
+  );
 
   app.delete<{ Params: { id: string } }>(
     "/api/sessions/:id",
@@ -1172,6 +1380,34 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     }
   );
 
+  app.get("/api/sse/status", async (_req, reply) => {
+    try {
+      return await admin.sseStatus();
+    } catch (e) {
+      return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+    }
+  });
+  app.post("/api/sse/rotate", { preHandler: requireRole("admin") }, async (_req, reply) => {
+    try {
+      return await admin.sseRotate();
+    } catch (e) {
+      return reply.code(502).send({ error: { code: "sse_rotate_failed", message: (e as Error).message } });
+    }
+  });
+  app.post<{ Body: { path?: string; force?: boolean } }>(
+    "/api/devices/add",
+    { preHandler: requireRole("admin") },
+    async (req, reply) => {
+      const path = req.body?.path ?? "";
+      if (!path) return reply.code(400).send({ error: { code: "bad_request", message: "path required" } });
+      try {
+        return await admin.deviceAdd(path, req.body?.force === true);
+      } catch (e) {
+        return reply.code(409).send({ error: { code: "device_add_failed", message: (e as Error).message } });
+      }
+    }
+  );
+
   return app;
 }
 
@@ -1192,6 +1428,11 @@ export function startServer(): void {
   });
   const history = new MetricsHistory();
   const app = buildServer({ admin, s3, s3m10, cfg, metricsHistory: history });
+
+  // 静态资源必须在 listen 之前注册,否则 Fastify 拒绝再加路由。
+  if (cfg.staticDir) {
+    mountStatic(app, cfg.staticDir);
+  }
 
   const { host, port } = listenHostPort(cfg.listen);
   app.listen({ host, port }).catch((e) => {
@@ -1220,6 +1461,14 @@ export function startServer(): void {
       return;
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
+      const hello = lastDashboardFrame(history);
+      if (hello) {
+        try {
+          ws.send(hello);
+        } catch {
+          /* 客户端瞬时断开 */
+        }
+      }
       wss.emit("connection", ws, req, claims);
     });
   });
@@ -1261,11 +1510,6 @@ export function startServer(): void {
       /* admin 短暂不可达:跳过本轮 */
     }
   }, 5000);
-
-  // 静态资源(控制台构建产物;可选)
-  if (cfg.staticDir) {
-    void import("./static.js").then(({ mountStatic }) => mountStatic(app, cfg.staticDir!));
-  }
 
   app.addHook("onClose", async () => {
     clearInterval(dashboardLoop);

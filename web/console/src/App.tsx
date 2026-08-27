@@ -5,13 +5,14 @@ import Dashboard from "./pages/Dashboard";
 import Buckets from "./pages/Buckets";
 import Objects from "./pages/Objects";
 import Keys from "./pages/Keys";
+import Sessions from "./pages/Sessions";
 import Audit from "./pages/Audit";
 import Settings from "./pages/Settings";
 import Uploads from "./pages/Uploads";
 import FirstRun from "./pages/FirstRun";
 import CenterApp from "./center/CenterApp";
 import { FIRST_RUN_DISMISS_KEY } from "./pages/FirstRun";
-
+import { hashRoutePath } from "./hash-route";
 function useHashRoute(): string {
   const [hash, setHash] = useState(window.location.hash);
   useEffect(() => {
@@ -19,7 +20,7 @@ function useHashRoute(): string {
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
-  return hash.replace(/^#/, "") || "/dashboard";
+  return hashRoutePath(hash);
 }
 
 const NAV = [
@@ -28,6 +29,7 @@ const NAV = [
   { path: "/objects", label: "对象浏览" },
   { path: "/uploads", label: "在途上传" },
   { path: "/keys", label: "访问密钥" },
+  { path: "/sessions", label: "临时会话" },
   { path: "/audit", label: "审计日志" },
   { path: "/settings", label: "设置" },
 ];
@@ -37,21 +39,9 @@ export default function App() {
   const [authed, setAuthed] = useState<boolean>(() => !!getToken());
   const [role, setRole] = useState<string>("admin");
 
-  // M14 G3-1:中心控制台(独立登录态;#/center/* 子应用)
-  if (route.startsWith("/center")) {
-    return <CenterApp />;
-  }
-
-  useEffect(() => {
-    // 校验 token 有效性(可选):dashboard 请求失败会 401 → 清 token
-    if (authed) {
-      api.dashboard().catch(() => {});
-    }
-  }, [authed]);
-
   useEffect(() => {
     // J5:登录后探测首启状态;first_run 且未显式跳过时,把默认首页重定向到向导
-    if (!authed) return;
+    if (!authed || hashRoutePath(window.location.hash).startsWith("/center")) return;
     api
       .bootstrap()
       .then((b) => {
@@ -67,6 +57,11 @@ export default function App() {
         /* admin 暂不可达:不阻塞进入控制台 */
       });
   }, [authed]);
+
+  // M14 G3-1:中心控制台(独立登录态;#/center/* 子应用)
+  if (route.startsWith("/center")) {
+    return <CenterApp />;
+  }
 
   if (!authed) {
     return (
@@ -94,6 +89,9 @@ export default function App() {
     case "/keys":
       page = isAdmin ? <Keys /> : <div className="muted">只读角色无权访问</div>;
       break;
+    case "/sessions":
+      page = isAdmin ? <Sessions /> : <div className="muted">只读角色无权访问</div>;
+      break;
     case "/audit":
       page = <Audit />;
       break;
@@ -118,7 +116,11 @@ export default function App() {
             <a
               key={n.path}
               href={`#${n.path}`}
-              className={route.startsWith(n.path) ? "active" : ""}
+              className={route === n.path ? "active" : ""}
+              onClick={(e) => {
+                e.preventDefault();
+                window.location.hash = n.path;
+              }}
             >
               {n.label}
             </a>

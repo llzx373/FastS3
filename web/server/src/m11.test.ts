@@ -148,6 +148,26 @@ test("生命周期 XML 渲染/解析往返(含 And 复合过滤与三类动作)"
   assert.deepEqual(back, SAMPLE_RULES);
 });
 
+test("生命周期 XML 往返含 Transition(GLACIER/GLACIER_IR/DEEP_ARCHIVE)", () => {
+  const rules: LifecycleRule[] = [
+    {
+      ID: "to-glacier",
+      Status: "Enabled",
+      Filter: { Prefix: "cold/" },
+      Transition: { Days: 30, StorageClass: "GLACIER" },
+    },
+    {
+      ID: "to-ir",
+      Status: "Enabled",
+      Transition: { Days: 7, StorageClass: "GLACIER_IR" },
+    },
+  ];
+  const xml = renderLifecycleXml(rules);
+  assert.match(xml, /<Transition><Days>30<\/Days><StorageClass>GLACIER<\/StorageClass><\/Transition>/);
+  assert.match(xml, /<StorageClass>GLACIER_IR<\/StorageClass>/);
+  assert.deepEqual(parseLifecycleXml(xml), rules);
+});
+
 test("parseLifecycleXml 兼容数据面渲染形态(单 Tag 直下 / 空 Filter)", () => {
   const xml =
     '<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">' +

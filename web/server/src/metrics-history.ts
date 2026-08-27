@@ -49,9 +49,16 @@ export interface MetricsSnapshotData {
   bytes: SnapshotBytes;
   latency: SnapshotLatency;
   errors: number;
+  /** 5xx 次数(缺省 0;旧快照无此字段时错误率按 0,避免把 4xx 当可用性故障)。 */
+  errors_5xx: number;
   ring_depth: number;
   group_commit: GroupCommitStats;
   pools: Record<string, unknown>;
+  /** WS 快照可选逐盘视图(与 /v1/admin/status.devices 同形)。 */
+  devices?: Array<Record<string, unknown>>;
+  pool_capacity?: number;
+  pool_live_bytes?: number;
+  pool_usage?: number;
 }
 
 export interface MetricsSnapshot {
@@ -72,6 +79,7 @@ export function emptySnapshotData(): MetricsSnapshotData {
     bytes: { in: 0, out: 0 },
     latency: { p50: 0, p99: 0, p999: 0 },
     errors: 0,
+    errors_5xx: 0,
     ring_depth: 0,
     group_commit: { count: 0, bytes: 0 },
     pools: {},
@@ -122,7 +130,7 @@ export function normalizeSnapshotData(raw: unknown): MetricsSnapshotData {
   const bytes = toRecord(d.bytes);
   const latency = toRecord(d.latency);
   const gc = toRecord(d.group_commit);
-  return {
+  const out: MetricsSnapshotData = {
     uptime: toNum(d.uptime),
     degraded: d.degraded === true,
     device_capacity: toNum(d.device_capacity),
@@ -139,10 +147,16 @@ export function normalizeSnapshotData(raw: unknown): MetricsSnapshotData {
     bytes: { in: toNum(bytes.in), out: toNum(bytes.out) },
     latency: { p50: toNum(latency.p50), p99: toNum(latency.p99), p999: toNum(latency.p999) },
     errors: toNum(d.errors),
+    errors_5xx: toNum(d.errors_5xx),
     ring_depth: toNum(d.ring_depth),
     group_commit: { count: toNum(gc.count), bytes: toNum(gc.bytes) },
     pools: toRecord(d.pools),
   };
+  if (Array.isArray(d.devices)) out.devices = d.devices as Array<Record<string, unknown>>;
+  if (typeof d.pool_capacity === "number") out.pool_capacity = d.pool_capacity;
+  if (typeof d.pool_live_bytes === "number") out.pool_live_bytes = d.pool_live_bytes;
+  if (typeof d.pool_usage === "number") out.pool_usage = d.pool_usage;
+  return out;
 }
 
 /**
