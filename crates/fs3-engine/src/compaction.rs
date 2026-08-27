@@ -1163,6 +1163,34 @@ mod tests {
         );
     }
 
+    /// F9-8:perf-M15 补档存在且门禁数字与 CHANGELOG/M16 报告一致。
+    #[test]
+    fn perf_m15_numbers_match_changelog_and_m16() {
+        let m15 = include_str!("../../../docs/perf-M15.md");
+        let cl = include_str!("../../../CHANGELOG.md");
+        let v21 = cl
+            .split("## v2.1.0")
+            .nth(1)
+            .and_then(|s| s.split("\n## ").next())
+            .expect("v2.1.0");
+        assert!(m15.contains("-0.6%") && m15.contains("-0.3%"));
+        assert!(v21.contains("-0.6%") && v21.contains("-0.3%"));
+        assert!(m15.contains("84.32%") && v21.contains("84.32%"));
+        assert!(
+            m15.contains("83.89%") && m15.contains("perf-M16"),
+            "M15 报告须承接 M16 覆盖率 83.89%"
+        );
+        let m16 = include_str!("../../../docs/perf-M16.md");
+        assert!(
+            m16.contains("83.89%"),
+            "仓内 M16 报告须含门禁覆盖率 83.89%"
+        );
+        assert!(
+            v21.contains("perf-M15.md") && v21.contains("perf-M16.md"),
+            "CHANGELOG v2.1 须指向两份报告的承接关系"
+        );
+    }
+
     #[test]
     fn compaction_migrates_locked_object_keeps_retention() {
         // W4-1:压缩可搬锁定版本数据,不可当泄漏回收。

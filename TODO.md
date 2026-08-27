@@ -180,7 +180,7 @@ F0 ADR-22
 - [x] F9-5 CHANGELOG v2.1 C1「统一 STANDARD」加勘误(被 M16 真实归档覆盖);compat.md Webhook HTTPS 与 F6-1 最终选择一致
 - [x] F9-6 s3-tests README:notification/归档「出集」改为「上游无测/配置 skip,不以 100% 声称」;N5/A5-1 门禁改为自有集成测试为权威
 - [x] F9-7 STS/Inventory smoke:无 boto3 **不得 exit 0 当过**(fail 或 skip 非零/明确 SKIP 计数);T3 补 boto3 STS client 或改 TODO 措辞为「Query API 兼容」
-- [ ] F9-8 补 `docs/perf-M15.md`(或 CHANGELOG 声明 M15 perf 以 M16 报告为承接、作废独立文件);门禁数字与仓内报告一致
+- [x] F9-8 补 `docs/perf-M15.md`(或 CHANGELOG 声明 M15 perf 以 M16 报告为承接、作废独立文件);门禁数字与仓内报告一致
 
 ### G. 本里程碑门禁(退出条件)
 

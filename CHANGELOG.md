@@ -55,6 +55,8 @@ workspace + web 三件套版本 **2.1.0**。git tag / `tools/package/` 属执行
 - **门禁**:s3-tests 495/0/249;崩溃 500 轮事件队列混载;perf 关闭态
   -0.6% / 开启态 -0.3%;覆盖率 84.32%;audit 0 漏洞;客户端矩阵
   (aws/boto3/mc/rclone + STS + restic + duplicati)全过;S3-GAP §4/§5 复核。
+  独立 perf 文件当时未落盘,补档见 [docs/perf-M15.md](./docs/perf-M15.md);
+  后续对照与覆盖率以 [docs/perf-M16.md](./docs/perf-M16.md)(83.89%)承接。
 
 ## v2.0.0 — M14 集中纳管与生态(2026-08-26)
 
