@@ -856,6 +856,41 @@ mod tests {
         e.close().unwrap();
     }
 
+    /// F8-4:s3-tests gate 生成的 toml 必须开启压缩,与实现/README 运行节一致。
+    #[test]
+    fn gate_compaction_enabled_is_true() {
+        let sh = include_str!("../../../tests/m8/regression.sh");
+        let marker = "cat > \"$CONF\" <<EOF";
+        let start = sh.find(marker).expect("gate toml heredoc");
+        let rest = &sh[start + marker.len()..];
+        let end = rest.find("\nEOF").expect("heredoc end");
+        let toml = rest[..end].trim();
+        assert!(
+            toml.contains("compaction_enabled = true"),
+            "gate toml must set compaction_enabled = true after F8"
+        );
+        assert!(
+            !toml
+                .lines()
+                .any(|l| l.trim() == "compaction_enabled = false"),
+            "gate toml must not force-disable compaction"
+        );
+        let readme = include_str!("../../../tests/s3-tests/README.md");
+        let run = readme
+            .split("## 运行")
+            .nth(1)
+            .and_then(|s| s.split("## ").next())
+            .expect("README 运行 section");
+        assert!(
+            run.contains("compaction_enabled = true"),
+            "README 运行节须与 gate 同口径开启压缩"
+        );
+        assert!(
+            !run.contains("gate 配置必须 compaction_enabled = false"),
+            "README 运行节不得再要求关压缩才能绿"
+        );
+    }
+
     #[test]
     fn compaction_migrates_locked_object_keeps_retention() {
         // W4-1:压缩可搬锁定版本数据,不可当泄漏回收。

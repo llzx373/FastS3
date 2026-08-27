@@ -160,7 +160,7 @@ F0 ADR-22
 
 ### F8 S8 压缩 × 流式读钉扎(原 D1;P0 错读)
 
-> 前置:F3-1(zc Drop 关 fd)。完成前生产默认压缩可保持开启,但 s3-tests 仍关压缩直到本项勾选。
+> 前置:F3-1(zc Drop 关 fd)。F8 完成后生产默认与 s3-tests gate 均开启压缩。
 
 - [x] F8-1 分配器/引擎:extent `pin_count`;`object_segments_meta` / 零拷贝快照 / 缓冲 GET 流 / MultiRange 入口 pin,对应 `Drop`/结束 unpin(含 abort、客户端断开)
   - 用例:`pin_drop_unpins` RAII;panic/unwind 也 unpin
@@ -168,7 +168,7 @@ F0 ADR-22
   - 用例:`compaction_skips_pinned_extent`;`allocate_does_not_reuse_pinned`
 - [x] F8-3 集成:大对象 GET 零拷贝进行中触发 compact_once(碎片布局),GET 字节与写入一致;复现原先 ~50% 失败的 `multipart_upload_resend_part` 量级(≥30MiB)在 **compaction_enabled=true** 下稳定
   - 用例:`streaming_get_during_compaction_stable`(engine 或 http 集成);s3-tests 门禁配置改为允许压缩(或双跑:关/开各一次)
-- [ ] F8-4 TODO 债务轨道 D1 勾选;s3-tests README 删除「必须关压缩才能绿」;A5-2 压缩并发补跑(可并入 G1)
+- [x] F8-4 TODO 债务轨道 D1 勾选;s3-tests README 删除「必须关压缩才能绿」;A5-2 压缩并发补跑(可并入 G1)
   - 用例:README/gate 脚本与实现一致(CI 或本地脚本断言 `compaction_enabled` 在 gate toml 为 true)
 
 ### F9 文档与门禁诚实化(代码项完成后再做,避免再写假完成)
@@ -234,7 +234,7 @@ F0 ADR-22
 - [x] 覆盖率 ≥80%;cargo audit 清零;发布 v2.1.0(workspace + web 三件套 bump,CHANGELOG/RELEASES 记档;不打 tag 不打包,与 v1.x/v2.0 同口径)
 
 ### D. 债务轨道(并行,不占特性主线)
-- [ ] D1 S8 压缩迁移 × 流式读并发竞态根治 → **并入审查修复 F8**;本组 F8-4 勾选后回头勾本条
+- [x] D1 S8 压缩迁移 × 流式读并发竞态根治 → **并入审查修复 F8**;本组 F8-4 勾选后回头勾本条
 - [ ] D2 v2.0 外部安全审计**执行**(范围:agent mTLS/中心 SQLite/0-RTT/缓存;M14 已立项)
 - [ ] D3 客户端矩阵补齐:Hadoop S3A/Spark/Trino 冒烟(补齐 java/hadoop 环境后跑;条件写已就绪)+ **Veeam 备份往返实测(优先;Community Edition + Object Lock 不可变仓库形态,作为 S3-GAP §4 备份场景闭环项)与 Commvault(授权/重部署环境,可后置)** + HTTP/3 netem 弱网对照
 - [ ] D4 发布执行项收敛:git tag / `tools/package/` / release 流水线首次实跑
@@ -277,7 +277,7 @@ F0 ADR-22
 
 #### A5 测试与门禁(≈1.3 pw)
 - [x] A5-1 s3-tests transition/restore/storage-class 族出排除集且 100%(test_lifecycle_transition_* 出集;test_restore_object* 按实现口径出集或逐名记录;EXCLUDE 正则与 README 矩阵同步)
-- [x] A5-2 崩溃 ≥500 轮(归档写/transition/restore/GC 混载)零撕裂/零泄漏/账目零漂移;transition×压缩 worker 并发回归(**未复核**:脚本 `compaction_enabled=false`;待审查修复 F8/G2)
+- [x] A5-2 崩溃 ≥500 轮(归档写/transition/restore/GC 混载)零撕裂/零泄漏/账目零漂移;transition×压缩 worker 并发回归(**F8 已复核**:`streaming_get_during_compaction_stable` + gate `compaction_enabled=true`;崩溃混载开压缩见 G2)
 - [x] A5-3 升级演练 v2.1→v2.2(含 ObjectMeta v6→v7 在线重写 + 回滚实测);归档读带宽/恢复耗时基准写入发布报告(§9.1 口径)
 - [x] A5-4 客户端矩阵:aws cli RestoreObject/存储类往返 + mc/rclone 归档对象行为;compat.md 存储类矩阵从「M15 映射 STANDARD」升版为真实归档语义
 

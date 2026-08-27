@@ -63,16 +63,13 @@ FastS3 v0.5 的协议一致性门禁 = **已实现特性的完整兼容**。跑 
 # 1) 启动服务(任意端口;最小配置示例:
 #      [server] listen = "127.0.0.1:19500"
 #      [storage] devices = ["<2GiB 镜像>"] meta_dir = "<meta 目录>" sync_mode = "full"
-#                compaction_enabled = false)
+#                compaction_enabled = true)
 #    M10 S5 起必须带 --allow-anonymous:cors_origin_response/wildcard 首条断言为匿名 GET;
 #    匿名族翻转影响见排除矩阵「匿名读写语义」行(list_buckets_anonymous 翻绿出集,
 #    _objects_anonymous_fail pair 转为配置语义对,仍由 _objects_anonymous 覆盖)
-#    M10 S5 起 gate 配置必须 compaction_enabled = false:全量跑批实测发现
-#    **压缩迁移与大对象流式读(zero-copy fd 直发)存在并发竞态**——迁移释放的
-#    extent 被复用覆写时,进行中的读返回新数据(test_multipart_upload_resend_part
-#    30MiB 对象区间错字节,碎片区+活压缩下 ~50% 复现)。该竞态为引擎层已发现
-#    未关闭缺陷(读路径无 extent 代数校验;修复属 ADR-9 后续里程碑),协议门禁
-#    需要确定性环境故关闭后台压缩;生产默认开启不变。
+#    审查修复 F8 后 gate 与生产一致:`compaction_enabled = true`(读钉扎 ADR-22 (c)
+#    关闭压缩迁移 × 流式读竞态)。下文 M10/M11 实测记录里的
+#    compaction_enabled=false 是 F8 完成前的缓解环境,不再作为运行要求。
 #    M11 L5-1 起 gate 配置加 lifecycle_interval_secs = 10:lifecycle 过期
 #    用例的观测窗(lc_debug_interval=10s 倍数睡眠)内需至少一个执行周期
 #    才可见删除(过去 Date 立即到期/NewerNoncurrentVersions 保量两用例
@@ -342,8 +339,8 @@ S3TEST_CONF=/tmp/s3-tests/s3tests.conf bash tests/s3-tests/run_s3tests.sh
   (`anonymous_request|success_code`)、`put_acl`(acl_mtime,PutObjectAcl 501)、
   匿名族残余(`raw_get_object_acl|anon_put_write_access`)、ownership 跨账号 6 个
   (`bucket_owner|object_writer`)。
-- gate 环境(实测必须):`--allow-anonymous`(cors 首条匿名 GET 断言)+
-  `compaction_enabled = false`(见「运行」节的竞态说明)。
+- gate 环境(当时实测):`--allow-anonymous`(cors 首条匿名 GET 断言)+
+  `compaction_enabled = false`(S5 缓解压缩×流式读竞态;F8 后运行节已改为开启压缩)。
 - 复测中发现并修复的服务端真实缺陷:**压缩 extent 打包溢出**
   (compaction.rs copy_segment debug_assert panic;release 下会静默覆写相邻
   extent 头)——候选 extent 数不约束累计活段字节,修复为逐对象容量预算
