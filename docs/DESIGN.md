@@ -62,6 +62,12 @@
 
 ### 1.3 非目标(V1)
 
+> **V1 立项口径,已被后续 ADR 取代**(实现以 ADR 与兼容矩阵为准,不得再把本列表当现行范围):
+> 生命周期/对象锁/版本控制 → ADR-11/12/13(v1.1–v1.3);
+> LDAP/OIDC → ADR-21(v2.2);在线扩容 → ADR-15(v1.4);
+> 纠删码/跨节点复制仍非目标;站点级容灾走 ADR-20 策略化同步(不内置 ?replication)。
+> S3 Select 停售排除。完整现行范围见 [compat.md](./site/docs/reference/compat.md) 与 ADR-5/9/14/22。
+
 - 多节点 / 分布式部署(单机内多设备条带化除外);
 - 纠删码、跨节点复制、站点级容灾(交给底层存储);
 - S3 Select、生命周期管理、对象锁、版本控制(列入路线图,V1 不做);
@@ -1463,10 +1469,14 @@ magic(4B) | 代数(8B) | 对象/上传归属 id(16B) | 对象内偏移(8B)
 
 ### 4.3 空间分配器
 
-- 内存中常驻**位图(每 extent 1 bit)+ 引用计数数组(u32)**;位图是权威状态,每次变更记录进 rocksdb 事务;
-- 分配策略:按设备条带轮转 + 每核私有 hint 游标(无锁近似,**真正的原子性靠 rocksdb 事务**),避免多核抢同一游标;
-- 检查点:每 `checkpoint_interval`(默认 30s)或每 64MB 分配增量,把位图 + 统计写入设备双缓冲区(先写副本 A 并 fsync,再写序号指针使 A 生效);
-- 启动恢复 = 加载最近检查点 + 从 rocksdb 重放该检查点之后的 `alloc` 记录(见 §4.10)。
+- 内存中常驻**位图(每 extent 1 bit)+ 引用计数数组(u32)+ pin_count(ADR-22)**;
+  **位图是分配权威**(checkpoint + `a:` 重放,ADR-5);泄漏判定另走元数据
+  mark-sweep(ADR-9/F7,不单信派生 `live_bytes==0`)。
+- 分配策略:按设备剩余空间加权轮转 + 每核私有 hint 游标(无锁近似,**真正的原子性靠 rocksdb 事务**);
+  pin>0 的 extent 进隔离队列,unpin 到 0 才清位,禁止 `allocate` 复用(ADR-22 (c))。
+- 检查点:**槽自含代数**(ADR-5),写代数较小/无效的槽,恢复取 CRC 有效且代数最大者;
+  **不是**「先写副本 A 再写序号指针」。周期默认 30s 或 64MB 分配增量。
+- 启动恢复 = 加载最近检查点 + 从 rocksdb 重放该检查点之后的 `alloc`/`ref_inc`/`ref_dec` 记录(见 §4.10)。
 
 ### 4.4 元数据存储(rocksdb)
 
@@ -1475,11 +1485,17 @@ magic(4B) | 代数(8B) | 对象/上传归属 id(16B) | 对象内偏移(8B)
 | 前缀 | 键 | 值 |
 | --- | --- | --- |
 | `b:{bucket}` | 桶名 | 桶元数据:创建时间、owner、策略 JSON、配额、统计(对象数/字节) |
-| `o:{bucket}\0{key}` | 转义后的对象键 | 对象元数据:`size、etag、mtime、extent 引用列表、用户自定义元数据头、content-type、uploadId 关联` |
+| `o:{bucket}\0{esc}` | 未版本化对象 | 对象元数据(ADR-11:版本化桶为 `o:{bucket}\0{esc}\0{vk16}`) |
+| `p:{uploadId}\0{part}` | 分片 | PartMeta |
 | `u:{uploadId}` | 分片上传会话 | 状态、各 part 的 extent 列表、创建时间 |
-| `a:{seq}` | 分配器变更记录 | 分配/释放的 extent 范围(供位图重放) |
-| `t:{txnId}` | 事务标记 | 事务提交标记(恢复时判定 a: 记录是否有效) |
+| `m:{bucket}\0{uploadId}` | MPU 桶索引 | ListMultipartUploads |
+| `a:{seq}` | 分配器变更记录 | alloc/ref_inc/ref_dec(ADR-5) |
+| `t:{seq}` | 事务标记 | 事务提交标记(恢复时判定 a: 记录是否有效) |
+| `e:{seq}` / `n:` / `x:` / `iv:` | 事件队列 / 通知规则 / restore 作业 / Inventory | M15–M16;须与 keys.rs、export DTO、check 扫描三处同步 |
 | `s:seq` | 系统计数器 | 事务单调序号(单点序列化;ADR-5) |
+
+> 完整前缀表以 `crates/fs3-meta/src/keys.rs` 为准(含 `bc:/bt:/bo:/bp:/r:/k:/l:` 等)。
+> 可达性扫描纳入 `o:` 全部版本 + `p:` + restore 副本段(ADR-22 (b))。
 
 - **键转义:** S3 对象键可含任意 UTF-8(理论上是任意字节),采用 `0x00 → 0xFF 0x00、0xFF → 0xFF 0xFF` 转义,保证前缀扫描 `o:{bucket}\0` 恰好是该桶全部对象;
 - **小对象内联:** `size ≤ small_object_limit`(默认 32KiB)的对象数据直接内联在元数据值里,**零设备 I/O**(一条 rocksdb 事务搞定 PUT/GET);
@@ -1545,7 +1561,7 @@ GET → 鉴权 → 查 o:{bucket}\0{key}(rocksdb 命中,微秒级)
 
 - `CreateMultipartUpload` → 创建 `u:` 记录,返回 uploadId(128 位随机);
 - `UploadPart` → 每个 part 就是一个"隐藏对象"(数据写 extent,元数据挂到 `u:` 会话下),完成即应;
-- `CompleteMultipartUpload` → 一条 rocksdb 事务:明文会话把 part 的 extent 列表按 part 序拼接进最终对象元数据,**零数据搬运**;SSE 会话 Complete 解密重加密为单一对象网格(ADR-12 D-E4),新段 `add_object` 后必须 `release_object` **且** `after_release` 分片旧段(seal-on-delete / 丢弃已清位的开放 extent)。ETag = MD5(各 part ETag 十六进制串拼接)+"-N"(与 AWS 完全一致);
+- `CompleteMultipartUpload` → 一条 rocksdb 事务:明文会话把 part 的 extent 列表按 part 序拼接进最终对象元数据,**零数据搬运**;SSE 会话 Complete 解密重加密为单一对象网格(ADR-12 D-E4),新段 `add_object` 后必须 `release_object` **且** `after_release` 分片旧段(seal-on-delete / 丢弃已清位的开放 extent)。ETag = `MD5(binary(各 part MD5 拼接))-"N"`(ADR-14,AWS 标准;**不是** hex 串拼接);
 - `AbortMultipartUpload` / 会话超时(默认 7 天)→ 释放全部 extent;
 - 好处:GET 完全不知道 multipart 的存在,extent 列表天然支持跨 part 连续读。
 

@@ -1005,6 +1005,49 @@ mod tests {
         );
     }
 
+    /// F9-4:DESIGN §1.3 标明 V1 非目标已被后续 ADR 取代;§4.3/4.4/4.7 与 ADR-5/9/14/22 对齐。
+    #[test]
+    fn design_v1_nongoals_and_alloc_meta_aligned() {
+        let d = include_str!("../../../docs/DESIGN.md");
+        let s13 = d
+            .split("### 1.3 非目标(V1)")
+            .nth(1)
+            .and_then(|s| s.split("\n### 1.4").next())
+            .expect("§1.3");
+        assert!(
+            s13.contains("已被后续 ADR 取代"),
+            "§1.3 须标明 V1 非目标已被后续 ADR 取代"
+        );
+        let s43 = d
+            .split("### 4.3 空间分配器")
+            .nth(1)
+            .and_then(|s| s.split("\n### 4.4").next())
+            .expect("§4.3");
+        assert!(s43.contains("ADR-5"), "§4.3 检查点须指向 ADR-5 代数槽");
+        assert!(
+            !s43.contains("再写序号指针使 A 生效"),
+            "§4.3 不得再把序号指针当现行检查点"
+        );
+        assert!(s43.contains("ADR-22"), "§4.3 须含读钉扎");
+        let s44 = d
+            .split("### 4.4 元数据存储(rocksdb)")
+            .nth(1)
+            .and_then(|s| s.split("\n### 4.5").next())
+            .expect("§4.4");
+        assert!(s44.contains("`p:{uploadId}"), "§4.4 须含分片前缀 p:");
+        assert!(s44.contains("`e:{seq}"), "§4.4 须含事件队列 e:");
+        let s47 = d
+            .split("### 4.7 Multipart 上传")
+            .nth(1)
+            .and_then(|s| s.split("\n### 4.8").next())
+            .expect("§4.7");
+        assert!(s47.contains("ADR-14"), "§4.7 ETag 须指向 ADR-14 二进制拼接");
+        assert!(
+            !s47.contains("十六进制串拼接"),
+            "§4.7 不得再把 hex 拼接当现行 ETag"
+        );
+    }
+
     #[test]
     fn compaction_migrates_locked_object_keeps_retention() {
         // W4-1:压缩可搬锁定版本数据,不可当泄漏回收。
