@@ -30,8 +30,8 @@ trap cleanup EXIT
 echo "== FastS3 G4 s3-tests gate (compaction_enabled=true) =="
 ulimit -n "${FS3_MAX_FDS:-131072}" 2>/dev/null || true
 
-truncate -s 4G "$IMG"
-"$BIN" init --device "$IMG" --size 4GiB --yes >/dev/null
+truncate -s 8G "$IMG"
+"$BIN" init --device "$IMG" --size 8GiB --yes >/dev/null
 
 cat > "$CONF" <<EOF
 [server]

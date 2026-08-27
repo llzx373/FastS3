@@ -12,7 +12,7 @@
 # 排除依据与版本映射见 README.md。
 #
 # 用法:
-#   S3TEST_CONF=... ./run_s3tests.sh            # 全量 + 排除集校验(默认 xdist 并行)
+#   S3TEST_CONF=... ./run_s3tests.sh            # 全量 + 排除集校验(默认 xdist ≤4 路)
 #   S3TESTS_N=0 ./run_s3tests.sh               # 强制串行
 #   ./run_s3tests.sh --list-failed              # 只列出失败(分析用)
 #   前置:fasts3d 已 serve;s3tests.conf fixtures.bucket prefix 含 {random};
@@ -26,7 +26,6 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 S3TESTS="${S3TESTS_DIR:-/tmp/s3-tests}"
 CONF="${S3TEST_CONF:-$S3TESTS/s3tests.conf}"
 OUT="$(mktemp /tmp/s3tests-gate.XXXXXX)"
-trap 'rm -f "$OUT"' EXIT
 
 [ -d "$S3TESTS" ] || { echo "s3-tests not found: set S3TESTS_DIR"; exit 2; }
 
@@ -134,18 +133,21 @@ EXCLUDE='kms|sse_c_post_object_authenticated_request|sse_c_enforced_with_bucket_
 
 # 并行:pytest-xdist --dist load(按用例分发)。桶前缀必须含 {random},
 # 否则 autouse nuke_prefixed_buckets 会删掉其他 worker 的桶。
-# S3TESTS_N=0 强制串行;未设则 min(nproc,16)。优先用 s3-tests/venv。
+# S3TESTS_N=0 强制串行;未设则 min(nproc,4)。16 路实测核心用例全红(服务过载)。
+# 结果以 --junitxml 为准:xdist -q 的 FAILED 行会重复,全红时摘要没有 "N passed"。
 if [ -x "$S3TESTS/venv/bin/python3" ]; then
     PY="$S3TESTS/venv/bin/python3"
 else
     PY=python3
 fi
-PYTEST_ARGS=(-q --tb=no)
+JUNIT="$OUT.junit.xml"
+trap 'rm -f "$OUT" "$OUT.failed" "$JUNIT"' EXIT
+PYTEST_ARGS=(-q --tb=line --junitxml="$JUNIT")
 if "$PY" -c "import xdist" 2>/dev/null; then
     n="${S3TESTS_N-}"
     if [ -z "$n" ]; then
-        c=$(nproc 2>/dev/null || echo 8)
-        n=$((c < 16 ? c : 16))
+        c=$(nproc 2>/dev/null || echo 4)
+        n=$((c < 4 ? c : 4))
         [ "$n" -lt 2 ] && n=2
     fi
     if [ "$n" != "0" ]; then
@@ -185,9 +187,40 @@ echo "pytest ${PYTEST_ARGS[*]} s3tests/functional/test_s3.py"
 cd "$S3TESTS" && S3TEST_CONF="$CONF" "$PY" -m pytest s3tests/functional/test_s3.py "${PYTEST_ARGS[@]}" > "$OUT" 2>&1
 TOTAL=$?
 echo "── s3-tests run finished (pytest exit=$TOTAL) ──"
-grep -E "FAILED|ERROR" "$OUT" | grep -E "test_s3\.py" \
-    | sed -E 's/.*FAILED[[:space:]]+//; s/.*ERROR[[:space:]]+//; s/^\[gw[0-9]+\][[:space:]]+//' \
-    > "$OUT.failed" || true
+tail -n 8 "$OUT" || true
+if [ ! -s "$JUNIT" ]; then
+    echo "RESULT: FAIL (no junitxml; pytest likely crashed before reporting)"
+    exit 1
+fi
+read -r NPASS NSKIP NFAIL < <("$PY" - "$JUNIT" "$OUT.failed" <<'PY'
+import os, sys, xml.etree.ElementTree as ET
+junit, outp = sys.argv[1], sys.argv[2]
+npass = nskip = 0
+failed = []
+if os.path.isfile(junit) and os.path.getsize(junit) > 0:
+    root = ET.parse(junit).getroot()
+    suites = root.findall("testsuite") if root.tag == "testsuites" else [root]
+    for ts in suites:
+        if ts.tag != "testsuite":
+            continue
+        for tc in ts.findall("testcase"):
+            cls, name = tc.get("classname") or "", tc.get("name") or ""
+            node = (cls.replace(".", "/") + ".py::" + name) if cls else name
+            if tc.find("skipped") is not None:
+                nskip += 1
+            elif tc.find("failure") is not None or tc.find("error") is not None:
+                failed.append(node)
+            else:
+                npass += 1
+seen, lines = set(), []
+for n in failed:
+    if n not in seen:
+        seen.add(n)
+        lines.append(n)
+open(outp, "w").write("\n".join(lines) + ("\n" if lines else ""))
+print(f"{npass} {nskip} {len(lines)}")
+PY
+)
 
 if [ "${1:-}" = "--list-failed" ]; then
     cat "$OUT.failed"
@@ -196,10 +229,7 @@ fi
 
 # 未预期失败 = 不在排除集内的失败
 UNEXPECTED=$(grep -vE "$EXCLUDE" "$OUT.failed" || true)
-NFAIL=$(wc -l < "$OUT.failed" || echo 0)
 NEXTRA=$(echo "$UNEXPECTED" | grep -c . || true)
-NPASS=$(grep -oE "[0-9]+ passed" "$OUT" | grep -oE "[0-9]+")
-NSKIP=$(grep -oE "[0-9]+ skipped" "$OUT" | grep -oE "[0-9]+")
 
 echo "passed=$NPASS skipped=$NSKIP excluded_failures=$NFAIL unexpected_failures=$NEXTRA"
 if [ -n "$UNEXPECTED" ]; then
