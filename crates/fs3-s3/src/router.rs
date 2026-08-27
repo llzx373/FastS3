@@ -75,6 +75,10 @@ pub enum Operation {
     DeletePublicAccessBlock {
         bucket: String,
     },
+    /// GET ?policyStatus(M17/B2;ADR-23 DB3)。
+    GetBucketPolicyStatus {
+        bucket: String,
+    },
     // —— 桶策略(M10 S3;ADR-11 D9 `bp:` 键) ——
     /// PUT ?policy:JSON body 原样携带(服务层解析校验 + 原文入库,GET 逐字节
     /// 回显——s3-tests test_set_get_del_bucket_policy 断言逐字节相等)。
@@ -661,6 +665,13 @@ impl Router {
                     _ => Err(S3Error::new(S3ErrorCode::MethodNotAllowed)),
                 };
             }
+            // M17/B2:GetBucketPolicyStatus(ADR-23 DB3)
+            if has_q("policyStatus") {
+                return match method {
+                    "GET" => Ok(Operation::GetBucketPolicyStatus { bucket }),
+                    _ => Err(S3Error::new(S3ErrorCode::MethodNotAllowed)),
+                };
+            }
             // M10 S3:桶策略(D9 `bp:` 键;JSON body 服务层解析校验)
             if has_q("policy") {
                 return match method {
@@ -754,8 +765,6 @@ impl Router {
             // 不支持/未实现的子资源
             for unsupported in [
                 "acl",
-                // GetBucketPolicyStatus:B2 接线;B1 仅配置往返,本条仍 501
-                "policyStatus",
                 "website",
                 // "notification" 自 M15 N1 起已实现(Put/Get/DeleteBucketNotifica-
                 // tionConfiguration),出表接线
@@ -1236,6 +1245,12 @@ mod tests {
         let op = r.route("DELETE", "localhost", "/b1", &q, b"").unwrap();
         assert!(matches!(op, Operation::DeleteBucketPolicy { bucket } if bucket == "b1"));
         let err = r.route("POST", "localhost", "/b1", &q, b"").unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::MethodNotAllowed);
+        // M17/B2:?policyStatus GET
+        let q = vec![("policyStatus".into(), "".into())];
+        let op = r.route("GET", "localhost", "/b1", &q, b"").unwrap();
+        assert!(matches!(op, Operation::GetBucketPolicyStatus { bucket } if bucket == "b1"));
+        let err = r.route("PUT", "localhost", "/b1", &q, b"").unwrap_err();
         assert_eq!(err.code, S3ErrorCode::MethodNotAllowed);
         // M10 S4:桶级 POST(无子资源)→ PostObject
         let op = r.route("POST", "localhost", "/b1", &[], b"").unwrap();

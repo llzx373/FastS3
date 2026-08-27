@@ -598,6 +598,7 @@ impl S3Service {
     }
 
     /// 匿名请求是否被桶策略显式授权(M10 S3;Principal "*" 且 Allow)。
+    /// RestrictPublicBuckets 为 true(默认)时忽略存量公开 Allow。
     fn anonymous_bucket_grant(
         &self,
         action: &str,
@@ -608,10 +609,54 @@ impl S3Service {
         if bucket.is_empty() {
             return false;
         }
+        if self
+            .bpa_of(bucket)
+            .is_some_and(|b| b.restrict_public_buckets)
+        {
+            return false;
+        }
         let Some(p) = self.bucket_policy(bucket) else {
             return false;
         };
         p.decide(action, &resource_arn(bucket, key), false, ctx) == crate::policy::Decision::Allow
+    }
+
+    /// 桶存在时的 BPA;无键 = 默认全 Block;桶不存在 = None。
+    fn bpa_of(&self, bucket: &str) -> Option<xml::PublicAccessBlock> {
+        match self.read_bucket_conf(bucket, fs3_meta::BucketConf::PublicAccessBlock) {
+            Ok(Some(doc)) => Some(
+                xml::parse_public_access_block(&doc).unwrap_or(xml::PublicAccessBlock::DEFAULT),
+            ),
+            Ok(None) => Some(xml::PublicAccessBlock::DEFAULT),
+            Err(_) => None,
+        }
+    }
+
+    /// ADR-23 DB2:BlockPublicAcls 为 true(默认,含建桶时桶尚不存在)时,
+    /// 公开 canned ACL 头/字段 403,先于 Put\*Acl 501。
+    fn enforce_block_public_acls(&self, bucket: &str, acl: &str) -> Result<(), S3Error> {
+        if !is_public_canned_acl(acl) {
+            return Ok(());
+        }
+        let bpa = self
+            .bpa_of(bucket)
+            .unwrap_or(xml::PublicAccessBlock::DEFAULT);
+        if bpa.block_public_acls {
+            return Err(S3Error::new(S3ErrorCode::AccessDenied)
+                .with_message("PublicAccessBlock BlockPublicAcls denies public canned ACL."));
+        }
+        Ok(())
+    }
+
+    fn enforce_block_public_acls_header(
+        &self,
+        bucket: &str,
+        req: &S3Request,
+    ) -> Result<(), S3Error> {
+        if let Some(acl) = header(req, "x-amz-acl") {
+            self.enforce_block_public_acls(bucket, acl)?;
+        }
+        Ok(())
     }
 
     /// J4+M10 S3 策略执行:密钥策略 × 桶策略双层求交(AWS 语义,单账号模型):
@@ -1413,18 +1458,16 @@ impl S3Service {
             // M10 S3:桶策略可对匿名显式授权(Principal "*" 且 Allow;读写同口径)。
             // 显式 Deny 已在 authorize 拒绝;NoMatch 落回既有语义(写拒绝/
             // 读按 allow_anonymous 全局开关)。
+            let (_op, name, bucket, key) = route_op_bucket_key(req);
+            if !bucket.is_empty()
+                && self.anonymous_bucket_grant(
+                    s3_action_name(&name, &bucket, &key),
+                    &bucket,
+                    &key,
+                    &self.policy_ctx(req, &bucket, &key),
+                )
             {
-                let (_op, name, bucket, key) = route_op_bucket_key(req);
-                if !bucket.is_empty()
-                    && self.anonymous_bucket_grant(
-                        s3_action_name(&name, &bucket, &key),
-                        &bucket,
-                        &key,
-                        &self.policy_ctx(req, &bucket, &key),
-                    )
-                {
-                    return Ok(None);
-                }
+                return Ok(None);
             }
             // REVIEW §3.5:allow_anonymous 仅开放「匿名公共读」(GET/HEAD),
             // 写操作(PUT/DELETE/POST 等)即使开启也必须携带有效签名。
@@ -1434,23 +1477,17 @@ impl S3Service {
                 // 匿名 DELETE 的桶已不存在 → NoSuchBucket(404)优先于通用
                 // AccessDenied(与桶存在时拒绝的 RGW/AWS 语义一致)。
                 if req.method == "DELETE" {
-                    let bucket = req
-                        .decoded_path
-                        .trim_start_matches('/')
-                        .split('/')
-                        .next()
-                        .unwrap_or("");
                     let missing = !bucket.is_empty()
                         && self
                             .engine
                             .read()
                             .meta()
-                            .get_bucket(bucket)
+                            .get_bucket(&bucket)
                             .map(|m| m.is_none())
                             .unwrap_or(false);
                     if missing {
                         return Err(S3Error::new(S3ErrorCode::NoSuchBucket)
-                            .with_extra("BucketName", bucket));
+                            .with_extra("BucketName", &bucket));
                     }
                 }
                 return Err(S3Error::new(S3ErrorCode::AccessDenied));
@@ -1458,6 +1495,14 @@ impl S3Service {
             if !self
                 .allow_anonymous
                 .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(S3Error::new(S3ErrorCode::AccessDenied));
+            }
+            // ADR-23 DB4:RestrictPublicBuckets(默认 true)优先于 --allow-anonymous
+            if !bucket.is_empty()
+                && self
+                    .bpa_of(&bucket)
+                    .is_some_and(|b| b.restrict_public_buckets)
             {
                 return Err(S3Error::new(S3ErrorCode::AccessDenied));
             }
@@ -1648,6 +1693,9 @@ impl S3Service {
             }
             Operation::DeletePublicAccessBlock { bucket } => {
                 Ok(self.op_delete_public_access_block(&bucket)?)
+            }
+            Operation::GetBucketPolicyStatus { bucket } => {
+                Ok(self.op_get_bucket_policy_status(&bucket)?)
             }
             // —— M10 S3:桶策略(D9 `bp:` 键) ——
             Operation::PutBucketPolicy { bucket, body } => {
@@ -2048,6 +2096,10 @@ impl S3Service {
         let _access = self.require_auth(req)?;
         // M9/A1:未实现头显式拒绝(流式 PUT/UploadPart 与缓冲路径同语义)
         self.check_unimplemented_headers(req)?;
+        if let StreamTarget::Object { bucket, .. } = &target {
+            validate_canned_acl(req)?;
+            self.enforce_block_public_acls_header(bucket, req)?;
+        }
         // M11 H1-1:键长/用户元数据尺寸上限(与缓冲路径同口径;UploadPart
         // 不受理 x-amz-meta-*,仅判键长)
         let (_, _, _, stream_key) = route_op_bucket_key(req);
@@ -2618,6 +2670,7 @@ impl S3Service {
         // M8/s3-tests:接受任意 LocationConstraint 并回显(RGW/MinIO 测试器
         // 语义;单机服务不做区域表)。无约束 = "" = us-east-1 默认语义。
         validate_canned_acl(req)?;
+        self.enforce_block_public_acls_header(bucket, req)?;
         let mut meta = BucketMeta {
             created: now_ts(),
             owner: "fasts3".into(),
@@ -2999,6 +3052,18 @@ impl S3Service {
         self.delete_bucket_conf(bucket, fs3_meta::BucketConf::PublicAccessBlock)
     }
 
+    /// GetBucketPolicyStatus(M17/B2;ADR-23 DB3):IsPublic 与四开关 + 策略求交。
+    fn op_get_bucket_policy_status(&self, bucket: &str) -> Result<ServiceResponse, S3Error> {
+        let bpa = self.bpa_of(bucket).ok_or_else(|| {
+            S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket)
+        })?;
+        let public_policy = self
+            .bucket_policy(bucket)
+            .is_some_and(|p| p.grants_anonymous_public_access());
+        let is_public = public_policy && !bpa.block_public_policy && !bpa.restrict_public_buckets;
+        Ok(Self::xml_response(xml::render_policy_status(is_public)))
+    }
+
     // ───────────────── M10 S3:桶策略(D9 `bp:` 键) ─────────────────
 
     /// PutBucketPolicy(M10 S3):JSON body 解析校验(Policy::parse;失败 →
@@ -3011,6 +3076,13 @@ impl S3Service {
         })?;
         let parsed = crate::policy::Policy::parse(text)
             .map_err(|e| S3Error::new(S3ErrorCode::MalformedPolicy).with_message(format!("{e}")))?;
+        if parsed.grants_anonymous_public_access()
+            && self.bpa_of(bucket).is_some_and(|b| b.block_public_policy)
+        {
+            return Err(S3Error::new(S3ErrorCode::AccessDenied).with_message(
+                "PublicAccessBlock BlockPublicPolicy denies a policy that grants anonymous access.",
+            ));
+        }
         {
             let engine = self.engine.write();
             engine
@@ -3559,6 +3631,7 @@ impl S3Service {
                 return Err(S3Error::new(S3ErrorCode::InvalidArgument)
                     .with_message(format!("The canned ACL you provided is not valid: {acl}")));
             }
+            self.enforce_block_public_acls(bucket, acl)?;
         }
         // 标签:M10 S1 落 ObjectMeta.tags。`tagging` 字段 = XML TagSet
         // (RGW/s3-tests post_object_tags_* 口径);`x-amz-tagging` 字段 =
@@ -4360,6 +4433,7 @@ impl S3Service {
         // M9/A1 配套:ACL 家族头显式校验(接受但不生效,单账号私有默认语义;
         // 非法值显式报错,不静默)
         validate_canned_acl(req)?;
+        self.enforce_block_public_acls_header(bucket, req)?;
         // M10 S1:x-amz-tagging 头 → ObjectMeta.tags(非法 → 400 InvalidTag)
         let tags = object_tags_header(req)?.unwrap_or_default();
         // 条件写(ADR-11 D6;V3-4):判定在引擎写锁内对当前版本元数据执行
@@ -5107,6 +5181,8 @@ impl S3Service {
         bucket: &str,
         key: &str,
     ) -> Result<ServiceResponse, S3Error> {
+        validate_canned_acl(req)?;
+        self.enforce_block_public_acls_header(bucket, req)?;
         let mut engine = self.engine.write();
         let bkt = engine
             .meta()
@@ -6833,6 +6909,13 @@ fn resp_headers_from(req: &S3Request) -> Vec<(String, String)> {
 /// 恒为私有默认 ACL;行为声明见 README「已知开放项」与 ADR-14)。
 /// x-amz-acl 值必须是 AWS 已知 canned ACL(大小写不敏感);未知值 → 400
 /// InvalidArgument(显式报错,不静默)。x-amz-grant-* 仅校验存在性。
+fn is_public_canned_acl(acl: &str) -> bool {
+    matches!(
+        acl.to_ascii_lowercase().as_str(),
+        "public-read" | "public-read-write" | "authenticated-read"
+    )
+}
+
 fn validate_canned_acl(req: &S3Request) -> Result<(), S3Error> {
     const KNOWN: &[&str] = &[
         "private",
@@ -7140,6 +7223,7 @@ fn route_op_bucket_key(req: &S3Request) -> (fs3_core::metrics::Op, String, Strin
         ("PUT", _, "") if has_q("publicAccessBlock") => (Op::Other, "PutPublicAccessBlock"),
         ("GET", _, "") if has_q("publicAccessBlock") => (Op::Other, "GetPublicAccessBlock"),
         ("DELETE", _, "") if has_q("publicAccessBlock") => (Op::Other, "DeletePublicAccessBlock"),
+        ("GET", _, "") if has_q("policyStatus") => (Op::Other, "GetBucketPolicyStatus"),
         // M10 S3:桶策略子资源审计名(即 AWS 动作名 s3:{Get,Put,Delete}BucketPolicy)
         ("PUT", _, "") if has_q("policy") => (Op::Other, "PutBucketPolicy"),
         ("GET", _, "") if has_q("policy") => (Op::Other, "GetBucketPolicy"),

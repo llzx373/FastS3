@@ -1674,7 +1674,9 @@ impl PublicAccessBlock {
 pub fn parse_public_access_block(body: &[u8]) -> Result<PublicAccessBlock, S3Error> {
     let malformed = |m: String| S3Error::new(S3ErrorCode::MalformedXML).with_message(m);
     if body.iter().all(|&b| b.is_ascii_whitespace()) {
-        return Err(malformed("PublicAccessBlockConfiguration body is empty".into()));
+        return Err(malformed(
+            "PublicAccessBlockConfiguration body is empty".into(),
+        ));
     }
     let mut reader = quick_xml::Reader::from_reader(body);
     reader.config_mut().trim_text(true);
@@ -1754,6 +1756,16 @@ pub fn render_public_access_block(b: PublicAccessBlock) -> String {
         flag(b.ignore_public_acls),
         flag(b.block_public_policy),
         flag(b.restrict_public_buckets)
+    )
+}
+
+pub fn render_policy_status(is_public: bool) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<PolicyStatus xmlns=\"{XMLNS}\">\
+<IsPublic>{}</IsPublic>\
+</PolicyStatus>",
+        if is_public { "true" } else { "false" }
     )
 }
 

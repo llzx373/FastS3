@@ -624,6 +624,21 @@ impl Policy {
             Decision::Allow
         )
     }
+
+    /// ADR-23:文档是否含 Principal `*` 的 Allow,且 Action 覆盖匿名读或写
+    /// (`s3:GetObject` / `s3:PutObject` / `s3:ListBucket` / `s3:*` 及通配)。
+    pub fn grants_anonymous_public_access(&self) -> bool {
+        const TARGETS: [&str; 3] = ["s3:getobject", "s3:putobject", "s3:listbucket"];
+        self.statements.iter().any(|st| {
+            if st.effect != Effect::Allow || st.principal != Some(Principal::Any) {
+                return false;
+            }
+            st.actions.iter().any(|pat| {
+                let p = normalize_action(pat);
+                TARGETS.iter().any(|t| wildcard_match(&p, t))
+            })
+        })
+    }
 }
 
 #[cfg(test)]
@@ -753,6 +768,27 @@ mod tests {
                 "匿名不匹配具体 principal: {doc}"
             );
         }
+        // Deny / 无 Principal * Allow 不算公开
+        let deny = Policy::parse(
+            r#"{"Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":["*"]}]}"#,
+        )
+        .unwrap();
+        assert!(!deny.grants_anonymous_public_access());
+        let auth_only = Policy::parse(
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::1:root"},"Action":"s3:*","Resource":["*"]}]}"#,
+        )
+        .unwrap();
+        assert!(!auth_only.grants_anonymous_public_access());
+        let public_get = Policy::parse(
+            r#"{"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":["*"]}]}"#,
+        )
+        .unwrap();
+        assert!(public_get.grants_anonymous_public_access());
+        let star = Policy::parse(
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:*","Resource":["*"]}]}"#,
+        )
+        .unwrap();
+        assert!(star.grants_anonymous_public_access());
         // 不支持形态显式报错(红线)
         for bad in [
             r#"{"Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"s3:*","Resource":["*"]}]}"#,

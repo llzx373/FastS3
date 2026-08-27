@@ -3805,7 +3805,10 @@ fn public_access_block_roundtrip() {
     assert_eq!(status(&r), 200, "{r:?}");
     let x = body_str(&r.unwrap());
     assert!(x.contains("<BlockPublicAcls>true</BlockPublicAcls>"), "{x}");
-    assert!(x.contains("<IgnorePublicAcls>true</IgnorePublicAcls>"), "{x}");
+    assert!(
+        x.contains("<IgnorePublicAcls>true</IgnorePublicAcls>"),
+        "{x}"
+    );
     assert!(
         x.contains("<BlockPublicPolicy>true</BlockPublicPolicy>"),
         "{x}"
@@ -3822,17 +3825,18 @@ fn public_access_block_roundtrip() {
 <RestrictPublicBuckets>true</RestrictPublicBuckets>
 </PublicAccessBlockConfiguration>"#
         .to_vec();
-    let r = svc.handle(&req_q(
-        "PUT",
-        "/bkt1",
-        &[("publicAccessBlock", "")],
-        body,
-    ));
+    let r = svc.handle(&req_q("PUT", "/bkt1", &[("publicAccessBlock", "")], body));
     assert_eq!(status(&r), 200, "{r:?}");
     let r = svc.handle(&req_q("GET", "/bkt1", &[("publicAccessBlock", "")], vec![]));
     let x = body_str(&r.unwrap());
-    assert!(x.contains("<BlockPublicAcls>false</BlockPublicAcls>"), "{x}");
-    assert!(x.contains("<IgnorePublicAcls>true</IgnorePublicAcls>"), "{x}");
+    assert!(
+        x.contains("<BlockPublicAcls>false</BlockPublicAcls>"),
+        "{x}"
+    );
+    assert!(
+        x.contains("<IgnorePublicAcls>true</IgnorePublicAcls>"),
+        "{x}"
+    );
     assert!(
         x.contains("<BlockPublicPolicy>false</BlockPublicPolicy>"),
         "{x}"
@@ -4462,12 +4466,42 @@ fn anon_req_q(method: &str, path: &str, query: &[(&str, &str)], body: Vec<u8>) -
     }
 }
 
+fn put_bpa(
+    svc: &S3Service,
+    bucket: &str,
+    block_acls: bool,
+    ignore: bool,
+    block_policy: bool,
+    restrict: bool,
+) {
+    let flag = |v: bool| if v { "true" } else { "false" };
+    let xml = format!(
+        "<PublicAccessBlockConfiguration>\
+<BlockPublicAcls>{}</BlockPublicAcls>\
+<IgnorePublicAcls>{}</IgnorePublicAcls>\
+<BlockPublicPolicy>{}</BlockPublicPolicy>\
+<RestrictPublicBuckets>{}</RestrictPublicBuckets>\
+</PublicAccessBlockConfiguration>",
+        flag(block_acls),
+        flag(ignore),
+        flag(block_policy),
+        flag(restrict)
+    );
+    assert_ok(&svc.handle(&req_q(
+        "PUT",
+        &format!("/{bucket}"),
+        &[("publicAccessBlock", "")],
+        xml.into_bytes(),
+    )));
+}
+
 /// M10 S3:PutBucketPolicy → GetBucketPolicy(逐字节回显)→ DeleteBucketPolicy
 /// → 再 GET 404 NoSuchBucketPolicy(s3-tests test_set_get_del_bucket_policy 口径)。
 #[test]
 fn bucket_policy_set_get_del() {
     let (_d, svc) = setup();
     assert_ok(&svc.handle(&req("PUT", "/pol", vec![])));
+    put_bpa(&svc, "pol", true, true, false, true);
     let doc = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:ListBucket","Resource":["arn:aws:s3:::pol","arn:aws:s3:::pol/*"]}]}"#;
     // PUT → 204
     let r = svc.handle(&req_q(
@@ -4544,6 +4578,7 @@ fn bucket_policy_intersection_semantics() {
     let (_d, svc) = setup();
     assert_ok(&svc.handle(&req("PUT", "/mix", vec![])));
     assert_ok(&svc.handle(&req("PUT", "/mix/obj", b"data".to_vec())));
+    put_bpa(&svc, "mix", true, true, false, true);
 
     // 1) 桶策略 Allow s3:*,密钥策略 Deny DeleteObject → 删除仍拒(跨层 Deny 优先)
     let bucket_allow_all = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:*","Resource":["arn:aws:s3:::mix","arn:aws:s3:::mix/*"]}]}"#;
@@ -4587,6 +4622,7 @@ fn bucket_policy_anonymous_and_prefix_condition() {
     assert_ok(&svc.handle(&req("PUT", "/pub", vec![])));
     assert_ok(&svc.handle(&req("PUT", "/pub/public/a.txt", b"a".to_vec())));
     assert_ok(&svc.handle(&req("PUT", "/pub/private/b.txt", b"b".to_vec())));
+    put_bpa(&svc, "pub", true, true, false, false);
 
     // 无策略:匿名 GET → 403(全局关)
     let r = svc.handle(&anon_req_q("GET", "/pub/public/a.txt", &[], vec![]));
@@ -4644,6 +4680,79 @@ fn bucket_policy_anonymous_and_prefix_condition() {
     assert_eq!(err_code(&r), "AccessDenied");
     // 已认证主密钥不受桶策略收缩影响(并集:隐式同账号放行)
     assert_ok(&svc.handle(&req("GET", "/pub/private/b.txt", vec![])));
+}
+
+/// M17/B2:默认 BlockPublicPolicy 拒绝会让桶公开的策略;私有 Principal 仍可写。
+#[test]
+fn bpa_blocks_public_policy() {
+    let (_d, svc) = setup();
+    assert_ok(&svc.handle(&req("PUT", "/bpa", vec![])));
+    let doc = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":["arn:aws:s3:::bpa/*"]}]}"#;
+    let r = svc.handle(&req_q(
+        "PUT",
+        "/bpa",
+        &[("policy", "")],
+        doc.as_bytes().to_vec(),
+    ));
+    assert_eq!(err_code(&r), "AccessDenied");
+    assert_eq!(status(&r), 403);
+    let r = svc.handle(&req_q("GET", "/bpa", &[("policy", "")], vec![]));
+    assert_eq!(err_code(&r), "NoSuchBucketPolicy");
+    let private = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::1:root"},"Action":"s3:GetObject","Resource":["arn:aws:s3:::bpa/*"]}]}"#;
+    assert_ok(&svc.handle(&req_q(
+        "PUT",
+        "/bpa",
+        &[("policy", "")],
+        private.as_bytes().to_vec(),
+    )));
+    let r = svc.handle(&req_q("GET", "/bpa", &[("policyStatus", "")], vec![]));
+    let x = body_str(&r.unwrap());
+    assert!(x.contains("<IsPublic>false</IsPublic>"), "{x}");
+}
+
+/// M17/B2:RestrictPublicBuckets 使存量公开 Allow 失效;GetBucketPolicy 仍回显原文。
+#[test]
+fn bpa_restrict_ignores_existing_public() {
+    let (_d, svc) = setup();
+    assert_ok(&svc.handle(&req("PUT", "/rst", vec![])));
+    assert_ok(&svc.handle(&req("PUT", "/rst/obj", b"hi".to_vec())));
+    put_bpa(&svc, "rst", true, true, false, false);
+    let doc = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":["arn:aws:s3:::rst/*"]}]}"#;
+    assert_ok(&svc.handle(&req_q(
+        "PUT",
+        "/rst",
+        &[("policy", "")],
+        doc.as_bytes().to_vec(),
+    )));
+    let r = svc.handle(&anon_req_q("GET", "/rst/obj", &[], vec![]));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let r = svc.handle(&req_q("GET", "/rst", &[("policyStatus", "")], vec![]));
+    let x = body_str(&r.unwrap());
+    assert!(x.contains("<IsPublic>true</IsPublic>"), "{x}");
+
+    put_bpa(&svc, "rst", true, true, false, true);
+    let r = svc.handle(&anon_req_q("GET", "/rst/obj", &[], vec![]));
+    assert_eq!(err_code(&r), "AccessDenied");
+    let r = svc.handle(&req_q("GET", "/rst", &[("policy", "")], vec![]));
+    assert_eq!(body_str(&r.unwrap()), doc);
+    let r = svc.handle(&req_q("GET", "/rst", &[("policyStatus", "")], vec![]));
+    let x = body_str(&r.unwrap());
+    assert!(x.contains("<IsPublic>false</IsPublic>"), "{x}");
+    assert_ok(&svc.handle(&req("GET", "/rst/obj", vec![])));
+}
+
+/// M17/B2:RestrictPublicBuckets(默认 true)优先于 --allow-anonymous。
+#[test]
+fn bpa_anonymous_get_denied_when_blocked() {
+    let (_d, svc) = setup();
+    svc.set_allow_anonymous(true);
+    assert_ok(&svc.handle(&req("PUT", "/anon", vec![])));
+    assert_ok(&svc.handle(&req("PUT", "/anon/obj", b"x".to_vec())));
+    let r = svc.handle(&anon_req_q("GET", "/anon/obj", &[], vec![]));
+    assert_eq!(err_code(&r), "AccessDenied");
+    put_bpa(&svc, "anon", true, true, true, false);
+    let r = svc.handle(&anon_req_q("GET", "/anon/obj", &[], vec![]));
+    assert_eq!(status(&r), 200, "{r:?}");
 }
 
 // ═══════════════════════ M10 S4:POST 表单上传 ═══════════════════════
@@ -5229,6 +5338,7 @@ fn post_object_fields_meta_tags() {
 fn post_object_anonymous_and_versioned() {
     let (_d, svc) = setup();
     assert_ok(&svc.handle(&req("PUT", "/post", vec![])));
+    put_bpa(&svc, "post", false, true, false, false);
 
     // 匿名无 policy 字段 → 403
     let body = post_form_body("----a1", &[("key", "foo.txt")], ("f.txt", b"bar"));

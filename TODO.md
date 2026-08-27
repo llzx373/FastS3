@@ -138,7 +138,7 @@
 - [x] B1 `Put/Get/DeletePublicAccessBlock` 配置往返(XML 四开关);非法 XML → MalformedXML;
   未配置时 Get 按 ADR-23 默认(新桶全 Block);Delete 回到默认而非「全开」
   - 用例:`public_access_block_roundtrip`;新桶 Get 四开关均为 true
-- [ ] B2 效果:BlockPublicPolicy 下 PutBucketPolicy 含 Principal `*` 公开读/写 → 403/AccessDenied
+- [x] B2 效果:BlockPublicPolicy 下 PutBucketPolicy 含 Principal `*` 公开读/写 → 403/AccessDenied
   (或明确 InvalidPolicy);RestrictPublicBuckets 使存量公开策略不再生效;GetBucketPolicyStatus
   `IsPublic` 与求交一致;匿名 GET 在阻断时 403,即使 `--allow-anonymous`
   - 用例:`bpa_blocks_public_policy`;`bpa_restrict_ignores_existing_public`;
