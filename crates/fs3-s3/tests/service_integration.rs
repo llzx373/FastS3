@@ -4755,6 +4755,28 @@ fn bpa_anonymous_get_denied_when_blocked() {
     assert_eq!(status(&r), 200, "{r:?}");
 }
 
+/// M17/B3:BlockPublicAcls 下 PutObject 公开 canned → 403;须在引擎写锁外求值(防自锁)。
+#[test]
+fn bpa_block_public_object_canned_acls() {
+    let (_d, svc) = setup();
+    assert_ok(&svc.handle(&req("PUT", "/canned", vec![])));
+    let r = svc.handle(&req_h(
+        "PUT",
+        "/canned/foo1",
+        &[("x-amz-acl", "public-read")],
+        b"x".to_vec(),
+    ));
+    assert_eq!(err_code(&r), "AccessDenied");
+    assert_eq!(status(&r), 403);
+    let r = svc.handle(&req_h(
+        "PUT",
+        "/canned/foo2",
+        &[("x-amz-acl", "private")],
+        b"x".to_vec(),
+    ));
+    assert_eq!(status(&r), 200, "{r:?}");
+}
+
 // ═══════════════════════ M10 S4:POST 表单上传 ═══════════════════════
 
 /// 构造 multipart/form-data 体(fields 保持给定大小写;file 带文件名)。

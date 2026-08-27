@@ -622,6 +622,7 @@ impl S3Service {
     }
 
     /// 桶存在时的 BPA;无键 = 默认全 Block;桶不存在 = None。
+    /// 调用方不得持有 `engine.write()`(本函数 `engine.read()`,parking_lot 非可重入)。
     fn bpa_of(&self, bucket: &str) -> Option<xml::PublicAccessBlock> {
         match self.read_bucket_conf(bucket, fs3_meta::BucketConf::PublicAccessBlock) {
             Ok(Some(doc)) => Some(
@@ -2667,10 +2668,15 @@ impl S3Service {
             });
         }
         // 新建:ACL 值合法性显式校验(接受但不生效,单账号模型声明)。
-        // M8/s3-tests:接受任意 LocationConstraint 并回显(RGW/MinIO 测试器
-        // 语义;单机服务不做区域表)。无约束 = "" = us-east-1 默认语义。
+        // 持有引擎写锁时不得再走 bpa_of(内部 engine.read() → 自锁);
+        // 新建桶无 `ba:` 键 = ADR-23 默认全 Block。
         validate_canned_acl(req)?;
-        self.enforce_block_public_acls_header(bucket, req)?;
+        if let Some(acl) = header(req, "x-amz-acl") {
+            if xml::PublicAccessBlock::DEFAULT.block_public_acls && is_public_canned_acl(acl) {
+                return Err(S3Error::new(S3ErrorCode::AccessDenied)
+                    .with_message("PublicAccessBlock BlockPublicAcls denies public canned ACL."));
+            }
+        }
         let mut meta = BucketMeta {
             created: now_ts(),
             owner: "fasts3".into(),
@@ -4429,11 +4435,13 @@ impl S3Service {
         // AES256 值已在本调用内显式拒绝,K1-4)
         let use_s3 = crate::sse::sse_s3_write_intent(req, ssec.as_ref(), bkt.default_encryption)?;
 
-        let mut engine = self.engine.write();
         // M9/A1 配套:ACL 家族头显式校验(接受但不生效,单账号私有默认语义;
-        // 非法值显式报错,不静默)
+        // 非法值显式报错,不静默)。BPA 读 ba: 必须在引擎写锁之外(否则
+        // parking_lot 写×读自锁,s3-tests test_block_public_object_canned_acls)。
         validate_canned_acl(req)?;
         self.enforce_block_public_acls_header(bucket, req)?;
+
+        let mut engine = self.engine.write();
         // M10 S1:x-amz-tagging 头 → ObjectMeta.tags(非法 → 400 InvalidTag)
         let tags = object_tags_header(req)?.unwrap_or_default();
         // 条件写(ADR-11 D6;V3-4):判定在引擎写锁内对当前版本元数据执行

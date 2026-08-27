@@ -143,7 +143,7 @@
   `IsPublic` 与求交一致;匿名 GET 在阻断时 403,即使 `--allow-anonymous`
   - 用例:`bpa_blocks_public_policy`;`bpa_restrict_ignores_existing_public`;
     `bpa_anonymous_get_denied_when_blocked`
-- [ ] B3 s3-tests:`public_access`/`block_public`/`ignore_public`/`policy_status` 能出集的出集;
+- [x] B3 s3-tests:`public_access`/`block_public`/`ignore_public`/`policy_status` 能出集的出集;
   因 Put\*Acl 501 或单账号模型不可满足的 **逐名记录理由**(沿用 C2 对 expected-bucket-owner 写法);
   `account_` 账号级 BPA 维持排除并写「单账号 501」
   - 用例:README 排除矩阵更新;gate 意外失败 0

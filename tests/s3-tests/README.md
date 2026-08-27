@@ -47,7 +47,7 @@ FastS3 v0.5 的协议一致性门禁 = **已实现特性的完整兼容**。跑 
 | 日志中继(Logging) / 通知(Notification) / 复制 / RequesterPays | 通知 ✅ v2.1(权威 = 自有集成测试 N4/N5;**不以 s3-tests 100% 声称**);Logging / RequesterPays 不做;复制 策略化 v2.2(不内置 ?replication) | 上游 `test_s3.py` **无 notification 专测**(文件已移除)= 配置 skip/无测,不是「出集 100%」。`notification` token 已移除 = 相关失败不再豁免。配置/队列/投递由 service_integration + fs3-http e2e 覆盖。残余 token:logging/replication/requester_pays/request_payment |
 | 桶策略 Condition 超集(s3:ExistingObjectTag/s3:RequestObjectTag/s3:x-amz-grant-full-control/s3:x-amz-copy-source/s3:x-amz-metadata-directive/s3:x-amz-server-side-encryption Null/StringLikeIfExists 等)与策略×ACL 组合 | 远期 | M10 S3 交付最小 Condition 集,超集键**显式 400 MalformedPolicy**(红线,非静默忽略);策略×ACL 组合依赖 Put*Acl(501)。token:existing_tag/request_obj_tag/put_obj_grant/s3_noenc/copy_source/IfExists(kms/sse 键同集,由既有 token 覆盖)、policy_acl/put_obj_acl |
 | 桶策略单账号身份组(alt 身份不可区分) | 恒排除 | test_bucket_policy_multipart / upload_part_copy / head_object_404_with_policy_prefix:断言 alt 账号被策略拒绝;单账号模型主/备同密钥 → 拒绝不成立。token:policy_multipart/policy_upload_part_copy/404_with_policy(详见「单账号模型限制」) |
-| Block Public Access / Account(usage)/ GetBucketPolicyStatus / public block 族 | 远期 | 安全基线规划(默认私有已满足开箱);PutPublicAccessBlock/policyStatus 显式 501。token:public_access/block_public/public_block/ignore_public/policy_status/account_ |
+| Block Public Access / GetBucketPolicyStatus / public block 族 | ✅ v2.3 部分出集(M17/B3) | 出集 6 例:`test_get_bucket_policy_status`、`test_get_nonpublicpolicy_principal_bucket_policy_status`、`test_put_public_block`、`test_block_public_object_canned_acls`、`test_block_public_policy`、`test_block_public_policy_with_principal`。逐名保留理由见「M17 B3 实测记录」;账号级 `account_` 维持排除(单账号 501,S3 Control PutPublicAccessBlock)。原族 token public_access/block_public/public_block/ignore_public/policy_status 已移除 |
 | ACL 全矩阵 / canned ACL / grant header / 匿名公开访问 | 不做(方向性排除) | AWS 2023-04 起新桶默认 BucketOwnerEnforced(ACL 默认禁用),与 FastS3 桶策略优先一致;维持私有默认 ACL 最小实现 + Owner;PutBucketAcl/PutObjectAcl 显式 501;s3-tests 2026 新版用例(object_acl*/canned/header_acl/special_key_names 尾部 PutObjectAcl)同集,M8 已同步正则;M10 S5 补 `put_acl`(test_object_put_acl_mtime,PutObjectAcl 501,见「单账号模型限制」恒排表)。token:bucket_acl/put_bucket_acl/get_bucket_acl/object_acl/canned/header_acl/special_key_names/access_bucket/put_acl |
 | 匿名读写语义(gate 服务 --allow-anonymous 下) | 远期 | gate 服务开启匿名读(README「运行」节);匿名写仍拒(anon_put_write_access/raw_get_object_acl 等依赖 public ACL,501/403 预期);`_objects_anonymous` 4 个含 ACL 501 与 allow-anonymous 配置语义对(pair `_fail` 期望拒绝、配置放行);匿名 POST 写组(token anonymous_request/success_code)依赖 public-read-write 桶 ACL;list_buckets_anonymous 翻绿出集,raw_get/raw_put/list_objects_anonymous 收窄或移除(M10 S5) |
 | ownership 跨账号语义(bucket_owner/object_writer 6 个) | 恒排除 | M10 S7 已交付纯配置往返(2 个出集);保留 6 个断言跨账号 owner 身份(alt client + public policy + ACL 组合),单账号身份映射不可满足(详见「单账号模型限制」)。token:bucket_owner/object_writer |
@@ -397,3 +397,33 @@ S3TEST_CONF=/tmp/s3-tests/s3tests.conf bash tests/s3-tests/run_s3tests.sh
 - M15 C2 密钥状态语义(S3-GAP §3.7 #7):禁用 vs 不存在在 admin/审计面可区分
   (审计 `auth_note`:key_disabled/key_not_found/session_token_invalid),
   协议错误码维持 AWS 同义(均 InvalidAccessKeyId)。
+
+## M17 B3 实测记录(2026-08-27,桶级 BPA 出集/逐名)
+
+- 出集 6(本机 boto3 对 debug `fasts3d` 逐条,非全量 gate):
+  `test_get_bucket_policy_status`、
+  `test_get_nonpublicpolicy_principal_bucket_policy_status`、
+  `test_put_public_block`、
+  `test_block_public_object_canned_acls`、
+  `test_block_public_policy`、
+  `test_block_public_policy_with_principal`。
+- 逐名保留(不把「不做」写成未实现缺陷):
+  - `test_get_public_acl_bucket_policy_status` /
+    `test_get_authpublic_acl_bucket_policy_status` /
+    `test_ignore_public_acls` /
+    `test_block_public_put_bucket_acls`:前置 PutBucketAcl / 公开 canned 写 ACL,
+    Put\*Acl 恒 501(ADR-23 与 ACL 求交,不得改成 200);后者用例期望 403。
+  - `test_get_publicpolicy_acl_bucket_policy_status` /
+    `test_block_public_restrict_public_buckets`:用例未先关掉默认全 Block
+    (或 Delete 后期望「无配置」);ADR-23 Delete 回默认四开关全 true,公开策略 Put 403。
+  - `test_get_undefined_public_block` /
+    `test_put_get_delete_public_block`:Delete 后 Get 期望
+    `NoSuchPublicAccessBlockConfiguration` 404;本实现 Get 回显默认全 true(B1)。
+  - `test_get_nonpublicpolicy_acl_bucket_policy_status`:`aws:SourceIp` Condition
+    超集 → MalformedPolicy 红线(仅 `s3:SourceIp`)。
+  - `test_get_public_block_deny_bucket_policy`:Deny `s3:GetBucketPublicAccessBlock`
+    的策略仍含 Principal `*`,默认 BlockPublicPolicy 拒绝写入。
+  - `account_` / `test_account_public_access_block`:账号级 S3 Control BPA,
+    单账号模型显式 501。
+- 实现侧:PutObject 公开 canned 的 BPA 检查必须在引擎写锁外,否则
+  parking_lot 写×读自锁(本条回归 `bpa_block_public_object_canned_acls`)。

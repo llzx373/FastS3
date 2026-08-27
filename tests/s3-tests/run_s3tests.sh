@@ -60,7 +60,6 @@ OUT="$(mktemp /tmp/s3tests-gate.XXXXXX)"
 #    copy_source|IfExists(桶策略 Condition 超集,显式 MalformedPolicy 红线)|
 #    policy_acl|put_obj_acl(策略×ACL 组合,Put*Acl 501)|policy_multipart|
 #    policy_upload_part_copy|404_with_policy(单账号:alt 身份不可区分)|
-#    policy_status(GetBucketPolicyStatus 501,PublicAccessBlock 组)|
 #    anonymous_request|success_code(匿名 POST 写,依赖 public-read-write 桶 ACL)|
 #    put_acl(test_object_put_acl_mtime,PutObjectAcl 显式 501 恒排)|
 #    raw_get_object_acl|anon_put_write_access(匿名族在 --allow-anonymous 下的剩余失败项;
@@ -134,7 +133,18 @@ OUT="$(mktemp /tmp/s3tests-gate.XXXXXX)"
 #    x-amz-expected-bucket-owner 语义已实现(= 自身放行,≠ 自身 403
 #    AccessDenied;单账号模型),但该用例前置 PutBucketAcl(public-read-write)
 #    = Put*Acl 501 红线,依赖面无法在 gate 内满足;语义由自有集成测试覆盖。
-EXCLUDE='kms|sse_c_post_object_authenticated_request|sse_c_enforced_with_bucket_policy|sse_c_deny_algo_with_bucket_policy|incorrect_algo_sse_s3|test_bucket_list_unordered( -|$)|test_bucket_listv2_unordered( -|$)|test_100_continue( -|$)|test_lifecycle_expiration( -|$)|test_lifecyclev2_expiration( -|$)|test_lifecycle_expiration_tags1( -|$)|test_lifecycle_expiration_tags2( -|$)|test_lifecycle_expiration_versioned_tags2( -|$)|test_lifecycle_expiration_noncur_tags1( -|$)|test_lifecycle_noncur_expiration( -|$)|test_lifecycle_deletemarker_expiration( -|$)|test_lifecycle_deletemarker_expiration_with_days_tag( -|$)|test_lifecycle_multipart_expiration( -|$)|test_delete_marker_expiration( -|$)|test_lifecycle_set_invalid_date( -|$)|test_lifecycle_transition_set_invalid_date( -|$)|test_lifecycle_expiration_size_gt( -|$)|test_lifecycle_expiration_size_lt( -|$)|website|logging|replication|requester_pays|public_access|block_public|account_|bucket_acl|put_bucket_acl|get_bucket_acl|copy_enc\[sse-c-unencrypted|copy_part_enc\[sse-c-unencrypted|copy_enc\[sse-s3-unencrypted|copy_part_enc\[sse-s3-unencrypted|tenant|request_payment|expected_bucket_owner|bucket_create_exists|head_extended|access_bucket|torrent|object_manifest|head_bucket_usage|multipart_upload_owner|_objects_anonymous|anon_put_write_access|not_owned|multipart_resend_first_finishes_last|special_key_names|object_acl|canned|header_acl|public_block|ignore_public|bucket_owner|object_writer|raw_get_object_acl|_v2|existing_tag|request_obj_tag|put_obj_grant|s3_noenc|copy_source|IfExists|policy_acl|put_obj_acl|policy_multipart|policy_upload_part_copy|404_with_policy|policy_status|anonymous_request|success_code|put_acl|return_version_id|delete_marker_nonversioned|delete_object_current_if_match( -|$)'
+# ⑪ M17/B3 出集(2026-08-27,桶级 BPA):移除族 token
+#    public_access|block_public|public_block|ignore_public|policy_status;
+#    出集 6 例见 README。`canned` 收窄为 object_copy_canned_acl|
+#    bucket_concurrent_set_canned_acl,以免误伤 test_block_public_object_canned_acls。
+#    逐名保留(Put*Acl 501 / 默认全 Block 与上游「Delete 后无配置 404」差 /
+#    Condition 超集 aws:SourceIp):get_public_acl_bucket_policy_status|
+#    get_authpublic_acl_bucket_policy_status|get_publicpolicy_acl_bucket_policy_status|
+#    get_nonpublicpolicy_acl_bucket_policy_status|get_undefined_public_block|
+#    get_public_block_deny_bucket_policy|block_public_put_bucket_acls|
+#    block_public_restrict_public_buckets|ignore_public_acls|
+#    put_get_delete_public_block。`account_` 维持(账号级 BPA 单账号 501)。
+EXCLUDE='kms|sse_c_post_object_authenticated_request|sse_c_enforced_with_bucket_policy|sse_c_deny_algo_with_bucket_policy|incorrect_algo_sse_s3|test_bucket_list_unordered( -|$)|test_bucket_listv2_unordered( -|$)|test_100_continue( -|$)|test_lifecycle_expiration( -|$)|test_lifecyclev2_expiration( -|$)|test_lifecycle_expiration_tags1( -|$)|test_lifecycle_expiration_tags2( -|$)|test_lifecycle_expiration_versioned_tags2( -|$)|test_lifecycle_expiration_noncur_tags1( -|$)|test_lifecycle_noncur_expiration( -|$)|test_lifecycle_deletemarker_expiration( -|$)|test_lifecycle_deletemarker_expiration_with_days_tag( -|$)|test_lifecycle_multipart_expiration( -|$)|test_delete_marker_expiration( -|$)|test_lifecycle_set_invalid_date( -|$)|test_lifecycle_transition_set_invalid_date( -|$)|test_lifecycle_expiration_size_gt( -|$)|test_lifecycle_expiration_size_lt( -|$)|website|logging|replication|requester_pays|account_|bucket_acl|put_bucket_acl|get_bucket_acl|copy_enc\[sse-c-unencrypted|copy_part_enc\[sse-c-unencrypted|copy_enc\[sse-s3-unencrypted|copy_part_enc\[sse-s3-unencrypted|tenant|request_payment|expected_bucket_owner|bucket_create_exists|head_extended|access_bucket|torrent|object_manifest|head_bucket_usage|multipart_upload_owner|_objects_anonymous|anon_put_write_access|not_owned|multipart_resend_first_finishes_last|special_key_names|object_acl|header_acl|object_copy_canned_acl|bucket_concurrent_set_canned_acl|bucket_owner|object_writer|raw_get_object_acl|_v2|existing_tag|request_obj_tag|put_obj_grant|s3_noenc|copy_source|IfExists|policy_acl|put_obj_acl|policy_multipart|policy_upload_part_copy|404_with_policy|anonymous_request|success_code|put_acl|return_version_id|delete_marker_nonversioned|delete_object_current_if_match( -|$)|get_public_acl_bucket_policy_status|get_authpublic_acl_bucket_policy_status|get_publicpolicy_acl_bucket_policy_status|get_nonpublicpolicy_acl_bucket_policy_status|get_undefined_public_block|get_public_block_deny_bucket_policy|block_public_put_bucket_acls|block_public_restrict_public_buckets|ignore_public_acls|put_get_delete_public_block'
 
 # 并行:pytest-xdist --dist load(按用例分发)。桶前缀必须含 {random},
 # 否则 autouse nuke_prefixed_buckets 会删掉其他 worker 的桶。
