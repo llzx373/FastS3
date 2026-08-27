@@ -387,12 +387,15 @@ FastS3 的终点不是一个能跑通的代码库,而是一个**陌生用户在�
 | v1.4 | 容量与底座升级 | 多设备**在线扩容**与再平衡(后台 extent 迁移任务 + 权重分配);**设备内元数据区**(BlueFS 风格,去除 rocksdb 文件依赖,边缘单盘即可整体迁移);可选 zstd 压缩(低档) | 迁移工具成熟 |
 | v2.0 | 集中纳管与生态 | 多节点纳管平台(agent 模式,复用 admin 通道,中心端聚合指标/密钥/策略下发);HTTP/3;可配热对象缓存;Terraform provider 与 K8s Operator(评估,若社区呼声高则立项) | 1.x 用户规模与反馈 |
 | v2.1 | 迁移即插即用 | 事件通知(Webhook 起步)、STS 临时凭证(管理面签发,数据面校验)、S3 Inventory(CSV)、存储类头接受矩阵(显式映射 STANDARD)、UploadPartCopy 源版本寻址等协议补完;债务轨道(压缩竞态根治/外部审计执行/Hadoop S3A·Veeam 冒烟) | 审计持久化(v1.2)、纳管平台(v2.0) |
-| v2.2 | 归档与复制(候选) | 归档存储类 + RestoreObject(zstd 压缩档 + 生命周期 Transition);复制策略化(中心调度同步任务);LDAP/OpenID(候选) | M15;需求证据(立项后拆) |
+| v2.2 | 归档与复制 | 归档存储类 + RestoreObject(zstd 压缩档 + 生命周期 Transition);复制策略化(中心调度同步任务);LDAP/OpenID | M15;已交付 v2.2.0,审查修复 v2.2.1 |
+| v2.3 | 可交付私有化 | 许可证口径对齐、单容器开箱、退出路径演练、mc 高并发死锁根治、Public Access Block、Hadoop S3A/不可变仓库冒烟、审计导出(代替 Logging 叙事) | v2.2.1;任务见 TODO.md M17 |
+| v2.4 | IAM 多租户 | MinIO 熟悉的用户/组/策略/服务账号;租户隔离;部门管理员自助;STS 本租户 Role;LDAP 映射到 User(ADR-28) | M17;任务见 TODO.md M18 |
+| v2.5 | 好用的私有化 | 控制台文件柜(预览/批量 zip/版本回滚/i18n)、保 mtime 迁入向导、Condition Date*、Kafka 通知、S3 Batch Operations | M18;任务见 TODO.md M19 |
 | 持续 | 性能与适配 | 每版本性能回归报告;Gen5/CXL 新硬件适配;新内核矩阵;客户端兼容性滚动测试 | — |
 
 - **v2.0 目标形态**:云上多机 + 边缘多节点的统一管理入口,单机引擎仍保持零依赖可独立运行(不锁死用户到平台);
 - 每个远期版本含 2~3 周专项性能回归,防止功能侵蚀性能(这是本产品的立身之本);
-- **v1.1~v2.0 已全部交付**(2026-08,执行记录见 docs/archive/TODO-v2.0.0.md);v2.1/v2.2 排期与任务见 [NEXT-ROUND.md](./NEXT-ROUND.md) 与 TODO.md M15/M16;
+- **v1.1~v2.2.1 已全部交付**(2026-08,M9~M14 见 docs/archive/TODO-v2.0.0.md,M15~审查修复见 docs/archive/TODO-v2.2.1.md);v2.3~v2.5 私有化部署任务见 [TODO.md](../TODO.md);
 - **停售排除**(AWS 已停止对新客户提供,不列入开发管线;依据 NEXT-ROUND §3.2):S3 Select / Glacier Select(2024-07-25 起)、Object Lambda(2025-11-07 起仅存量+APN)、Torrent(已移除)、ACL 全矩阵(2023-04 起新桶默认禁用)——协议面维持显式报错。
 
 ### 6.4 长期视野(24 个月+,方向性,不承诺)

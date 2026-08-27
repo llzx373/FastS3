@@ -1,355 +1,444 @@
-# FastS3 实现 TODO 清单(v2.1+ 迁移就绪)
+# FastS3 实现 TODO 清单(v2.3+ 私有化部署形态)
 
-> 依据:[docs/NEXT-ROUND.md](./docs/NEXT-ROUND.md)(下一轮规划报告,2026-08-26 评审通过,
-> 含 AWS 停售核查与里程碑建议)、
-> [docs/DESIGN-FUTURE.md](./docs/DESIGN-FUTURE.md) §8(长期视野评估,含停售结论)、
-> [docs/S3-GAP.md](./docs/S3-GAP.md)(企业级特性差距分析与优先级)、
-> [docs/ROADMAP.md](./docs/ROADMAP.md) §6.3/§6.4(远期/长期视野)、
-> [docs/s3-protocol-inventory.md](./docs/s3-protocol-inventory.md)(协议代码盘点证据)。
+> 依据:私有化部署优先级(机房 / 专有云 / 边缘;对照 S3 缺口、既有债务与开箱体验)、
+> [docs/S3-GAP.md](./docs/S3-GAP.md)、
+> [docs/ROADMAP.md](./docs/ROADMAP.md) §6.3、
+> [docs/DESIGN.md](./docs/DESIGN.md)(ADR-1~22 已落盘;ADR-28 IAM 多租户已落盘,M18 实现)。
 > 用途:逐条勾选实现进度;一个勾选项 = 一个可验证的交付(粒度 0.5~2 人周)。
-> 目标:私有化完整齐全的 S3 部署;客户从云上任何 S3 服务迁移到云下**几乎零变更**
-> (端点 + 凭证替换即可接入)。
-> 已归档:M9 v1.0.x → M14 v2.0.0 执行期清单见
-> [docs/archive/TODO-v2.0.0.md](./docs/archive/TODO-v2.0.0.md);
-> v1.0.0(M0~M8)执行期清单见 [docs/archive/TODO-v1.0.0.md](./docs/archive/TODO-v1.0.0.md)。
+> 目标:客户把对象存储放在**自己的机房**,一天内能装能跑、能迁入、能融入 AD/审计/监控、
+> 能运维交接;应用侧仍是换 endpoint + 凭证。
+> 已归档:M15 v2.1.0 → 审查修复 v2.2.1 见
+> [docs/archive/TODO-v2.2.1.md](./docs/archive/TODO-v2.2.1.md);
+> M9~M14 见 [docs/archive/TODO-v2.0.0.md](./docs/archive/TODO-v2.0.0.md);
+> v1.0.0(M0~M8)见 [docs/archive/TODO-v1.0.0.md](./docs/archive/TODO-v1.0.0.md)。
 
 ## 使用约定
 
-1. **当前执行面 = [审查修复 v2.2.1](#审查修复-v221-数据正确性与资源生命周期)**(2026-08-27 审查债务)。M15/M16 主力已交付;未完成的 D2–D4 / Batch / BPA 等仍按原排期,不插入本清单中间。
+1. **当前执行面 = [M17 可交付私有化](#m17-v230-可交付私有化)**。M18 IAM 不得抢跑(M17 门禁未过);M19 不得在 IAM 未交付前当「部门自助」宣传。
 2. 按里程碑顺序推进;**门禁(退出条件)全部勾选**后方可进入下一里程碑(ROADMAP §5 纪律)。
 3. 每条任务标注所属 WBS 编号,完成时在提交/PR 描述中引用本文件条目。
-4. **决策纪律**:各里程碑首条任务 = ADR 落盘——M15 = ADR-18(D-E1~D-E4,✅ 已落盘并交付);**M16 各组 = ADR-19(归档)/ADR-20(复制)/ADR-21(LDAP)**;本审查修复 **F0 = ADR-22**(共享表语义 + Restore 入账 + 读钉扎)。后置评估组(Batch/安全基线/MX)立项时补 ADR;实现偏离推荐方案必须走 ADR 流程,不得静默偏离(AGENT §5)。
-5. **差距收敛标尺**:每交付一个特性,从 `tests/s3-tests/run_s3tests.sh` 的 `EXCLUDE` 正则移除对应条目并跑全量 gate;`tests/s3-tests/README.md` 排除矩阵同步改 ✅。排除集之外任何失败 = 未预期兼容缺陷,gate 失败。
-6. **演进纪律**(DESIGN-FUTURE §2):元数据字段变更走值版本字节(双读单写);新键前缀(本里程碑 `e:` 事件队列)同步三处(keys.rs 前缀表、meta-export/import DTO、check 可达性扫描);磁盘布局变更走 layout_version + 升级框架(自动回滚,N-1 保证)。
-7. **红线**(DESIGN-FUTURE §9.4 + NEXT-ROUND §3.2):SSE 密钥零落盘/零日志;Object Lock 无绕过路径(check --fix 锁感知);agent 无 mTLS 不合入;静默忽略客户端头 = 拒绝合入(存储类头必须「接受 + 显式文档化映射」,不得静默);**停售特性(S3 Select/Glacier Select、Object Lambda、Torrent、ACL 全矩阵)不新增实现投入,协议面维持显式报错**;未实现自动回滚的迁移 = 拒绝合入。
-8. **发布与常驻轨道**:每版本发布报告附 S3-GAP Top20 对照表更新 + 企业硬门槛覆盖率(S3-GAP §8.3);常驻「性能与适配」轨道(ROADMAP §6.3「持续」行:每版本性能回归报告、新硬件/内核矩阵、客户端兼容性滚动测试)随各里程碑门禁执行。
+4. **决策纪律**:各组首条含 ADR 的必须先落盘——M17 = ADR-23(BPA);
+   M18 = ADR-28(IAM 多租户,**已写入 DESIGN.md**);
+   M19 = ADR-24(迁入保真)/ADR-25(Kafka)/ADR-26(Batch)/ADR-27(Condition 超集 Date*)。
+   实现偏离推荐方案必须走 ADR,不得静默偏离(AGENT §5)。
+5. **差距收敛标尺**:每交付一个 S3 API 特性,从 `tests/s3-tests/run_s3tests.sh` 的
+   `EXCLUDE` 移除对应 token 并跑全量 gate;`tests/s3-tests/README.md` 排除矩阵同步。
+   排除集之外任何失败 = 未预期兼容缺陷,gate 失败。无上游用例的项以自有集成测试为权威,
+   不以「s3-tests 100% 出集」虚称。
+6. **演进纪律**(DESIGN-FUTURE §2):元数据字段变更走值版本字节(双读单写);新键前缀同步三处
+   (keys.rs 前缀表、meta-export/import DTO、check 可达性扫描);磁盘布局变更走 layout_version
+   + 升级框架(自动回滚,N-1 保证)。
+7. **红线**(沿用 DESIGN-FUTURE §9.4):SSE 密钥零落盘/零日志;Object Lock 无绕过路径;
+   agent 无 mTLS 不合入;静默忽略客户端头 = 拒绝合入;
+   **停售特性(S3 Select/Glacier Select、Object Lambda、Torrent、ACL 全矩阵)不新增实现**;
+   未实现自动回滚的迁移 = 拒绝合入;
+   **不抄 `/minio/admin`、`mc admin`、`ListenBucketNotification`**;
+   **不在已有 RAID/SAN 上再做 EC/Raft/内置 `?replication`**。
+8. **本清单不含非代码执行项**:外部安全审计签约、git tag / GitHub Release / 公网下载与签名发布、
+   真 NVMe + warp 标书数字,由人工决策后另开执行单(见文末「人工后置」)。不要把它们写成工程欠债。
 
 ## 里程碑总览
 
 | 里程碑 | 版本 | 工期(2 人并行) | 核心交付 | 状态 |
 | --- | --- | --- | --- | --- |
-| [审查修复 v2.2.1](#审查修复-v221-数据正确性与资源生命周期) | v2.2.1 | ≈2.5 周 | P0 损坏窗口 + fd/任务泄漏 + 账目泄漏 + S8 钉扎 + 半成品/门禁诚实化 | ✅ 完成(v2.2.1,2026-08-27) |
-| [M15 迁移即插即用](#m15-v210-迁移即插即用) | v2.1.0 | ≈6 周 | 事件通知(Webhook)+ STS 临时凭证 + Inventory + 存储类头矩阵 + 协议补完 | ✅ 完成(v2.1.0,2026-08-26) |
-| [M16 归档与复制](#m16-v220-归档与复制) | v2.2.0 | ≈5 周(主力组) | 归档存储类 + RestoreObject / 复制策略化 / LDAP·OpenID | ✅ 主力完成(2026-08-26);审查债务见 v2.2.1 |
+| [M17 可交付私有化](#m17-v230-可交付私有化) | v2.3.0 | ≈3 周 | 许可证对齐、单容器开箱、退出路径、mc 死锁、BPA、湖仓/不可变仓库冒烟、审计导出 | ⬜ 当前 |
+| [M18 IAM 多租户](#m18-v240-iam-多租户) | v2.4.0 | ≈4 周 | MinIO 熟悉的用户/组/策略/服务账号 + 租户隔离;部门管理员自助,不依赖 root | ⬜ 未开始 |
+| [M19 好用的私有化](#m19-v250-好用的私有化) | v2.5.0 | ≈6 周 | 控制台文件柜、保元数据迁入向导、Condition Date*、Kafka 通知、S3 Batch Operations | ⬜ 未开始 |
+
+已交付底座(不占排期,门禁不得回退):S3 核心读写、版本、Object Lock、SSE-S3/C、生命周期、
+归档 Restore、Webhook、STS、Inventory、LDAP/OIDC、中心纳管、策略化复制、配额/限速/Prometheus。
 
 ---
 
-## 审查修复 v2.2.1 数据正确性与资源生命周期
+## M17 v2.3.0 可交付私有化
 
-> 依据:2026-08-27 对 v2.2.0 的只读审查(存储结构 / 资源生命周期 / 已勾选功能真实性)。
-> 目标:关闭损坏窗口与泄漏,每条交付必须带防复发用例;修完一条再勾一条,禁止打包勾选。
-> 工期:≈2.5 周(2 人);首条 = ADR-22。D1(S8)并入本组 F8,完成后把下方「债务轨道」D1 勾上。
-
-### 执行纪律(本里程碑额外)
-
-1. **顺序不可跳**:F0 → F1 → F2 → F3 → F4 → F5 → F6 → F7 → F8 → F9 → G。F2 内部必须「入账 → 扫描纳入 → GET 切副本 → `--fix` 才安全」。
-2. **防泄漏确认**(每条勾选前必跑,结果写在提交说明):
-   - `cargo test -p <crate> -- <新增测试名>` 绿
-   - 触及分配器/引擎的项:用例结束断言 `allocator().leaks().is_empty()` 且相关 extent `live_bytes` / 位图与对象引用一致
-   - 触及 HTTP 的项:用例结束断言准入 `in_flight == 0`(测完后)、明文连接 fd 不递增
-3. **禁止**:先改 `check --fix` 语义再补 restore 入账(会把活副本当泄漏回收);禁止在 F8 完成前把生产默认压缩重新宣传为「已安全」。
-4. 一条 checklist = 一次可验证交付;测试与实现同一 PR。
-
-### 顺序约束(避免修 A 弄坏 B)
-
-```
-F0 ADR-22
- └─ F1 共享表重建(COW 损坏)          ──独立,先做
- └─ F2 Restore 入账与读路径           ──独立,与 F1 可并行
- └─ F3 套接字/任务/准入               ──独立,与 F1/F2 可并行
- └─ F4 存储账目(分片重传/Complete)    ──F1 之后(共享表语义已钉死)
- └─ F5 内存与后台有界化
- └─ F6 半成品功能(通知/STS/LDAP/指标)
- └─ F7 check --fix 覆盖缺口           ──F2+F4 之后(扫描集合已完整)
- └─ F8 S8 读钉扎                      ──F3 零拷贝 Drop 已关 fd 之后
- └─ F9 文档/门禁诚实化                ──全部代码项之后
- └─ G  门禁回归
-```
-
-### F0 决策落盘
-
-- [x] F0-1 ADR-22 写入 DESIGN.md §3.3,写死三件事(偏离必须再走 ADR,不得静默):**(a)** 共享表值 = **持有者总数**(≥2 才有条目;重建写入 `cnt` 不是 `cnt-1`;模块头「额外持有者数」作废);**(b)** Restore 大对象副本必须 `add_object`,启动扫描 / `live_extent_occupancy` / `repair_leaks` 锁集纳入 `restore_state.restored_extents`,GET/HEAD 在 `restore_valid` 时读明文副本(内联或 extents),不再解压归档流;**(c)** 读钉扎:GET/Range/零拷贝在快照段列表时 pin extent,Drop/完成时 unpin;压缩/transition 不得释放 pin>0 的 extent,unpin 后才允许清位重分配(隔离期 = pin 寿命,不做定时猜测)
-
-### F1 CopyObject 共享表重建 off-by-one(P0 损坏)
-
-- [x] F1-1 `rebuild_derived` 共享表改为 `cnt > 1` 时插入 **`cnt`**(与 `share_object` 的 `or_insert(1) += 1` 对齐);统一注释为「持有者总数」;核对 `rollback` 的 `> 2` / 出表插 `1` 仍与运行时一致,不一致则一并改并补回滚测试
-  - 用例:`rebuild_then_release_one_of_two_cow_holders`——两对象共享一段 → `rebuild_derived` → `release_object` 其中一个 → 断言另一段 `live_bytes` 仍为该段 len、位图仍置位、`leaks().is_empty()`;三人共享删两个后第三人仍在
-- [x] F1-2 引擎级重启:CopyObject → `Engine::open` 二次打开(同设备)→ 删副本 → GET 源对象逐字节一致;再删源 → 该 extent `live_bytes==0` 且可被 `--fix` 或自然 `ref_dec` 回收
-  - 用例:`copy_restart_delete_clone_source_intact`(fs3-engine);结束断言无泄漏、无双重释放下溢
-- [x] F1-3 覆盖「从未 COW 的独占段」重建后释放:表中无条目,`release_object` 走 `None` 分支,不得误插共享表
-  - 用例:`rebuild_exclusive_segment_release_clears_bitmap`
-
-### F2 Restore 副本入账 + GET 读副本(P0 账目/语义)
-
-> 内部顺序:F2-1 入账 → F2-2 扫描三处纳入 → F2-3 才切换 GET → F2-4 `--fix` 锁保护。禁止颠倒。
-
-- [x] F2-1 大对象 restore 物化后对 `restored_extents` 调用 `add_object`;提交失败 `abort_draft`;内联臂不分配 extent(保持)
-  - 用例:`restore_large_object_add_object_no_leak`——对象 > `small_object_limit`(强制走 extent,禁止再用 `"restore me please"` 内联);restore 完成后 `leaks().is_empty()`,`live_bytes` 含归档流 **加** 副本;GC 到期后副本 `release_object` + `after_release`,归档流仍在,`leaks().is_empty()`
-- [x] F2-2 `rebuild_segment_state` / `live_extent_occupancy` / `locked_referenced_extents`(W4-2)把 `restore_state.restored_extents` 并入段列表;meta-import 已并入的路径加回归,避免双计
-  - 用例:`rebuild_includes_restored_extents_after_restart`——restore 大对象 → 重启引擎 → leaks 空、副本 extent 位图仍置;故意不入账的旧镜像(若测试夹具能造)不得被误清直到 F2-4 锁集生效
-- [x] F2-3 GET/HEAD/Copy 源/GetObjectAttributes/零拷贝快照: `restore_valid` 时读 `restored_inline` / `restored_extents`(明文,不走 `read_compressed_meta`);未恢复仍 403;GLACIER_IR 仍直接读归档流;Copy 未恢复源仍 InvalidObjectState,同存储类复制豁免不变
-  - 用例:`get_restored_glacier_reads_plaintext_copy`(内容与 PUT 前明文逐字节一致,且读路径不要求 zstd 解压归档流——可用「归档流故意损坏/换 CRC、副本完好、GET 仍成功」证明走的是副本);`head_ongoing_vs_get_403` 回归不破
-- [x] F2-4 `repair_leaks` 跳过仍被 `restored_extents` 引用的 extent(与锁定对象同一锁集);`check_report` 不得把活副本列为 leak
-  - 用例:`check_fix_does_not_reclaim_live_restore_copy`——restore 后 `check_report().leaks` 空;`--fix` 前后 GET 仍成功;再造一个真正无人引用的孤儿 extent,`--fix` 只回收那个
-- [x] F2-5 `put_stream` / `delete_*` / `delete_bucket` 的 `after_release` 对 **主段与恢复副本段** 都调用(审查:extent 覆盖路径主段缺 `after_release`;delete 封口只看 `meta.extents`)
-  - 用例:`overwrite_restored_object_seals_and_no_leak`;`delete_restored_object_releases_both_extent_sets`
-
-### F3 套接字 / 任务 / 准入泄漏(P0–P1)
-
-- [x] F3-1 `ZeroCopyIo` 实现 `Drop`: `zfd` `libc::close`;`new` 在 dup 失败时行为不变;重复 Drop 安全(`take`)
-  - 用例:`zero_copy_io_drop_closes_dup_fd`——构造/drop 前后 `/proc/self/fd` 或 `fcntl(F_GETFD)` 计数回到基线;循环 1000 次连接模拟不涨 fd(可用 `dup` 计数 hook,避免依赖 WSL `/proc` 伪影时改测 `ZeroCopyIo` 暴露的测试用 `zfd_closed` 标志)
-- [x] F3-2 `device_remove` 对弹出的 zc fd `close`(对齐 `Engine::close`);`TRUSTED_FDS` 在连接结束/设备移除时摘除对应 fd,防内核 fd 号复用误信任
-  - 用例:`device_remove_closes_zc_fd`;`trusted_fds_deregister_on_connection_drop`(伪造 fd 号复用:先注册、close、新 fd 同号,sendfile 白名单不得放行)
-- [x] F3-3 流式 PUT 泵: `try_send` 区分 `Full`(yield 重试)与 `Disconnected`(**break**);`Err` 帧路径已 break 保持;泵任务在 PUT 结束/校验失败后必须退出
-  - 用例:`streaming_put_pump_exits_when_reader_dropped`——丢弃 `ChannelReader` 后在超时内任务结束(JoinHandle 或可观测的 inflight-pump 计数归零);再跑完整 PUT 成功路径证明 Full 退避仍工作
-- [x] F3-4 流式 GET / SSE GET / MultiRange:准入用与 `ZcBodyStream` 相同的 RAII(`AdmitGuard`/`Drop` 释放);`spawn`/`spawn_blocking` 被 abort 或 channel 断开必须释放
-  - 用例:`buffered_get_abort_releases_admission`——占用接近上限、中途 drop body、随后新请求 `try_acquire` 成功;`multirange_abort_releases_admission` 同理;断言 `in_flight==0`
-- [x] F3-5 HTTP/3 请求体走全局同一 `Admission::try_acquire`(按实际长度或硬上限),硬上限 ≤ `BUFFERED_PUT_LIMIT`(8MiB)或单独可配 `h3_max_body`(默认 8MiB,**禁止**再用 16GiB `limit()` 当缓冲 cap);超限 503;worker 结束 `release`
-  - 用例:`h3_body_respects_global_admission`;`h3_body_hard_cap_rejects_without_allocating_limit`(构造声明超 cap 的请求,堆分配峰值不超过 cap+余量)
-- [x] F3-6 非流式 `collect()` 加硬上限(默认 8MiB,与缓冲 PUT 对齐;超限 413/400 InvalidRequest,不断连吞内存)
-  - 用例:`non_put_body_over_limit_rejected`(大 POST 通知配置等);合法小 POST 仍 200
-- [x] F3-7 HTTP/3 `serve` 停机: `endpoint.close` + drain(对齐 TCP `shutdown_timeout`);连接/请求 task 纳入 JoinSet 或等价跟踪
-  - 用例:`h3_shutdown_drains_without_hang`(超时内返回;重复启动不泄漏 UDP fd)
-- [x] F3-8 io_uring `submit_batch`:第一个 CQE `res<0` 时**先收完本批其余 CQE**再返回错误,避免 CQ 残留污染下一批
-  - 用例:`uring_error_cqe_drains_rest_of_batch`(注入或 mock;无 uring 环境则单元化 completion 循环抽函数测试)
-
-### F4 Multipart / 覆盖路径账目泄漏
-
-- [x] F4-1 `upload_part` 同号重传:覆盖 `p:` 前 `release_object` + `after_release` 旧 `PartMeta.extents`(同事务草稿);新段 `add_object`
-  - 用例:`upload_part_resend_releases_old_extents`——两次 UploadPart 同 part 不同内容(或同内容强制新写),`leaks` 空,live 只有最新段;重启后再断言
-- [x] F4-2 Complete:对 **未列入客户端列表** 的已存分片 `release_object` + `after_release`,再删全部 `p:`;全 extent 拼接路径「无分配器变更」只适用于列入且所有权转移的子集
-  - 用例:`complete_subset_releases_unlisted_parts`——传 1,2,3 只 complete 1+3,分片 2 的 extent 回收,对象不含分片 2,`leaks` 空
-- [x] F4-3 混合 Complete 对 `part_segments` 补 `after_release`(对齐 SSE/归档臂)
-  - 用例:`mixed_complete_after_release_seals_open_extent`(内联+extent 混合组装后开放 extent 封口,无二次写入覆写)
-- [x] F4-4 `a:` / `t:` 在检查点成功后截断 `seq <= checkpoint_seq` 的键(批量、可配保留窗口默认 0);恢复仍只重放 `seq > checkpoint`
-  - 用例:`checkpoint_truncates_old_alloc_keys`——写 N 条 Alloc → checkpoint → 前缀扫描 `a:` 条数下降;`kill -9` 在截断前/后各一次,重放后位图与元数据一致、`leaks` 空
-
-### F5 内存与后台有界化
-
-- [x] F5-1 检查点 tick 改 `sync_channel(1)`(或原子标志);满则跳过;引擎 `close()` **join** 该线程
-  - 用例:`checkpoint_tick_bounded_idle`——空闲 10 个 interval,队列长度 ≤1;drop Engine 后线程退出(可 join 或 `thread::is_finished`)
-- [x] F5-2 STS:校验过期时 `delete_session`;后台扫 `s:session`(可挂现有 `sweep_expired_sessions` **旁路**,不要复用 multipart 函数名造成误解)周期删除;管理面 DELETE 保持
-  - 用例:`expired_sts_session_is_deleted_from_meta`——签发 TTL=1s → 睡 2s → 鉴权 InvalidToken → 扫描无该 `s:session` 键;未过期会话仍在
-- [x] F5-3 通知 `retry` HashMap: `truncate_events` 后 `retain` 仍存在的 seq;成功/死信/无目标已 `remove` 保持;worker 关闭时若仍有桶规则,主循环或独立 tick 仍截断 `e:`(或配置互斥:关 worker 则拒绝 PutNotification)
-  - 用例:`notification_retry_map_does_not_grow_after_truncate`;`notification_disabled_does_not_unbounded_enqueue`(关 worker 后写入不堆积或显式拒绝)
-- [x] F5-4 热缓存超 `max_bytes` 淘汰的槽 **push 回 `free`**;单对象 `len > max_bytes` 拒绝插入(不 panic)
-  - 用例:`cache_evict_returns_slot_to_free`;`cache_object_larger_than_max_bytes_rejected_no_panic`;插满再插触发淘汰后仍可插入
-- [x] F5-5 压缩发现扫描纳入版本对象(`vk`)与 `restored_extents`(迁数据、不删锁定版本;恢复副本可迁或显式跳过并文档化,二选一写进 ADR-22 补遗)
-  - 用例:`compaction_discovers_versioned_and_restore_extents`(低活 extent 成为候选);锁定版本不回收(沿用 skipped_locked)
-
-### F6 半成品功能补齐(声称完成但未完成)
-
-- [x] F6-1 Webhook HTTPS:用已有 rustls 栈实现 `https://` POST(或 compat/CHANGELOG **降级为「仅 http,https 须前置 TLS 终结」并改 XML 校验拒绝 https**)。二选一必须文档与代码一致;推荐实现 HTTPS
-  - 用例:`webhook_https_posts_signed_body`(自签/测试 listener);失败重试/死信仍有效;`http` 回归不破
-- [x] F6-2 Grafana `alerts.yml` 增加 `FastS3NotificationDeliveryStalled`、`InventoryGenerationStalled`(表达式对准已有 `fasts3_notification_*` / inventory 指标;无指标则先加 counter 再加告警)
-  - 用例:规则文件静态检查(promtool 或 yaml 含表达式 + 对应 metrics 名在 admin 导出字符串测试中出现)
-- [x] F6-3 实现 `fasts3_archive_*` 指标组(对象数/字节按存储类、transition 次数已有则别重复命名)并进 admin `/metrics`
-  - 用例:`archive_metrics_exported_after_glacier_put`(prometheus 文本含 `fasts3_archive_`)
-- [x] F6-4 LDAP/OIDC:`buildServer` 默认把 **同一个** `IdentityEvents` 注入 `LdapSync` 与 `GET /api/identity-events`;生产路径补集成测试(禁止只靠测试注入同一 ring 绿)
-  - 用例:`ldap_sync_events_visible_on_identity_events_endpoint`(不注入 deps.identity,走默认装配)
-- [x] F6-5 LDAP bind 密码:配置加载拒绝把明文密码写入将落盘的 config(或启动时警告 + 文档删除 `security.md` 示例中的 `bind_password` 字段);只允许 env
-  - 用例:`ldap_bind_password_not_serialized_to_config_file`
-- [x] F6-6 `error.rs` 的 `InvalidToken` 注释从「预留:无 STS」改为 T2 语义
-
-### F7 `check` / `--fix` 覆盖缺口(依赖 F2、F4)
-
-- [x] F7-1 `leaks()` 改为「位图已分配 ∧ 元数据不可达」(mark-sweep: o:+p:+restore 段集合),不再单独信派生 `live_bytes==0`;`heal_bitmap` 仍处理反方向
-  - 用例:`leaks_mark_sweep_ignores_live_restore_and_cow`;`leaks_detects_unreferenced_after_part_resend_without_restart`(F4-1 修好后运行期就能看见旧语义下的泄漏,本项应断言为 0)
-- [x] F7-2 `check_report` 的 objects/bytes 含版本条目口径或明确标注「仅当前版本」;历史版本不计入时文档与 JSON 字段名一致
-  - 用例:版本化桶 1 key × 2 版本,报告数字与所选口径一致(钉死一种,禁止静默漏计)
-
-### F8 S8 压缩 × 流式读钉扎(原 D1;P0 错读)
-
-> 前置:F3-1(zc Drop 关 fd)。F8 完成后生产默认与 s3-tests gate 均开启压缩。
-
-- [x] F8-1 分配器/引擎:extent `pin_count`;`object_segments_meta` / 零拷贝快照 / 缓冲 GET 流 / MultiRange 入口 pin,对应 `Drop`/结束 unpin(含 abort、客户端断开)
-  - 用例:`pin_drop_unpins` RAII;panic/unwind 也 unpin
-- [x] F8-2 Compactor / lifecycle transition / restore GC:`release_object` 若 `pin_count>0` 则进入隔离队列,unpin 到 0 再清位;禁止把 pin 中的 extent 交给 `allocate`
-  - 用例:`compaction_skips_pinned_extent`;`allocate_does_not_reuse_pinned`
-- [x] F8-3 集成:大对象 GET 零拷贝进行中触发 compact_once(碎片布局),GET 字节与写入一致;复现原先 ~50% 失败的 `multipart_upload_resend_part` 量级(≥30MiB)在 **compaction_enabled=true** 下稳定
-  - 用例:`streaming_get_during_compaction_stable`(engine 或 http 集成);s3-tests 门禁配置改为允许压缩(或双跑:关/开各一次)
-- [x] F8-4 TODO 债务轨道 D1 勾选;s3-tests README 删除「必须关压缩才能绿」;A5-2 压缩并发补跑(可并入 G1)
-  - 用例:README/gate 脚本与实现一致(CI 或本地脚本断言 `compaction_enabled` 在 gate toml 为 true)
-
-### F9 文档与门禁诚实化(代码项完成后再做,避免再写假完成)
-
-- [x] F9-1 TODO 总览 M16 行与正文勾选一致(已在本文件改为「主力完成」;复核 A5-2 在 F8 完成前保持「压缩并发未复核」脚注)
-- [x] F9-2 `docs/S3-GAP.md` Restore/复制/通知/STS/Inventory 从 ⛔/🔜 改为已交付,残余缺口只列 HTTPS-or-proxy、Batch、BPA 等
-- [x] F9-3 README 当前状态补 M13–M16;「完整 S3」改为与 compat 同口径;Hadoop 保持「未测/规划」
-- [x] F9-4 DESIGN §1.3 V1 非目标加「已被后续 ADR 取代」指向;§4.3 位图权威 / §4.4 键前缀 / 检查点指针 / ETag hex 拼接与 ADR-5/9/14/22 对齐
-- [x] F9-5 CHANGELOG v2.1 C1「统一 STANDARD」加勘误(被 M16 真实归档覆盖);compat.md Webhook HTTPS 与 F6-1 最终选择一致
-- [x] F9-6 s3-tests README:notification/归档「出集」改为「上游无测/配置 skip,不以 100% 声称」;N5/A5-1 门禁改为自有集成测试为权威
-- [x] F9-7 STS/Inventory smoke:无 boto3 **不得 exit 0 当过**(fail 或 skip 非零/明确 SKIP 计数);T3 补 boto3 STS client 或改 TODO 措辞为「Query API 兼容」
-- [x] F9-8 补 `docs/perf-M15.md`(或 CHANGELOG 声明 M15 perf 以 M16 报告为承接、作废独立文件);门禁数字与仓内报告一致
-
-### G. 本里程碑门禁(退出条件)
-
-- [x] G1 `cargo test --workspace` 全绿;本清单新增用例全部执行且含泄漏断言
-  - 用例:`alloc_records_visible_until_explicit_checkpoint`;`pending_checkpoint_tick_truncates_alloc_log_on_first_put`(open tick 与首写 checkpoint 竞态);`zero_copy_io_drop_closes_dup_fd` 不以并行 F_GETFD 当权威
-- [x] G2 崩溃 ≥200 轮混载:**COW 复制+删副本+重启**、**大对象 restore+check+GET 副本**、**multipart 重传+subset complete**、压缩开启下大对象 GET(F8 后);零撕裂、`leaks` 空、账目零漂移
-  - 用例:`g2_mixed_crash_reopen_200_rounds`;脚本 `tests/crash/run_crash_v221.sh`
-- [x] G3 明文 HTTP 长跑(或集成循环 accept/GET/close ≥1000):进程 fd 计数相对基线稳态(允许 keep-alive 常驻,禁止线性涨)
-  - 用例:`g3_http_get_close_1000_fd_steady`(in_flight==0, fd 相对基线 ≤+16)
-- [x] G4 s3-tests 全量:意外失败 0;F8 后 gate 开压缩复跑一次
-  - 用例:`bash tests/s3-tests/run_g4.sh`(`compaction_enabled=true`,4 路 xdist + 全局 ListBuckets 串行补跑);`passed=487 skipped=94 excluded_failures=236 unexpected_failures=0`;诚实断言 `g4_s3tests_gate_enables_compaction`
-- [x] G5 clippy -D warnings;覆盖率不回退 >1pt(相对 perf-M16 83.89% 口径);cargo audit 清零
-  - 用例:`cargo clippy --workspace --all-targets -- -D warnings`;`cargo llvm-cov --workspace --summary-only` 行 **84.41%**(相对 83.89% +0.52pt);`cargo audit` 0 漏洞(2 条 allowed unmaintained,与 M16 同集);诚实断言 `g5_clippy_pin_and_coverage_baseline`
-- [x] G6 发布 v2.2.1:CHANGELOG/RELEASES 记本审查修复(不打 tag,与既有口径一致);D1 勾选
-  - 用例:CHANGELOG/RELEASES `## v2.2.1`;workspace + console/server **2.2.1**;债务轨道 `- [x] D1 S8`;诚实断言 `g6_changelog_releases_v221_d1_no_tag`;`git tag` 无 v2.2.1
-
----
-
-## M15 v2.1.0 迁移即插即用
-
-> WBS:NEXT-ROUND.md §5(特性 ≈11 pw)+ 债务轨道(≈2 pw 并行);合计 ≈6 周。
-> 目标:补齐 B 档硬阻断(事件通知/STS/存储类头),客户迁移端点+凭证即可接入,应用几乎零变更。
-> 首条任务 = ADR-18 落盘(NEXT-ROUND §5.6:D-E1~D-E4)。
+> 私有化对外一句话:能过法务口径、能离线内网装起来、迁入主路径不卡死、备份/湖仓有可复跑证据。
+> 工期:许可证 0.1 + 单容器 ≈1.2 + 退出路径 0.5 + 死锁 ≈1.5 + BPA ≈1 + 客户端冒烟 ≈1
+> + 审计导出 0.5 ≈ 5.8 pw / 2 人 ≈3 周。
+> 顺序:A0 → L/T/X 可并行 → **D 死锁必须在 C(并发冒烟)与 M19 提高同步并发之前** → B → C → G → F → 门禁。
 
 ### A0 决策落盘
-- [x] A0-1 ADR-18 写入 DESIGN.md §3.3:D-E1(事件队列一致性语义:入队与数据事务边界、崩溃零漂移)、D-E2(STS 会话模型:会话 = 基密钥 + 会话策略求交,无角色派生;secret 仅签发时一次回显)、D-E3(存储类头接受矩阵:GLACIER*/IA/IT/RRS 统一映射 STANDARD + 元数据记录请求类 + 响应回显实际类,文档化非静默)、D-E4(通知目标范围:Webhook 起步,SQS/SNS/EventBridge 后置评估)
 
-### N. 事件通知(Webhook 起步;NEXT-ROUND §5 N1~N5,≈4 pw)
-- [x] N1 `n:{bucket}\0{id}` 配置键 + Put/Get/DeleteBucketNotificationConfiguration(?notification 新旧参数兼容;XML 校验,非法目标/事件 → MalformedXML/InvalidArgument 显式报错)
-- [x] N2 持久化事件队列(新键前缀 `e:`;复用审计环形底座模式:批量截断删最旧、崩溃零漂移;事件集 = ObjectCreated:*/ObjectRemoved:*/Restore*/Lifecycle* 起步;三处同步:keys.rs 前缀表、meta-export/import DTO、check 可达性扫描)
-- [x] N3 投递 worker(BackgroundWorker 实例:节流/暂停/批额度;Webhook = HTTP POST + HMAC 签名;重试指数退避 + 死信留存;指标 `fasts3_notification_*` + 告警 FastS3NotificationDeliveryStalled)
-- [x] N4 集成测试(配置→写对象→投递→载荷/签名断言;失败重试与死信;重启后队列继续;投递失败不影响数据面请求语义)
-- [x] N5 s3-tests `notification` token 已移除(上游无专测,失败不再豁免 ≠ 100% 出集);**权威 = N4 自有集成测试** + 关闭态 perf 零回退对照
+- [ ] A0-1 ADR-23 写入 DESIGN.md §3.3,写死 BPA 四件事(偏离再走 ADR):
+  **(a)** 作用域 = **仅桶级** `Put/Get/DeletePublicAccessBlock`;账号级 PublicAccessBlock
+  在单账号模型下 **显式 501**(不做伪多账号);新桶默认四开关全部 `true`(私有化安全默认;
+  与 AWS 新桶默认启用 BPA 对齐,若实现细节有差必须在 compat.md 逐项写出);
+  **(b)** 四开关语义:`BlockPublicAcls` 与既有 Put\*Acl 501 求交(再 PutAcl 仍 501);
+  `IgnorePublicAcls` 使公开 canned/grant 不生效(GetAcl 维持私有桩);
+  `BlockPublicPolicy` 拒绝会让桶公开的策略(Principal `*` + Allow 匿名可读/写);
+  `RestrictPublicBuckets` 对已存在的公开策略停止授权(IsPublic=false);
+  **(c)** `GetBucketPolicyStatus` 返回 `IsPublic`,与四开关 + 策略求交一致;
+  **(d)** `--allow-anonymous` 不得绕过 BPA:开关阻断时匿名 403,即使 gate 开了匿名读
 
-### T. STS 临时凭证(NEXT-ROUND §5 T1~T3,≈3.5 pw)
-- [x] T1 Node 管理面 STS 兼容端点(Query API:GetSessionToken/AssumeRole 最小集;基于 admin 身份对既有密钥签发会话;会话策略与密钥策略求交;TTL 默认 1h,上限对齐 AWS;secret 仅签发时一次回显,沿用 G1-3 语义不落盘)
-- [x] T2 数据面 `x-amz-security-token` 解析与校验(会话 → 基密钥 + 会话策略求交 + 过期判定;InvalidToken 显式错误码;SigV4 含 token 按 AWS 语义;匿名路径不受影响)
-- [x] T3 会话审计(签发/过期/使用六维检索扩展)+ 集成测试(**Query API** GetSessionToken/AssumeRole 签发 → 临时凭证 → S3 数据面往返;会话策略 Deny 生效;过期后拒绝;无 boto3 不得当过)
+### L. 许可证口径唯一(≈0.1 pw)
 
-### I. S3 Inventory(CSV;NEXT-ROUND §5 I1~I3,≈1 pw)
-- [x] I1 Put/Get/Delete/ListBucketInventoryConfigurations(?inventory;CSV 起步,ORC/Parquet 显式不支持)+ 配置校验
-- [x] I2 生成 worker(复用 ListObjects 全量翻页;清单对象 + manifest.json 落桶;节流/暂停复用 BackgroundWorker)+ 指标
-- [x] I3 集成测试(配置→生成→清单内容对账;版本化桶含删除标记口径)+ 迁移对账演示(mc/rclone 迁移后以清单逐项 md5 对账)
+> 现状:`Cargo.toml` workspace `license = "Apache-2.0"`,README 写「待定」,无 `LICENSE` 文件,
+> web 包无 license 字段。私有化合同第一行不能含糊。
 
-### C. 存储类头矩阵 + 协议补完(NEXT-ROUND §5 C1~C3,≈1.5 pw)
-- [x] C1 存储类头接受矩阵(ADR-18 D-E3):接受 STANDARD/STANDARD_IA/ONEZONE_IA/REDUCED_REDUNDANCY/INTELLIGENT_TIERING/GLACIER/GLACIER_IR/DEEP_ARCHIVE → 统一落 STANDARD + 元数据记录请求类;HEAD/GET/GetObjectAttributes 回显实际 STANDARD + admin 可见请求类;响应 `x-amz-storage-class`;EXPRESS_ONEZONE(目录桶类)显式拒绝;compat.md 文档化映射
-- [x] C2 UploadPartCopy 源 `?versionId` 寻址(闭合 s3-tests README 唯一残留 501 红线 token `multipart_copy_versioned`)+ 协议补完:密钥状态语义(禁用 vs 不存在在 admin/审计面可区分,S3-GAP §3.7 #7;协议错误码维持 AWS 同义)、`x-amz-expected-bucket-owner`(= 自身 → 放行,≠ 自身 → 403 显式,单账号模型语义)
-- [x] C3 逐项 s3-tests/自有集成测试 + 排除正则收敛(`multipart_copy_versioned` 移除;`expected_bucket_owner`/`tenant` 按结论出集或保留并逐名记录理由)
+- [ ] L1 仓库根增加 `LICENSE`(Apache-2.0 全文,与 Cargo.toml 一致);README「许可证」改为 Apache-2.0
+  并指向该文件;web 三件套 `package.json` 补 `"license": "Apache-2.0"`;文档站/compat/SBOM 生成
+  物声明同一口径
+  - 用例:脚本或测试断言 README 不再含「待定」;三个 `package.json` 与 `Cargo.toml` 的 license 字符串一致
 
-### G. M15 门禁(退出条件)
-- [x] ADR-18 落盘 DESIGN.md §3.3(D-E1~D-E4),与实现无偏离
-- [x] s3-tests 全量零回归:notification 族出排除集且 100%;multipart_copy_versioned 出集;其余排除逐名记录(README 排除矩阵同步)
-- [x] 客户端矩阵回归:aws cli/boto3/mc/rclone 全过 + boto3 STS→S3 会话往返 + restic/duplicati 复跑
-- [x] S3-GAP §4 企业场景映射复核:多租户/媒体/IoT 场景卡点随 M15 清零,残余仅 M16 项(归档/Transition、复制策略化)与远期项(Condition 超集/tenant 族);§4 场景表与 §5 硬门槛对照表同步更新
-- [x] 崩溃 ≥500 轮(事件队列写入/投递/删除混载)零撕裂/零泄漏/账目零漂移
-- [x] perf:通知/STS/存储类关闭态零回退(<5% 门禁);开启态增量写入发布报告(DESIGN-FUTURE §9.1 预算表口径)
-- [x] 覆盖率 ≥80%;cargo audit 清零;发布 v2.1.0(workspace + web 三件套 bump,CHANGELOG/RELEASES 记档;不打 tag 不打包,与 v1.x/v2.0 同口径)
+### T. 单容器试用(≈1.2 pw)
 
-### D. 债务轨道(并行,不占特性主线)
-- [x] D1 S8 压缩迁移 × 流式读并发竞态根治 → **并入审查修复 F8**;本组 F8-4 勾选后回头勾本条
-- [ ] D2 v2.0 外部安全审计**执行**(范围:agent mTLS/中心 SQLite/0-RTT/缓存;M14 已立项)
-- [ ] D3 客户端矩阵补齐:Hadoop S3A/Spark/Trino 冒烟(补齐 java/hadoop 环境后跑;条件写已就绪)+ **Veeam 备份往返实测(优先;Community Edition + Object Lock 不可变仓库形态,作为 S3-GAP §4 备份场景闭环项)与 Commvault(授权/重部署环境,可后置)** + HTTP/3 netem 弱网对照
-- [ ] D4 发布执行项收敛:git tag / `tools/package/` / release 流水线首次实跑
+> 现状:镜像已打进数据面+管理面,但 `docker run` 仍需 `docker exec init`;compose 默认双服务且
+> 演示用第二 web 实例;镜像标签仍写 1.0.0。POC 输给「一条命令起来」的竞品。
+> 生产仍允许拆分,不强迫理解裸设备。
+
+- [ ] T1 entrypoint 首启:`/var/lib/fasts3/disk.img` 不存在则 `fasts3d init --yes`
+  (默认镜像文件,大小可配 `FASTS3_INIT_SIZE` 默认 20GiB)+ 写 meta 目录;
+  已 init 则跳过;失败容器非 0 退出并打明确日志。禁止再要求用户 exec init 才能 POC
+  - 用例:`tests/container/poc_first_boot.sh`——空数据卷 `docker run` 后 `/health` 200、
+    可用内置开发密钥(或打印一次性密钥)对 9000 做 ListBuckets;二次启动不重复 init、数据仍在
+- [ ] T2 compose **poc 配置**(默认):单服务、端口 9000(S3)+ 8080(控制台),数据卷 `./data`;
+  **prod 配置**(profile 或独立文件):数据面/管理面拆分,沿用现双服务。镜像标签与 workspace
+  版本一致(现 2.2.1 → 随本版本 bump)。去掉默认拉起的第二 web 演示实例(移到 docs 示例)
+  - 用例:文档中的一条命令 `docker compose -f deploy/container/docker-compose.yml up -d --build`
+    对应 poc;prod 文件单独可 `config` 校验
+- [ ] T3 文档:Quickstart「内网一天跑起来」(compose poc / 单二进制 `--web-root` 两条);
+  生产拆分、裸设备、升级 N-1 链到既有 operations 页。容器 README 镜像版本与 init 步骤与 T1 一致
+  - 用例:文档无「请先 docker exec init」作为 POC 必经步骤
+
+### X. 退出路径(≈0.5 pw)
+
+> 自研盘格式的采购否决点:项目停了数据怎么拿。已有 meta-export + 卷快照,叙事弱、缺一条演练。
+
+- [ ] X1 文档站独立页(或 migration.md 升格)写清三层退出,且每层有命令:
+  ① **软件仍可用**:rclone/mc 全量迁出到另一 S3/文件系统(保内容与用户元数据口径写明);
+  ② **软件不可用但盘在**:卷快照恢复 + `meta-import`/`fasts3d` 旧二进制只读拉起;
+  ③ **只有裸盘/镜像文件**:声明对象数据非 POSIX 文件、不要指望 mount 出目录树、联系卷级恢复
+  - 用例:页面无「占位/待补」;三条路径各至少一条可复制命令
+- [ ] X2 演练脚本 `tests/exit/exit_path_drill.sh`:POC 实例写入已知对象 → rclone 迁出到本地目录
+  → md5 一致;再走 meta-export 往返(沿用既有备份脚本,本条只要求入口统一、退出页引用)
+  - 用例:脚本非 0 即失败;对象正文 md5 对账
+
+### D. mc mirror 高并发死锁(≈1.5 pw;P0)
+
+> S3-GAP §9 已知:mc 默认 `--max-workers autodetect` 并发 PUT/List 会偶发整节点挂死
+> (全线程 futex)。现状靠 ADR-20 串行档(`--max-workers 1`)当产品,迁入/站点同步不可用。
+> 修复 = 引擎锁序,不是继续调低客户端。
+
+- [ ] D1 复现 harness:`tests/repro/mc_mirror_concurrency.sh`(或集成测试)对本地 FastS3
+  跑 `mc mirror --max-workers 8`(对象数 ≥200、含 List 交错),超时(默认 120s)内必须结束;
+  复现失败(挂死)时本条先红,作为防复发基线,禁止用 workers=1 让它绿
+  - 用例:harness 在修复前可红(记录);修复后必绿;注释写清复现签名(futex/端口无响应)
+- [ ] D2 根治:查清 io_uring 完成回调 × meta/引擎锁顺序;禁止在完成回调里拿会与提交路径
+  互等的锁;补单测或内部探针覆盖「并发 PUT + List + Head」
+  - 用例:`concurrent_put_list_no_deadlock`(线程或 HTTP 级,≥32 并发,跑完 `in_flight==0`
+    且后续 ListBuckets 仍 200);D1 harness 转绿
+- [ ] D3 同步执行器默认并发恢复合理值:mc `--max-workers` 默认 ≥4(可配,上限文档化);
+  rclone `--transfers` 对齐;compat/ADR-20 补遗删除「必须串行才能稳」的产品口径
+  - 用例:单测或 drill 断言 spawn 参数不再写死 1;M16 双节点 drill 以新默认跑通
+- [ ] D4 崩溃混载补一条:并发 mirror 进行中 kill -9 × ≥50 轮,重启后账目零漂移、无挂死
+  - 用例:`tests/crash` 增补或并入现有脚本;记录轮数与结果
+
+### B. Public Access Block(≈1 pw;ADR-23)
+
+- [ ] B1 `Put/Get/DeletePublicAccessBlock` 配置往返(XML 四开关);非法 XML → MalformedXML;
+  未配置时 Get 按 ADR-23 默认(新桶全 Block);Delete 回到默认而非「全开」
+  - 用例:`public_access_block_roundtrip`;新桶 Get 四开关均为 true
+- [ ] B2 效果:BlockPublicPolicy 下 PutBucketPolicy 含 Principal `*` 公开读/写 → 403/AccessDenied
+  (或明确 InvalidPolicy);RestrictPublicBuckets 使存量公开策略不再生效;GetBucketPolicyStatus
+  `IsPublic` 与求交一致;匿名 GET 在阻断时 403,即使 `--allow-anonymous`
+  - 用例:`bpa_blocks_public_policy`;`bpa_restrict_ignores_existing_public`;
+    `bpa_anonymous_get_denied_when_blocked`
+- [ ] B3 s3-tests:`public_access`/`block_public`/`ignore_public`/`policy_status` 能出集的出集;
+  因 Put\*Acl 501 或单账号模型不可满足的 **逐名记录理由**(沿用 C2 对 expected-bucket-owner 写法);
+  `account_` 账号级 BPA 维持排除并写「单账号 501」
+  - 用例:README 排除矩阵更新;gate 意外失败 0
+
+### C. 客户端矩阵(代码侧可完成部分,≈1 pw)
+
+> Hadoop 环境本机已具备(AGENT §9.1:JDK 21 + Hadoop 3.4.1)。Veeam/Commvault 授权环境、
+> Spark/Trino 发行版 **不阻塞本里程碑门禁**;无环境必须诚实 skip(非零 SKIP 计数),禁止 exit 0 当过。
+
+- [ ] C1 Hadoop S3A 冒烟脚本 `tests/lakehouse/s3a_smoke.sh`:建桶、put/get/list、overwrite、
+  条件写(If-None-Match)至少一条;失败即非 0。文档写 `JAVA_HOME`/`HADOOP_HOME`
+  - 用例:本机按 AGENT 环境跑通;compat.md Hadoop 从「规划」改为「冒烟通过」并记版本
+- [ ] C2 Spark / Trino:脚本骨架 + 版本钉死(文档写明发行版);环境缺则打印 SKIP 并以非 0
+  或明确 SKIP 计数退出(同 F9-7 纪律)。不把「未装 Spark」写成通过
+  - 用例:无 Spark 时输出含 `SKIP`;有环境则一条 parquet 读写往返
+- [ ] C3 Object Lock 不可变仓库形态演练 `tests/backup/immutable_lock_drill.sh`
+  (governance + compliance:覆盖写拒绝、合规期不可删、legal hold);
+  作为 Veeam 不可变仓库的协议替身。真 Veeam CE 若 PATH 中存在则加一轮往返,不存在则 SKIP 不计门禁失败
+  - 用例:drill 无 Veeam 仍必须绿(锁语义);有 Veeam 则额外断言备份/不可变失败注入
+
+### G. 审计导出(Logging 替代叙事,≈0.5 pw)
+
+> 等保常点名「访问日志」。完整 `?logging` 不做(网关可替代)。本条把已有审计变成可交接文件。
+
+- [ ] G1 admin `GET /v1/admin/audit/export`(时间窗 + 可选 bucket/key 前缀;JSONL;
+  行内无 secret);控制台审计页提供下载。超限截断有明确头/参数
+  - 用例:`audit_export_jsonl_time_range`;导出文件不含密钥明文
+- [ ] G2 compat.md + operations:专节「用审计导出代替 S3 Server Access Logging」;
+  `?logging` 维持 501 并指向该节。不实现 Logging XML
+  - 用例:compat 声明与 handler 501 一致
+
+### F. 文档与持有项诚实化
+
+- [ ] F1 S3-GAP §9 死锁行在 D 完成后改为已修复;Hadoop/BPA/审计导出状态同步
+- [ ] F2 tenant / `account_` / 跨账号 ownership 排除用例逐名记进 s3-tests README
+  (实现不做多账号;只记账,禁止把「不做」写成「未实现缺陷」)
+- [ ] F3 BlueFS(旧 H3)再评估结论一页:归档已交付、方案 C 维持常态;N3 门槛改为
+  「裸盘无根分区可挂或元数据 I/O 实测成瓶颈」,与归档脱钩。不在本里程碑开工 C++ shim
+
+### M17 门禁(退出条件)
+
+- [ ] ADR-23 落盘,与 BPA 实现无偏离
+- [ ] `cargo test --workspace` 全绿;D1 harness + T1 poc 脚本 + C1 S3A + C3 锁演练 + X2 退出演练绿
+- [ ] s3-tests 全量意外失败 0;BPA 按 B3 出集或逐名
+- [ ] 同步默认并发 ≥4 下,M16 双节点 drill 或等价 mirror 往返仍收敛
+- [ ] clippy -D warnings;覆盖率不回退 >1pt(相对 v2.2.1 口径);cargo audit 清零
+- [ ] 发布记录 v2.3.0:CHANGELOG/RELEASES + workspace/web 版本 bump(**不打 git tag、不跑公网 Release**,
+  与既有口径一致;打包脚本可本地跑但不作为本门禁)
 
 ---
 
-## M16 v2.2.0 归档与复制
+## M18 v2.4.0 IAM 多租户
 
-> WBS:NEXT-ROUND §6 拆解落地(2026-08-26);各组按**立项条件**独立启动,不必捆绑:
-> 归档 = 冷数据成本诉求(M15 交付后复核);复制 = DR 诉求证据;LDAP = 企业 SSO 诉求;
-> Batch/安全基线/MX = 后置评估(诉求证据出现后立项);持有组不占 M16 排期。
-> 主力组(归档 ≈6 + 复制 ≈2 + LDAP ≈2 pw)/ 2 人 ≈5 周;全组含后置 ≈14 pw。
-> 前置:M15 已全部交付(存储类请求类字段 C1、事件队列 N2、中心下发白名单 G2-1);
-> v1.2 lifecycle / v1.4 zstd·多设备 / v1.2 审计持久化均已就绪。
-> 纪律:各组首条任务 = ADR 落盘(归档 ADR-19、复制 ADR-20、LDAP ADR-21);后置组立项时补 ADR。
+> 私有化对外一句话:企业用户按 MinIO 习惯用**用户 / 组 / 策略 / 服务账号**办事;
+> 部门管理员管自己的人与桶,**日常不找超级用户**。数据面仍是 SigV4 Access Key(应用零变更)。
+> 设计已落盘 [ADR-28](./docs/DESIGN.md)(DI1~DI10)。不实现 `/minio/admin`。
+> 前置:M17 全部勾选。工期:数据模型 1 + 用户组策略 1.5 + SA/鉴权 1.5 + STS/LDAP 1 + 控制台 1.5 + 测试 1
+> ≈ 7.5 pw / 2 人 ≈4 周。
 
-### A. 归档存储类 + RestoreObject(≈6 pw;ADR-19;立项条件 = 冷数据成本诉求)
+### A0 决策落盘
 
-#### A0 决策落盘
-- [x] A0-1 ADR-19 写入 DESIGN.md §3.3:DA1(归档落地形态:GLACIER_IR = zstd 标准档在线可读;GLACIER/DEEP_ARCHIVE = zstd 高压缩档需 restore;冷盘倾斜可选;DEEP_ARCHIVE 取回延迟无人工模拟,文档化与 AWS 差异)、DA2(RestoreObject 语义:后台解压出临时标准副本 + restored_until 过期 GC;Tier 接受并映射;x-amz-restore 回显 ongoing-request/done;重复 restore 幂等延长)、DA3(Transition 目标类限定 GLACIER/GLACIER_IR/DEEP_ARCHIVE;INTELLIGENT_TIERING 维持映射 STANDARD 不迁移)、DA4(ObjectMeta v7 值版本:storage_class + restore_state 字段,v6 双读回退;升格/复用 M15 C1 requested_storage_class;transition 同版本(vk 不变)原子换数据)、DA5(归档 Copy/版本删除/统计口径 + 锁定对象跳过)
+- [x] A0-1 ADR-28 写入 DESIGN.md §3.3(DI1 租户隔离 / DI2 用户组策略 SA 角色 / DI3 生效策略与 admin:* /
+  DI4 root 仅引导 / DI5 AssumeRole 本租户角色,取代 D-E2「无角色实体」 / DI6 LDAP→User 且允许 bind 登录,
+  修正 ADR-21 DL1/DL4 / DI7 KeyRecord 属主 / DI8 API 对照表而非 mc admin 路径 / DI9 Owner 与 s3-tests /
+  DI10 明确不做)
 
-#### A1 元数据与写路径(≈1.5 pw)
-- [x] A1-1 ObjectMeta v7(值版本字节,v6 双读单写):storage_class(真实)+ restore_state{restored_until,restored_size};meta-export/import DTO 同步;升级工具 v6→v7 在线重写(复用值格式重写框架,自动回滚)
-- [x] A1-2 PUT 存储类落地:GLACIER_IR → zstd 标准档在线可读;GLACIER/DEEP_ARCHIVE → zstd 高压缩档;HEAD/GET/GetObjectAttributes/List 回显真实存储类;CreateMultipart 会话类沿用 C1 模式
-- [x] A1-3 统计按存储类分账(五路径 + transition/restore 口径,DA5)+ admin 存储类视图
+### I. 数据模型与租户(≈1 pw)
 
-#### A2 读取与 RestoreObject(≈1.5 pw)
-- [x] A2-1 未恢复归档对象 GET/HEAD → 403 InvalidObjectState(标准错误 XML + x-amz-storage-class);GLACIER_IR 直接可读
-- [x] A2-2 POST ?restore(Days/Tier 解析校验;restore 作业入队;BackgroundWorker 节流/暂停;已恢复对象幂等延长)
-- [x] A2-3 恢复副本生命周期:临时标准副本 + restored_until 过期后台 GC;x-amz-restore 响应头;过期后回落 InvalidObjectState
-- [x] A2-4 CopyObject/UploadPartCopy/版本删除 × 归档语义(源归档未恢复 → InvalidObjectState;同存储类复制豁免;DeleteObjects 归档条目口径,DA5)
+- [ ] I1 `tn:` / `iu:` / `ig:` / `ip:` / `ir:` 键前缀三处同步(keys.rs、meta-export/import、check 可达性);
+  Tenant CRUD(root);升级:存量进入租户 `default`,canonical_id 钉死并写入 compat
+  - 用例:`tenant_default_migration_preserves_existing_keys`;export 不含 secret 明文
+- [ ] I2 `KeyRecord` 增 tenant_id / owner_user / embedded_policy;旧键双读缺省 default+bootstrap 用户;
+  在线值重写或打开时填充(ADR 钉死一种,自动回滚)
+  - 用例:`key_record_vN_roundtrip_owner`;孤儿密钥挂 bootstrap,鉴权仍成功
 
-#### A3 生命周期 Transition(≈0.7 pw)
-- [x] A3-1 Transition XML(Days/Date + StorageClass 校验;Filter 复用 v1.2 语法;非法目标显式 InvalidArgument)
-- [x] A3-2 执行器 transition 动作(压缩→归档 + 原子换数据,同版本 vk;统计入账;who=system:lifecycle 审计;锁定对象跳过 skipped_locked 沿用 M12)
-- [x] A3-3 指标与告警:fasts3_archive_*/fasts3_restore_* 指标组 + FastS3RestoreStalled 告警
+### U. 用户 / 组 / 策略(≈1.5 pw)
 
-#### A4 管理面(≈0.5 pw)
-- [x] A4-1 控制台/审计:存储类分布与 restore 状态展示、手动 restore 操作、归档审计过滤(web/server 桥接端点)
+- [ ] U1 User CRUD(租户内):启用/禁用、控制台口令哈希、挂载 policy、加入 group;User **无** SigV4 secret
+  - 用例:`iam_user_cannot_sigv4_without_sa`;禁用用户后其 SA 全部 403/InvalidAccessKeyId(口径与 ADR 一致)
+- [ ] U2 Group CRUD + 成员;Policy CRUD + **canned 只读**:
+  `readonly` / `readwrite` / `writeonly` / `diagnostics` / `consoleAdmin` / `tenantAdmin`;
+  自定义策略非法键继续 MalformedPolicy
+  - 用例:`canned_readonly_get_ok_put_denied`;`tenant_admin_cannot_attach_consoleAdmin`
+- [ ] U3 桶策略 Principal 匹配 `arn:aws:iam::{canonical_id}:user/{name}` 与 `:root`;
+  生效策略 = 用户∪组 ∩ SA 嵌入 ∩ 桶策略,Deny 优先
+  - 用例:`bucket_policy_allows_named_user_denies_other_tenant`
 
-#### A5 测试与门禁(≈1.3 pw)
-- [x] A5-1 s3-tests 归档用例多为配置 skip/上游无测(**不以 100% 出集声称**);**权威 = 自有集成测试**(m16_archive_smoke + service_integration);EXCLUDE 无归档专 token
-- [x] A5-2 崩溃 ≥500 轮(归档写/transition/restore/GC 混载)零撕裂/零泄漏/账目零漂移;transition×压缩 worker 并发回归(**F8 已复核**:`streaming_get_during_compaction_stable` + gate `compaction_enabled=true`;崩溃混载开压缩见 G2)
-- [x] A5-3 升级演练 v2.1→v2.2(含 ObjectMeta v6→v7 在线重写 + 回滚实测);归档读带宽/恢复耗时基准写入发布报告(§9.1 口径)
-- [x] A5-4 客户端矩阵:aws cli RestoreObject/存储类往返 + mc/rclone 归档对象行为;compat.md 存储类矩阵从「M15 映射 STANDARD」升版为真实归档语义
+### S. 服务账号与数据面(≈1.5 pw)
 
-### R. 复制策略化落地(≈2 pw;ADR-20;立项条件 = DR 诉求证据)
-- [x] R1-1 ADR-20:同步任务模型(中心 = 配置源,节点本地执行 = 裁决权威,沿用 ADR-17 DV1;不内置 ?replication,compat 声明;调度语义与冲突口径)
-- [x] R1-2 中心:sync 任务 CRUD(源/目标桶与节点、调度、mode=mirror/增量)+ 下发 ops 白名单 7 类 → 8 类扩展 + 账本入账/对账
-- [x] R1-3 节点:本地调度执行 mc mirror/rclone(经本地 admin 编排;节流档;失败重试与 rejected 显式上报)
-- [x] R1-4 健康/对账视图(任务状态/lag/校验和 + 告警)+ 控制台同步任务页
-- [x] R1-5 演练:双节点互备 drill(断线重连恰好同步一次、拔中心后按最后配置安全停止/继续语义实测)+ 文档化
+- [ ] S1 Service Account = `k:` 属主必填;用户自助创建/列出/吊销**自己的** SA(无需 root);
+  tenantAdmin 可代管本租户;嵌入策略求交
+  - 用例:`user_self_service_sa_put_in_allowed_prefix`;嵌入 Deny 覆盖用户 readwrite
+- [ ] S2 数据面热路径:SigV4 → KeyRecord → 加载 User/Group 算生效策略(内存表,IAM 变更立即生效)
+  - 用例:`policy_detach_takes_effect_on_next_put`;perf 关闭 IAM 复杂策略时相对 v2.3 不回退 >5%(简单 AK 路径)
+- [ ] S3 ListBuckets / CreateBucket:只列可见桶;新桶属主 = 调用者租户;跨租户默认 403
+  - 用例:`list_buckets_filtered_by_iam`;`create_bucket_owner_is_caller_tenant`
 
-### L. LDAP / OpenID(≈2 pw;ADR-21;立项条件 = 企业 SSO 诉求)
-- [x] L1-1 ADR-21:LDAP 组 → FastS3 密钥/角色映射模型(bind 凭据管理;密码不落盘不进数据面)
-- [x] L1-2 Node 管理面 LDAP 目录同步(用户/组查询;组 → 密钥创建/禁用/删除策略;周期同步 + 失败告警)
-- [x] L1-3 OIDC SSO 控制台登录(JWT 角色映射;浏览器免 LDAP 密码;与既有 JWT 会话共存)
-- [x] L1-4 审计(身份来源/映射变更可检索)+ 集成测试(mock LDAP/OIDC)+ 部署文档
+### R. STS / LDAP / OIDC(≈1 pw)
 
-### B. Batch Operations(后置评估,≈2~3 pw;立项条件 = 批量运维诉求;前置 = M15 通知底座 ✅)
-- [ ] B1-1 ADR:Job 状态机 + CSV manifest 模型(CreateJob/GetJob/ListJobs;操作集 copy/delete/restore/tag 起步)
-- [ ] B1-2 执行 worker(复用 BackgroundWorker;结果报告对象;与 M15 事件队列联动)
-- [ ] B1-3 报告/审计/控制台 Job 视图 + s3-tests batch 族(如有)与集成测试
+- [ ] R1 AssumeRole:本租户 `ir:` 角色;权限 = Role ∩ 调用者可 assume 约束;不能越租户、不能变 root;
+  GetSessionToken 仍不提权。compat 声明 D-E2「无角色」已被本条取代
+  - 用例:`assume_role_same_tenant_ok`;`assume_role_cross_tenant_denied`
+- [ ] R2 LDAP 同步改为 User/Group + 策略挂载,**停止**「组→直接造 k:」;LDAP bind 登录控制台
+  (目录无 User 则拒);OIDC `sub` 映射 User,JIT 必须落入默认组,禁止默默 consoleAdmin
+  - 用例:`ldap_sync_creates_user_not_raw_key`;`ldap_bind_login_issues_jwt`;`oidc_jit_not_console_admin`
 
-### S. 安全基线收尾(BPA/expected-bucket-owner/tenant;≈1.5 pw;远期评估)
-- [ ] S1-1 Put/Get/DeletePublicAccessBlock(配置往返 + 效果:阻断公开桶策略/匿名 POST;策略求交生效点)
-- [ ] S1-2 tenant 族收尾(expected-bucket-owner 显式语义 M15 C2 已落地;剩余 tenant/account 族单账号模型逐名记录)
-- [ ] S1-3 s3-tests public_access/block_public/ignore_public/tenant 族出集或逐名维持
+### C. 控制台委托(≈1.5 pw)
 
-### MX. MFA Delete / mtime 二级索引(维持评估;各自独立立项)
-- [ ] MX1 MFA Delete 评估(TOTP 形态 vs 维持参数显式拒绝;防误删诉求证据 → 立项,≈1.5 pw)
-- [ ] MX2 mtime 二级索引(旧 DL3:m: 前缀写时维护;生命周期分钟级过期精度;≈1.5 pw;精度诉求证据 → 立项)
+- [ ] C1 JWT 只证明身份;授权查 IAM `admin:*`。控制台页:用户/组/策略/SA/角色;租户页仅 root。
+  废除以 JWT `admin|readonly` 为授权真相(升级:原 admin → consoleAdmin 或 default 的 tenantAdmin)
+  - 用例:`tenant_admin_console_cannot_see_other_tenant_users`;root 仍可
+- [ ] C2 部门自助演练(门禁剧本):root 建租户 A + tenantAdmin → 管理员登录建用户 `alice` 挂 readwrite
+  → alice 自助建 SA → SA 读写 A 的桶 → 租户 B 的桶 List/GET 失败
+  - 用例:脚本 `tests/iam/delegated_admin_drill.sh` 全绿,全程不用 root 数据面 AK
+- [ ] C3 文档:MinIO 运维对照表(`mc admin user/group/policy` 概念 → FastS3 控制台/API);
+  写明 **不支持** `mc admin` 二进制;生产「root 只引导」清单
 
-### H. 持有组(不占 M16 排期;需求证据出现后单独立项,复用既有评估)
-- [ ] H1 Terraform provider(≈1~1.5 pw;门槛 = issue 投票 ≥10;范围见 m14-ecosystem-eval §1)
-- [ ] H2 K8s Operator(≈2~3 pw;门槛 = issue 投票 ≥10;范围见 m14-ecosystem-eval §2;不做 CSI)
-- [ ] H3 BlueFS 设备内元数据(旧 M13 N3;≈5~7 pw;spike 已通过;与归档/底座诉求挂钩再评估)
+### T. 协议与测试
 
-### M16 门禁(退出条件;按各组立项范围执行)
-- [x] ADR-19/ADR-20/ADR-21 落盘;归档族 s3-tests 出集(transition/restore/storage-class)
-- [x] 崩溃 ≥500 轮(归档混载)+ 复制双节点 drill;升级 v2.1→v2.2 + 回滚实测
-- [x] perf:归档路径带宽/恢复基准 + 非归档负载零回退(<5%);覆盖率 ≥80%;cargo audit 清零
-- [x] 发布 v2.2.0(CHANGELOG/RELEASES 记档;附 S3-GAP §4/§5 更新:媒体/IoT/边缘场景闭环)
+- [ ] T1 s3-tests 主/备配置两把不同 AK、两个 User;「单账号模型限制」表中
+  `policy_multipart` / `copy_not_owned` / `404_with_policy` 等能出集的出集,其余逐名
+  - 用例:README 恒排表更新;gate 意外失败 0
+- [ ] T2 Owner 回显 = 租户 canonical_id;expected-bucket-owner 按租户 ID(M15 C2 从「恒 fasts3」升格)
+  - 用例:`expected_bucket_owner_matches_tenant_canonical_id`
+
+### M18 门禁(退出条件)
+
+- [ ] ADR-28 与实现无偏离;compat 记载 D-E2 角色实体变更与 canned 策略名
+- [ ] `cargo test --workspace` 全绿;C2 委托演练 + LDAP mock 绿
+- [ ] s3-tests 全量意外失败 0;DI9 出集或逐名
+- [ ] 崩溃 ≥200 轮(IAM 用户/SA 建删 + PUT 混载)零撕裂、无孤儿 `k:`/`iu:`
+- [ ] clippy -D warnings;覆盖率不回退 >1pt;cargo audit 清零
+- [ ] 发布记录 v2.4.0:CHANGELOG/RELEASES + 版本 bump(**不打 tag / 不公网 Release**)
+
+---
+
+## M19 v2.5.0 好用的私有化
+
+> 私有化对外一句话:管理员少用 CLI;从 MinIO/云迁入保 LastModified 与策略;事件进 Kafka;
+> 千万级桶可批量打标/恢复/删除。
+> 前置:M18 IAM 全部勾选(部门身份已可自助);M17 死锁已修(迁入向导走并发拷)。
+> 工期:控制台 ≈2.5 + 迁入 ≈2.5 + Condition Date* ≈1.2 + Kafka ≈1.8 + Batch ≈2.5 ≈ 10.5 pw / 2 人 ≈6 周。
+> 各组可并行,但每组首条 ADR 未落盘不得写实现。控制台无热路径,不进 Rust 引擎。
+
+### U. 控制台「内网文件柜」(≈2.5 pw;无 ADR)
+
+> 现状:运维台够用(桶/对象/密钥/审计),不是文件产品。全在 Node/React,零热路径。
+
+- [ ] U1 对象预览:图片/文本/PDF(浏览器原生或轻量组件);超大小阈值只给下载;SSE-C 对象不预览明文到浏览器以外
+  - 用例:控制台测或 Playwright:小文本预览可见正文;超限显示「请下载」
+- [ ] U2 批量下载 zip:勾选多个对象 → 管理面流式打包(不经数据热路径缓冲整桶);
+  单请求上限(文件数/总字节)可配,超限 413
+  - 用例:`console_zip_selected_objects`;超限拒绝
+- [ ] U3 版本 diff/回滚:版本化对象列出版本;任选一版「恢复为当前」(服务端 Copy 到同 key,不静默删历史);
+  控制台展示 LastModified/ETag/size 对比,不做二进制 GUI diff
+  - 用例:回滚后 GET 当前版正文等于所选历史;ListObjectVersions 历史仍在
+- [ ] U4 中文 i18n:控制台 UI 中/英切换(默认随浏览器 `Accept-Language`,可手动覆盖);
+  关键运维文案(告警、删除确认、锁/合规)必须翻译
+  - 用例:切换后导航与删除确认不是英文硬编码
+
+### M. 保 mtime/元数据/策略的迁入向导(≈2.5 pw;ADR-24)
+
+> `mc mirror` 会丢掉源 LastModified,对账/合规疼。本能力走管理面任务,禁止开放匿名 S3 PUT 伪造 mtime。
+
+- [ ] M0 ADR-24: **(a)** 保留 LastModified = 管理面任务写引擎 `ObjectMeta.mtime`(仅迁入通道,
+  S3 PUT/POST 仍用服务器时间,防伪造);**(b)** 用户元数据(`x-amz-meta-*`)、内容类型、
+  存储类、对象标签一并拷;**(c)** 桶策略/BPA/生命周期/通知配置可选拷贝,密钥不拷(目标侧预置);
+  **(d)** 执行器 = 流式 GET 源 + PUT 目标(可复用节点本地调度),节流/可暂停,失败可重跑幂等
+- [ ] M1 中心或单机 admin:迁入任务 CRUD(源 endpoint/桶/前缀、是否保 mtime、是否拷桶配置)+ 进度/失败列表
+  - 用例:`ingest_job_create_and_status`
+- [ ] M2 执行:源对象 LastModified 在目标 HEAD 上回显一致(±1s 内,ADR 钉死精度);
+  用户元数据与标签一致;重跑不双计容量
+  - 用例:`ingest_preserves_mtime_and_usermeta`;账目 `leaks` 空
+- [ ] M3 控制台向导页(源类型 MinIO/S3/OSS 只是 endpoint 预设)+ 文档;默认并发受 M17 D3 约束
+  - 用例:向导走完后目标桶 List 与源对象数一致(小夹具)
+
+### P. Condition 时间/变量补全(≈1.2 pw;ADR-27)
+
+> `aws:username` / Principal 用户 ARN 已在 M18 IAM 落地。本条补**工作时间**与 Resource 变量展开。
+> 非法键继续 400,不静默。
+
+- [ ] P0 ADR-27:白名单钉死 `DateGreaterThan`/`DateLessThan`/`DateEquals` × `aws:CurrentTime`;
+  `${aws:username}` 在 Resource 中展开(用户名 = IAM User,与 M18 一致)。
+  **明确仍拒绝**:`s3:ExistingObjectTag` 等未列入键(维持 MalformedPolicy)
+- [ ] P1 单测:工作时间 Allow、非工作时间 Deny、变量展开只命中自己的前缀
+  - 用例:`condition_current_time_office_hours`;`policy_variable_username_in_resource`
+- [ ] P2 s3-tests:能转绿的出集;其余逐名维持;非法键仍 MalformedPolicy
+  - 用例:排除矩阵更新
+
+### K. Kafka 通知(≈1.8 pw;ADR-25)
+
+> Webhook 已交付。私有化事件总线 Kafka 远比 SQS 常见。只加这一个目标;**不要** AMQP/MQTT/NSQ。
+
+- [ ] K0 ADR-25: **(a)** 目标配置 = bootstrap + topic + 可选 SASL/TLS(密码仅 env,不落盘,对齐 LDAP bind);
+  **(b)** 复用 `e:` 队列与投递 worker,至少一次;失败重试/死信沿用 N3;
+  **(c)** 载荷 JSON(与 Webhook 同源字段,便于双写);**(d)** XML 校验:非法目标显式错误;
+  SQS/SNS/EventBridge/AMQP 仍拒绝
+- [ ] K1 PutNotification 接受 Kafka 目标;worker 生产消息;无 Kafka 时集成测试用 mock/Testcontainers 或
+  进程内 fake(二选一写进 ADR,禁止「未跑当过」)
+  - 用例:`notification_kafka_delivers_put_event`;Webhook 回归不破
+- [ ] K2 指标沿用 `fasts3_notification_*`(目标类型标签);文档部署(内网 Kafka 证书/ACL)
+  - 用例:admin `/metrics` 含投递计数;compat 声明 Kafka 为第二目标
+
+### J. S3 Batch Operations(≈2.5 pw;ADR-26)
+
+> 千万级桶一次性打标/恢复/删除。对齐 **AWS Batch 形态**(CreateJob + CSV manifest),
+> 不是 `mc batch` YAML。不实现 Lambda 操作。
+
+- [ ] J0 ADR-26: **(a)** API 形态 = CreateJob/GetJob/ListJobs/CancelJob
+  (JSON 或 AWS S3 Control XML,ADR 钉死一种;推荐管理面 JSON + 控制台,并提供与 AWS 字段同名的 DTO,
+  不承诺 `aws s3control` 客户端 100% 开箱,除非本 ADR 选择实现 Control 端口);
+  **(b)** manifest = CSV(bucket,key[,versionId])或复用 Inventory 输出;
+  **(c)** 操作起步 = copy / delete / restore / replace-tag;权限 = 调用者密钥策略求交,无隐式 bypass 锁;
+  **(d)** 结果报告对象写入指定桶;状态机 Submitted→Running→Complete/Failed/Cancelled;崩溃后续跑
+- [ ] J1 配置与状态落元数据(新键前缀须三处同步);Create/Get/List/Cancel 往返
+  - 用例:`batch_job_create_get_list_cancel`
+- [ ] J2 worker 复用 BackgroundWorker;copy/delete/restore/tag 各至少一条集成;
+  锁定对象 delete 失败记入报告且不绕过 Object Lock
+  - 用例:`batch_delete_skips_locked`;`batch_restore_glacier_object`;报告 CSV/JSON 可对账
+- [ ] J3 控制台 Job 视图(进度/失败抽样)+ 审计(who 创建/取消);s3-tests batch 族若有则出集或逐名
+  - 用例:控制台或 API 可见 Complete;审计可检索 job id
+
+### M19 门禁(退出条件)
+
+- [ ] ADR-24/25/26/27 落盘,与实现无偏离
+- [ ] `cargo test --workspace` 全绿;本清单新增用例全部执行
+- [ ] s3-tests 全量意外失败 0;Condition/Batch 按出集或逐名
+- [ ] 迁入向导夹具:源 MinIO 或第二 FastS3 → 目标,mtime 与用户元数据对账
+- [ ] Kafka 用例绿(含 mock 方案则文档化边界)
+- [ ] clippy -D warnings;覆盖率不回退 >1pt;cargo audit 清零
+- [ ] 发布记录 v2.5.0:CHANGELOG/RELEASES + 版本 bump(**不打 tag / 不公网 Release**)
+
+---
+
+## 持有组(不占 M17–M19 排期;门槛未过不拆实现任务)
+
+> 有合同条款/issue 投票/实测瓶颈再单独立项并补 ADR。不要在本清单中间插入。
+
+| ID | 项 | 门槛 | 现状替代 |
+| --- | --- | --- | --- |
+| H1 | Terraform provider | issue 投票 ≥10(见 docs/m14-ecosystem-eval.md) | admin API / 脚本 / `http` provider |
+| H2 | K8s Operator(不做 CSI) | issue 投票 ≥10 或企业 K8s 生产反馈 | compose / systemd / 现有 Helm 式 YAML 示例 |
+| H3 | BlueFS 设备内元数据 | 裸盘无根分区 **或** 元数据 I/O 成为瓶颈(M17 F3 已脱钩归档) | 方案 C:同盘 meta-dir |
+| H4 | MFA Delete | 防误删诉求且 Object Lock 不够 | COMPLIANCE 锁 + 删权限收窄;参数维持显式拒绝 |
+| H5 | mtime 二级索引 | 生命周期要分钟级、不能等午夜 | 现行 Days 午夜语义 + 全量扫描 |
+| H6 | 跨云 AWS IAM Identity Center / 多账号 Organizations | 要跟公有云同一套账号体系 | M18 本进程租户 + LDAP/OIDC + 本租户 Role |
+| H8 | SSE-KMS(真接内网 Vault/KMS) | 等保/密评强制密钥出存储进程 | SSE-S3;禁止空壳 KMS |
+| H9 | 通知再扩 AMQP/NATS/Redis | 总线不是 Kafka/Webhook | 中间适配服务 |
+| H10 | FUSE / 全文检索 / 病毒扫描 | 点名需求 | rclone mount;Inventory+ES;通知打 ClamAV |
 
 ---
 
 ## 排除清单(不列入开发管线)
 
-> 依据:NEXT-ROUND §3.2。协议面维持显式报错/显式 501(不静默忽略,红线不变),
-> 但不投入实现与测试;特定客户合同硬需求 → 独立定制评估,不进主版本。
+> 协议面维持显式报错/501(不静默),但不投入实现。特定合同硬需求 → 独立定制,不进主版本。
 
 | 特性 | 排除类别 | 理由 |
 | --- | --- | --- |
-| S3 Select / Glacier Select | 停售排除 | AWS 2024-07-25 起不对新客户提供;官方引导 Athena/Trino/Parquet 化替代 |
-| Object Lambda | 停售 + 定位排除 | AWS 2025-11-07 起仅存量客户 + APN;单机下读代理/应用层可替代 |
-| Torrent | 停售排除(已移除) | AWS 2021 弃用,文档页已移除 |
-| ACL 全矩阵 | 方向性排除 | 2023-04 起新桶默认 BucketOwnerEnforced(ACL 禁用);维持 GetObjectAcl 私有桩 + Put*Acl 显式 501 |
-| Website / Logging / RequesterPays / Accelerate / Access Points / Directory Buckets / SigV2 / SSE-KMS·DSSE | 定位排除(AWS 仍在提供) | 单机定位/无 KMS 托管;nginx·LB·网关层替代;compat.md 已声明 |
+| S3 Select / Glacier Select | 停售 | AWS 2024-07-25 起不对新客户提供 |
+| Object Lambda | 停售 + 定位 | 2025-11-07 起仅存量 + APN |
+| Torrent | 停售 | AWS 2021 弃用 |
+| ACL 全矩阵 | 方向性 | 新桶默认 BucketOwnerEnforced;维持 GetObjectAcl 私有桩 + Put\*Acl 501 |
+| 纠删码 / Heal / Pool / Raft / 内置 `?replication` | 定位 | 底层已 HA;写放大 1;复制走 ADR-20 策略化 |
+| `/minio/admin`、`mc admin`、`ListenBucketNotification` | 定位 | 厂商协议;用 FastS3 admin/console + Webhook/Kafka |
+| `?quota` / `?durability` / `?lambda` 伪装 S3 子资源 | 定位 | 配额在 admin,不污染 S3 端口 |
+| Website / Logging API / RequesterPays / Accelerate / Access Points / Directory Buckets / SigV2 / SSE-KMS 空壳 / DSSE | 定位 | nginx/网关/无 KMS 托管;Logging 用 M17 审计导出代替 |
+| Iceberg catalog / RDMA / FTP·SFTP / 向量检索 / TCO 面板 | 范围 | 不是私有化存储门槛 |
+| macOS / Windows 服务端 | 绑定 | io_uring + 私有化服务器即 Linux |
+| 遥测 / 强制账号才能下载 | 私有化红线 | 内网断外网也要能装 |
 
 ---
 
-## 附录:门禁速查(每里程碑末尾「门禁」为退出条件)
+## 人工后置(非代码,不进本清单勾选)
 
-| 里程碑 | 协议门禁(s3-tests 排除集收敛) | 崩溃/一致性 | 性能 | 其它 |
-| --- | --- | --- | --- | --- |
-| 审查修复 v2.2.1 | 全量意外失败 0;F8 后 gate **开压缩**复跑 | ≥200 轮(COW 重启+大对象 restore+分片账目+压缩下 GET);明文 fd 长跑不线性涨 | 不回退 >5%(相对 M16 报告) | ADR-22;本清单每条带防复发用例;发布 v2.2.1 |
-| M15 | notification 族出集;multipart_copy_versioned 出集 | ≥500 轮(事件队列混载) | 关闭态零回退(<5%) | ADR-18;STS 会话往返;覆盖率 ≥80% |
-| M16 | transition/restore/storage-class 族出集;复制双节点 drill | ≥500 轮(归档混载)+ 升级回滚 | 归档带宽基准 + 非归档零回退(<5%) | ADR-19/20/21;S3-GAP 场景闭环 |
+> 需要商务/环境/发布决策。工程侧只保证代码与脚本不挡路。
+
+| 项 | 说明 | 仓库内已有 |
+| --- | --- | --- |
+| 外部安全审计执行 | 签约第三方;v1.0 与 v2.0 增量范围见 docs/ga/security-audit.md、m14-v2-security-audit.md | 自审全绿;RFP 草稿 |
+| 公网发布 | git tag、`.github/workflows/release.yml`、可下载签名 + SBOM | `tools/package/`、package.yml 可构建性门禁 |
+| 真 NVMe + warp 同机对照(含 MinIO)入标书 | 专用 runner + 硬件/日期一并公布 | `tests/bench/` 脚本;现有数字不得虚写进标书 |
+| Commvault 实测 | 授权与重部署环境 | Object Lock 能力已有;M17 C3 为协议替身 |
+| Veeam CE 真机往返 | 授权软件外部环境 | 同上;有 PATH 则 C3 加跑,无则 SKIP |
 
 ---
 
-*本清单依据 [docs/NEXT-ROUND.md](./docs/NEXT-ROUND.md)(2026-08-26 评审通过)拆解;任何偏离走 ADR 流程。差距收敛进度 = s3-tests 排除集收敛项 + S3-GAP §8 验证方法。*
+## 附录:门禁速查
+
+| 里程碑 | 协议 | 崩溃/正确性 | 其它 |
+| --- | --- | --- | --- |
+| M17 | BPA 出集或逐名;意外失败 0 | 并发 mirror 不挂死;kill -9 ×≥50 轮混载 | ADR-23;poc 一键;S3A 冒烟;许可证唯一;不打 tag |
+| M18 | alt 身份用例出集或逐名;意外失败 0 | IAM 建删 + PUT 混载 ≥200 轮无孤儿密钥 | ADR-28;委托演练不用 root AK;不打 tag |
+| M19 | Condition/Batch 出集或逐名;意外失败 0 | 迁入保真账目不漂 | ADR-24~27;Kafka 用例;不打 tag |
+
+---
+
+*本清单将私有化优先级中「现在就做 / 下一里程碑做」及 IAM 多租户的**代码与文档交付**任务化;
+P2 持有与 P3 排除见上表。任何偏离走 ADR。*

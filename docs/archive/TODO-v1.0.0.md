@@ -1,7 +1,8 @@
 # FastS3 实现 TODO 清单
 
 > **【已归档 — 2026-08-21】** 本文件为 v1.0.0(M0~M8/P1/M5~M8 GA)执行期的 TODO 清单,已完成使命,冻结于此存档(内部相对链接指向归档前位置,仅作历史参考)。
-> 后续开发请使用根目录 [TODO.md](../TODO.md)(远期里程碑 M9 v1.0.x → M14 v2.0);设计依据 [DESIGN-FUTURE.md](../DESIGN-FUTURE.md) 与 [S3-GAP.md](../S3-GAP.md)。
+> 后续开发请使用根目录 [TODO.md](../../TODO.md)(当前 M17 私有化部署);
+> M9~M14 见 [TODO-v2.0.0.md](./TODO-v2.0.0.md);M15~v2.2.1 见 [TODO-v2.2.1.md](./TODO-v2.2.1.md)。设计依据 [DESIGN-FUTURE.md](../DESIGN-FUTURE.md) 与 [S3-GAP.md](../S3-GAP.md)。
 >
 > 依据:[docs/ROADMAP.md](./docs/ROADMAP.md)(WBS 工作分解、里程碑计划、验收总表)与 [docs/DESIGN.md](./docs/DESIGN.md)(设计细节)。
 > 用途:逐条勾选实现进度;一个勾选项 = 一个可验证的交付。

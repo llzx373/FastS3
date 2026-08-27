@@ -8,13 +8,12 @@ FastS3 是一个**单机 S3 服务**,面向裸块设备 / 磁盘镜像文件的�
 
 - 数据面 + S3 协议:**Rust**(io_uring + thread-per-core + O_DIRECT)
 - 管理面 + Web 控制台:**Node.js**(Fastify + React/Vite),永不进入数据热路径
-- 当前状态:**v2.0.0 已交付**(M0~M14:GA 候选 + 协议卫生 + 版本控制 + 生命周期/
-  加密 + Object Lock + 容量与底座 + 集中纳管与生态;M14 另含 HTTP/3 实验开关
-  与热缓存,M13 起版本弧线 v1.4→v2.0)。M9~M14 门禁见
-  [docs/archive/TODO-v2.0.0.md](./docs/archive/TODO-v2.0.0.md)(已归档);
-  下一里程碑 **M15 v2.1.0 迁移即插即用**(任务与门禁见 TODO.md,规划见
-  [docs/NEXT-ROUND.md](./docs/NEXT-ROUND.md))。
-  git tag / 真 NVMe / v2.0 外部审计(已立项)仍按 checklist 如实为执行期项
+- 当前状态:**v2.2.1 已交付**(M0~M16 + 审查修复:GA 候选、版本/锁/加密/生命周期/
+  归档、Webhook/STS/Inventory、LDAP/OIDC、中心纳管与策略化复制)。
+  M9~M14 见 [docs/archive/TODO-v2.0.0.md](./docs/archive/TODO-v2.0.0.md);
+  M15~v2.2.1 见 [docs/archive/TODO-v2.2.1.md](./docs/archive/TODO-v2.2.1.md)。
+  下一里程碑 **M17 v2.3.0 可交付私有化**(任务与门禁见 TODO.md)。
+  git tag / 真 NVMe / 外部审计属人工后置,不进当前 TODO
 
 ## 2. 权威文档(改动任何设计前必读)
 
@@ -24,7 +23,7 @@ FastS3 是一个**单机 S3 服务**,面向裸块设备 / 磁盘镜像文件的�
 | [docs/DESIGN-FUTURE.md](./docs/DESIGN-FUTURE.md) | 远期规划(v1.1~v2.0)详细设计与实现:§11 决策点清单、键空间/值格式演进纪律、每特性 WBS 与门禁 |
 | [docs/S3-GAP.md](./docs/S3-GAP.md) | 企业级 S3 特性差距分析:现状/缺口/优先级/路线归属;差距收敛标尺 = s3-tests 排除集收敛 |
 | [docs/ROADMAP.md](./docs/ROADMAP.md) | 规划:WBS 工作分解、里程碑与门禁、开箱即用验收标准 |
-| [TODO.md](./TODO.md) | 执行清单:M15 v2.1.0「迁移即插即用」逐条任务 + 门禁,进度跟踪(见 §4);M9~M14 已归档 docs/archive/TODO-v2.0.0.md |
+| [TODO.md](./TODO.md) | 执行清单:M17 可交付私有化(当前)+ M18 IAM 多租户 + M19 好用的私有化;M15~v2.2.1 已归档 docs/archive/TODO-v2.2.1.md |
 
 **规则:实现行为与 DESIGN.md 冲突时,以 DESIGN.md 为准,并走 ADR 流程修正文档(见 §5),不得静默偏离。**
 
@@ -45,10 +44,10 @@ tests/    s3-tests 配置、loadgen、crash harness
 ## 4. 任务跟踪工作流(使用 TODO.md)
 
 1. **认领**:开始实现前,在 [TODO.md](./TODO.md) 找到对应条目,确认所属里程碑(WBS 编号 → 任务 → 门禁)。
-2. **实现**:一个勾选项 = 一个可验证的交付;按里程碑顺序推进,**禁止跨里程碑抢跑**(如 M0 未完成就做 S3 协议)。
+2. **实现**:一个勾选项 = 一个可验证的交付;按里程碑顺序推进,**禁止跨里程碑抢跑**(如 M17 未完成就做 M18 迁入向导)。
 3. **勾选**:交付完成并验证后,将该条目改为 `- [x]`,并在提交/PR 描述中引用条目文字与编号。
 4. **门禁**:里程碑末尾的门禁(退出条件)全部勾选后才能进入下一里程碑;不达标须如实报告,不得自行勾选。
-5. **PR 引用**:提交信息形如 `feat(fs3-device): O_DIRECT 打开与 4KiB 对齐(TODO M0/B1)`。
+5. **PR 引用**:提交信息形如 `feat(fs3-s3): PutPublicAccessBlock 往返(TODO M17/B1)`。
 
 ## 5. ADR 纪律
 
@@ -124,7 +123,7 @@ fio 基线脚本、crash harness、loadgen、warp、s3-tests 配置
   duplicati 2.3.0.4(自包含 CLI)在 `/tmp/clients/duplicati/`;
   `client_smoke.sh` 的 `CLIENTS_DIR` 默认 `/tmp/clients`(mc/rclone 已符号链接,
   aws 经 PATH 解析)。
-- **湖仓/备份冒烟(M15 D3)**:JDK 21(Temurin,`~/.local/jdk-21`,`java` 在 PATH);
+- **湖仓/备份冒烟(M17 C)**:JDK 21(Temurin,`~/.local/jdk-21`,`java` 在 PATH);
   Hadoop 3.4.1(`~/.local/hadoop-3.4.1`,含 `hadoop-aws-3.4.1.jar` + AWS SDK v2
   `bundle-2.24.6.jar`);S3A 冒烟设 `JAVA_HOME=$HOME/.local/jdk-21`、
   `HADOOP_HOME=$HOME/.local/hadoop-3.4.1`。Veeam 为授权软件,需外部环境。

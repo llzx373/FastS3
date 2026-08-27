@@ -64,9 +64,10 @@
 
 > **V1 立项口径,已被后续 ADR 取代**(实现以 ADR 与兼容矩阵为准,不得再把本列表当现行范围):
 > 生命周期/对象锁/版本控制 → ADR-11/12/13(v1.1–v1.3);
-> LDAP/OIDC → ADR-21(v2.2);在线扩容 → ADR-15(v1.4);
+> LDAP/OIDC → ADR-21(v2.2);IAM 多租户(用户/组/策略/服务账号)→ ADR-28(v2.4);
+> 在线扩容 → ADR-15(v1.4);
 > 纠删码/跨节点复制仍非目标;站点级容灾走 ADR-20 策略化同步(不内置 ?replication)。
-> S3 Select 停售排除。完整现行范围见 [compat.md](./site/docs/reference/compat.md) 与 ADR-5/9/14/22。
+> S3 Select 停售排除。完整现行范围见 [compat.md](./site/docs/reference/compat.md) 与 ADR-5/9/14/22/28。
 
 - 多节点 / 分布式部署(单机内多设备条带化除外);
 - 纠删码、跨节点复制、站点级容灾(交给底层存储);
@@ -1423,6 +1424,150 @@ s3-tests 零新增 API(管理面特性,数据面无新端点);mock LDAP/OIDC
 **门禁**:TODO 审查修复 v2.2.1 F1–F8 定向用例 + G 门禁;每条含
 `leaks().is_empty()` / 准入归零 / fd 不线性涨。
 
+#### ADR-28(M18 立项决策):IAM 多租户(MinIO 熟悉的用户/组/策略/服务账号)
+
+**背景**:私有化落地后,运维不能再「所有事找超级用户」。MinIO 企业用户熟悉的是
+进程内 IAM:**User / Group / Policy / Service Account(Access Key)** + 控制台按
+策略过滤,而不是 AWS 账号级 Organizations,也不是 `mc admin` 二进制兼容。
+现状(ADR-18 D-E2 + ADR-21):数据面只有 `k:` 密钥;控制台 JWT 仅 `admin`/
+`readonly` 二元;LDAP 同步直接造密钥;STS AssumeRole **不引入角色实体**。
+本 ADR 把身份升为一等公民,并**部分取代** D-E2「无角色」与 ADR-21「组→密钥」
+映射。实现偏离必须再走 ADR。不实现 `/minio/admin` 与 `mc admin` 线协议
+(红线不变);概念与 canned 策略名对齐,便于从 MinIO 迁运维习惯。
+
+**DI1(租户 = 隔离边界,不是第二套集群)**:
+
+1. **Tenant** 一等实体:`tn:{tenant_id}` → {display_name, canonical_id,
+   status, created_at}。`canonical_id` = 对外账号 ID(Owner / 
+   `x-amz-expected-bucket-owner` 比对对象;稳定、不可改)。
+2. 一个 FastS3 进程内多个租户共享同一引擎与磁盘;**隔离靠 IAM + 桶属主**,
+   不做每租户独立 rocksdb/设备(那是 MinIO Operator Tenant,另一产品)。
+3. **升级兼容**:已有部署隐式进入租户 `default`,canonical_id 沿用现行
+   `fasts3`(或首个 access key 的既有 Owner 字符串,compat 钉死一种);
+   存量 `k:` 无属主 → 归属 `default` 的引导用户(见 DI7)。
+4. 跨租户默认拒绝。桶策略 Principal 显式点名另一租户 ARN 才放行(可选能力,
+   默认模板不含)。
+
+**DI2(身份实体,对齐 MinIO IAM 概念)**:
+
+| 实体 | 键 | 作用 | MinIO 对应 |
+| --- | --- | --- | --- |
+| User | `iu:{tenant}\0{user}` | 控制台登录身份;密码只用于管理面,不用于 SigV4 | `mc admin user` |
+| Group | `ig:{tenant}\0{group}` | 用户集合 + 策略挂载 | `mc admin group` |
+| Policy | `ip:{tenant}\0{name}` 或内置 canned(无租户前缀) | IAM JSON 文档 | `mc admin policy` |
+| Access Key / Service Account | `k:{access_key}` 扩展属主 | **唯一数据面身份**(SigV4) | Service Account / 用户 AK |
+| Role | `ir:{tenant}\0{role}` | STS AssumeRole 目标(策略包) | MinIO 无独立 Role;本设计补 AWS 习惯 |
+
+1. User 字段:status(enabled/disabled)、password 哈希(仅 console,Argon2id
+   或与现网 JWT 口令同档)、挂载的 policy 名列表、所属 groups、是否
+   `tenantAdmin`。**User 没有 SigV4 secret**。
+2. Group:成员用户名列表 + policy 名列表。
+3. Policy:标准 IAM Statement(Effect/Action/Resource/Condition/Principal)。
+   **内置 canned**(名与 MinIO 对齐,文档给对照表,内容按 FastS3 Action 翻译):
+   `readonly` / `readwrite` / `writeonly` / `diagnostics` / `consoleAdmin`
+   (集群范围,仅 root 可授)+ FastS3 增补 `tenantAdmin`(仅本租户
+   `admin:CreateUser|CreatePolicy|CreateServiceAccount|…`)。
+   canned 只读,用户自定义策略可 CRUD。
+4. Access Key = Service Account:必有 `owner_user` + `tenant_id`;可选
+   **嵌入策略**(与用户生效策略求交,Deny 优先)。secret 仍 G1-3:仅创建时
+   一次回显。用户可在控制台自助创建/吊销**自己的** SA,无需 root。
+5. Role:策略文档 + 可 Assume 的主体(本租户 User/Group)。无跨租户 Assume
+   (防提权;需要时显式加 Principal,默认关)。
+
+**DI3(生效策略与管理面授权,告别 JWT 二元角色)**:
+
+1. **数据面生效策略** =
+   (User 直挂 policies ∪ 所属 Group 的 policies) ∩ (SA 嵌入策略,若有)
+   ∩ 桶策略(Principal 匹配当前身份)。Deny 优先,与现 policy.rs 一致。
+2. **Principal 匹配**(补齐桶策略多主体):支持
+   `arn:aws:iam::{canonical_id}:user/{name}`、
+   `arn:aws:iam::{canonical_id}:root`(租户内任意身份)、
+   `*`。单账号时代 `Principal: *` 语义不变;新桶默认仍受 BPA 约束(ADR-23)。
+3. **管理面/控制台授权 = 同一套 IAM**,Action 使用 `admin:*` 族
+   (CreateUser/ListUsers/CreatePolicy/GetAudit/…)。废除「JWT 只有
+   admin|readonly」作为授权真相;JWT 只证明「谁登录」,权限查 IAM。
+   过渡:升级后引导用户挂 `consoleAdmin` 或 `tenantAdmin`,readonly 账号
+   挂 `diagnostics` 或 `readonly`。
+4. **ListBuckets / 控制台对象浏览器**:只返回策略允许的桶(隐式过滤,
+   不 403 整个 List)。CreateBucket 的属主租户 = 调用者租户。
+
+**DI4(超级用户只做引导,日常不依赖)**:
+
+1. 配置文件 `root_user` / `root_password`(或环境变量,对齐 MinIO
+   `MINIO_ROOT_USER` 习惯)**仅引导**:不受 IAM 限制、不可删除、不可降权。
+2. 生产清单:root 创建租户 + 首个 `tenantAdmin` 用户后,**部门管理员用自己的
+   控制台账号**管用户/组/SA/本租户桶;root 口令进保管库,不进日常。
+3. 无 `tenantAdmin` 的租户禁止「所有人共用一把数据面 AK 当超管」。
+4. 审计:`who` = user 或 SA access key;root 操作强制记 `auth_note=root`。
+
+**DI5(STS:引入本租户 Role,取代 D-E2「无角色实体」)**:
+
+1. **GetSessionToken**:保持「当前 AK ∩ 会话策略」,不提权(D-E2 此条仍成立)。
+2. **AssumeRole**:RoleArn 必须是本租户 `ir:` 角色;最终权限 = Role 策略 ∩
+   调用者生效策略的**可 assume 约束**(调用者需 `sts:AssumeRole` 对该 Role)。
+   **可以相对调用者 SA 缩权或换策略包,不能越租户、不能获得 root**。
+   此条**取代** D-E2「AssumeRole 裁成无角色、不引入角色实体」。
+3. **AssumeRoleWithLDAPIdentity / AssumeRoleWithWebIdentity**(MinIO 运维熟悉):
+   校验 LDAP bind 或 OIDC token 成功 → 映射到本进程 User → 按配置 Role
+   或用户生效策略签发临时 AK+token。数据面仍只认临时 AK,不在热路径打 LDAP。
+4. 会话存储沿用 `s:session`,字段增加 `role` / `user` / `tenant_id`;secret
+   零落盘纪律不变。
+
+**DI6(LDAP/OIDC:改映射到 User/Group,修正 ADR-21 DL1/DL4)**:
+
+1. LDAP 周期同步:**目录用户 → FastS3 User**(禁用/恢复),**目录组 → Group
+   + 配置的 policy 挂载**;**不再**「组存在就直接 `k:` 一把密钥」。
+   应用密钥由该用户(或 tenantAdmin)自助建 SA。
+2. **允许 LDAP bind 登录控制台**(修正 DL4「不做 bind 认证」):登录时对
+   目录 BIND,成功则发 JWT(身份 = 已同步 User);目录无对应 User 则拒绝
+   (先同步后登录,防幽灵账号)。失败回退本地口令用户。
+3. OIDC:校验后映射 `sub`/`preferred_username` → User(可 just-in-time 创建
+   但必须落入配置的默认 Group/策略,禁止默默变 consoleAdmin)。
+4. bind 密码仍不进数据面、不进 `k:`(ADR-21 DL1.3 保持)。
+
+**DI7(密钥记录扩展与迁移)**:
+
+1. `KeyRecord` 增:`tenant_id`、`owner_user`、`embedded_policy`(Option)、
+   `sa_name`(展示名)。值版本双读单写;旧记录缺省 tenant=`default`、
+   owner=`bootstrap`(升级工具创建的隐藏用户,仅用于挂载孤儿密钥)。
+2. 数据面鉴权:SigV4 仍按 access key 查 `k:`;再加载 User/Group 算生效策略。
+   热路径用内存表,IAM 变更立即失效(与现 add_key 同口径)。
+3. 禁用 User → 其全部 SA 鉴权失败(InvalidAccessKeyId 或显式 Forbidden,
+   compat 钉死一种);禁用单把 SA 不影响 User 登录。
+
+**DI8(API 与控制台,熟悉但不抄路径)**:
+
+1. admin HTTP(回环/unix,现有鉴权通道):`/v1/iam/tenants|users|groups|policies|roles|service-accounts`
+   CRUD + attach/detach policy。字段名用 MinIO 运维熟悉的
+   `accessKey`/`policy`/`members`,文档给 `mc admin user add` → 本 API
+   对照表。
+2. Node `/api/iam/*` 代理上述接口;控制台页:租户(仅 root)、用户、组、
+   策略、服务账号、角色。对象/桶页按 DI3 过滤。
+3. **禁止**实现 `/minio/admin/v3` 以通过 `mc admin user` 二进制。
+
+**DI9(Owner 与 s3-tests)**:
+
+1. 对象/桶 Owner = 创建者租户 `canonical_id` + 用户 display(或 SA 名)。
+2. s3-tests 主/备用户必须配置**两把不同 AK、两个 User**(可同租户或两租户);
+   据此收敛「单账号模型限制」表中依赖 alt 身份的用例(policy_multipart /
+   copy_not_owned 等)——能出集的出集,仍依赖 ACL 写的维持 501 排除。
+
+**DI10(明确不做)**:
+
+- AWS Organizations / 多账号计费 / 跨账号资源共享完整矩阵;
+- 每租户独立设备池或独立进程;
+- `/minio/admin`、`mc admin` 线协议;
+- 跨租户 STS 提权、User 直接当 SigV4 密钥(必须经 SA)。
+
+**键前缀三处同步**:`tn:` / `iu:` / `ig:` / `ip:` / `ir:` 登记 keys.rs、
+meta-export/import DTO、check 可达性扫描。IAM 文档进 export(不含口令哈希
+可逆材料;口令哈希可导出供灾备,secret 明文仍不出现)。
+
+**门禁口径**(TODO M18):ADR-28 与实现无偏离;root 之外 tenantAdmin 可完成
+「建用户 → 挂 readonly/readwrite → 自助 SA → 该 SA 读写本租户桶、看不到
+他租户」全程;LDAP bind 登录或 mock 绿;s3-tests alt 身份用例按 DI9 收敛;
+崩溃混载下 IAM 键与 `k:` 同事务、无孤儿 SA。
+
 ---
 
 ## 4. 存储引擎设计(Rust)
@@ -1809,12 +1954,14 @@ echo none > /sys/block/nvme0n1/queue/scheduler    # 直通,免合并层
 | `GET /api/buckets/{name}/objects?prefix=&continuation=` | 对象浏览(代理 S3 ListObjectsV2) |
 | `POST /api/buckets/{name}/presign` | 签发 PUT/GET 预签名 URL(直传数据面) |
 | `POST /api/buckets/{name}/multipart/init|complete|abort` | 浏览器大文件分片上传编排(每片预签名) |
-| `GET/POST/DELETE /api/keys[/{id}]` | 密钥管理(代理到 Rust) |
+| `GET/POST/DELETE /api/keys[/{id}]` | 密钥管理(代理到 Rust;M18 起为当前用户的 SA) |
+| `GET/POST /api/iam/*` | 租户/用户/组/策略/角色/SA(ADR-28;代理 `/v1/iam`) |
 | `GET /api/audit?limit=` | 审计日志查询(Rust 审计环形缓冲) |
 | `WS /api/ws` | 向浏览器推送实时指标(来自 Rust WS 的转发/合并) |
 | `GET /api/health` | 自身健康检查 |
 
-- 认证:JWT(HS256)+ 角色(admin / readonly);会话无状态,支持多实例;
+- 认证:JWT(HS256)证明登录者;授权以 IAM 生效策略为准(ADR-28),不再以
+  JWT 内 `admin|readonly` 二元角色为真相(升级过渡见 DI3.3);
 - 指标历史:内存环形缓冲(如 24h × 5s 粒度),可选落 SQLite 留更长历史。
 
 ### 7.4 Web 控制台(React + Vite)
@@ -1825,7 +1972,8 @@ echo none > /sys/block/nvme0n1/queue/scheduler    # 直通,免合并层
 | 桶管理 | 创建/删除、配额、策略编辑 |
 | 对象浏览 | 前缀导航、上传(拖拽 + 大文件分片直传)、下载、删除、复制、生成预签名链接、元数据查看 |
 | Multipart | 在途上传列表、强制中止 |
-| 访问密钥 | 创建/禁用/删除,策略编辑器(AWS 策略语法子集) |
+| 访问密钥 | 当前用户的 Service Account(创建/禁用/嵌入策略);tenantAdmin 可代管本租户 |
+| 身份(IAM) | 用户/组/策略/角色;root 可见租户;列表按生效策略过滤(ADR-28) |
 | 审计日志 | 操作流水检索 |
 | 设置 | 性能模式(sync_mode/校验/缓存)、TLS、限额、日志级别 |
 
@@ -1857,9 +2005,9 @@ echo none > /sys/block/nvme0n1/queue/scheduler    # 直通,免合并层
 | 面 | 设计 |
 | --- | --- |
 | 传输 | rustls TLS 1.2/1.3;虚拟主机桶用通配符证书;支持外部 LB 终结 TLS |
-| S3 鉴权 | SigV4 + 预签名 + 桶策略(AWS 语法子集:Allow/Deny、Principal、Action、Resource、Condition 常用键)+ 匿名公共读 |
-| 密钥存储 | access key 明文索引 + secret 磁盘存储 = 加盐哈希(HMAC-SHA256)+ AES-256-GCM 密文(密钥 = SHA-256(持久化种子盐),重启恢复明文供 SigV4 验证);admin API 只下发一次 secret(ADR:M3 实现细化,见 §9.1) |
-| 管理面 | admin 通道 unix socket/回环 + token;控制台 JWT;角色分离 |
+| S3 鉴权 | SigV4 + 预签名 + 桶策略 + IAM 用户/组/SA 生效策略(ADR-28);匿名公共读受 BPA 约束 |
+| 密钥存储 | access key 明文索引 + secret 磁盘存储 = 加盐哈希(HMAC-SHA256)+ AES-256-GCM 密文(密钥 = SHA-256(持久化种子盐),重启恢复明文供 SigV4 验证);admin API 只下发一次 secret(ADR:M3 实现细化,见 §9.1);SA 必有属主用户 |
+| 管理面 | admin 通道 unix socket/回环 + token;控制台 JWT 证明身份,授权走 IAM(ADR-28);root 仅引导 |
 | 限额与抗滥用 | 每桶配额、每密钥限速、全局在途字节上限、超时(header 30s / idle 60s) |
 | 数据静态保护 | V1 信任底层卷(加密盘/云盘加密);应用层加密(SSE-C 路线图) |
 | 依赖面 | Rust 单一二进制(glibc 动态链接;容器采用 Ubuntu slim 携带运行时依赖,REVIEW §3.1 与 §3.1 容器文档一致)+ 最小化容器,攻击面最小化 |
