@@ -23,13 +23,13 @@
 
 > 状态图例:✅ 完整 · 🟡 部分 · ⛔ 缺失 · 🔜 已排期(标注版本)· ❌ 明确不做 · 🚫 停售排除(不列入管线)
 > 优先级:P0 = 缺失即被采购否决;P1 = 缺失即某类工作流失败;P2 = 增强。
-> 更新(2026-08-26):对照 v2.0.0 交付状态与 v2.1/v2.2 排期(NEXT-ROUND.md §3/§5)。
+> 更新(2026-08-27):对照 v2.2.0 主力交付 + 审查修复 F9;残余缺口见 Batch / BPA / 内置 ?replication。
 
 | 域 | 特性 | 现状 | 优先级 | 路线归属 |
 | --- | --- | --- | --- | --- |
 | 对象 API | PUT/GET/HEAD/DELETE、Range 单段、条件 GET、x-amz-meta-*、Content-MD5/SHA256 | ✅ | P0 | — |
 | 对象 API | Multipart 全流程(init/part/complete/abort/list/幂等) | ✅ | P0 | — |
-| 对象 API | CopyObject COW / UploadPartCopy / 条件复制 | 🟡 UploadPartCopy 源 ?versionId 未实现(唯一残留 501 红线) | P0 | 🔜 v2.1(M15 C2) |
+| 对象 API | CopyObject COW / UploadPartCopy / 条件复制 | ✅ v2.1(M15 C2 含 UploadPartCopy 源 ?versionId) | P0 | — |
 | 对象 API | DeleteObjects(Quiet/Verbose) | ✅(1000 键上限 v1.0.1) | P1 | — |
 | 对象 API | **条件写入 PUT(If-Match / If-None-Match: \*)** | ✅ v1.1 | P0 | — |
 | 对象 API | **checksum 家族(CRC32/32C/SHA1/256/CRC64NVME + trailer)** | ✅ v1.2 | P0 | — |
@@ -39,9 +39,9 @@
 | 对象 API | GET ?partNumber / HEAD ?partNumber | ✅ | — | — |
 | 对象 API | POST 对象表单上传(browser-based POST policy) | ✅ v1.1 | P1 | — |
 | 对象 API | S3 Select | 🚫 AWS 2024-07-25 起不对新客户提供(Glacier Select 同) | —(原 P2) | 不做(停售排除,NEXT-ROUND §3.2) |
-| 对象 API | RestoreObject / 存储类分层 / 归档 | ⛔ | P1 | 🔜 v2.2(M16) |
+| 对象 API | RestoreObject / 存储类分层 / 归档 | ✅ v2.2(ADR-19:GLACIER_IR 在线;GLACIER/DEEP_ARCHIVE + Restore) | P1 | — |
 | 对象 API | 对象标签(x-amz-tagging / ?tagging) | ✅ v1.1 | P1 | — |
-| 对象 API | x-amz-storage-class | 🟡 仅 STANDARD;其余 400 InvalidStorageClass(显式) | P1 | 🔜 v2.1 接受矩阵(M15 C1) |
+| 对象 API | x-amz-storage-class | ✅ v2.2 真实归档类;IA/IT/RRS 映射 STANDARD(M15 C1,非静默) | P1 | — |
 | 桶配置 | 桶 CRUD / Location / ListBuckets 分页 | ✅ | P0 | — |
 | 桶配置 | ListObjectsV1/V2(游标/delimiter/StartAfter) | ✅(fetch-owner/encoding-type v1.0.1) | P0 | — |
 | 桶配置 | **版本控制(真实多版本)** | ✅ v1.1 | P0 | — |
@@ -50,16 +50,16 @@
 | 桶配置 | **桶策略(IAM 语法 + 条件键)** | ✅ v1.1(桶级 + 最小 Condition 键集) | P0 | — |
 | 桶配置 | ACL 全家(桶/对象 ACL、canned、grant 头) | 🚫 最小桩 + 显式 501;AWS 2023-04 起新桶默认禁用 ACL(BucketOwnerEnforced) | P2 | 不做(方向性排除) |
 | 桶配置 | **CORS(含预检)** | ✅ v1.1 | P1 | — |
-| 桶配置 | Lifecycle(过期/非当前版本/MPU 中止) | ✅ v1.2;Transition 显式不支持 | P1 | Transition → 🔜 v2.2(M16) |
-| 桶配置 | Replication(CRR/SRR) | ⛔ 内置不做 | P1(容灾场景) | 策略化:v2.2 候选(中心调度同步) |
-| 桶配置 | Notification(EventBridge/SQS/SNS/Webhook) | ⛔ | P1 | 🔜 v2.1(M15 N) |
+| 桶配置 | Lifecycle(过期/非当前版本/MPU 中止/Transition) | ✅ v1.2 过期 + v2.2 Transition(GLACIER*) | P1 | — |
+| 桶配置 | Replication(CRR/SRR) | 🟡 策略化 ✅ v2.2(ADR-20 中心同步任务);**不内置** ?replication | P1(容灾场景) | 内置 CRR 明确不做 |
+| 桶配置 | Notification(EventBridge/SQS/SNS/Webhook) | ✅ v2.1 Webhook(http/https);SQS/SNS/EventBridge 目标显式拒绝 | P1 | — |
 | 桶配置 | Website 静态托管 | ⛔ | P2 | 不做(nginx 可替代) |
-| 桶配置 | Logging / Metrics / Analytics / Inventory | 🟡 审计持久化 ✅ v1.2;Inventory ⛔;Logging/Analytics 不做 | P2 | Inventory 🔜 v2.1(M15 I) |
-| 桶配置 | Accelerate / RequestPayment / OwnershipControls / PublicAccessBlock | 🟡 OwnershipControls 配置族 ✅ v1.1;Accelerate/RequestPayment 不做;PublicAccessBlock 远期 | P2/P1(多租户 BPA) | 远期(BPA 随桶策略评估) |
+| 桶配置 | Logging / Metrics / Analytics / Inventory | 🟡 审计 ✅ v1.2;Inventory ✅ v2.1;Logging/Analytics 不做 | P2 | — |
+| 桶配置 | Accelerate / RequestPayment / OwnershipControls / PublicAccessBlock | 🟡 OwnershipControls ✅ v1.1;Accelerate/RequestPayment 不做;PublicAccessBlock 远期(BPA) | P2/P1(多租户 BPA) | 残余:BPA |
 | 认证安全 | SigV4 header + query 预签名 + aws-chunked | ✅ | P0 | — |
 | 认证安全 | SigV2 | ⛔ | P2 | 明确不做(默认关闭等价) |
 | 认证安全 | POST 表单签名 | ✅ v1.1 | P1 | — |
-| 认证安全 | STS 临时凭证 / Session Policy | ⛔ | P1(多租户) | 🔜 v2.1(M15 T) |
+| 认证安全 | STS 临时凭证 / Session Policy | ✅ v2.1(GetSessionToken/AssumeRole,会话策略求交;无角色派生) | P1(多租户) | — |
 | 认证安全 | LDAP / OpenID / IAM 联邦 | 🟢 部分(LDAP 目录同步 + OIDC SSO v2.2,ADR-21;IAM 联邦维持远期) | P1(企业 AD 集成) | 数据面仍认 access key(D-E2 延续) |
 | 认证安全 | SSE-KMS / DSSE-KMS | ⛔ | P2 | ❌ 不做(无 KMS 托管;参数显式拒绝) |
 | 认证安全 | 密钥级 IAM 策略子集 | 🟡 已补最小 Condition 集(ipAddress/prefix/bypass 键);超集显式 400 | P1 | 超集远期 |
@@ -232,12 +232,12 @@
 
 | # | 门槛 | FastS3 现状 | 差距动作 |
 | --- | --- | --- | --- |
-| 11 | Lifecycle(过期/非当前版本/过滤) | ✅ v1.2 达标(Transition 显式不支持 → v2.2) | M16 归档联动 |
-| 12 | 事件通知(≥Webhook/SQS 形态) | ✅ v2.1 达标(Webhook 起步,ADR-18 D-E4;SNS/SQS 目标显式拒绝) | — |
-| 13 | 复制/DR | ⛔ 内置;策略 = 底层 HA + 迁移脚本(mc mirror/rclone 已演练) | v2.2 候选(中心调度同步);compat 声明 |
+| 11 | Lifecycle(过期/非当前版本/过滤) | ✅ v1.2 过期 + v2.2 Transition | — |
+| 12 | 事件通知(≥Webhook/SQS 形态) | ✅ v2.1 达标(Webhook http/https,ADR-18 D-E4;SNS/SQS 目标显式拒绝) | — |
+| 13 | 复制/DR | ✅ v2.2 策略化(ADR-20 中心同步任务 + mc/rclone);不内置 ?replication | 残余:内置 CRR 不做 |
 | 14 | 预签名 + STS/Session Policy | ✅ v2.1 达标(GetSessionToken/AssumeRole 管理面签发,会话策略求交;无角色派生,compat 声明) | — |
 | 15 | 多租户隔离 + 配额/计量 | ✅ v2.1 达标(桶隔离/配额;Inventory CSV 计量;expected-bucket-owner 显式语义) | — |
-| 16 | RestoreObject + 归档层 | ⛔ | 🔜 v2.2(M16;前置已全部就绪) |
+| 16 | RestoreObject + 归档层 | ✅ v2.2 达标(ADR-19) | — |
 | 17 | CORS + 预检 | ✅ v1.1 达标 | — |
 | 18 | 访问日志 + 审计面 | ✅ v1.2 审计持久化(访问日志仍不做) | — |
 
@@ -245,7 +245,7 @@
 
 | # | 门槛 | FastS3 现状 | 差距动作 |
 | --- | --- | --- | --- |
-| 19 | S3 Select / Inventory / Batch Operations | 🚫 Select 停售排除(2024-07-25 起不对新客户);Inventory ✅ v2.1;Batch Operations ⛔ | 不做 Select;Batch 后置(依赖通知) |
+| 19 | S3 Select / Inventory / Batch Operations | 🚫 Select 停售排除;Inventory ✅ v2.1;Batch Operations ⛔ 后置 | 残余:Batch、BPA |
 | 20 | 目录桶/Express / Accelerate / Object Lambda / S3 Tables / DSSE-KMS | ❌ 明确不做(Express 定位 = FastS3 单机本体;Accelerate/Tables 与定位冲突;Object Lambda 叠加停售 2025-11-07;DSSE 无 KMS) | 文档化定位声明 |
 
 ## 6. 差距 → 路线图收敛映射
@@ -259,7 +259,7 @@
 | 纳管 agent、HTTP/3、热缓存、Terraform/Operator 评估 | v2.0(§7) | ✅ 已交付(v2.0.0,2026-08-26) |
 | 桶策略(桶级)、CORS、对象标签、POST 表单 | v1.1(§7 建议 1 已采纳) | ✅ 已交付(M10 S1~S4) |
 | 事件通知(Webhook 起步)、STS 临时凭证、Inventory、存储类头矩阵、UploadPartCopy 源版本寻址 | v2.1(NEXT-ROUND §5) | ✅ 已交付(v2.1.0,2026-08-26) |
-| 归档存储类 + RestoreObject、复制策略化、LDAP/OpenID | v2.2(NEXT-ROUND §6) | 🔜 M16 候选(立项后拆) |
+| 归档存储类 + RestoreObject、复制策略化、LDAP/OpenID | v2.2(NEXT-ROUND §6) | ✅ 已交付(v2.2.0,2026-08-26;审查修复见 v2.2.1) |
 | S3 Select / Glacier Select、Object Lambda、Torrent、ACL 全矩阵 | — | 🚫 停售排除(NEXT-ROUND §3.2,不列入管线) |
 | 协议正确性残余(密钥状态语义、expected-bucket-owner 显式语义) | v2.1(NEXT-ROUND §5 C) | ✅ 已交付(M15 C2/C3,2026-08-26) |
 

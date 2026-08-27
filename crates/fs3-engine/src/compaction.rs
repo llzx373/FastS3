@@ -938,6 +938,41 @@ mod tests {
         assert!(a52.contains("F8 已复核") || a52.contains("compaction_enabled=true"));
     }
 
+    /// F9-2:§1 全景表 Restore/复制/通知/STS/Inventory 不得再标 ⛔/🔜。
+    #[test]
+    fn s3_gap_delivered_features_not_missing() {
+        let gap = include_str!("../../../docs/S3-GAP.md");
+        let panorama = gap
+            .split("## 1. 全景总表")
+            .nth(1)
+            .and_then(|s| s.split("\n## 2.").next())
+            .expect("S3-GAP §1");
+        for needle in [
+            "RestoreObject",
+            "Replication(CRR/SRR)",
+            "Notification(EventBridge/SQS/SNS/Webhook)",
+            "STS 临时凭证",
+            "Inventory",
+        ] {
+            let line = panorama
+                .lines()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("missing §1 row {needle}"));
+            assert!(
+                !line.contains("⛔") && !line.contains("🔜"),
+                "{needle} 已交付,§1 不得再标缺失/已排期: {line}"
+            );
+            assert!(
+                line.contains("✅") || line.contains("🟡"),
+                "{needle} 须标已交付或部分: {line}"
+            );
+        }
+        assert!(
+            panorama.contains("Batch") || panorama.contains("BPA") || panorama.contains("PublicAccessBlock"),
+            "残余缺口须仍列出 Batch/BPA"
+        );
+    }
+
     #[test]
     fn compaction_migrates_locked_object_keeps_retention() {
         // W4-1:压缩可搬锁定版本数据,不可当泄漏回收。
