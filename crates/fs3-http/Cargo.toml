@@ -46,6 +46,7 @@ libc.workspace = true
 tracing.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
+webpki-roots = "0.26"
 tokio-rustls = "0.26"
 # M14 H1-1(ADR-17 DV2):HTTP/3 实验栈(feature 默认关;quinn 传输 +
 # hyperium h3 协议层;不进入默认构建,零常驻开销)。依赖审批见

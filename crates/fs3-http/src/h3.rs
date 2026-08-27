@@ -169,11 +169,8 @@ async fn worker(
         let shutdown = shutdown.clone();
         if shutdown.load(Ordering::Relaxed) {
             endpoint.close(quinn::VarInt::from_u32(0), b"shutdown");
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                endpoint.wait_idle(),
-            )
-            .await;
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(5), endpoint.wait_idle()).await;
             break;
         }
         // accept 可能长期无新连接:周期唤醒检查 shutdown(quinn Endpoint

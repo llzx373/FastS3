@@ -20,12 +20,14 @@
 //! - **数据面隔离**:worker 独立线程,交互仅 meta 短事务/只读快照,
 //!   绝不影响数据面请求语义(ADR-18 D-E1.3);失败只计指标 + 重试。
 //!
-//! 依赖最小化(AGENT §9.3):Webhook 客户端 = hyper `http1::conn` 手写
-//! 迷你 POST(仿 fs3-agent http1.rs 先例,不引入 reqwest);https 复用
-//! 既有 tokio-rustls(系统根证书经 rustls-native-certs,新依赖已登记
-//! DESIGN-FUTURE §9.3 审批表)。
+//! 依赖最小化(AGENT §9.3):Webhook 客户端 = 阻塞 HTTP/1.1 POST(仿
+//! fs3-agent http1.rs,不引入 reqwest);https 复用既有 rustls 0.23 +
+//! webpki-roots(Mozilla CA 包;自签目标经 `SimpleWebhookSender::with_roots`
+//! 注入测试根)。
 
 use std::collections::HashMap;
+use std::io::Write;
+use std::net::ToSocketAddrs;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -104,13 +106,41 @@ pub trait WebhookSender: Send + Sync + std::fmt::Debug {
 }
 
 /// 极小 HTTP/1.1 阻塞 POST 客户端(每请求一条连接;投递 worker 是后台
-/// 线程,阻塞 IO 可接受——不引入 reqwest/hyper 客户端运行时,依赖
-/// 最小化 §9.3 同 fs3-agent http1.rs 先例)。仅 `http://` 明文目标
-/// (https 走前置 TLS 终结代理/网关,compat.md 明示;TLS 目标显式报错
-/// 触发重试死信,不静默)。
-#[derive(Debug, Default)]
+/// 线程,阻塞 IO 可接受——不引入 reqwest/hyper 客户端运行时)。
+/// `http://` 明文与 `https://`(rustls + webpki-roots)均支持。
 pub struct SimpleWebhookSender {
-    _priv: (),
+    tls: Arc<rustls::ClientConfig>,
+}
+
+impl std::fmt::Debug for SimpleWebhookSender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimpleWebhookSender").finish()
+    }
+}
+
+impl Default for SimpleWebhookSender {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SimpleWebhookSender {
+    /// 生产默认:Mozilla CA 包(webpki-roots)。
+    pub fn new() -> Self {
+        crate::tls::ensure_provider();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        Self::with_roots(roots)
+    }
+
+    /// 注入根证书(测试自签 / 私有 CA)。
+    pub fn with_roots(roots: rustls::RootCertStore) -> Self {
+        crate::tls::ensure_provider();
+        let tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        SimpleWebhookSender { tls: Arc::new(tls) }
+    }
 }
 
 impl WebhookSender for SimpleWebhookSender {
@@ -121,97 +151,112 @@ impl WebhookSender for SimpleWebhookSender {
         body: Vec<u8>,
         timeout: Duration,
     ) -> Result<u16, String> {
-        use std::io::Read;
-        // 拆 URL:http://host[:port]/path;仅 http 明文(https 显式报错,
-        // 走前置 TLS 终结代理;compat.md 明示)。
-        let rest = url.strip_prefix("http://").ok_or_else(|| {
-            if url.starts_with("https://") {
-                "https webhook target requires a TLS terminator (v2.1: http:// only; front with nginx/reverse proxy)".to_string()
-            } else {
-                format!("webhook target must be an http:// URL: {url}")
-            }
-        })?;
-        let (hostport, path) = match rest.find('/') {
-            Some(i) => (&rest[..i], &rest[i..]),
-            None => (rest, "/"),
-        };
-        let parsed = hostport
-            .parse::<std::net::SocketAddr>()
-            .or_else(|_| {
-                // host:port 或 host(默认 80)
-                let (host, port) = match hostport.rsplit_once(':') {
-                    Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => {
-                        (h, p.parse::<u16>().map_err(|e| format!("bad port: {e}"))?)
-                    }
-                    _ => (hostport, 80u16),
-                };
-                format!("{host}:{port}")
-                    .parse()
-                    .map_err(|e| format!("bad target {url}: {e}"))
-            })
-            .map_err(|e| format!("bad webhook target {url}: {e}"))?;
-        let mut stream =
-            std::net::TcpStream::connect(parsed).map_err(|e| format!("connect {url}: {e}"))?;
-        stream
-            .set_read_timeout(Some(timeout))
+        let (https, host, port, path) = parse_webhook_url(url)?;
+        let addr = (host.as_str(), port)
+            .to_socket_addrs()
+            .map_err(|e| format!("resolve {host}:{port}: {e}"))?
+            .next()
+            .ok_or_else(|| format!("no address for {host}:{port}"))?;
+        let tcp = std::net::TcpStream::connect_timeout(&addr, timeout)
+            .map_err(|e| format!("connect {url}: {e}"))?;
+        tcp.set_read_timeout(Some(timeout))
             .map_err(|e| format!("set read timeout: {e}"))?;
-        stream
-            .set_write_timeout(Some(timeout))
+        tcp.set_write_timeout(Some(timeout))
             .map_err(|e| format!("set write timeout: {e}"))?;
-        // 请求行 + 头:Host 必须携带(http/1.1);Content-Length 定长
-        let host_header = if parsed.port() == 80 {
-            parsed.ip().to_string()
+        let host_header = if (https && port == 443) || (!https && port == 80) {
+            host.clone()
         } else {
-            parsed.to_string()
+            format!("{host}:{port}")
         };
-        let mut req = format!(
-            "POST {path} HTTP/1.1\r\nHost: {host_header}\r\nContent-Length: {}\r\n",
-            body.len()
-        );
-        for (k, v) in headers {
-            req.push_str(&format!("{k}: {v}\r\n"));
+        if https {
+            let name = rustls::pki_types::ServerName::try_from(host)
+                .map_err(|e| format!("tls server name: {e}"))?;
+            let conn = rustls::ClientConnection::new(self.tls.clone(), name)
+                .map_err(|e| format!("tls client: {e}"))?;
+            let mut stream = rustls::StreamOwned::new(conn, tcp);
+            http_post(&mut stream, &host_header, &path, headers, &body)
+        } else {
+            let mut stream = tcp;
+            http_post(&mut stream, &host_header, &path, headers, &body)
         }
-        req.push_str("\r\n");
-        write_all_timeout(&mut stream, req.as_bytes())
-            .and_then(|_| write_all_timeout(&mut stream, &body))
-            .map_err(|e| format!("write request: {e}"))?;
-        // 读状态行 + 头(响应体丢弃;投递只关心状态码)
-        let mut buf = [0u8; 4096];
-        let mut acc = Vec::new();
-        loop {
-            let n = match stream.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut
-                    {
-                        return Err(format!("read response timeout: {e}"));
-                    }
-                    return Err(format!("read response: {e}"));
-                }
-            };
-            acc.extend_from_slice(&buf[..n]);
-            if acc.windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
-            }
-            if acc.len() > 64 * 1024 {
-                return Err("response headers too large".into());
-            }
-        }
-        let head = String::from_utf8_lossy(&acc);
-        let status = head
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse::<u16>().ok())
-            .ok_or_else(|| format!("malformed status line: {head:?}"))?;
-        Ok(status)
     }
 }
 
-fn write_all_timeout(s: &mut std::net::TcpStream, data: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    s.write_all(data)
+fn parse_webhook_url(url: &str) -> Result<(bool, String, u16, String), String> {
+    let (https, rest) = if let Some(r) = url.strip_prefix("https://") {
+        (true, r)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        (false, r)
+    } else {
+        return Err(format!("webhook target must be http:// or https://: {url}"));
+    };
+    let (hostport, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], rest[i..].to_string()),
+        None => (rest, "/".to_string()),
+    };
+    let default_port = if https { 443 } else { 80 };
+    let (host, port) = match hostport.rsplit_once(':') {
+        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => {
+            let port = p.parse::<u16>().map_err(|e| format!("bad port: {e}"))?;
+            (h.trim_matches(['[', ']']).to_string(), port)
+        }
+        _ => (hostport.trim_matches(['[', ']']).to_string(), default_port),
+    };
+    if host.is_empty() {
+        return Err(format!("webhook target missing host: {url}"));
+    }
+    Ok((https, host, port, path))
+}
+
+fn http_post(
+    stream: &mut (impl std::io::Read + std::io::Write),
+    host_header: &str,
+    path: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Result<u16, String> {
+    let mut req = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host_header}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+    stream
+        .write_all(req.as_bytes())
+        .and_then(|_| stream.write_all(body))
+        .map_err(|e| format!("write request: {e}"))?;
+    let mut buf = [0u8; 4096];
+    let mut acc = Vec::new();
+    loop {
+        let n = match std::io::Read::read(stream, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut
+                {
+                    return Err(format!("read response timeout: {e}"));
+                }
+                return Err(format!("read response: {e}"));
+            }
+        };
+        acc.extend_from_slice(&buf[..n]);
+        if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        if acc.len() > 64 * 1024 {
+            return Err("response headers too large".into());
+        }
+    }
+    let head = String::from_utf8_lossy(&acc);
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .ok_or_else(|| format!("malformed status line: {head:?}"))?;
+    Ok(status)
 }
 
 /// 投递 worker 配置。
@@ -905,6 +950,170 @@ mod tests {
         assert_eq!(meta.event_count().unwrap(), 0, "无匹配规则事件直接删除");
         assert_eq!(stats.snapshot().delivered, 0, "未投递");
         assert_eq!(sender.calls.lock().unwrap().len(), 0);
+    }
+
+    /// F6-1:https Webhook 投递自签 listener;HMAC 签名仍有效。
+    #[test]
+    fn webhook_https_posts_signed_body() {
+        crate::tls::ensure_provider();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_der = certified.cert.der().clone();
+        let key_der =
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der());
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der.clone()).unwrap();
+        let server_cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert_der],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(key_der),
+            )
+            .unwrap();
+        let server_cfg = Arc::new(server_cfg);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let got = Arc::new(std::sync::Mutex::new(
+            Vec::<(Vec<(String, String)>, Vec<u8>)>::new(),
+        ));
+        let got2 = got.clone();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let Ok((tcp, _)) = listener.accept() else {
+                return;
+            };
+            let conn = rustls::ServerConnection::new(server_cfg).unwrap();
+            let mut tls = rustls::StreamOwned::new(conn, tcp);
+            let mut acc = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = match tls.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                acc.extend_from_slice(&buf[..n]);
+                if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head = String::from_utf8_lossy(&acc).to_string();
+            let clen: usize = head
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|v| v.trim().parse().unwrap_or(0))
+                })
+                .unwrap_or(0);
+            while acc
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .is_none_or(|i| acc.len() < i + 4 + clen)
+            {
+                let n = match tls.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                acc.extend_from_slice(&buf[..n]);
+            }
+            let split = acc.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(0);
+            let mut headers = Vec::new();
+            for line in head.lines().skip(1) {
+                if line.is_empty() {
+                    break;
+                }
+                if let Some((k, v)) = line.split_once(':') {
+                    headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+                }
+            }
+            let body = if split + 4 <= acc.len() {
+                acc[split + 4..].to_vec()
+            } else {
+                Vec::new()
+            };
+            got2.lock().unwrap().push((headers, body));
+            let _ = tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        });
+
+        let hook = format!("https://localhost:{}/hooks", addr.port());
+        let rule = fs3_core::NotificationRule {
+            id: "rule-https".into(),
+            events: vec!["s3:ObjectCreated:*".into()],
+            kind: fs3_core::NotificationTargetKind::Queue,
+            url: hook,
+            hmac_key: Some("https-secret".into()),
+            enabled: true,
+            filter: fs3_core::NotificationKeyFilter::default(),
+        };
+        let (_d, meta) = meta_with_rule(rule);
+        let sender = Arc::new(SimpleWebhookSender::with_roots(roots));
+        let stats = Arc::new(NotificationStats::default());
+        let mut w = NotificationWorker::new(
+            meta.clone(),
+            sender,
+            stats.clone(),
+            NotificationConfig {
+                retry_base: Duration::from_millis(1),
+                max_retries: 16,
+                batch: 64,
+                stall_after: Duration::from_secs(60),
+                max_queued: 1000,
+                ..Default::default()
+            },
+        );
+        meta.commit_with_event(
+            &[fs3_meta::Op::ObjectPut {
+                bucket: "b1".into(),
+                key: "logs/k".into(),
+                meta: sample_object_meta(),
+            }],
+            &sample_event(0),
+        )
+        .unwrap();
+        w.run_round_blocking().unwrap();
+        assert_eq!(stats.snapshot().delivered, 1, "https delivery 2xx");
+        assert_eq!(meta.event_count().unwrap(), 0);
+        let calls = got.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let sig = calls[0]
+            .0
+            .iter()
+            .find(|(k, _)| k == "x-fasts3-signature")
+            .map(|(_, v)| v.clone())
+            .expect("hmac header");
+        let expect = fs3_core::util::hmac_sha256_hex("https-secret", &calls[0].1);
+        assert_eq!(sig, expect);
+    }
+
+    /// F6-1:http 明文投递回归。
+    #[test]
+    fn webhook_http_plain_still_posts() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let got = Arc::new(std::sync::Mutex::new(0u16));
+        let got2 = got.clone();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            *got2.lock().unwrap() = 200;
+        });
+        let sender = SimpleWebhookSender::new();
+        let code = sender
+            .post(
+                &format!("http://{addr}/x"),
+                &[],
+                b"hi".to_vec(),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(code, 200);
+        assert_eq!(*got.lock().unwrap(), 200);
     }
 
     fn sample_object_meta() -> fs3_core::ObjectMeta {

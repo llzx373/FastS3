@@ -70,7 +70,7 @@ fn build_server_config(cert: CertifiedKey) -> RustlsConfig {
 }
 
 /// 确保 ring CryptoProvider 已安装(default-features=false 时无自动默认)。
-fn ensure_provider() {
+pub(crate) fn ensure_provider() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
