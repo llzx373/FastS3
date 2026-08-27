@@ -1177,6 +1177,29 @@ mod tests {
         );
     }
 
+    /// M17/F2:tenant/account_/跨账号排除须逐名,且标明定位而非缺陷。
+    #[test]
+    fn s3tests_f2_tenant_account_named_positioning() {
+        let readme = include_str!("../../../tests/s3-tests/README.md");
+        let sec = readme
+            .split("## M17 F2 单账号定位排除")
+            .nth(1)
+            .expect("M17 F2 节");
+        assert!(
+            sec.contains("定位") && (sec.contains("非缺陷") || sec.contains("不是未实现缺陷")),
+            "F2 须标明定位排除而非缺陷"
+        );
+        for name in [
+            "test_bucket_policy_different_tenant",
+            "test_account_public_access_block",
+            "test_object_copy_not_owned_bucket",
+            "test_expected_bucket_owner",
+            "test_create_bucket_bucket_owner_enforced",
+        ] {
+            assert!(sec.contains(name), "F2 须逐名列出 {name}");
+        }
+    }
+
     /// F9-6:notification/归档不以 s3-tests 100% 出集声称;权威为自有集成测试。
     #[test]
     fn s3tests_readme_notification_archive_not_claimed_100() {

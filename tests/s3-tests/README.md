@@ -53,7 +53,7 @@ FastS3 v0.5 的协议一致性门禁 = **已实现特性的完整兼容**。跑 
 | ownership 跨账号语义(bucket_owner/object_writer 6 个) | 恒排除 | M10 S7 已交付纯配置往返(2 个出集);保留 6 个断言跨账号 owner 身份(alt client + public policy + ACL 组合),单账号身份映射不可满足(详见「单账号模型限制」)。token:bucket_owner/object_writer |
 | POST 表单上传 SSE/checksum 组 | v1.2 | post_object 认证族已出集(M10 S4);checksum 组已出集(M11 C1:test_post_object_upload_checksum 通过,x-amz-checksum-* 表单字段 policy 覆盖豁免 + 值验算);SSE 组已出集(M11 G-1:test_sse_s3_default_post_object_authenticated_request 通过——桶默认加密对 POST 生效;残余仅 test_encryption_sse_c_post_object_authenticated_request,DE4 裁决,见 SSE-C 行) |
 | 兼容性已知项:`test_bucket_create_exists(_nonowner)`(botocore ClientError 无 .status)、`test_bucket_head_extended`(RGW 专有 x-rgw-object-count) | 长期 | M1 已记录,服务端行为正确;bucket 重建属性(recreate_overwrite_acl)同为已知开放项 |
-| 静态网站(Website)/ Torrent / 租户(tenant)/ expected-bucket-owner / object_manifest | 不做 | 定位排除(Website 由 nginx/LB 替代;tenant 单账号模型;expected-bucket-owner 语义已实现(M15 C2:= 自身放行,≠ 自身 403),用例仍排除因前置 PutBucketAcl = Put*Acl 501 红线);**Torrent = 停售排除(AWS 2021 弃用,已移除)**;**S3 Select = 停售排除(AWS 2024-07-25 起不对新客户提供,Glacier Select 同),不列入管线**。对应 EXCLUDE token:website/torrent/tenant/expected_bucket_owner/object_manifest |
+| 静态网站(Website)/ Torrent / 租户(tenant)/ expected-bucket-owner / object_manifest | 不做 | **定位排除**(不是未实现缺陷):Website 由 nginx/LB 替代;tenant/`account_`/跨账号 ownership = 单账号模型(M18 前不做多账号)。逐名清单与理由见「M17 F2 单账号定位排除」。expected-bucket-owner 语义已实现(M15 C2),用例仍排除因前置 PutBucketAcl。**Torrent/S3 Select = 停售排除**。token:website/torrent/tenant/expected_bucket_owner/object_manifest/`account_` |
 
 > 维护:新增排除必须同步本表;`run_s3tests.sh` 的 `EXCLUDE` 正则与之一一对应。
 
@@ -427,3 +427,43 @@ S3TEST_CONF=/tmp/s3-tests/s3tests.conf bash tests/s3-tests/run_s3tests.sh
     单账号模型显式 501。
 - 实现侧:PutObject 公开 canned 的 BPA 检查必须在引擎写锁外,否则
   parking_lot 写×读自锁(本条回归 `bpa_block_public_object_canned_acls`)。
+
+## M17 F2 单账号定位排除(逐名,2026-08-27)
+
+> **口径**:下列用例排除 = **产品定位**(单账号,M18 前不做多账号 / IAM 账号 /
+> RGW tenant),**禁止写成「未实现缺陷」**。服务端对多账号 API 显式 501
+> 或不提供第二身份,与 AWS 多账号期望不一致是刻意的。权威对照 =
+> `run_s3tests.sh` 的 `EXCLUDE` token `tenant` / `account_` /
+> `expected_bucket_owner` / `not_owned` / `bucket_owner` / `object_writer`。
+
+### tenant(RGW 租户隔离,token `tenant`)
+
+| 用例 | 理由(定位,非缺陷) |
+| --- | --- |
+| `test_object_raw_get_x_amz_expires_not_expired_tenant` | 第二 tenant 身份预签名;本进程无 RGW tenant 命名空间 |
+| `test_object_presigned_put_object_with_acl_tenant` | 同上 + Put*Acl 501 |
+| `test_cors_presigned_get_object_tenant` / `_tenant_v2` | 跨 tenant CORS 预签名;另 `_v2` 叠加 SigV2 不做 |
+| `test_cors_presigned_put_object_tenant` / `_tenant_v2` / `_tenant_with_acl` | 同上 |
+| `test_bucket_policy_different_tenant` | 断言另一 tenant 被桶策略拒绝;无第二账号 |
+| `test_bucket_policy_tenanted_bucket` | RGW tenanted bucket 策略 |
+| `test_put_bucket_logging_tenant_s` / `test_put_bucket_logging_tenant_j` | `?logging` 定位 501(见 operations/audit-export)+ tenant |
+
+### `account_`(账号级 / RGW usage / 若收集 IAM 则整族)
+
+| 用例 | 理由(定位,非缺陷) |
+| --- | --- |
+| `test_account_public_access_block` | S3 Control 账号级 Put/GetPublicAccessBlock;单账号显式 501(B3) |
+| `test_account_usage` | RGW 专有账号用量头;非 S3 规范 |
+| `test_account_*`(IAM:`user`/`group`/`role`/`oidc`/`policy` 等,在 `test_iam.py`) | IAM 账号实体 API;FastS3 数据面无 IAM,M18 为本进程租户,不接 AWS IAM 账号模型 |
+
+### 跨账号 ownership / 归属(token `not_owned` / `bucket_owner` / `object_writer` / `expected_bucket_owner`)
+
+| 用例 | 理由(定位,非缺陷) |
+| --- | --- |
+| `test_object_copy_not_owned_bucket` / `test_object_copy_not_owned_object_bucket` | 跨账号复制拒绝;单账号下复制必然允许 |
+| `test_bucket_create_exists_nonowner` | 备用账号建同名桶 409;单账号 + 幂等 200 |
+| `test_expected_bucket_owner` | 语义已实现(= 自身放行 / ≠ 自身 403);前置 `PutBucketAcl(public-read-write)` = Put*Acl 501,gate 内不可绿 |
+| `test_create_bucket_bucket_owner_enforced` / `test_create_bucket_bucket_owner_preferred` / `test_create_bucket_object_writer` | 跨账号 Owner 身份 + ACL 组合;纯配置往返已出集(另 2 例) |
+| `test_put_bucket_ownership_bucket_owner_enforced` / `test_put_bucket_ownership_bucket_owner_preferred` / `test_put_bucket_ownership_object_writer` | 同上,token `bucket_owner`/`object_writer` |
+
+相关「单账号模型限制」表(multipart owner / policy alt / put_acl)仍然有效,与本表同属定位而非缺陷。

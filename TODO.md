@@ -178,7 +178,7 @@
 ### F. 文档与持有项诚实化
 
 - [x] F1 S3-GAP §9 死锁行在 D 完成后改为已修复;Hadoop/BPA/审计导出状态同步
-- [ ] F2 tenant / `account_` / 跨账号 ownership 排除用例逐名记进 s3-tests README
+- [x] F2 tenant / `account_` / 跨账号 ownership 排除用例逐名记进 s3-tests README
   (实现不做多账号;只记账,禁止把「不做」写成「未实现缺陷」)
 - [ ] F3 BlueFS(旧 H3)再评估结论一页:归档已交付、方案 C 维持常态;N3 门槛改为
   「裸盘无根分区可挂或元数据 I/O 实测成瓶颈」,与归档脱钩。不在本里程碑开工 C++ shim
