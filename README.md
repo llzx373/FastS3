@@ -18,12 +18,12 @@ FastS3 的对策:**不做底层已经做过的事**。工程力量全部投入�
 ## 特性
 
 - **存储底座**:裸块设备(`/dev/nvme0n1`)与磁盘镜像文件两种模式,同一套引擎与磁盘布局,差异仅在零拷贝路径
-- **完整 S3 语义**:桶 / 对象 CRUD、Multipart、服务端复制(COW 零数据搬运)、预签名 URL、POST 表单上传、SigV4 鉴权、密钥级 IAM 策略 × 桶策略(Deny 优先、最小 Condition 键集,见兼容矩阵)、Range / 条件头
+- **S3 语义(与 [兼容矩阵](./docs/site/docs/reference/compat.md) 同口径)**:桶 / 对象 CRUD、Multipart、服务端复制(COW 零数据搬运)、预签名 URL、POST 表单上传、SigV4 鉴权、密钥级 IAM 策略 × 桶策略(Deny 优先、最小 Condition 键集)、Range / 条件头、版本化 / Object Lock / SSE / 归档 Restore / 事件通知 / STS / Inventory;停售与定位性不做项见兼容矩阵,不以「完整 S3」声称
 - **强一致**:元数据单点序列化,强 read-after-write 一致性,比 S3 官方语义更强
 - **崩溃安全**:进程任意时刻 kill -9 / 断电,不撕裂对象、不丢已应答数据、空间账目不漂移
 - **极低资源**:空载内存 < 256MiB,单一二进制(glibc 动态链接;C 运行时依赖见容器文档),无 GC 停顿,边缘设备可用
 - **开箱即用**:systemd / 容器双形态,Web 控制台,`fasts3 init` 交互向导 5 分钟内装好配好用起来
-- **兼容主流客户端**:aws cli、boto3、mc、rclone 零配置对接;浏览器 SDK 走预签名直传(分体部署需配置数据面 `cors_allow_origins`);s3cmd(SigV2 未实现)与 Hadoop S3A 为规划兼容,详见兼容性矩阵
+- **兼容主流客户端**:aws cli、boto3、mc、rclone 零配置对接;浏览器 SDK 走预签名直传(分体部署需配置数据面 `cors_allow_origins`);s3cmd(SigV2 未实现)与 **Hadoop S3A 未测/规划**(兼容矩阵 D3),详见兼容性矩阵
 
 ## 架构一览
 
@@ -81,7 +81,15 @@ FastS3 的对策:**不做底层已经做过的事**。工程力量全部投入�
 
 ✅ **M11 生命周期与加密完成(v1.2.0)。** Lifecycle 执行器 + SSE-C/SSE-S3 + checksum 五族 + GetObjectAttributes + 审计持久化;门禁:s3-tests 457/94/287/0、加密崩溃 500 轮、未加密 perf PUT −0.4%/GET −1.7%、覆盖率 84.80% 行。报告 [docs/perf-M11.md](./docs/perf-M11.md)。
 
-✅ **M12 Object Lock / WORM 完成(v1.3.0)。** 治理/合规/法定保留(强制矩阵逐格)+ 可信时钟(回拨不缩短剩余保留,ADR-13)+ bypass 策略 Condition 与强制审计 + 生命周期/压缩/check 锁感知 + 管理面锁状态;门禁:s3-tests 494/94/250/0(含 object_lock 族 39/39 出集)、锁+删除混载崩溃 500 轮、锁判定 1.6 ns/op、覆盖率 84.84% 行。报告 [docs/perf-M12.md](./docs/perf-M12.md)。下一步:M13 容量与底座(v1.4.0)。
+✅ **M12 Object Lock / WORM 完成(v1.3.0)。** 治理/合规/法定保留(强制矩阵逐格)+ 可信时钟(回拨不缩短剩余保留,ADR-13)+ bypass 策略 Condition 与强制审计 + 生命周期/压缩/check 锁感知 + 管理面锁状态;门禁:s3-tests 494/94/250/0(含 object_lock 族 39/39 出集)、锁+删除混载崩溃 500 轮、锁判定 1.6 ns/op、覆盖率 84.84% 行。报告 [docs/perf-M12.md](./docs/perf-M12.md)。
+
+✅ **M13 容量与底座完成(v1.4.0)。** 多设备池与在线扩容/移除、跨盘再平衡、zstd 数据压缩(与空间压缩分轨);设备内元数据(BlueFS)持有。清单见 [docs/archive/TODO-v2.0.0.md](./docs/archive/TODO-v2.0.0.md) M13。
+
+✅ **M14 集中纳管与生态完成(v2.0.0)。** 纳管 agent(出站 mTLS)+ 中心节点/下发账本、HTTP/3 实验开关、热对象缓存(默认关);Terraform/Operator 持有。报告 [docs/perf-M14.md](./docs/perf-M14.md)。
+
+✅ **M15 迁移即插即用完成(v2.1.0)。** 事件通知(Webhook http/https)+ STS 临时凭证 + S3 Inventory + 存储类头接受矩阵 + UploadPartCopy 源版本寻址。CHANGELOG v2.1.0。
+
+✅ **M16 归档与复制完成(v2.2.0)。** 真实归档类 + RestoreObject + Lifecycle Transition、复制策略化(不内置 ?replication)、LDAP/OIDC;审查修复 v2.2.1 关闭读钉扎与账目窗口。报告 [docs/perf-M16.md](./docs/perf-M16.md)。
 
 ✅ **M8 GA 发布(v1.0.0)。** 全量回归资产与本地实测(`tests/m8/regression.sh`:客户端 × OS × 内核 × 设备形态逐轴编排 + 汇总;CI 接入 regression.yml);RC1→RC2→GA 候选流程(`tests/m8/rc-gate.sh` + docs/ga/rc-flow.md + CHANGELOG.md);安全审计(自审 14 项全绿 + 外部审计范围,见 docs/ga/security-audit.md);发布流水线复核(签名 + SBOM 229 组件 + 供应链锁定,`tools/package/verify-release.sh` 实测 PASS,版本源统一为 Cargo.toml);官网与公告(文档站新增兼容矩阵/安全基线 CVE 响应/v1.0.0 公告页,mkdocs 0 警告);§1.1 开箱清单逐项证据表(docs/ga/checklist.md)+ 内置示例 `deploy/examples/backup-dir.sh`(实测);GA 检查单复核 → **v1.0.0 发布**(版本号全仓同步)。执行期门禁(真 NVMe §6.8 数值 / 外部审计执行 / rpm·ARM64 真机构建 / Beta 窗口)按 checklist.md 如实标注。RELEASES.md v1.0.0。
 
@@ -95,7 +103,7 @@ FastS3 的对策:**不做底层已经做过的事**。工程力量全部投入�
 | --- | --- |
 | [docs/DESIGN.md](./docs/DESIGN.md) | 总体架构、存储引擎、S3 协议、性能方案、管理面设计(含 ADR-1~5) |
 | [docs/ROADMAP.md](./docs/ROADMAP.md) | 实现规划、WBS 工作分解、里程碑计划、开箱即用验收标准 |
-| [TODO.md](./TODO.md) | 执行清单:M15 v2.1.0「迁移即插即用」逐条任务与门禁,勾选跟踪实现进度(M9~M14 已归档 docs/archive/TODO-v2.0.0.md) |
+| [TODO.md](./TODO.md) | 执行清单:当前审查修复 v2.2.1;M15/M16 主力已交付(M9~M14 已归档 docs/archive/TODO-v2.0.0.md) |
 
 路线图:9 个里程碑(M0~M8,合计约 7 个月)→ v1.0 GA;v0.1 起逐版本发布(引擎 PoC → S3 核心 → 高级语义 → 管理面 → 加固 → 性能冲刺 → 打包开箱 → 文档与 Beta → GA)。
 

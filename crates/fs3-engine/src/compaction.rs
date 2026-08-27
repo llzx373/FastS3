@@ -973,6 +973,38 @@ mod tests {
         );
     }
 
+    /// F9-3:README 当前状态含 M13–M16;不以「完整 S3」声称;Hadoop 保持未测/规划。
+    #[test]
+    fn readme_status_m13_m16_compat_caliber() {
+        let readme = include_str!("../../../README.md");
+        let status = readme
+            .split("## 当前状态")
+            .nth(1)
+            .and_then(|s| s.split("\n## ").next())
+            .expect("README 当前状态");
+        for m in ["M13", "M14", "M15", "M16"] {
+            assert!(status.contains(m), "当前状态须含 {m}");
+        }
+        let features = readme
+            .split("## 特性")
+            .nth(1)
+            .and_then(|s| s.split("\n## ").next())
+            .expect("README 特性");
+        assert!(
+            !features.contains("完整 S3 语义"),
+            "特性节不得再以完整 S3 声称"
+        );
+        assert!(
+            features.contains("兼容矩阵") || features.contains("compat"),
+            "S3 口径须指向兼容矩阵"
+        );
+        assert!(
+            features.contains("Hadoop")
+                && (features.contains("未测") || features.contains("规划")),
+            "Hadoop 须保持未测/规划"
+        );
+    }
+
     #[test]
     fn compaction_migrates_locked_object_keeps_retention() {
         // W4-1:压缩可搬锁定版本数据,不可当泄漏回收。
