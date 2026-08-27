@@ -109,7 +109,7 @@
   ② **软件不可用但盘在**:卷快照恢复 + `meta-import`/`fasts3d` 旧二进制只读拉起;
   ③ **只有裸盘/镜像文件**:声明对象数据非 POSIX 文件、不要指望 mount 出目录树、联系卷级恢复
   - 用例:页面无「占位/待补」;三条路径各至少一条可复制命令
-- [ ] X2 演练脚本 `tests/exit/exit_path_drill.sh`:POC 实例写入已知对象 → rclone 迁出到本地目录
+- [x] X2 演练脚本 `tests/exit/exit_path_drill.sh`:POC 实例写入已知对象 → rclone 迁出到本地目录
   → md5 一致;再走 meta-export 往返(沿用既有备份脚本,本条只要求入口统一、退出页引用)
   - 用例:脚本非 0 即失败;对象正文 md5 对账
 
