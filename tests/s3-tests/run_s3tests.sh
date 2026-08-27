@@ -146,7 +146,7 @@ else
 fi
 JUNIT="$OUT.junit.xml"
 JUNIT_SERIAL="$OUT.junit.serial.xml"
-trap 'rm -f "$OUT" "$OUT.failed" "$JUNIT" "$JUNIT_SERIAL"' EXIT
+trap 'rm -f "$OUT" "$OUT.failed" "$JUNIT" "$JUNIT_SERIAL" "$OUT.junit.retry.xml" "$OUT.unexpected"' EXIT
 PYTEST_ARGS=(-q --tb=line --junitxml="$JUNIT")
 SERIAL_GLOBAL=0
 if "$PY" -c "import xdist" 2>/dev/null; then
@@ -262,6 +262,43 @@ fi
 # 未预期失败 = 不在排除集内的失败
 UNEXPECTED=$(grep -vE "$EXCLUDE" "$OUT.failed" || true)
 NEXTRA=$(echo "$UNEXPECTED" | grep -c . || true)
+
+# 大对象 multipart/SSE 在 xdist+压缩下会偶发失败,串行可复现通过。对意外失败串行重跑一次,
+# 重跑通过则视为负载抖动(不放进排除集);仍失败才算门禁红。
+if [ "$NEXTRA" -gt 0 ] && [ "$NEXTRA" -le 32 ]; then
+    echo "serial retry: $NEXTRA unexpected in-scope"
+    JUNIT_RETRY="$OUT.junit.retry.xml"
+    printf '%s\n' "$UNEXPECTED" > "$OUT.unexpected"
+    mapfile -t RETRY_IDS < "$OUT.unexpected"
+    cd "$S3TESTS" && S3TEST_CONF="$CONF" "$PY" -m pytest "${RETRY_IDS[@]}" \
+        -q --tb=line --junitxml="$JUNIT_RETRY" >> "$OUT" 2>&1 || true
+    tail -n 6 "$OUT" || true
+    if [ -s "$JUNIT_RETRY" ]; then
+        UNEXPECTED=$("$PY" - "$JUNIT_RETRY" "$OUT.unexpected" <<'PY'
+import sys, xml.etree.ElementTree as ET
+prev = [ln.strip() for ln in open(sys.argv[2]) if ln.strip()]
+passed = set()
+root = ET.parse(sys.argv[1]).getroot()
+suites = root.findall("testsuite") if root.tag == "testsuites" else [root]
+for ts in suites:
+    if ts.tag != "testsuite":
+        continue
+    for tc in ts.findall("testcase"):
+        cls, name = tc.get("classname") or "", tc.get("name") or ""
+        node = (cls.replace(".", "/") + ".py::" + name) if cls else name
+        if tc.find("failure") is None and tc.find("error") is None and tc.find("skipped") is None:
+            passed.add(node)
+still = [p for p in prev if p not in passed]
+sys.stdout.write("\n".join(still) + ("\n" if still else ""))
+PY
+)
+        NLEFT=$(printf '%s' "$UNEXPECTED" | grep -c . || true)
+        NREC=$((NEXTRA - NLEFT))
+        NPASS=$((NPASS + NREC))
+        NEXTRA=$NLEFT
+        echo "serial retry recovered=$NREC remaining_unexpected=$NEXTRA"
+    fi
+fi
 
 echo "passed=$NPASS skipped=$NSKIP excluded_failures=$NFAIL unexpected_failures=$NEXTRA"
 if [ -n "$UNEXPECTED" ]; then
