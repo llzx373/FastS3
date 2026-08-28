@@ -342,6 +342,35 @@ export interface IamCapabilities {
   can_keys: boolean;
   /** M19 M3:迁入向导(consoleAdmin 域;能力发现老版本缺省 → undefined 兜底 false) */
   can_ingest?: boolean;
+  /** M19 J3:Batch Operations(consoleAdmin 域) */
+  can_batch?: boolean;
+}
+
+/** M19 J1(ADR-26):Batch 任务。 */
+export interface BatchJob {
+  id: string;
+  operation: {
+    type: string;
+    dest_bucket?: string | null;
+    dest_prefix?: string | null;
+    days?: number | null;
+    tier?: string | null;
+    tags?: { key: string; value: string }[] | null;
+  };
+  manifest: { type: string; bytes?: number; bucket?: string; key?: string };
+  report_bucket: string;
+  report_prefix: string;
+  report_key: string | null;
+  state: string;
+  created_at: number;
+  updated_at: number;
+  total: number;
+  processed: number;
+  succeeded: number;
+  failed: number;
+  cursor: number;
+  failures: { kind: string; key: string; error: string; at: number }[];
+  error: string | null;
 }
 
 /** M19 M3(ADR-24):迁入任务。 */
@@ -557,6 +586,23 @@ export const api = {
     request<{ deleted: string }>(
       "DELETE",
       `/api/ingest/jobs/${encodeURIComponent(id)}`,
+    ),
+
+  // ── M19 J3:Batch Operations ──
+  batchJobs: () => request<{ jobs: BatchJob[] }>("GET", "/api/batch/jobs"),
+  batchJob: (id: string) =>
+    request<BatchJob>("GET", `/api/batch/jobs/${encodeURIComponent(id)}`),
+  createBatchJob: (body: {
+    operation: Record<string, unknown>;
+    manifest: Record<string, unknown>;
+    report: { bucket: string; prefix?: string };
+  }) => request<BatchJob>("POST", "/api/batch/jobs", body),
+  cancelBatchJob: (id: string) =>
+    request<BatchJob>("POST", `/api/batch/jobs/${encodeURIComponent(id)}/cancel`),
+  deleteBatchJob: (id: string) =>
+    request<{ deleted: string }>(
+      "DELETE",
+      `/api/batch/jobs/${encodeURIComponent(id)}`,
     ),
 
   /** M19 U2:勾选对象打包 zip 下载(二进制回包 → blob 保存;超限 413 文案直出)。 */

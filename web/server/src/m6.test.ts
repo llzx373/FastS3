@@ -8,7 +8,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { buildServer } from "./index.js";
 import { loadConfig } from "./config.js";
-import type { AdminApi, AuditQuery, ConfigPatchResult, AdminConfig, IngestJobInfo } from "./admin-client.js";
+import type { AdminApi, AuditQuery, ConfigPatchResult, AdminConfig, IngestJobInfo, BatchJobInfo } from "./admin-client.js";
 import { consoleAdminIam } from "./testkit.js";
 
 /** 记录每次 audit() 收到的过滤条件,供断言「透传」。 */
@@ -26,6 +26,21 @@ class FakeAdmin implements AdminApi {
     throw new Error("not implemented");
   }
   deleteIngestJob(_id: string): Promise<Record<string, unknown>> {
+    return Promise.resolve({ deleted: _id });
+  }
+  batchJobs(): Promise<{ jobs: BatchJobInfo[] }> {
+    return Promise.resolve({ jobs: [] });
+  }
+  batchJob(_id: string): Promise<BatchJobInfo> {
+    throw new Error("not implemented");
+  }
+  createBatchJob(_body: Parameters<AdminApi["createBatchJob"]>[0]): Promise<BatchJobInfo> {
+    throw new Error("not implemented");
+  }
+  cancelBatchJob(_id: string): Promise<BatchJobInfo> {
+    throw new Error("not implemented");
+  }
+  deleteBatchJob(_id: string): Promise<Record<string, unknown>> {
     return Promise.resolve({ deleted: _id });
   }
   statusData: Record<string, unknown> = {};

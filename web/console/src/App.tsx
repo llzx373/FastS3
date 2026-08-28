@@ -18,6 +18,7 @@ import Roles from "./pages/Roles";
 import ServiceAccounts from "./pages/ServiceAccounts";
 import Tenants from "./pages/Tenants";
 import Ingest from "./pages/Ingest";
+import Batches from "./pages/Batches";
 import CenterApp from "./center/CenterApp";
 import { FIRST_RUN_DISMISS_KEY } from "./pages/FirstRun";
 import { hashRoutePath } from "./hash-route";
@@ -55,6 +56,7 @@ const NAV: NavItem[] = [
   { path: "/roles", labelZh: "IAM 角色", labelEn: "IAM Roles", show: (c) => c.can_iam },
   { path: "/tenants", labelZh: "租户", labelEn: "Tenants", show: (c) => c.is_console_admin },
   { path: "/ingest", labelZh: "迁入", labelEn: "Ingest", show: (c) => !!c.can_ingest },
+  { path: "/batches", labelZh: "批量任务", labelEn: "Batch Ops", show: (c) => !!c.can_batch },
   { path: "/settings", labelZh: "设置", labelEn: "Settings", show: (c) => c.is_console_admin },
 ];
 
@@ -167,6 +169,9 @@ export default function App() {
       break;
     case "/ingest":
       page = eff.can_ingest ? <Ingest /> : denied;
+      break;
+    case "/batches":
+      page = eff.can_batch ? <Batches /> : denied;
       break;
     case "/settings":
       page = eff.is_console_admin ? <Settings /> : denied;

@@ -66,6 +66,17 @@ export interface AdminApi {
   }): Promise<IngestJobInfo>;
   ingestJobAction(id: string, action: "pause" | "resume" | "cancel"): Promise<IngestJobInfo>;
   deleteIngestJob(id: string): Promise<Record<string, unknown>>;
+  /** M19 J1(ADR-26 DR1):Batch Operations(管理面 JSON + AWS 同名字段)。 */
+  batchJobs(): Promise<{ jobs: BatchJobInfo[] }>;
+  batchJob(id: string): Promise<BatchJobInfo>;
+  createBatchJob(body: {
+    operation: Record<string, unknown>;
+    manifest: Record<string, unknown>;
+    report: { bucket: string; prefix?: string };
+    operator?: string;
+  }): Promise<BatchJobInfo>;
+  cancelBatchJob(id: string): Promise<BatchJobInfo>;
+  deleteBatchJob(id: string): Promise<Record<string, unknown>>;
   /** M18 R1(ADR-28 DI5.2):STS AssumeRole(本租户角色;secret 仅一次回显)。 */
   assumeRole(body: {
     tenant: string;
@@ -651,6 +662,33 @@ export class AdminClient implements AdminApi {
     return this.expect("DELETE", `/v1/admin/ingest/jobs/${encodeURIComponent(id)}`);
   }
 
+  // ── M19 J1(ADR-26 DR1):Batch Operations ──
+
+  batchJobs(): Promise<{ jobs: BatchJobInfo[] }> {
+    return this.expect("GET", "/v1/admin/batch/jobs");
+  }
+
+  batchJob(id: string): Promise<BatchJobInfo> {
+    return this.expect("GET", `/v1/admin/batch/jobs/${encodeURIComponent(id)}`);
+  }
+
+  createBatchJob(body: {
+    operation: Record<string, unknown>;
+    manifest: Record<string, unknown>;
+    report: { bucket: string; prefix?: string };
+    operator?: string;
+  }): Promise<BatchJobInfo> {
+    return this.expect("POST", "/v1/admin/batch/jobs", body);
+  }
+
+  cancelBatchJob(id: string): Promise<BatchJobInfo> {
+    return this.expect("POST", `/v1/admin/batch/jobs/${encodeURIComponent(id)}/cancel`);
+  }
+
+  deleteBatchJob(id: string): Promise<Record<string, unknown>> {
+    return this.expect("DELETE", `/v1/admin/batch/jobs/${encodeURIComponent(id)}`);
+  }
+
   /** M18 R1:AssumeRole(角色校验/授权在 Rust 侧;错误原样上抛)。 */
   assumeRole(body: {
     tenant: string;
@@ -946,6 +984,33 @@ export interface IngestJobInfo {
   failed: number;
   bytes: number;
   last_key: string;
+  failures: { kind: string; key: string; error: string; at: number }[];
+  error: string | null;
+}
+
+/** M19 J1:Batch 任务。 */
+export interface BatchJobInfo {
+  id: string;
+  operation: {
+    type: string;
+    dest_bucket?: string | null;
+    dest_prefix?: string | null;
+    days?: number | null;
+    tier?: string | null;
+    tags?: { key: string; value: string }[] | null;
+  };
+  manifest: { type: string; bytes?: number; bucket?: string; key?: string };
+  report_bucket: string;
+  report_prefix: string;
+  report_key: string | null;
+  state: string;
+  created_at: number;
+  updated_at: number;
+  total: number;
+  processed: number;
+  succeeded: number;
+  failed: number;
+  cursor: number;
   failures: { kind: string; key: string; error: string; at: number }[];
   error: string | null;
 }

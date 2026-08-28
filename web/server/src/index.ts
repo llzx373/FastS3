@@ -16,6 +16,7 @@
  *   POST /api/buckets/{name}/presign      签发 PUT/GET 预签名 URL
  *   POST /api/buckets/{name}/objects/zip  M19 U2:勾选对象打包 zip 流式下载(超限 413)
  *   M19 M3:GET/POST /api/ingest/jobs[...](迁入向导代理;ADR-24 DR5)
+ *   M19 J3:GET/POST /api/batch/jobs[...](Batch Operations 代理;ADR-26 DR1)
  *   POST /api/buckets/{name}/multipart/{init|complete|abort}
  *   M10:GET /api/buckets/{name}/versions;POST .../versions/action(restore/delete)
  *   M10:GET/PUT /api/buckets/{name}/versioning;GET/PUT/DELETE .../cors;GET/PUT/DELETE .../policy
@@ -51,6 +52,7 @@ import { AdminClient, consoleRoleFor, type IamUserInfo, type IamVerifyResult } f
 import {
   authorizeAdmin,
   ownTenant,
+  requestSub,
   requireIamAction,
   resolveCaller,
   syncConfigUsers,
@@ -1458,6 +1460,67 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     },
   );
 
+  // ── M19 J3:Batch Operations(代理 admin /v1/admin/batch/*;ADR-26 DR1)──
+  // consoleAdmin 域(admin:CreateBatchJob 等);operator = JWT sub 审计归属
+  // (admin 通道信任 Node 身份注入,compat 记载)。
+  app.get(
+    "/api/batch/jobs",
+    { preHandler: requireIamAction(admin, "admin:ListBatchJobs") },
+    async (_req, reply) => {
+      try {
+        return await admin.batchJobs();
+      } catch (e) {
+        return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+      }
+    },
+  );
+  app.get<{ Params: { id: string } }>(
+    "/api/batch/jobs/:id",
+    { preHandler: requireIamAction(admin, "admin:GetBatchJob") },
+    async (req, reply) => {
+      try {
+        return await admin.batchJob(req.params.id);
+      } catch (e) {
+        return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+      }
+    },
+  );
+  app.post(
+    "/api/batch/jobs",
+    { preHandler: requireIamAction(admin, "admin:CreateBatchJob", ownTenant) },
+    async (req, reply) => {
+      try {
+        const body = (req.body ?? {}) as Record<string, unknown>;
+        body.operator = requestSub(req) || "admin";
+        return await admin.createBatchJob(body as Parameters<AdminClient["createBatchJob"]>[0]);
+      } catch (e) {
+        return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+      }
+    },
+  );
+  app.post<{ Params: { id: string } }>(
+    "/api/batch/jobs/:id/cancel",
+    { preHandler: requireIamAction(admin, "admin:UpdateBatchJob", ownTenant) },
+    async (req, reply) => {
+      try {
+        return await admin.cancelBatchJob(req.params.id);
+      } catch (e) {
+        return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+      }
+    },
+  );
+  app.delete<{ Params: { id: string } }>(
+    "/api/batch/jobs/:id",
+    { preHandler: requireIamAction(admin, "admin:DeleteBatchJob", ownTenant) },
+    async (req, reply) => {
+      try {
+        return await admin.deleteBatchJob(req.params.id);
+      } catch (e) {
+        return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+      }
+    },
+  );
+
   // ── 密钥管理(M18 C1:legacy 无属主密钥映射 SA 动作族;见 compat) ──
   app.get(
     "/api/keys",
@@ -1861,6 +1924,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       can_keys: await probe("admin:ListServiceAccounts", caller.tenant),
       // M19 M3:迁入向导(管理面任务;consoleAdmin 域)
       can_ingest: await probe("admin:CreateIngestJob"),
+      // M19 J3:Batch Operations(consoleAdmin 域)
+      can_batch: await probe("admin:CreateBatchJob"),
     };
   });
 

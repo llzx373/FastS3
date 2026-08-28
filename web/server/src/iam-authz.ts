@@ -62,7 +62,7 @@ export async function authorizeAdmin(
 }
 
 /** 从请求取 JWT sub(authPlugin 已注入 request.user)。 */
-function requestSub(req: FastifyRequest): string {
+export function requestSub(req: FastifyRequest): string {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return ((req as any).user as JwtClaims | undefined)?.sub ?? "";
 }
