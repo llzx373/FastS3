@@ -54,6 +54,27 @@ export interface AdminApi {
   sseRotate(): Promise<Record<string, unknown>>;
   /** 在线加盘。 */
   deviceAdd(path: string, force?: boolean): Promise<Record<string, unknown>>;
+  // M18 S1(ADR-28 DI2.4/DI8):IAM 用户查询 + 服务账号 CRUD(自助/代管)
+  /** 租户列表(callerIam 跨租户解析调用者用)。 */
+  iamTenants(): Promise<{ tenants: IamTenantInfo[] }>;
+  /** IAM 用户详情(不存在 → null)。 */
+  iamUser(tenant: string, name: string): Promise<IamUserInfo | null>;
+  /** SA 列表(按 tenant/owner 过滤;元数据,无 secret 材料)。 */
+  serviceAccounts(filter?: { tenant?: string; owner?: string }): Promise<{
+    service_accounts: ServiceAccountInfo[];
+  }>;
+  /** 单个 SA 元数据(不存在 → null)。 */
+  serviceAccount(accessKey: string): Promise<ServiceAccountInfo | null>;
+  /** 创建 SA(secret 明文仅本响应一次)。 */
+  createServiceAccount(body: {
+    tenant?: string;
+    owner_user: string;
+    name?: string;
+    embedded_policy?: string | null;
+    policy?: string | null;
+  }): Promise<ServiceAccountInfo & { secret_key: string }>;
+  /** 吊销 SA。 */
+  deleteServiceAccount(accessKey: string): Promise<Record<string, unknown>>;
 }
 
 /** 审计查询过滤(J5:与 limit 并存的 query 参数,全部转发 Rust 侧)。 */
@@ -139,6 +160,36 @@ export interface KeyInfo {
   enabled: boolean;
   created: number;
   policy: string | null;
+  note: string | null;
+}
+
+/** M18 S1(ADR-28 DI2.1):IAM 用户详情视图(零口令材料)。 */
+export interface IamUserInfo {
+  tenant_id: string;
+  name: string;
+  enabled: boolean;
+  policies: string[];
+  groups: string[];
+}
+
+/** M18 I1(ADR-28 DI1.1):租户视图。 */
+export interface IamTenantInfo {
+  tenant_id: string;
+  display_name?: string;
+  canonical_id?: string;
+  enabled?: boolean;
+}
+
+/** M18 S1(ADR-28 DI2.4):服务账号元数据(绝不含 secret 材料)。 */
+export interface ServiceAccountInfo {
+  access_key: string;
+  tenant_id: string;
+  owner_user: string;
+  sa_name: string | null;
+  enabled: boolean;
+  created: number;
+  policy: string | null;
+  embedded_policy: string | null;
   note: string | null;
 }
 
@@ -409,6 +460,66 @@ export class AdminClient implements AdminApi {
 
   deviceAdd(path: string, force = false): Promise<Record<string, unknown>> {
     return this.expect("POST", "/v1/admin/devices/add", { path, force });
+  }
+
+  // ── M18 S1:IAM 服务账号(ADR-28 DI2.4/DI8;root 可信通道) ──
+
+  iamTenants(): Promise<{ tenants: IamTenantInfo[] }> {
+    return this.expect("GET", "/v1/iam/tenants");
+  }
+
+  /** IAM 用户详情;404 → null(自助端点判调用者身份用)。 */
+  async iamUser(tenant: string, name: string): Promise<IamUserInfo | null> {
+    const res = await this.request(
+      "GET",
+      `/v1/iam/users/${encodeURIComponent(tenant)}/${encodeURIComponent(name)}`
+    );
+    if (res.status === 404) return null;
+    if (res.status !== 200) {
+      throw new Error(`admin GET iam user: HTTP ${res.status}: ${res.text}`);
+    }
+    return res.json as IamUserInfo;
+  }
+
+  serviceAccounts(filter: { tenant?: string; owner?: string } = {}): Promise<{
+    service_accounts: ServiceAccountInfo[];
+  }> {
+    const q = new URLSearchParams();
+    if (filter.tenant) q.set("tenant", filter.tenant);
+    if (filter.owner) q.set("owner", filter.owner);
+    const qs = q.toString();
+    return this.expect("GET", `/v1/iam/service-accounts${qs ? `?${qs}` : ""}`);
+  }
+
+  /** 单个 SA 元数据;404 → null(DELETE 前属主核对用)。 */
+  async serviceAccount(accessKey: string): Promise<ServiceAccountInfo | null> {
+    const res = await this.request(
+      "GET",
+      `/v1/iam/service-accounts/${encodeURIComponent(accessKey)}`
+    );
+    if (res.status === 404) return null;
+    if (res.status !== 200) {
+      throw new Error(`admin GET service-account: HTTP ${res.status}: ${res.text}`);
+    }
+    return res.json as ServiceAccountInfo;
+  }
+
+  /** 创建 SA(secret 明文仅本响应一次,调用方负责一次性下发)。 */
+  createServiceAccount(body: {
+    tenant?: string;
+    owner_user: string;
+    name?: string;
+    embedded_policy?: string | null;
+    policy?: string | null;
+  }): Promise<ServiceAccountInfo & { secret_key: string }> {
+    return this.expect("POST", "/v1/iam/service-accounts", body);
+  }
+
+  deleteServiceAccount(accessKey: string): Promise<Record<string, unknown>> {
+    return this.expect(
+      "DELETE",
+      `/v1/iam/service-accounts/${encodeURIComponent(accessKey)}`
+    );
   }
 }
 

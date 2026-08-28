@@ -18,6 +18,7 @@
  *   M12:GET/PUT /api/buckets/{name}/object-lock;GET/PUT .../object-lock/{retention,legal-hold}
  *   GET/POST/DELETE /api/keys[/{id}]      密钥管理(代理)
  *   PUT  /api/keys/{access}/policy        密钥策略文档(代理 admin PATCH)
+ *   GET/POST/DELETE /api/iam/service-accounts[/{access}]  SA 自助/代管(M18 S1;C1 前过渡口径)
  *   GET  /api/uploads;POST /api/uploads/{id}/abort
  *   GET  /api/audit                       审计查询(limit/since/until/op/bucket/key/who/status/bypass 透传)
  *   GET  /api/audit/export                审计 JSONL 下载(同过滤;截断头透传)
@@ -29,7 +30,7 @@
  *
  * 静态资源(控制台构建产物)由 --static 提供;数据流永不经过 Node。
  */
-import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { createServer } from "node:http";
 import { readFileSync } from "node:fs";
 import { WebSocketServer } from "ws";
@@ -1254,6 +1255,160 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         return await admin.setKeyPolicy(req.params.access, policy);
       } catch (e) {
         return reply.code(502).send({ error: { code: "policy_error", message: (e as Error).message } });
+      }
+    }
+  );
+
+  // ── M18 S1:服务账号自助(ADR-28 DI2.4;完整 IAM admin:* 授权属 C1) ──
+  // 过渡口径(C1 前):JWT 只证明「谁登录」;配置文件用户映射到租户
+  // `default` 的同名 IAM User。无对应 IAM User → 409(不自动建号,
+  // 防幽灵账户;由 root/tenantAdmin 先建用户)。tenantAdmin/consoleAdmin
+  // 可代管本租户(consoleAdmin 集群范围)用户的 SA;其余用户只能
+  // 操作自己(owner = JWT sub)名下的 SA。本组路由对一切已认证用户
+  // 开放(自助语义),不使用 requireRole("admin")。
+  const callerIam = async (sub: string) => {
+    // 配置文件用户(pre-IAM)先映射租户 `default` 同名 IAM User;不存在
+    // 则跨租户按同名查找(找到首个即归属;过渡期无多租户同名歧义处理,
+    // C1 以 IAM 登录身份为准)。
+    let u = await admin.iamUser("default", sub);
+    if (!u) {
+      const { tenants } = await admin.iamTenants();
+      for (const t of tenants) {
+        if (t.tenant_id === "default") continue;
+        u = await admin.iamUser(t.tenant_id, sub);
+        if (u) break;
+      }
+    }
+    if (!u) return null;
+    const pols = u.policies ?? [];
+    return {
+      tenant: u.tenant_id || "default",
+      name: u.name || sub,
+      enabled: u.enabled !== false,
+      isTenantAdmin: pols.includes("tenantAdmin") || pols.includes("consoleAdmin"),
+      isClusterAdmin: pols.includes("consoleAdmin"),
+    };
+  };
+  const noIamUser = (reply: FastifyReply, sub: string) =>
+    reply.code(409).send({
+      error: {
+        code: "no_iam_user",
+        message: `no IAM user for console account "${sub}" in tenant default; ask an admin to create it first`,
+      },
+    });
+  // 调用者解析:不存在 → 409;禁用 → 403;否则返回身份视图
+  const resolveCaller = async (
+    req: FastifyRequest,
+    reply: FastifyReply
+  ): Promise<NonNullable<Awaited<ReturnType<typeof callerIam>>> | null> => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sub = ((req as any).user as JwtClaims | undefined)?.sub ?? "";
+    const caller = await callerIam(sub);
+    if (!caller) {
+      await noIamUser(reply, sub);
+      return null;
+    }
+    if (!caller.enabled) {
+      await reply.code(403).send({
+        error: { code: "user_disabled", message: `IAM user ${caller.tenant}/${caller.name} is disabled` },
+      });
+      return null;
+    }
+    return caller;
+  };
+
+  app.get<{ Querystring: { tenant?: string; owner?: string } }>(
+    "/api/iam/service-accounts",
+    async (req, reply) => {
+      let caller;
+      try {
+        caller = await resolveCaller(req, reply);
+      } catch (e) {
+        return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+      }
+      if (!caller) return;
+      // tenantAdmin:可列本租户任意属主;consoleAdmin:集群范围;
+      // 其余:强制只看自己
+      if (!caller.isClusterAdmin && req.query.tenant && req.query.tenant !== caller.tenant) {
+        return reply.code(403).send({ error: { code: "forbidden", message: "cross-tenant listing denied" } });
+      }
+      const tenant = caller.isClusterAdmin
+        ? req.query.tenant ?? caller.tenant
+        : caller.tenant;
+      const owner = caller.isTenantAdmin ? req.query.owner : caller.name;
+      try {
+        return await admin.serviceAccounts({ tenant, owner });
+      } catch (e) {
+        return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+      }
+    }
+  );
+
+  app.post<{
+    Body: {
+      tenant?: string;
+      owner_user?: string;
+      name?: string;
+      embedded_policy?: string | null;
+      policy?: string | null;
+    };
+  }>("/api/iam/service-accounts", async (req, reply) => {
+    let caller;
+    try {
+      caller = await resolveCaller(req, reply);
+    } catch (e) {
+      return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+    }
+    if (!caller) return;
+    const tenant = req.body?.tenant ?? caller.tenant;
+    const owner = req.body?.owner_user ?? caller.name;
+    // 自助:owner 强制 = 自己;代管:tenantAdmin 同租户 / consoleAdmin 任意租户
+    const selfService = owner === caller.name && tenant === caller.tenant;
+    const delegated =
+      (caller.isTenantAdmin && tenant === caller.tenant) || caller.isClusterAdmin;
+    if (!selfService && !delegated) {
+      return reply.code(403).send({
+        error: { code: "forbidden", message: "cannot create service accounts for other users/tenants" },
+      });
+    }
+    try {
+      return await admin.createServiceAccount({
+        tenant,
+        owner_user: owner,
+        name: req.body?.name,
+        embedded_policy: req.body?.embedded_policy ?? null,
+        policy: req.body?.policy ?? null,
+      });
+    } catch (e) {
+      return reply.code(400).send({ error: { code: "sa_error", message: (e as Error).message } });
+    }
+  });
+
+  app.delete<{ Params: { access: string } }>(
+    "/api/iam/service-accounts/:access",
+    async (req, reply) => {
+      let caller;
+      let sa;
+      try {
+        caller = await resolveCaller(req, reply);
+        sa = caller ? await admin.serviceAccount(req.params.access) : null;
+      } catch (e) {
+        return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+      }
+      if (!caller) return;
+      if (!sa) {
+        return reply.code(404).send({ error: { code: "no_such_key", message: `service account ${req.params.access}` } });
+      }
+      const own = sa.owner_user === caller.name && sa.tenant_id === caller.tenant;
+      const delegated =
+        (caller.isTenantAdmin && sa.tenant_id === caller.tenant) || caller.isClusterAdmin;
+      if (!own && !delegated) {
+        return reply.code(403).send({ error: { code: "forbidden", message: "not the owner of this service account" } });
+      }
+      try {
+        return await admin.deleteServiceAccount(req.params.access);
+      } catch (e) {
+        return reply.code(404).send({ error: { code: "no_such_key", message: (e as Error).message } });
       }
     }
   );

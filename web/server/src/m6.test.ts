@@ -135,6 +135,24 @@ class FakeAdmin implements AdminApi {
   async deviceAdd(): Promise<never> {
     throw new Error("not used");
   }
+  async iamUser(): Promise<never> {
+    throw new Error("not used");
+  }
+  async iamTenants(): Promise<never> {
+    throw new Error("not used");
+  }
+  async serviceAccounts(): Promise<never> {
+    throw new Error("not used");
+  }
+  async serviceAccount(): Promise<never> {
+    throw new Error("not used");
+  }
+  async createServiceAccount(): Promise<never> {
+    throw new Error("not used");
+  }
+  async deleteServiceAccount(): Promise<never> {
+    throw new Error("not used");
+  }
 }
 
 const cfg = loadConfig();
