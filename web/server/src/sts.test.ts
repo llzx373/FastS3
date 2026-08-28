@@ -1,11 +1,13 @@
 /**
- * M15 T1:STS Query API 端点单测(ADR-18 D-E2)。mock 注入 buildServer,
- * 不依赖 Rust 侧;断言:
+ * M15 T1:STS Query API 端点单测(ADR-18 D-E2;M18 R1 起 AssumeRole 走
+ * 角色实体,ADR-28 DI5)。mock 注入 buildServer,不依赖 Rust 侧;断言:
  * - GetSessionToken 表单参数(action/version/duration/policy)→ 调用
  *   管理面签发 → 渲染 AWS 兼容 GetSessionTokenResponse(临时 AK/SK/token
  *   三元组 + Expiration);
- * - AssumeRole 最小集(接受 RoleArn,按会话策略签发,无角色派生——
- *   D-E2 语义在 Rust 侧 same,此处验证 XML 形状含 AssumedRoleUser);
+ * - AssumeRole(M18 R1):RoleArn `arn:aws:iam::{canonical}:role/{name}`
+ *   经 canonical → tenant 解析后调用管理面 /v1/iam/assume-role(角色
+ *   校验/授权在 Rust 侧);未知 canonical → 403 AccessDenied;管理面
+ *   403/404 → AccessDenied XML;无 RoleArn → 兼容路径(按会话策略签发);
  * - 非法 action → InvalidAction 错误 XML;
  * - 会话列表/撤销端点接线。
  */
@@ -18,6 +20,14 @@ import type { AdminApi, SessionInfo } from "./admin-client.js";
 /** 记录签发请求的 FakeAdmin(验证透传参数)。 */
 class FakeAdmin implements Partial<AdminApi> {
   createCalls: Array<{ base: string; policy: string | null; ttl: number }> = [];
+  assumeCalls: Array<{
+    tenant: string;
+    role: string;
+    base: string;
+    ttl: number;
+    policy?: string;
+  }> = [];
+  assumeError: Error | null = null;
   revoked: string[] = [];
   async status(): Promise<any> {
     return {};
@@ -98,6 +108,38 @@ class FakeAdmin implements Partial<AdminApi> {
     this.revoked.push(id);
     return { revoked: id };
   }
+  async iamTenants(): Promise<any> {
+    return { tenants: [{ tenant_id: "default", canonical_id: "123456789012" }] };
+  }
+  async assumeRole(body: {
+    tenant: string;
+    role: string;
+    base_access_key: string;
+    session_name?: string;
+    duration_secs?: number;
+    policy?: string;
+  }): Promise<any> {
+    if (this.assumeError) throw this.assumeError;
+    this.assumeCalls.push({
+      tenant: body.tenant,
+      role: body.role,
+      base: body.base_access_key,
+      ttl: body.duration_secs ?? 3600,
+      policy: body.policy,
+    });
+    return {
+      session_id: "sess-role-1",
+      temporary_access_key: "FSSTROLE1234",
+      secret_key: "once-only-role-secret",
+      session_token: "sess-role-1",
+      expires_at: 1_800_000_000,
+      issued_at: 1_799_900_000,
+      tenant_id: body.tenant,
+      role: body.role,
+      user: "alice",
+      assumed_role_arn: `arn:aws:sts::${body.tenant}:assumed-role/${body.role}/${body.session_name}`,
+    };
+  }
 }
 
 const fake = new FakeAdmin();
@@ -142,7 +184,7 @@ test("sts get-session-token renders AWS-shaped response and forwards params", as
   assert.equal(fake.createCalls[0].ttl, 7200);
 });
 
-test("sts assume-role accepts role arn but mints on management identity (no role derivation)", async () => {
+test("sts assume-role resolves role arn to tenant role and mints via admin assume-role", async () => {
   const token = await login();
   const r = await app.inject({
     method: "POST",
@@ -156,10 +198,67 @@ test("sts assume-role accepts role arn but mints on management identity (no role
   assert.equal(r.statusCode, 200, r.body);
   assert.ok(r.body.includes("<AssumeRoleResponse"), r.body);
   assert.ok(r.body.includes("<AssumedRoleId>AROAFASTS3:job-1</AssumedRoleId>"), r.body);
-  assert.ok(r.body.includes("<SessionToken>sess-1234</SessionToken>"), r.body);
-  assert.equal(fake.createCalls.length, 2);
-  assert.equal(fake.createCalls[1].base, "fasts3dev", "AssumeRole 基密钥 = 管理面配置密钥(无角色派生)");
-  assert.equal(fake.createCalls[1].ttl, 1800);
+  assert.ok(r.body.includes("<SessionToken>sess-role-1</SessionToken>"), r.body);
+  // M18 R1:RoleArn canonical → tenant 解析,角色名校验/授权在 Rust 侧
+  assert.equal(fake.assumeCalls.length, 1);
+  assert.equal(fake.assumeCalls[0].tenant, "default", "canonical 123456789012 → default 租户");
+  assert.equal(fake.assumeCalls[0].role, "demo");
+  assert.equal(fake.assumeCalls[0].base, "fasts3dev", "基密钥 = 管理面配置密钥");
+  assert.equal(fake.assumeCalls[0].ttl, 1800);
+  assert.equal(fake.assumeCalls[0].policy, "{}");
+});
+
+test("sts assume-role without RoleArn keeps legacy session path (compat)", async () => {
+  const token = await login();
+  const r = await app.inject({
+    method: "POST",
+    url: "/api/sts",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/x-www-form-urlencoded",
+    },
+    payload: `Action=AssumeRole&Version=2011-06-15&RoleSessionName=job-2&DurationSeconds=900`,
+  });
+  assert.equal(r.statusCode, 200, r.body);
+  assert.ok(r.body.includes("<AssumeRoleResponse"), r.body);
+  // 兼容路径:无角色派生,走 createSession(assumeCalls 不增)
+  assert.equal(fake.assumeCalls.length, 1, "无 RoleArn 不走角色路径");
+  assert.equal(fake.createCalls.at(-1)?.base, "fasts3dev");
+  assert.equal(fake.createCalls.at(-1)?.ttl, 900);
+});
+
+test("sts assume-role propagates admin denial as AccessDenied", async () => {
+  const token = await login();
+  fake.assumeError = new Error("admin POST /v1/iam/assume-role: HTTP 403: cross-tenant assume denied");
+  try {
+    const r = await app.inject({
+      method: "POST",
+      url: "/api/sts",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      payload: `Action=AssumeRole&Version=2011-06-15&RoleArn=arn%3Aaws%3Aiam%3A%3A123456789012%3Arole%2Fdemo&RoleSessionName=job-3`,
+    });
+    assert.equal(r.statusCode, 403, r.body);
+    assert.ok(r.body.includes("<Code>AccessDenied</Code>"), r.body);
+  } finally {
+    fake.assumeError = null;
+  }
+  // 未知 canonical(无租户匹配)→ 403 AccessDenied,不触达管理面
+  const before = fake.assumeCalls.length;
+  const r2 = await app.inject({
+    method: "POST",
+    url: "/api/sts",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/x-www-form-urlencoded",
+    },
+    payload: `Action=AssumeRole&Version=2011-06-15&RoleArn=arn%3Aaws%3Aiam%3A%3A999999999999%3Arole%2Fdemo&RoleSessionName=job-4`,
+  });
+  assert.equal(r2.statusCode, 403, r2.body);
+  assert.ok(r2.body.includes("<Code>AccessDenied</Code>"), r2.body);
+  assert.equal(fake.assumeCalls.length, before, "未知 canonical 不触达管理面");
 });
 
 test("sts rejects unsupported action with InvalidAction XML", async () => {

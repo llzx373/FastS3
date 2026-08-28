@@ -48,6 +48,26 @@ export interface AdminApi {
   }>;
   sessions(): Promise<{ sessions: SessionInfo[] }>;
   revokeSession(sessionId: string): Promise<Record<string, unknown>>;
+  /** M18 R1(ADR-28 DI5.2):STS AssumeRole(本租户角色;secret 仅一次回显)。 */
+  assumeRole(body: {
+    tenant: string;
+    role: string;
+    base_access_key: string;
+    session_name?: string;
+    duration_secs?: number;
+    policy?: string;
+  }): Promise<{
+    session_id: string;
+    temporary_access_key: string;
+    secret_key: string;
+    session_token: string;
+    expires_at: number;
+    issued_at: number;
+    tenant_id: string;
+    role: string;
+    user: string | null;
+    assumed_role_arn: string;
+  }>;
   /** SSE-S3 KEK 状态(零密钥材料)。 */
   sseStatus(): Promise<Record<string, unknown>>;
   /** SSE-S3 KEK 轮换 + 后台重包裹。 */
@@ -448,6 +468,29 @@ export class AdminClient implements AdminApi {
 
   revokeSession(sessionId: string): Promise<Record<string, unknown>> {
     return this.expect("DELETE", `/v1/admin/sessions/${encodeURIComponent(sessionId)}`);
+  }
+
+  /** M18 R1:AssumeRole(角色校验/授权在 Rust 侧;错误原样上抛)。 */
+  assumeRole(body: {
+    tenant: string;
+    role: string;
+    base_access_key: string;
+    session_name?: string;
+    duration_secs?: number;
+    policy?: string;
+  }): Promise<{
+    session_id: string;
+    temporary_access_key: string;
+    secret_key: string;
+    session_token: string;
+    expires_at: number;
+    issued_at: number;
+    tenant_id: string;
+    role: string;
+    user: string | null;
+    assumed_role_arn: string;
+  }> {
+    return this.expect("POST", "/v1/iam/assume-role", body);
   }
 
   sseStatus(): Promise<Record<string, unknown>> {

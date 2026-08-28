@@ -126,6 +126,10 @@ class FakeAdmin implements AdminApi {
   async revokeSession(): Promise<never> {
     throw new Error("not used");
   }
+  // M18 R1:STS AssumeRole(测试未直接使用;接口占位)
+  async assumeRole(): Promise<never> {
+    throw new Error("not used");
+  }
   async sseStatus(): Promise<never> {
     throw new Error("not used");
   }

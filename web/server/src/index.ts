@@ -1107,9 +1107,11 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
   // ── M15 T1:STS 会话(ADR-18 D-E2;管理面签发,数据面校验) ──
   // Query API(GetSessionToken/AssumeRole 最小集):boto3 sts 客户端
-  // 指向本端点时按 AWS Query 协议 POST 表单参数。会话 = 既有密钥 +
-  // 会话策略求交(无角色派生);secret 仅签发响应一次回显(Rust 侧
-  // 同一语义,库中只有 SHA-256 比对子)。
+  // 指向本端点时按 AWS Query 协议 POST 表单参数。GetSessionToken = 既有
+  // 密钥 + 会话策略求交(不提权);AssumeRole(M18 R1;ADR-28 DI5,取代
+  // D-E2「无角色实体」)= 本租户 ir: 角色派生(校验/授权在 Rust 侧;
+  // 无 RoleArn → 兼容路径,按会话策略签发)。secret 仅签发响应一次回显
+  // (Rust 侧同一语义,库中只有 SHA-256 比对子)。
   // AWS Query API 的 content-type 为 application/x-www-form-urlencoded;
   // Fastify 5 默认不解析该媒体类型,此路由按原始字符串接收自行解码。
   app.addContentTypeParser(
@@ -1139,15 +1141,59 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
           .send(renderGetSessionTokenResponse(creds, req));
       }
       if (action === "AssumeRole") {
-        // D-E2:无角色派生——AssumeRole 接受 RoleArn 但语义 = 按会话策略
-        // 签发(范围声明进 compat.md);基密钥 = 管理面调用方身份
         const duration = Number(params.get("DurationSeconds") ?? 3600);
         const policy = params.get("Policy") ?? undefined;
         const roleSessionName = params.get("RoleSessionName") ?? "fasts3-session";
-        const creds = await admin.createSession(sessionBaseKey(cfg), policy || null, duration);
-        return reply
-          .type("text/xml")
-          .send(renderAssumeRoleResponse(creds, roleSessionName, req));
+        const roleArn = params.get("RoleArn") ?? "";
+        if (!roleArn) {
+          // 兼容路径(D-E2 遗留;compat 钉死):无 RoleArn → 按会话策略为
+          // 管理面身份签发,无角色派生
+          const creds = await admin.createSession(sessionBaseKey(cfg), policy || null, duration);
+          return reply
+            .type("text/xml")
+            .send(renderAssumeRoleResponse(creds, roleSessionName, req));
+        }
+        // M18 R1(ADR-28 DI5.2,取代 D-E2「无角色实体」):RoleArn =
+        // arn:aws:iam::{canonical}:role/{name};canonical → tenant 解析
+        // (扫描租户表匹配 canonical_id),角色校验与授权在 Rust 侧
+        const m = /^arn:aws:iam::([0-9a-zA-Z]+):role\/(.+)$/.exec(roleArn);
+        if (!m) {
+          return reply
+            .code(400)
+            .type("text/xml")
+            .send(renderStsError("ValidationError", `invalid RoleArn: ${roleArn}`));
+        }
+        const [, canonical, roleName] = m;
+        const tenants = await admin.iamTenants();
+        const tenant = tenants.tenants.find((t) => t.canonical_id === canonical);
+        if (!tenant) {
+          return reply
+            .code(403)
+            .type("text/xml")
+            .send(renderStsError("AccessDenied", `no tenant matches RoleArn account ${canonical}`));
+        }
+        try {
+          const creds = await admin.assumeRole({
+            tenant: tenant.tenant_id,
+            role: roleName,
+            base_access_key: sessionBaseKey(cfg),
+            session_name: roleSessionName,
+            duration_secs: duration,
+            policy: policy || undefined,
+          });
+          return reply
+            .type("text/xml")
+            .send(renderAssumeRoleResponse(creds, roleSessionName, req));
+        } catch (e) {
+          // 授权/校验失败(跨租户、无 sts:AssumeRole 授予、assumable_by
+          // 等,Rust 侧 403/404)→ AWS 口径 AccessDenied;其余为内部错误
+          const msg = (e as Error).message;
+          const denied = /HTTP (403|404)/.test(msg);
+          return reply
+            .code(denied ? 403 : 400)
+            .type("text/xml")
+            .send(renderStsError(denied ? "AccessDenied" : "InternalFailure", msg));
+        }
       }
       const _ = version;
       return reply.code(400).type("text/xml").send(
