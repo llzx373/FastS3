@@ -45,6 +45,7 @@
 //! - `DELETE /v1/iam/roles/{tenant}/{name}`     删除角色(无条件;已签发会话持自身策略副本)
 //! - `POST /v1/iam/assume-role`                 STS AssumeRole(本租户角色;跨租户/无授予/越 assumable_by → 403)
 //! - `POST /v1/iam/authorize`                   管理面授权求值(M18 C1;{tenant,user,action,target_tenant?} → {allow})
+//! - `POST /v1/iam/verify-password`             IAM 用户口令校验(M18 C1 收口;{tenant,user,password} → {ok,user?};禁用 403)
 //! - `GET  /v1/admin/uploads`                   在途 multipart 会话
 //! - `POST /v1/admin/uploads/{id}/abort`        强制中止会话
 //! - `GET  /v1/admin/audit?limit=`              审计日志
@@ -591,6 +592,9 @@ impl AdminServer {
             // M18 C1(ADR-28 DI3.3):管理面授权求值(控制台/管理面调用方
             // 身份 → admin:* 动作 allow;求值在 S3Service::check_admin_action)
             ("POST", ["authorize"]) => self.handle_iam_authorize(body),
+            // M18 C1 收口(ADR-28 DI2.1/DI4):IAM 用户口令校验(控制台
+            // /api/login 的 IAM 口令登录通路)
+            ("POST", ["verify-password"]) => self.handle_verify_password(body),
             _ => json::err(StatusCode::NOT_FOUND, "not_found", "unknown iam endpoint"),
         }
     }
@@ -3037,6 +3041,90 @@ impl AdminServer {
             .service
             .check_admin_action(tenant, user, action, target_tenant);
         json::ok(serde_json::json!({ "allow": allow }))
+    }
+
+    /// POST /v1/iam/verify-password:IAM 用户口令校验(M18 C1 收口,
+    /// ADR-28 DI2.1/DI4「root 只引导」)。body:`tenant`/`user`/`password`
+    /// 均必填(缺失 → 400)。语义钉死(compat):
+    /// - 口令匹配 → 200 `{"ok":true,"user":<同 GET 用户详情的安全视图,
+    ///   含 policies,零口令材料>}`
+    /// - 未知用户 / 无本地口令(LDAP/OIDC 身份)/ 口令错误 → 401 `{"ok":false}`
+    /// - 用户已禁用 → 403 `{"ok":false,"error":{"code":"user_disabled"}}`
+    ///
+    /// 比较恒定时间(`IamUser::verify_password` 内 constant_time_eq,
+    /// 与 KeyRecord secret 校验同方案)。**本端点不做速率限制**(compat
+    /// 登记;暴力破解防护由部署层/反向代理负责)。
+    fn handle_verify_password(&self, body: &[u8]) -> Response<String> {
+        // 拒绝视图:恒带 "ok":false,错误细节沿用统一 error 格式
+        fn deny(status: StatusCode, code: &str, message: &str) -> Response<String> {
+            Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .body(
+                    serde_json::json!({
+                        "ok": false,
+                        "error": { "code": code, "message": message },
+                    })
+                    .to_string(),
+                )
+                .unwrap()
+        }
+        let parsed: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(_) => {
+                return json::err(StatusCode::BAD_REQUEST, "bad_request", "invalid JSON body")
+            }
+        };
+        let tenant = parsed.get("tenant").and_then(|v| v.as_str()).unwrap_or("");
+        let user = parsed.get("user").and_then(|v| v.as_str()).unwrap_or("");
+        let password = parsed
+            .get("password")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if tenant.is_empty() || user.is_empty() || password.is_empty() {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "missing required field: tenant, user and/or password",
+            );
+        }
+        let engine = self.engine.read();
+        let user_rec = match engine.meta().get_iam_user(tenant, user) {
+            Ok(Some(u)) => u,
+            Ok(None) => {
+                return deny(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_credentials",
+                    "unknown user or bad password",
+                )
+            }
+            Err(e) => {
+                return json::err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    &e.to_string(),
+                )
+            }
+        };
+        if !user_rec.enabled {
+            return deny(
+                StatusCode::FORBIDDEN,
+                "user_disabled",
+                &format!("user {tenant}/{user} is disabled"),
+            );
+        }
+        // 无本地口令 → verify_password 恒 false(恒定时间同档)
+        if !user_rec.verify_password(password) {
+            return deny(
+                StatusCode::UNAUTHORIZED,
+                "invalid_credentials",
+                "unknown user or bad password",
+            );
+        }
+        json::ok(serde_json::json!({
+            "ok": true,
+            "user": Self::user_json(&user_rec),
+        }))
     }
 
     // ───────────────────── M18 S1:IAM 服务账号(ADR-28 DI2.4/DI8)─────────────────────

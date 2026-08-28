@@ -174,6 +174,8 @@ export interface AdminApi {
     action: string;
     target_tenant?: string;
   }): Promise<{ allow: boolean }>;
+  /** M18 C1 收口(DI2.1/DI4):IAM 用户口令校验(控制台登录通路)。 */
+  iamVerifyPassword(body: { tenant: string; user: string; password: string }): Promise<IamVerifyResult>;
 }
 
 /** 审计查询过滤(J5:与 limit 并存的 query 参数,全部转发 Rust 侧)。 */
@@ -317,6 +319,15 @@ export function consoleRoleFor(user: IamUserInfo): "admin" | "readonly" {
     ? "admin"
     : "readonly";
 }
+
+/**
+ * M18 C1 收口:`POST /v1/iam/verify-password` 结果视图。
+ * ok:true → user = 安全视图(零口令材料);ok:false + disabled:true →
+ * 用户已禁用(HTTP 403);其余 ok:false = 未知用户/无本地口令/口令错(HTTP 401)。
+ */
+export type IamVerifyResult =
+  | { ok: true; user: IamUserInfo }
+  | { ok: false; disabled?: boolean };
 
 /** M18 S1(ADR-28 DI2.4):服务账号元数据(绝不含 secret 材料)。 */
 export interface ServiceAccountInfo {
@@ -841,6 +852,21 @@ export class AdminClient implements AdminApi {
     target_tenant?: string;
   }): Promise<{ allow: boolean }> {
     return this.expect("POST", "/v1/iam/authorize", body);
+  }
+
+  /** IAM 口令校验:200 → {ok:true,user};403 → 禁用;401 → 拒绝;其余状态抛错。 */
+  async iamVerifyPassword(body: {
+    tenant: string;
+    user: string;
+    password: string;
+  }): Promise<IamVerifyResult> {
+    const res = await this.request("POST", "/v1/iam/verify-password", body);
+    if (res.status === 200) {
+      return { ok: true, user: (res.json as { user: IamUserInfo }).user };
+    }
+    if (res.status === 403) return { ok: false, disabled: true };
+    if (res.status === 401) return { ok: false };
+    throw new Error(`admin POST /v1/iam/verify-password: HTTP ${res.status}: ${res.text}`);
   }
 }
 

@@ -493,3 +493,79 @@ test("ldap_sync_events_visible_on_identity_events_endpoint", async (t) => {
     `expected ldap sync.skipped on default assembly, got ${JSON.stringify(evs)}`,
   );
 });
+
+/**
+ * M18 C1 收口(ADR-28 DI2.1/DI4「root 只引导」):IAM 用户口令登录。
+ * /api/login 顺序(本地配置用户 → LDAP bind → IAM 口令)最后一档:
+ * Rust /v1/iam/verify-password 校验,成功签发 JWT(role 经 consoleRoleFor
+ * 推导);口令错/未知/无本地口令 → 401;禁用 → 403;租户解析 default 先行、
+ * 按名跨租户扫描(首命中即归属),body.tenant 显式指定优先。
+ */
+test("iam_password_login_issues_jwt", async (t) => {
+  const admin = new FakeAdmin();
+  // ta/tadmin:tenantAdmin + 口令;ta/off:带口令但禁用;ta/nopw:无本地口令
+  // (LDAP/OIDC 型);同名歧义:default/carol 无口令,ta/carol 有口令。
+  await admin.createIamUser({ tenant: "ta", name: "tadmin", password: "pw-ta" });
+  await admin.patchIamUser("ta", "tadmin", { policies: ["tenantAdmin"] });
+  await admin.createIamUser({ tenant: "ta", name: "off", password: "pw-off" });
+  await admin.patchIamUser("ta", "off", { enabled: false });
+  await admin.createIamUser({ tenant: "ta", name: "nopw" });
+  await admin.createIamUser({ tenant: "default", name: "carol" });
+  await admin.createIamUser({ tenant: "ta", name: "carol", password: "pw-carol" });
+  const events = new IdentityEvents();
+  const app = buildServer({
+    admin: admin as never,
+    s3: {} as never,
+    cfg: makeCfg(), // users: [],ldap/oidc 均未启用
+    identity: { events, ldap: disabledSync(admin, events), oidc: new OidcVerifier(oidcCfg()) },
+  });
+  t.after(() => app.close());
+
+  const login = (username: string, password: string, tenant?: string) =>
+    app.inject({ method: "POST", url: "/api/login", payload: { username, password, tenant } });
+
+  // 带口令 IAM 用户 → 200 + JWT;角色由 IAM 挂载推导(tenantAdmin → admin)
+  let r = await login("tadmin", "pw-ta");
+  assert.equal(r.statusCode, 200, r.body);
+  let body = r.json() as { token: string; role: string; username: string };
+  assert.equal(body.username, "tadmin");
+  assert.equal(body.role, "admin");
+  let claims = verifyJwt(body.token, JWT_SECRET);
+  assert.equal(claims?.sub, "tadmin");
+  assert.equal(claims?.role, "admin");
+  assert.ok(events.list().some((e) => e.source === "iam" && e.action === "login" && e.detail.includes("ta/tadmin")));
+
+  // 显式 tenant 字段同样放行
+  r = await login("tadmin", "pw-ta", "ta");
+  assert.equal(r.statusCode, 200);
+
+  // 口令错 → 401 invalid_credentials
+  r = await login("tadmin", "wrong");
+  assert.equal(r.statusCode, 401);
+  assert.equal((r.json() as { error: { code: string } }).error.code, "invalid_credentials");
+
+  // 未知用户 → 401(与口令错同口径)
+  r = await login("ghost", "pw");
+  assert.equal(r.statusCode, 401);
+
+  // 无本地口令(LDAP/OIDC 身份)→ 401
+  r = await login("nopw", "anything");
+  assert.equal(r.statusCode, 401);
+
+  // 禁用 → 403 user_disabled
+  r = await login("off", "pw-off");
+  assert.equal(r.statusCode, 403);
+  assert.equal((r.json() as { error: { code: string } }).error.code, "user_disabled");
+  assert.ok(events.list().some((e) => e.source === "iam" && e.action === "login.rejected" && e.detail.includes("ta/off")));
+
+  // 同名歧义:default/carol 首命中但无口令 → 401(不继续扫 ta);显式
+  // tenant=ta → 200,角色 readonly(无挂载)
+  r = await login("carol", "pw-carol");
+  assert.equal(r.statusCode, 401);
+  r = await login("carol", "pw-carol", "ta");
+  assert.equal(r.statusCode, 200);
+  body = r.json() as { token: string; role: string; username: string };
+  assert.equal(body.role, "readonly");
+  claims = verifyJwt(body.token, JWT_SECRET);
+  assert.equal(claims?.sub, "carol");
+});

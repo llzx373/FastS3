@@ -49,7 +49,7 @@ export interface LdapSyncConfig {
 
 export interface IdentityEvent {
   ts: number;
-  source: "ldap" | "oidc";
+  source: "ldap" | "oidc" | "iam";
   // user.created | user.enabled | user.disabled | user.conflict |
   // group.created | group.updated | group.emptied | sync.skipped | login | login.rejected
   action: string;

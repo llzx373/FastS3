@@ -217,6 +217,9 @@ class FakeAdmin implements AdminApi {
   async iamAuthorize(body: { tenant: string; user: string; action: string; target_tenant?: string }) {
     return this.iamApi.iamAuthorize(body);
   }
+  async iamVerifyPassword(body: { tenant: string; user: string; password: string }) {
+    return this.iamApi.iamVerifyPassword(body);
+  }
   async serviceAccounts(): Promise<never> {
     throw new Error("not used");
   }

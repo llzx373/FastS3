@@ -27,6 +27,9 @@ export class FakeAdmin {
   userList: IamUserInfo[] = [];
   groupList: IamGroupInfo[] = [];
   calls: string[] = [];
+  /** M18 C1 收口:createIamUser/patchIamUser 捕获的口令(真实侧只存哈希)。 */
+  passwords = new Map<string, string>();
+  private static pkey = (tenant: string, name: string) => `${tenant}${name}`;
   async keys() {
     return { keys: this.keyList };
   }
@@ -69,12 +72,13 @@ export class FakeAdmin {
       groups: [],
     };
     this.userList.push(u);
+    if (body.password !== undefined) this.passwords.set(FakeAdmin.pkey(u.tenant_id, u.name), body.password);
     return u;
   }
   async patchIamUser(
     tenant: string,
     name: string,
-    patch: { enabled?: boolean; display_name?: string | null; policies?: string[] },
+    patch: { enabled?: boolean; display_name?: string | null; policies?: string[]; password?: string | null },
   ) {
     this.calls.push(`user.patch:${name}:${JSON.stringify(patch)}`);
     const u = this.userList.find((x) => x.tenant_id === tenant && x.name === name);
@@ -82,7 +86,18 @@ export class FakeAdmin {
     if (patch.enabled !== undefined) u.enabled = patch.enabled;
     if (patch.display_name !== undefined) u.display_name = patch.display_name;
     if (patch.policies !== undefined) u.policies = [...patch.policies];
+    if (patch.password) this.passwords.set(FakeAdmin.pkey(tenant, name), patch.password);
     return u;
+  }
+  // M18 C1 收口:口令校验(镜像 Rust /v1/iam/verify-password 状态语义)。
+  async iamVerifyPassword(body: { tenant: string; user: string; password: string }) {
+    const u = this.userList.find((x) => x.tenant_id === body.tenant && x.name === body.user);
+    if (!u) return { ok: false as const };
+    if (u.enabled === false) return { ok: false as const, disabled: true };
+    if (this.passwords.get(FakeAdmin.pkey(body.tenant, body.user)) !== body.password) {
+      return { ok: false as const };
+    }
+    return { ok: true as const, user: u };
   }
   async iamGroups(tenant = "default") {
     return { tenant_id: tenant, groups: this.groupList.filter((g) => g.tenant_id === tenant) };

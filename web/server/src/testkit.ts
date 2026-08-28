@@ -270,6 +270,17 @@ export class FakeIam {
       async iamAuthorize(body: { tenant: string; user: string; action: string; target_tenant?: string }) {
         return { allow: iam.authorize(body) };
       },
+      // M18 C1 收口:口令校验(镜像 Rust /v1/iam/verify-password;真实侧
+      // 存哈希,本 fake 比对 createIamUser/patchIamUser 捕获的明文)。
+      async iamVerifyPassword(body: { tenant: string; user: string; password: string }) {
+        const u = iam.users.get(FakeIam.ukey(body.tenant, body.user));
+        if (!u) return { ok: false as const };
+        if (u.enabled === false) return { ok: false as const, disabled: true };
+        if (iam.passwords.get(FakeIam.ukey(body.tenant, body.user)) !== body.password) {
+          return { ok: false as const };
+        }
+        return { ok: true as const, user: u };
+      },
     };
   }
 }

@@ -2475,3 +2475,122 @@ fn admin_iam_authorize() {
 
     let _ = handle;
 }
+
+/// M18 C1 收口(ADR-28 DI2.1/DI4):POST /v1/iam/verify-password —— IAM
+/// 用户口令校验。钉死:口令对 → 200 {ok:true,user:安全视图(含 policies,
+/// 零口令材料)};口令错/未知用户/无本地口令 → 401 {ok:false};禁用 → 403;
+/// 字段缺失 → 400。
+#[test]
+fn admin_iam_verify_password() {
+    let (_d, img) = setup();
+    let cfg = EngineConfig {
+        devices: vec![img.clone()],
+        meta_dir: img.parent().unwrap().join("meta"),
+        ..Default::default()
+    };
+    let (sock, handle) = start_admin(&cfg, "t");
+    let sock = sock.trim_start_matches("unix://").to_string();
+    let sock = sock.as_str();
+
+    let verify = |tenant: &str, user: &str, password: &str| -> (u16, String) {
+        http_unix(
+            sock,
+            "POST",
+            "/v1/iam/verify-password",
+            Some(&format!(
+                r#"{{"tenant":"{tenant}","user":"{user}","password":"{password}"}}"#
+            )),
+            "t",
+        )
+    };
+
+    // 租户 ta + 三个用户:alice(带口令+策略)、nopw(无口令,LDAP/OIDC 型)、
+    // off(带口令,随后禁用)
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/tenants",
+        Some(r#"{"tenant_id":"ta"}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "{body}");
+    for (name, pw) in [
+        ("alice", Some("s3cret-A")),
+        ("nopw", None),
+        ("off", Some("s3cret-O")),
+    ] {
+        let body = match pw {
+            Some(p) => format!(r#"{{"tenant":"ta","name":"{name}","password":"{p}"}}"#),
+            None => format!(r#"{{"tenant":"ta","name":"{name}"}}"#),
+        };
+        let (code, body) = http_unix(sock, "POST", "/v1/iam/users", Some(&body), "t");
+        assert_eq!(code, 200, "{body}");
+    }
+    let (code, body) = http_unix(
+        sock,
+        "PATCH",
+        "/v1/iam/users/ta/alice",
+        Some(r#"{"policies":["readwrite"]}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "{body}");
+
+    // 口令对 → 200,ok:true,user 视图含 policies 且零口令材料
+    let (code, body) = verify("ta", "alice", "s3cret-A");
+    assert_eq!(code, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["user"]["tenant_id"], "ta");
+    assert_eq!(v["user"]["name"], "alice");
+    assert_eq!(v["user"]["policies"], serde_json::json!(["readwrite"]));
+    assert!(v["user"].get("password_hash").is_none());
+    assert!(v["user"].get("password_salt").is_none());
+
+    // 口令错 → 401 ok:false
+    let (code, body) = verify("ta", "alice", "wrong");
+    assert_eq!(code, 401, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["ok"],
+        false
+    );
+
+    // 未知用户 → 401(与口令错同口径,不泄露存在性)
+    let (code, _) = verify("ta", "ghost", "s3cret-A");
+    assert_eq!(code, 401);
+    // 未知租户 → 401
+    let (code, _) = verify("tb", "alice", "s3cret-A");
+    assert_eq!(code, 401);
+
+    // 无本地口令(LDAP/OIDC 身份)→ 恒 401
+    let (code, _) = verify("ta", "nopw", "anything");
+    assert_eq!(code, 401);
+
+    // 禁用 → 403 user_disabled
+    let (code, body) = http_unix(
+        sock,
+        "PATCH",
+        "/v1/iam/users/ta/off",
+        Some(r#"{"enabled":false}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "{body}");
+    let (code, body) = verify("ta", "off", "s3cret-O");
+    assert_eq!(code, 403, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "user_disabled");
+
+    // 字段缺失 → 400
+    let (code, _) = http_unix(sock, "POST", "/v1/iam/verify-password", Some(r#"{}"#), "t");
+    assert_eq!(code, 400);
+    let (code, _) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/verify-password",
+        Some(r#"{"tenant":"ta","user":"alice"}"#),
+        "t",
+    );
+    assert_eq!(code, 400);
+
+    let _ = handle;
+}
