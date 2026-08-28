@@ -1587,7 +1587,12 @@ B2 效果用例 + B3 s3-tests 出集或逐名;账号级 token 维持排除并写
 2. 生产清单:root 创建租户 + 首个 `tenantAdmin` 用户后,**部门管理员用自己的
    控制台账号**管用户/组/SA/本租户桶;root 口令进保管库,不进日常。
 3. 无 `tenantAdmin` 的租户禁止「所有人共用一把数据面 AK 当超管」。
-4. 审计:`who` = user 或 SA access key;root 操作强制记 `auth_note=root`。
+4. 审计:`who` = user 或 SA access key;root 使用由审计 `who` + 身份事件
+   (`GET /api/identity-events`)追踪。
+   修正记录(2026-08-28):原「root 操作强制记 `auth_note=root`」未实现。
+   原因:`auth_note` 语义本就限定认证失败侧写(`key_disabled`/
+   `key_not_found`/`session_token_invalid`/`user_disabled`,M15 C2 起),
+   root 追踪改由 `who` + identity-events 覆盖,避免双口径。
 
 **DI5(STS:引入本租户 Role,取代 D-E2「无角色实体」)**:
 
@@ -1599,6 +1604,9 @@ B2 效果用例 + B3 s3-tests 出集或逐名;账号级 token 维持排除并写
 3. **AssumeRoleWithLDAPIdentity / AssumeRoleWithWebIdentity**(MinIO 运维熟悉):
    校验 LDAP bind 或 OIDC token 成功 → 映射到本进程 User → 按配置 Role
    或用户生效策略签发临时 AK+token。数据面仍只认临时 AK,不在热路径打 LDAP。
+   **延期记录(2026-08-28,v2.4.0 未接线)**:需额外 STS 签发通路(管理面按
+   Role/用户生效策略签发);LDAP bind 登录与 OIDC JIT 已落地身份映射(DI6),
+   STS 变体随后续里程碑单评。compat 已登记。
 4. 会话存储沿用 `s:session`,字段增加 `role` / `user` / `tenant_id`;secret
    零落盘纪律不变。
 
@@ -1637,6 +1645,10 @@ B2 效果用例 + B3 s3-tests 出集或逐名;账号级 token 维持排除并写
 **DI9(Owner 与 s3-tests)**:
 
 1. 对象/桶 Owner = 创建者租户 `canonical_id` + 用户 display(或 SA 名)。
+   延期记录(2026-08-28):「用户 display / SA 名」部分 v2.4.0 未实现——
+   `ObjectMeta` 不记录创建者身份,Owner 回显的 `DisplayName` 恒 =
+   canonical_id;为回显加 creator 字段属更大 schema 变更,后续里程碑
+   单评(compat 已钉死,T2)。
 2. s3-tests 主/备用户必须配置**两把不同 AK、两个 User**(可同租户或两租户);
    据此收敛「单账号模型限制」表中依赖 alt 身份的用例(policy_multipart /
    copy_not_owned 等)——能出集的出集,仍依赖 ACL 写的维持 501 排除。
