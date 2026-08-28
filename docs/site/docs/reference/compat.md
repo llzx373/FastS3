@@ -137,9 +137,13 @@ meta-export/import 可见并可往返;真实类独立落 ObjectMeta v7 `storage_
 | canonical_id | 对外账号 ID(Owner/expected-bucket-owner 比对对象),**稳定不可改**;新建租户 = 创建时服务端随机 64 hex,仅 `default` 钉死 `"fasts3"`;`PATCH` 改 canonical_id 显式 400 |
 | IAM 命名字符集 | tenant_id / user / group / policy / role 名 = `[A-Za-z0-9_+=,.@-]{1,128}`(对齐 AWS IAM NameRegexString);**不转义、非法名直接拒绝**(InvalidArgument);`tn:` 单段式键,`iu:`/`ig:`/`ip:`/`ir:` 为 `{tenant}\0{name}` 两段式键 |
 | 控制台口令哈希 | 加盐 HMAC-SHA256(`HMAC-SHA256(salt, password)`,16 字节随机盐;与 `k:` secret 哈希同方案同档——ADR-28 DI2.1「Argon2id 或与现网同档」取后者,不引入新依赖);恒定时间比较;口令仅用于控制台登录,User 无 SigV4 secret |
-| 租户删除 | `default` 恒拒绝;非空租户(存在 `iu:`/`ig:`/`ip:`/`ir:` 实体)拒绝,不做级联删除 |
+| 租户删除 | `default` 恒拒绝;非空租户(存在 `iu:`/`ig:`/`ip:`/`ir:` 实体,或存在 `tenant_id` 等于该租户的 `k:` 密钥,M18 I2 起)拒绝,不做级联删除 |
+| 密钥属主(M18 I2) | `k:` 值扩展 `tenant_id`/`owner_user`/`embedded_policy`/`sa_name`(ADR-28 DI7.1,postcard 尾部追加);**值版本双读单写**:旧记录读时补默认 tenant=`default`、owner=`bootstrap`、embedded_policy/sa_name=None,写时恒落新格式,不做在线重写 |
+| bootstrap 用户 | 升级迁移(MetaStore::open)创建的**隐藏用户** `iu:default\0bootstrap`:enabled、无控制台口令(display_name 标记 upgrade-internal),仅用于挂载存量孤儿密钥,不参与日常登录 |
+| 用户禁用语义 | 禁用 User → 其全部 SA(数据面 `k:`)鉴权失败,错误码钉死 **InvalidAccessKeyId**(与「密钥不存在/被禁用」同义,口径同上节密钥状态语义);禁用单把 SA 不影响 User 控制台登录(ADR-28 DI7.3;数据面强制执行属 M18 S2) |
+| SA 嵌入策略 | `embedded_policy` 与属主生效策略**求交**,Deny 优先(与 policy.rs 现口径一致);完整评估属 M18 S2/U3,I2 仅落数据模型 |
 | 管理面 | Rust admin `/v1/iam/tenants` CRUD(root 可信通道;`admin:*` IAM 授权细分属 M18 C1) |
-| 备份 | meta-export v2 起含 `tenants` 字段(旧导出缺省 = 仅 default);IAM 口令哈希可导出供灾备,secret 明文仍零导出 |
+| 备份 | meta-export v2 起含 `tenants` 字段,M18 I2 起含 `users` 字段(口令哈希可导出供灾备);旧导出缺省 = 仅 default 租户 + bootstrap 用户;`k:` 旧 JSON 缺属主字段 → 导入补 default/bootstrap;secret 明文仍零导出 |
 
 
 

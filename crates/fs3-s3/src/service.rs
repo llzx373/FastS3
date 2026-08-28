@@ -396,11 +396,34 @@ impl S3Service {
 
     /// 运行时添加访问密钥(M3 密钥 CRUD):写 meta 持久化 + 更新认证表。
     /// 返回创建后的记录(secret 明文只在此刻持有,调用方负责下发一次)。
+    /// M18 I2 兼容路径:归属 default 租户 + bootstrap 隐藏用户(ADR-28
+    /// DI7.1);IAM 属主路径(S1 服务账号)用 add_key_owned。
     pub fn add_key(
         &self,
         access_key: &str,
         secret: &str,
         note: Option<String>,
+    ) -> Result<fs3_core::KeyRecord, S3Error> {
+        self.add_key_owned(
+            access_key,
+            secret,
+            note,
+            fs3_core::Tenant::DEFAULT_TENANT,
+            fs3_core::IamUser::BOOTSTRAP_USER,
+            None,
+        )
+    }
+
+    /// 带 IAM 属主的密钥创建(M18 I2;ADR-28 DI2.4/DI7.1;S1 服务账号
+    /// 创建路径用):tenant_id / owner_user / sa_name 落 KeyRecord。
+    pub fn add_key_owned(
+        &self,
+        access_key: &str,
+        secret: &str,
+        note: Option<String>,
+        tenant_id: &str,
+        owner_user: &str,
+        sa_name: Option<String>,
     ) -> Result<fs3_core::KeyRecord, S3Error> {
         let seed = self
             .engine
@@ -409,7 +432,8 @@ impl S3Service {
             .seed_salt()
             .map_err(|e| map_engine_error(e, "", ""))?;
         let rec = fs3_core::KeyRecord::new(access_key, secret, &seed, note)
-            .map_err(|e| map_engine_error(e, "", ""))?;
+            .map_err(|e| map_engine_error(e, "", ""))?
+            .with_iam_owner(tenant_id, owner_user, sa_name);
         self.engine
             .read()
             .meta()

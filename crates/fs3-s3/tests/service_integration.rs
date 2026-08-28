@@ -11994,3 +11994,101 @@ fn c2_auth_failure_audit_note_distinguishes_disabled() {
     let last = &ring[0];
     assert_eq!(last.auth_note.as_deref(), Some("key_disabled"), "{last:?}");
 }
+
+/// M18 I2(ADR-28 DI7.1)孤儿密钥:I2 前旧形态(KeyRecordV1)字节直写
+/// `k:`,重开经 open 迁移(default 租户 + 隐藏用户 bootstrap 落地)+
+/// decode_key_record 双读后属主 = default/bootstrap,鉴权仍成功
+/// (verify_secret / restore_keys_from_meta / SigV4 全链路)。
+/// 数据面「禁用 User → SA 失败」强制执行属 S2,不在本用例范围。
+#[test]
+fn i2_legacy_key_dual_read_orphan_auth_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("disk.img");
+    std::fs::File::create(&img)
+        .unwrap()
+        .set_len(128 * 1024 * 1024)
+        .unwrap();
+    fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
+    let cfg = fs3_engine::EngineConfig {
+        devices: vec![img],
+        meta_dir: dir.path().join("meta"),
+        ..Default::default()
+    };
+    // 第一阶段:构造 I2 前旧形态字节直写 k:(模拟存量库)
+    {
+        let mut engine = Engine::open(&cfg).unwrap();
+        let seed = engine.meta().seed_salt().unwrap();
+        let rec = fs3_core::KeyRecord::new("legacy-orphan", "orphan-secret", &seed, None).unwrap();
+        let v1 = fs3_core::KeyRecordV1 {
+            access_key: rec.access_key,
+            secret_hash: rec.secret_hash,
+            salt: rec.salt,
+            secret_cipher: rec.secret_cipher,
+            enabled: rec.enabled,
+            created: rec.created,
+            policy: rec.policy,
+            note: rec.note,
+        };
+        engine
+            .meta()
+            .put_key_value_raw("legacy-orphan", &postcard::to_allocvec(&v1).unwrap())
+            .unwrap();
+        engine.close().unwrap();
+    }
+    // 第二阶段:重开(open 迁移落地 bootstrap 用户),服务从 meta 恢复密钥
+    let engine = Arc::new(parking_lot::RwLock::new(Engine::open(&cfg).unwrap()));
+    let svc = S3Service::new(engine, vec![], "us-east-1".into(), false);
+    {
+        let engine = svc.engine();
+        let guard = engine.read();
+        // 双读:属主补默认(孤儿密钥挂 bootstrap)
+        let rec = guard.meta().get_key("legacy-orphan").unwrap().unwrap();
+        assert_eq!(rec.tenant_id, fs3_core::Tenant::DEFAULT_TENANT);
+        assert_eq!(rec.owner_user, fs3_core::IamUser::BOOTSTRAP_USER);
+        assert!(rec.verify_secret("orphan-secret"));
+        // 隐藏引导用户已由 open 迁移落地(无控制台口令)
+        let boot = guard
+            .meta()
+            .get_iam_user("default", "bootstrap")
+            .unwrap()
+            .unwrap();
+        assert!(boot.enabled);
+        assert_eq!(boot.password_hash, None);
+    }
+    // 认证表恢复 + SigV4 签名请求全链路鉴权成功
+    assert_eq!(svc.restore_keys_from_meta().unwrap(), 1);
+    let body: Vec<u8> = vec![];
+    let amz_date = auth::now_amz();
+    let hash = hex::encode(Sha256::digest(&body));
+    let mut headers: Vec<(String, String)> = vec![
+        ("host".into(), "localhost:9000".into()),
+        ("x-amz-date".into(), amz_date.clone()),
+        ("x-amz-content-sha256".into(), hash.clone()),
+    ];
+    let cred = Credentials {
+        access_key: "legacy-orphan".into(),
+        secret_key: "orphan-secret".into(),
+    };
+    let auth_hdr = auth::sign_request(
+        &cred,
+        "us-east-1",
+        "PUT",
+        "/orphan-bucket",
+        &[],
+        &headers,
+        &amz_date,
+        &PayloadHash::HexSha256(hash),
+    )
+    .unwrap();
+    headers.push(("authorization".into(), auth_hdr));
+    let r = svc.handle(&S3Request {
+        method: "PUT".into(),
+        raw_path: "/orphan-bucket".into(),
+        decoded_path: "/orphan-bucket".into(),
+        host: "localhost".into(),
+        query: vec![],
+        headers,
+        body,
+    });
+    assert_eq!(status(&r), 200, "孤儿密钥(legacy V1)鉴权成功: {r:?}");
+}

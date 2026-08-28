@@ -215,7 +215,7 @@
 - [x] I1 `tn:` / `iu:` / `ig:` / `ip:` / `ir:` 键前缀三处同步(keys.rs、meta-export/import、check 可达性);
   Tenant CRUD(root);升级:存量进入租户 `default`,canonical_id 钉死并写入 compat
   - 用例:`tenant_default_migration_preserves_existing_keys`;export 不含 secret 明文
-- [ ] I2 `KeyRecord` 增 tenant_id / owner_user / embedded_policy;旧键双读缺省 default+bootstrap 用户;
+- [x] I2 `KeyRecord` 增 tenant_id / owner_user / embedded_policy;旧键双读缺省 default+bootstrap 用户;
   在线值重写或打开时填充(ADR 钉死一种,自动回滚)
   - 用例:`key_record_vN_roundtrip_owner`;孤儿密钥挂 bootstrap,鉴权仍成功
 

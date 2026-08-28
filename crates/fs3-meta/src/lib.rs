@@ -579,9 +579,14 @@ pub enum Op {
     TenantPut {
         tenant: fs3_core::Tenant,
     },
+    /// 写/更新 IAM 用户(`iu:{tenant}\0{user}` → IamUser;M18 I2;
+    /// 覆盖语义,同 KeyPut/TenantPut 先例)。
+    IamUserPut {
+        user: fs3_core::IamUser,
+    },
     /// 删除 IAM 租户。**非空拒绝**:事务内扫描 `iu:`/`ig:`/`ip:`/`ir:`
-    /// 租户子前缀,存在任何 IAM 实体 → InvalidArgument。
-    /// TODO(M18/I2):`k:` 属主字段落地后补「该租户仍持有密钥」拒绝检查。
+    /// 租户子前缀与 `k:` 属主字段(M18 I2),存在任何 IAM 实体或本租户
+    /// 持有的密钥 → InvalidArgument。
     TenantDelete {
         tenant_id: String,
     },
@@ -804,6 +809,22 @@ fn decode_notification_rule(v: &[u8]) -> Result<fs3_core::NotificationRule> {
                 enabled: old.enabled,
                 filter: fs3_core::NotificationKeyFilter::default(),
             })
+        }
+    }
+}
+
+/// 密钥记录值解码(M18 I2;ADR-28 DI7.1 值版本双读单写):新格式优先,
+/// 失败回退 I2 前旧形态(KeyRecordV1)补默认 —— tenant = `default`、
+/// owner = `bootstrap`(隐藏用户,MetaStore::open 的 ensure_bootstrap_user
+/// 落地)、embedded_policy / sa_name = None。写路径恒序列化当前结构
+/// (单写),照 decode_lifecycle_rule / decode_session 先例,零迁移。
+fn decode_key_record(v: &[u8]) -> Result<fs3_core::KeyRecord> {
+    match postcard::from_bytes::<fs3_core::KeyRecord>(v) {
+        Ok(r) => Ok(r),
+        Err(_) => {
+            let old: fs3_core::KeyRecordV1 = postcard::from_bytes(v)
+                .map_err(|e| Error::Corrupt(format!("postcard decode key record: {e}")))?;
+            Ok(old.upgrade())
         }
     }
 }
@@ -1371,6 +1392,9 @@ impl MetaStore {
         // M18 I1(ADR-28 DI1.3)升级迁移:存量部署隐式落入租户 default
         // (canonical_id 钉死 "fasts3");幂等,首次打开即落地。
         store.ensure_default_tenant()?;
+        // M18 I2(ADR-28 DI7.1)升级迁移:隐藏引导用户 bootstrap 落地,
+        // 承接存量孤儿 `k:` 密钥的属主字段(双读默认 owner=bootstrap)。
+        store.ensure_bootstrap_user()?;
         Ok(store)
     }
 
@@ -2894,12 +2918,12 @@ impl MetaStore {
         }])
     }
 
-    /// 读访问密钥。
+    /// 读访问密钥(M18 I2:decode_key_record 双读,旧值补默认属主)。
     pub fn get_key(&self, access_key: &str) -> Result<Option<fs3_core::KeyRecord>> {
         let k = key_key(access_key);
         match self.db.get(&k).map_err(rocks_err)? {
             Some(v) => {
-                Ok(Some(decode(&v).map_err(|e| {
+                Ok(Some(decode_key_record(&v).map_err(|e| {
                     Error::Corrupt(format!("key {access_key}: {e}"))
                 })?))
             }
@@ -2907,7 +2931,7 @@ impl MetaStore {
         }
     }
 
-    /// 列全部访问密钥(按 access_key 排序)。
+    /// 列全部访问密钥(按 access_key 排序;M18 I2:双读同 get_key)。
     pub fn list_keys(&self) -> Result<Vec<fs3_core::KeyRecord>> {
         let mut out = Vec::new();
         for item in self
@@ -2918,7 +2942,9 @@ impl MetaStore {
             if !k.starts_with(PREFIX_KEY) {
                 break;
             }
-            out.push(decode(&v).map_err(|e| Error::Corrupt(format!("key record: {e}")))?);
+            out.push(
+                decode_key_record(&v).map_err(|e| Error::Corrupt(format!("key record: {e}")))?,
+            );
         }
         Ok(out)
     }
@@ -2997,6 +3023,72 @@ impl MetaStore {
             .put(tenant_key(&tenant.tenant_id)?, encode(&tenant)?)
             .map_err(rocks_err)?;
         self.db.flush_wal(true).map_err(rocks_err)
+    }
+
+    /// 升级迁移(M18 I2;ADR-28 DI7.1):`iu:default\0bootstrap` 缺席 →
+    /// 创建隐藏引导用户(enabled、无控制台口令、display_name 标记升级
+    /// 内部用途;仅用于挂载存量孤儿 `k:` 密钥,不参与日常登录)。
+    /// 幂等;MetaStore::open 单点调用(随 ensure_default_tenant 之后),
+    /// 不经事务不增 seq(同租户迁移先例)。
+    pub fn ensure_bootstrap_user(&self) -> Result<()> {
+        let k = iam_user_key(
+            fs3_core::Tenant::DEFAULT_TENANT,
+            fs3_core::IamUser::BOOTSTRAP_USER,
+        )?;
+        if self.db.get(&k).map_err(rocks_err)?.is_some() {
+            return Ok(());
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let user = fs3_core::IamUser {
+            tenant_id: fs3_core::Tenant::DEFAULT_TENANT.to_string(),
+            name: fs3_core::IamUser::BOOTSTRAP_USER.to_string(),
+            enabled: true,
+            password_hash: None,
+            password_salt: None,
+            policies: Vec::new(),
+            groups: Vec::new(),
+            display_name: Some("bootstrap (upgrade-internal; holds orphan keys)".into()),
+            created_at: now,
+        };
+        self.db.put(k, encode(&user)?).map_err(rocks_err)?;
+        self.db.flush_wal(true).map_err(rocks_err)
+    }
+
+    // —— IAM 用户(M18;ADR-28 DI2.1) ——
+
+    /// 写/更新 IAM 用户(覆盖语义;非法名 → InvalidArgument)。
+    pub fn commit_iam_user_put(&self, user: &fs3_core::IamUser) -> Result<u64> {
+        self.commit(&[Op::IamUserPut { user: user.clone() }])
+    }
+
+    /// 读 IAM 用户。
+    pub fn get_iam_user(&self, tenant: &str, name: &str) -> Result<Option<fs3_core::IamUser>> {
+        let k = iam_user_key(tenant, name)?;
+        match self.db.get(&k).map_err(rocks_err)? {
+            Some(v) => Ok(Some(decode(&v).map_err(|e| {
+                Error::Corrupt(format!("iam user {tenant}/{name}: {e}"))
+            })?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 列全部 IAM 用户(按 `{tenant}\0{name}` 排序;导出/灾备恢复用)。
+    pub fn list_iam_users(&self) -> Result<Vec<fs3_core::IamUser>> {
+        let mut out = Vec::new();
+        for item in self
+            .db
+            .iterator(IteratorMode::From(PREFIX_IAM_USER, Direction::Forward))
+        {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(PREFIX_IAM_USER) {
+                break;
+            }
+            out.push(decode(&v).map_err(|e| Error::Corrupt(format!("iam user record: {e}")))?);
+        }
+        Ok(out)
     }
 
     /// 对象 PUT + 分配记录 + 桶统计(ADR-4 同事务)。
@@ -3418,6 +3510,15 @@ impl MetaStore {
             None => object_key(bucket, key),
         };
         self.db.put(k, value).map_err(rocks_err)?;
+        self.db.flush_wal(true).map_err(rocks_err)
+    }
+
+    /// 测试/演练专用:以原始字节直写密钥值(构造 M18 I2 前旧形态
+    /// KeyRecordV1 存量值夹具,decode_key_record 双读用)。生产路径恒走
+    /// commit_key_put(单写当前结构),勿用。
+    #[doc(hidden)]
+    pub fn put_key_value_raw(&self, access_key: &str, value: &[u8]) -> Result<()> {
+        self.db.put(key_key(access_key), value).map_err(rocks_err)?;
         self.db.flush_wal(true).map_err(rocks_err)
     }
 
@@ -4286,7 +4387,10 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
                     return Err(Error::NotFound(format!("tenant {tenant_id}")));
                 }
                 // 非空拒绝:租户下存在任何 IAM 实体 → 拒绝(DI1 隔离边界,
-                // 不做级联删除)。`k:` 属主检查待 I2(KeyRecord 尚无 tenant 字段)。
+                // 不做级联删除)。M18 I2:`k:` 属主检查 —— 任一密钥
+                // tenant_id == 本租户 → 拒绝(双读:旧记录按 default 计,
+                // 不拦截非 default 删除;迭代器读不入冲突集,由上面的
+                // tget(tn:{id}) 锚点检出并发变更,同 tprefix_nonempty 纪律)。
                 for prefix in [
                     iam_user_prefix(tenant_id)?,
                     iam_group_prefix(tenant_id)?,
@@ -4299,7 +4403,24 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
                         )));
                     }
                 }
+                let mut it = tx.iterator(IteratorMode::From(PREFIX_KEY, Direction::Forward));
+                for item in &mut it {
+                    let (kk, v) = item.map_err(rocks_err)?;
+                    if !kk.starts_with(PREFIX_KEY) {
+                        break;
+                    }
+                    if decode_key_record(&v)?.tenant_id == *tenant_id {
+                        return Err(Error::InvalidArgument(format!(
+                            "tenant {tenant_id} not empty (keys exist)"
+                        )));
+                    }
+                }
                 tremove(tx, &k)?;
+            }
+            Op::IamUserPut { user } => {
+                let k = iam_user_key(&user.tenant_id, &user.name)?;
+                tget(tx, &k)?;
+                tinsert(tx, k, encode(user)?)?;
             }
         }
     }
@@ -5257,6 +5378,155 @@ mod tests {
         ));
         s.db.delete(iam_user_key("acme", "alice").unwrap()).unwrap();
         s.commit_tenant_delete("acme").unwrap();
+        // M18 I2:`k:` 属主检查 —— 租户仍持有密钥 → 删除拒绝
+        let owned = fs3_core::KeyRecord::new("AKIA_ACME", "acme-secret", &[9u8; 32], None)
+            .unwrap()
+            .with_iam_owner("acme", "alice", None);
+        s.commit_tenant_put(&t).unwrap();
+        s.commit_key_put(&owned).unwrap();
+        assert!(matches!(
+            s.commit_tenant_delete("acme"),
+            Err(Error::InvalidArgument(_))
+        ));
+        // 他租户/default 密钥不拦截(default 属主钥匙不影响 acme 删除)
+        s.commit_key_put(
+            &fs3_core::KeyRecord::new("AKIA_DFLT", "dflt-secret", &[9u8; 32], None).unwrap(),
+        )
+        .unwrap();
+        s.commit_key_delete("AKIA_ACME").unwrap();
+        s.commit_tenant_delete("acme").unwrap();
+        s.commit_key_delete("AKIA_DFLT").unwrap();
+    }
+
+    /// M18 I2(ADR-28 DI7.1)值版本双读单写:I2 前旧形态(KeyRecordV1)
+    /// 字节经 decode_key_record / get_key / list_keys 补默认
+    /// (tenant=default、owner=bootstrap、embedded_policy/sa_name=None);
+    /// 鉴权材料(verify/decrypt)完好 —— 孤儿密钥挂 bootstrap 仍可认证;
+    /// 新结构读写往返保真(单写侧)。
+    #[test]
+    #[allow(non_snake_case)] // 用例名按 TODO M18/I2 钉死
+    fn key_record_vN_roundtrip_owner() {
+        let (_d, s) = open_tmp();
+        let seed = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let rec = fs3_core::KeyRecord::new("AKIA_V1", "v1-secret", seed, None).unwrap();
+        // 构造 I2 前旧形态字节并直写 k:(模拟存量库)
+        let v1 = fs3_core::KeyRecordV1 {
+            access_key: rec.access_key.clone(),
+            secret_hash: rec.secret_hash.clone(),
+            salt: rec.salt.clone(),
+            secret_cipher: rec.secret_cipher.clone(),
+            enabled: rec.enabled,
+            created: rec.created,
+            policy: rec.policy.clone(),
+            note: rec.note.clone(),
+        };
+        let raw = postcard::to_allocvec(&v1).unwrap();
+        s.put_key_value_raw("AKIA_V1", &raw).unwrap();
+        // 双读:补默认属主;鉴权材料完好
+        let got = s.get_key("AKIA_V1").unwrap().unwrap();
+        assert_eq!(got.tenant_id, fs3_core::Tenant::DEFAULT_TENANT);
+        assert_eq!(got.owner_user, fs3_core::IamUser::BOOTSTRAP_USER);
+        assert_eq!(got.embedded_policy, None);
+        assert_eq!(got.sa_name, None);
+        assert!(got.verify_secret("v1-secret"));
+        assert_eq!(got.decrypt_secret(seed).unwrap(), "v1-secret");
+        // list_keys 同走双读
+        assert_eq!(s.list_keys().unwrap(), vec![got.clone()]);
+        // 单写:任何写路径落当前结构,之后按新格式解码成功
+        s.commit_key_put(&got).unwrap();
+        let raw2 = s.db.get(key_key("AKIA_V1")).unwrap().unwrap();
+        assert!(postcard::from_bytes::<fs3_core::KeyRecord>(&raw2).is_ok());
+        // 新结构往返保真(含 IAM 属主字段)
+        let sa = fs3_core::KeyRecord::new("AKIA_SA", "sa-secret", seed, None)
+            .unwrap()
+            .with_iam_owner("acme", "alice", Some("ci".into()));
+        s.commit_key_put(&sa).unwrap();
+        assert_eq!(s.get_key("AKIA_SA").unwrap().unwrap(), sa);
+    }
+
+    /// M18 I2 升级迁移(ADR-28 DI7.1):隐藏引导用户 bootstrap 随 open 落
+    /// 地(enabled、无控制台口令、display_name 标记升级内部用途);幂等
+    /// (重开不覆盖、不重复);不经事务不增 seq。
+    #[test]
+    fn bootstrap_user_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let s = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
+            let u = s
+                .get_iam_user("default", fs3_core::IamUser::BOOTSTRAP_USER)
+                .unwrap()
+                .unwrap();
+            assert_eq!(u.tenant_id, "default");
+            assert_eq!(u.name, "bootstrap");
+            assert!(u.enabled);
+            assert_eq!(u.password_hash, None, "隐藏用户无控制台口令");
+            assert_eq!(u.password_salt, None);
+            assert!(!u.verify_password("anything"));
+            assert!(
+                u.display_name.as_deref().unwrap().contains("upgrade"),
+                "display_name 标记升级内部用途: {:?}",
+                u.display_name
+            );
+            assert_eq!(s.last_seq().unwrap(), 0, "迁移不经事务不增 seq");
+            let created = u.created_at;
+            // 幂等:重复调用与重开都不覆盖
+            s.ensure_bootstrap_user().unwrap();
+            assert_eq!(
+                s.get_iam_user("default", "bootstrap")
+                    .unwrap()
+                    .unwrap()
+                    .created_at,
+                created
+            );
+        }
+        let s = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
+        assert_eq!(
+            s.list_iam_users()
+                .unwrap()
+                .iter()
+                .map(|u| u.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bootstrap"]
+        );
+    }
+
+    /// M18 I2:IamUser CRUD 往返(commit/get/list;非法名拒绝)。
+    #[test]
+    fn iam_user_crud_roundtrip() {
+        let (_d, s) = open_tmp();
+        let salt = fs3_core::IamUser::new_password_salt().unwrap();
+        let u = fs3_core::IamUser {
+            tenant_id: "default".into(),
+            name: "alice".into(),
+            enabled: true,
+            password_hash: Some(fs3_core::IamUser::hash_password(&salt, "pw")),
+            password_salt: Some(salt),
+            policies: vec!["readwrite".into()],
+            groups: vec![],
+            display_name: None,
+            created_at: 1_700_000_000,
+        };
+        s.commit_iam_user_put(&u).unwrap();
+        assert_eq!(
+            s.get_iam_user("default", "alice").unwrap().as_ref(),
+            Some(&u)
+        );
+        assert_eq!(
+            s.list_iam_users()
+                .unwrap()
+                .iter()
+                .map(|x| x.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alice", "bootstrap"]
+        );
+        let bad = fs3_core::IamUser {
+            name: "a b".into(),
+            ..u.clone()
+        };
+        assert!(matches!(
+            s.commit_iam_user_put(&bad),
+            Err(Error::InvalidArgument(_))
+        ));
     }
 
     /// M18 I1 升级迁移(ADR-28 DI1.3):存量部署(已有 k: 密钥/桶/对象,

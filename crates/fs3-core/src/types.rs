@@ -1588,6 +1588,11 @@ impl BucketStats {
 ///
 /// secret 磁盘存储 = 加盐哈希(校验)+ AES-256-GCM 密文(重启恢复明文,
 /// 密钥派生自持久化种子盐);admin API 只在创建时下发一次明文。
+///
+/// 演进纪律:结构只许尾部追加字段/变体(postcard 序,同 SessionRecord);
+/// I2 前旧值经 fs3-meta `decode_key_record` 双读回退补默认
+/// (ADR-28 DI7.1 值版本双读单写;写路径恒序列化当前结构)。
+/// serde 默认值同时服务 meta-export 旧 JSON 导入(v2 导出无新增字段)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyRecord {
     pub access_key: String,
@@ -1605,6 +1610,68 @@ pub struct KeyRecord {
     pub policy: Option<String>,
     /// 备注(可选)。
     pub note: Option<String>,
+    /// 所属租户(M18 I2;ADR-28 DI7.1;`tn:` 引用;旧值双读补 `default`)。
+    #[serde(default = "key_record_default_tenant")]
+    pub tenant_id: String,
+    /// 属主用户(M18 I2;`iu:{tenant}\0{user}` 引用;旧值双读补隐藏用户
+    /// `bootstrap`)。禁用属主 → 其全部 SA 鉴权失败 InvalidAccessKeyId
+    /// (DI7.3;数据面强制执行属 S2)。
+    #[serde(default = "key_record_default_owner")]
+    pub owner_user: String,
+    /// SA 嵌入策略 JSON(M18 I2;可选;与属主生效策略求交,Deny 优先;
+    /// 完整评估属 S2/U3)。
+    #[serde(default)]
+    pub embedded_policy: Option<String>,
+    /// SA 展示名(M18 I2;可选;Owner 显示用,DI9)。
+    #[serde(default)]
+    pub sa_name: Option<String>,
+}
+
+/// KeyRecord 旧值/旧导出 JSON 双读默认:默认租户(ADR-28 DI7.1)。
+fn key_record_default_tenant() -> String {
+    Tenant::DEFAULT_TENANT.to_string()
+}
+
+/// KeyRecord 旧值/旧导出 JSON 双读默认:隐藏引导用户(ADR-28 DI7.1)。
+fn key_record_default_owner() -> String {
+    IamUser::BOOTSTRAP_USER.to_string()
+}
+
+/// M18 I2(ADR-28 DI7.1)双读回退用旧形态(I2 前字段集,无属主/租户)。
+/// 仅 fs3-meta `decode_key_record` 回退臂与旧值夹具构造使用;新代码
+/// 一律写当前 `KeyRecord`(单写)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyRecordV1 {
+    pub access_key: String,
+    pub secret_hash: String,
+    pub salt: String,
+    pub secret_cipher: String,
+    pub enabled: bool,
+    pub created: i64,
+    pub policy: Option<String>,
+    pub note: Option<String>,
+}
+
+impl KeyRecordV1 {
+    /// 旧记录升级(ADR-28 DI7.1 钉死):tenant = `default`、
+    /// owner = `bootstrap`(升级创建的隐藏用户,仅挂载孤儿密钥)、
+    /// embedded_policy / sa_name = None。
+    pub fn upgrade(self) -> KeyRecord {
+        KeyRecord {
+            access_key: self.access_key,
+            secret_hash: self.secret_hash,
+            salt: self.salt,
+            secret_cipher: self.secret_cipher,
+            enabled: self.enabled,
+            created: self.created,
+            policy: self.policy,
+            note: self.note,
+            tenant_id: key_record_default_tenant(),
+            owner_user: key_record_default_owner(),
+            embedded_policy: None,
+            sa_name: None,
+        }
+    }
 }
 
 impl KeyRecord {
@@ -1688,7 +1755,27 @@ impl KeyRecord {
                 .unwrap_or(0),
             policy: None,
             note,
+            // M18 I2(ADR-28 DI7.1):既有调用点(向导/运行时补建/admin
+            // 创建)默认归属 default 租户 + bootstrap 隐藏用户;IAM 属主
+            // 路径(S1 服务账号)用 with_iam_owner 指定。
+            tenant_id: key_record_default_tenant(),
+            owner_user: key_record_default_owner(),
+            embedded_policy: None,
+            sa_name: None,
         })
+    }
+
+    /// 指定 IAM 属主(builder;M18 I2,S1 服务账号创建路径用)。
+    pub fn with_iam_owner(
+        mut self,
+        tenant_id: &str,
+        owner_user: &str,
+        sa_name: Option<String>,
+    ) -> Self {
+        self.tenant_id = tenant_id.to_string();
+        self.owner_user = owner_user.to_string();
+        self.sa_name = sa_name;
+        self
     }
 }
 
@@ -1810,6 +1897,11 @@ pub struct IamUser {
 }
 
 impl IamUser {
+    /// 升级迁移创建的隐藏用户(M18 I2;ADR-28 DI7.1):仅用于挂载孤儿
+    /// 密钥(存量 `k:` 无属主时的默认属主),无控制台口令、不参与日常
+    /// 登录。compat 钉死。
+    pub const BOOTSTRAP_USER: &'static str = "bootstrap";
+
     /// 计算口令加盐哈希:HMAC-SHA256(salt, password) → hex(复用
     /// KeyRecord::hash_secret 同一份实现,方案同档钉死于 compat)。
     pub fn hash_password(salt: &str, password: &str) -> String {
@@ -3023,6 +3115,55 @@ mod tests {
         let dec: KeyRecord = postcard::from_bytes(&enc).unwrap();
         assert_eq!(rec, dec);
         assert_eq!(dec.decrypt_secret(seed).unwrap(), "s3cr3t-value");
+        // M18 I2(ADR-28 DI7.1):new 默认归属 default 租户 + bootstrap 属主
+        assert_eq!(rec.tenant_id, Tenant::DEFAULT_TENANT);
+        assert_eq!(rec.owner_user, IamUser::BOOTSTRAP_USER);
+        assert_eq!(rec.embedded_policy, None);
+        assert_eq!(rec.sa_name, None);
+    }
+
+    /// M18 I2(ADR-28 DI7.1):I2 前旧形态(KeyRecordV1)postcard 字节
+    /// 升级补默认(default 租户 + bootstrap 属主);指定属主的 builder
+    /// 覆盖默认;新结构 postcard 往返保真(双读单写的「单写」侧)。
+    #[test]
+    fn key_record_v1_upgrade_fills_owner_defaults() {
+        let seed = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let rec = KeyRecord::new("AKIA_OLD", "old-secret", seed, Some("n".into())).unwrap();
+        // 构造旧形态字节(字段集 = I2 前)
+        let v1 = KeyRecordV1 {
+            access_key: rec.access_key.clone(),
+            secret_hash: rec.secret_hash.clone(),
+            salt: rec.salt.clone(),
+            secret_cipher: rec.secret_cipher.clone(),
+            enabled: rec.enabled,
+            created: rec.created,
+            policy: rec.policy.clone(),
+            note: rec.note.clone(),
+        };
+        let bytes = postcard::to_allocvec(&v1).unwrap();
+        // 旧字节按新结构直接解码必须失败(尾部字段缺失)→ 走回退臂
+        assert!(postcard::from_bytes::<KeyRecord>(&bytes).is_err());
+        let dec: KeyRecordV1 = postcard::from_bytes(&bytes).unwrap();
+        let up = dec.upgrade();
+        assert_eq!(up.access_key, "AKIA_OLD");
+        assert_eq!(up.tenant_id, Tenant::DEFAULT_TENANT);
+        assert_eq!(up.owner_user, IamUser::BOOTSTRAP_USER);
+        assert_eq!(up.embedded_policy, None);
+        assert_eq!(up.sa_name, None);
+        assert_eq!(up.note.as_deref(), Some("n"));
+        // 孤儿密钥鉴权材料完好(verify/decrypt 不受升级影响)
+        assert!(up.verify_secret("old-secret"));
+        assert_eq!(up.decrypt_secret(seed).unwrap(), "old-secret");
+        // 升级结果按新结构序列化 → 新结构往返(单写)
+        let enc = postcard::to_allocvec(&up).unwrap();
+        assert_eq!(postcard::from_bytes::<KeyRecord>(&enc).unwrap(), up);
+        // builder 覆盖默认属主
+        let sa = KeyRecord::new("AKIA_SA", "sa-secret", seed, None)
+            .unwrap()
+            .with_iam_owner("acme", "alice", Some("ci-bot".into()));
+        assert_eq!(sa.tenant_id, "acme");
+        assert_eq!(sa.owner_user, "alice");
+        assert_eq!(sa.sa_name.as_deref(), Some("ci-bot"));
     }
 
     /// M18 I1(ADR-28 DI1/DI2):IAM 实体 postcard 往返 + 口令哈希语义。

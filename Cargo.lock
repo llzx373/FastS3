@@ -687,6 +687,7 @@ dependencies = [
  "libc",
  "md-5",
  "parking_lot",
+ "postcard",
  "proptest",
  "quick-xml",
  "serde_json",

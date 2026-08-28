@@ -541,6 +541,12 @@ pub struct MetaExportFile {
     /// 无此字段)→ 空表,导入侧 ensure_default_tenant 已兜底 default。
     #[serde(default)]
     pub tenants: Vec<fs3_core::Tenant>,
+    /// IAM 用户(M18 I2;ADR-28 DI2.1 + 键前缀三处同步之二:`iu:` 登记于
+    /// fs3-meta keys.rs;口令**哈希**可导出供灾备,明文与 `k:` secret 仍
+    /// 零导出)。含迁移落地的隐藏用户 bootstrap(挂载孤儿密钥)。旧导出
+    /// (无此字段)→ 空表,导入侧 ensure_bootstrap_user 兜底 bootstrap。
+    #[serde(default)]
+    pub users: Vec<fs3_core::IamUser>,
     pub objects: Vec<ObjectEntryDto>,
     pub uploads: Vec<UploadDto>,
 }
@@ -663,6 +669,10 @@ pub fn run_meta_export(
     // M18 I1:IAM 租户(含迁移落地的 default;无秘密材料,随导出)
     let tenants = store.list_tenants()?;
 
+    // M18 I2:IAM 用户(含迁移落地的隐藏用户 bootstrap;口令哈希可导出
+    // 供灾备,明文不出现 —— IamUser 只存哈希)
+    let users = store.list_iam_users()?;
+
     // M10 V5-1:版本化桶逐版本条目导出(含删除标记与 null 槽),vk 不丢 ——
     // 键形态经 ObjectDto.version_id 承载(None/"null"/hex 三态)。
     let objects: Vec<ObjectEntryDto> = store
@@ -703,6 +713,7 @@ pub fn run_meta_export(
         buckets,
         keys,
         tenants,
+        users,
         objects,
         uploads,
     };
@@ -712,10 +723,11 @@ pub fn run_meta_export(
 
     write_private(&args.output, json.as_bytes())?;
     println!(
-        "meta-export: {} buckets, {} keys, {} tenants, {} objects, {} uploads → {}",
+        "meta-export: {} buckets, {} keys, {} tenants, {} users, {} objects, {} uploads → {}",
         file.buckets.len(),
         file.keys.len(),
         file.tenants.len(),
+        file.users.len(),
         file.objects.len(),
         file.uploads.len(),
         args.output.display()
@@ -894,6 +906,14 @@ pub fn run_meta_import(
     // default,语义等同「存量隐式 default」迁移。
     for t in &file.tenants {
         store.commit_tenant_put(t)?;
+    }
+
+    // 5c) IAM 用户(M18 I2):原样恢复(覆盖语义;MetaStore::open 的
+    // ensure_bootstrap_user 已先落地 bootstrap,导出中的 bootstrap 记录
+    // 以其原值覆盖)。口令哈希随记录恢复(灾备口径,compat 钉死);旧导出
+    // (无 users 字段)→ 仅 bootstrap,语义等同「孤儿密钥挂 bootstrap」。
+    for u in &file.users {
+        store.commit_iam_user_put(u)?;
     }
 
     // 6) 对象:段校验(布局边界/对齐)+ 分配草稿 + 零统计增量
@@ -1848,6 +1868,129 @@ mod tests {
         assert_eq!(
             rec.decrypt_secret(&store.seed_salt().unwrap()).unwrap(),
             secret
+        );
+    }
+
+    /// M18 I2(ADR-28 DI7.1):`users` 随 export/import 往返(含迁移落地
+    /// 的隐藏用户 bootstrap);手写旧格式 JSON(剥离 KeyRecord 新增字段 +
+    /// 无 users 字段)导入 → 属主字段补默认(default/bootstrap),
+    /// bootstrap 由 open 迁移兜底;导出 JSON 不含 secret 明文。
+    #[test]
+    fn key_owner_export_import_roundtrip_defaults() {
+        let (dir, img1, img2) = tmp_devices();
+        let img3 = dir.path().join("disk3.img");
+        std::fs::copy(&img1, &img3).unwrap();
+        let meta1 = dir.path().join("meta1");
+        let meta2 = dir.path().join("meta2");
+        let meta3 = dir.path().join("meta3");
+        let secret = "plaintext-secret-never-exported-i2-0123456789";
+        let salt = fs3_core::IamUser::new_password_salt().unwrap();
+        let alice = fs3_core::IamUser {
+            tenant_id: "default".into(),
+            name: "alice".into(),
+            enabled: true,
+            password_hash: Some(fs3_core::IamUser::hash_password(&salt, "console-pw")),
+            password_salt: Some(salt),
+            policies: vec!["readwrite".into()],
+            groups: vec![],
+            display_name: None,
+            created_at: 1_700_000_000,
+        };
+        {
+            let mut e = fs3_engine::Engine::open(&engine_cfg(&img1, &meta1)).unwrap();
+            let seed = e.meta().seed_salt().unwrap();
+            let rec = fs3_core::KeyRecord::new("AKIA_OWNED", secret, &seed, None)
+                .unwrap()
+                .with_iam_owner("default", "alice", Some("ci-bot".into()));
+            e.meta().commit_key_put(&rec).unwrap();
+            e.meta().commit_iam_user_put(&alice).unwrap();
+            e.close().unwrap();
+        }
+        let export = dir.path().join("export.json");
+        run_meta_export(
+            &img1,
+            &meta1,
+            &MetaExportArgs {
+                output: export.clone(),
+            },
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&export).unwrap();
+        // 红线:secret/口令明文零导出
+        assert!(!text.contains(secret), "导出含 secret 明文");
+        assert!(!text.contains("console-pw"), "导出含控制台口令明文");
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        // users 含 bootstrap(迁移落地)+ alice;key 属主字段导出保真
+        let users = json["users"].as_array().unwrap();
+        assert_eq!(users.len(), 2);
+        assert!(users.iter().any(|u| u["name"] == "bootstrap"
+            && u["tenant_id"] == "default"
+            && u["password_hash"].is_null()));
+        assert!(users.iter().any(|u| u["name"] == "alice"));
+        assert_eq!(json["keys"][0]["owner_user"], "alice");
+        assert_eq!(json["keys"][0]["sa_name"], "ci-bot");
+
+        // 全量往返:users 与 key 属主字段原样恢复
+        std::fs::copy(&img1, &img2).unwrap();
+        run_meta_import(
+            &img2,
+            &meta2,
+            &MetaImportArgs {
+                input: export.clone(),
+                force: false,
+            },
+        )
+        .unwrap();
+        let store2 = MetaStore::open(&meta2, &MetaConfig::default()).unwrap();
+        assert_eq!(
+            store2.get_iam_user("default", "alice").unwrap().as_ref(),
+            Some(&alice)
+        );
+        assert!(store2
+            .get_iam_user("default", "bootstrap")
+            .unwrap()
+            .is_some());
+        let rec2 = store2.get_key("AKIA_OWNED").unwrap().unwrap();
+        assert_eq!(rec2.owner_user, "alice");
+        assert_eq!(rec2.sa_name.as_deref(), Some("ci-bot"));
+        assert!(rec2.verify_secret(secret));
+
+        // 旧格式 JSON(I2 前:keys 无属主字段、顶层无 users)→ 双读补默认
+        let mut old = json.clone();
+        for k in old["keys"].as_array_mut().unwrap() {
+            let ko = k.as_object_mut().unwrap();
+            for f in ["tenant_id", "owner_user", "embedded_policy", "sa_name"] {
+                ko.remove(f);
+            }
+        }
+        old.as_object_mut().unwrap().remove("users");
+        let old_path = dir.path().join("export-old.json");
+        std::fs::write(&old_path, serde_json::to_string_pretty(&old).unwrap()).unwrap();
+        run_meta_import(
+            &img3,
+            &meta3,
+            &MetaImportArgs {
+                input: old_path,
+                force: false,
+            },
+        )
+        .unwrap();
+        let store3 = MetaStore::open(&meta3, &MetaConfig::default()).unwrap();
+        let rec3 = store3.get_key("AKIA_OWNED").unwrap().unwrap();
+        assert_eq!(rec3.tenant_id, fs3_core::Tenant::DEFAULT_TENANT);
+        assert_eq!(rec3.owner_user, fs3_core::IamUser::BOOTSTRAP_USER);
+        assert_eq!(rec3.embedded_policy, None);
+        assert_eq!(rec3.sa_name, None);
+        assert!(rec3.verify_secret(secret));
+        // users 字段缺席 → 迁移兜底 bootstrap(孤儿密钥属主可解析)
+        assert_eq!(
+            store3
+                .list_iam_users()
+                .unwrap()
+                .iter()
+                .map(|u| u.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bootstrap"]
         );
     }
 
