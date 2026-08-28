@@ -257,7 +257,7 @@
 - [x] C1 JWT 只证明身份;授权查 IAM `admin:*`。控制台页:用户/组/策略/SA/角色;租户页仅 root。
   废除以 JWT `admin|readonly` 为授权真相(升级:原 admin → consoleAdmin、readonly → readonly,仅无挂载时挂载)
   - 用例:`tenant_admin_console_cannot_see_other_tenant_users`;root 仍可
-- [ ] C2 部门自助演练(门禁剧本):root 建租户 A + tenantAdmin → 管理员登录建用户 `alice` 挂 readwrite
+- [x] C2 部门自助演练(门禁剧本):root 建租户 A + tenantAdmin → 管理员登录建用户 `alice` 挂 readwrite
   → alice 自助建 SA → SA 读写 A 的桶 → 租户 B 的桶 List/GET 失败
   - 用例:脚本 `tests/iam/delegated_admin_drill.sh` 全绿,全程不用 root 数据面 AK
 - [ ] C3 文档:MinIO 运维对照表(`mc admin user/group/policy` 概念 → FastS3 控制台/API);
