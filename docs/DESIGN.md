@@ -1822,6 +1822,65 @@ webhook 既有用例零回归;`/metrics` 含 target 标签计数。
 
 ---
 
+#### ADR-26(M19 立项决策):S3 Batch Operations——API 形态 / manifest / 操作集 / 权限 / 报告与状态机
+
+> 背景:千万级桶一次性打标/恢复/删除。对齐 **AWS Batch Operations 形态**
+> (CreateJob + manifest),不是 `mc batch` YAML;不实现 Lambda 操作。
+
+**DR1(API 形态 = 管理面 JSON + AWS 同名字段 DTO)**:
+
+1. 端点 = `/v1/admin/batch/jobs`(admin 通道,复用既有鉴权):
+   `POST`(创建,字段与 AWS S3 Control `CreateJob` 同名:`Operation`/
+   `Manifest`/`Report`/`Priority`?——本版不实现优先级调度,字段仅校验
+   接受)、`GET /{id}`(Describe)、`GET`(List)、`POST /{id}/cancel`;
+2. **不实现** S3 Control 独立端口(`s3-control.` 主机名/ARN 账号段路由),
+   **不承诺** `aws s3control` 客户端 100% 开箱;控制台提供 Job 视图;
+3. Node 代理 `/api/batch/jobs/*` + consoleAdmin 授权
+   (`admin:CreateBatchJob`/`GetBatchJob`/`ListBatchJobs`/`UpdateBatchJob`/
+   `DeleteBatchJob`,词汇沿用 M18 `admin:*` 族)。
+
+**DR2(manifest = CSV 或 Inventory 输出)**:
+
+1. CSV 行 = `bucket,key[,versionId]`(首行可为 `bucket,key,versionId`
+   表头;逗号分隔,键不做引号转义——S3 键含逗号时须用 Inventory 形态);
+2. `s3://{bucket}/{key}` 对象引用:内容为 CSV,或 S3 Inventory
+   `manifest.json`(检测 `files[].key` 清单;配合 Inventory CSV 列名
+   `Bucket,Key,VersionId` 容忍首行表头/列序);
+3. 行内嵌 manifest(≤ 1 MiB)或对象引用二选一;行校验失败计入
+   failed 并记失败样本(不中断任务)。
+
+**DR3(操作起步四类;无隐式 bypass)**:
+
+- `COPY`(目标桶/前缀可选)——服务端 CopyObject 语义(新 mtime);
+- `DELETE`——版本化寻址按 manifest versionId;**Object Lock 锁定对象
+  delete 失败记入报告,绝不绕过**(GOVERNANCE bypass 不进 batch);
+- `RESTORE`——归档恢复(days/tier,复用 M16 恢复状态机,幂等);
+- `REPLACE-TAGS`——整体替换标签集(值随 Job 携带);
+- 执行 = 以**创建者调用者的生效策略**许可为前提的引擎原语(admin 通道
+  身份 = root 信任链 + 控制台 IAM `admin:*` 求值;batch 不获得任何
+  「数据面策略 bypass」);逐项失败记 `Failed` 样本继续下一项。
+
+**DR4(报告与状态机)**:
+
+1. Job 完成后生成报告对象(CSV:`bucket,key,versionId,status,error` +
+   汇总行;JSON 头行可选——本版 CSV 单格式)写入 `report.bucket`
+   (前缀 `report.prefix`),报告写失败仅告警不改变 Job 状态;
+2. 状态机 `Submitted → Running → Completed/Failed/Cancelled`
+   (Paused 预留字段不启用——batch 单跑短任务,取消即可);Cancelled
+   生成已处理部分的报告;
+3. 崩溃续跑:状态/游标/统计落元数据(`jb:`),worker 重启从游标继续
+   (逐项幂等:delete 幂等/restore 幂等/tag 整体替换/copy 覆盖)。
+
+**DR5(键前缀 `jb:` 三处同步)**:`jb:{job_id}`;keys.rs 登记;
+meta-export/import DTO **显式不导出**(同 `ij:` 口径——运维瞬态);
+check 可达性扫描注释登记(报告对象经正常 put 入账,不影响扫描)。
+
+**门禁口径**(TODO M19/J):`batch_job_create_get_list_cancel` 绿;
+`batch_delete_skips_locked`/`batch_restore_glacier_object` 绿且报告可对账;
+s3-tests batch 族无上游用例(逐名记账,不虚称出集);审计可检索 job id。
+
+---
+
 ## 4. 存储引擎设计(Rust)
 
 ### 4.1 设备抽象
