@@ -40,6 +40,7 @@ export default function Objects() {
   const [restoreDays, setRestoreDays] = useState("1");
   const [restoreTier, setRestoreTier] = useState("Standard");
   const [previewKey, setPreviewKey] = useState<string | null>(null);
+  const [versionKey, setVersionKey] = useState<string | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
 
   const load = useCallback(async (token?: string) => {
@@ -375,6 +376,9 @@ export default function Objects() {
                       <button className="ghost small" onClick={() => setPreviewKey(o.key)}>
                         预览
                       </button>{" "}
+                      <button className="ghost small" onClick={() => setVersionKey(o.key)}>
+                        版本
+                      </button>{" "}
                       <button className="ghost small" onClick={() => download(o.key)}>
                         下载
                       </button>{" "}
@@ -509,6 +513,8 @@ export default function Objects() {
       )}
 
       {previewKey && <PreviewModal bucket={bucket} objKey={previewKey} onClose={() => setPreviewKey(null)} />}
+
+      {versionKey && <VersionsModal bucket={bucket} objKey={versionKey} onClose={() => setVersionKey(null)} />}
     </div>
   );
 }
@@ -1108,4 +1114,173 @@ function PreviewFrame({ bucket, objKey, onError }: { bucket: string; objKey: str
   }, [bucket, objKey, onError]);
   if (!src) return <div className="muted">加载中…</div>;
   return <iframe src={src} title={objKey} style={{ width: "100%", height: 480, border: "1px solid var(--border)" }} />;
+}
+
+/**
+ * M19 U3:版本对比/回滚弹窗。
+ * 列出版本(含删除标记);任选一版与当前版做 LastModified/ETag/size 对比
+ * (仅元数据对比,不做二进制 GUI diff);「恢复为当前」= 服务端 CopyObject
+ * 同键自复制生成新当前版,历史版本全部保留。
+ */
+function VersionsModal({ bucket, objKey, onClose }: { bucket: string; objKey: string; onClose: () => void }) {
+  const [versions, setVersions] = useState<ObjectVersion[] | null>(null);
+  const [selectedVid, setSelectedVid] = useState<string | null>(null);
+  const [truncated, setTruncated] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const r = await api.listVersions(bucket, objKey);
+      const mine = r.versions.filter((v) => v.key === objKey);
+      setVersions(mine);
+      setTruncated(r.isTruncated);
+      setSelectedVid((prev) => prev ?? mine.find((v) => !v.isLatest && !v.isDeleteMarker)?.versionId ?? null);
+      setError(null);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }, [bucket, objKey]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const current = versions?.find((v) => v.isLatest) ?? null;
+  const selected = versions?.find((v) => v.versionId === selectedVid) ?? null;
+
+  const restore = async () => {
+    if (!selected || selected.isLatest) return;
+    if (
+      !confirm(
+        `将 ${objKey} 的版本 ${selected.versionId.slice(0, 12)}… 恢复为当前版本?\n` +
+          `(以所选历史版本内容生成新的当前版本,全部历史版本保留)`,
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    try {
+      await api.versionAction(bucket, "restore", objKey, selected.versionId);
+      await load();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const purge = async (v: ObjectVersion) => {
+    if (!confirm(`永久删除版本 ${v.versionId.slice(0, 12)}…?该版本数据将被物理删除,不可恢复。`)) return;
+    setBusy(true);
+    try {
+      await api.versionAction(bucket, "delete", objKey, v.versionId);
+      setSelectedVid(null);
+      await load();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const diffRow = (label: string, a: string, b: string) => (
+    <tr>
+      <td className="muted">{label}</td>
+      <td className={a !== b ? "mono" : "mono muted"}>{a}</td>
+      <td className={a !== b ? "mono" : "mono muted"}>{b}</td>
+    </tr>
+  );
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()} style={{ width: 820 }}>
+        <h3>版本:{objKey}</h3>
+        {error && <div className="alert">{error}</div>}
+        {versions === null && !error && <div className="muted">加载中…</div>}
+        {versions !== null && versions.length === 0 && (
+          <div className="muted">无版本信息(桶未启用版本化?)</div>
+        )}
+        {versions !== null && versions.length > 0 && (
+          <table>
+            <thead>
+              <tr>
+                <th style={{ width: 32 }} />
+                <th>VersionId</th>
+                <th>状态</th>
+                <th>修改时间</th>
+                <th>大小</th>
+                <th>ETag</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {versions.map((v) => (
+                <tr key={v.versionId} style={v.versionId === selectedVid ? { background: "var(--bg-hover, rgba(255,255,255,0.06))" } : undefined}>
+                  <td>
+                    <input
+                      type="radio"
+                      name="version-select"
+                      checked={v.versionId === selectedVid}
+                      onChange={() => setSelectedVid(v.versionId)}
+                    />
+                  </td>
+                  <td className="mono" style={{ fontSize: 12 }} title={v.versionId}>
+                    {v.versionId.length > 16 ? `${v.versionId.slice(0, 16)}…` : v.versionId}
+                  </td>
+                  <td>
+                    {v.isDeleteMarker && <span className="badge">删除标记</span>}{" "}
+                    {v.isLatest && <span style={{ color: "var(--green)" }}>当前</span>}
+                  </td>
+                  <td className="muted">{v.lastModified ? new Date(v.lastModified).toLocaleString() : "—"}</td>
+                  <td>{v.isDeleteMarker ? "—" : fmtBytes(v.size)}</td>
+                  <td className="mono muted" style={{ fontSize: 12 }}>
+                    {v.etag ? `${v.etag.slice(0, 12)}…` : "—"}
+                  </td>
+                  <td>
+                    <button className="danger small" disabled={busy} onClick={() => purge(v)}>
+                      永久删除
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+        {truncated && <div className="muted" style={{ fontSize: 12 }}>版本列表已截断(仅显示首页)</div>}
+
+        {selected && current && (
+          <div style={{ marginTop: 14 }}>
+            <div className="title">对比:当前版本 vs 所选版本</div>
+            <table>
+              <thead>
+                <tr>
+                  <th style={{ width: 120 }} />
+                  <th>当前版本{current.isDeleteMarker ? "(删除标记)" : ""}</th>
+                  <th>所选版本{selected.isDeleteMarker ? "(删除标记)" : ""}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {diffRow("修改时间", current.lastModified ? new Date(current.lastModified).toLocaleString() : "—", selected.lastModified ? new Date(selected.lastModified).toLocaleString() : "—")}
+                {diffRow("大小", current.isDeleteMarker ? "—" : fmtBytes(current.size), selected.isDeleteMarker ? "—" : fmtBytes(selected.size))}
+                {diffRow("ETag", current.etag || "—", selected.etag || "—")}
+                {diffRow("VersionId", current.versionId, selected.versionId)}
+              </tbody>
+            </table>
+            <div className="toolbar" style={{ marginTop: 8 }}>
+              <button onClick={() => void restore()} disabled={busy || selected.isLatest || selected.isDeleteMarker}>
+                恢复为当前
+              </button>
+              {selected.isLatest && <span className="muted">所选即当前版本,无需恢复</span>}
+            </div>
+          </div>
+        )}
+        <div className="actions">
+          <button className="ghost" onClick={onClose}>
+            关闭
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 }
