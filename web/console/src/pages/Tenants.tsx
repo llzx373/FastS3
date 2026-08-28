@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, type IamTenant } from "../api";
+import { t, tf } from "../i18n";
 
 /** M18 C1:租户管理(仅 consoleAdmin;TENANT_ACTIONS 在 Rust 侧强制)。 */
 export default function Tenants() {
@@ -70,7 +71,7 @@ export default function Tenants() {
   const del = async (t: IamTenant) => {
     if (
       !confirm(
-        `删除租户 ${t.tenant_id}?其下全部 IAM 用户/组/服务账户将一并删除,桶与对象不受影响但会失去属主。`
+        tf("删除租户 {id}?其下全部 IAM 用户/组/服务账户将一并删除,桶与对象不受影响但会失去属主。", "Delete tenant {id}? All IAM users/groups/service accounts under it will be deleted as well; buckets and objects are unaffected but lose their owner.", { id: t.tenant_id })
       )
     )
       return;
@@ -84,10 +85,10 @@ export default function Tenants() {
 
   return (
     <div>
-      <h1>租户</h1>
+      <h1>{t("租户", "Tenants")}</h1>
       {error && <div className="alert">{error}</div>}
       <div className="toolbar">
-        <button onClick={openCreate}>新建租户</button>
+        <button onClick={openCreate}>{t("新建租户", "New tenant")}</button>
         <button className="ghost" onClick={load}>
           刷新
         </button>
@@ -96,11 +97,11 @@ export default function Tenants() {
         <table>
           <thead>
             <tr>
-              <th>租户 ID</th>
-              <th>显示名</th>
+              <th>{t("租户 ID", "Tenant ID")}</th>
+              <th>{t("显示名", "Display name")}</th>
               <th>Canonical ID</th>
-              <th>状态</th>
-              <th>操作</th>
+              <th>{t("状态", "Status")}</th>
+              <th>{t("操作", "Actions")}</th>
             </tr>
           </thead>
           <tbody>
@@ -144,11 +145,11 @@ export default function Tenants() {
       {showModal && (
         <div className="modal-backdrop" onClick={() => setShowModal(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h3>{editing ? `编辑租户 ${editing.tenant_id}` : "新建租户"}</h3>
+            <h3>{editing ? tf("编辑租户 {id}", "Edit tenant {id}", { id: editing.tenant_id }) : t("新建租户", "New tenant")}</h3>
             {formErr && <div className="alert">{formErr}</div>}
             {!editing && (
               <div className="form-row">
-                <label>租户 ID</label>
+                <label>{t("租户 ID", "Tenant ID")}</label>
                 <input
                   value={tenantId}
                   onChange={(e) => setTenantId(e.target.value)}
@@ -157,7 +158,7 @@ export default function Tenants() {
               </div>
             )}
             <div className="form-row">
-              <label>显示名</label>
+              <label>{t("显示名", "Display name")}</label>
               <input value={displayName} onChange={(e) => setDisplayName(e.target.value)} />
             </div>
             {editing && (
@@ -178,7 +179,7 @@ export default function Tenants() {
                 取消
               </button>
               <button onClick={save} disabled={busy}>
-                {busy ? "保存中…" : "保存"}
+                {busy ? t("保存中…", "Saving…") : t("保存", "Save")}
               </button>
             </div>
           </div>

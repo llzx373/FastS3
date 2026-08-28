@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, fmtTime, type UploadInfo } from "../api";
+import { t, tf } from "../i18n";
 
 export default function Uploads() {
   const [uploads, setUploads] = useState<UploadInfo[]>([]);
@@ -21,7 +22,7 @@ export default function Uploads() {
   }, [load]);
 
   const abort = async (u: UploadInfo) => {
-    if (!confirm(`强制中止上传 ${u.bucket}/${u.key}?已上传分片将释放。`)) return;
+    if (!confirm(tf("强制中止上传 {b}/{k}?已上传分片将释放。", "Force-abort upload {b}/{k}? Uploaded parts will be released.", { b: u.bucket, k: u.key }))) return;
     try {
       await api.abortUpload(u.upload_id);
       await load();
@@ -32,19 +33,19 @@ export default function Uploads() {
 
   return (
     <div>
-      <h1>在途上传</h1>
+      <h1>{t("在途上传", "In-flight Uploads")}</h1>
       {error && <div className="alert">{error}</div>}
       <div className="card">
         <table>
           <thead>
             <tr>
-              <th>桶</th>
-              <th>键</th>
+              <th>{t("桶", "Bucket")}</th>
+              <th>{t("键", "Key")}</th>
               <th>UploadId</th>
               <th>分片</th>
-              <th>创建时间</th>
-              <th>状态</th>
-              <th>操作</th>
+              <th>{t("创建时间", "Created")}</th>
+              <th>{t("状态", "Status")}</th>
+              <th>{t("操作", "Actions")}</th>
             </tr>
           </thead>
           <tbody>
@@ -60,7 +61,7 @@ export default function Uploads() {
                 <td>{u.completed ? "已完成" : "进行中"}</td>
                 <td>
                   <button className="danger small" onClick={() => abort(u)}>
-                    强制中止
+                    {t("强制中止", "Force abort")}
                   </button>
                 </td>
               </tr>

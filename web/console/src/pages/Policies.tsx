@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, type IamCapabilities, type IamPolicy } from "../api";
+import { t, tf } from "../i18n";
 import { validatePolicy } from "./Keys";
 
 const pretty = (doc: string) => {
@@ -71,7 +72,7 @@ export default function Policies({ caps }: { caps: IamCapabilities }) {
   };
 
   const del = async (p: IamPolicy) => {
-    if (!confirm(`删除策略 ${p.name}?`)) return;
+    if (!confirm(tf("删除策略 {p}?", "Delete policy {p}?", { p: p.name }))) return;
     try {
       await api.iamDeletePolicy(tenant, p.name);
       await load(tenant);
@@ -85,7 +86,7 @@ export default function Policies({ caps }: { caps: IamCapabilities }) {
 
   return (
     <div>
-      <h1>IAM 策略</h1>
+      <h1>{t("IAM 策略", "IAM Policies")}</h1>
       {error && <div className="alert">{error}</div>}
       <div className="toolbar">
         {caps.is_console_admin && (
@@ -96,7 +97,7 @@ export default function Policies({ caps }: { caps: IamCapabilities }) {
             style={{ width: 160 }}
           />
         )}
-        <button onClick={openCreate}>新建策略</button>
+        <button onClick={openCreate}>{t("新建策略", "New policy")}</button>
         <button className="ghost" onClick={() => load(tenant)}>
           刷新
         </button>
@@ -105,16 +106,16 @@ export default function Policies({ caps }: { caps: IamCapabilities }) {
         <table>
           <thead>
             <tr>
-              <th>策略名</th>
-              <th>来源</th>
-              <th>操作</th>
+              <th>{t("策略名", "Policy name")}</th>
+              <th>{t("来源", "Source")}</th>
+              <th>{t("操作", "Actions")}</th>
             </tr>
           </thead>
           <tbody>
             {custom.map((p) => (
               <tr key={p.name}>
                 <td className="mono">{p.name}</td>
-                <td className="muted">自定义</td>
+                <td className="muted">{t("自定义", "Custom")}</td>
                 <td>
                   <button className="ghost small" onClick={() => openEdit(p)}>
                     编辑
@@ -173,12 +174,12 @@ export default function Policies({ caps }: { caps: IamCapabilities }) {
             {!editing && (
               <>
                 <div className="form-row">
-                  <label>策略名</label>
+                  <label>{t("策略名", "Policy name")}</label>
                   <input value={name} onChange={(e) => setName(e.target.value)} autoFocus />
                 </div>
                 {canned.length > 0 && (
                   <div className="form-row">
-                    <label>从内置复制</label>
+                    <label>{t("从内置复制", "Copy from built-in")}</label>
                     <select
                       defaultValue=""
                       onChange={(e) => {
@@ -223,7 +224,7 @@ export default function Policies({ caps }: { caps: IamCapabilities }) {
               </button>
               {!editing?.canned && (
                 <button onClick={save} disabled={busy}>
-                  {busy ? "保存中…" : "保存"}
+                  {busy ? t("保存中…", "Saving…") : t("保存", "Save")}
                 </button>
               )}
             </div>

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, type IamCapabilities, type IamGroup } from "../api";
+import { t, tf } from "../i18n";
 
 const csv = (s: string) =>
   s
@@ -77,7 +78,7 @@ export default function Groups({ caps }: { caps: IamCapabilities }) {
   };
 
   const del = async (g: IamGroup) => {
-    if (!confirm(`删除组 ${g.name}?`)) return;
+    if (!confirm(tf("删除组 {g}?", "Delete group {g}?", { g: g.name }))) return;
     try {
       await api.iamDeleteGroup(tenant, g.name);
       await load(tenant);
@@ -88,7 +89,7 @@ export default function Groups({ caps }: { caps: IamCapabilities }) {
 
   return (
     <div>
-      <h1>IAM 组</h1>
+      <h1>{t("IAM 组", "IAM Groups")}</h1>
       {error && <div className="alert">{error}</div>}
       <div className="toolbar">
         {caps.is_console_admin && (
@@ -99,7 +100,7 @@ export default function Groups({ caps }: { caps: IamCapabilities }) {
             style={{ width: 160 }}
           />
         )}
-        <button onClick={openCreate}>新建组</button>
+        <button onClick={openCreate}>{t("新建组", "New group")}</button>
         <button className="ghost" onClick={() => load(tenant)}>
           刷新
         </button>
@@ -108,10 +109,10 @@ export default function Groups({ caps }: { caps: IamCapabilities }) {
         <table>
           <thead>
             <tr>
-              <th>组名</th>
-              <th>成员</th>
-              <th>策略</th>
-              <th>操作</th>
+              <th>{t("组名", "Group name")}</th>
+              <th>{t("成员", "Members")}</th>
+              <th>{t("策略", "Policy")}</th>
+              <th>{t("操作", "Actions")}</th>
             </tr>
           </thead>
           <tbody>
@@ -133,7 +134,7 @@ export default function Groups({ caps }: { caps: IamCapabilities }) {
             {groups !== null && groups.length === 0 && (
               <tr>
                 <td colSpan={4} className="muted">
-                  该租户还没有 IAM 组
+                  {t("该租户还没有 IAM 组", "No IAM groups in this tenant yet")}
                 </td>
               </tr>
             )}
@@ -151,20 +152,20 @@ export default function Groups({ caps }: { caps: IamCapabilities }) {
       {showModal && (
         <div className="modal-backdrop" onClick={() => setShowModal(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h3>{editing ? `编辑组 ${editing.name}` : "新建组"}</h3>
+            <h3>{editing ? tf("编辑组 {g}", "Edit group {g}", { g: editing.name }) : t("新建组", "New group")}</h3>
             {formErr && <div className="alert">{formErr}</div>}
             {!editing && (
               <div className="form-row">
-                <label>组名</label>
+                <label>{t("组名", "Group name")}</label>
                 <input value={name} onChange={(e) => setName(e.target.value)} autoFocus />
               </div>
             )}
             <div className="form-row">
-              <label>成员(逗号分隔)</label>
+              <label>{t("成员(逗号分隔)", "Members (comma separated)")}</label>
               <input value={members} onChange={(e) => setMembers(e.target.value)} />
             </div>
             <div className="form-row">
-              <label>挂载策略(逗号分隔)</label>
+              <label>{t("挂载策略(逗号分隔)", "Policies (comma separated)")}</label>
               <input value={policies} onChange={(e) => setPolicies(e.target.value)} />
             </div>
             <div className="actions">
@@ -172,7 +173,7 @@ export default function Groups({ caps }: { caps: IamCapabilities }) {
                 取消
               </button>
               <button onClick={save} disabled={busy}>
-                {busy ? "保存中…" : "保存"}
+                {busy ? t("保存中…", "Saving…") : t("保存", "Save")}
               </button>
             </div>
           </div>

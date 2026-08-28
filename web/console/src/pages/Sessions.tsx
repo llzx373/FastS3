@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, fmtTime, type SessionInfo, type KeyInfo } from "../api";
+import { t, tf } from "../i18n";
 
 export default function Sessions() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
@@ -46,7 +47,7 @@ export default function Sessions() {
   };
 
   const revoke = async (id: string) => {
-    if (!confirm(`撤销会话 ${id.slice(0, 12)}…?立即失效。`)) return;
+    if (!confirm(tf("撤销会话 {id}?立即失效。", "Revoke session {id}? It becomes invalid immediately.", { id: `${id.slice(0, 12)}…` }))) return;
     try {
       await api.revokeSession(id);
       await load();
@@ -57,7 +58,7 @@ export default function Sessions() {
 
   return (
     <div>
-      <h1>临时会话(STS)</h1>
+      <h1>{t("临时会话(STS)", "Temporary sessions (STS)")}</h1>
       {error && <div className="alert">{error}</div>}
       <p className="muted" style={{ fontSize: 12, marginTop: 0 }}>
         会话 = 既有密钥 ∩ 可选会话策略;secret / session token 仅签发时显示一次。
@@ -65,7 +66,7 @@ export default function Sessions() {
       <div className="card">
         <div className="title">签发会话</div>
         <div className="form-row">
-          <label>基密钥</label>
+          <label>{t("基密钥", "Base key")}</label>
           <select value={base} onChange={(e) => setBase(e.target.value)}>
             {keys.map((k) => (
               <option key={k.access_key} value={k.access_key}>
@@ -76,11 +77,11 @@ export default function Sessions() {
           </select>
         </div>
         <div className="form-row">
-          <label>TTL(秒, 300–129600)</label>
+          <label>{t("TTL(秒, 300–129600)", "TTL (seconds, 300–129600)")}</label>
           <input type="number" min={300} max={129600} value={ttl} onChange={(e) => setTtl(e.target.value)} />
         </div>
         <div className="form-row">
-          <label>会话策略 JSON(可选,与基密钥求交)</label>
+          <label>{t("会话策略 JSON(可选,与基密钥求交)", "Session policy JSON (optional; intersected with the base key)")}</label>
           <textarea rows={4} value={policy} onChange={(e) => setPolicy(e.target.value)} style={{ width: "100%" }} />
         </div>
         <button onClick={issue} disabled={busy || !base}>
@@ -109,11 +110,11 @@ export default function Sessions() {
         <table>
           <thead>
             <tr>
-              <th>临时 AK</th>
-              <th>基密钥</th>
-              <th>签发</th>
-              <th>过期</th>
-              <th>状态</th>
+              <th>{t("临时 AK", "Temporary AK")}</th>
+              <th>{t("基密钥", "Base key")}</th>
+              <th>{t("签发", "Issued")}</th>
+              <th>{t("过期", "Expires")}</th>
+              <th>{t("状态", "Status")}</th>
               <th />
             </tr>
           </thead>
@@ -127,7 +128,7 @@ export default function Sessions() {
                 <td>{s.expired ? "已过期" : "有效"}</td>
                 <td>
                   <button className="danger small" onClick={() => revoke(s.session_id)} disabled={s.expired}>
-                    撤销
+                    {t("撤销", "Revoke")}
                   </button>
                 </td>
               </tr>

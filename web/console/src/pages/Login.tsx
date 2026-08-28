@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, setToken } from "../api";
+import { t, tf } from "../i18n";
 
 const NONCE_KEY = "fs3_oidc_nonce";
 
@@ -24,11 +25,11 @@ export default function Login({ onLogin }: { onLogin: (token: string, role: stri
           onLogin(r.token, r.role);
         })
         .catch((e) => {
-          setError(`OIDC 登录失败:${(e as Error).message}`);
+          setError(tf("OIDC 登录失败:{msg}", "OIDC sign-in failed: {msg}", { msg: (e as Error).message }));
           window.location.hash = "";
         });
     } else if (frag.get("error")) {
-      setError(`OIDC 授权失败:${frag.get("error_description") ?? frag.get("error")}`);
+      setError(tf("OIDC 授权失败:{msg}", "OIDC authorization failed: {msg}", { msg: frag.get("error_description") ?? frag.get("error") ?? "" }));
       window.location.hash = "";
     }
   }, [onLogin]);
@@ -71,11 +72,11 @@ export default function Login({ onLogin }: { onLogin: (token: string, role: stri
         <div className="card">
           <form onSubmit={submit}>
             <div className="form-row">
-              <label>用户名</label>
+              <label>{t("用户名", "Username")}</label>
               <input value={username} onChange={(e) => setUsername(e.target.value)} autoFocus />
             </div>
             <div className="form-row">
-              <label>密码</label>
+              <label>{t("密码", "Password")}</label>
               <input
                 type="password"
                 value={password}
@@ -84,7 +85,7 @@ export default function Login({ onLogin }: { onLogin: (token: string, role: stri
             </div>
             {error && <div className="alert">{error}</div>}
             <button type="submit" disabled={busy} style={{ width: "100%" }}>
-              {busy ? "登录中…" : "登录"}
+              {busy ? t("登录中…", "Signing in…") : t("登录", "Sign in")}
             </button>
           </form>
           {oidcUrl && (
@@ -93,7 +94,7 @@ export default function Login({ onLogin }: { onLogin: (token: string, role: stri
               disabled={busy}
               style={{ width: "100%", marginTop: 8 }}
             >
-              使用 OIDC 单点登录
+              {t("使用 OIDC 单点登录", "Sign in with OIDC SSO")}
             </button>
           )}
         </div>

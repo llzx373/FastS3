@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, type IamCapabilities, type IamRole } from "../api";
+import { t, tf } from "../i18n";
 import { validatePolicy } from "./Keys";
 
 const csv = (s: string) =>
@@ -87,7 +88,7 @@ export default function Roles({ caps }: { caps: IamCapabilities }) {
   };
 
   const del = async (r: IamRole) => {
-    if (!confirm(`删除角色 ${r.name}?`)) return;
+    if (!confirm(tf("删除角色 {r}?", "Delete role {r}?", { r: r.name }))) return;
     try {
       await api.iamDeleteRole(tenant, r.name);
       await load(tenant);
@@ -98,7 +99,7 @@ export default function Roles({ caps }: { caps: IamCapabilities }) {
 
   return (
     <div>
-      <h1>IAM 角色</h1>
+      <h1>{t("IAM 角色", "IAM Roles")}</h1>
       {error && <div className="alert">{error}</div>}
       <div className="toolbar">
         {caps.is_console_admin && (
@@ -109,7 +110,7 @@ export default function Roles({ caps }: { caps: IamCapabilities }) {
             style={{ width: 160 }}
           />
         )}
-        <button onClick={openCreate}>新建角色</button>
+        <button onClick={openCreate}>{t("新建角色", "New role")}</button>
         <button className="ghost" onClick={() => load(tenant)}>
           刷新
         </button>
@@ -118,9 +119,9 @@ export default function Roles({ caps }: { caps: IamCapabilities }) {
         <table>
           <thead>
             <tr>
-              <th>角色名</th>
-              <th>可担任者</th>
-              <th>操作</th>
+              <th>{t("角色名", "Role name")}</th>
+              <th>{t("可担任者", "Principals")}</th>
+              <th>{t("操作", "Actions")}</th>
             </tr>
           </thead>
           <tbody>
@@ -141,7 +142,7 @@ export default function Roles({ caps }: { caps: IamCapabilities }) {
             {roles !== null && roles.length === 0 && (
               <tr>
                 <td colSpan={3} className="muted">
-                  该租户还没有 IAM 角色
+                  {t("该租户还没有 IAM 角色", "No IAM roles in this tenant yet")}
                 </td>
               </tr>
             )}
@@ -163,19 +164,19 @@ export default function Roles({ caps }: { caps: IamCapabilities }) {
             onClick={(e) => e.stopPropagation()}
             style={{ width: 640 }}
           >
-            <h3>{editing ? `编辑角色 ${editing.name}` : "新建角色"}</h3>
+            <h3>{editing ? tf("编辑角色 {r}", "Edit role {r}", { r: editing.name }) : t("新建角色", "New role")}</h3>
             {!editing && (
               <div className="form-row">
-                <label>角色名</label>
+                <label>{t("角色名", "Role name")}</label>
                 <input value={name} onChange={(e) => setName(e.target.value)} autoFocus />
               </div>
             )}
             <div className="form-row">
-              <label>可担任者(逗号分隔;空 = 不限制)</label>
+              <label>{t("可担任者(逗号分隔;空 = 不限制)", "Principals (comma separated; empty = unrestricted)")}</label>
               <input value={assumableBy} onChange={(e) => setAssumableBy(e.target.value)} />
             </div>
             <div className="form-row">
-              <label>信任策略(权限文档)</label>
+              <label>{t("信任策略(权限文档)", "Trust policy (permission document)")}</label>
             </div>
             <textarea
               value={doc}
@@ -198,7 +199,7 @@ export default function Roles({ caps }: { caps: IamCapabilities }) {
                 取消
               </button>
               <button onClick={save} disabled={busy}>
-                {busy ? "保存中…" : "保存"}
+                {busy ? t("保存中…", "Saving…") : t("保存", "Save")}
               </button>
             </div>
           </div>

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, fmtBytes, type ListResult, type BucketInfo, type ObjectVersion, type S3Tag, type ObjectRetention, type ObjectHead } from "../api";
+import { t, tf } from "../i18n";
 import { decidePreview, looksLikeSseCError, type PreviewDecision } from "../lib/preview";
 
 const PART_SIZE = 8 * 1024 * 1024; // 8MiB/片(>5MiB 下限)
@@ -143,7 +144,7 @@ export default function Objects() {
     if (!bucket || !restoreKey) return;
     const days = Number(restoreDays);
     if (!Number.isInteger(days) || days < 1 || days > 365) {
-      setError("恢复天数须为 1–365 的整数");
+      setError(t("恢复天数须为 1–365 的整数", "Restore days must be an integer between 1 and 365"));
       return;
     }
     setBusy(true);
@@ -160,7 +161,7 @@ export default function Objects() {
   };
 
   const remove = async (key: string) => {
-    if (!confirm(`删除对象 ${key}?`)) return;
+    if (!confirm(tf("删除对象 {key}?", "Delete object {key}?", { key }))) return;
     try {
       await api.objectAction(bucket, "delete", key);
       await load();
@@ -188,7 +189,7 @@ export default function Objects() {
 
   const deleteSelected = async () => {
     if (selected.length === 0) return;
-    if (!confirm(`批量删除 ${selected.length} 个对象?`)) return;
+    if (!confirm(tf("批量删除 {n} 个对象?", "Delete {n} objects in batch?", { n: selected.length }))) return;
     try {
       await api.objectAction(bucket, "deleteMany", "", undefined, undefined, selected);
       await load();
@@ -218,11 +219,11 @@ export default function Objects() {
 
   return (
     <div>
-      <h1>对象浏览</h1>
+      <h1>{t("对象浏览", "Objects")}</h1>
       {error && <div className="alert">{error}</div>}
       <div className="toolbar">
         <select value={bucket} onChange={(e) => setBucket(e.target.value)}>
-          <option value="">选择桶…</option>
+          <option value="">{t("选择桶…", "Select bucket…")}</option>
           {buckets.map((b) => (
             <option key={b.name} value={b.name}>
               {b.name}
@@ -230,20 +231,20 @@ export default function Objects() {
           ))}
         </select>
         <button className="ghost" onClick={() => void load()} disabled={!bucket || busy}>
-          刷新
+          {t("刷新", "Refresh")}
         </button>
         {selected.length > 0 && (
           <>
             <button className="ghost" onClick={() => void zipSelected()} disabled={busy}>
-              打包下载({selected.length})
+              {tf("打包下载({n})", "Download zip ({n})", { n: selected.length })}
             </button>
             <button className="danger" onClick={() => void deleteSelected()}>
-              删除所选({selected.length})
+              {tf("删除所选({n})", "Delete selected ({n})", { n: selected.length })}
             </button>
           </>
         )}
         <div className="spacer" />
-        <select value={uploadClass} onChange={(e) => setUploadClass(e.target.value)} title="上传存储类">
+        <select value={uploadClass} onChange={(e) => setUploadClass(e.target.value)} title={t("上传存储类", "Upload storage class")}>
           {STORAGE_CLASSES.map((c) => (
             <option key={c} value={c}>
               {c}
@@ -253,11 +254,11 @@ export default function Objects() {
         <input
           value={sseKey}
           onChange={(e) => setSseKey(e.target.value)}
-          placeholder="SSE-C 密钥(32B base64,可选)"
+          placeholder={t("SSE-C 密钥(32B base64,可选)", "SSE-C key (32B base64, optional)")}
           style={{ width: 220 }}
           spellCheck={false}
         />
-        <button onClick={() => fileInput.current?.click()}>上传文件</button>
+        <button onClick={() => fileInput.current?.click()}>{t("上传文件", "Upload files")}</button>
         <input
           ref={fileInput}
           type="file"
@@ -270,7 +271,7 @@ export default function Objects() {
       {bucket && (
         <>
           <div className="crumbs">
-            <a onClick={() => navTo("")}>根目录</a>
+            <a onClick={() => navTo("")}>{t("根目录", "Root")}</a>
             {crumbs.map((c, i) => {
               const p = crumbs.slice(0, i + 1).join("/") + "/";
               return (
@@ -296,7 +297,7 @@ export default function Objects() {
             }}
             onClick={() => fileInput.current?.click()}
           >
-            拖拽文件到此处上传(大文件自动分片直传),或点击选择文件
+            {t("拖拽文件到此处上传(大文件自动分片直传),或点击选择文件", "Drag files here to upload (large files auto-multipart), or click to choose")}
           </div>
 
           {tasks.length > 0 && (
@@ -330,12 +331,12 @@ export default function Objects() {
                       }
                     />
                   </th>
-                  <th>名称</th>
-                  <th>大小</th>
+                  <th>{t("名称", "Name")}</th>
+                  <th>{t("大小", "Size")}</th>
                   <th>ETag</th>
-                  <th>修改时间</th>
-                  <th>存储类</th>
-                  <th>操作</th>
+                  <th>{t("修改时间", "Last Modified")}</th>
+                  <th>{t("存储类", "Storage Class")}</th>
+                  <th>{t("操作", "Actions")}</th>
                 </tr>
               </thead>
               <tbody>
@@ -374,13 +375,13 @@ export default function Objects() {
                     </td>
                     <td>
                       <button className="ghost small" onClick={() => setPreviewKey(o.key)}>
-                        预览
+                        {t("预览", "Preview")}
                       </button>{" "}
                       <button className="ghost small" onClick={() => setVersionKey(o.key)}>
-                        版本
+                        {t("版本", "Versions")}
                       </button>{" "}
                       <button className="ghost small" onClick={() => download(o.key)}>
-                        下载
+                        {t("下载", "Download")}
                       </button>{" "}
                       {o.storageClass === "GLACIER" ||
                       o.storageClass === "DEEP_ARCHIVE" ||
@@ -393,7 +394,7 @@ export default function Objects() {
                             setRestoreTier("Standard");
                           }}
                         >
-                          恢复
+                          {t("恢复", "Restore")}
                         </button>
                       ) : null}{" "}
                       <button
@@ -404,13 +405,13 @@ export default function Objects() {
                           setCopyDestBucket(bucket);
                         }}
                       >
-                        复制
+                        {t("复制", "Copy")}
                       </button>{" "}
                       <button className="ghost small" onClick={() => setMetaObj({ bucket, key: o.key, size: o.size, etag: o.etag, lastModified: o.lastModified })}>
-                        详情
+                        {t("详情", "Details")}
                       </button>{" "}
                       <button className="danger small" onClick={() => remove(o.key)}>
-                        删除
+                        {t("删除", "Delete")}
                       </button>
                     </td>
                   </tr>
@@ -418,7 +419,7 @@ export default function Objects() {
                 {list && list.objects.length === 0 && list.prefixes.length === 0 && (
                   <tr>
                     <td colSpan={7} className="muted">
-                      空目录
+                      {t("空目录", "Empty directory")}
                     </td>
                   </tr>
                 )}
@@ -427,7 +428,7 @@ export default function Objects() {
             {list?.isTruncated && list.nextContinuationToken && (
               <div className="toolbar" style={{ marginTop: 10 }}>
                 <button className="ghost" disabled={busy} onClick={() => void load(list.nextContinuationToken ?? undefined)}>
-                  加载更多
+                  {t("加载更多", "Load more")}
                 </button>
               </div>
             )}
@@ -438,13 +439,13 @@ export default function Objects() {
       {copyKey && (
         <div className="modal-backdrop" onClick={() => setCopyKey(null)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h3>复制对象</h3>
+            <h3>{t("复制对象", "Copy object")}</h3>
             <div className="form-row">
-              <label>源</label>
+              <label>{t("源", "Source")}</label>
               <input value={copyKey} disabled />
             </div>
             <div className="form-row">
-              <label>目标桶</label>
+              <label>{t("目标桶", "Destination bucket")}</label>
               <select value={copyDestBucket || bucket} onChange={(e) => setCopyDestBucket(e.target.value)}>
                 {buckets.map((b) => (
                   <option key={b.name} value={b.name}>
@@ -454,15 +455,15 @@ export default function Objects() {
               </select>
             </div>
             <div className="form-row">
-              <label>目标键(可含目录)</label>
+              <label>{t("目标键(可含目录)", "Destination key (may include folders)")}</label>
               <input value={copyDest} onChange={(e) => setCopyDest(e.target.value)} autoFocus />
             </div>
             <div className="actions">
               <button className="ghost" onClick={() => setCopyKey(null)}>
-                取消
+                {t("取消", "Cancel")}
               </button>
               <button onClick={doCopy} disabled={!copyDest}>
-                复制
+                {t("复制", "Copy")}
               </button>
             </div>
           </div>
@@ -472,17 +473,17 @@ export default function Objects() {
       {restoreKey && (
         <div className="modal-backdrop" onClick={() => setRestoreKey(null)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h3>恢复归档对象</h3>
+            <h3>{t("恢复归档对象", "Restore archived object")}</h3>
             <div className="form-row">
-              <label>键</label>
+              <label>{t("键", "Key")}</label>
               <input value={restoreKey} disabled />
             </div>
             <div className="form-row">
-              <label>可用天数(1–365)</label>
+              <label>{t("可用天数(1–365)", "Available days (1–365)")}</label>
               <input type="number" min={1} max={365} value={restoreDays} onChange={(e) => setRestoreDays(e.target.value)} />
             </div>
             <div className="form-row">
-              <label>档位</label>
+              <label>{t("档位", "Tier")}</label>
               <select value={restoreTier} onChange={(e) => setRestoreTier(e.target.value)}>
                 <option value="Expedited">Expedited</option>
                 <option value="Standard">Standard</option>
@@ -491,10 +492,10 @@ export default function Objects() {
             </div>
             <div className="actions">
               <button className="ghost" onClick={() => setRestoreKey(null)}>
-                取消
+                {t("取消", "Cancel")}
               </button>
               <button onClick={() => void restoreArchive()} disabled={busy}>
-                提交恢复
+                {t("提交恢复", "Submit restore")}
               </button>
             </div>
           </div>
@@ -558,18 +559,18 @@ function ObjectMeta({
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()} style={{ width: 720 }}>
-        <h3>对象详情</h3>
+        <h3>{t("对象详情", "Object details")}</h3>
         <div className="form-row">
-          <label>键</label>
+          <label>{t("键", "Key")}</label>
           <input value={key} readOnly />
         </div>
         <div className="form-row">
-          <label>桶</label>
+          <label>{t("桶", "Bucket")}</label>
           <input value={bucket} readOnly />
         </div>
         {/* REVIEW §4.15:弹窗展示 size/etag/修改时间元数据(此前只有键与桶) */}
         <div className="form-row">
-          <label>大小</label>
+          <label>{t("大小", "Size")}</label>
           <input value={size !== undefined ? fmtBytes(size) : "—"} readOnly />
         </div>
         <div className="form-row">
@@ -577,7 +578,7 @@ function ObjectMeta({
           <input value={etag ?? "—"} readOnly />
         </div>
         <div className="form-row">
-          <label>修改时间</label>
+          <label>{t("修改时间", "Last Modified")}</label>
           <input
             value={lastModified ? new Date(lastModified).toLocaleString() : "—"}
             readOnly
@@ -603,7 +604,7 @@ function ObjectMeta({
             )}
             {head.metadata && Object.keys(head.metadata).length > 0 && (
               <div className="form-row">
-                <label>用户元数据</label>
+                <label>{t("用户元数据", "User metadata")}</label>
                 <textarea
                   rows={3}
                   readOnly
@@ -617,7 +618,7 @@ function ObjectMeta({
           </>
         )}
         <button className="ghost" onClick={gen}>
-          生成预签名下载链接(1 小时)
+          {t("生成预签名下载链接(1 小时)", "Generate presigned download link (1 hour)")}
         </button>
         <button
           className="ghost"
@@ -634,7 +635,7 @@ function ObjectMeta({
         {error && <div className="alert">{error}</div>}
         {presign && (
           <div className="form-row" style={{ marginTop: 10 }}>
-            <label>预签名 URL(复制到浏览器/命令行)</label>
+            <label>{t("预签名 URL(复制到浏览器/命令行)", "Presigned URL (copy to browser/CLI)")}</label>
             <textarea rows={3} readOnly value={presign} style={{ width: "100%" }} />
           </div>
         )}
@@ -650,7 +651,7 @@ function ObjectMeta({
         <LockPanel bucket={bucket} objKey={key} />
         <div className="actions">
           <button className="ghost" onClick={onClose}>
-            关闭
+            {t("关闭", "Close")}
           </button>
         </div>
       </div>
@@ -682,7 +683,7 @@ function VersionPanel({ bucket, objKey }: { bucket: string; objKey: string }) {
   }, [load]);
 
   const restore = async (v: ObjectVersion) => {
-    if (!confirm(`将 ${objKey} 恢复到版本 ${v.versionId.slice(0, 12)}…?(以其内容生成新的当前版本)`)) {
+    if (!confirm(tf("将 {key} 恢复到版本 {vid}?(以其内容生成新的当前版本)", "Restore {key} to version {vid}? (creates a new current version from its content)", { key: objKey, vid: `${v.versionId.slice(0, 12)}…` }))) {
       return;
     }
     setBusy(true);
@@ -697,7 +698,7 @@ function VersionPanel({ bucket, objKey }: { bucket: string; objKey: string }) {
   };
 
   const purge = async (v: ObjectVersion) => {
-    if (!confirm(`永久删除版本 ${v.versionId.slice(0, 12)}…?该版本数据将被物理删除,不可恢复。`)) return;
+    if (!confirm(tf("永久删除版本 {vid}?该版本数据将被物理删除,不可恢复。", "Permanently delete version {vid}? The version data will be physically deleted and cannot be recovered.", { vid: `${v.versionId.slice(0, 12)}…` }))) return;
     setBusy(true);
     try {
       await api.versionAction(bucket, "delete", objKey, v.versionId);
@@ -711,19 +712,19 @@ function VersionPanel({ bucket, objKey }: { bucket: string; objKey: string }) {
 
   return (
     <div style={{ marginTop: 16 }}>
-      <div className="title">版本</div>
+      <div className="title">{t("版本", "Versions")}</div>
       {error && <div className="alert">{error}</div>}
-      {versions === null && !error && <div className="muted">加载中…</div>}
-      {versions !== null && versions.length === 0 && <div className="muted">无版本信息(桶未启用版本化?)</div>}
+      {versions === null && !error && <div className="muted">{t("加载中…", "Loading…")}</div>}
+      {versions !== null && versions.length === 0 && <div className="muted">{t("无版本信息(桶未启用版本化?)", "No version info (versioning not enabled?)")}</div>}
       {versions !== null && versions.length > 0 && (
         <table>
           <thead>
             <tr>
               <th>VersionId</th>
-              <th>状态</th>
-              <th>时间</th>
-              <th>大小</th>
-              <th>操作</th>
+              <th>{t("状态", "Status")}</th>
+              <th>{t("时间", "Time")}</th>
+              <th>{t("大小", "Size")}</th>
+              <th>{t("操作", "Actions")}</th>
             </tr>
           </thead>
           <tbody>
@@ -733,8 +734,8 @@ function VersionPanel({ bucket, objKey }: { bucket: string; objKey: string }) {
                   {v.versionId.length > 16 ? `${v.versionId.slice(0, 16)}…` : v.versionId}
                 </td>
                 <td>
-                  {v.isDeleteMarker && <span className="badge">删除标记</span>}{" "}
-                  {v.isLatest && <span style={{ color: "var(--green)" }}>最新</span>}
+                  {v.isDeleteMarker && <span className="badge">{t("删除标记", "Delete marker")}</span>}{" "}
+                  {v.isLatest && <span style={{ color: "var(--green)" }}>{t("最新", "Latest")}</span>}
                 </td>
                 <td className="muted">{v.lastModified ? new Date(v.lastModified).toLocaleString() : "—"}</td>
                 <td>{v.isDeleteMarker ? "—" : fmtBytes(v.size)}</td>
@@ -742,12 +743,12 @@ function VersionPanel({ bucket, objKey }: { bucket: string; objKey: string }) {
                   {!v.isDeleteMarker && (
                     <>
                       <button className="ghost small" disabled={busy} onClick={() => restore(v)}>
-                        恢复
+                        {t("恢复", "Restore")}
                       </button>{" "}
                     </>
                   )}
                   <button className="danger small" disabled={busy} onClick={() => purge(v)}>
-                    永久删除
+                    {t("永久删除", "Permanently delete")}
                   </button>
                 </td>
               </tr>
@@ -755,7 +756,7 @@ function VersionPanel({ bucket, objKey }: { bucket: string; objKey: string }) {
           </tbody>
         </table>
       )}
-      {truncated && <div className="muted" style={{ fontSize: 12 }}>版本列表已截断(仅显示首页)</div>}
+      {truncated && <div className="muted" style={{ fontSize: 12 }}>{t("版本列表已截断(仅显示首页)", "Version list truncated (first page only)")}</div>}
     </div>
   );
 }
@@ -782,7 +783,7 @@ function TagPanel({ bucket, objKey }: { bucket: string; objKey: string }) {
   const save = async () => {
     if (tags === null) return;
     if (tags.some((t) => t.key.trim() === "")) {
-      setError("标签键不能为空(删除整行可移除标签)");
+      setError(t("标签键不能为空(删除整行可移除标签)", "Tag key must not be empty (remove the row to delete the tag)"));
       return;
     }
     setSaving(true);
@@ -799,9 +800,9 @@ function TagPanel({ bucket, objKey }: { bucket: string; objKey: string }) {
 
   return (
     <div style={{ marginTop: 16 }}>
-      <div className="title">标签</div>
+      <div className="title">{t("标签", "Tags")}</div>
       {error && <div className="alert">{error}</div>}
-      {tags === null && !error && <div className="muted">加载中…</div>}
+      {tags === null && !error && <div className="muted">{t("加载中…", "Loading…")}</div>}
       {tags !== null && (
         <>
           {tags.map((t, i) => (
@@ -837,12 +838,12 @@ function TagPanel({ bucket, objKey }: { bucket: string; objKey: string }) {
                 setSaved(false);
               }}
             >
-              + 添加标签
+              {t("+ 添加标签", "+ Add tag")}
             </button>
             <div className="spacer" />
-            {saved && <span style={{ color: "var(--green)", fontSize: 12 }}>✓ 已保存</span>}
+            {saved && <span style={{ color: "var(--green)", fontSize: 12 }}>{t("✓ 已保存", "✓ Saved")}</span>}
             <button className="small" onClick={save} disabled={saving}>
-              {saving ? "保存中…" : "保存标签"}
+              {saving ? t(t("保存中…", "Saving…"), "Saving…") : t(t("保存标签", "Save tags"), "Save tags")}
             </button>
           </div>
         </>
@@ -900,7 +901,7 @@ function LockPanel({ bucket, objKey }: { bucket: string; objKey: string }) {
 
   const saveRetention = async () => {
     if (!untilLocal) {
-      setError("请填写保留到期时间");
+      setError(t("请填写保留到期时间", "Please fill in the retention until time"));
       return;
     }
     setSaving(true);
@@ -930,38 +931,38 @@ function LockPanel({ bucket, objKey }: { bucket: string; objKey: string }) {
 
   return (
     <div style={{ marginTop: 16 }}>
-      <div className="title">对象锁</div>
+      <div className="title">{t("对象锁", "Object Lock")}</div>
       {error && <div className="alert">{error}</div>}
-      {enabled === null && !error && <div className="muted">加载中…</div>}
-      {enabled === false && <div className="muted">桶未启用 Object Lock(在桶设置 → 对象锁 中启用)</div>}
+      {enabled === null && !error && <div className="muted">{t("加载中…", "Loading…")}</div>}
+      {enabled === false && <div className="muted">{t("桶未启用 Object Lock(在桶设置 → 对象锁 中启用)", "Object Lock not enabled on bucket (enable in Bucket settings → Object Lock)")}</div>}
       {enabled && (
         <>
           <div className="form-row">
-            <label>保留模式</label>
+            <label>{t("保留模式", "Retention mode")}</label>
             <select value={mode} onChange={(e) => setMode(e.target.value as "GOVERNANCE" | "COMPLIANCE")}>
               <option value="GOVERNANCE">GOVERNANCE</option>
               <option value="COMPLIANCE">COMPLIANCE</option>
             </select>
           </div>
           <div className="form-row">
-            <label>保留至</label>
+            <label>{t("保留至", "Retain until")}</label>
             <input type="datetime-local" value={untilLocal} onChange={(e) => setUntilLocal(e.target.value)} />
           </div>
           <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
-            当前:{retention ? `${retention.Mode} 至 ${new Date(retention.RetainUntilDate).toLocaleString()}` : "无保留"}
+            {tf("当前:{cur}", "Current: {cur}", { cur: retention ? `${retention.Mode} until ${new Date(retention.RetainUntilDate).toLocaleString()}` : t("无保留", "no retention") })}
           </div>
           <label style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
             <input type="checkbox" checked={bypass} onChange={(e) => setBypass(e.target.checked)} />
-            GOVERNANCE bypass(缩短/覆盖治理保留)
+            {t("GOVERNANCE bypass(缩短/覆盖治理保留)", "GOVERNANCE bypass (shorten/override governance retention)")}
           </label>
           <div className="toolbar" style={{ marginTop: 0 }}>
             <button className="small" onClick={saveRetention} disabled={saving}>
-              {saving ? "保存中…" : "保存保留"}
+              {saving ? t(t("保存中…", "Saving…"), "Saving…") : t(t("保存保留", "Save retention"), "Save retention")}
             </button>
             <button className="ghost small" disabled={saving} onClick={() => saveHold(hold === "ON" ? "OFF" : "ON")}>
-              法定保留:{hold === "ON" ? "ON → 关闭" : "OFF → 开启"}
+              {tf("法定保留:{s}", "Legal hold: {s}", { s: hold === "ON" ? "ON → " + t("关闭", "off") : "OFF → " + t("开启", "on") })}
             </button>
-            {saved && <span style={{ color: "var(--green)", fontSize: 12 }}>✓ 已保存</span>}
+            {saved && <span style={{ color: "var(--green)", fontSize: 12 }}>{t("✓ 已保存", "✓ Saved")}</span>}
           </div>
         </>
       )}
@@ -1030,13 +1031,13 @@ function PreviewModal({ bucket, objKey, onClose }: { bucket: string; objKey: str
   if (headErr) {
     body = looksLikeSseCError(headErr) ? (
       <div className="muted">
-        该对象为 SSE-C 加密,控制台不以预览通道读取明文。请使用「下载」并在上方工具栏提供 SSE-C 密钥。
+        {t("该对象为 SSE-C 加密,控制台不以预览通道读取明文。请使用「下载」并在上方工具栏提供 SSE-C 密钥。", "This object is SSE-C encrypted; the console does not read plaintext through the preview channel. Use Download and provide the SSE-C key in the toolbar.")}
       </div>
     ) : (
       <div className="alert">{headErr}</div>
     );
   } else if (!head || !decision) {
-    body = <div className="muted">加载中…</div>;
+    body = <div className="muted">{t("加载中…", "Loading…")}</div>;
   } else if (decision.kind === "image") {
     body = (
       <PreviewImage bucket={bucket} objKey={objKey} onError={setError} />
@@ -1044,18 +1045,18 @@ function PreviewModal({ bucket, objKey, onClose }: { bucket: string; objKey: str
   } else if (decision.kind === "pdf") {
     body = <PreviewFrame bucket={bucket} objKey={objKey} onError={setError} />;
   } else if (decision.kind === "text") {
-    body = text === null ? <div className="muted">加载中…</div> : <pre className="mono" style={{ maxHeight: 420, overflow: "auto", whiteSpace: "pre-wrap" }}>{text}</pre>;
+    body = text === null ? <div className="muted">{t("加载中…", "Loading…")}</div> : <pre className="mono" style={{ maxHeight: 420, overflow: "auto", whiteSpace: "pre-wrap" }}>{text}</pre>;
   } else if (decision.kind === "sse-c") {
-    body = <div className="muted">该对象为 SSE-C 加密,控制台不以预览通道读取明文。请使用「下载」并自备密钥。</div>;
+    body = <div className="muted">{t("该对象为 SSE-C 加密,控制台不以预览通道读取明文。请使用「下载」并自备密钥。", "This object is SSE-C encrypted; the console does not read plaintext through the preview channel. Use Download with your own key.")}</div>;
   } else {
     body = (
       <div className="muted">
-        {decision.reason === "over-limit"
-          ? `对象超过预览大小上限(${fmtBytes(head.contentLength)}),请下载后查看。`
+        {decision.kind === "download" && decision.reason === "over-limit"
+          ? tf("对象超过预览大小上限({size}),请下载后查看。", "Object exceeds the preview size limit ({size}); please download it.", { size: fmtBytes(head.contentLength) })
           : "该类型不支持预览,请下载后查看。"}
         <div style={{ marginTop: 8 }}>
           <button className="ghost small" onClick={() => void downloadNow()}>
-            下载
+            {t("下载", "Download")}
           </button>
         </div>
       </div>
@@ -1065,7 +1066,7 @@ function PreviewModal({ bucket, objKey, onClose }: { bucket: string; objKey: str
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()} style={{ width: 760 }}>
-        <h3>预览:{objKey}</h3>
+        <h3>{tf("预览:{key}", "Preview: {key}", { key: objKey })}</h3>
         {head && (
           <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
             {head.contentType || "application/octet-stream"} · {fmtBytes(head.contentLength)}
@@ -1075,7 +1076,7 @@ function PreviewModal({ bucket, objKey, onClose }: { bucket: string; objKey: str
         {body}
         <div className="actions">
           <button className="ghost" onClick={onClose}>
-            关闭
+            {t("关闭", "Close")}
           </button>
         </div>
       </div>
@@ -1092,13 +1093,13 @@ function PreviewImage({ bucket, objKey, onError }: { bucket: string; objKey: str
       .then((u) => setSrc(u.url))
       .catch((e) => onError((e as Error).message));
   }, [bucket, objKey, onError]);
-  if (!src) return <div className="muted">加载中…</div>;
+  if (!src) return <div className="muted">{t("加载中…", "Loading…")}</div>;
   return (
     <img
       src={src}
       alt={objKey}
       style={{ maxWidth: "100%", maxHeight: 480 }}
-      onError={() => onError("图片加载失败(对象可能不可读)")}
+      onError={() => onError(t("图片加载失败(对象可能不可读)", "Image failed to load (object may be unreadable)"))}
     />
   );
 }
@@ -1112,7 +1113,7 @@ function PreviewFrame({ bucket, objKey, onError }: { bucket: string; objKey: str
       .then((u) => setSrc(u.url))
       .catch((e) => onError((e as Error).message));
   }, [bucket, objKey, onError]);
-  if (!src) return <div className="muted">加载中…</div>;
+  if (!src) return <div className="muted">{t("加载中…", "Loading…")}</div>;
   return <iframe src={src} title={objKey} style={{ width: "100%", height: 480, border: "1px solid var(--border)" }} />;
 }
 
@@ -1153,8 +1154,11 @@ function VersionsModal({ bucket, objKey, onClose }: { bucket: string; objKey: st
     if (!selected || selected.isLatest) return;
     if (
       !confirm(
-        `将 ${objKey} 的版本 ${selected.versionId.slice(0, 12)}… 恢复为当前版本?\n` +
-          `(以所选历史版本内容生成新的当前版本,全部历史版本保留)`,
+        tf(
+          "将 {key} 的版本 {vid} 恢复为当前版本?\n(以所选历史版本内容生成新的当前版本,全部历史版本保留)",
+          "Restore version {vid} of {key} as the current version?\n(A new current version is created from the selected historical version; all history is preserved)",
+          { key: objKey, vid: `${selected.versionId.slice(0, 12)}…` },
+        ),
       )
     ) {
       return;
@@ -1171,7 +1175,7 @@ function VersionsModal({ bucket, objKey, onClose }: { bucket: string; objKey: st
   };
 
   const purge = async (v: ObjectVersion) => {
-    if (!confirm(`永久删除版本 ${v.versionId.slice(0, 12)}…?该版本数据将被物理删除,不可恢复。`)) return;
+    if (!confirm(tf("永久删除版本 {vid}?该版本数据将被物理删除,不可恢复。", "Permanently delete version {vid}? The version data will be physically deleted and cannot be recovered.", { vid: `${v.versionId.slice(0, 12)}…` }))) return;
     setBusy(true);
     try {
       await api.versionAction(bucket, "delete", objKey, v.versionId);
@@ -1195,11 +1199,11 @@ function VersionsModal({ bucket, objKey, onClose }: { bucket: string; objKey: st
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()} style={{ width: 820 }}>
-        <h3>版本:{objKey}</h3>
+        <h3>{tf("版本:{key}", "Versions: {key}", { key: objKey })}</h3>
         {error && <div className="alert">{error}</div>}
-        {versions === null && !error && <div className="muted">加载中…</div>}
+        {versions === null && !error && <div className="muted">{t("加载中…", "Loading…")}</div>}
         {versions !== null && versions.length === 0 && (
-          <div className="muted">无版本信息(桶未启用版本化?)</div>
+          <div className="muted">{t("无版本信息(桶未启用版本化?)", "No version info (versioning not enabled?)")}</div>
         )}
         {versions !== null && versions.length > 0 && (
           <table>
@@ -1207,11 +1211,11 @@ function VersionsModal({ bucket, objKey, onClose }: { bucket: string; objKey: st
               <tr>
                 <th style={{ width: 32 }} />
                 <th>VersionId</th>
-                <th>状态</th>
-                <th>修改时间</th>
-                <th>大小</th>
+                <th>{t("状态", "Status")}</th>
+                <th>{t("修改时间", "Last Modified")}</th>
+                <th>{t("大小", "Size")}</th>
                 <th>ETag</th>
-                <th>操作</th>
+                <th>{t("操作", "Actions")}</th>
               </tr>
             </thead>
             <tbody>
@@ -1229,8 +1233,8 @@ function VersionsModal({ bucket, objKey, onClose }: { bucket: string; objKey: st
                     {v.versionId.length > 16 ? `${v.versionId.slice(0, 16)}…` : v.versionId}
                   </td>
                   <td>
-                    {v.isDeleteMarker && <span className="badge">删除标记</span>}{" "}
-                    {v.isLatest && <span style={{ color: "var(--green)" }}>当前</span>}
+                    {v.isDeleteMarker && <span className="badge">{t("删除标记", "Delete marker")}</span>}{" "}
+                    {v.isLatest && <span style={{ color: "var(--green)" }}>{t("当前", "Current")}</span>}
                   </td>
                   <td className="muted">{v.lastModified ? new Date(v.lastModified).toLocaleString() : "—"}</td>
                   <td>{v.isDeleteMarker ? "—" : fmtBytes(v.size)}</td>
@@ -1239,7 +1243,7 @@ function VersionsModal({ bucket, objKey, onClose }: { bucket: string; objKey: st
                   </td>
                   <td>
                     <button className="danger small" disabled={busy} onClick={() => purge(v)}>
-                      永久删除
+                      {t("永久删除", "Permanently delete")}
                     </button>
                   </td>
                 </tr>
@@ -1247,11 +1251,11 @@ function VersionsModal({ bucket, objKey, onClose }: { bucket: string; objKey: st
             </tbody>
           </table>
         )}
-        {truncated && <div className="muted" style={{ fontSize: 12 }}>版本列表已截断(仅显示首页)</div>}
+        {truncated && <div className="muted" style={{ fontSize: 12 }}>{t("版本列表已截断(仅显示首页)", "Version list truncated (first page only)")}</div>}
 
         {selected && current && (
           <div style={{ marginTop: 14 }}>
-            <div className="title">对比:当前版本 vs 所选版本</div>
+            <div className="title">{t("对比:当前版本 vs 所选版本", "Compare: current version vs selected version")}</div>
             <table>
               <thead>
                 <tr>
@@ -1269,15 +1273,15 @@ function VersionsModal({ bucket, objKey, onClose }: { bucket: string; objKey: st
             </table>
             <div className="toolbar" style={{ marginTop: 8 }}>
               <button onClick={() => void restore()} disabled={busy || selected.isLatest || selected.isDeleteMarker}>
-                恢复为当前
+                {t("恢复为当前", "Restore as current")}
               </button>
-              {selected.isLatest && <span className="muted">所选即当前版本,无需恢复</span>}
+              {selected.isLatest && <span className="muted">{t("所选即当前版本,无需恢复", "Selected version is already the current one")}</span>}
             </div>
           </div>
         )}
         <div className="actions">
           <button className="ghost" onClick={onClose}>
-            关闭
+            {t("关闭", "Close")}
           </button>
         </div>
       </div>

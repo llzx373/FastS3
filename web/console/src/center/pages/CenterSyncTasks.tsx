@@ -12,6 +12,7 @@ import {
   type CenterNode,
   type CenterSyncTask,
 } from "../../center-api";
+import { tf } from "../../i18n";
 
 const fmtTs = (t: number) => (t > 0 ? new Date(t * 1000).toLocaleString() : "从未执行");
 
@@ -74,7 +75,7 @@ export default function CenterSyncTasks({ onError }: { onError: (e: string) => v
   };
 
   const remove = async (id: string) => {
-    if (!window.confirm(`删除同步任务 ${id}?`)) return;
+    if (!window.confirm(tf("删除同步任务 {id}?", "Delete sync task {id}?", { id }))) return;
     try {
       await centerApi.deleteSyncTask(id);
       await load();

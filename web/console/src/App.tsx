@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, getToken, clearToken, type IamCapabilities } from "./api";
+import { t, setLocale, useLocale } from "./i18n";
 import Login from "./pages/Login";
 import Dashboard from "./pages/Dashboard";
 import Buckets from "./pages/Buckets";
@@ -30,27 +31,29 @@ function useHashRoute(): string {
 }
 
 /** M18 C1:导航显隐 = 服务端 IAM admin:* 求值结果(capabilities);
- *  caps 未加载前用 JWT role claim 兜底(JWT 仅作 UI 提示,不作授权)。 */
+ *  caps 未加载前用 JWT role claim 兜底(JWT 仅作 UI 提示,不作授权)。
+ *  M19 U4:label = [zh, en] 双语,渲染时按当前语言取值。 */
 interface NavItem {
   path: string;
-  label: string;
+  labelZh: string;
+  labelEn: string;
   show: (c: IamCapabilities) => boolean;
 }
 const NAV: NavItem[] = [
-  { path: "/dashboard", label: "仪表盘", show: (c) => c.can_diagnostics },
-  { path: "/buckets", label: "桶管理", show: () => true },
-  { path: "/objects", label: "对象浏览", show: () => true },
-  { path: "/uploads", label: "在途上传", show: (c) => c.can_diagnostics },
-  { path: "/keys", label: "访问密钥", show: (c) => c.can_keys },
-  { path: "/sessions", label: "临时会话", show: (c) => c.is_console_admin },
-  { path: "/audit", label: "审计日志", show: (c) => c.can_audit },
-  { path: "/users", label: "IAM 用户", show: (c) => c.can_iam },
-  { path: "/groups", label: "IAM 组", show: (c) => c.can_iam },
-  { path: "/policies", label: "IAM 策略", show: (c) => c.can_iam },
-  { path: "/service-accounts", label: "服务账户", show: (c) => c.can_iam },
-  { path: "/roles", label: "IAM 角色", show: (c) => c.can_iam },
-  { path: "/tenants", label: "租户", show: (c) => c.is_console_admin },
-  { path: "/settings", label: "设置", show: (c) => c.is_console_admin },
+  { path: "/dashboard", labelZh: "仪表盘", labelEn: "Dashboard", show: (c) => c.can_diagnostics },
+  { path: "/buckets", labelZh: "桶管理", labelEn: "Buckets", show: () => true },
+  { path: "/objects", labelZh: "对象浏览", labelEn: "Objects", show: () => true },
+  { path: "/uploads", labelZh: "在途上传", labelEn: "In-flight Uploads", show: (c) => c.can_diagnostics },
+  { path: "/keys", labelZh: "访问密钥", labelEn: "Access Keys", show: (c) => c.can_keys },
+  { path: "/sessions", labelZh: "临时会话", labelEn: "STS Sessions", show: (c) => c.is_console_admin },
+  { path: "/audit", labelZh: "审计日志", labelEn: "Audit Log", show: (c) => c.can_audit },
+  { path: "/users", labelZh: "IAM 用户", labelEn: "IAM Users", show: (c) => c.can_iam },
+  { path: "/groups", labelZh: "IAM 组", labelEn: "IAM Groups", show: (c) => c.can_iam },
+  { path: "/policies", labelZh: "IAM 策略", labelEn: "IAM Policies", show: (c) => c.can_iam },
+  { path: "/service-accounts", labelZh: "服务账户", labelEn: "Service Accounts", show: (c) => c.can_iam },
+  { path: "/roles", labelZh: "IAM 角色", labelEn: "IAM Roles", show: (c) => c.can_iam },
+  { path: "/tenants", labelZh: "租户", labelEn: "Tenants", show: (c) => c.is_console_admin },
+  { path: "/settings", labelZh: "设置", labelEn: "Settings", show: (c) => c.is_console_admin },
 ];
 
 export default function App() {
@@ -58,6 +61,7 @@ export default function App() {
   const [authed, setAuthed] = useState<boolean>(() => !!getToken());
   const [role, setRole] = useState<string>("admin");
   const [caps, setCaps] = useState<IamCapabilities | null>(null);
+  const locale = useLocale(); // M19 U4:语言切换时驱动整树重渲染
 
   useEffect(() => {
     // M18 C1:登录/恢复会话后取能力发现;失败(admin 暂不可达)保持 null 走 role 兜底
@@ -120,7 +124,7 @@ export default function App() {
     can_audit: role === "admin",
     can_keys: role === "admin",
   };
-  const denied = <div className="muted">无权访问(IAM 策略拒绝)</div>;
+  const denied = <div className="muted">{t("无权访问(IAM 策略拒绝)", "Access denied (IAM policy refusal)")}</div>;
   let page: React.ReactNode;
   switch (route) {
     case "/buckets":
@@ -186,10 +190,21 @@ export default function App() {
                 window.location.hash = n.path;
               }}
             >
-              {n.label}
+              {t(n.labelZh, n.labelEn)}
             </a>
           ))}
         </nav>
+        <div className="lang-switch" style={{ marginTop: "auto", padding: "0 14px 6px" }}>
+          <select
+            aria-label="Language"
+            value={locale}
+            onChange={(e) => setLocale(e.target.value as "zh" | "en")}
+            style={{ width: "100%" }}
+          >
+            <option value="zh">中文</option>
+            <option value="en">English</option>
+          </select>
+        </div>
         <div
           className="logout"
           onClick={() => {
@@ -198,7 +213,7 @@ export default function App() {
             setAuthed(false);
           }}
         >
-          退出登录
+          {t("退出登录", "Sign out")}
         </div>
       </aside>
       <main className="main">{page}</main>

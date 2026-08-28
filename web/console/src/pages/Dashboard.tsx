@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import uPlot from "uplot";
 import "uplot/dist/uPlot.min.css";
 import { api, getToken, fmtBytes, type Dashboard as Dash, type MetricsSnapshot } from "../api";
+import { t, tf } from "../i18n";
 
 /** 轻量滚动时间序列缓存(5s 采样 × 120 点 = 10 分钟)。 */
 const MAX_POINTS = 120;
@@ -188,7 +189,7 @@ export default function Dashboard() {
   };
 
   const doRepair = async () => {
-    if (!confirm("确认扫描并回收孤儿 extent?进行中的写入占用的 extent 会被跳过。")) return;
+    if (!confirm(t("确认扫描并回收孤儿 extent?进行中的写入占用的 extent 会被跳过。", "Confirm scanning and reclaiming orphan extents? Extents held by in-flight writes are skipped."))) return;
     setRepairing(true);
     try {
       const r = await api.repair();
@@ -207,7 +208,7 @@ export default function Dashboard() {
   if (error && !dash) {
     return (
       <div>
-        <h1>仪表盘</h1>
+        <h1>{t("仪表盘", "Dashboard")}</h1>
         <div className="alert">无法连接管理 API:{error}</div>
       </div>
     );
@@ -215,7 +216,7 @@ export default function Dashboard() {
   if (!dash) {
     return (
       <div>
-        <h1>仪表盘</h1>
+        <h1>{t("仪表盘", "Dashboard")}</h1>
         <div className="muted">
           <span className="spin" /> 加载中…
         </div>
@@ -231,7 +232,7 @@ export default function Dashboard() {
   return (
     <div>
       <h1>
-        仪表盘
+        {t("仪表盘", "Dashboard")}
         {wsMode === true && <span className="badge">实时 WS</span>}
         {wsMode === false && <span className="badge muted">轮询 5s</span>}
       </h1>
@@ -259,7 +260,7 @@ export default function Dashboard() {
       )}
       <div className="grid">
         <div className="card">
-          <div className="title">健康状态</div>
+          <div className="title">{t("健康状态", "Health")}</div>
           <div className="big">
             <span className={`dot ${dash.healthy ? "ok" : "bad"}`} />
             {dash.healthy ? "正常" : dash.degraded ? "降级" : "异常"}
@@ -311,7 +312,7 @@ export default function Dashboard() {
       </div>
       {(dash.devices?.length ?? 0) > 0 && (
         <>
-          <h2>设备水位</h2>
+          <h2>{t("设备水位", "Device usage")}</h2>
           <div className="grid">
             {dash.devices!.map((d) => (
               <div className="card" key={`${d.path}:${d.base}`}>
@@ -329,7 +330,7 @@ export default function Dashboard() {
       )}
       {dash.extras && hasDashboardExtras(dash.extras) && (
         <>
-          <h2>后台作业</h2>
+          <h2>{t("后台作业", "Background jobs")}</h2>
           <div className="grid">
             {dash.extras.lifecycleLastCycle !== undefined && (
               <div className="card">
@@ -372,7 +373,7 @@ export default function Dashboard() {
           </div>
         </>
       )}
-      <h2>实时吞吐(5s 采样,最近 10 分钟)</h2>
+      <h2>{t("实时吞吐(5s 采样,最近 10 分钟)", "Realtime throughput (5s samples, last 10 minutes)")}</h2>
       <div className="card">
         <div ref={chartRef} />
       </div>

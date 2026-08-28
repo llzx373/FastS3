@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, type BootstrapInfo } from "../api";
+import { t, tf } from "../i18n";
 
 /** 用户显式「跳过向导」后写入,避免每次登录都被重定向(数据就绪后自动失效)。 */
 export const FIRST_RUN_DISMISS_KEY = "fasts3_firstrun_dismissed";
@@ -94,7 +95,7 @@ export default function FirstRun() {
   if (bootError && !boot) {
     return (
       <div>
-        <h1>首启向导</h1>
+        <h1>{t("首启向导", "First-run wizard")}</h1>
         <div className="alert">无法连接管理 API:{bootError}</div>
         <div className="toolbar">
           <button className="ghost" onClick={dismissFirstRun}>
@@ -108,7 +109,7 @@ export default function FirstRun() {
   if (!boot) {
     return (
       <div>
-        <h1>首启向导</h1>
+        <h1>{t("首启向导", "First-run wizard")}</h1>
         <div className="muted">
           <span className="spin" /> 加载中…
         </div>
@@ -118,7 +119,7 @@ export default function FirstRun() {
 
   return (
     <div style={{ maxWidth: 720 }}>
-      <h1>欢迎使用 FastS3 🚀</h1>
+      <h1>{t("欢迎使用 FastS3 🚀", "Welcome to FastS3 🚀")}</h1>
 
       {/* 步骤指示 */}
       <div className="toolbar">
@@ -163,7 +164,7 @@ export default function FirstRun() {
             <button className="ghost" onClick={dismissFirstRun}>
               跳过向导
             </button>
-            <button onClick={() => setStep(2)}>下一步</button>
+            <button onClick={() => setStep(2)}>{t("下一步", "Next")}</button>
           </div>
         </div>
       )}
@@ -174,14 +175,14 @@ export default function FirstRun() {
           {error && <div className="alert">{error}</div>}
 
           <div className="form-row">
-            <label>桶名(S3 桶命名规则:小写字母 / 数字 / 连字符)</label>
+            <label>{t("桶名(S3 桶命名规则:小写字母 / 数字 / 连字符)", "Bucket name (S3 rules: lowercase letters / digits / hyphens)")}</label>
             <input
               value={bucketName}
               onChange={(e) => {
                 setBucketName(e.target.value.toLowerCase());
                 setError(null);
               }}
-              placeholder="如 my-first-bucket"
+              placeholder={t("如 my-first-bucket", "e.g. my-first-bucket")}
               disabled={!!bucketDone}
             />
           </div>
@@ -200,7 +201,7 @@ export default function FirstRun() {
           {!issued ? (
             <>
               <div className="form-row">
-                <label>Access Key ID(密钥备注会标记为 first-run)</label>
+                <label>{t("Access Key ID(密钥备注会标记为 first-run)", "Access Key ID (key note will be marked first-run)")}</label>
                 <input
                   value={accessKey}
                   onChange={(e) => {
@@ -238,7 +239,7 @@ export default function FirstRun() {
                   重新生成
                 </button>
                 <button onClick={() => setStep(3)} disabled={!bucketDone}>
-                  下一步
+                  {t("下一步", "Next")}
                 </button>
               </div>
             </>

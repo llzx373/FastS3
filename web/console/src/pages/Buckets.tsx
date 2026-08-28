@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, fmtBytes, fmtTime, type BucketInfo, type BucketCorsRule, type LifecycleRule, type ObjectLockConfig } from "../api";
+import { t, tf } from "../i18n";
 import { InventoryPane, NotificationPane, OwnershipPane, TagsPane } from "./BucketExtras";
 import { validatePolicy } from "./Keys";
 
@@ -51,7 +52,7 @@ export default function Buckets() {
   };
 
   const remove = async (b: BucketInfo, force: boolean) => {
-    if (!confirm(`删除桶 ${b.name}${force ? "(含全部对象)" : ""}?`)) return;
+    if (!confirm(tf("删除桶 {b}{f}?", "Delete bucket {b}{f}?", { b: b.name, f: force ? t("(含全部对象)", " (including all objects)") : "" }))) return;
     setBusy(true);
     try {
       await api.deleteBucket(b.name, force);
@@ -65,10 +66,10 @@ export default function Buckets() {
 
   return (
     <div>
-      <h1>桶管理</h1>
+      <h1>{t("桶管理", "Buckets")}</h1>
       {error && <div className="alert">{error}</div>}
       <div className="toolbar">
-        <button onClick={() => setShowCreate(true)}>新建桶</button>
+        <button onClick={() => setShowCreate(true)}>{t("新建桶", "New bucket")}</button>
         <button className="ghost" onClick={load}>
           刷新
         </button>
@@ -79,11 +80,11 @@ export default function Buckets() {
           <thead>
             <tr>
               <th>名称</th>
-              <th>对象数</th>
-              <th>已用空间</th>
-              <th>存储类分布</th>
-              <th>配额</th>
-              <th>创建时间</th>
+              <th>{t("对象数", "Objects")}</th>
+              <th>{t("已用空间", "Used")}</th>
+              <th>{t("存储类分布", "Storage class distribution")}</th>
+              <th>{t("配额", "Quota")}</th>
+              <th>{t("创建时间", "Created")}</th>
               <th>操作</th>
             </tr>
           </thead>
@@ -103,18 +104,18 @@ export default function Buckets() {
                 </td>
                 <td>{b.objects}</td>
                 <td>{fmtBytes(b.bytes)}</td>
-                <td title="存储类分账(M16)">{fmtClassDist(b.by_class)}</td>
-                <td>{b.quota ? fmtBytes(b.quota) : "不限"}</td>
+                <td title={t("存储类分账(M16)", "Storage class accounting (M16)")}>{fmtClassDist(b.by_class)}</td>
+                <td>{b.quota ? fmtBytes(b.quota) : t("不限", "unlimited")}</td>
                 <td className="muted">{fmtTime(b.created)}</td>
                 <td>
                   <button className="ghost small" onClick={() => setSettingsFor(b)}>
-                    设置
+                    {t("设置", "Settings")}
                   </button>{" "}
                   <button className="danger small" onClick={() => remove(b, false)}>
                     删除
                   </button>{" "}
-                  <button className="danger small" onClick={() => remove(b, true)} title="强制删除">
-                    强删
+                  <button className="danger small" onClick={() => remove(b, true)} title={t("强制删除", "Force delete")}>
+                    {t("强删", "Force")}
                   </button>
                 </td>
               </tr>
@@ -122,7 +123,7 @@ export default function Buckets() {
             {buckets.length === 0 && (
               <tr>
                 <td colSpan={7} className="muted">
-                  暂无桶
+                  {t("暂无桶", "No buckets")}
                 </td>
               </tr>
             )}
@@ -133,14 +134,14 @@ export default function Buckets() {
       {showCreate && (
         <div className="modal-backdrop" onClick={() => setShowCreate(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h3>新建桶</h3>
+            <h3>{t("新建桶", "New bucket")}</h3>
             <div className="form-row">
-              <label>桶名(小写字母/数字/连字符)</label>
+              <label>{t("桶名(小写字母/数字/连字符)", "Bucket name (lowercase letters/digits/hyphens)")}</label>
               <input value={name} onChange={(e) => setName(e.target.value)} autoFocus />
             </div>
             <div className="form-row">
-              <label>配额(字节;留空 = 不限)</label>
-              <input value={quota} onChange={(e) => setQuota(e.target.value)} placeholder="如 1073741824" />
+              <label>{t("配额(字节;留空 = 不限)", "Quota (bytes; empty = unlimited)")}</label>
+              <input value={quota} onChange={(e) => setQuota(e.target.value)} placeholder={t("如 1073741824", "e.g. 1073741824")} />
             </div>
             <div className="actions">
               <button className="ghost" onClick={() => setShowCreate(false)}>
@@ -182,17 +183,17 @@ type SettingsTab =
   | "inventory";
 
 const TAB_LABELS: { id: SettingsTab; label: string }[] = [
-  { id: "quota", label: "配额" },
-  { id: "versioning", label: "版本化" },
+  { id: "quota", label: t("配额", "Quota") },
+  { id: "versioning", label: t("版本化", "Versioning") },
   { id: "cors", label: "CORS" },
-  { id: "policy", label: "桶策略" },
-  { id: "lifecycle", label: "生命周期" },
-  { id: "encryption", label: "加密" },
-  { id: "lock", label: "对象锁" },
-  { id: "tags", label: "桶标签" },
-  { id: "ownership", label: "所有权" },
-  { id: "notify", label: "通知" },
-  { id: "inventory", label: "清单" },
+  { id: "policy", label: t("桶策略", "Policy") },
+  { id: "lifecycle", label: t("生命周期", "Lifecycle") },
+  { id: "encryption", label: t("加密", "Encryption") },
+  { id: "lock", label: t("对象锁", "Object Lock") },
+  { id: "tags", label: t("桶标签", "Tags") },
+  { id: "ownership", label: t("所有权", "Ownership") },
+  { id: "notify", label: t("通知", "Notification") },
+  { id: "inventory", label: t("清单", "Inventory") },
 ];
 
 /** M10:桶设置弹窗(配额 / 版本化 / CORS / 桶策略;M11 加生命周期 / 加密 两个 Tab)。 */
@@ -209,7 +210,7 @@ function BucketSettings({
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()} style={{ width: 680 }}>
-        <h3>桶设置:{bucket.name}</h3>
+        <h3>{tf("桶设置:{b}", "Bucket settings: {b}", { b: bucket.name })}</h3>
         <div className="toolbar" style={{ marginBottom: 12, flexWrap: "wrap" }}>
           {TAB_LABELS.map((t) => (
             <button
@@ -265,14 +266,14 @@ function QuotaPane({
     <div>
       {error && <div className="alert">{error}</div>}
       <div className="form-row">
-        <label>配额(字节;空 = 不限)</label>
+        <label>{t("配额(字节;空 = 不限)", "Quota (bytes; empty = unlimited)")}</label>
         <input
           value={quota ?? ""}
           onChange={(e) => setQuota(e.target.value ? Number(e.target.value) : null)}
         />
       </div>
       <div className="muted" style={{ marginBottom: 8 }}>
-        当前已用 {fmtBytes(bucket.bytes)}
+        {tf("当前已用 {u}", "Currently used {u}", { u: fmtBytes(bucket.bytes) })}
       </div>
       <div className="actions" style={{ marginTop: 0 }}>
         <button className="ghost" onClick={onCancel}>
@@ -327,13 +328,13 @@ function VersioningPane({ bucket }: { bucket: BucketInfo }) {
   const cleanup = async () => {
     if (
       !confirm(
-        `清理 ${bucket.name} 的全部历史(非最新)版本与历史删除标记?\n该操作逐条物理删除,不可恢复。`
+        tf("清理 {b} 的全部历史(非最新)版本与历史删除标记?\n该操作逐条物理删除,不可恢复。", "Clean all historical (non-current) versions and historical delete markers of {b}?\nEach is physically deleted and unrecoverable.", { b: bucket.name })
       )
     ) {
       return;
     }
     setCleaning(true);
-    setCleanMsg("扫描版本中…");
+    setCleanMsg(t("扫描版本中…", "Scanning versions…"));
     try {
       const targets: { key: string; versionId: string }[] = [];
       let keyMarker: string | undefined;
@@ -351,50 +352,50 @@ function VersioningPane({ bucket }: { bucket: BucketInfo }) {
       for (const t of targets) {
         await api.versionAction(bucket.name, "delete", t.key, t.versionId);
         done++;
-        setCleanMsg(`已删除 ${done}/${targets.length}`);
+        setCleanMsg(tf("已删除 {d}/{t}", "Deleted {d}/{t}", { d: done, t: targets.length }));
       }
-      setCleanMsg(`完成:清理 ${done} 个历史版本`);
+      setCleanMsg(tf("完成:清理 {n} 个历史版本", "Done: cleaned {n} historical versions", { n: done }));
     } catch (e) {
-      setCleanMsg(`清理失败:${(e as Error).message}`);
+      setCleanMsg(tf("清理失败:{msg}", "Cleanup failed: {msg}", { msg: (e as Error).message }));
     } finally {
       setCleaning(false);
     }
   };
 
-  const statusLabel = status === null ? "加载中…" : status === "" ? "未启用(Off)" : status;
+  const statusLabel = status === null ? t("加载中…", "Loading…") : status === "" ? t("未启用(Off)", "Not enabled (Off)") : status;
   return (
     <div>
       {error && <div className="alert">{error}</div>}
       <div className="form-row">
-        <label>当前状态</label>
+        <label>{t("当前状态", "Current status")}</label>
         <input value={statusLabel} readOnly />
       </div>
       <div className="form-row">
-        <label>设置为</label>
+        <label>{t("设置为", "Set to")}</label>
         <select value={target} onChange={(e) => setTarget(e.target.value as "Enabled" | "Suspended")}>
-          <option value="Enabled">Enabled(启用)</option>
-          <option value="Suspended">Suspended(暂停)</option>
+          <option value="Enabled">{t("Enabled(启用)", "Enabled")}</option>
+          <option value="Suspended">{t("Suspended(暂停)", "Suspended")}</option>
         </select>
       </div>
       <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
-        启用后不可回退到 Off(仅可在 Enabled ↔ Suspended 间切换);Suspended 后写入不再产生新版本,历史版本保留。
+        {t("启用后不可回退到 Off(仅可在 Enabled ↔ Suspended 间切换);Suspended 后写入不再产生新版本,历史版本保留。", "Cannot go back to Off once enabled (only Enabled ↔ Suspended); while suspended, writes no longer create new versions and history is preserved.")}
       </div>
       <div className="toolbar">
         <button onClick={save} disabled={saving || status === null || target === status}>
-          {saving ? "保存中…" : "保存"}
+          {saving ? t("保存中…", "Saving…") : t("保存", "Save")}
         </button>
-        {saved && <span style={{ color: "var(--green)", fontSize: 12 }}>✓ 已保存</span>}
+        {saved && <span style={{ color: "var(--green)", fontSize: 12 }}>{t("✓ 已保存", "✓ Saved")}</span>}
       </div>
       <hr style={{ border: "none", borderTop: "1px solid var(--border)", margin: "12px 0" }} />
-      <div className="title">历史版本清理</div>
+      <div className="title">{t("历史版本清理", "Historical version cleanup")}</div>
       <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
-        删除全部非最新版本与历史删除标记(永久删除,不可恢复;最新条目不动)。
+        {t("删除全部非最新版本与历史删除标记(永久删除,不可恢复;最新条目不动)。", "Delete all non-current versions and historical delete markers (permanent and unrecoverable; current entries are untouched).")}
       </div>
       <div className="toolbar">
         <button className="danger" onClick={cleanup} disabled={cleaning || status === "" || status === null}>
-          {cleaning ? "清理中…" : "清理历史版本"}
+          {cleaning ? t("清理中…", "Cleaning…") : t("清理历史版本", "Clean history versions")}
         </button>
-        {status === "" && <span className="muted" style={{ fontSize: 12 }}>桶未启用版本化,无历史版本可清理</span>}
+        {status === "" && <span className="muted" style={{ fontSize: 12 }}>{t("桶未启用版本化,无历史版本可清理", "Versioning not enabled; nothing to clean")}</span>}
         {cleanMsg && <span className="muted" style={{ fontSize: 12 }}>{cleanMsg}</span>}
       </div>
     </div>
@@ -431,18 +432,18 @@ function CorsPane({ bucket }: { bucket: BucketInfo }) {
   const save = async () => {
     const trimmed = text.trim();
     if (trimmed === "") {
-      setError("内容为空;如需清除配置请点击「删除配置」");
+      setError(t("内容为空;如需清除配置请点击「删除配置」", "Content is empty; to clear the config click Delete configuration"));
       return;
     }
     let rules: unknown;
     try {
       rules = JSON.parse(trimmed);
     } catch (e) {
-      setError(`JSON 解析失败:${(e as Error).message}`);
+      setError(tf("JSON 解析失败:{msg}", "JSON parse error: {msg}", { msg: (e as Error).message }));
       return;
     }
     if (!validate(rules)) {
-      setError("须为非空规则数组,每条规则至少含非空 AllowedOrigins 与 AllowedMethods");
+      setError(t("须为非空规则数组,每条规则至少含非空 AllowedOrigins 与 AllowedMethods", "Must be a non-empty rule array; each rule needs non-empty AllowedOrigins and AllowedMethods"));
       return;
     }
     setSaving(true);
@@ -458,7 +459,7 @@ function CorsPane({ bucket }: { bucket: BucketInfo }) {
   };
 
   const remove = async () => {
-    if (!confirm(`删除 ${bucket.name} 的 CORS 配置?`)) return;
+    if (!confirm(tf("删除 {b} 的 CORS 配置?", "Delete the CORS configuration of {b}?", { b: bucket.name }))) return;
     try {
       await api.deleteCors(bucket.name);
       setText("");
@@ -474,7 +475,7 @@ function CorsPane({ bucket }: { bucket: BucketInfo }) {
       {error && <div className="alert">{error}</div>}
       <p className="muted" style={{ fontSize: 12, marginTop: 0 }}>
         JSON 规则数组,字段:AllowedOrigins[] / AllowedMethods[](GET/PUT/POST/HEAD/DELETE)/
-        AllowedHeaders[]? / ExposeHeaders[]? / MaxAgeSeconds?。留空不可保存,清除请用「删除配置」。
+        AllowedHeaders[]? / ExposeHeaders[]? / MaxAgeSeconds?。留空不可保存,清除请用「{t("删除配置", "Delete configuration")}」。
       </p>
       <textarea
         value={text}
@@ -488,12 +489,12 @@ function CorsPane({ bucket }: { bucket: BucketInfo }) {
       />
       <div className="toolbar" style={{ marginTop: 8 }}>
         <button onClick={save} disabled={saving}>
-          {saving ? "保存中…" : "保存"}
+          {saving ? t("保存中…", "Saving…") : t("保存", "Save")}
         </button>
         <button className="danger" onClick={remove}>
-          删除配置
+          {t("删除配置", "Delete configuration")}
         </button>
-        {saved && <span style={{ color: "var(--green)", fontSize: 12 }}>✓ 已保存</span>}
+        {saved && <span style={{ color: "var(--green)", fontSize: 12 }}>{t("✓ 已保存", "✓ Saved")}</span>}
       </div>
     </div>
   );
@@ -524,7 +525,7 @@ function PolicyPane({ bucket }: { bucket: BucketInfo }) {
   const save = async () => {
     const trimmed = text.trim();
     if (trimmed === "") {
-      if (!confirm(`删除 ${bucket.name} 的桶策略?`)) return;
+      if (!confirm(tf("删除 {b} 的桶策略?", "Delete the bucket policy of {b}?", { b: bucket.name }))) return;
       setSaving(true);
       try {
         await api.deleteBucketPolicy(bucket.name);
@@ -555,7 +556,7 @@ function PolicyPane({ bucket }: { bucket: BucketInfo }) {
     <div>
       <p className="muted" style={{ fontSize: 12, marginTop: 0 }}>
         支持 AWS 策略子集:Version / Statement[].{"{"}Effect, Action[], Resource[], Condition?{"}"}
-        。留空保存 = 删除策略。Resource 建议形如 arn:aws:s3:::桶名/*。
+        {t("。留空保存 = 删除策略。Resource 建议形如 arn:aws:s3:::桶名/*。", ". Save empty to delete the policy. Resource should look like arn:aws:s3:::bucket/*.")}
       </p>
       <textarea
         value={text}
@@ -582,7 +583,7 @@ function PolicyPane({ bucket }: { bucket: BucketInfo }) {
       )}
       <div className="toolbar" style={{ marginTop: 8 }}>
         <button onClick={save} disabled={saving}>
-          {saving ? "保存中…" : "保存"}
+          {saving ? t("保存中…", "Saving…") : t("保存", "Save")}
         </button>
       </div>
     </div>
@@ -594,27 +595,27 @@ function PolicyPane({ bucket }: { bucket: BucketInfo }) {
 /** 规则过滤条件摘要(表格列)。 */
 function lifecycleFilterSummary(r: LifecycleRule): string {
   const parts: string[] = [];
-  if (r.Filter?.Prefix) parts.push(`前缀 ${r.Filter.Prefix}`);
-  if (r.Filter?.Tag) parts.push(`标签 ${r.Filter.Tag.Key}=${r.Filter.Tag.Value}`);
-  return parts.length ? parts.join(" + ") : "全部对象";
+  if (r.Filter?.Prefix) parts.push(tf("前缀 {p}", "prefix {p}", { p: r.Filter.Prefix }));
+  if (r.Filter?.Tag) parts.push(tf("标签 {k}={v}", "tag {k}={v}", { k: r.Filter.Tag.Key, v: r.Filter.Tag.Value }));
+  return parts.length ? parts.join(" + ") : t("全部对象", "all objects");
 }
 
 /** 规则动作摘要(表格列)。 */
 function lifecycleActionSummary(r: LifecycleRule): string {
   const parts: string[] = [];
-  if (r.Expiration?.Days !== undefined) parts.push(`${r.Expiration.Days} 天后过期`);
-  if (r.Expiration?.Date) parts.push(`${r.Expiration.Date.slice(0, 10)} 过期`);
-  if (r.Expiration?.ExpiredObjectDeleteMarker) parts.push("清理过期删除标记");
+  if (r.Expiration?.Days !== undefined) parts.push(tf("{n} 天后过期", "expire in {n} days", { n: r.Expiration.Days }));
+  if (r.Expiration?.Date) parts.push(tf("{d} 过期", "expire on {d}", { d: r.Expiration.Date.slice(0, 10) }));
+  if (r.Expiration?.ExpiredObjectDeleteMarker) parts.push(t("清理过期删除标记", "clean expired delete markers"));
   if (r.NoncurrentVersionExpiration?.NoncurrentDays !== undefined) {
-    parts.push(`非当前版本 ${r.NoncurrentVersionExpiration.NoncurrentDays} 天后过期`);
+    parts.push(tf("非当前版本 {n} 天后过期", "non-current versions expire in {n} days", { n: r.NoncurrentVersionExpiration.NoncurrentDays }));
   }
   if (r.AbortIncompleteMultipartUpload?.DaysAfterInitiation !== undefined) {
-    parts.push(`未完成分片 ${r.AbortIncompleteMultipartUpload.DaysAfterInitiation} 天后中止`);
+    parts.push(tf("未完成分片 {n} 天后中止", "abort incomplete multipart uploads after {n} days", { n: r.AbortIncompleteMultipartUpload.DaysAfterInitiation }));
   }
   if (r.Transition?.StorageClass) {
     const when =
       r.Transition.Days !== undefined ? `${r.Transition.Days} 天后` : r.Transition.Date?.slice(0, 10) ?? "";
-    parts.push(`转换 ${r.Transition.StorageClass}(${when})`);
+    parts.push(tf("转换 {c}({w})", "transition to {c} ({w})", { c: r.Transition.StorageClass, w: when }));
   }
   return parts.join(";");
 }
@@ -668,7 +669,7 @@ function LifecyclePane({ bucket }: { bucket: BucketInfo }) {
     const base = rules ?? [];
     const idx = editing?.index ?? null;
     if (idx === null && base.some((r) => r.ID === rule.ID)) {
-      setError(`规则 ID「${rule.ID}」已存在`);
+      setError(tf("规则 ID「{id}」已存在", "Rule ID \"{id}\" already exists", { id: rule.ID }));
       return;
     }
     const next = idx === null ? [...base, rule] : base.map((r, i) => (i === idx ? rule : r));
@@ -677,7 +678,7 @@ function LifecyclePane({ bucket }: { bucket: BucketInfo }) {
 
   const removeRule = async (i: number) => {
     if (!rules) return;
-    if (!confirm(`删除规则 ${rules[i].ID}?${rules.length === 1 ? "(最后一条,删除后清空生命周期配置)" : ""}`)) {
+    if (!confirm(tf("删除规则 {id}?{last}", "Delete rule {id}?{last}", { id: rules[i].ID, last: rules.length === 1 ? t("(最后一条,删除后清空生命周期配置)", " (last rule; deleting it clears the lifecycle configuration)") : "" }))) {
       return;
     }
     await persist(rules.filter((_, j) => j !== i));
@@ -700,13 +701,13 @@ function LifecyclePane({ bucket }: { bucket: BucketInfo }) {
     <div>
       {error && <div className="alert">{error}</div>}
       <p className="muted" style={{ fontSize: 12, marginTop: 0 }}>
-        过期/清理/归档转换按桶整体保存;删除全部规则即清除配置。Transition 目标类:
+        {t("过期/清理/归档转换按桶整体保存;删除全部规则即清除配置。Transition 目标类:", "Expiration/cleanup/transition rules are saved as a whole per bucket; deleting all rules clears the configuration. Transition target classes:")}
         GLACIER / GLACIER_IR / DEEP_ARCHIVE。
       </p>
       <div className="toolbar">
-        <button onClick={() => setEditing({ index: null })}>新建规则</button>
+        <button onClick={() => setEditing({ index: null })}>{t("新建规则", "New rule")}</button>
         {saving && <span className="spin" />}
-        {saved && <span style={{ color: "var(--green)", fontSize: 12 }}>✓ 已保存</span>}
+        {saved && <span style={{ color: "var(--green)", fontSize: 12 }}>{t("✓ 已保存", "✓ Saved")}</span>}
       </div>
       {rules === null ? (
         <div className="muted">加载中…</div>
@@ -716,8 +717,8 @@ function LifecyclePane({ bucket }: { bucket: BucketInfo }) {
             <tr>
               <th>ID</th>
               <th>状态</th>
-              <th>过滤</th>
-              <th>动作</th>
+              <th>{t("过滤", "Filter")}</th>
+              <th>{t("动作", "Actions")}</th>
               <th>操作</th>
             </tr>
           </thead>
@@ -725,7 +726,7 @@ function LifecyclePane({ bucket }: { bucket: BucketInfo }) {
             {rules.map((r, i) => (
               <tr key={r.ID}>
                 <td>{r.ID}</td>
-                <td>{r.Status === "Enabled" ? "启用" : "禁用"}</td>
+                <td>{r.Status === "Enabled" ? t("启用", "Enabled") : t("禁用", "Disabled")}</td>
                 <td className="muted">{lifecycleFilterSummary(r)}</td>
                 <td className="muted">{lifecycleActionSummary(r)}</td>
                 <td>
@@ -806,11 +807,11 @@ function LifecycleRuleForm({
   const submit = async () => {
     const id = ruleId.trim();
     if (!id) {
-      setFormError("规则 ID 不能为空");
+      setFormError(t("规则 ID 不能为空", "Rule ID must not be empty"));
       return;
     }
     if ((tagKey && !tagValue) || (!tagKey && tagValue)) {
-      setFormError("标签的键与值须同时填写(或都不填)");
+      setFormError(t("标签的键与值须同时填写(或都不填)", "Tag key and value must both be filled (or both empty)"));
       return;
     }
     const rule: LifecycleRule = { ID: id, Status: enabled ? "Enabled" : "Disabled" };
@@ -823,13 +824,13 @@ function LifecycleRuleForm({
     if (expMode === "days") {
       const d = positiveInt(expDays);
       if (d === null) {
-        setFormError("过期天数须为正整数");
+        setFormError(t("过期天数须为正整数", "Expiration days must be a positive integer"));
         return;
       }
       rule.Expiration = { Days: d };
     } else if (expMode === "date") {
       if (!expDate) {
-        setFormError("请选择过期日期");
+        setFormError(t("请选择过期日期", "Please choose an expiration date"));
         return;
       }
       rule.Expiration = { Date: `${expDate}T00:00:00Z` };
@@ -839,7 +840,7 @@ function LifecycleRuleForm({
     if (noncurrentDays.trim() !== "") {
       const d = positiveInt(noncurrentDays);
       if (d === null) {
-        setFormError("非当前版本过期天数须为正整数");
+        setFormError(t("非当前版本过期天数须为正整数", "Non-current version expiration days must be a positive integer"));
         return;
       }
       rule.NoncurrentVersionExpiration = { NoncurrentDays: d };
@@ -847,7 +848,7 @@ function LifecycleRuleForm({
     if (abortDays.trim() !== "") {
       const d = positiveInt(abortDays);
       if (d === null) {
-        setFormError("分片中止天数须为正整数");
+        setFormError(t("分片中止天数须为正整数", "Multipart abort days must be a positive integer"));
         return;
       }
       rule.AbortIncompleteMultipartUpload = { DaysAfterInitiation: d };
@@ -855,11 +856,11 @@ function LifecycleRuleForm({
     if (transClass) {
       const d = positiveInt(transDays);
       if (d === null) {
-        setFormError("转换天数须为正整数");
+        setFormError(t("转换天数须为正整数", "Transition days must be a positive integer"));
         return;
       }
       if (!["GLACIER", "GLACIER_IR", "DEEP_ARCHIVE"].includes(transClass)) {
-        setFormError("转换目标须为 GLACIER / GLACIER_IR / DEEP_ARCHIVE");
+        setFormError(t("转换目标须为 GLACIER / GLACIER_IR / DEEP_ARCHIVE", "Transition target must be GLACIER / GLACIER_IR / DEEP_ARCHIVE"));
         return;
       }
       rule.Transition = { Days: d, StorageClass: transClass };
@@ -870,7 +871,7 @@ function LifecycleRuleForm({
       !rule.AbortIncompleteMultipartUpload &&
       !rule.Transition
     ) {
-      setFormError("至少配置一个动作(过期 / 转换 / 非当前版本过期 / 分片中止)");
+      setFormError(t("至少配置一个动作(过期 / 转换 / 非当前版本过期 / 分片中止)", "Configure at least one action (expiration / transition / non-current expiration / multipart abort)"));
       return;
     }
     setFormError(null);
@@ -878,38 +879,38 @@ function LifecycleRuleForm({
   };
 
   const EXP_MODES: { id: ExpirationMode; label: string }[] = [
-    { id: "none", label: "不启用" },
-    { id: "days", label: "按天数过期" },
-    { id: "date", label: "按日期过期" },
-    { id: "marker", label: "清理过期删除标记" },
+    { id: "none", label: t("不启用", "Disabled") },
+    { id: "days", label: t("按天数过期", "Expire by days") },
+    { id: "date", label: t("按日期过期", "Expire by date") },
+    { id: "marker", label: t("清理过期删除标记", "Clean expired delete markers") },
   ];
 
   return (
     <div>
       {(formError ?? error) && <div className="alert">{formError ?? error}</div>}
       <div className="form-row">
-        <label>规则 ID</label>
+        <label>{t("规则 ID", "Rule ID")}</label>
         <input value={ruleId} onChange={(e) => setRuleId(e.target.value)} autoFocus />
       </div>
       <div className="form-row">
         <label style={{ display: "flex", alignItems: "center", gap: 6, margin: 0 }}>
           <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />
-          启用该规则
+          {t("启用该规则", "Enable this rule")}
         </label>
       </div>
       <div className="form-row">
-        <label>前缀过滤(留空 = 全部对象)</label>
+        <label>{t("前缀过滤(留空 = 全部对象)", "Prefix filter (empty = all objects)")}</label>
         <input value={prefix} onChange={(e) => setPrefix(e.target.value)} placeholder="如 logs/" />
       </div>
       <div className="form-row">
-        <label>标签过滤(可选,键与值)</label>
+        <label>{t("标签过滤(可选,键与值)", "Tag filter (optional; key and value)")}</label>
         <div style={{ display: "flex", gap: 8 }}>
           <input value={tagKey} onChange={(e) => setTagKey(e.target.value)} placeholder="键" />
           <input value={tagValue} onChange={(e) => setTagValue(e.target.value)} placeholder="值" />
         </div>
       </div>
       <div className="form-row">
-        <label>过期动作(三者互斥)</label>
+        <label>{t("过期动作(三者互斥)", "Expiration action (mutually exclusive)")}</label>
         <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
           {EXP_MODES.map((m) => (
             <label key={m.id} style={{ margin: 0, display: "flex", alignItems: "center", gap: 4 }}>
@@ -926,31 +927,31 @@ function LifecycleRuleForm({
       </div>
       {expMode === "days" && (
         <div className="form-row">
-          <label>过期天数</label>
+          <label>{t("过期天数", "Expiration days")}</label>
           <input type="number" min={1} value={expDays} onChange={(e) => setExpDays(e.target.value)} />
         </div>
       )}
       {expMode === "date" && (
         <div className="form-row">
-          <label>过期日期(UTC 零点)</label>
+          <label>{t("过期日期(UTC 零点)", "Expiration date (UTC midnight)")}</label>
           <input type="date" value={expDate} onChange={(e) => setExpDate(e.target.value)} />
         </div>
       )}
       <div className="form-row">
-        <label>非当前版本过期天数(可选;需桶已启用版本化)</label>
+        <label>{t("非当前版本过期天数(可选;需桶已启用版本化)", "Non-current version expiration days (optional; requires versioning)")}</label>
         <input type="number" min={1} value={noncurrentDays} onChange={(e) => setNoncurrentDays(e.target.value)} />
       </div>
       <div className="form-row">
-        <label>未完成分片中止天数(可选)</label>
+        <label>{t("未完成分片中止天数(可选)", "Abort incomplete multipart after days (optional)")}</label>
         <input type="number" min={1} value={abortDays} onChange={(e) => setAbortDays(e.target.value)} />
       </div>
       <div className="form-row">
-        <label>归档转换(可选;当前版本)</label>
+        <label>{t("归档转换(可选;当前版本)", "Archive transition (optional; current version)")}</label>
         <select value={transClass} onChange={(e) => setTransClass(e.target.value)}>
-          <option value="">不转换</option>
-          <option value="GLACIER_IR">GLACIER_IR(在线可读)</option>
-          <option value="GLACIER">GLACIER(需 restore)</option>
-          <option value="DEEP_ARCHIVE">DEEP_ARCHIVE(需 restore)</option>
+          <option value="">{t("不转换", "No transition")}</option>
+          <option value="GLACIER_IR">{t("GLACIER_IR(在线可读)", "GLACIER_IR (online readable)")}</option>
+          <option value="GLACIER">{t("GLACIER(需 restore)", "GLACIER (restore required)")}</option>
+          <option value="DEEP_ARCHIVE">{t("DEEP_ARCHIVE(需 restore)", "DEEP_ARCHIVE (restore required)")}</option>
         </select>
         {transClass && (
           <input
@@ -958,7 +959,7 @@ function LifecycleRuleForm({
             min={1}
             value={transDays}
             onChange={(e) => setTransDays(e.target.value)}
-            placeholder="天数"
+            placeholder={t("天数", "days")}
             style={{ marginTop: 6 }}
           />
         )}
@@ -968,7 +969,7 @@ function LifecycleRuleForm({
           取消
         </button>
         <button onClick={submit} disabled={saving}>
-          {saving ? "保存中…" : "保存规则"}
+          {saving ? t("保存中…", "Saving…") : t("保存规则", "Save rule")}
         </button>
       </div>
     </div>
@@ -1015,23 +1016,23 @@ function EncryptionPane({ bucket }: { bucket: BucketInfo }) {
     }
   };
 
-  const currentLabel = current === null ? "加载中…" : current === "" ? "无默认加密" : current;
+  const currentLabel = current === null ? t("加载中…", "Loading…") : current === "" ? t("无默认加密", "No default encryption") : current;
   return (
     <div>
       {error && <div className="alert">{error}</div>}
       <p className="muted" style={{ fontSize: 12, marginTop: 0 }}>
-        桶默认加密(SSE-S3):新写入未显式指定加密的对象自动以 AES256 加密;不含 KMS(aws:kms 不受理)。
+        {t("桶默认加密(SSE-S3):新写入未显式指定加密的对象自动以 AES256 加密;不含 KMS(aws:kms 不受理)。", "Bucket default encryption (SSE-S3): writes without explicit encryption are automatically AES256 encrypted; no KMS (aws:kms not accepted).")}
       </p>
       <div className="form-row">
-        <label>当前配置</label>
+        <label>{t("当前配置", "Current configuration")}</label>
         <input value={currentLabel} readOnly />
       </div>
       <div className="form-row">
-        <label>设置为</label>
+        <label>{t("设置为", "Set to")}</label>
         <div style={{ display: "flex", gap: 14 }}>
           <label style={{ margin: 0, display: "flex", alignItems: "center", gap: 4 }}>
             <input type="radio" name="enc-mode" checked={target === ""} onChange={() => setTarget("")} />
-            无默认加密
+            {t("无默认加密", "No default encryption")}
           </label>
           <label style={{ margin: 0, display: "flex", alignItems: "center", gap: 4 }}>
             <input
@@ -1046,9 +1047,9 @@ function EncryptionPane({ bucket }: { bucket: BucketInfo }) {
       </div>
       <div className="toolbar">
         <button onClick={save} disabled={saving || current === null || target === (current === "AES256" ? "AES256" : "")}>
-          {saving ? "保存中…" : "保存"}
+          {saving ? t("保存中…", "Saving…") : t("保存", "Save")}
         </button>
-        {saved && <span style={{ color: "var(--green)", fontSize: 12 }}>✓ 已保存</span>}
+        {saved && <span style={{ color: "var(--green)", fontSize: 12 }}>{t("✓ 已保存", "✓ Saved")}</span>}
       </div>
     </div>
   );
@@ -1103,7 +1104,7 @@ function ObjectLockPane({ bucket }: { bucket: BucketInfo }) {
   };
 
   const enable = async () => {
-    if (!confirm(`启用 ${bucket.name} 的 Object Lock?\n启用后不可关闭,并将自动开启版本化。`)) {
+    if (!confirm(tf("启用 {b} 的 Object Lock?\n启用后不可关闭,并将自动开启版本化。", "Enable Object Lock on {b}?\nIt cannot be disabled once enabled, and versioning will be turned on automatically.", { b: bucket.name }))) {
       return;
     }
     setSaving(true);
@@ -1139,7 +1140,7 @@ function ObjectLockPane({ bucket }: { bucket: BucketInfo }) {
         Object Lock(WORM):启用后不可关闭。新对象可继承默认保留;COMPLIANCE 仅可延长,GOVERNANCE 缩短需 bypass。
       </p>
       <div className="form-row">
-        <label>当前状态</label>
+        <label>{t("当前状态", "Current status")}</label>
         <input value={cfg === null ? "加载中…" : enabled ? "已启用(不可关闭)" : "未启用"} readOnly />
       </div>
       <div className="form-row">
@@ -1173,7 +1174,7 @@ function ObjectLockPane({ bucket }: { bucket: BucketInfo }) {
             {saving ? "保存中…" : "保存默认保留"}
           </button>
         )}
-        {saved && <span style={{ color: "var(--green)", fontSize: 12 }}>✓ 已保存</span>}
+        {saved && <span style={{ color: "var(--green)", fontSize: 12 }}>{t("✓ 已保存", "✓ Saved")}</span>}
       </div>
     </div>
   );

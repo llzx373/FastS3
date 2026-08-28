@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, fmtTime, type KeyInfo } from "../api";
+import { t, tf } from "../i18n";
 
 /** AWS 策略 JSON 子集校验:Version/Statement[].{Effect,Action[],Resource[],Condition?}。
  *  返回错误列表;空数组 = 通过。对多余字段(Sid 等)保持宽松。 */
@@ -9,14 +10,14 @@ export function validatePolicy(text: string): string[] {
   try {
     doc = JSON.parse(text);
   } catch (e) {
-    return [`JSON 解析失败:${(e as Error).message}`];
+    return [tf("JSON 解析失败:{msg}", "JSON parse error: {msg}", { msg: (e as Error).message })];
   }
   if (doc === null || typeof doc !== "object" || Array.isArray(doc)) {
-    return ["策略必须是 JSON 对象"];
+    return [t("策略必须是 JSON 对象", "Policy must be a JSON object")];
   }
   const d = doc as Record<string, unknown>;
   if (d.Version !== undefined && typeof d.Version !== "string") {
-    errs.push("Version 必须是字符串(如 \"2012-10-17\")");
+    errs.push(t("Version 必须是字符串(如 \"2012-10-17\")", "Version must be a string (e.g. \"2012-10-17\")"));
   }
   const st = d.Statement;
   if (!Array.isArray(st) || st.length === 0) {
@@ -26,23 +27,23 @@ export function validatePolicy(text: string): string[] {
   st.forEach((s, i) => {
     const p = `Statement[${i}]`;
     if (s === null || typeof s !== "object" || Array.isArray(s)) {
-      errs.push(`${p} 必须是对象`);
+      errs.push(tf("{p} 必须是对象", "{p} must be an object", { p }));
       return;
     }
     const stmt = s as Record<string, unknown>;
     if (stmt.Effect !== "Allow" && stmt.Effect !== "Deny") {
-      errs.push(`${p}.Effect 必须是 "Allow" 或 "Deny"`);
+      errs.push(tf("{p}.Effect 必须是 \"Allow\" 或 \"Deny\"", "{p}.Effect must be \"Allow\" or \"Deny\"", { p }));
     }
     const actions = stmt.Action;
     if (!isStringOrStringArray(actions) || isEmpty(actions)) {
-      errs.push(`${p}.Action 必填,须为字符串或非空字符串数组(如 "s3:GetObject" 或 ["s3:GetObject"])`);
+      errs.push(tf("{p}.Action 必填,须为字符串或非空字符串数组(如 \"s3:GetObject\" 或 [\"s3:GetObject\"])", "{p}.Action is required; a string or non-empty string array (e.g. \"s3:GetObject\" or [\"s3:GetObject\"])", { p }));
     }
     const resources = stmt.Resource;
     if (!isStringOrStringArray(resources) || isEmpty(resources)) {
-      errs.push(`${p}.Resource 必填,须为字符串或非空字符串数组`);
+      errs.push(tf("{p}.Resource 必填,须为字符串或非空字符串数组", "{p}.Resource is required; a string or non-empty string array", { p }));
     }
     if (stmt.Condition !== undefined && !isPlainObject(stmt.Condition)) {
-      errs.push(`${p}.Condition 可选,须为对象(如 {"StringEquals": {...}})`);
+      errs.push(tf("{p}.Condition 可选,须为对象", "{p}.Condition is optional and must be an object", { p }));
     }
   });
   return errs;
@@ -123,7 +124,7 @@ export default function Keys() {
   };
 
   const remove = async (k: KeyInfo) => {
-    if (!confirm(`删除密钥 ${k.access_key}?`)) return;
+    if (!confirm(tf("删除密钥 {ak}?", "Delete key {ak}?", { ak: k.access_key }))) return;
     try {
       await api.deleteKey(k.access_key);
       await load();
@@ -167,10 +168,10 @@ export default function Keys() {
 
   return (
     <div>
-      <h1>访问密钥</h1>
+      <h1>{t("访问密钥", "Access Keys")}</h1>
       {error && <div className="alert">{error}</div>}
       <div className="toolbar">
-        <button onClick={() => setShowCreate(true)}>创建密钥</button>
+        <button onClick={() => setShowCreate(true)}>{t("创建密钥", "Create key")}</button>
         <button className="ghost" onClick={load}>
           刷新
         </button>
@@ -193,9 +194,9 @@ export default function Keys() {
                 <td className="mono">{k.access_key}</td>
                 <td>
                   <span className={`dot ${k.enabled ? "ok" : "bad"}`} />
-                  {k.enabled ? "启用" : "禁用"}
+                  {k.enabled ? t("启用", "Enable") : t("禁用", "Disable")}
                 </td>
-                <td>{k.policy ? <span className="badge">已设置</span> : <span className="muted">—</span>}</td>
+                <td>{k.policy ? <span className="badge">{t("已设置", "Set")}</span> : <span className="muted">—</span>}</td>
                 <td className="muted">{k.note ?? "—"}</td>
                 <td className="muted">{fmtTime(k.created)}</td>
                 <td>
@@ -203,7 +204,7 @@ export default function Keys() {
                     策略
                   </button>{" "}
                   <button className="ghost small" onClick={() => toggle(k)}>
-                    {k.enabled ? "禁用" : "启用"}
+                    {k.enabled ? t("禁用", "Disable") : t("启用", "Enable")}
                   </button>{" "}
                   <button className="danger small" onClick={() => remove(k)}>
                     删除
@@ -214,7 +215,7 @@ export default function Keys() {
             {keys.length === 0 && (
               <tr>
                 <td colSpan={6} className="muted">
-                  暂无运行时密钥(配置/CLI 密钥不在此列表)
+                  {t("暂无运行时密钥(配置/CLI 密钥不在此列表)", "No runtime keys (config/CLI keys are not listed here)")}
                 </td>
               </tr>
             )}
@@ -225,13 +226,13 @@ export default function Keys() {
       {showCreate && (
         <div className="modal-backdrop" onClick={() => setShowCreate(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h3>创建密钥</h3>
+            <h3>{t("创建密钥", "Create key")}</h3>
             <div className="form-row">
               <label>Access Key ID</label>
               <input value={accessKey} onChange={(e) => setAccessKey(e.target.value)} autoFocus />
             </div>
             <div className="form-row">
-              <label>备注(可选)</label>
+              <label>{t("备注(可选)", "Note (optional)")}</label>
               <input value={note} onChange={(e) => setNote(e.target.value)} />
             </div>
             <div className="actions">
@@ -249,7 +250,7 @@ export default function Keys() {
       {policyFor && (
         <div className="modal-backdrop" onClick={closePolicy}>
           <div className="modal" onClick={(e) => e.stopPropagation()} style={{ width: 640 }}>
-            <h3>策略编辑器 · {policyFor.access_key}</h3>
+            <h3>{tf("策略编辑器 · {ak}", "Policy editor · {ak}", { ak: policyFor.access_key })}</h3>
             <p className="muted" style={{ fontSize: 12, marginTop: -8 }}>
               支持 AWS 策略子集:Version / Statement[].{"{"}Effect, Action[], Resource[], Condition?{"}"}
               。留空保存 = 清除策略。语法校验通过后提交,是否生效取决于服务端策略引擎。
@@ -271,13 +272,13 @@ export default function Keys() {
                 ))}
               </div>
             )}
-            {policySaved && <div className="alert" style={{ color: "#4ade80", borderColor: "#4ade80" }}>✓ 策略已保存</div>}
+            {policySaved && <div className="alert" style={{ color: "#4ade80", borderColor: "#4ade80" }}>{t("✓ 策略已保存", "✓ Policy saved")}</div>}
             <div className="actions">
               <button className="ghost" onClick={closePolicy}>
                 取消
               </button>
               <button onClick={savePolicy} disabled={saving}>
-                {saving ? "保存中…" : "保存"}
+                {saving ? t("保存中…", "Saving…") : t("保存", "Save")}
               </button>
             </div>
           </div>
@@ -287,9 +288,9 @@ export default function Keys() {
       {issued && (
         <div className="modal-backdrop" onClick={() => setIssued(null)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h3>密钥创建成功</h3>
+            <h3>{t("密钥创建成功", "Key created")}</h3>
             <div className="alert warn">
-              Secret 仅此一次显示,请立即保存;关闭后无法再次查看。
+              {t("Secret 仅此一次显示,请立即保存;关闭后无法再次查看。", "The secret is shown only once; save it now. It cannot be viewed again after closing.")}
             </div>
             <div className="form-row">
               <label>Access Key</label>
@@ -300,7 +301,7 @@ export default function Keys() {
               <input value={issued.secret_key} readOnly />
             </div>
             <div className="actions">
-              <button onClick={() => setIssued(null)}>我已保存</button>
+              <button onClick={() => setIssued(null)}>{t("我已保存", "I have saved it")}</button>
             </div>
           </div>
         </div>

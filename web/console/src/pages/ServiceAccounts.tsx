@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, fmtTime, type IamCapabilities, type ServiceAccount } from "../api";
+import { t, tf } from "../i18n";
 
 /** M18 C1:服务账户(数据面访问凭据)。默认列自己;有 admin:ListServiceAccounts
  *  的管理员可查看指定 owner;代管创建同理(owner_user ≠ 自己时服务端求值)。 */
@@ -47,7 +48,7 @@ export default function ServiceAccounts({ caps }: { caps: IamCapabilities }) {
   };
 
   const del = async (sa: ServiceAccount) => {
-    if (!confirm(`删除服务账户 ${sa.access_key}(属主 ${sa.owner_user})?`)) return;
+    if (!confirm(tf("删除服务账户 {ak}(属主 {o})?", "Delete service account {ak} (owner {o})?", { ak: sa.access_key, o: sa.owner_user }))) return;
     try {
       await api.deleteServiceAccount(sa.access_key);
       await load(owner);
@@ -58,7 +59,7 @@ export default function ServiceAccounts({ caps }: { caps: IamCapabilities }) {
 
   return (
     <div>
-      <h1>服务账户</h1>
+      <h1>{t("服务账户", "Service Accounts")}</h1>
       {error && <div className="alert">{error}</div>}
       <div className="toolbar">
         {caps.can_keys && (
@@ -69,7 +70,7 @@ export default function ServiceAccounts({ caps }: { caps: IamCapabilities }) {
             style={{ width: 220 }}
           />
         )}
-        <button onClick={() => setShowCreate(true)}>创建服务账户</button>
+        <button onClick={() => setShowCreate(true)}>{t("创建服务账户", "Create service account")}</button>
         <button className="ghost" onClick={() => load(owner)}>
           刷新
         </button>
@@ -79,12 +80,12 @@ export default function ServiceAccounts({ caps }: { caps: IamCapabilities }) {
           <thead>
             <tr>
               <th>Access Key</th>
-              <th>属主</th>
-              <th>名称</th>
-              <th>状态</th>
-              <th>策略</th>
-              <th>创建时间</th>
-              <th>操作</th>
+              <th>{t("属主", "Owner")}</th>
+              <th>{t("名称", "Name")}</th>
+              <th>{t("状态", "Status")}</th>
+              <th>{t("策略", "Policy")}</th>
+              <th>{t("创建时间", "Created")}</th>
+              <th>{t("操作", "Actions")}</th>
             </tr>
           </thead>
           <tbody>
@@ -133,14 +134,14 @@ export default function ServiceAccounts({ caps }: { caps: IamCapabilities }) {
       {showCreate && (
         <div className="modal-backdrop" onClick={() => setShowCreate(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h3>创建服务账户</h3>
+            <h3>{t("创建服务账户", "Create service account")}</h3>
             {formErr && <div className="alert">{formErr}</div>}
             <div className="form-row">
-              <label>名称(可选)</label>
+              <label>{t("名称(可选)", "Name (optional)")}</label>
               <input value={name} onChange={(e) => setName(e.target.value)} autoFocus />
             </div>
             <div className="form-row">
-              <label>属主用户(留空 = 自己;代管需权限)</label>
+              <label>{t("属主用户(留空 = 自己;代管需权限)", "Owner user (empty = yourself; delegation requires permission)")}</label>
               <input value={ownerUser} onChange={(e) => setOwnerUser(e.target.value)} />
             </div>
             <div className="actions">
@@ -158,7 +159,7 @@ export default function ServiceAccounts({ caps }: { caps: IamCapabilities }) {
       {issued && (
         <div className="modal-backdrop" onClick={() => setIssued(null)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h3>服务账户创建成功</h3>
+            <h3>{t("服务账户创建成功", "Service account created")}</h3>
             <div className="alert warn">Secret 仅此一次显示,请立即保存;关闭后无法再次查看。</div>
             <div className="form-row">
               <label>Access Key</label>

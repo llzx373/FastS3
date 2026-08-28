@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, fmtTime, getToken, type AuditEntry, type AuditFilters } from "../api";
+import { t, tf } from "../i18n";
 
 /** datetime-local 输入值(如 "2026-01-01T08:30") → unix 秒;空字符串 → undefined。 */
 function toUnix(value: string): number | undefined {
@@ -167,7 +168,7 @@ export default function Audit() {
 
   return (
     <div>
-      <h1>审计日志</h1>
+      <h1>{t("审计日志", "Audit Log")}</h1>
       {error && <div className="alert">{error}</div>}
 
       <div className="card">
@@ -277,9 +278,9 @@ export default function Audit() {
               <th>时间</th>
               <th>用户</th>
               <th>操作</th>
-              <th>桶</th>
+              <th>{t("桶", "Bucket")}</th>
               <th>键</th>
-              <th>结果</th>
+              <th>{t("结果", "Result")}</th>
               <th>bypass</th>
               <th>保留变更</th>
               <th>客户端</th>

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, fmtTime, type AdminConfig, type ConfigPatchResult, type IdentityEvent, type LdapStatus } from "../api";
+import { t, tf } from "../i18n";
 
 const SYNC_MODES = ["group", "full", "none"] as const;
 const ETAG_MODES = ["md5", "crc32c"] as const;
@@ -144,7 +145,7 @@ export default function Settings() {
 
   return (
     <div>
-      <h1>设置</h1>
+      <h1>{t("设置", "Settings")}</h1>
       {error && <div className="alert">{error}</div>}
       {reloadMsg && <div className="alert" style={{ color: "#4ade80", borderColor: "#4ade80" }}>✓ {reloadMsg}</div>}
       {validErr.length > 0 && (
@@ -182,7 +183,7 @@ export default function Settings() {
               重新加载配置
             </button>
             <button onClick={save} disabled={busy}>
-              {busy ? "保存中…" : "保存"}
+              {busy ? t("保存中…", "Saving…") : t("保存", "Save")}
             </button>
           </div>
 
@@ -369,14 +370,14 @@ function OpsPanels() {
   return (
     <div className="grid" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))", marginTop: 16 }}>
       <div className="card">
-        <div className="title">泄漏修复</div>
+        <div className="title">{t("泄漏修复", "Leak repair")}</div>
         <p className="muted" style={{ fontSize: 12 }}>
           扫描并回收孤儿 extent;进行中的写入占用会被跳过。
         </p>
         <button
           disabled={busy}
           onClick={async () => {
-            if (!confirm("确认执行泄漏修复?")) return;
+            if (!confirm(t("确认执行泄漏修复?", "Confirm leak repair?"))) return;
             setBusy(true);
             try {
               const r = await api.repair();
@@ -405,7 +406,7 @@ function OpsPanels() {
           className="ghost"
           disabled={busy}
           onClick={async () => {
-            if (!confirm("轮换 SSE 主密钥?新写入使用新密钥,旧对象仍用旧密钥解密。")) return;
+            if (!confirm(t("轮换 SSE 主密钥?新写入使用新密钥,旧对象仍用旧密钥解密。", "Rotate the SSE master key? New writes use the new key; existing objects still decrypt with the old key."))) return;
             setBusy(true);
             try {
               setSse(await api.sseRotate());
