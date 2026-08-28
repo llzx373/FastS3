@@ -1738,6 +1738,90 @@ keys.rs 前缀表登记;meta-export/import DTO **显式声明不导出**(运维�
 
 ---
 
+#### ADR-27(M19 立项决策):Condition 时间/变量补全——Date* × aws:CurrentTime 白名单 / ${aws:username} Resource 变量展开
+
+> 背景:`aws:username` / Principal 用户 ARN 已随 M18 IAM 落地(DI3.2);
+> 「工作时间访问」与「用户只管自己前缀」仍不可表达。本 ADR 钉死**最小
+> 白名单**扩展;非法键继续 400 MalformedPolicy,不静默。实现于 M19/P 组。
+
+**DR1(时间条件白名单,恒定)**:
+
+1. 操作符:`DateGreaterThan` / `DateLessThan` / `DateEquals` × 键
+   `aws:CurrentTime`,**恰此三乘一**(DateGreaterThanEquals 等变体不收);
+2. 键缺席语义(AWS 口径):`aws:CurrentTime` 恒有值(服务器时钟);时钟
+   不可用上下文(密钥级 `evaluate` 兼容接口)条件不成立(正向 false);
+3. 值格式:ISO 8601(`2026-01-01T00:00:00Z`,容忍小数秒与 ±HH:MM 偏移)
+   或字符串整数(unix 秒 epoch);其余 → MalformedPolicy;
+4. 时间源 = 引擎时钟(`lock_now()` 同源,受 M12 可信时钟回拨防护约束);
+   取值点在 `policy_ctx`(请求上下文构造),不读客户端时间头。
+
+**DR2(${aws:username} Resource 变量展开)**:
+
+1. Resource 中的 `${aws:username}` 在**求值期**展开为调用者属主用户名
+   (`CallerIdentity.user`,与 M18 DI3.2 同源;legacy bootstrap 密钥即
+   bootstrap,不作特判);解析期不改写存储原文(策略文档逐字节回显口径
+   保持);
+2. **匿名/无 caller 上下文**:含变量的 Resource 永不匹配(变量不可解析
+   → 该 Resource 不命中;AWS 「variable not resolved → no match」口径);
+3. 仍拒绝:`${aws:SourceIp}` 等其余变量、`s3:ExistingObjectTag/*`、
+   `StringEquals × aws:username` 等未列入键(维持解析错误)。
+
+**DR3(兼容与测试)**:s3-tests Condition 族能转绿的出集,其余逐名;
+单测钉:工作时间 Allow/非工作时间 Deny、变量展开只命中自己的前缀
+(`policy_variable_username_in_resource`)、非法键仍 MalformedPolicy。
+
+**门禁口径**(TODO M19/P):排除矩阵更新;全量 gate 意外失败 0。
+
+---
+
+#### ADR-25(M19 立项决策):Kafka 通知——目标形态 / 线协议 / 投递语义 / 校验与拒绝面
+
+> 背景:Webhook 已交付(M15 N1~N3);私有化事件总线 Kafka 远比 SQS 常见。
+> 本 ADR 钉死**只加 Kafka 这一个目标**;AMQP/MQTT/NSQ/Redis 不做(H9 门槛)。
+
+**DR1(目标配置 = URL 形态,零值格式演进)**:
+
+1. 通知目标串 = `kafka://[user@]host:port[,host:port2...]/topic[?tls=1][&sasl_env=VAR]`
+   ——复用 `NotificationRule.url` 字段与 `n:` 存储,**不新增**
+   `NotificationTargetKind` 变体、不扩 `NotificationRule` 结构
+   (postcard 双读链与 meta-export 不动);
+2. 投递分派按 URL scheme(`kafka://` → Kafka 生产者,`http(s)://` →
+   Webhook),三种容器(Topic/Queue/CloudFunction)受理面不变;
+3. SASL:URL userinfo = 用户名;**密码仅环境变量**(`sasl_env=VAR`,
+   VAR 值即密码;对齐 LDAP bind 密码「env 注入不落盘」红线)——URL/
+   配置/日志/审计零密码明文;env 缺失 = 投递失败(重试/死信路径),
+   非配置错误;
+4. TLS:`tls=1` → rustls + webpki-roots(与 webhook 客户端同栈);
+   SASL 明文机制(PLAIN)仅建议与 TLS 同用(文档警示,不做 SCRAM)。
+
+**DR2(线协议 = 进程内最小生产者,零新依赖)**:std TcpStream(+rustls)
+手写 Kafka 协议三帧——`Metadata v1`(取 topic 分区 0 leader)→
+`Produce v3`(record-batch magic 2,单记录无压缩,acks=1)→ 解析错误码;
+CRC32C(0x82F63B78)表驱动自实现。**明确不走 librdkafka**(C 依赖违背
+离线构建/最小依赖红线)与纯 Rust `kafka` crate(维护停滞)。每投递一
+连接(与 webhook 每请求一连接同口径;Broker 端需 auto-create 或预建
+topic,未知 topic = 投递错误走重试)。
+
+**DR3(投递语义 = 复用 e: 队列与 worker)**:`k:` 事件入队路径、投递
+worker、重试退避、死信标记、截断上限全部沿用 N3 现状(至少一次);
+载荷 JSON 与 Webhook **同源字段**(同一 `build_payload`;message key =
+`{bucket}/{key}`,便于下游分区聚合);`fasts3_notification_*` 指标沿用,
+delivered/failed 计数加 `target="webhook"|"kafka"` 标签(K2)。
+
+**DR4(XML 校验与拒绝面)**:PutBucketNotification 受理 `kafka://` 目标;
+非法形态(缺 topic、空 host、端口非数字、未知 query 参数)→ 显式
+`InvalidArgument`;SQS/SNS/EventBridge ARN 与 AMQP 等仍显式拒绝(现状
+http/https-only 校验收窄为 http/https/kafka 三形态)。
+
+**DR5(测试纪律)**:单元/集成测试 = **进程内 fake broker**(真实 TCP:
+帧解析 → Metadata 响应 → Produce 落盘断言),webhook 回归不破;不做
+Testcontainers(离线红线),ADR 记录该边界。
+
+**门禁口径**(TODO M19/K):`notification_kafka_delivers_put_event` 绿;
+webhook 既有用例零回归;`/metrics` 含 target 标签计数。
+
+---
+
 ## 4. 存储引擎设计(Rust)
 
 ### 4.1 设备抽象
