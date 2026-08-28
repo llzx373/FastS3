@@ -277,6 +277,7 @@
 - [ ] `cargo test --workspace` 全绿;C2 委托演练 + LDAP mock 绿
 - [ ] s3-tests 全量意外失败 0;DI9 出集或逐名
 - [ ] 崩溃 ≥200 轮(IAM 用户/SA 建删 + PUT 混载)零撕裂、无孤儿 `k:`/`iu:`
+  (演练:`tests/crash/run_crash_m18.sh`)
 - [ ] clippy -D warnings;覆盖率不回退 >1pt;cargo audit 清零
 - [ ] 发布记录 v2.4.0:CHANGELOG/RELEASES + 版本 bump(**不打 tag / 不公网 Release**)
 
