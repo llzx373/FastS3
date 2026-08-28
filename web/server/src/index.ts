@@ -14,6 +14,7 @@
  *   PATCH /api/buckets/{name}             配额
  *   GET  /api/buckets/{name}/objects      对象浏览(数据面 ListObjectsV2)
  *   POST /api/buckets/{name}/presign      签发 PUT/GET 预签名 URL
+ *   POST /api/buckets/{name}/objects/zip  M19 U2:勾选对象打包 zip 流式下载(超限 413)
  *   POST /api/buckets/{name}/multipart/{init|complete|abort}
  *   M10:GET /api/buckets/{name}/versions;POST .../versions/action(restore/delete)
  *   M10:GET/PUT /api/buckets/{name}/versioning;GET/PUT/DELETE .../cors;GET/PUT/DELETE .../policy
@@ -62,6 +63,7 @@ import { presignUrl } from "./presign.js";
 import { buildDashboard, buildSnapshot, dashboardFromSnapshot, lastDashboardFrame } from "./dashboard.js";
 import { MetricsHistory } from "./metrics-history.js";
 import { mountStatic } from "./static.js";
+import { ZipStreamWriter } from "./zip-stream.js";
 
 export interface ServerDeps {
   admin: AdminClient;
@@ -627,6 +629,96 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       } catch (e) {
         return reply.code(502).send({ error: { code: "s3_error", message: (e as Error).message } });
       }
+    }
+  );
+
+  // ── M19 U2:批量打包下载 zip(管理面流式;超上限 413) ──
+  // 预检阶段逐键 HEAD(数量/总字节/存在性/SSE-C),过限即拒,不启流;
+  // 打包阶段对象正文逐块入 zip,不在 Node 整体缓冲。
+  app.post<{ Params: { name: string }; Body: { keys?: string[] } }>(
+    "/api/buckets/:name/objects/zip",
+    async (req, reply) => {
+      const { name } = req.params;
+      const keys = req.body?.keys;
+      if (!Array.isArray(keys) || keys.length === 0) {
+        return reply.code(400).send({ error: { code: "bad_request", message: "keys[] required" } });
+      }
+      if (keys.length > cfg.zip.maxFiles) {
+        return reply.code(413).send({
+          error: { code: "too_many_files", message: `打包对象数 ${keys.length} 超过上限 ${cfg.zip.maxFiles}` },
+        });
+      }
+      // 预检:HEAD 取大小/存在性(并发 8;SSE-C 对象无密钥 HEAD 400 → 显式拒绝)
+      const sizes = new Map<string, number>();
+      const lmt = new Map<string, string>();
+      const missing: string[] = [];
+      const unreadable: string[] = [];
+      const queue = [...keys];
+      const headOne = async (key: string) => {
+        try {
+          const h = await s3.headObject(name, key);
+          sizes.set(key, h.contentLength);
+          if (h.lastModified) lmt.set(key, h.lastModified);
+        } catch (e) {
+          const msg = (e as Error).message;
+          if (msg.includes("Server Side Encryption")) unreadable.push(key);
+          else missing.push(key);
+        }
+      };
+      await Promise.all(
+        Array.from({ length: Math.min(8, queue.length) }, async () => {
+          for (let k = queue.shift(); k !== undefined; k = queue.shift()) await headOne(k);
+        }),
+      );
+      if (unreadable.length > 0) {
+        return reply.code(400).send({
+          error: {
+            code: "sse_c_unreadable",
+            message: `以下对象为 SSE-C 加密,管理面无密钥不读取:${unreadable.join(", ")}`,
+          },
+        });
+      }
+      if (missing.length > 0) {
+        return reply.code(404).send({
+          error: { code: "no_such_key", message: `对象不存在:${missing.join(", ")}` },
+        });
+      }
+      const total = [...sizes.values()].reduce((a, b) => a + b, 0);
+      if (total > cfg.zip.maxBytes) {
+        return reply.code(413).send({
+          error: {
+            code: "payload_too_large",
+            message: `打包总字节 ${total} 超过上限 ${cfg.zip.maxBytes}(可用 FS3_ZIP_MAX_BYTES 调整)`,
+          },
+        });
+      }
+      const zip = new ZipStreamWriter();
+      reply.header("content-type", "application/zip");
+      reply.header(
+        "content-disposition",
+        `attachment; filename="${name}-selected.zip"`,
+      );
+      reply.header("x-fasts3-zip-entries", String(keys.length));
+      void (async () => {
+        try {
+          for (const key of keys) {
+            const src = await s3.getObjectStream(name, key);
+            await zip.addEntry(
+              {
+                name: key,
+                size: sizes.get(key) ?? -1,
+                lastModified: lmt.get(key) ? new Date(lmt.get(key) as string) : undefined,
+              },
+              src,
+            );
+          }
+          await zip.finish();
+        } catch (e) {
+          req.log.warn({ err: (e as Error).message }, "zip stream aborted");
+          zip.abort();
+        }
+      })();
+      return reply.send(zip.out);
     }
   );
 

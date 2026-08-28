@@ -196,6 +196,20 @@ export default function Objects() {
     }
   };
 
+  /** M19 U2:勾选对象打包 zip(管理面流式;超限 413 文案直出)。 */
+  const zipSelected = async () => {
+    if (selected.length === 0) return;
+    setBusy(true);
+    try {
+      await api.downloadZip(bucket, selected);
+      setError(null);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const crumbs = prefix.split("/").filter(Boolean);
   const navTo = (p: string) => {
     setPrefix(p);
@@ -218,9 +232,14 @@ export default function Objects() {
           刷新
         </button>
         {selected.length > 0 && (
-          <button className="danger" onClick={() => void deleteSelected()}>
-            删除所选({selected.length})
-          </button>
+          <>
+            <button className="ghost" onClick={() => void zipSelected()} disabled={busy}>
+              打包下载({selected.length})
+            </button>
+            <button className="danger" onClick={() => void deleteSelected()}>
+              删除所选({selected.length})
+            </button>
+          </>
         )}
         <div className="spacer" />
         <select value={uploadClass} onChange={(e) => setUploadClass(e.target.value)} title="上传存储类">

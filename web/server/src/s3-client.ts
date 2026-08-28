@@ -349,6 +349,46 @@ export class S3Client {
       throw new Error(`${method} ${path}: HTTP ${res.status} ${res.body.toString().slice(0, 300)}`);
     }
   }
+
+  /**
+   * M19 U2:GET Object 流式(不缓冲)。
+   * 仅管理面 zip 打包使用;状态非 200 时消费错误体并抛错(含 SSE-C 400 消息)。
+   */
+  async getObjectStream(bucket: string, key: string): Promise<http.IncomingMessage> {
+    const path = `/${bucket}/${this.encodeKey(key)}`;
+    const signed = signRequest(this.cfg, "GET", path, Buffer.alloc(0), {});
+    const u = new URL(this.cfg.endpoint);
+    const mod = u.protocol === "https:" ? https : http;
+    return new Promise((resolve, reject) => {
+      const req = mod.request(
+        {
+          hostname: u.hostname,
+          port: u.port || (u.protocol === "https:" ? 443 : 80),
+          method: "GET",
+          path: signed.path,
+          headers: signed.headers,
+        },
+        (res) => {
+          if (res.statusCode === 200) {
+            resolve(res);
+            return;
+          }
+          const chunks: Buffer[] = [];
+          res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("end", () =>
+            reject(
+              new Error(
+                `GetObject ${bucket}/${key}: HTTP ${res.statusCode} ${Buffer.concat(chunks).toString().slice(0, 200)}`,
+              ),
+            ),
+          );
+          res.on("error", reject);
+        },
+      );
+      req.on("error", reject);
+      req.end();
+    });
+  }
 }
 
 export interface ObjectHead {

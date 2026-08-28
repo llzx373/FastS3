@@ -85,6 +85,13 @@ export interface WebConfig {
   ldap: LdapConfig;
   /** OIDC 控制台 SSO(ADR-21) */
   oidc: OidcConfig;
+  /** M19 U2:批量打包下载上限(超限 413) */
+  zip: {
+    /** 单次打包对象数上限 */
+    maxFiles: number;
+    /** 单次打包总字节上限 */
+    maxBytes: number;
+  };
 }
 
 function loadJson<T>(p: string): Partial<T> | undefined {
@@ -198,6 +205,11 @@ export function loadConfig(opts?: LoadConfigOpts): WebConfig {
       fallback_role: (pick(env, "FS3_OIDC_FALLBACK_ROLE", file?.oidc?.fallback_role, "") as "" | "admin" | "readonly") ?? "",
       default_tenant: pick(env, "FS3_OIDC_DEFAULT_TENANT", file?.oidc?.default_tenant, "default"),
       default_group: pick(env, "FS3_OIDC_DEFAULT_GROUP", file?.oidc?.default_group, ""),
+    },
+    zip: {
+      maxFiles: Number(pick(env, "FS3_ZIP_MAX_FILES", file?.zip?.maxFiles, 500)) || 500,
+      // 默认 1 GiB;32 位 zip 上限的硬兜底在 zip-stream 内(ZIP_MAX_TOTAL)
+      maxBytes: Number(pick(env, "FS3_ZIP_MAX_BYTES", file?.zip?.maxBytes, 1024 * 1024 * 1024)) || 1024 * 1024 * 1024,
     },
   };
 }

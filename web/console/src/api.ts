@@ -502,6 +502,29 @@ export const api = {
       destBucket,
       keys,
     }),
+  /** M19 U2:勾选对象打包 zip 下载(二进制回包 → blob 保存;超限 413 文案直出)。 */
+  downloadZip: async (bucket: string, keys: string[]): Promise<void> => {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    const token = getToken();
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+    const res = await fetch(`/api/buckets/${encodeURIComponent(bucket)}/objects/zip`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ keys }),
+    });
+    if (!res.ok) {
+      const data = (await res.json().catch(() => null)) as { error?: { message?: string } } | null;
+      throw new Error(data?.error?.message ?? `HTTP ${res.status}`);
+    }
+    const blob = await res.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `${bucket}-selected.zip`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(a.href);
+  },
 
   // ── M10:版本化 / 标签 / CORS / 桶策略 ──
   listVersions: (bucket: string, prefix = "", keyMarker?: string, versionIdMarker?: string) => {
