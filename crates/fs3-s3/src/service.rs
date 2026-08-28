@@ -3598,9 +3598,15 @@ impl S3Service {
         let max = q("max-buckets")
             .and_then(|v| v.parse::<usize>().ok())
             .or_else(|| q("max-keys").and_then(|v| v.parse::<usize>().ok()));
-        let engine = self.engine.read();
-        let mut buckets: Vec<(String, fs3_core::BucketMeta)> =
-            engine.list_buckets().unwrap_or_default();
+        // 引擎读锁只覆盖 list_buckets 取数,随即释放:M18 S3 可见性过滤会经
+        // bucket_policy/authenticate_full(会话路径)重入 engine.read(),
+        // parking_lot 读-读递归在中间有写者排队时自锁(写者等本线程的读,
+        // 本线程等写者)——s3-tests 双身份全量 gate 曾因此 wedge(跨租户
+        // 过滤是 SA/alt 身份专属路径,主身份 Owner 恒匹配走不到重入)。
+        let mut buckets: Vec<(String, fs3_core::BucketMeta)> = {
+            let engine = self.engine.read();
+            engine.list_buckets().unwrap_or_default()
+        };
         if let Some(p) = prefix {
             buckets.retain(|(n, _)| n.starts_with(&p));
         }

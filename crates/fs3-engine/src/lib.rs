@@ -7698,6 +7698,10 @@ struct ExtentWriter {
     compressed_out: u64,
     /// MD5/客户端摘要已按明文口径喂入(压缩臂;feed_bytes 不再重复)。
     hasher_plain_fed: bool,
+    /// 已即时记账的段数前缀(M18 T1:segments[..live_counted] 已经
+    /// `alloc.note_inflight_segment` 计入 live_bytes,提交点 add_object
+    /// 按多重集跳过,不重复计数)。
+    live_counted: usize,
 }
 
 impl ExtentWriter {
@@ -7775,7 +7779,19 @@ impl ExtentWriter {
             compression,
             compressed_out: 0,
             hasher_plain_fed: false,
+            live_counted: 0,
         })
+    }
+
+    /// 段封口即把新段计入分配器 live_bytes(M18 T1 修复,见
+    /// `fs3_alloc::Alloc::note_inflight_segment`):不等事务提交,压缩器
+    /// 并发释放同 extent 既有段时余额充足,不会误清位图导致本写事务
+    /// 后续段重分配同一 extent 自覆写。
+    fn catch_up_live(&mut self, engine: &Engine, draft: &mut Staged) {
+        for seg in &self.segments[self.live_counted..] {
+            engine.alloc.note_inflight_segment(draft, seg);
+        }
+        self.live_counted = self.segments.len();
     }
 
     /// 开始新段:记录段起点(当前 watermark),重置段 CRC 网格。
@@ -7884,6 +7900,8 @@ impl ExtentWriter {
                 // extent 写满 → 段结束 + 封口(对象尾部跨界续写,ADR-9 D2)
                 if engine.cur_open().unwrap().watermark as u64 >= capacity {
                     engine.end_segment(self)?;
+                    // M18 T1:封口段立即入账(防压缩器并发清位自覆写)
+                    self.catch_up_live(engine, draft);
                 }
                 continue;
             }
@@ -7954,6 +7972,8 @@ impl ExtentWriter {
                 crcs: std::mem::take(&mut self.seg_crcs),
             });
         }
+        // M18 T1:尾段(含 7967 恰好写满的封口段)同样在提交前即时入账
+        self.catch_up_live(engine, draft);
         // sync_mode=full:数据 fsync 后再提交元数据(当前活动设备)
         if engine.meta.sync_mode() == SyncMode::Full {
             let fd = engine.cur_slot().1.dev.raw_fd();

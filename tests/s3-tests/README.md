@@ -46,11 +46,11 @@ FastS3 v0.5 的协议一致性门禁 = **已实现特性的完整兼容**。跑 
 | SigV2 预签名(cors_presigned_*_v2) | 不做 | SigV2 签名未实现(SigV4 已全量);对应 EXCLUDE token:`_v2` |
 | 日志中继(Logging) / 通知(Notification) / 复制 / RequesterPays | 通知 ✅ v2.1(权威 = 自有集成测试 N4/N5;**不以 s3-tests 100% 声称**);Logging / RequesterPays 不做;复制 策略化 v2.2(不内置 ?replication) | 上游 `test_s3.py` **无 notification 专测**(文件已移除)= 配置 skip/无测,不是「出集 100%」。`notification` token 已移除 = 相关失败不再豁免。配置/队列/投递由 service_integration + fs3-http e2e 覆盖。残余 token:logging/replication/requester_pays/request_payment |
 | 桶策略 Condition 超集(s3:ExistingObjectTag/s3:RequestObjectTag/s3:x-amz-grant-full-control/s3:x-amz-copy-source/s3:x-amz-metadata-directive/s3:x-amz-server-side-encryption Null/StringLikeIfExists 等)与策略×ACL 组合 | 远期 | M10 S3 交付最小 Condition 集,超集键**显式 400 MalformedPolicy**(红线,非静默忽略);策略×ACL 组合依赖 Put*Acl(501)。token:existing_tag/request_obj_tag/put_obj_grant/s3_noenc/copy_source/IfExists(kms/sse 键同集,由既有 token 覆盖)、policy_acl/put_obj_acl |
-| 桶策略单账号身份组(alt 身份不可区分) | 恒排除 | test_bucket_policy_multipart / upload_part_copy / head_object_404_with_policy_prefix:断言 alt 账号被策略拒绝;单账号模型主/备同密钥 → 拒绝不成立。token:policy_multipart/policy_upload_part_copy/404_with_policy(详见「单账号模型限制」) |
+| 桶策略双身份组(alt 跨租户断言) | 恒排除(理由 M18 T1 更新) | test_bucket_policy_multipart / upload_part_copy / head_object_404_with_policy_prefix:M18 T1 起 alt = 独立租户+用户+SA,身份不可区分问题已消;残余原因 = 用例未关默认 BPA 即写 Principal `*` 公开策略 → PutBucketPolicy 被默认 BlockPublicPolicy 拒绝(ADR-23 红线,与 AWS 新桶默认同向)。token:policy_multipart/policy_upload_part_copy/404_with_policy(详见「单账号模型限制」收敛后残余表) |
 | Block Public Access / GetBucketPolicyStatus / public block 族 | ✅ v2.3 部分出集(M17/B3) | 出集 6 例:`test_get_bucket_policy_status`、`test_get_nonpublicpolicy_principal_bucket_policy_status`、`test_put_public_block`、`test_block_public_object_canned_acls`、`test_block_public_policy`、`test_block_public_policy_with_principal`。逐名保留理由见「M17 B3 实测记录」;账号级 `account_` 维持排除(单账号 501,S3 Control PutPublicAccessBlock)。原族 token public_access/block_public/public_block/ignore_public/policy_status 已移除 |
 | ACL 全矩阵 / canned ACL / grant header / 匿名公开访问 | 不做(方向性排除) | AWS 2023-04 起新桶默认 BucketOwnerEnforced(ACL 默认禁用),与 FastS3 桶策略优先一致;维持私有默认 ACL 最小实现 + Owner;PutBucketAcl/PutObjectAcl 显式 501;s3-tests 2026 新版用例(object_acl*/canned/header_acl/special_key_names 尾部 PutObjectAcl)同集,M8 已同步正则;M10 S5 补 `put_acl`(test_object_put_acl_mtime,PutObjectAcl 501,见「单账号模型限制」恒排表)。token:bucket_acl/put_bucket_acl/get_bucket_acl/object_acl/canned/header_acl/special_key_names/access_bucket/put_acl |
 | 匿名读写语义(gate 服务 --allow-anonymous 下) | 远期 | gate 仍开匿名读;ADR-23 (d)`--allow-anonymous` 不得绕过默认 BPA。`list_buckets_anonymous` 仍出集;raw_get/raw_authenticated/expires 与 CORS 匿名 Origin 依赖 CreateBucket public-read,默认 BlockPublicAcls 拒绝(M17 门禁逐名,见下节)。匿名写/POST 仍由 `_objects_anonymous`/`anonymous_request`/`success_code` 覆盖 |
-| ownership 跨账号语义(bucket_owner/object_writer 6 个) | 恒排除 | M10 S7 已交付纯配置往返(2 个出集);保留 6 个断言跨账号 owner 身份(alt client + public policy + ACL 组合),单账号身份映射不可满足(详见「单账号模型限制」)。token:bucket_owner/object_writer |
+| ownership 跨账号语义(bucket_owner/object_writer 6 个) | 恒排除 | M10 S7 已交付纯配置往返(2 个出集);保留 6 个断言跨账号 owner 身份,前置组合 Put*Acl(501)/公开 canned ACL 与 Principal `*` 策略(默认 BPA 拒),gate 内不可满足(详见「单账号模型限制」收敛后残余表)。token:bucket_owner/object_writer |
 | POST 表单上传 SSE/checksum 组 | v1.2 | post_object 认证族已出集(M10 S4);checksum 组已出集(M11 C1:test_post_object_upload_checksum 通过,x-amz-checksum-* 表单字段 policy 覆盖豁免 + 值验算);SSE 组已出集(M11 G-1:test_sse_s3_default_post_object_authenticated_request 通过——桶默认加密对 POST 生效;残余仅 test_encryption_sse_c_post_object_authenticated_request,DE4 裁决,见 SSE-C 行) |
 | 兼容性已知项:`test_bucket_create_exists(_nonowner)`(botocore ClientError 无 .status)、`test_bucket_head_extended`(RGW 专有 x-rgw-object-count) | 长期 | M1 已记录,服务端行为正确;bucket 重建属性(recreate_overwrite_acl)同为已知开放项 |
 | 静态网站(Website)/ Torrent / 租户(tenant)/ expected-bucket-owner / object_manifest | 不做 | **定位排除**(不是未实现缺陷):Website 由 nginx/LB 替代;tenant/`account_`/跨账号 ownership = 单账号模型(M18 前不做多账号)。逐名清单与理由见「M17 F2 单账号定位排除」。expected-bucket-owner 语义已实现(M15 C2),用例仍排除因前置 PutBucketAcl。**Torrent/S3 Select = 停售排除**。token:website/torrent/tenant/expected_bucket_owner/object_manifest/`account_` |
@@ -78,6 +78,11 @@ FastS3 v0.5 的协议一致性门禁 = **已实现特性的完整兼容**。跑 
 #    M11 G-1 干净复测起 runner 固定 TZ=UTC:非 UTC 时区下
 #    test_lifecycle_expiration_header_tags_head 用本地 naive now 减 UTC
 #    午夜会把正确的 x-amz-expiration 头判失败(UTC+8 必现)。
+#    M18 T1 起 [s3 alt] 需要**独立租户身份**(双 AK 双 User,ADR-28 DI9.2):
+#    `run_g4.sh` 已自动化(admin API 建租户 alt+用户 alt+SA 落 conf);
+#    手工起服务时需自行创建 alt 身份并把 SA AK/SK 与 canonical_id 填入
+#    s3tests.conf [s3 alt](user_id/display_name = alt 租户 canonical_id),
+#    否则 test_object_copy_not_owned_bucket 等双身份用例不成立。
 fasts3d serve --config s3tests-server.toml --key test:secret123 --allow-anonymous &
 # 2) 配置 s3tests.conf(host/port/ak/sk 指向上一步;tests/m8/regression.sh 自动生成)
 # 3) 门禁(全量 + 排除集;pytest-xdist 并行;`fixtures.bucket prefix` 须含 `{random}`
@@ -116,23 +121,29 @@ S3TEST_CONF=/tmp/s3-tests/s3tests.conf bash tests/s3-tests/run_s3tests.sh
 | chunked + content-encoding | ✅ M9/D5 | aws-chunked 剔除 + 其余编码接收/回显 |
 | bucket 重建属性保留 | ✅ M9/C5 | 重复创建幂等 200 / 带 ACL 409 / 删除重建 = 全新属性 |
 | 条件写(PUT/DELETE 的 If-(None-)Match 等) | ✅ M10/V6-1 | 版本化条件写出集:V6-1 修复 DeleteObjects LastModifiedTime RFC 7231 解析(botocore 线格式)与 D1a 同秒裁决保序;残余 1 个口径排除(delete_object_current_if_match,见排除矩阵 Versioning 行) |
-| 列表/multipart owner 元素 | ✅ M9/C4(部分) | ListParts/版本条目 Owner 统一输出;`multipart_upload_owner` 用例依赖**多账号身份映射**(s3tests.conf 主/备用户共享同一 access key,服务端无法区分上传者),单账号模型下不可关闭 → 该用例移入「单账号模型限制」恒排除 |
+| 列表/multipart owner 元素 | ✅ M9/C4(部分) | ListParts/版本条目 Owner 统一输出;`multipart_upload_owner` 用例前置 PutBucketAcl 501 + 断言每用户 user_id/display_name(T2 起回显 = 桶属主租户 canonical)→ 留「单账号模型限制」收敛后残余表逐名 |
 | 匿名访问与 ACL 公开语义(list/object anonymous、anon put) | 维持关闭 | 与「默认私有」基线一致;gate 配置(--allow-anonymous)下各用例翻转/保留覆盖面见排除矩阵「匿名读写语义」行 |
 | RGW 专有 head_bucket_usage / head_extended / create_bucket_exists(botocore) | 恒排除 | 非 S3 规范 |
 | checksum / GetObjectAttributes | ✅ M11/C1 | 五族验算 + 复合/FULL_OBJECT + GetObjectAttributes(含 ObjectParts 分页/版本寻址)全量出集;残余限制见排除矩阵 checksum 行(非默认 ChecksumType 组合显式 400) |
 | 新 ACL 族(object_acl*/canned/header_acl)、匿名 raw_get 族残余(raw_get_object_acl)、special_key_names(尾部 PutObjectAcl)、public block、bucket-owner 跨账号语义残余、PUT 条件写新用例 | 见排除矩阵 | 2026 新版 s3-tests 用例命名,与排除矩阵语义同集;M10 S5:Tagging/bucket-owner 纯配置已出集,匿名族在 --allow-anonymous 下翻绿项已收窄 |
 
-### 单账号模型限制(恒排除,附理由)
+### 单账号模型限制(逐名,附理由;M18 T1 alt 双身份收敛后残余)
+
+> M18 T1(2026-08-28,ADR-28 DI9.2):s3-tests 主/备已升格为**两把不同 AK、两个
+> User、两个租户**(`run_g4.sh` 启动后经 admin API 建租户 `alt` + 用户 `alt` + SA,
+> secret 仅此一次回显落 conf;`[s3 alt] user_id/display_name` = alt 租户
+> canonical_id,与 T2 Owner 回显口径一致)。依赖 alt 身份的用例逐名实测,
+> 能出集的已出集(见「M18 T1 实测记录」);下表为收敛后仍逐名保留的用例。
 
 | 用例 | 不可关闭原因 |
 | --- | --- |
-| `test_list_multipart_upload_owner` | 断言 Initiator/Owner = s3tests.conf 中**每用户**的 user_id/display_name;本仓库测试配置主/备/租户用户共用同一对 access key(`tests/m8/regression.sh` 生成),单账号服务无法区分上传者 → 期望不满足。关闭需多账号身份映射(远期,与密钥状态语义同批评估)。服务端行为:每上传会话 Owner = 创建者 access key(单账号下统一),元素结构与 AWS 一致。 |
-| `test_object_copy_not_owned_bucket` / `test_object_copy_not_owned_object_bucket` | 断言**跨账号**复制被拒(源桶/对象不属于请求者);单账号模型下所有密钥同属一账号,复制必然允许 → 期望不满足(「跨账号复制归属」②组项)。关闭需多账号模型。 |
-| `test_bucket_create_exists_nonowner` | 断言备用账号建同名桶 409;单账号 +「重复创建幂等 200」语义下不成立(RGW"非 S3 规范"恒排项,botocore 版本差异亦曾导致 .status 不可用)。 |
+| `test_list_multipart_upload_owner` | 前置 `put_bucket_acl(ACL='public-read-write')` = PutBucketAcl **显式 501**(ACL 全矩阵远期行);且 M18 T2 起 Initiator/Owner 回显 = **桶属主租户 canonical_id**(非每用户身份),用例断言每用户 user_id/display_name 与本实现口径不同。 |
+| `test_object_copy_not_owned_object_bucket` | 前置 `put_object_acl` + `put_bucket_acl`(向 alt 授权)= Put*Acl **显式 501**,gate 内不可满足。跨账号复制拒绝语义本身已由 `test_object_copy_not_owned_bucket` 出集验证(M18 T1)。token:`test_object_copy_not_owned_object_bucket( -\|$)` |
+| `test_bucket_create_exists_nonowner` | 断言备用账号建同名桶 **409 BucketAlreadyExists**;M18 起跨租户同名创建命中**跨租户默认 403**(ADR-28 DI3/S3 红线,授权层先于建桶幂等判定)。403→409 的 AWS 全局命名空间对齐属服务端语义裁决,超出 T1 收敛范围,逐名保留。token:`bucket_create_exists`(与 `test_bucket_create_exists` RGW"非 S3 规范"恒排项同 token) |
 | `test_multipart_resend_first_finishes_last` | 客户端在**读体回调中同步发起同号分片重传**,Complete 得到重复分片号 [1,1];服务端按 REVIEW §3.10/AWS 严格递增校验 → 400 InvalidPartOrder。RGW 对该竞态有容忍;严格递增是本实现已落地的正确性门禁(AWS 同),该用例的竞态结果不进入排除集判定依据(专用回归见 fs3-engine)。 |
-| `test_bucket_policy_multipart` / `test_bucket_policy_upload_part_copy` / `test_head_object_404_with_policy_prefix` | 断言 **alt 账号**被桶策略拒绝(multipart init/upload-part-copy 403、越 prefix HEAD 403);s3tests.conf 主/备共用同一 access key,单账号模型下策略评估身份相同 → 拒绝不成立(M10 S5 实测:ClientError not raised / 404≠403)。关闭需多账号身份映射。token:policy_multipart/policy_upload_part_copy/404_with_policy |
-| `test_create_bucket_bucket_owner_*` / `test_create_bucket_object_writer` / `test_put_bucket_ownership_*`(6 个) | M10 S7 后 PutBucketPolicy 中断已消,现断言**跨账号 owner 身份**(Owner=(user_id,display_name),服务端单账号恒为 access key 身份)+ 组合 Put*Acl(501)/ alt 拒绝不成立;同属多账号身份映射前提。token:bucket_owner/object_writer(纯配置往返 2 个已出集) |
-| `test_object_put_acl_mtime` | 用例主体是 `put_object_acl(ACL='private')` API 调用 → 服务端**显式 501**(单账号模型 ACL 写不实现,属排除矩阵「ACL 全矩阵」远期行);非「PUT 带 acl 头」语义,非服务端缺陷。token:put_acl |
+| `test_bucket_policy_multipart` / `test_bucket_policy_upload_part_copy` / `test_head_object_404_with_policy_prefix` | alt 双身份已就位(M18 T1),但三例均在**未先关默认 BPA** 的情况下 `put_bucket_policy` 写 Principal `*` 公开策略(PutObject/GetObject/ListBucket)→ 被新桶默认 **BlockPublicPolicy 拒绝 403**(M17 门禁,ADR-23 红线,与 AWS 2023 起新桶默认同向;用例属前 BPA 时代上游写法,AWS 新桶同判)。token:policy_multipart/policy_upload_part_copy/404_with_policy |
+| `test_create_bucket_bucket_owner_*` / `test_create_bucket_object_writer` / `test_put_bucket_ownership_*`(6 个) | 断言**跨账号 owner 身份**需组合 Put*Acl(501)/ 公开 canned ACL(默认 BlockPublicAcls 拒)/ Principal `*` 公开策略(默认 BlockPublicPolicy 拒),gate 内不可满足。token:bucket_owner/object_writer(纯配置往返 2 个已出集) |
+| `test_object_put_acl_mtime` | 用例主体是 `put_object_acl(ACL='private')` API 调用 → 服务端**显式 501**(ACL 写不实现,属排除矩阵「ACL 全矩阵」远期行);非「PUT 带 acl 头」语义,非服务端缺陷。token:put_acl |
 
 ### SSE 族显式拒绝(历史记录,M11 已出集)
 
@@ -430,11 +441,12 @@ S3TEST_CONF=/tmp/s3-tests/s3tests.conf bash tests/s3-tests/run_s3tests.sh
 
 ## M17 F2 单账号定位排除(逐名,2026-08-27)
 
-> **口径**:下列用例排除 = **产品定位**(单账号,M18 前不做多账号 / IAM 账号 /
-> RGW tenant),**禁止写成「未实现缺陷」**。服务端对多账号 API 显式 501
-> 或不提供第二身份,与 AWS 多账号期望不一致是刻意的。权威对照 =
+> **口径**:下列用例排除 = **产品定位**(RGW tenant 命名空间 / AWS IAM 账号模型 /
+> 账号级 S3 Control,均不做;M18 交付的是本进程租户而非 RGW tenant 语法),
+> **禁止写成「未实现缺陷」**。权威对照 =
 > `run_s3tests.sh` 的 `EXCLUDE` token `tenant` / `account_` /
-> `expected_bucket_owner` / `not_owned` / `bucket_owner` / `object_writer`。
+> `expected_bucket_owner` / `bucket_owner` / `object_writer`
+> (`not_owned` 宽 token 已于 M18 T1 收窄为逐名,见下节)。
 
 ### tenant(RGW 租户隔离,token `tenant`)
 
@@ -444,7 +456,7 @@ S3TEST_CONF=/tmp/s3-tests/s3tests.conf bash tests/s3-tests/run_s3tests.sh
 | `test_object_presigned_put_object_with_acl_tenant` | 同上 + Put*Acl 501 |
 | `test_cors_presigned_get_object_tenant` / `_tenant_v2` | 跨 tenant CORS 预签名;另 `_v2` 叠加 SigV2 不做 |
 | `test_cors_presigned_put_object_tenant` / `_tenant_v2` / `_tenant_with_acl` | 同上 |
-| `test_bucket_policy_different_tenant` | 断言另一 tenant 被桶策略拒绝;无第二账号 |
+| `test_bucket_policy_different_tenant` | RGW `:bucket` tenant 寻址语法(不做)+ Principal `*` 公开策略被默认 BlockPublicPolicy 拒;M18 租户为进程内隔离,非 RGW tenant 命名空间 |
 | `test_bucket_policy_tenanted_bucket` | RGW tenanted bucket 策略 |
 | `test_put_bucket_logging_tenant_s` / `test_put_bucket_logging_tenant_j` | `?logging` 定位 501(见 operations/audit-export)+ tenant |
 
@@ -456,12 +468,15 @@ S3TEST_CONF=/tmp/s3-tests/s3tests.conf bash tests/s3-tests/run_s3tests.sh
 | `test_account_usage` | RGW 专有账号用量头;非 S3 规范 |
 | `test_account_*`(IAM:`user`/`group`/`role`/`oidc`/`policy` 等,在 `test_iam.py`) | IAM 账号实体 API;FastS3 数据面无 IAM,M18 为本进程租户,不接 AWS IAM 账号模型 |
 
-### 跨账号 ownership / 归属(token `not_owned` / `bucket_owner` / `object_writer` / `expected_bucket_owner`)
+### 跨账号 ownership / 归属(token `bucket_owner` / `object_writer` / `expected_bucket_owner` / 逐名 `test_object_copy_not_owned_object_bucket`)
+
+> M18 T1(2026-08-28)起 alt = 独立租户+用户+SA 双身份;`not_owned` 宽 token 已收窄
+> 为逐名(`test_object_copy_not_owned_bucket` 跨租户复制拒绝 403 实测转绿出集)。
 
 | 用例 | 理由(定位,非缺陷) |
 | --- | --- |
-| `test_object_copy_not_owned_bucket` / `test_object_copy_not_owned_object_bucket` | 跨账号复制拒绝;单账号下复制必然允许 |
-| `test_bucket_create_exists_nonowner` | 备用账号建同名桶 409;单账号 + 幂等 200 |
+| `test_object_copy_not_owned_object_bucket` | 前置 PutObjectAcl/PutBucketAcl 向 alt 授权 = Put*Acl 501;复制拒绝语义已由 `_bucket` 变体出集验证(M18 T1) |
+| `test_bucket_create_exists_nonowner` | 备用账号建同名桶期望 409 BucketAlreadyExists;M18 起跨租户同名创建命中跨租户默认 403(ADR-28 DI3 红线),403→409 对齐属服务端语义裁决,超 T1 范围 |
 | `test_expected_bucket_owner` | 语义已实现(= 自身放行 / ≠ 自身 403);前置 `PutBucketAcl(public-read-write)` = Put*Acl 501,gate 内不可绿 |
 | `test_create_bucket_bucket_owner_enforced` / `test_create_bucket_bucket_owner_preferred` / `test_create_bucket_object_writer` | 跨账号 Owner 身份 + ACL 组合;纯配置往返已出集(另 2 例) |
 | `test_put_bucket_ownership_bucket_owner_enforced` / `test_put_bucket_ownership_bucket_owner_preferred` / `test_put_bucket_ownership_object_writer` | 同上,token `bucket_owner`/`object_writer` |
@@ -485,3 +500,45 @@ S3TEST_CONF=/tmp/s3-tests/s3tests.conf bash tests/s3-tests/run_s3tests.sh
 | 公开策略 | `test_bucket_policy`/`test_bucketv2_policy` 及 `_another_bucket`;`test_set_get_del_bucket_policy`;`test_multipart_upload_on_a_bucket_with_policy` | Principal `*` / `AWS:*` |
 | POST+ACL | `test_post_object_authenticated_no_content_type`/`_request_bad_access_key`;`test_post_object_success_redirect_action` | `create_bucket(ACL=public-read-write)` |
 | 建桶 ACL | `test_bucket_recreate_overwrite_acl` | `create_bucket(ACL=public-read)` |
+
+## M18 T1 实测记录(2026-08-28,alt 双身份 + 排除集收敛)
+
+> ADR-28 DI9.2:s3-tests 主/备 = 两把不同 AK、两个 User。本仓库取**两租户**形态:
+> 主 = `--key test:secret123`(default 租户),alt = 独立租户 `alt` + 用户 `alt` +
+> SA(`run_g4.sh` 启动后经 admin API `/v1/iam/tenants|users|service-accounts` 创建,
+> SA secret 仅此一次回显并直接落入生成的 `s3tests.conf`)。`[s3 alt]`
+> `user_id`/`display_name` = alt 租户 canonical_id(T2 起 Owner 回显 = 属主租户
+> canonical,DisplayName 恒 = ID)。跨账号语义由「跨租户默认 403 + 桶策略具名/`*`
+> 放行」产出——同租户 alt 不产生这些拒绝,故不取同租户形态。
+
+逐名实测(串行,release,`compaction_enabled=true`):
+
+| 用例 | 结果 | 处置 |
+| --- | --- | --- |
+| `test_object_copy_not_owned_bucket` | ✅ 转绿(alt 跨租户复制源对象 → 403,断言成立) | **出集**;EXCLUDE `not_owned` 宽 token 收窄为逐名 `test_object_copy_not_owned_object_bucket( -\|$)` |
+| `test_object_copy_not_owned_object_bucket` | ❌ 前置 `put_object_acl`/`put_bucket_acl` 显式 501 | 逐名保留(501 前置) |
+| `test_bucket_policy_multipart` / `test_bucket_policy_upload_part_copy` / `test_head_object_404_with_policy_prefix` | ❌ 均失败于 `put_bucket_policy` 步:Principal `*` 公开策略被新桶默认 BlockPublicPolicy 拒 403(ADR-23 红线;用例未先关 BPA,AWS 新桶同判) | 逐名保留,理由由「单账号身份不可区分」更新为默认 BPA 前置 |
+| `test_bucket_create_exists_nonowner` | ❌ 跨租户同名创建 = 403 AccessDenied(跨租户默认拒绝先于建桶幂等判定),用例期望 409 BucketAlreadyExists | 逐名保留(token `bucket_create_exists` 不变);403→409 对齐属服务端语义裁决,超 T1 范围 |
+| `test_list_multipart_upload_owner` | ❌ 前置 `put_bucket_acl(public-read-write)` 显式 501;且 T2 起 Initiator/Owner 回显 = 桶属主租户 canonical(非每用户身份),用例断言每用户 user_id/display_name | 逐名保留(`multipart_upload_owner` token 不变) |
+
+全量 gate(`run_g4.sh`)终跑(release,2026-08-28):**RESULT PASS,意外失败 0**;
+passed=461 skipped=94 excluded-failed=260(全部命中逐名排除集)。
+
+T1 实测牵出的两个服务端缺陷(同提交修复):
+
+- **ListBuckets 读锁递归 wedge**(`fs3-s3/src/service.rs` op_list_buckets):
+  原实现整函数持有引擎读锁,跨 `bucket_policy()`(内部再 `engine.read()`)
+  形成 parking_lot 读-读递归,中间有写者排队即自锁——双身份 gate 的
+  alt 租户每桶走可见性过滤必触发(主身份 Owner 恒匹配走不到重入)。
+  修复:读锁收窄到只覆盖 `list_buckets()` 取数块,随即释放。
+- **compaction 搅动下 SSE copy-part 数据损坏**(`fs3-alloc` + `fs3-engine`):
+  压缩器阶段 3 不经引擎大锁(ADR-9 §6.3),并发 `dec_live` 释放在写事务
+  所在 extent 的既有段时,新段只在事务提交点才 `add_object` 入账 →
+  `live_bytes` 提前归零 → 提交收口清位图 → 在写事务把同一 extent 重分配
+  给本对象后续段,物理覆写已写密文(gate 两连挂
+  `test_copy_part_enc[sse-s3-sse-s3-STANDARD-STANDARD-8388608]` chunk 鉴损,
+  churn+compaction 复现率 ~10-15%)。修复:段一封口即
+  `note_inflight_segment` 即时计入 live_bytes(`ExtentWriter::
+  catch_up_live`),`add_object` 按 (extent_id, len) 多重集跳过已记账段。
+  修复后 churn+compaction 下该用例 30/30 过;fs3-alloc 30 + fs3-engine 206
+  单测全绿。

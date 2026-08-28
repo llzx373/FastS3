@@ -67,6 +67,10 @@ pub struct Staged {
     cleared: Vec<u64>,
     /// live_bytes 增加(新段;回滚时递减)。
     live_inc: Vec<(u64, u32)>,
+    /// 写入进行中已提前记账的段(M18 T1,`note_inflight_segment`):
+    /// `add_object` 按 (extent_id, len) 多重集跳过这些段,不重复计数。
+    /// 回滚无需单列(live_inc 已覆盖)。
+    inflight: Vec<(u64, u32)>,
     /// live_bytes 减少(释放段;回滚时递增)。
     live_dec: Vec<(u64, u32)>,
     /// 共享段表新增(COW;回滚时递减/删除)。
@@ -282,14 +286,33 @@ impl Allocator {
     ///
     /// 覆盖路径:新段经本方法记账,旧段经 [`release_object`] 释放,同 draft
     /// 同事务(ADR-9 §5.4)。
+    ///
+    /// M18 T1:写入进行中已封口的段由 [`Alloc::note_inflight_segment`] 提前
+    /// 记账(draft.live_inc);此处按 (extent_id, len) 多重集跳过已记账段,
+    /// 不重复计数(refcount 仍按对象 × extent 正常 +1)。
     pub fn add_object(&self, draft: &mut Staged, segs: &[Segment]) {
         if segs.is_empty() {
             return;
         }
+        let mut pre_counted: std::collections::HashMap<(u64, u32), usize> =
+            std::collections::HashMap::new();
+        for &(id, len) in &draft.inflight {
+            *pre_counted.entry((id, len)).or_insert(0) += 1;
+        }
         let mut seen: Vec<u64> = Vec::new();
         for s in segs {
-            self.live_bytes[s.extent_id as usize].fetch_add(s.len, Ordering::AcqRel);
-            draft.live_inc.push((s.extent_id as u64, s.len));
+            let key = (s.extent_id as u64, s.len);
+            if let Some(n) = pre_counted.get_mut(&key) {
+                if *n > 0 {
+                    *n -= 1;
+                } else {
+                    self.live_bytes[s.extent_id as usize].fetch_add(s.len, Ordering::AcqRel);
+                    draft.live_inc.push(key);
+                }
+            } else {
+                self.live_bytes[s.extent_id as usize].fetch_add(s.len, Ordering::AcqRel);
+                draft.live_inc.push(key);
+            }
             if !seen.contains(&(s.extent_id as u64)) {
                 seen.push(s.extent_id as u64);
             }
@@ -298,6 +321,21 @@ impl Allocator {
             self.refcounts[id as usize].fetch_add(1, Ordering::AcqRel);
             draft.refcount_inc.push(id);
         }
+    }
+
+    /// 写入进行中的段即时记账(M18 T1 修复):段一封口就 `live_bytes += len`
+    /// 并记入 draft(不等到对象/分片提交点 add_object)。
+    ///
+    /// 背景:压缩器阶段 3 不经引擎大锁(ADR-9 §6.3),其释放并发地
+    /// dec_live;若在写事务的新段只在提交时才入账,共享 extent 的既有段被
+    /// 释放后 live 会提前归零 → 提交收口清位图 → 在写事务把同一 extent
+    /// 重分配给本对象的后续段 → 物理覆写已写密文(s3-tests
+    /// test_copy_part_enc sse-s3 8MiB 在 compaction 搅动下 chunk 鉴损)。
+    pub fn note_inflight_segment(&self, draft: &mut Staged, seg: &Segment) {
+        self.live_bytes[seg.extent_id as usize].fetch_add(seg.len, Ordering::AcqRel);
+        let key = (seg.extent_id as u64, seg.len);
+        draft.live_inc.push(key);
+        draft.inflight.push(key);
     }
 
     /// COW 复制(CopyObject):共享源对象的段,零数据 I/O。

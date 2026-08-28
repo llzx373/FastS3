@@ -57,6 +57,29 @@ done
 curl -sf "http://127.0.0.1:$SPORT/health" >/dev/null 2>&1 \
     || { echo "serve health failed"; tail -20 "$WORK/serve.log"; exit 1; }
 
+# ── M18 T1(ADR-28 DI9.2):alt 身份 = 两把不同 AK、两个 User、两个租户 ──
+# 主身份保持 test/secret123(default 租户);alt = 独立租户 alt + 用户 alt +
+# SA(secret 仅此一次回显,直接落 conf)。跨租户默认 403 + 桶策略具名/`*`
+# 放行,产出 copy_not_owned / policy_multipart 等双身份语义;Owner 回显 =
+# 属主租户 canonical_id(T2),故 [s3 alt] user_id/display_name 钉 canonical。
+ADM="http://127.0.0.1:$((SPORT + 1))"
+IAM_JSON="$WORK/iam.json"
+iam_api() { # method path [body] → 响应落 $IAM_JSON
+    curl -sf -X "$1" -H "Authorization: Bearer g4-token" \
+        -H 'Content-Type: application/json' ${3:+-d "$3"} \
+        "$ADM$2" > "$IAM_JSON" \
+        || { echo "iam api $1 $2 failed"; tail -5 "$WORK/serve.log"; exit 1; }
+}
+iam_api POST /v1/iam/tenants '{"tenant_id":"alt","display_name":"alt"}'
+ALT_CANON=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["canonical_id"])' "$IAM_JSON")
+iam_api POST /v1/iam/users '{"tenant":"alt","name":"alt","display_name":"alt"}'
+iam_api POST /v1/iam/service-accounts '{"tenant":"alt","owner_user":"alt","name":"s3tests-alt"}'
+read -r ALT_AK ALT_SK < <(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(d["access_key"], d["secret_key"])' "$IAM_JSON")
+echo "alt identity: tenant=alt canonical=$ALT_CANON ak=$ALT_AK"
+
 cat > "$S3TESTS/s3tests.conf" <<EOF
 [DEFAULT]
 host = 127.0.0.1
@@ -77,10 +100,10 @@ email = test@fasts3.local
 api_name = s3
 
 [s3 alt]
-access_key = test
-secret_key = secret123
-display_name = fasts3 alt
-user_id = 54321
+access_key = $ALT_AK
+secret_key = $ALT_SK
+display_name = $ALT_CANON
+user_id = $ALT_CANON
 email = alt@fasts3.local
 api_name = s3
 

@@ -49,8 +49,8 @@ OUT="$(mktemp /tmp/s3tests-gate.XXXXXX)"
 #    x-amz-expires 越界/DeleteObjects 键数上限/bucket 重建属性/chunked+content-encoding 并出集;
 #    M10/V4-4 已关闭条件 GET 边界——304 补带 ETag/Last-Modified 头,
 #    ifmodifiedsince/ifnonematch 出集):
-#    跨账号复制归属、匿名读写语义、
-#    RGW 专有头、multipart_upload_owner(单账号模型恒排)
+#    匿名读写语义、RGW 专有头、multipart_upload_owner(前置 PutBucketAcl 501
+#    恒排;跨账号复制归属 M18 T1 已部分出集,见 ⑬)
 # ③ M8 补充(2026-08-21,上游 s3-tests 新用例命名同步):
 #    新 ACL 族(object_acl/canned/header_acl/special_key_names 尾部 ACL 调用)、
 #    public block 族、GetObjectAttributes multipart 族、
@@ -58,8 +58,11 @@ OUT="$(mktemp /tmp/s3tests-gate.XXXXXX)"
 # ④ M10 S5 补充(2026-08-23,族出集后保留的文档化 token,逐用例核对):
 #    _v2(SigV2 预签名,未实现)|existing_tag|request_obj_tag|put_obj_grant|s3_noenc|
 #    copy_source|IfExists(桶策略 Condition 超集,显式 MalformedPolicy 红线)|
-#    policy_acl|put_obj_acl(策略×ACL 组合,Put*Acl 501)|policy_multipart|
-#    policy_upload_part_copy|404_with_policy(单账号:alt 身份不可区分)|
+#    policy_acl|put_obj_acl(策略×ACL 组合,Put*Acl 501)|
+#    policy_multipart|policy_upload_part_copy|404_with_policy(M18 T1 起理由更新:
+#    alt 双身份已就位,但用例未关默认 BPA 即写 Principal * 公开策略 →
+#    PutBucketPolicy 被 BlockPublicPolicy 拒绝 403,ADR-23 红线与 AWS 新桶
+#    默认同向;见 ⑬)|
 #    anonymous_request|success_code(匿名 POST 写,依赖 public-read-write 桶 ACL)|
 #    put_acl(test_object_put_acl_mtime,PutObjectAcl 显式 501 恒排)|
 #    raw_get_object_acl|anon_put_write_access(匿名族在 --allow-anonymous 下的剩余失败项;
@@ -151,7 +154,19 @@ OUT="$(mktemp /tmp/s3tests-gate.XXXXXX)"
 #    raw_get/raw_authenticated/expires 匿名族、CORS 匿名 Origin 族、
 #    公开策略 CRUD、create_bucket(ACL=public-read-write) 的 POST 三例、
 #    recreate_overwrite_acl。自有集成测试覆盖 BPA 与策略/CORS API。
-EXCLUDE='kms|sse_c_post_object_authenticated_request|sse_c_enforced_with_bucket_policy|sse_c_deny_algo_with_bucket_policy|incorrect_algo_sse_s3|test_bucket_list_unordered( -|$)|test_bucket_listv2_unordered( -|$)|test_100_continue( -|$)|test_lifecycle_expiration( -|$)|test_lifecyclev2_expiration( -|$)|test_lifecycle_expiration_tags1( -|$)|test_lifecycle_expiration_tags2( -|$)|test_lifecycle_expiration_versioned_tags2( -|$)|test_lifecycle_expiration_noncur_tags1( -|$)|test_lifecycle_noncur_expiration( -|$)|test_lifecycle_deletemarker_expiration( -|$)|test_lifecycle_deletemarker_expiration_with_days_tag( -|$)|test_lifecycle_multipart_expiration( -|$)|test_delete_marker_expiration( -|$)|test_lifecycle_set_invalid_date( -|$)|test_lifecycle_transition_set_invalid_date( -|$)|test_lifecycle_expiration_size_gt( -|$)|test_lifecycle_expiration_size_lt( -|$)|website|logging|replication|requester_pays|account_|bucket_acl|put_bucket_acl|get_bucket_acl|copy_enc\[sse-c-unencrypted|copy_part_enc\[sse-c-unencrypted|copy_enc\[sse-s3-unencrypted|copy_part_enc\[sse-s3-unencrypted|tenant|request_payment|expected_bucket_owner|bucket_create_exists|head_extended|access_bucket|torrent|object_manifest|head_bucket_usage|multipart_upload_owner|_objects_anonymous|anon_put_write_access|not_owned|multipart_resend_first_finishes_last|special_key_names|object_acl|header_acl|object_copy_canned_acl|bucket_concurrent_set_canned_acl|bucket_owner|object_writer|raw_get_object_acl|_v2|existing_tag|request_obj_tag|put_obj_grant|s3_noenc|copy_source|IfExists|policy_acl|put_obj_acl|policy_multipart|policy_upload_part_copy|404_with_policy|anonymous_request|success_code|put_acl|return_version_id|delete_marker_nonversioned|delete_object_current_if_match( -|$)|get_public_acl_bucket_policy_status|get_authpublic_acl_bucket_policy_status|get_publicpolicy_acl_bucket_policy_status|get_nonpublicpolicy_acl_bucket_policy_status|get_undefined_public_block|get_public_block_deny_bucket_policy|block_public_put_bucket_acls|block_public_restrict_public_buckets|ignore_public_acls|put_get_delete_public_block|test_object_raw_get|test_object_raw_authenticated|test_object_delete_key_bucket_gone|test_post_object_authenticated_no_content_type|test_post_object_authenticated_request_bad_access_key|test_post_object_success_redirect_action|test_cors_origin_response|test_cors_origin_wildcard|test_cors_header_option|test_cors_presigned_get_object|test_cors_presigned_put_object|test_bucket_recreate_overwrite_acl|test_bucket_policy( -|$)|test_bucket_policy_another_bucket|test_bucketv2_policy( -|$)|test_bucketv2_policy_another_bucket|test_set_get_del_bucket_policy|test_multipart_upload_on_a_bucket_with_policy'
+# ⑬ M18 T1 出集(2026-08-28,ADR-28 DI9.2 alt 双身份):run_g4.sh 启动后
+#    经 admin API 建租户 alt + 用户 alt + SA(secret 仅此一次回显落 conf),
+#    [s3 alt] 用独立 AK/SK,user_id/display_name = alt 租户 canonical_id
+#    (T2 Owner 回显口径)。实测出集 1 例:test_object_copy_not_owned_bucket
+#    (跨租户默认 403 成立);`not_owned` 宽 token 收窄为逐名
+#    test_object_copy_not_owned_object_bucket( -|$)(前置 Put*Acl 501 恒排)。
+#    逐名保留并更新理由:policy_multipart/policy_upload_part_copy/
+#    404_with_policy(默认 BPA 拒 Principal * 公开策略写入,见 ④)、
+#    test_bucket_create_exists_nonowner(跨租户同名创建命中默认 403 红线,
+#    用例期望 409 BucketAlreadyExists;403→409 属服务端语义裁决,超 T1 范围)、
+#    test_list_multipart_upload_owner(PutBucketAcl 501 前置 + Initiator/Owner
+#    回显 = 桶属主租户 canonical,非每用户身份)。
+EXCLUDE='kms|sse_c_post_object_authenticated_request|sse_c_enforced_with_bucket_policy|sse_c_deny_algo_with_bucket_policy|incorrect_algo_sse_s3|test_bucket_list_unordered( -|$)|test_bucket_listv2_unordered( -|$)|test_100_continue( -|$)|test_lifecycle_expiration( -|$)|test_lifecyclev2_expiration( -|$)|test_lifecycle_expiration_tags1( -|$)|test_lifecycle_expiration_tags2( -|$)|test_lifecycle_expiration_versioned_tags2( -|$)|test_lifecycle_expiration_noncur_tags1( -|$)|test_lifecycle_noncur_expiration( -|$)|test_lifecycle_deletemarker_expiration( -|$)|test_lifecycle_deletemarker_expiration_with_days_tag( -|$)|test_lifecycle_multipart_expiration( -|$)|test_delete_marker_expiration( -|$)|test_lifecycle_set_invalid_date( -|$)|test_lifecycle_transition_set_invalid_date( -|$)|test_lifecycle_expiration_size_gt( -|$)|test_lifecycle_expiration_size_lt( -|$)|website|logging|replication|requester_pays|account_|bucket_acl|put_bucket_acl|get_bucket_acl|copy_enc\[sse-c-unencrypted|copy_part_enc\[sse-c-unencrypted|copy_enc\[sse-s3-unencrypted|copy_part_enc\[sse-s3-unencrypted|tenant|request_payment|expected_bucket_owner|bucket_create_exists|head_extended|access_bucket|torrent|object_manifest|head_bucket_usage|multipart_upload_owner|_objects_anonymous|anon_put_write_access|test_object_copy_not_owned_object_bucket( -|$)|multipart_resend_first_finishes_last|special_key_names|object_acl|header_acl|object_copy_canned_acl|bucket_concurrent_set_canned_acl|bucket_owner|object_writer|raw_get_object_acl|_v2|existing_tag|request_obj_tag|put_obj_grant|s3_noenc|copy_source|IfExists|policy_acl|put_obj_acl|policy_multipart|policy_upload_part_copy|404_with_policy|anonymous_request|success_code|put_acl|return_version_id|delete_marker_nonversioned|delete_object_current_if_match( -|$)|get_public_acl_bucket_policy_status|get_authpublic_acl_bucket_policy_status|get_publicpolicy_acl_bucket_policy_status|get_nonpublicpolicy_acl_bucket_policy_status|get_undefined_public_block|get_public_block_deny_bucket_policy|block_public_put_bucket_acls|block_public_restrict_public_buckets|ignore_public_acls|put_get_delete_public_block|test_object_raw_get|test_object_raw_authenticated|test_object_delete_key_bucket_gone|test_post_object_authenticated_no_content_type|test_post_object_authenticated_request_bad_access_key|test_post_object_success_redirect_action|test_cors_origin_response|test_cors_origin_wildcard|test_cors_header_option|test_cors_presigned_get_object|test_cors_presigned_put_object|test_bucket_recreate_overwrite_acl|test_bucket_policy( -|$)|test_bucket_policy_another_bucket|test_bucketv2_policy( -|$)|test_bucketv2_policy_another_bucket|test_set_get_del_bucket_policy|test_multipart_upload_on_a_bucket_with_policy'
 
 # 并行:pytest-xdist --dist load(按用例分发)。桶前缀必须含 {random},
 # 否则 autouse nuke_prefixed_buckets 会删掉其他 worker 的桶。
