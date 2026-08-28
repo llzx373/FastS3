@@ -64,6 +64,14 @@ pub struct NotificationStats {
     pub stalled: AtomicBool,
     /// 最近一次成功投递的 unix 秒(0 = 从未成功;停滞告警时间窗用)。
     pub last_delivered_at: AtomicU64,
+    /// 按目标类型分账(M19 K2,ADR-25 DR3:webhook 成功次数)。
+    pub delivered_webhook: AtomicU64,
+    /// M19 K2:kafka 成功次数。
+    pub delivered_kafka: AtomicU64,
+    /// M19 K2:webhook 失败次数。
+    pub failed_webhook: AtomicU64,
+    /// M19 K2:kafka 失败次数。
+    pub failed_kafka: AtomicU64,
 }
 
 impl NotificationStats {
@@ -76,6 +84,10 @@ impl NotificationStats {
             queue: self.queue.load(Ordering::Relaxed),
             stalled: self.stalled.load(Ordering::Relaxed),
             last_delivered_at: self.last_delivered_at.load(Ordering::Relaxed),
+            delivered_webhook: self.delivered_webhook.load(Ordering::Relaxed),
+            delivered_kafka: self.delivered_kafka.load(Ordering::Relaxed),
+            failed_webhook: self.failed_webhook.load(Ordering::Relaxed),
+            failed_kafka: self.failed_kafka.load(Ordering::Relaxed),
         }
     }
 }
@@ -90,6 +102,10 @@ pub struct NotificationStatsSnapshot {
     pub queue: u64,
     pub stalled: bool,
     pub last_delivered_at: u64,
+    pub delivered_webhook: u64,
+    pub delivered_kafka: u64,
+    pub failed_webhook: u64,
+    pub failed_kafka: u64,
 }
 
 /// Webhook 投递器(可注入测试替身;生产 = [`SimpleWebhookSender`])。
@@ -298,6 +314,8 @@ struct RetryState {
 pub struct NotificationWorker {
     meta: Arc<MetaStore>,
     sender: Arc<dyn WebhookSender>,
+    /// M19 K1(ADR-25 DR2):kafka:// 目标的生产者(scheme 分派)。
+    kafka: Arc<dyn crate::kafka::KafkaSender>,
     stats: Arc<NotificationStats>,
     cfg: NotificationConfig,
     /// 重试表(seq → 尝试次数/下次到期;内存态,重启即重投)。
@@ -325,12 +343,19 @@ impl NotificationWorker {
         NotificationWorker {
             meta,
             sender,
+            kafka: Arc::new(crate::kafka::MinimalKafkaSender::default()),
             stats,
             cfg,
             retry: HashMap::new(),
             head_first_seen: None,
             head_first_seq: None,
         }
+    }
+
+    /// 注入 kafka 生产者(测试 fake)。
+    pub fn with_kafka_sender(mut self, kafka: Arc<dyn crate::kafka::KafkaSender>) -> Self {
+        self.kafka = kafka;
+        self
     }
 
     /// 手动触发一轮完整投递(测试/运维;同步跑完)。
@@ -420,9 +445,27 @@ impl NotificationWorker {
                 }
                 // 投递超时:常量 30s(AWS SDK 默认读超时同量级;不随退避变化)
                 let timeout = Duration::from_secs(30);
-                match self.sender.post(&rule.url, &headers, body, timeout) {
+                // M19 K1(ADR-25 DR1.2):按 URL scheme 分派;载荷同源(K2 分账)
+                let is_kafka = rule.url.starts_with("kafka://");
+                let outcome = if is_kafka {
+                    match crate::kafka::parse_kafka_url(&rule.url) {
+                        Ok(t) => self
+                            .kafka
+                            .send(&t, format!("{}/{}", rec.bucket, rec.key).as_bytes(), &body)
+                            .map(|_| 200),
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    self.sender.post(&rule.url, &headers, body, timeout)
+                };
+                match outcome {
                     Ok(code) if (200..300).contains(&code) => {
                         self.stats.delivered.fetch_add(1, Ordering::Relaxed);
+                        if is_kafka {
+                            self.stats.delivered_kafka.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            self.stats.delivered_webhook.fetch_add(1, Ordering::Relaxed);
+                        }
                         self.stats
                             .last_delivered_at
                             .store(now_ts(), Ordering::Relaxed);
@@ -431,6 +474,11 @@ impl NotificationWorker {
                     Ok(code) => {
                         all_ok = false;
                         self.stats.failed.fetch_add(1, Ordering::Relaxed);
+                        if is_kafka {
+                            self.stats.failed_kafka.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            self.stats.failed_webhook.fetch_add(1, Ordering::Relaxed);
+                        }
                         tracing::warn!(
                             "notification delivery to {} failed: HTTP {code} (event seq {})",
                             rule.url,
@@ -440,6 +488,11 @@ impl NotificationWorker {
                     Err(e) => {
                         all_ok = false;
                         self.stats.failed.fetch_add(1, Ordering::Relaxed);
+                        if is_kafka {
+                            self.stats.failed_kafka.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            self.stats.failed_webhook.fetch_add(1, Ordering::Relaxed);
+                        }
                         tracing::warn!(
                             "notification delivery to {} failed: {e} (event seq {})",
                             rule.url,
@@ -717,6 +770,119 @@ mod tests {
             NotificationWorker::new(meta, sender, stats.clone(), cfg),
             stats,
         )
+    }
+
+    /// M19 K1(ADR-25 DR2/DR3;TODO M19/K1):kafka:// 目标经 KafkaSender
+    /// 投递——载荷与 Webhook 同源(key = bucket/key);成功删除事件 +
+    /// delivered_kafka 分账;webhook 计数不受影响。
+    #[test]
+    fn kafka_target_gets_payload_with_key() {
+        use std::sync::Mutex as SyncMutex;
+        /// (topic::broker, key, payload)。
+        type KafkaCall = (String, Vec<u8>, Vec<u8>);
+        struct MockKafka {
+            calls: SyncMutex<Vec<KafkaCall>>,
+            fail: bool,
+        }
+        impl crate::kafka::KafkaSender for MockKafka {
+            fn send(
+                &self,
+                target: &fs3_core::KafkaTarget,
+                key: &[u8],
+                payload: &[u8],
+            ) -> Result<(), String> {
+                self.calls.lock().unwrap().push((
+                    format!("{}::{}", target.topic, target.brokers[0].0),
+                    key.to_vec(),
+                    payload.to_vec(),
+                ));
+                if self.fail {
+                    Err("broker down".into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let rule = fs3_core::NotificationRule {
+            id: "kafka-1".into(),
+            events: vec!["s3:ObjectCreated:*".into()],
+            kind: fs3_core::NotificationTargetKind::Topic,
+            url: "kafka://prod@127.0.0.1:9092/events?tls=1&sasl_env=FS3_KAFKA_PASS".into(),
+            hmac_key: None,
+            enabled: true,
+            filter: fs3_core::NotificationKeyFilter::default(),
+        };
+        let (_d, meta) = meta_with_rule(rule);
+        meta.commit(&[fs3_meta::Op::EventEnqueue { record: sample_event(0) }]).unwrap();
+        let kafka = Arc::new(MockKafka {
+            calls: SyncMutex::new(Vec::new()),
+            fail: false,
+        });
+        let (mut worker, stats) = worker_with(meta.clone(), Arc::new(MockSender {
+            calls: SyncMutex::new(Vec::new()),
+            fail_first: 0,
+            fail_with: 500,
+        }), 3);
+        worker = worker.with_kafka_sender(kafka.clone());
+        worker.run_round_blocking().unwrap();
+
+        let calls = kafka.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "one kafka delivery");
+        assert_eq!(calls[0].0, "events::127.0.0.1");
+        assert_eq!(calls[0].1, b"b1/logs/k", "message key = bucket/key");
+        // 载荷与 Webhook 同源字段
+        let payload: serde_json::Value = serde_json::from_slice(&calls[0].2).unwrap();
+        let rec0 = &payload["Records"][0];
+        assert_eq!(rec0["eventName"], "ObjectCreated:Put");
+        assert_eq!(rec0["s3"]["bucket"]["name"], "b1");
+        // 事件已删 + 分账计数
+        assert_eq!(meta.event_count().unwrap(), 0);
+        let snap = stats.snapshot();
+        assert_eq!(snap.delivered, 1);
+        assert_eq!(snap.delivered_kafka, 1);
+        assert_eq!(snap.delivered_webhook, 0);
+        assert_eq!(snap.failed_kafka, 0);
+    }
+
+    /// M19 K1:kafka 投递失败走既有重试/死信路径(N3 复用),webhook 计数不动。
+    #[test]
+    fn kafka_delivery_failure_retries() {
+        use std::sync::Mutex as SyncMutex;
+        struct FailingKafka;
+        impl crate::kafka::KafkaSender for FailingKafka {
+            fn send(
+                &self,
+                _target: &fs3_core::KafkaTarget,
+                _key: &[u8],
+                _payload: &[u8],
+            ) -> Result<(), String> {
+                Err("broker down".into())
+            }
+        }
+        let rule = fs3_core::NotificationRule {
+            id: "kafka-1".into(),
+            events: vec!["s3:ObjectCreated:*".into()],
+            kind: fs3_core::NotificationTargetKind::Topic,
+            url: "kafka://127.0.0.1:9092/events".into(),
+            hmac_key: None,
+            enabled: true,
+            filter: fs3_core::NotificationKeyFilter::default(),
+        };
+        let (_d, meta) = meta_with_rule(rule);
+        meta.commit(&[fs3_meta::Op::EventEnqueue { record: sample_event(0) }]).unwrap();
+        let (mut worker, stats) = worker_with(meta.clone(), Arc::new(MockSender {
+            calls: SyncMutex::new(Vec::new()),
+            fail_first: 0,
+            fail_with: 500,
+        }), 1);
+        worker = worker.with_kafka_sender(Arc::new(FailingKafka));
+        worker.run_round_blocking().unwrap();
+        let snap = stats.snapshot();
+        assert_eq!(snap.failed, 1);
+        assert_eq!(snap.failed_kafka, 1);
+        assert_eq!(snap.delivered_kafka, 0);
+        // 事件仍在队列(重试记账)
+        assert_eq!(meta.event_count().unwrap(), 1);
     }
 
     /// 成功投递:键删除 + 统计 + 载荷/签名头断言。

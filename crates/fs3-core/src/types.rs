@@ -3471,3 +3471,95 @@ pub struct IngestListed {
     /// 源 LastModified(unix 秒,已取整)。
     pub mtime: i64,
 }
+
+// ─────────────────────────── Kafka 通知目标(M19 K,ADR-25) ───────────────────────────
+
+/// 已解析的 kafka:// 目标(ADR-25 DR1)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KafkaTarget {
+    /// bootstrap brokers(host:port 列表)。
+    pub brokers: Vec<(String, u16)>,
+    /// 用户名(URL userinfo;None = 匿名)。
+    pub user: Option<String>,
+    /// SASL 密码环境变量名(DR1.3;None = 不做 SASL)。
+    pub sasl_env: Option<String>,
+    /// TLS(tls=1)。
+    pub tls: bool,
+    /// topic(非空)。
+    pub topic: String,
+}
+
+/// 解析 `kafka://[user@]host:port[,host2:port2]/topic[?tls=1][&sasl_env=VAR]`。
+pub fn parse_kafka_url(url: &str) -> std::result::Result<KafkaTarget, String> {
+    let rest = url
+        .strip_prefix("kafka://")
+        .ok_or_else(|| format!("not a kafka:// url: {url}"))?;
+    // topic 与 query
+    let (authority_path, query) = match rest.split_once('?') {
+        Some((a, q)) => (a, q),
+        None => (rest, ""),
+    };
+    let (authority, topic) = authority_path
+        .split_once('/')
+        .ok_or_else(|| format!("kafka url missing topic: {url}"))?;
+    if topic.is_empty() {
+        return Err(format!("kafka url empty topic: {url}"));
+    }
+    let (user, hostport) = match authority.rsplit_once('@') {
+        Some((u, hp)) => {
+            if u.is_empty() {
+                return Err(format!("kafka url empty user: {url}"));
+            }
+            (Some(u.to_string()), hp)
+        }
+        None => (None, authority),
+    };
+    let mut brokers = Vec::new();
+    for hp in hostport.split(',') {
+        let hp = hp.trim();
+        if hp.is_empty() {
+            continue;
+        }
+        let (h, p) = match hp.rsplit_once(':') {
+            Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+                let port = p.parse::<u16>().map_err(|e| format!("kafka bad port: {e}"))?;
+                (h, port)
+            }
+            // 有冒号但端口非数字 → 显式错误(不静默当默认端口)
+            Some((_, p)) if !p.is_empty() => return Err(format!("kafka bad port: {p}")),
+            _ => (hp, 9092),
+        };
+        if h.is_empty() {
+            return Err(format!("kafka url empty host: {url}"));
+        }
+        brokers.push((h.trim_matches(['[', ']']).to_string(), p));
+    }
+    if brokers.is_empty() {
+        return Err(format!("kafka url no brokers: {url}"));
+    }
+    let mut tls = false;
+    let mut sasl_env = None;
+    if !query.is_empty() {
+        for kv in query.split('&') {
+            match kv {
+                "tls=1" | "tls=true" => tls = true,
+                _ if kv.starts_with("sasl_env=") => {
+                    let v = kv.trim_start_matches("sasl_env=");
+                    if v.is_empty() {
+                        return Err(format!("kafka url empty sasl_env: {url}"));
+                    }
+                    sasl_env = Some(v.to_string());
+                }
+                _ => return Err(format!("kafka url unknown query param: {kv}")),
+            }
+        }
+    }
+    Ok(KafkaTarget {
+        brokers,
+        user,
+        sasl_env,
+        tls,
+        topic: topic.to_string(),
+    })
+}
+

@@ -178,3 +178,36 @@ fasts3d serve --config fasts3.toml --web-root /usr/share/fasts3/web/console/dist
 - [故障排查](troubleshooting.md):FAQ 与常见问题处置;
 - [备份/恢复](backup-restore.md)与[迁移](migration.md);
 - [admin API 参考](../reference/admin-api.md) / [错误码速查](../reference/errors.md)。
+
+## Kafka 事件通知(M19;ADR-25)
+
+私有化事件总线常用 Kafka。FastS3 在 `PutBucketNotificationConfiguration`
+中接受 `kafka://` 目标(与 Webhook 容器/事件/过滤语义完全一致):
+
+```xml
+<NotificationConfiguration>
+  <QueueConfiguration>
+    <Id>audit-kafka</Id>
+    <Event>s3:ObjectCreated:*</Event>
+    <Queue>kafka://prod@kafka1.internal:9092,admin@kafka2.internal:9092/s3-events?tls=1&sasl_env=FS3_KAFKA_SASL_PASS</Queue>
+  </QueueConfiguration>
+</NotificationConfiguration>
+```
+
+要点(ADR-25):
+
+- **密码仅环境变量**:`sasl_env=VAR` 指向存放 SASL 密码的环境变量
+  (SASL PLAIN;强烈建议与 `tls=1` 同用)。URL/配置/日志/审计零密码明文;
+  env 缺失 = 投递失败走重试/死信,不影响数据面。
+- **topic**:broker 需预建 topic 或开启 auto-create;未知 topic 记投递
+  失败(退避重试,超限死信)。
+- **消息形态**:value = 与 Webhook 同源的 AWS S3 事件 JSON(同字段便于
+  双写);key = `{bucket}/{key}`(同 key 落同分区,下游可按对象聚合)。
+- **投递语义**:at-least-once(acks=1;崩溃/失败重投,`eventId` 幂等去重);
+  每条消息新建连接,吞吐受批次与队列上限约束。
+- **指标**:`fasts3_notification_delivered_by_target_total{target="webhook"|"kafka"}`
+  与 `fasts3_notification_failed_by_target_total{...}`;队列深度/死信/滞留
+  指标与 Webhook 共用(同一 `e:` 队列)。
+- **内网证书**:TLS 走系统信任根(webpki-roots);私有 CA 请在容器/主机层
+  预置信任(与 Webhook https 同口径)。
+- **明确不做**(ADR-25 DR4):SQS/SNS/EventBridge/AMQP/MQTT/NSQ 目标。

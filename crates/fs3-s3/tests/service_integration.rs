@@ -11173,6 +11173,29 @@ fn bucket_notification_rejects() {
         x.contains("<NotificationConfiguration") && !x.contains("<Id>"),
         "{x}"
     );
+    // M19 K1(ADR-25 DR4):kafka:// 目标受理;非法 kafka 形态显式拒绝
+    let body = br#"<NotificationConfiguration><QueueConfiguration><Id>k1</Id>
+        <Event>s3:ObjectCreated:*</Event>
+        <Queue>kafka://127.0.0.1:9092/events</Queue></QueueConfiguration></NotificationConfiguration>"#
+        .to_vec();
+    let r = svc.handle(&req_q("PUT", "/bkt1", q, body));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let x = body_str(&svc.handle(&req_q("GET", "/bkt1", q, vec![])).unwrap());
+    assert!(x.contains("kafka://127.0.0.1:9092/events"), "{x}");
+    // 缺 topic → InvalidArgument
+    let body = br#"<NotificationConfiguration><QueueConfiguration><Id>k2</Id>
+        <Event>s3:ObjectCreated:*</Event>
+        <Queue>kafka://127.0.0.1:9092</Queue></QueueConfiguration></NotificationConfiguration>"#
+        .to_vec();
+    let r = svc.handle(&req_q("PUT", "/bkt1", q, body));
+    assert_eq!(err_code(&r), "InvalidArgument", "{r:?}");
+    // 未知 query 参数 → InvalidArgument
+    let body = br#"<NotificationConfiguration><QueueConfiguration><Id>k3</Id>
+        <Event>s3:ObjectCreated:*</Event>
+        <Queue>kafka://127.0.0.1:9092/events?foo=1</Queue></QueueConfiguration></NotificationConfiguration>"#
+        .to_vec();
+    let r = svc.handle(&req_q("PUT", "/bkt1", q, body));
+    assert_eq!(err_code(&r), "InvalidArgument", "{r:?}");
 }
 
 /// 删桶清理 + 两桶隔离(n: 键随桶删除;前缀互不串扰)。

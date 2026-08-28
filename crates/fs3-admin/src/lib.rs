@@ -1258,6 +1258,25 @@ impl AdminServer {
             text.push_str("# HELP fasts3_notification_failed_total Webhook delivery failures (non-2xx or network)\n");
             text.push_str("# TYPE fasts3_notification_failed_total counter\n");
             text.push_str(&format!("fasts3_notification_failed_total {}\n", s.failed));
+            // M19 K2(ADR-25 DR3):按目标类型分账(webhook / kafka)
+            text.push_str("# TYPE fasts3_notification_delivered_by_target_total counter\n");
+            text.push_str(&format!(
+                "fasts3_notification_delivered_by_target_total{{target=\"webhook\"}} {}\n",
+                s.delivered_webhook
+            ));
+            text.push_str(&format!(
+                "fasts3_notification_delivered_by_target_total{{target=\"kafka\"}} {}\n",
+                s.delivered_kafka
+            ));
+            text.push_str("# TYPE fasts3_notification_failed_by_target_total counter\n");
+            text.push_str(&format!(
+                "fasts3_notification_failed_by_target_total{{target=\"webhook\"}} {}\n",
+                s.failed_webhook
+            ));
+            text.push_str(&format!(
+                "fasts3_notification_failed_by_target_total{{target=\"kafka\"}} {}\n",
+                s.failed_kafka
+            ));
             text.push_str(
                 "# HELP fasts3_notification_dead_total Events dead-lettered after retry limit\n",
             );
