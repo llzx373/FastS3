@@ -638,6 +638,7 @@ dependencies = [
  "h3",
  "h3-quinn",
  "hex",
+ "hmac",
  "http",
  "http-body",
  "http-body-util",
@@ -659,6 +660,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "webpki-roots 0.26.11",
+ "zeroize",
 ]
 
 [[package]]

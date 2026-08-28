@@ -462,6 +462,17 @@ pub enum Op {
         bucket: String,
         id: String,
     },
+    /// 迁入任务写入(M19 M,ADR-24 DR5/DR6;`ij:{job_id}` → postcard
+    /// IngestJob;覆盖语义——worker 每 key 更新统计/游标,admin pause/
+    /// resume/cancel 同一写通道,单写者语义由调用方保证:worker 与 admin
+    /// 都走「读-改-写整条记录」小事务)。
+    IngestJobPut {
+        job: fs3_core::IngestJob,
+    },
+    /// 迁入任务删除(admin 删除接口/清账;幂等)。
+    IngestJobDelete {
+        id: String,
+    },
     /// 对象标签单事务读改写(M10 S1;PutObjectTagging/DeleteObjectTagging
     /// 落地):`vk = None` → 未版本化单键 `o:{b}\0{k}`;`Some(vk)` → 版本键
     /// (含 VK_NULL null 槽)。仅 tags 字段变更,不触碰数据段/统计;
@@ -888,6 +899,15 @@ fn decode_inventory_rule(v: &[u8]) -> Result<fs3_core::InventoryRule> {
         Err(e) => Err(Error::Corrupt(format!(
             "postcard decode inventory rule: {e}"
         ))),
+    }
+}
+
+/// M19 迁入任务值解码(ADR-24 DR6;postcard,无版本字节——演进走尾部
+/// 追加 + serde default;`IngestJob` 新字段全部带 default 时旧值可解)。
+fn decode_ingest_job(v: &[u8]) -> Result<fs3_core::IngestJob> {
+    match postcard::from_bytes::<fs3_core::IngestJob>(v) {
+        Ok(j) => Ok(j),
+        Err(e) => Err(Error::Corrupt(format!("postcard decode ingest job: {e}"))),
     }
 }
 
@@ -2883,6 +2903,42 @@ impl MetaStore {
         }])
     }
 
+    // ── M19 迁入任务(ADR-24 DR5/DR6;`ij:` 域,不导出) ──
+
+    /// 读单条任务(None = 不存在)。
+    pub fn get_ingest_job(&self, id: &str) -> Result<Option<fs3_core::IngestJob>> {
+        match self.db.get(ingest_job_key(id)?).map_err(rocks_err)? {
+            Some(v) => Ok(Some(decode_ingest_job(&v)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 写入(覆盖语义;worker 统计/游标更新与 admin 状态转移共用)。
+    pub fn put_ingest_job(&self, job: &fs3_core::IngestJob) -> Result<u64> {
+        self.commit(&[Op::IngestJobPut { job: job.clone() }])
+    }
+
+    /// 删除(幂等)。
+    pub fn delete_ingest_job(&self, id: &str) -> Result<u64> {
+        self.commit(&[Op::IngestJobDelete { id: id.to_string() }])
+    }
+
+    /// 全量列表(按 job_id 字典序;数量为运维量级,无分页)。
+    pub fn list_ingest_jobs(&self) -> Result<Vec<fs3_core::IngestJob>> {
+        let mut out = Vec::new();
+        for item in self
+            .db
+            .iterator(IteratorMode::From(PREFIX_INGEST_JOB, Direction::Forward))
+        {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(PREFIX_INGEST_JOB) {
+                break;
+            }
+            out.push(decode_ingest_job(&v)?);
+        }
+        Ok(out)
+    }
+
     /// 对象标签单事务读改写(M10 S1):`vk = None` → 未版本化单键;
     /// `Some(vk)` → 版本键(含 VK_NULL null 槽)。目标不存在 → NotFound。
     pub fn commit_object_set_tags(
@@ -4327,6 +4383,12 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
                     return Err(Error::NotFound(format!("bucket {bucket}")));
                 }
                 tremove(tx, &inventory_config_key(bucket, id))?;
+            }
+            Op::IngestJobPut { job } => {
+                tinsert(tx, ingest_job_key(&job.id)?, encode(job)?)?;
+            }
+            Op::IngestJobDelete { id } => {
+                tremove(tx, &ingest_job_key(id)?)?;
             }
             Op::ObjectSetTags {
                 bucket,

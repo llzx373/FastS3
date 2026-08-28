@@ -19,6 +19,8 @@ mod handler;
 // M15 N3:事件通知投递 worker(Webhook + HMAC;独立后台线程,与压缩/
 // 生命周期同源令牌桶;完整模块文档见 notify.rs)
 pub mod notify;
+/// M19 迁入源端 S3 客户端(ADR-24 DR4.1;实现 fs3_engine::ingest::IngestSourceClient)。
+pub mod s3_source;
 mod static_files;
 mod timeout_io;
 pub mod tls;

@@ -114,6 +114,13 @@ pub const PREFIX_IAM_POLICY: &[u8] = b"ip:";
 /// IAM 角色(M18 I1;ADR-28 DI2/DI5:`ir:{tenant}\0{role}` → postcard
 /// IamRole;STS AssumeRole 目标)。三处同步同 `iu:` 口径。
 pub const PREFIX_IAM_ROLE: &[u8] = b"ir:";
+/// 迁入任务(M19 M,ADR-24 DR5/DR6:`ij:{job_id}` → postcard IngestJob;
+/// 任务状态/统计/失败列表/游标持久化,ingest worker 崩溃后从游标续跑)。
+/// 新一级前缀:三处同步——keys.rs 前缀表(本处)、meta-export/import DTO
+/// (**显式不导出**:任务为运维瞬态且含源凭证,secret 明文不进导出物,
+/// 同 `e:`/`x:` 不导出口径)、check 可达性扫描(只读 `o:`/`p:` 段引用键,
+/// 任务值不含 extent 引用,对 `ij:` 天然安全,登记于注释)。
+pub const PREFIX_INGEST_JOB: &[u8] = b"ij:";
 
 /// 系统单调计数器(每个事务 +1,单点序列化;ADR-5)。
 pub const SYS_SEQ: &[u8] = b"s:seq";
@@ -770,6 +777,28 @@ pub fn iam_role_prefix(tenant: &str) -> Result<Vec<u8>> {
 /// 解析 `ir:` 键 → (tenant, role)。
 pub fn parse_iam_role_key(raw: &[u8]) -> Result<(String, String)> {
     parse_iam_entity_key(PREFIX_IAM_ROLE, raw)
+}
+
+/// 迁入任务键:`ij:{job_id}`(M19 M,ADR-24 DR6)。job_id 由 admin 生成
+/// (时间戳+随机 hex);不含 0x00,`ij:` 单段扁平域。
+pub fn ingest_job_key(job_id: &str) -> Result<Vec<u8>> {
+    if job_id.is_empty() || job_id.len() > 128 || job_id.bytes().any(|b| b == 0x00) {
+        return Err(Error::InvalidArgument(format!(
+            "ingest job id {job_id:?}: must be 1..=128 bytes without NUL"
+        )));
+    }
+    let mut k = Vec::with_capacity(PREFIX_INGEST_JOB.len() + job_id.len());
+    k.extend_from_slice(PREFIX_INGEST_JOB);
+    k.extend_from_slice(job_id.as_bytes());
+    Ok(k)
+}
+
+/// 解析 `ij:` 键 → job_id。
+pub fn parse_ingest_job_key(raw: &[u8]) -> Result<String> {
+    let body = raw
+        .strip_prefix(PREFIX_INGEST_JOB)
+        .ok_or_else(|| Error::Corrupt("ingest job key missing prefix".into()))?;
+    String::from_utf8(body.to_vec()).map_err(|_| Error::Corrupt("ingest job id not utf8".into()))
 }
 
 #[cfg(test)]

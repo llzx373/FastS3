@@ -2594,3 +2594,130 @@ fn admin_iam_verify_password() {
 
     let _ = handle;
 }
+
+/// M19 M1(ADR-24 DR5;TODO M19/M1):迁入任务 CRUD 往返
+/// (ingest_job_create_and_status)。不发起源连接(仅形态校验);
+/// 凭证零回显;pause/cancel 状态转移;delete。
+#[test]
+fn ingest_job_create_and_status() {
+    let (dir, img) = setup();
+    let cfg = EngineConfig {
+        devices: vec![img.clone()],
+        meta_dir: dir.path().join("meta"),
+        compaction: fs3_engine::CompactionConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let (sock, _h) = start_admin(&cfg, "t");
+    let _keep = &img;
+
+    // 建目标桶(直连引擎;admin 无建桶侧效)——经 engine 打开一次写入
+    // 这里用数据面太重:直接走 admin buckets 端点
+    let (code, body) = http_unix(
+        sock.as_str(),
+        "POST",
+        "/v1/admin/buckets",
+        Some(r#"{"name":"dest"}"#),
+        "t",
+    );
+    assert!(code == 200 || code == 409, "{code} {body}");
+
+    // 创建任务:凭证回显打码
+    let create_body = r#"{
+        "source": {
+            "endpoint": "http://10.0.0.9:9000",
+            "region": "us-east-1",
+            "bucket": "src",
+            "prefix": "logs/",
+            "access_key": "src-ak",
+            "secret_key": "src-secret-value"
+        },
+        "dest_bucket": "dest",
+        "preserve_mtime": true,
+        "copy_bucket_config": false
+    }"#;
+    let (code, body) = http_unix(sock.as_str(), "POST", "/v1/admin/ingest/jobs", Some(create_body), "t");
+    assert_eq!(code, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let id = v["id"].as_str().unwrap().to_string();
+    assert!(id.starts_with("ing-"), "{body}");
+    assert_eq!(v["source"]["secret_key"], "***", "secret must be redacted");
+    assert_eq!(v["state"], "Submitted");
+    assert!(!body.contains("src-secret-value"), "secret must never echo");
+
+    // 目标桶不存在 → 404
+    let bad = create_body.replace("\"dest\"", "\"nope\"");
+    let (code, body) = http_unix(sock.as_str(), "POST", "/v1/admin/ingest/jobs", Some(&bad), "t");
+    assert_eq!(code, 404, "{body}");
+
+    // 缺字段 → 400
+    let (code, _) = http_unix(
+        sock.as_str(),
+        "POST",
+        "/v1/admin/ingest/jobs",
+        Some(r#"{"source":{"endpoint":"http://x:1","bucket":"b"}}"#),
+        "t",
+    );
+    assert_eq!(code, 400);
+
+    // Get → 同一任务
+    let (code, body) = http_unix(
+        sock.as_str(),
+        "GET",
+        &format!("/v1/admin/ingest/jobs/{id}"),
+        None,
+        "t",
+    );
+    assert_eq!(code, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["id"], id);
+    assert_eq!(v["listed"], 0);
+
+    // 列表包含
+    let (code, body) = http_unix(sock.as_str(), "GET", "/v1/admin/ingest/jobs", None, "t");
+    assert_eq!(code, 200, "{body}");
+    assert!(body.contains(&id), "list must contain the job");
+
+    // pause → Paused;resume → Running;cancel → Cancelled
+    for (action, want) in [("pause", "Paused"), ("resume", "Running"), ("cancel", "Cancelled")] {
+        let (code, body) = http_unix(
+            sock.as_str(),
+            "POST",
+            &format!("/v1/admin/ingest/jobs/{id}/{action}"),
+            None,
+            "t",
+        );
+        assert_eq!(code, 200, "{action}: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["state"], want, "{action}");
+    }
+    // 终态再转移 → 409
+    let (code, body) = http_unix(
+        sock.as_str(),
+        "POST",
+        &format!("/v1/admin/ingest/jobs/{id}/pause"),
+        None,
+        "t",
+    );
+    assert_eq!(code, 409, "{body}");
+
+    // 删除 → 404
+    let (code, body) = http_unix(
+        sock.as_str(),
+        "DELETE",
+        &format!("/v1/admin/ingest/jobs/{id}"),
+        None,
+        "t",
+    );
+    assert_eq!(code, 200, "{body}");
+    let (code, _) = http_unix(
+        sock.as_str(),
+        "GET",
+        &format!("/v1/admin/ingest/jobs/{id}"),
+        None,
+        "t",
+    );
+    assert_eq!(code, 404);
+}

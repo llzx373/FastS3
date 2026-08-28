@@ -851,6 +851,29 @@ fn cmd_serve(
     };
     let restore_stats = restore_worker.as_ref().map(|(w, _, _)| w.stats());
 
+    // M19 M(ADR-24 DR4):迁入 worker(默认启用;无 `ij:` 任务零动作;
+    // 只读引擎不启动——对象写需引擎写锁)。执行器 = 流式 GET 源 + 引擎
+    // 内部写(显式 mtime);源客户端 = fs3-http S3SourceClient(生产)。
+    let ingest_worker = if !engine_cfg.read_only && cfg.ingest.enabled.unwrap_or(true) {
+        let ipoll = Duration::from_secs_f64(cfg.ingest.poll_secs.unwrap_or(1.0).max(0.1));
+        let (meta, throttle) = {
+            let e = engine.read();
+            (e.meta_arc(), e.throttle())
+        };
+        let worker = fs3_engine::ingest::IngestWorker::new(
+            SharedEngine(engine.clone()),
+            meta,
+            Box::new(|src| {
+                Ok(Box::new(fs3_http::s3_source::S3SourceClient::new(src)?)
+                    as Box<dyn fs3_engine::ingest::IngestSourceClient>)
+            }),
+            cfg.ingest.batch.unwrap_or(64),
+        );
+        Some((worker, throttle, ipoll))
+    } else {
+        None
+    };
+
     // M6 / K4:优雅停机标志(SIGTERM/SIGINT → 排空 → 引擎收尾)。
     // 提前创建供 admin/agent 等后台模块注入(agent 循环每周期观测)。
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -983,6 +1006,11 @@ fn cmd_serve(
     // 周期 = restore_poll_secs;过期 GC 由 worker 内部周期触发)
     let mut restore_worker = restore_worker.map(|(worker, throttle, poll)| {
         fs3_engine::worker::WorkerHandle::spawn("fs3-restore", worker, throttle, poll)
+    });
+
+    // M19 M:迁入 worker 启动(独立线程 + 全局共享令牌桶;轮询 = ingest.poll_secs)
+    let mut ingest_worker = ingest_worker.map(|(worker, throttle, poll)| {
+        fs3_engine::worker::WorkerHandle::spawn("fs3-ingest", worker, throttle, poll)
     });
 
     let addr: std::net::SocketAddr = listen
@@ -1124,6 +1152,10 @@ fn cmd_serve(
         h.stop();
     }
     if let Some(mut h) = restore_worker.take() {
+        h.stop();
+    }
+    // M19 M:迁入 worker 停止(任务游标已持久化,重启续跑)
+    if let Some(mut h) = ingest_worker.take() {
         h.stop();
     }
     tracing::info!("http workers drained; finalizing engine (checkpoint + meta close)");

@@ -18,6 +18,8 @@ pub mod inventory;
 pub mod io;
 pub mod lifecycle;
 pub mod restore;
+/// M19 迁入执行器(ADR-24;TODO M19/M1/M2)。
+pub mod ingest;
 pub mod worker;
 
 #[cfg(test)]
@@ -2097,6 +2099,94 @@ impl Engine {
         requested_storage_class: Option<String>,
         storage_class: Option<String>,
     ) -> Result<ObjectMeta> {
+        self.put_with_lock_ev_mtime(
+            bucket,
+            key,
+            reader,
+            content_type,
+            user_meta,
+            resp_headers,
+            tags,
+            precond,
+            checksum_alg,
+            sse_key,
+            lock,
+            event,
+            requested_storage_class,
+            storage_class,
+            None,
+        )
+    }
+
+    /// M19/ADR-24 DR1/DR2:迁入通道对象写入(显式 mtime + 元数据拷贝;
+    /// 仅 ingest worker 可达,S3 协议路径无此入口)。目标桶默认加密
+    /// (DS3)时现铸 SSE-S3 写密钥;Object Lock 不经迁入设置(目标侧
+    /// 无锁语义;锁定对象被覆盖属正常 put 流程)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn ingest_put_object(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        reader: &mut dyn Read,
+        content_type: Option<&str>,
+        user_meta: Vec<(String, String)>,
+        tags: Vec<(String, String)>,
+        requested_storage_class: Option<String>,
+        explicit_mtime: i64,
+    ) -> Result<ObjectMeta> {
+        let sse_key = {
+            let Some(bkt) = self.meta.get_bucket(bucket)? else {
+                return Err(Error::NotFound(format!("bucket {bucket}")));
+            };
+            match bkt.default_encryption {
+                Some(fs3_core::SseAlgorithm::Aes256) => {
+                    Some(fs3_core::SseWriteKey::SseS3(&self.sse_s3_mint_write_key()?))
+                }
+                None => None,
+            }
+        };
+        self.put_with_lock_ev_mtime(
+            bucket,
+            key,
+            reader,
+            content_type,
+            user_meta,
+            Vec::new(), // resp_headers:迁入不拷贝回显头(源/目标头族语义不同)
+            tags,
+            None,
+            None,
+            sse_key.as_ref(),
+            ObjectLockWrite::default(),
+            None,
+            requested_storage_class,
+            None,
+            Some(explicit_mtime),
+        )
+    }
+
+    /// M19/ADR-24 DR1:迁入通道写对象——`explicit_mtime = Some(t)` 时
+    /// ObjectMeta.mtime 用 t(管理面迁入任务专用,保留源 LastModified);
+    /// S3 协议路径恒传 None(服务器时间),防客户端伪造。语义与其余
+    /// 参数与 [`Self::put_with_lock_ev`] 完全一致。
+    #[allow(clippy::too_many_arguments)]
+    pub fn put_with_lock_ev_mtime(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        reader: &mut dyn Read,
+        content_type: Option<&str>,
+        user_meta: Vec<(String, String)>,
+        resp_headers: Vec<(String, String)>,
+        tags: Vec<(String, String)>,
+        precond: Option<&WritePrecondition>,
+        checksum_alg: Option<ChecksumAlgorithm>,
+        sse_key: Option<&fs3_core::SseWriteKey>,
+        lock: ObjectLockWrite,
+        event: Option<fs3_core::EventDraft>,
+        requested_storage_class: Option<String>,
+        storage_class: Option<String>,
+        explicit_mtime: Option<i64>,
+    ) -> Result<ObjectMeta> {
         let Some(bkt) = self.meta.get_bucket(bucket)? else {
             return Err(Error::NotFound(format!("bucket {bucket}")));
         };
@@ -2209,7 +2299,11 @@ impl Engine {
                 ),
             };
             let etag = plain_md5.unwrap_or_else(|| self.compute_etag(&inline_data));
-            let mtime = self.write_mtime(&target, bucket, key)?;
+            // ADR-24 DR1:迁入通道显式 mtime;S3 路径 = 写目标感知服务器时间
+            let mtime = match explicit_mtime {
+                Some(m) => m,
+                None => self.write_mtime(&target, bucket, key)?,
+            };
             let meta = ObjectMeta {
                 size,
                 etag,
@@ -2300,6 +2394,7 @@ impl Engine {
             requested_storage_class,
             storage_class,
             compression_level,
+            explicit_mtime,
         });
         match result {
             Ok(meta) => {
@@ -2343,6 +2438,7 @@ impl Engine {
             requested_storage_class,
             storage_class,
             compression_level,
+            explicit_mtime,
         } = ctx;
         let old_size = old.size;
         let old_segments = old.segments;
@@ -2376,7 +2472,11 @@ impl Engine {
         // M11 C1-2:tee 已读尽(EOF 落值),提交前取回 checksum(未声明 = None)
         let checksum = checksum_out.borrow_mut().take();
 
-        let mtime = self.write_mtime(&target, bucket, key)?;
+        // ADR-24 DR1:迁入通道显式 mtime;S3 路径 = 写目标感知服务器时间
+        let mtime = match explicit_mtime {
+            Some(m) => m,
+            None => self.write_mtime(&target, bucket, key)?,
+        };
         let meta = ObjectMeta {
             size,
             etag,
@@ -7233,6 +7333,9 @@ struct PutCtx<'a> {
     /// M16 A1(ADR-19 DA1):本写路径压缩档位(0 = 不压缩;归档类强制,
     /// STANDARD 随全局配置)。
     compression_level: u32,
+    /// M19/ADR-24 DR1:迁入通道显式 mtime(None = 服务器时间;仅
+    /// put_with_lock_ev_mtime 的迁入臂传入)。
+    explicit_mtime: Option<i64>,
 }
 
 /// 版本化写入目标(ADR-11 §3.4.2;put/copy/complete 共用分叉)。

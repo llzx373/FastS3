@@ -3376,3 +3376,98 @@ impl CompressionConfig {
         Ok(())
     }
 }
+
+// ─────────────────────────── M19 迁入任务(ADR-24,TODO M19/M) ───────────────────────────
+
+/// 迁入任务源端点(ADR-24 DR5;凭证与 `k:` 同级静态保存于 `ij:`,
+/// meta-export 不导出任务,secret 明文不进导出物)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngestSource {
+    /// 源 S3 endpoint(http://host:port;仅 http/https)。
+    pub endpoint: String,
+    /// SigV4 region(缺省 us-east-1)。
+    pub region: String,
+    /// 源桶名。
+    pub bucket: String,
+    /// 源键前缀(空 = 全桶)。
+    pub prefix: String,
+    pub access_key: String,
+    pub secret_key: String,
+}
+
+/// 迁入任务状态机(ADR-24 DR5):Submitted → Running → Completed/Failed/
+/// Cancelled;Running ↔ Paused(任务级暂停,resume 回 Running)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IngestJobState {
+    Submitted,
+    Running,
+    Paused,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl IngestJobState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            IngestJobState::Submitted => "Submitted",
+            IngestJobState::Running => "Running",
+            IngestJobState::Paused => "Paused",
+            IngestJobState::Completed => "Completed",
+            IngestJobState::Failed => "Failed",
+            IngestJobState::Cancelled => "Cancelled",
+        }
+    }
+}
+
+/// 单条失败记录(封顶 100 条;kind = "object" | "config:<what>")。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngestFailure {
+    pub kind: String,
+    /// 对象键或配置名。
+    pub key: String,
+    pub error: String,
+    pub at: i64,
+}
+
+/// 迁入任务(键 `ij:{job_id}` → postcard 本结构;ADR-24 DR4.4/DR6:
+/// 状态/统计/失败列表/`last_key` 游标持久化,worker 崩溃后从游标续跑,
+/// 至少一次 + 逐键幂等)。演进纪律:尾部追加字段 + serde default。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngestJob {
+    pub id: String,
+    pub source: IngestSource,
+    /// 目标桶(必须已存在于本机)。
+    pub dest_bucket: String,
+    /// ADR-24 DR1:保留源 LastModified(管理面专用通道)。
+    pub preserve_mtime: bool,
+    /// ADR-24 DR3:拷贝桶策略/BPA/生命周期/通知配置(密钥不拷)。
+    pub copy_bucket_config: bool,
+    pub state: IngestJobState,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// 进度统计( listed = 源列举累计;copied/skipped/failed = 键数;bytes = 已迁字节)。
+    pub listed: u64,
+    pub copied: u64,
+    pub skipped: u64,
+    pub failed: u64,
+    pub bytes: u64,
+    /// 游标 = 已处理完的最后一个键(字典序;续跑从其后列举)。
+    pub last_key: String,
+    /// 失败列表(封顶 100 条,新条目挤掉最旧)。
+    pub failures: Vec<IngestFailure>,
+    /// 连续系统性错误计数(源不可达等;成功即清零;>10 → Failed,ADR-24 DR4)。
+    pub consecutive_errors: u32,
+    /// 终态错误摘要(Failed/Cancelled;Completed/进行中 = None)。
+    pub error: Option<String>,
+}
+
+/// 迁入列举条目(worker 从源 ListObjectsV2 取得)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngestListed {
+    pub key: String,
+    pub size: u64,
+    pub etag: String,
+    /// 源 LastModified(unix 秒,已取整)。
+    pub mtime: i64,
+}

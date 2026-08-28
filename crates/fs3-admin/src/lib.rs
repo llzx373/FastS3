@@ -540,6 +540,21 @@ impl AdminServer {
             // 只暴露代数/时间戳/重包裹进度,红线)
             ("POST", ["sse", "rotate"]) => self.handle_sse_rotate(),
             ("GET", ["sse", "status"]) => self.handle_sse_status(),
+            // M19 M1(ADR-24 DR5):迁入任务 CRUD(保 mtime/元数据/策略;
+            // 执行 = ingest worker;凭证零回显)
+            ("GET", ["ingest", "jobs"]) => self.handle_ingest_jobs_list(),
+            ("POST", ["ingest", "jobs"]) => self.handle_ingest_job_create(body),
+            ("GET", ["ingest", "jobs", id]) => self.handle_ingest_job_get(id),
+            ("DELETE", ["ingest", "jobs", id]) => self.handle_ingest_job_delete(id),
+            ("POST", ["ingest", "jobs", id, "pause"]) => {
+                self.handle_ingest_job_state(id, fs3_core::IngestJobState::Paused)
+            }
+            ("POST", ["ingest", "jobs", id, "resume"]) => {
+                self.handle_ingest_job_state(id, fs3_core::IngestJobState::Running)
+            }
+            ("POST", ["ingest", "jobs", id, "cancel"]) => {
+                self.handle_ingest_job_state(id, fs3_core::IngestJobState::Cancelled)
+            }
             _ => json::err(StatusCode::NOT_FOUND, "not_found", "unknown admin endpoint"),
         }
     }
@@ -655,6 +670,313 @@ impl AdminServer {
                 "internal",
                 &e.to_string(),
             ),
+        }
+    }
+
+    // ── M19 M1(ADR-24 DR5):迁入任务 admin API ──
+
+    /// 任务 JSON(凭证零回显:secret_key 恒 "***")。
+    fn ingest_job_json(job: &fs3_core::IngestJob) -> serde_json::Value {
+        serde_json::json!({
+            "id": job.id,
+            "source": {
+                "endpoint": job.source.endpoint,
+                "region": job.source.region,
+                "bucket": job.source.bucket,
+                "prefix": job.source.prefix,
+                "access_key": job.source.access_key,
+                "secret_key": "***",
+            },
+            "dest_bucket": job.dest_bucket,
+            "preserve_mtime": job.preserve_mtime,
+            "copy_bucket_config": job.copy_bucket_config,
+            "state": job.state.as_str(),
+            "created_at": job.created_at,
+            "updated_at": job.updated_at,
+            "listed": job.listed,
+            "copied": job.copied,
+            "skipped": job.skipped,
+            "failed": job.failed,
+            "bytes": job.bytes,
+            "last_key": job.last_key,
+            "failures": job.failures.iter().map(|f| serde_json::json!({
+                "kind": f.kind,
+                "key": f.key,
+                "error": f.error,
+                "at": f.at,
+            })).collect::<Vec<_>>(),
+            "error": job.error,
+        })
+    }
+
+    fn unix_now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
+    }
+
+    fn handle_ingest_jobs_list(&self) -> Response<String> {
+        let engine = self.engine.read();
+        match engine.meta_arc().list_ingest_jobs() {
+            Ok(mut jobs) => {
+                jobs.sort_by_key(|j| std::cmp::Reverse(j.created_at));
+                json::ok(serde_json::json!({
+                    "jobs": jobs.iter().map(Self::ingest_job_json).collect::<Vec<_>>()
+                }))
+            }
+            Err(e) => json::err(StatusCode::INTERNAL_SERVER_ERROR, "internal", &e.to_string()),
+        }
+    }
+
+    fn handle_ingest_job_get(&self, id: &str) -> Response<String> {
+        let engine = self.engine.read();
+        match engine.meta_arc().get_ingest_job(id) {
+            Ok(Some(job)) => json::ok(Self::ingest_job_json(&job)),
+            Ok(None) => json::err(StatusCode::NOT_FOUND, "not_found", &format!("ingest job {id}")),
+            Err(e) => json::err(StatusCode::INTERNAL_SERVER_ERROR, "internal", &e.to_string()),
+        }
+    }
+
+    /// 创建迁入任务(ADR-24 DR5):源 endpoint/桶/前缀/凭证 + 目标桶 +
+    /// preserve_mtime + copy_bucket_config。目标桶必须已存在;源凭证仅
+    /// 落 `ij:`(不回显);copy_bucket_config 时同步拷贝桶配置(DR3,
+    /// 失败记入任务失败列表,不阻塞对象迁入)。
+    fn handle_ingest_job_create(&self, body: &[u8]) -> Response<String> {
+        let parsed: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(_) => return json::err(StatusCode::BAD_REQUEST, "bad_request", "invalid JSON body"),
+        };
+        let get_str = |v: &serde_json::Value, k: &str| -> String {
+            v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
+        };
+        let src_v = parsed.get("source").cloned().unwrap_or_default();
+        let source = fs3_core::IngestSource {
+            endpoint: get_str(&src_v, "endpoint"),
+            region: get_str(&src_v, "region"),
+            bucket: get_str(&src_v, "bucket"),
+            prefix: get_str(&src_v, "prefix"),
+            access_key: get_str(&src_v, "access_key"),
+            secret_key: get_str(&src_v, "secret_key"),
+        };
+        if source.endpoint.is_empty() || source.bucket.is_empty() {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "source.endpoint and source.bucket are required",
+            );
+        }
+        if source.access_key.is_empty() || source.secret_key.is_empty() {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "source.access_key and source.secret_key are required",
+            );
+        }
+        let dest_bucket = get_str(&parsed, "dest_bucket");
+        if dest_bucket.is_empty() {
+            return json::err(StatusCode::BAD_REQUEST, "bad_request", "dest_bucket is required");
+        }
+        let preserve_mtime = parsed
+            .get("preserve_mtime")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let copy_bucket_config = parsed
+            .get("copy_bucket_config")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        // 前置校验(不发起网络):endpoint 形态合法;目标桶存在
+        if let Err(e) = fs3_http::s3_source::S3SourceClient::new(&source) {
+            return json::err(StatusCode::BAD_REQUEST, "bad_source", &e.to_string());
+        }
+        {
+            let engine = self.engine.read();
+            match engine.meta_arc().get_bucket(&dest_bucket) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return json::err(
+                        StatusCode::NOT_FOUND,
+                        "no_such_bucket",
+                        &format!("dest bucket {dest_bucket} does not exist"),
+                    )
+                }
+                Err(e) => {
+                    return json::err(StatusCode::INTERNAL_SERVER_ERROR, "internal", &e.to_string())
+                }
+            }
+        }
+        let now = Self::unix_now();
+        let mut rnd = [0u8; 4];
+        let _ = fs3_core::random_bytes(&mut rnd);
+        let id = format!("ing-{:x}-{:02x}{:02x}{:02x}{:02x}", now, rnd[0], rnd[1], rnd[2], rnd[3]);
+        let mut job = fs3_core::IngestJob {
+            id: id.clone(),
+            source,
+            dest_bucket: dest_bucket.clone(),
+            preserve_mtime,
+            copy_bucket_config,
+            state: fs3_core::IngestJobState::Submitted,
+            created_at: now,
+            updated_at: now,
+            listed: 0,
+            copied: 0,
+            skipped: 0,
+            failed: 0,
+            bytes: 0,
+            last_key: String::new(),
+            failures: Vec::new(),
+            consecutive_errors: 0,
+            error: None,
+        };
+        if copy_bucket_config {
+            let src = job.source.clone();
+            self.ingest_copy_bucket_config(&src, &dest_bucket, &mut job);
+        }
+        let engine = self.engine.read();
+        match engine.meta_arc().put_ingest_job(&job) {
+            Ok(_) => json::ok(Self::ingest_job_json(&job)),
+            Err(e) => json::err(StatusCode::INTERNAL_SERVER_ERROR, "internal", &e.to_string()),
+        }
+    }
+
+    /// ADR-24 DR3:桶配置拷贝(策略/BPA/生命周期/通知;密钥不拷)。
+    /// 失败的配置项记入任务失败列表(kind = "config:<what>"),不阻塞对象迁入。
+    fn ingest_copy_bucket_config(
+        &self,
+        source: &fs3_core::IngestSource,
+        dest_bucket: &str,
+        job: &mut fs3_core::IngestJob,
+    ) {
+        let now = Self::unix_now();
+        let record = |job: &mut fs3_core::IngestJob, what: &str, err: &str| {
+            job.failures.push(fs3_core::IngestFailure {
+                kind: format!("config:{what}"),
+                key: source.bucket.clone(),
+                error: err.chars().take(300).collect(),
+                at: now,
+            });
+            job.failed += 1;
+        };
+        let Ok(mut client) = fs3_http::s3_source::S3SourceClient::new(source) else {
+            record(job, "all", "source client init failed");
+            return;
+        };
+        let engine = self.engine.read();
+        let meta = engine.meta_arc();
+        // ① 桶策略(原始 JSON 逐字节拷贝)
+        match client.get_subresource("policy") {
+            Ok(Some(doc)) => {
+                if let Err(e) = meta.commit(&[fs3_meta::Op::BucketConfPut {
+                    bucket: dest_bucket.to_string(),
+                    conf: fs3_meta::BucketConf::Policy,
+                    value: doc,
+                }]) {
+                    record(job, "policy", &e.to_string());
+                }
+            }
+            Ok(None) => {}
+            Err(e) => record(job, "policy", &e.to_string()),
+        }
+        // ② Public Access Block(原始 XML;ADR-23 四开关)
+        match client.get_subresource("publicAccessBlock=") {
+            Ok(Some(doc)) => {
+                if let Err(e) = meta.commit(&[fs3_meta::Op::BucketConfPut {
+                    bucket: dest_bucket.to_string(),
+                    conf: fs3_meta::BucketConf::PublicAccessBlock,
+                    value: doc,
+                }]) {
+                    record(job, "public_access_block", &e.to_string());
+                }
+            }
+            Ok(None) => {}
+            Err(e) => record(job, "public_access_block", &e.to_string()),
+        }
+        // ③ 生命周期(解析为规则集整体替换)
+        match client.get_subresource("lifecycle=") {
+            Ok(Some(doc)) => match fs3_s3::xml::parse_lifecycle_configuration(&doc) {
+                Ok(rules) => {
+                    if let Err(e) =
+                        meta.commit(&[fs3_meta::Op::LifecycleRulesReplace {
+                            bucket: dest_bucket.to_string(),
+                            rules,
+                        }])
+                    {
+                        record(job, "lifecycle", &e.to_string());
+                    }
+                }
+                Err(e) => record(job, "lifecycle", &e.to_string()),
+            },
+            Ok(None) => {}
+            Err(e) => record(job, "lifecycle", &e.to_string()),
+        }
+        // ④ 通知配置(解析为规则集整体替换)
+        match client.get_subresource("notification=") {
+            Ok(Some(doc)) => {
+                match fs3_s3::xml::parse_notification_configuration(&doc) {
+                    Ok(rules) => {
+                        if let Err(e) =
+                            meta.commit(&[fs3_meta::Op::NotificationRulesReplace {
+                                bucket: dest_bucket.to_string(),
+                                rules,
+                            }])
+                        {
+                            record(job, "notification", &e.to_string());
+                        }
+                    }
+                    Err(e) => record(job, "notification", &e.to_string()),
+                }
+            }
+            Ok(None) => {}
+            Err(e) => record(job, "notification", &e.to_string()),
+        }
+    }
+
+    /// 状态转移(pause/resume/cancel):终态不可转移;同态幂等 409。
+    fn handle_ingest_job_state(
+        &self,
+        id: &str,
+        state: fs3_core::IngestJobState,
+    ) -> Response<String> {
+        let engine = self.engine.read();
+        let meta = engine.meta_arc();
+        match meta.get_ingest_job(id) {
+            Ok(Some(mut job)) => {
+                use fs3_core::IngestJobState::*;
+                match job.state {
+                    Completed | Failed | Cancelled => json::err(
+                        StatusCode::CONFLICT,
+                        "already_terminal",
+                        &format!("ingest job {id} is {}", job.state.as_str()),
+                    ),
+                    s if s == state => json::err(
+                        StatusCode::CONFLICT,
+                        "already_in_state",
+                        &format!("ingest job {id} is already {}", s.as_str()),
+                    ),
+                    _ => {
+                        job.state = state;
+                        job.updated_at = Self::unix_now();
+                        match meta.put_ingest_job(&job) {
+                            Ok(_) => json::ok(Self::ingest_job_json(&job)),
+                            Err(e) => json::err(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "internal",
+                                &e.to_string(),
+                            ),
+                        }
+                    }
+                }
+            }
+            Ok(None) => json::err(StatusCode::NOT_FOUND, "not_found", &format!("ingest job {id}")),
+            Err(e) => json::err(StatusCode::INTERNAL_SERVER_ERROR, "internal", &e.to_string()),
+        }
+    }
+
+    fn handle_ingest_job_delete(&self, id: &str) -> Response<String> {
+        let engine = self.engine.read();
+        match engine.meta_arc().delete_ingest_job(id) {
+            Ok(_) => json::ok(serde_json::json!({ "deleted": id })),
+            Err(e) => json::err(StatusCode::INTERNAL_SERVER_ERROR, "internal", &e.to_string()),
         }
     }
 

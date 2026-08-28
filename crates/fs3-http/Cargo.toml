@@ -33,6 +33,12 @@ fs3-s3.workspace = true
 fs3-meta.workspace = true
 serde_json.workspace = true
 rcgen.workspace = true
+# M19 迁入源客户端(ADR-24 DR4.1):SigV4 签名与 hex(hmac/sha2/hex 已在
+# workspace 依赖树;zeroize 供请求行用后即擦,非新增外部包版本)
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true
+zeroize = "1"
 fs3-engine.workspace = true
 hyper = { version = "1.5", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }

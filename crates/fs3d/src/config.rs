@@ -29,6 +29,21 @@ pub struct RootConfig {
     /// M15 I2:S3 Inventory 生成 worker(`[inventory]`)。
     #[serde(default)]
     pub inventory: InventoryConfig,
+    /// M19 M(ADR-24):迁入 worker(`[ingest]`;默认启用——有 `ij:` 任务
+    /// 即跑,无任务零动作;关 = 任务仍可 CRUD/暂停,但不推进)。
+    #[serde(default)]
+    pub ingest: IngestConfig,
+}
+
+/// M19 M:`[ingest]` 段(迁入 worker;ADR-24 DR4)。
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+pub struct IngestConfig {
+    /// 总开关(默认 true;只读引擎不启动)。
+    pub enabled: Option<bool>,
+    /// 每 tick 处理键数上限(默认 64)。
+    pub batch: Option<usize>,
+    /// 轮询周期秒(默认 1;下限 0.1)。
+    pub poll_secs: Option<f64>,
 }
 
 /// M15 I2:`[inventory]` 段(S3 Inventory 生成 worker;默认启用,

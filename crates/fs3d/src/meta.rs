@@ -563,6 +563,11 @@ pub struct MetaExportFile {
     /// (无此字段)→ 空表。
     #[serde(default)]
     pub roles: Vec<fs3_core::IamRole>,
+    /// M19 迁入任务(ADR-24 DR6):`ij:` 键前缀三处同步之二——本 DTO
+    /// **显式不导出**(任务为运维瞬态且含源凭证,secret 明文不进导出物,
+    /// 同 `e:`/`x:` 不导出口径;迁移后由管理员经向导重建任务)。
+    /// check 可达性扫描只读 `o:`/`p:` 段引用键,对 `ij:` 天然安全
+    /// (三处,keys.rs 注释登记)。(无字段承载 = 不导出的显式声明。)
     pub objects: Vec<ObjectEntryDto>,
     pub uploads: Vec<UploadDto>,
 }
