@@ -67,7 +67,9 @@
 > LDAP/OIDC → ADR-21(v2.2);IAM 多租户(用户/组/策略/服务账号)→ ADR-28(v2.4);
 > 在线扩容 → ADR-15(v1.4);
 > 纠删码/跨节点复制仍非目标;站点级容灾走 ADR-20 策略化同步(不内置 ?replication)。
-> Public Access Block → ADR-23(v2.3);S3 Select 停售排除。完整现行范围见
+> Public Access Block → ADR-23(v2.3);迁入保真 → ADR-24、Kafka 通知 → ADR-25、
+> S3 Batch → ADR-26、Condition 时间/变量 → ADR-27(v2.5);S3 Select 停售排除。
+> 完整现行范围见
 > [compat.md](./site/docs/reference/compat.md) 与 ADR-5/9/14/22/23/28。
 
 - 多节点 / 分布式部署(单机内多设备条带化除外);
@@ -1668,6 +1670,71 @@ meta-export/import DTO、check 可达性扫描。IAM 文档进 export(不含口�
 「建用户 → 挂 readonly/readwrite → 自助 SA → 该 SA 读写本租户桶、看不到
 他租户」全程;LDAP bind 登录或 mock 绿;s3-tests alt 身份用例按 DI9 收敛;
 崩溃混载下 IAM 键与 `k:` 同事务、无孤儿 SA。
+
+---
+
+#### ADR-24(M19 立项决策):迁入保真——mtime 写入通道 / 执行器 / 元数据与桶配置拷贝边界 / 任务模型与幂等
+
+> 背景:`mc mirror`/rclone 在 S3 目标上**无法**还原源 LastModified(S3 PUT 由
+> 服务器计时),对账/合规场景迁入即失真。本 ADR 钉死「保真迁入」的唯一合法
+> 通道与边界;实现于 M19/M 组(TODO M19/M0~M3)。
+
+**DR1(mtime 保留 = 管理面专用通道,拒绝伪造)**:
+
+1. 源对象 LastModified 的保留**只能**由管理面迁入任务实现:admin API 创建任务
+   → 引擎内置 worker 经**内部写通道** `ingest_put_object` 构造 `ObjectMeta` 并
+   指定 `mtime`(源 LastModified 取整到秒)。S3 端口(PUT/POST/Copy/
+   multipart)**永远**使用服务器时间(`write_mtime` / copy 强制 `now_ts()`
+   语义不变),**不开放**任何显式 mtime 请求参数——防客户端伪造。
+2. 精度钉死:AWS Last-Modified 本身秒级(IMF-fixdate);对账容差 **±1s**
+   (覆盖源端时钟粒度),`ingest_preserves_mtime_and_usermeta` 按此断言。
+3. 迁入通道不绕过任何写路径纪律:数据先落盘(ExtentWriter)、元数据
+   (`Op::ObjectPut`+`Op::Alloc`+`Op::Stats`)同事务后提交,与普通 put 一致。
+
+**DR2(对象级元数据拷贝)**:拷贝 content_type、`x-amz-meta-*` 用户元数据、
+对象标签、requested_storage_class 申报值;目标侧真实 `storage_class` 按目标桶
+规则(源 GLACIER 归档态对象正文不可读,任务前置校验并记失败,不做静默降级);
+ETag/size 由数据自然生成,不显式拷贝。SSE-C 源密钥**不拷**(本版不读 SSE-C 源,
+显式报错);目标侧加密按目标桶默认(DS3 口径)。
+
+**DR3(桶配置可选拷贝)**:`copy_bucket_config = true` 时依次拷贝桶策略、
+Public Access Block(ADR-23 四开关)、生命周期规则、通知配置(四类都显式校验
+后写入);**访问密钥不拷**(目标侧预置);版本化状态不拷(目标桶自管)。
+拷贝失败的项记入任务失败列表,不阻塞对象迁入。
+
+**DR4(执行器 = 流式 GET 源 + 引擎内部写)**:
+
+1. 源读取:进程内最小 S3 客户端(SigV4 LIST/GET/HEAD,复用既有 hmac/sha2
+   原语),流式读正文,不在内存缓冲整个对象;
+2. 调度:复用 `BackgroundWorker` 体系(`WorkerHandle::spawn` + 全局
+   `Throttle` 节流,默认 64 MiB/s 档);任务级并发 1(串行键序,保序且限速
+   即可满足迁入窗口),暂停 = 任务 `Paused` 状态(worker 跳过,可恢复);
+3. 幂等重跑:逐键先 HEAD 目标,size+ETag 均一致 → **skip**(不产生任何写事务,
+   不双计容量);不一致 → 覆盖写(账目按覆盖语义走 StatsDelta);
+4. 崩溃恢复:任务记录(状态/统计/失败列表/`last_key` 游标)落元数据;worker
+   重启后取 `Pending/Running` 任务从游标继续(至少一次,操作幂等兜底)。
+
+**DR5(任务模型与 admin API)**:admin JSON(`/v1/admin/ingest/jobs`,走既有
+admin 鉴权通道):`POST`(创建,字段 = 源 endpoint/region/bucket/prefix/凭证 +
+目标桶 + `preserve_mtime` + `copy_bucket_config`)、`GET /:id`(状态+进度+
+失败列表)、`GET`(列表)、`POST /:id/pause|resume|cancel`。状态机
+`Submitted → Running → Completed/Failed/Cancelled/Paused`;失败列表封顶
+100 条(键、错误摘要、时间)。源凭证与 `k:` 同级静态保存;**meta-export
+不导出任务**(DR6),secret 明文不进导出物(红线沿用)。
+
+**DR6(新键前缀 `ij:` 三处同步)**:`ij:{job_id}` 存任务 postcard 值;
+keys.rs 前缀表登记;meta-export/import DTO **显式声明不导出**(运维瞬态 + 含
+源凭证);check 可达性扫描注释登记(任务值不含 extent 引用,天然安全)。
+
+**DR7(明确不做)**:S3 端口任何形式的显式 mtime/时间戳参数(永久拒绝);
+以 mc/rclone 为保真迁入执行器(mtime 无法保真,与 ADR-20 DR5.2 同源结论);
+跨节点中心化迁入调度(单机任务先行,中心形态后续单评);SSE-C 源读取;
+源为非 S3 协议(FTP/POSIX 等)。
+
+**门禁口径**(TODO M19/M):`ingest_job_create_and_status`、
+`ingest_preserves_mtime_and_usermeta`(±1s)绿;重跑不双计容量、
+`check_report` leaks 空;向导页小夹具对象数对账一致;S3 PUT 伪造 mtime
+路径不存在(S3 面无参数可传)。
 
 ---
 
