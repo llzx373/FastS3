@@ -12153,6 +12153,7 @@ fn disabled_user_sas_fail_auth() {
         "default",
         "alice",
         Some("ci".into()),
+        None,
     )
     .unwrap();
     let sa = Credentials {
@@ -12217,7 +12218,7 @@ fn canned_readonly_get_ok_put_denied() {
     // ① 直挂:alice + canned readonly
     svc.put_iam_user(&mk_user("alice", vec!["readonly".into()]))
         .unwrap();
-    svc.add_key_owned("AKIA_RO", "ro-secret", None, "default", "alice", None)
+    svc.add_key_owned("AKIA_RO", "ro-secret", None, "default", "alice", None, None)
         .unwrap();
     let sa_ro = Credentials {
         access_key: "AKIA_RO".into(),
@@ -12237,7 +12238,7 @@ fn canned_readonly_get_ok_put_denied() {
         created_at: 1_700_000_000,
     })
     .unwrap();
-    svc.add_key_owned("AKIA_BOB", "bob-secret", None, "default", "bob", None)
+    svc.add_key_owned("AKIA_BOB", "bob-secret", None, "default", "bob", None, None)
         .unwrap();
     let sa_bob = Credentials {
         access_key: "AKIA_BOB".into(),
@@ -12260,8 +12261,16 @@ fn canned_readonly_get_ok_put_denied() {
     assert_eq!(status(&r), 200, "解组后回退 legacy 语义: {r:?}");
     // ③ 无挂载用户 carol:行为不变
     svc.put_iam_user(&mk_user("carol", vec![])).unwrap();
-    svc.add_key_owned("AKIA_CAROL", "carol-secret", None, "default", "carol", None)
-        .unwrap();
+    svc.add_key_owned(
+        "AKIA_CAROL",
+        "carol-secret",
+        None,
+        "default",
+        "carol",
+        None,
+        None,
+    )
+    .unwrap();
     let sa_carol = Credentials {
         access_key: "AKIA_CAROL".into(),
         secret_key: "carol-secret".into(),
@@ -12343,9 +12352,17 @@ fn bucket_policy_allows_named_user_denies_other_tenant() {
     };
     svc.put_iam_user(&mk_user("ta", "alice")).unwrap();
     svc.put_iam_user(&mk_user("tb", "bob")).unwrap();
-    svc.add_key_owned("AKIA_ALICE", "alice-secret", None, "ta", "alice", None)
-        .unwrap();
-    svc.add_key_owned("AKIA_BOB", "bob-secret", None, "tb", "bob", None)
+    svc.add_key_owned(
+        "AKIA_ALICE",
+        "alice-secret",
+        None,
+        "ta",
+        "alice",
+        None,
+        None,
+    )
+    .unwrap();
+    svc.add_key_owned("AKIA_BOB", "bob-secret", None, "tb", "bob", None, None)
         .unwrap();
     let sa_alice = Credentials {
         access_key: "AKIA_ALICE".into(),
@@ -12442,4 +12459,245 @@ fn bucket_policy_allows_named_user_denies_other_tenant() {
     );
     let r = svc.handle(&req_creds("GET", "/u3bkt/k", &sa_bob, &[], vec![]));
     assert_eq!(err_code(&r), "AccessDenied", "具名 Deny 优先: {r:?}");
+}
+
+// ───────────────────── M18 S1:服务账号嵌入策略(ADR-28 DI2.4/DI3.1)─────────────────────
+
+/// S1 测试共用:创建 enabled 用户(挂载 canned 策略集)。
+fn s1_user(tenant: &str, name: &str, policies: Vec<String>) -> fs3_core::IamUser {
+    fs3_core::IamUser {
+        tenant_id: tenant.into(),
+        name: name.into(),
+        enabled: true,
+        password_hash: None,
+        password_salt: None,
+        policies,
+        groups: vec![],
+        display_name: None,
+        created_at: 1_700_000_000,
+    }
+}
+
+/// M18 S1(TODO 钉死用例;ADR-28 DI2.4/DI3.1):用户自助 SA + 嵌入策略
+/// 求交 —— alice 挂 canned readwrite(身份层全量),SA 嵌入策略仅 Allow
+/// s3:PutObject/GetObject 于 `arn:aws:s3:::s1bkt/incoming/*`:
+/// PUT incoming/a → 200(嵌入 Allow ∩ 身份 Allow);PUT other/b → 403
+/// (嵌入 NoMatch = 作用域上限,「未显式放行 = 不放行」);GET incoming/a
+/// → 200。嵌入策略不扩权:身份层之外的路径一律拒绝。
+#[test]
+fn user_self_service_sa_put_in_allowed_prefix() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/s1bkt", vec![]))), 200);
+    svc.put_iam_user(&s1_user("default", "alice", vec!["readwrite".into()]))
+        .unwrap();
+    let embedded = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:PutObject","s3:GetObject"],"Resource":["arn:aws:s3:::s1bkt/incoming/*"]}]}"#;
+    svc.add_key_owned(
+        "AKIA_S1A",
+        "s1a-secret",
+        None,
+        "default",
+        "alice",
+        Some("uploader".into()),
+        Some(embedded.into()),
+    )
+    .unwrap();
+    let sa = Credentials {
+        access_key: "AKIA_S1A".into(),
+        secret_key: "s1a-secret".into(),
+    };
+    // 允许前缀内 PUT → 200
+    let r = svc.handle(&req_creds(
+        "PUT",
+        "/s1bkt/incoming/a",
+        &sa,
+        &[],
+        b"x".to_vec(),
+    ));
+    assert_eq!(status(&r), 200, "嵌入 Allow 前缀内 PUT 放行: {r:?}");
+    // 前缀外 PUT → 403(嵌入 NoMatch → 拒绝,即便身份层 readwrite Allow)
+    let r = svc.handle(&req_creds("PUT", "/s1bkt/other/b", &sa, &[], b"x".to_vec()));
+    assert_eq!(
+        err_code(&r),
+        "AccessDenied",
+        "嵌入策略前缀外 PUT 拒绝: {r:?}"
+    );
+    // 允许前缀内 GET → 200
+    let r = svc.handle(&req_creds("GET", "/s1bkt/incoming/a", &sa, &[], vec![]));
+    assert_eq!(status(&r), 200, "嵌入 Allow 前缀内 GET 放行: {r:?}");
+    // 前缀外 GET 同样被拒(嵌入 = 上限,不只管写)
+    let r = svc.handle(&req_creds("GET", "/s1bkt/other/b", &sa, &[], vec![]));
+    assert_eq!(err_code(&r), "AccessDenied", "前缀外 GET 拒绝: {r:?}");
+}
+
+/// M18 S1(TODO 钉死用例):嵌入 Deny 覆盖属主 readwrite —— alice 身份层
+/// readwrite(s3:* Allow),SA 嵌入 = Allow s3:GetObject + 显式 Deny
+/// s3:PutObject:PUT → 403(Deny 优先,跨层短路),GET → 200。无嵌入
+/// 策略的 SA 与 legacy 密钥行为分毫不改(读写均放行)。
+#[test]
+fn embedded_deny_overrides_user_readwrite() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/s2bkt", vec![]))), 200);
+    assert_eq!(
+        status(&svc.handle(&req("PUT", "/s2bkt/k", b"data".to_vec()))),
+        200
+    );
+    svc.put_iam_user(&s1_user("default", "alice", vec!["readwrite".into()]))
+        .unwrap();
+    let embedded = r#"{"Version":"2012-10-17","Statement":[
+        {"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::s2bkt/*"]},
+        {"Effect":"Deny","Action":["s3:PutObject"],"Resource":["*"]}
+    ]}"#;
+    svc.add_key_owned(
+        "AKIA_S2A",
+        "s2a-secret",
+        None,
+        "default",
+        "alice",
+        None,
+        Some(embedded.into()),
+    )
+    .unwrap();
+    let sa = Credentials {
+        access_key: "AKIA_S2A".into(),
+        secret_key: "s2a-secret".into(),
+    };
+    // 嵌入 Deny 覆盖身份 readwrite:PUT 403
+    let r = svc.handle(&req_creds("PUT", "/s2bkt/k2", &sa, &[], b"x".to_vec()));
+    assert_eq!(
+        err_code(&r),
+        "AccessDenied",
+        "嵌入 Deny 覆盖 readwrite: {r:?}"
+    );
+    // 嵌入 Allow 内 GET 200
+    let r = svc.handle(&req_creds("GET", "/s2bkt/k", &sa, &[], vec![]));
+    assert_eq!(status(&r), 200, "嵌入 Allow GET 放行: {r:?}");
+    // 无嵌入策略的 SA(同一属主):行为 = 身份层 readwrite 全量
+    svc.add_key_owned(
+        "AKIA_S2B",
+        "s2b-secret",
+        None,
+        "default",
+        "alice",
+        None,
+        None,
+    )
+    .unwrap();
+    let sa_plain = Credentials {
+        access_key: "AKIA_S2B".into(),
+        secret_key: "s2b-secret".into(),
+    };
+    let r = svc.handle(&req_creds(
+        "PUT",
+        "/s2bkt/k3",
+        &sa_plain,
+        &[],
+        b"x".to_vec(),
+    ));
+    assert_eq!(status(&r), 200, "无嵌入 SA 不受约束: {r:?}");
+    // legacy 密钥(构造注入,无嵌入)行为不变
+    assert_eq!(
+        status(&svc.handle(&req("PUT", "/s2bkt/k4", b"x".to_vec()))),
+        200,
+        "legacy 密钥不变"
+    );
+    assert_eq!(status(&svc.handle(&req("GET", "/s2bkt/k", vec![]))), 200);
+}
+
+/// M18 S1:嵌入策略随 `k:` 记录持久化,重启(restore_keys_from_meta)
+/// 后求交层立即生效 —— 前缀内 PUT/GET 200,前缀外 PUT 403。
+#[test]
+fn embedded_policy_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("disk.img");
+    std::fs::File::create(&img)
+        .unwrap()
+        .set_len(128 * 1024 * 1024)
+        .unwrap();
+    fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
+    let cfg = fs3_engine::EngineConfig {
+        devices: vec![img],
+        meta_dir: dir.path().join("meta"),
+        ..Default::default()
+    };
+    let embedded = r#"{"Statement":[{"Effect":"Allow","Action":["s3:PutObject","s3:GetObject"],"Resource":["arn:aws:s3:::s3bkt/incoming/*"]}]}"#;
+    // 第一阶段:建桶 + 用户 + 带嵌入策略的 SA,写入一个对象
+    {
+        let engine = Arc::new(parking_lot::RwLock::new(Engine::open(&cfg).unwrap()));
+        let svc = S3Service::new(
+            engine.clone(),
+            vec![Credentials {
+                access_key: "test".into(),
+                secret_key: "secret123".into(),
+            }],
+            "us-east-1".into(),
+            false,
+        );
+        svc.add_key("test", "secret123", None).unwrap();
+        assert_eq!(status(&svc.handle(&req("PUT", "/s3bkt", vec![]))), 200);
+        svc.put_iam_user(&s1_user("default", "alice", vec!["readwrite".into()]))
+            .unwrap();
+        svc.add_key_owned(
+            "AKIA_S3A",
+            "s3a-secret",
+            None,
+            "default",
+            "alice",
+            Some("persisted".into()),
+            Some(embedded.into()),
+        )
+        .unwrap();
+        let sa = Credentials {
+            access_key: "AKIA_S3A".into(),
+            secret_key: "s3a-secret".into(),
+        };
+        let r = svc.handle(&req_creds(
+            "PUT",
+            "/s3bkt/incoming/a",
+            &sa,
+            &[],
+            b"x".to_vec(),
+        ));
+        assert_eq!(status(&r), 200, "重启前 PUT: {r:?}");
+        drop(svc);
+        Arc::try_unwrap(engine)
+            .map_err(|_| "engine arc still shared")
+            .unwrap()
+            .into_inner()
+            .close()
+            .unwrap();
+    }
+    // 第二阶段:重开 + restore,嵌入策略求交继续生效
+    let engine = Arc::new(parking_lot::RwLock::new(Engine::open(&cfg).unwrap()));
+    let svc = S3Service::new(engine, vec![], "us-east-1".into(), false);
+    assert_eq!(svc.restore_keys_from_meta().unwrap(), 2);
+    let sa = Credentials {
+        access_key: "AKIA_S3A".into(),
+        secret_key: "s3a-secret".into(),
+    };
+    let r = svc.handle(&req_creds("GET", "/s3bkt/incoming/a", &sa, &[], vec![]));
+    assert_eq!(status(&r), 200, "重启后 GET: {r:?}");
+    let r = svc.handle(&req_creds(
+        "PUT",
+        "/s3bkt/incoming/b",
+        &sa,
+        &[],
+        b"y".to_vec(),
+    ));
+    assert_eq!(status(&r), 200, "重启后前缀内 PUT: {r:?}");
+    let r = svc.handle(&req_creds("PUT", "/s3bkt/other/c", &sa, &[], b"y".to_vec()));
+    assert_eq!(
+        err_code(&r),
+        "AccessDenied",
+        "重启后前缀外 PUT 仍拒绝: {r:?}"
+    );
+    // 嵌入策略文本仍在 meta 记录中(单写当前格式)
+    let rec = svc
+        .engine()
+        .read()
+        .meta()
+        .get_key("AKIA_S3A")
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec.embedded_policy.as_deref(), Some(embedded));
+    assert_eq!(rec.sa_name.as_deref(), Some("persisted"));
 }

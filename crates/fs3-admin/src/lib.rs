@@ -34,6 +34,10 @@
 //! - `GET  /v1/iam/policies/{tenant}/{name}`    策略详情(canned 可读)
 //! - `PATCH /v1/iam/policies/{tenant}/{name}`   替换自定义策略文档(canned → 400)
 //! - `DELETE /v1/iam/policies/{tenant}/{name}`  删除自定义策略(仍被挂载 → 409;canned → 400)
+//! - `GET  /v1/iam/service-accounts?tenant=&owner=`  SA 列表(M18 S1;元数据,绝不含 secret 材料)
+//! - `POST /v1/iam/service-accounts`            创建 SA(owner_user 必填;access key 服务端生成;secret 仅一次回显)
+//! - `GET  /v1/iam/service-accounts/{access}`   SA 详情(元数据)
+//! - `DELETE /v1/iam/service-accounts/{access}` 吊销 SA
 //! - `GET  /v1/admin/uploads`                   在途 multipart 会话
 //! - `POST /v1/admin/uploads/{id}/abort`        强制中止会话
 //! - `GET  /v1/admin/audit?limit=`              审计日志
@@ -86,6 +90,17 @@ impl Default for AdminConfig {
 /// 配置热重载回调(H3):fs3d 注入,重读配置文件并应用可重载子集。
 /// 返回人类可读的变更摘要。
 pub type ReloadFn = dyn Fn() -> Result<String, String> + Send + Sync;
+
+/// 生成 n 字符随机字母数字串(M3 密钥 secret / M18 S1 SA access key
+/// 生成共用模式)。
+fn random_alnum(n: usize) -> String {
+    let mut buf = vec![0u8; n];
+    let _ = fs3_core::random_bytes(&mut buf);
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    buf.iter()
+        .map(|b| CHARS[(*b as usize) % CHARS.len()] as char)
+        .collect()
+}
 
 /// 配置读取供应器(M6 / J5 设置页):返回当前配置 JSON 视图。
 pub type ConfigGetFn = dyn Fn() -> Result<serde_json::Value, String> + Send + Sync;
@@ -554,6 +569,11 @@ impl AdminServer {
             ("GET", ["policies", tenant, name]) => self.handle_policy_get(tenant, name),
             ("PATCH", ["policies", tenant, name]) => self.handle_policy_patch(tenant, name, body),
             ("DELETE", ["policies", tenant, name]) => self.handle_policy_delete(tenant, name),
+            // M18 S1(ADR-28 DI2.4/DI8):服务账号(SA = 带属主的 k: 密钥)
+            ("GET", ["service-accounts"]) => self.handle_sa_list(query),
+            ("POST", ["service-accounts"]) => self.handle_sa_create(body),
+            ("GET", ["service-accounts", access]) => self.handle_sa_get(access),
+            ("DELETE", ["service-accounts", access]) => self.handle_sa_delete(access),
             _ => json::err(StatusCode::NOT_FOUND, "not_found", "unknown iam endpoint"),
         }
     }
@@ -2609,6 +2629,258 @@ impl AdminServer {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",
                 &e.to_string(),
+            ),
+        }
+    }
+
+    // ───────────────────── M18 S1:IAM 服务账号(ADR-28 DI2.4/DI8)─────────────────────
+
+    /// SA JSON 视图(元数据;绝不含 secret_hash/salt/secret_cipher,
+    /// 同 handle_keys_list 口径,另加 sa_name/属主/嵌入策略字段)。
+    fn sa_json(k: &fs3_core::KeyRecord) -> serde_json::Value {
+        serde_json::json!({
+            "access_key": k.access_key,
+            "tenant_id": k.tenant_id,
+            "owner_user": k.owner_user,
+            "sa_name": k.sa_name,
+            "enabled": k.enabled,
+            "created": k.created,
+            "policy": k.policy,
+            "embedded_policy": k.embedded_policy,
+            "note": k.note,
+        })
+    }
+
+    /// GET /v1/iam/service-accounts?tenant=&owner=:SA 列表,按
+    /// tenant/owner 过滤(缺省 = 全部密钥;legacy 密钥 owner =
+    /// bootstrap,DI7.1)。只回元数据。
+    fn handle_sa_list(&self, query: &[(String, String)]) -> Response<String> {
+        let tenant = query
+            .iter()
+            .find(|(k, _)| k == "tenant")
+            .map(|(_, v)| v.as_str());
+        let owner = query
+            .iter()
+            .find(|(k, _)| k == "owner")
+            .map(|(_, v)| v.as_str());
+        let engine = self.engine.read();
+        match engine.meta().list_keys() {
+            Ok(keys) => json::ok(serde_json::json!({
+                "service_accounts": keys.iter()
+                    .filter(|k| tenant.is_none_or(|t| k.tenant_id == t))
+                    .filter(|k| owner.is_none_or(|o| k.owner_user == o))
+                    .map(Self::sa_json)
+                    .collect::<Vec<_>>(),
+            })),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    /// POST /v1/iam/service-accounts:创建 SA(属主必填,DI2.4)。body:
+    /// `owner_user`(必填,属主用户;须存在且 enabled)、`tenant`(可选,
+    /// 缺省 default;租户须已存在)、`name`(可选,展示名 sa_name)、
+    /// `embedded_policy`(可选,策略 JSON 文本;数据面与属主生效策略
+    /// 求交、Deny 优先;非法 → 400 MalformedPolicy)、`policy`(可选,
+    /// J4 密钥策略层,同校验)。access key 服务端生成("SA"+18 随机
+    /// 字母数字),secret 明文**仅此一次**回显(G1-3)。
+    fn handle_sa_create(&self, body: &[u8]) -> Response<String> {
+        let parsed: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(_) => {
+                return json::err(StatusCode::BAD_REQUEST, "bad_request", "invalid JSON body")
+            }
+        };
+        let owner = parsed
+            .get("owner_user")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if owner.is_empty() {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "missing required field: owner_user",
+            );
+        }
+        let tenant = parsed
+            .get("tenant")
+            .and_then(|v| v.as_str())
+            .unwrap_or(fs3_core::Tenant::DEFAULT_TENANT);
+        for n in [owner, tenant] {
+            if let Err(e) = fs3_meta::keys::validate_iam_name(n) {
+                return json::err(StatusCode::BAD_REQUEST, "invalid_name", &e.to_string());
+            }
+        }
+        let sa_name = match parsed.get("name") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(s)) => {
+                if let Err(e) = fs3_meta::keys::validate_iam_name(s) {
+                    return json::err(StatusCode::BAD_REQUEST, "invalid_name", &e.to_string());
+                }
+                Some(s.clone())
+            }
+            Some(other) => {
+                return json::err(
+                    StatusCode::BAD_REQUEST,
+                    "bad_request",
+                    &format!("name must be a string or null, got {other}"),
+                )
+            }
+        };
+        // 嵌入策略/密钥策略文本:可选 string;写入前经数据面同一解析器校验
+        let policy_text = |field: &str| -> Result<Option<String>, Box<Response<String>>> {
+            match parsed.get(field) {
+                None | Some(serde_json::Value::Null) => Ok(None),
+                Some(serde_json::Value::String(s)) => {
+                    if let Err(e) = fs3_s3::policy::Policy::parse(s) {
+                        return Err(Box::new(json::err(
+                            StatusCode::BAD_REQUEST,
+                            "MalformedPolicy",
+                            &format!("invalid {field}: {e}"),
+                        )));
+                    }
+                    Ok(Some(s.clone()))
+                }
+                Some(other) => Err(Box::new(json::err(
+                    StatusCode::BAD_REQUEST,
+                    "bad_request",
+                    &format!("{field} must be a JSON string or null, got {other}"),
+                ))),
+            }
+        };
+        let embedded_policy = match policy_text("embedded_policy") {
+            Ok(p) => p,
+            Err(r) => return *r,
+        };
+        let key_policy = match policy_text("policy") {
+            Ok(p) => p,
+            Err(r) => return *r,
+        };
+        let engine = self.engine.read();
+        match engine.meta().get_tenant(tenant) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return json::err(
+                    StatusCode::NOT_FOUND,
+                    "no_such_tenant",
+                    &format!("tenant {tenant}"),
+                )
+            }
+            Err(e) => {
+                return json::err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    &e.to_string(),
+                )
+            }
+        }
+        match engine.meta().get_iam_user(tenant, owner) {
+            Ok(Some(u)) if u.enabled => {}
+            Ok(Some(_)) => {
+                return json::err(
+                    StatusCode::CONFLICT,
+                    "user_disabled",
+                    &format!("owner user {tenant}/{owner} is disabled"),
+                )
+            }
+            Ok(None) => {
+                return json::err(
+                    StatusCode::NOT_FOUND,
+                    "no_such_user",
+                    &format!("user {tenant}/{owner}"),
+                )
+            }
+            Err(e) => {
+                return json::err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    &e.to_string(),
+                )
+            }
+        }
+        // access key 服务端生成(同 handle_key_create secret 的随机模式);
+        // 撞名重试(概率忽略,防御性上限)
+        let access = {
+            let mut candidate = String::new();
+            for _ in 0..8 {
+                candidate = format!("SA{}", random_alnum(18));
+                match engine.meta().get_key(&candidate) {
+                    Ok(None) => break,
+                    Ok(Some(_)) => continue,
+                    Err(e) => {
+                        return json::err(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "internal",
+                            &e.to_string(),
+                        )
+                    }
+                }
+            }
+            candidate
+        };
+        drop(engine);
+        let secret = random_alnum(30);
+        let rec = match self.service.add_key_owned(
+            &access,
+            &secret,
+            None,
+            tenant,
+            owner,
+            sa_name,
+            embedded_policy,
+        ) {
+            Ok(r) => r,
+            Err(e) => return json::err(StatusCode::CONFLICT, "key_error", &e.describe()),
+        };
+        if let Some(pol) = key_policy {
+            if let Err(e) = self.service.set_key_policy(&access, Some(pol)) {
+                return json::err(StatusCode::BAD_REQUEST, "MalformedPolicy", &e.describe());
+            }
+        }
+        json::ok(serde_json::json!({
+            "access_key": rec.access_key,
+            // 仅此一次下发明文(G1-3)
+            "secret_key": secret,
+            "tenant_id": rec.tenant_id,
+            "owner_user": rec.owner_user,
+            "sa_name": rec.sa_name,
+            "enabled": rec.enabled,
+            "created": rec.created,
+            "embedded_policy": rec.embedded_policy,
+        }))
+    }
+
+    /// GET /v1/iam/service-accounts/{access_key}:单个 SA 元数据(不存在
+    /// → 404;绝不含 secret 材料)。
+    fn handle_sa_get(&self, access: &str) -> Response<String> {
+        let engine = self.engine.read();
+        match engine.meta().get_key(access) {
+            Ok(Some(k)) => json::ok(Self::sa_json(&k)),
+            Ok(None) => json::err(
+                StatusCode::NOT_FOUND,
+                "no_such_key",
+                &format!("service account {access}"),
+            ),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    /// DELETE /v1/iam/service-accounts/{access_key}:吊销 SA(meta + 认证
+    /// 表 + 内存索引同步移除;不存在 → 404)。
+    fn handle_sa_delete(&self, access: &str) -> Response<String> {
+        match self.service.remove_key(access) {
+            Ok(()) => json::ok(serde_json::json!({"deleted": access})),
+            Err(e) => json::err(
+                StatusCode::NOT_FOUND,
+                "no_such_key",
+                &format!("key {access}: {}", e.describe()),
             ),
         }
     }

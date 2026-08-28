@@ -592,6 +592,7 @@ fn admin_iam_users_crud() {
             "default",
             "alice",
             Some("ci".into()),
+            None,
         )
         .unwrap();
     let (code, _) = http_unix(sock, "DELETE", "/v1/iam/users/default/alice", None, "t");
@@ -905,6 +906,201 @@ fn admin_iam_policies_crud() {
         "t",
     );
     assert_eq!(code, 200);
+
+    let _ = handle;
+}
+
+/// M18 S1(ADR-28 DI2.4/DI8):/v1/iam/service-accounts —— 创建(属主必填,
+/// 租户+属主用户校验,secret 仅一次回显,access key 服务端生成)、列表
+/// (?tenant=&owner= 过滤,零秘密材料)、详情、吊销;嵌入策略非法 →
+/// 400 MalformedPolicy;禁用属主 → 409。
+#[test]
+fn admin_iam_service_accounts_crud() {
+    let (_d, img) = setup();
+    let cfg = EngineConfig {
+        devices: vec![img.clone()],
+        meta_dir: img.parent().unwrap().join("meta"),
+        ..Default::default()
+    };
+    let (sock, handle) = start_admin(&cfg, "t");
+    let sock = sock.trim_start_matches("unix://");
+
+    // 前置:租户 acme + 用户 alice(default)/bob(acme)
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/tenants",
+        Some(r#"{"tenant_id":"acme"}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "create tenant failed: {body}");
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/users",
+        Some(r#"{"tenant":"default","name":"alice"}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "create alice failed: {body}");
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/users",
+        Some(r#"{"tenant":"acme","name":"bob"}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "create bob failed: {body}");
+
+    // 缺 owner_user → 400;租户不存在 → 404;属主不存在 → 404
+    let (code, _) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/service-accounts",
+        Some(r#"{"tenant":"default"}"#),
+        "t",
+    );
+    assert_eq!(code, 400);
+    let (code, _) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/service-accounts",
+        Some(r#"{"tenant":"nope","owner_user":"alice"}"#),
+        "t",
+    );
+    assert_eq!(code, 404);
+    let (code, _) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/service-accounts",
+        Some(r#"{"tenant":"default","owner_user":"nope"}"#),
+        "t",
+    );
+    assert_eq!(code, 404);
+
+    // 嵌入策略非法 → 400 MalformedPolicy(数据面同一解析器)
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/service-accounts",
+        Some(
+            r#"{"owner_user":"alice","embedded_policy":"{\"Statement\":[{\"Effect\":\"Allow\",\"NotAction\":[\"s3:GetObject\"],\"Resource\":[\"*\"]}]}"}"#,
+        ),
+        "t",
+    );
+    assert_eq!(code, 400, "malformed embedded policy: {body}");
+    assert!(body.contains("MalformedPolicy"), "{body}");
+
+    // 创建 SA:secret 仅本响应一次;access key 服务端生成(SA 前缀)
+    let embedded = r#"{"Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::bkt/*"]}]}"#;
+    let create = format!(
+        r#"{{"owner_user":"alice","name":"ci-bot","embedded_policy":{}}}"#,
+        serde_json::to_string(embedded).unwrap()
+    );
+    let (code, body) = http_unix(sock, "POST", "/v1/iam/service-accounts", Some(&create), "t");
+    assert_eq!(code, 200, "create SA failed: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let ak = v["access_key"].as_str().unwrap().to_string();
+    assert!(ak.starts_with("SA"), "access key 服务端生成: {ak}");
+    let secret = v["secret_key"].as_str().unwrap().to_string();
+    assert!(!secret.is_empty());
+    assert_eq!(v["tenant_id"], "default");
+    assert_eq!(v["owner_user"], "alice");
+    assert_eq!(v["sa_name"], "ci-bot");
+    assert_eq!(v["embedded_policy"].as_str().unwrap(), embedded);
+
+    // 详情:元数据,零秘密材料
+    let (code, body) = http_unix(
+        sock,
+        "GET",
+        &format!("/v1/iam/service-accounts/{ak}"),
+        None,
+        "t",
+    );
+    assert_eq!(code, 200, "get SA failed: {body}");
+    assert!(!body.contains(&secret), "detail must not leak secret");
+    assert!(!body.contains("secret_hash"), "{body}");
+    assert!(!body.contains("secret_cipher"), "{body}");
+    let (code, _) = http_unix(sock, "GET", "/v1/iam/service-accounts/nope", None, "t");
+    assert_eq!(code, 404);
+
+    // 列表按 owner 过滤:alice 只见自己的 SA;再建 bob 的 SA 互不见
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/service-accounts",
+        Some(r#"{"tenant":"acme","owner_user":"bob"}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "create bob SA failed: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let bob_ak = v["access_key"].as_str().unwrap().to_string();
+    let (code, body) = http_unix(
+        sock,
+        "GET",
+        "/v1/iam/service-accounts?tenant=default&owner=alice",
+        None,
+        "t",
+    );
+    assert_eq!(code, 200);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let sas = v["service_accounts"].as_array().unwrap();
+    assert_eq!(sas.len(), 1, "{body}");
+    assert_eq!(sas[0]["access_key"], ak);
+    assert_eq!(sas[0]["sa_name"], "ci-bot");
+    assert!(!body.contains(&secret), "list must not leak secret");
+    let (_, body) = http_unix(
+        sock,
+        "GET",
+        "/v1/iam/service-accounts?tenant=acme&owner=bob",
+        None,
+        "t",
+    );
+    assert!(body.contains(&bob_ak));
+    assert!(!body.contains(&ak));
+
+    // 禁用属主 → 创建 409
+    let (code, _) = http_unix(
+        sock,
+        "PATCH",
+        "/v1/iam/users/default/alice",
+        Some(r#"{"enabled":false}"#),
+        "t",
+    );
+    assert_eq!(code, 200);
+    let (code, _) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/service-accounts",
+        Some(r#"{"owner_user":"alice"}"#),
+        "t",
+    );
+    assert_eq!(code, 409, "disabled owner must reject: ");
+
+    // 吊销:200;再删 → 404
+    let (code, _) = http_unix(
+        sock,
+        "DELETE",
+        &format!("/v1/iam/service-accounts/{ak}"),
+        None,
+        "t",
+    );
+    assert_eq!(code, 200);
+    let (code, _) = http_unix(
+        sock,
+        "DELETE",
+        &format!("/v1/iam/service-accounts/{ak}"),
+        None,
+        "t",
+    );
+    assert_eq!(code, 404);
+    let (_, body) = http_unix(
+        sock,
+        "GET",
+        "/v1/iam/service-accounts?tenant=default&owner=alice",
+        None,
+        "t",
+    );
+    assert!(!body.contains(&ak), "revoked SA 不再列出: {body}");
 
     let _ = handle;
 }

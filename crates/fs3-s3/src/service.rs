@@ -154,6 +154,13 @@ pub struct S3Service {
     /// 密钥策略缓存(J4:access → Policy;None = 无策略 = 放行)。
     /// 与 meta 中 KeyRecord.policy 保持同步(启动恢复/写入时更新)。
     policies: std::sync::Mutex<std::collections::HashMap<String, Option<crate::policy::Policy>>>,
+    /// SA 嵌入策略缓存(M18 S1;ADR-28 DI2.4:access → 解析后 Policy;
+    /// None = 该密钥无嵌入策略 = 本层 no-op)。与 meta 中
+    /// KeyRecord.embedded_policy 同步:add_key_owned/restore 写入,
+    /// remove_key 清除;写入前均已 Policy::parse 校验(解析失败仅
+    /// 可能源于外部篡改,按 None 处理并告警,同 `policies` 缓存口径)。
+    embedded_policies:
+        std::sync::Mutex<std::collections::HashMap<String, Option<crate::policy::Policy>>>,
     /// 桶策略缓存(M10 S3:bucket → Option<Policy>;None = 已确认无策略)。
     /// 读穿透自 meta `bp:` 键(D9);PutBucketPolicy/DeleteBucketPolicy 写时
     /// 失效,CreateBucket/DeleteBucket 同步失效(防删桶重建后陈旧策略复活)。
@@ -271,6 +278,7 @@ impl S3Service {
             limiter: Arc::new(crate::ratelimit::KeyLimiter::new()),
             cache: None,
             policies: std::sync::Mutex::new(std::collections::HashMap::new()),
+            embedded_policies: std::sync::Mutex::new(std::collections::HashMap::new()),
             bucket_policies: std::sync::Mutex::new(std::collections::HashMap::new()),
             iam_users: std::sync::Mutex::new(std::collections::HashMap::new()),
             iam_groups: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -493,11 +501,16 @@ impl S3Service {
             fs3_core::Tenant::DEFAULT_TENANT,
             fs3_core::IamUser::BOOTSTRAP_USER,
             None,
+            None,
         )
     }
 
     /// 带 IAM 属主的密钥创建(M18 I2;ADR-28 DI2.4/DI7.1;S1 服务账号
-    /// 创建路径用):tenant_id / owner_user / sa_name 落 KeyRecord。
+    /// 创建路径用):tenant_id / owner_user / sa_name / embedded_policy
+    /// 落 KeyRecord;embedded_policy 解析进嵌入策略缓存(S1 数据面
+    /// 求交层;调用方须先 Policy::parse 校验,解析失败按无嵌入处理
+    /// 并告警,同 `policies` 缓存口径)。
+    #[allow(clippy::too_many_arguments)]
     pub fn add_key_owned(
         &self,
         access_key: &str,
@@ -506,6 +519,7 @@ impl S3Service {
         tenant_id: &str,
         owner_user: &str,
         sa_name: Option<String>,
+        embedded_policy: Option<String>,
     ) -> Result<fs3_core::KeyRecord, S3Error> {
         let seed = self
             .engine
@@ -513,9 +527,10 @@ impl S3Service {
             .meta()
             .seed_salt()
             .map_err(|e| map_engine_error(e, "", ""))?;
-        let rec = fs3_core::KeyRecord::new(access_key, secret, &seed, note)
+        let mut rec = fs3_core::KeyRecord::new(access_key, secret, &seed, note)
             .map_err(|e| map_engine_error(e, "", ""))?
             .with_iam_owner(tenant_id, owner_user, sa_name);
+        rec.embedded_policy = embedded_policy;
         self.engine
             .read()
             .meta()
@@ -535,6 +550,19 @@ impl S3Service {
             access_key.to_string(),
             (tenant_id.to_string(), owner_user.to_string()),
         );
+        // M18 S1:嵌入策略缓存(求交层;None = 无嵌入 = no-op)
+        self.embedded_policies.lock().unwrap().insert(
+            access_key.to_string(),
+            rec.embedded_policy
+                .as_deref()
+                .and_then(|t| match crate::policy::Policy::parse(t) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        tracing::warn!("key {access_key}: embedded policy parse failed: {e}");
+                        None
+                    }
+                }),
+        );
         Ok(rec)
     }
 
@@ -550,6 +578,7 @@ impl S3Service {
             .write()
             .retain(|k| k.access_key != access_key);
         self.key_owners.lock().unwrap().remove(access_key);
+        self.embedded_policies.lock().unwrap().remove(access_key);
         Ok(())
     }
 
@@ -789,6 +818,12 @@ impl S3Service {
     /// AWS session policy 语义一致)。会话策略不参与匿名路径(匿名无
     /// 会话)。
     ///
+    /// M18 S1(ADR-28 DI2.4):已认证请求多一层 **SA 嵌入策略求交**
+    /// (KeyRecord.embedded_policy,解析缓存):语义同会话策略层 ——
+    /// 显式 Deny → 拒绝,非显式 Allow → 拒绝(嵌入 = 作用域上限,
+    /// 与属主生效策略求交、Deny 优先);无嵌入策略 → no-op(legacy
+    /// 密钥行为分毫不改)。会话请求以基密钥身份命中本层。
+    ///
     /// M18 U2(ADR-28 DI3.1 首片):已认证请求再多一层 **IAM 身份层** ——
     /// 密钥属主用户的「直挂 policies ∪ 所属组 policies」(canned 或租户内
     /// 自定义)求值:显式 Deny → 拒绝(跨层优先);有挂载且至少一个
@@ -843,6 +878,17 @@ impl S3Service {
         };
         if key_decision == Decision::Deny {
             return Err(denied());
+        }
+        // M18 S1(ADR-28 DI2.4/DI3.1):SA 嵌入策略求交 —— 嵌入策略 =
+        // 作用域上限(与会话策略同语义):显式 Deny → 拒绝;非显式
+        // Allow → 拒绝;无嵌入策略(缓存 None/缺席)→ 本层 no-op。
+        // 会话请求 who = 基密钥,基密钥的嵌入策略同样生效。
+        if let Some(ak) = access {
+            if let Some(Some(p)) = self.embedded_policies.lock().unwrap().get(ak) {
+                if p.decide(action, &resource, true, &ctx) != Decision::Allow {
+                    return Err(denied());
+                }
+            }
         }
         // M15 T2:会话策略求交(显式 Deny → 拒绝;非显式 Allow → 拒绝;
         // 会话 = 作用域下限)
@@ -1053,6 +1099,22 @@ impl S3Service {
             self.key_owners.lock().unwrap().insert(
                 rec.access_key.clone(),
                 (rec.tenant_id.clone(), rec.owner_user.clone()),
+            );
+            // M18 S1:嵌入策略缓存(无论启用与否;重启后求交层立即生效)
+            self.embedded_policies.lock().unwrap().insert(
+                rec.access_key.clone(),
+                rec.embedded_policy.as_deref().and_then(|t| {
+                    match crate::policy::Policy::parse(t) {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            tracing::warn!(
+                                "key {}: embedded policy parse failed, skipped: {e}",
+                                rec.access_key
+                            );
+                            None
+                        }
+                    }
+                }),
             );
             if !rec.enabled {
                 continue;

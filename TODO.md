@@ -233,7 +233,7 @@
 
 ### S. 服务账号与数据面(≈1.5 pw)
 
-- [ ] S1 Service Account = `k:` 属主必填;用户自助创建/列出/吊销**自己的** SA(无需 root);
+- [x] S1 Service Account = `k:` 属主必填;用户自助创建/列出/吊销**自己的** SA(无需 root);
   tenantAdmin 可代管本租户;嵌入策略求交
   - 用例:`user_self_service_sa_put_in_allowed_prefix`;嵌入 Deny 覆盖用户 readwrite
 - [ ] S2 数据面热路径:SigV4 → KeyRecord → 加载 User/Group 算生效策略(内存表,IAM 变更立即生效)
