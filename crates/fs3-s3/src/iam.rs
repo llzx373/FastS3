@@ -23,10 +23,23 @@
 //!   `admin:DeletePolicy` `admin:AttachPolicy`(挂载/解挂 = 用户/组
 //!   PATCH 的细分动作)
 //! - 服务账号:`admin:CreateServiceAccount` `admin:ListServiceAccounts`
-//!   `admin:DeleteServiceAccount`
+//!   `admin:DeleteServiceAccount` `admin:UpdateServiceAccount`(启用/
+//!   禁用/策略文档;C1 起 legacy 密钥 PATCH/PUT policy 也映射到此)
 //! - 角色:`admin:CreateRole` `admin:ListRoles` `admin:GetRole`
-//!   `admin:DeleteRole`
+//!   `admin:DeleteRole`(角色文档替换走 CreateRole 语义,C1 钉死)
 //! - 审计:`admin:GetAudit`
+//! - 租户(M18 C1;**仅 consoleAdmin**,求值处强制,见
+//!   [`TENANT_ACTIONS`]):`admin:CreateTenant` `admin:ListTenants`
+//!   `admin:GetTenant` `admin:UpdateTenant` `admin:DeleteTenant`
+//! - 桶管理面(M18 C1;控制台桶生命周期/配置写):`admin:CreateBucket`
+//!   `admin:UpdateBucket` `admin:DeleteBucket`(tenantAdmin 含此三动作,
+//!   租户边界由求值处 target_tenant 强制)
+//! - 集群写(M18 C1;仅 consoleAdmin,不进 tenantAdmin 文档):
+//!   `admin:ClusterWrite`(运行时配置 PATCH/reload、repair、SSE 轮换、
+//!   加盘、会话签发/撤销)
+//! - 控制台可观测读(M18 C1;diagnostics 经 `admin:Get*`/`admin:List*`
+//!   通配覆盖):`admin:GetDashboard`(dashboard/指标历史/在途上传/
+//!   SSE 状态/运行时配置读/身份集成状态)、`admin:ListSessions`
 //!
 //! ## canned 语义对照(MinIO → FastS3)
 //!
@@ -63,6 +76,18 @@ pub const CANNED_NAMES: &[&str] = &[
     CANNED_DIAGNOSTICS,
     CANNED_CONSOLE_ADMIN,
     CANNED_TENANT_ADMIN,
+];
+
+/// M18 C1(ADR-28 DI3.3/DI8.2):租户生命周期动作(**仅 consoleAdmin**;
+/// 小写,求值处对规范化后的动作精确匹配)。即使自定义策略显式授予
+/// 这些动作,非 consoleAdmin 也一律拒绝——租户管理 = 控制台「root」
+/// 语义,不随策略下放。
+pub const TENANT_ACTIONS: &[&str] = &[
+    "admin:createtenant",
+    "admin:listtenants",
+    "admin:gettenant",
+    "admin:updatetenant",
+    "admin:deletetenant",
 ];
 
 const DOC_READONLY: &str = r#"{
@@ -121,9 +146,10 @@ const DOC_TENANT_ADMIN: &str = r#"{
        "admin:CreatePolicy", "admin:ListPolicies", "admin:GetPolicy",
        "admin:DeletePolicy", "admin:AttachPolicy",
        "admin:CreateServiceAccount", "admin:ListServiceAccounts",
-       "admin:DeleteServiceAccount",
+       "admin:DeleteServiceAccount", "admin:UpdateServiceAccount",
        "admin:CreateRole", "admin:ListRoles", "admin:GetRole",
        "admin:DeleteRole",
+       "admin:CreateBucket", "admin:UpdateBucket", "admin:DeleteBucket",
        "s3:*"
      ],
      "Resource": ["*"]}

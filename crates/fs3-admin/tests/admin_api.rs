@@ -2265,3 +2265,213 @@ fn audit_export_jsonl_time_range() {
 
     let _ = handle;
 }
+
+/// M18 C1(ADR-28 DI3.3;TODO 必考):POST /v1/iam/authorize —— 管理面授权
+/// 求值。钉死:tenantAdmin 本租户写放行/跨租户拒绝/租户动作拒绝;
+/// consoleAdmin 集群范围;diagnostics 只读;未知/禁用用户拒绝;自定义
+/// 策略经同一求值;挂载脏名 fail-closed;字段缺失 400。
+#[test]
+fn admin_iam_authorize() {
+    let (_d, img) = setup();
+    let cfg = EngineConfig {
+        devices: vec![img.clone()],
+        meta_dir: img.parent().unwrap().join("meta"),
+        ..Default::default()
+    };
+    let engine = Arc::new(RwLock::new(Engine::open(&cfg).unwrap()));
+    let service = Arc::new(S3Service::new(
+        engine.clone(),
+        vec![Credentials {
+            access_key: "ak".into(),
+            secret_key: "sk".into(),
+        }],
+        "us-east-1".into(),
+        false,
+    ));
+    let (sock, handle) = start_admin_with(&cfg, engine, service.clone(), "t", None);
+    let sock = sock.trim_start_matches("unix://").to_string();
+    let sock = sock.as_str();
+
+    let allow = |tenant: &str, user: &str, action: &str, target: Option<&str>| -> bool {
+        let body = match target {
+            Some(t) => format!(
+                r#"{{"tenant":"{tenant}","user":"{user}","action":"{action}","target_tenant":"{t}"}}"#
+            ),
+            None => format!(r#"{{"tenant":"{tenant}","user":"{user}","action":"{action}"}}"#),
+        };
+        let (code, body) = http_unix(sock, "POST", "/v1/iam/authorize", Some(&body), "t");
+        assert_eq!(code, 200, "authorize call failed: {body}");
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["allow"]
+            .as_bool()
+            .unwrap()
+    };
+
+    // 租户与用户:ta/tadmin(tenantAdmin)、ta/alice(readwrite)、
+    // default/root(consoleAdmin)、default/viewer(diagnostics)、
+    // default/plain(无挂载)、tb/carol(readwrite)
+    for t in ["ta", "tb"] {
+        let (code, body) = http_unix(
+            sock,
+            "POST",
+            "/v1/iam/tenants",
+            Some(&format!(r#"{{"tenant_id":"{t}"}}"#)),
+            "t",
+        );
+        assert_eq!(code, 200, "create tenant failed: {body}");
+    }
+    let mkuser = |tenant: &str, name: &str, policies: &str| {
+        let (code, body) = http_unix(
+            sock,
+            "POST",
+            "/v1/iam/users",
+            Some(&format!(r#"{{"tenant":"{tenant}","name":"{name}"}}"#)),
+            "t",
+        );
+        assert_eq!(code, 200, "create user failed: {body}");
+        if !policies.is_empty() {
+            let (code, body) = http_unix(
+                sock,
+                "PATCH",
+                &format!("/v1/iam/users/{tenant}/{name}"),
+                Some(&format!(r#"{{"policies":{policies}}}"#)),
+                "t",
+            );
+            assert_eq!(code, 200, "attach policies failed: {body}");
+        }
+    };
+    mkuser("ta", "tadmin", r#"["tenantAdmin"]"#);
+    mkuser("ta", "alice", r#"["readwrite"]"#);
+    mkuser("default", "root", r#"["consoleAdmin"]"#);
+    mkuser("default", "viewer", r#"["diagnostics"]"#);
+    mkuser("default", "plain", "");
+    mkuser("tb", "carol", r#"["readwrite"]"#);
+
+    // tenantAdmin:本租户用户写放行(target 显式本租户 / 缺席均可)
+    assert!(allow("ta", "tadmin", "admin:CreateUser", Some("ta")));
+    assert!(allow("ta", "tadmin", "admin:CreateUser", None));
+    assert!(allow("ta", "tadmin", "admin:ListUsers", Some("ta")));
+    // 跨租户 → 拒绝(TODO 必考 tenant_admin 租户边界的服务端一半)
+    assert!(!allow("ta", "tadmin", "admin:CreateUser", Some("tb")));
+    assert!(!allow("ta", "tadmin", "admin:ListUsers", Some("tb")));
+    // 租户生命周期 = consoleAdmin 专属(target 缺席也拒)
+    assert!(!allow("ta", "tadmin", "admin:CreateTenant", None));
+    assert!(!allow("ta", "tadmin", "admin:ListTenants", None));
+    assert!(!allow("ta", "tadmin", "admin:DeleteTenant", Some("ta")));
+    // tenantAdmin 不含集群审计读 / 集群写
+    assert!(!allow("ta", "tadmin", "admin:GetAudit", None));
+    assert!(!allow("ta", "tadmin", "admin:ClusterWrite", None));
+    // tenantAdmin 桶管理面动作本租户放行
+    assert!(allow("ta", "tadmin", "admin:CreateBucket", Some("ta")));
+    assert!(!allow("ta", "tadmin", "admin:CreateBucket", Some("tb")));
+
+    // consoleAdmin:集群范围,含租户动作
+    assert!(allow("default", "root", "admin:CreateTenant", None));
+    assert!(allow("default", "root", "admin:CreateUser", Some("tb")));
+    assert!(allow("default", "root", "admin:GetAudit", None));
+    assert!(allow("default", "root", "admin:ClusterWrite", None));
+
+    // diagnostics:管理面读放行、写拒绝;s3 读放行
+    assert!(allow(
+        "default",
+        "viewer",
+        "admin:ListUsers",
+        Some("default")
+    ));
+    assert!(allow("default", "viewer", "admin:GetDashboard", None));
+    assert!(!allow(
+        "default",
+        "viewer",
+        "admin:CreateUser",
+        Some("default")
+    ));
+    // diagnostics 也不得越租户读(target ≠ 本租户 → 拒)
+    assert!(!allow("default", "viewer", "admin:ListUsers", Some("ta")));
+    // diagnostics 不含租户动作(admin:List* 通配也不放行,求值处强制)
+    assert!(!allow("default", "viewer", "admin:ListTenants", None));
+
+    // 纯数据面 canned:admin 动作全拒;s3 读动作经同端点可评
+    assert!(!allow("ta", "alice", "admin:ListUsers", Some("ta")));
+    assert!(allow("ta", "alice", "s3:ListAllMyBuckets", None));
+    assert!(allow("default", "viewer", "s3:ListAllMyBuckets", None));
+    // 无挂载用户:全拒
+    assert!(!allow("default", "plain", "admin:ListUsers", None));
+    assert!(!allow("default", "plain", "s3:GetObject", None));
+    // 未知用户:拒
+    assert!(!allow("default", "ghost", "admin:ListUsers", None));
+
+    // 自定义策略经同一求值:ta/auditor 挂自定义 admin:GetAudit → 本租户放行
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/policies",
+        Some(
+            r#"{"tenant":"ta","name":"audit-read","document":"{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"admin:GetAudit\"],\"Resource\":[\"*\"]}]}"}"#,
+        ),
+        "t",
+    );
+    assert_eq!(code, 200, "create policy failed: {body}");
+    mkuser("ta", "auditor", r#"["audit-read"]"#);
+    assert!(allow("ta", "auditor", "admin:GetAudit", Some("ta")));
+    assert!(!allow("ta", "auditor", "admin:GetAudit", Some("tb")));
+    // 自定义策略显式授予租户动作也救不回非 consoleAdmin(求值处强制)
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/policies",
+        Some(
+            r#"{"tenant":"ta","name":"tenant-wannabe","document":"{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"admin:CreateTenant\"],\"Resource\":[\"*\"]}]}"}"#,
+        ),
+        "t",
+    );
+    assert_eq!(code, 200, "{body}");
+    mkuser("ta", "wannabe", r#"["tenant-wannabe"]"#);
+    assert!(!allow("ta", "wannabe", "admin:CreateTenant", None));
+
+    // 组挂载参与求值:ta/ops 组挂 tenantAdmin,成员 bob 继承
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/groups",
+        Some(r#"{"tenant":"ta","name":"ops","members":["alice"],"policies":["tenantAdmin"]}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "create group failed: {body}");
+    assert!(allow("ta", "alice", "admin:CreateUser", Some("ta")));
+    assert!(!allow("ta", "alice", "admin:CreateUser", Some("tb")));
+
+    // 禁用用户 → 全拒
+    let (code, body) = http_unix(
+        sock,
+        "PATCH",
+        "/v1/iam/users/ta/tadmin",
+        Some(r#"{"enabled":false}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "{body}");
+    assert!(!allow("ta", "tadmin", "admin:CreateUser", Some("ta")));
+
+    // 挂载脏名(库中无法解析)→ fail-closed
+    mkuser("ta", "dirty", r#"["readwrite"]"#);
+    {
+        let e = service.engine().read();
+        let mut u = e.meta().get_iam_user("ta", "dirty").unwrap().unwrap();
+        u.policies = vec!["no-such-policy".to_string()];
+        drop(e);
+        service.put_iam_user(&u).unwrap();
+    }
+    assert!(!allow("ta", "dirty", "s3:GetObject", None));
+
+    // 字段缺失 → 400
+    let (code, _) = http_unix(sock, "POST", "/v1/iam/authorize", Some(r#"{}"#), "t");
+    assert_eq!(code, 400);
+    let (code, _) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/authorize",
+        Some(r#"{"tenant":"ta","user":"alice"}"#),
+        "t",
+    );
+    assert_eq!(code, 400);
+
+    let _ = handle;
+}

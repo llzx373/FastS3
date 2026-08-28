@@ -1696,6 +1696,85 @@ impl S3Service {
         })
     }
 
+    /// M18 C1(ADR-28 DI3.3):管理面/控制台授权求值(admin `/v1/iam/authorize`
+    /// 的唯一求值点)。语义(compat 钉死):
+    /// - 未知用户 / 已禁用 → false(管理面无「无记录即存活」口径,与数据面
+    ///   预 M18 密钥不同:控制台身份必须是显式 IAM User);
+    /// - 生效策略 = 用户直挂 ∪ 所属组挂载(去重);canned 走代码常量,自定义
+    ///   走 iam_policies 缓存;挂载名两处均缺席 → fail-closed false;
+    /// - 动作经 `policy::normalize_action` 规范化(`admin:` 自成一族),
+    ///   **资源恒为 `*`**(管理面动作只评 Action+Effect,Resource 通配);
+    /// - 租户生命周期动作(iam::TENANT_ACTIONS)仅 consoleAdmin 可执行;
+    /// - 租户边界:调用者策略集不含 consoleAdmin 时,`target_tenant` 存在
+    ///   且 ≠ 调用者租户 → false(target 缺席 = 本租户内操作,放行由策略
+    ///   决定);consoleAdmin 集群范围不受限。
+    pub fn check_admin_action(
+        &self,
+        tenant: &str,
+        user: &str,
+        action: &str,
+        target_tenant: Option<&str>,
+    ) -> bool {
+        use crate::policy::Decision;
+        let ustate = {
+            let users = self.iam_users.lock().unwrap();
+            match users.get(&(tenant.to_string(), user.to_string())) {
+                Some(u) => u.clone(),
+                None => return false,
+            }
+        };
+        if !ustate.enabled {
+            return false;
+        }
+        // 直挂 ∪ 组挂载(去重,保序;同 iam_identity_decision)
+        let mut names = ustate.policies;
+        {
+            let groups = self.iam_groups.lock().unwrap();
+            for g in &ustate.groups {
+                if let Some(pols) = groups.get(&(tenant.to_string(), g.clone())) {
+                    for p in pols {
+                        if !names.contains(p) {
+                            names.push(p.clone());
+                        }
+                    }
+                }
+            }
+        }
+        let console_admin = names.iter().any(|n| n == crate::iam::CANNED_CONSOLE_ADMIN);
+        let norm = action.trim().to_ascii_lowercase();
+        if !console_admin {
+            // 租户生命周期 = consoleAdmin 专属(DI8.2 租户页仅 root 语义)
+            if crate::iam::TENANT_ACTIONS.contains(&norm.as_str()) {
+                return false;
+            }
+            // 跨租户目标拒绝(target 缺席 = 本租户内操作)
+            if let Some(t) = target_tenant {
+                if t != tenant {
+                    return false;
+                }
+            }
+        }
+        let ctx = crate::policy::EvalCtx::default();
+        for name in &names {
+            let decision = if crate::iam::is_canned(name) {
+                crate::iam::canned_parsed(name).map(|p| p.decide(&norm, "*", true, &ctx))
+            } else {
+                self.iam_policies
+                    .lock()
+                    .unwrap()
+                    .get(&(tenant.to_string(), name.clone()))
+                    .map(|p| p.decide(&norm, "*", true, &ctx))
+            };
+            match decision {
+                // Deny 优先;挂载名无法解析(脏数据)→ 保守拒绝(绝不扩权)
+                Some(Decision::Deny) | None => return false,
+                Some(Decision::Allow) => return true,
+                Some(Decision::NoMatch) => {}
+            }
+        }
+        false
+    }
+
     // ── M15 T1/T2:STS 临时凭证(ADR-18 D-E2) ──
 
     /// TTL 默认(1h)与上限(36h = AWS GetSessionToken 上限对齐)。

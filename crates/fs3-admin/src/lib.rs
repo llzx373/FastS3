@@ -44,6 +44,7 @@
 //! - `PATCH /v1/iam/roles/{tenant}/{name}`      更新 policy/assumable_by(整表替换)
 //! - `DELETE /v1/iam/roles/{tenant}/{name}`     删除角色(无条件;已签发会话持自身策略副本)
 //! - `POST /v1/iam/assume-role`                 STS AssumeRole(本租户角色;跨租户/无授予/越 assumable_by → 403)
+//! - `POST /v1/iam/authorize`                   管理面授权求值(M18 C1;{tenant,user,action,target_tenant?} → {allow})
 //! - `GET  /v1/admin/uploads`                   在途 multipart 会话
 //! - `POST /v1/admin/uploads/{id}/abort`        强制中止会话
 //! - `GET  /v1/admin/audit?limit=`              审计日志
@@ -587,6 +588,9 @@ impl AdminServer {
             ("PATCH", ["roles", tenant, name]) => self.handle_role_patch(tenant, name, body),
             ("DELETE", ["roles", tenant, name]) => self.handle_role_delete(tenant, name),
             ("POST", ["assume-role"]) => self.handle_assume_role(body),
+            // M18 C1(ADR-28 DI3.3):管理面授权求值(控制台/管理面调用方
+            // 身份 → admin:* 动作 allow;求值在 S3Service::check_admin_action)
+            ("POST", ["authorize"]) => self.handle_iam_authorize(body),
             _ => json::err(StatusCode::NOT_FOUND, "not_found", "unknown iam endpoint"),
         }
     }
@@ -3002,6 +3006,37 @@ impl AdminServer {
                 json::err(status, code, &e.describe())
             }
         }
+    }
+
+    /// POST /v1/iam/authorize:管理面授权求值(M18 C1;ADR-28 DI3.3)。
+    /// body:`tenant`(必填)、`user`(必填)、`action`(必填,`admin:`/`s3:`
+    /// 族动作名)、`target_tenant`(可选;租户边界判定用)。响应恒 200
+    /// `{allow: bool}`——求值结果不是错误:未知/禁用用户、策略不命中、
+    /// 跨租户、非 consoleAdmin 触租户动作均为 `allow:false`(语义见
+    /// S3Service::check_admin_action 文档)。本端点自身不做调用方鉴权
+    /// (admin 通道 = root 可信;它只是求值器,不产生任何变更)。
+    fn handle_iam_authorize(&self, body: &[u8]) -> Response<String> {
+        let parsed: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(_) => {
+                return json::err(StatusCode::BAD_REQUEST, "bad_request", "invalid JSON body")
+            }
+        };
+        let tenant = parsed.get("tenant").and_then(|v| v.as_str()).unwrap_or("");
+        let user = parsed.get("user").and_then(|v| v.as_str()).unwrap_or("");
+        let action = parsed.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        if tenant.is_empty() || user.is_empty() || action.is_empty() {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "missing required field: tenant, user and/or action",
+            );
+        }
+        let target_tenant = parsed.get("target_tenant").and_then(|v| v.as_str());
+        let allow = self
+            .service
+            .check_admin_action(tenant, user, action, target_tenant);
+        json::ok(serde_json::json!({ "allow": allow }))
     }
 
     // ───────────────────── M18 S1:IAM 服务账号(ADR-28 DI2.4/DI8)─────────────────────
