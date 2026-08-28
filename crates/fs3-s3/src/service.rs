@@ -132,8 +132,6 @@ pub struct S3Service {
     allow_anonymous: std::sync::atomic::AtomicBool,
     region: String,
     host_id: String,
-    /// 所有者标识(CanonicalUser ID/DisplayName):取首个凭据 access key。
-    owner: String,
     /// 指标注册表(H2;admin `/v1/admin/metrics`)。
     metrics: Arc<fs3_core::metrics::Metrics>,
     /// 审计环形缓冲(H2;admin `/v1/admin/audit`)。
@@ -264,10 +262,6 @@ impl S3Service {
         audit: Arc<fs3_core::audit::AuditRing>,
     ) -> Self {
         let host_id = format!("{:x}", rand_hex());
-        let owner = keys
-            .first()
-            .map(|k| k.access_key.clone())
-            .unwrap_or_else(|| "fasts3".into());
         S3Service {
             engine,
             auth: Authenticator::new(keys, region.clone(), std::time::SystemTime::now()),
@@ -275,7 +269,6 @@ impl S3Service {
             allow_anonymous: std::sync::atomic::AtomicBool::new(allow_anonymous),
             region,
             host_id,
-            owner,
             metrics,
             audit,
             last_peer: std::sync::Mutex::new(String::new()),
@@ -446,10 +439,12 @@ impl S3Service {
         }
     }
 
-    /// M15 C2(协议补完):x-amz-expected-bucket-owner —— 单账号模型语义:
-    /// 头值 = 桶属主(BucketMeta.owner)→ 放行;≠ → 403 AccessDenied(显式,
+    /// M15 C2(协议补完)+ M18 T2(ADR-28 DI1.1/DI9.1):
+    /// x-amz-expected-bucket-owner —— 头值 = 桶属主租户 canonical_id
+    /// (BucketMeta.owner)→ 放行;≠ → 403 AccessDenied(显式,
     /// 不静默);无桶(服务级 op)或未带头 → 放行。桶不存在由下游 op 按
-    /// 既有 NoSuchBucket 语义裁决,不在此预判。
+    /// 既有 NoSuchBucket 语义裁决,不在此预判(比对兜底 = default
+    /// 租户 canonical "fasts3")。
     fn check_expected_bucket_owner(&self, req: &S3Request, bucket: &str) -> Result<(), S3Error> {
         let Some(expected) = header(req, "x-amz-expected-bucket-owner") else {
             return Ok(());
@@ -462,7 +457,7 @@ impl S3Service {
             .ok()
             .flatten()
             .map(|b| b.owner)
-            .unwrap_or_else(|| self.owner.clone());
+            .unwrap_or_else(|| fs3_core::Tenant::DEFAULT_CANONICAL_ID.to_string());
         if expected != owner {
             return Err(S3Error::new(S3ErrorCode::AccessDenied)
                 .with_message("The request signature does not match the expected bucket owner."));
@@ -3657,7 +3652,8 @@ impl S3Service {
             None
         };
         // Owner 块 = 调用者租户 canonical(legacy/匿名 → default canonical
-        // "fasts3",与 M18 前硬编码一致;T2 负责其余 Owner 回显点升格)
+        // "fasts3",与 M18 前硬编码一致;其余 Owner 回显点由 T2 升格为
+        // 属主租户 canonical,见 op_list_objects_*/op_get_object_acl 等)
         let owner = caller
             .as_ref()
             .map(|c| c.tenant_canonical_id.as_str())
@@ -5199,14 +5195,13 @@ impl S3Service {
         encoding_type: Option<&str>,
     ) -> Result<ServiceResponse, S3Error> {
         let engine = self.engine.read();
-        if engine
+        let Some(bkt_meta) = engine
             .meta()
             .get_bucket(bucket)
             .map_err(|e| map_engine_error(e, bucket, ""))?
-            .is_none()
-        {
+        else {
             return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
-        }
+        };
         // max-keys=0 → 空页且不截断(AWS 语义),避免空 NextKeyMarker 死循环。
         let max = max_keys.min(1000) as usize;
         let page = if max == 0 {
@@ -5243,7 +5238,10 @@ impl S3Service {
             next,
             delimiter,
             encoding_type,
-            &self.owner,
+            // M18 T2(ADR-28 DI9.1):Owner 回显 = 属主租户 canonical_id
+            // (BucketMeta.owner;ObjectMeta 不记录创建者身份,ID/DisplayName
+            // 同 canonical,compat 钉死)。
+            &bkt_meta.owner,
         );
         Ok(ServiceResponse {
             status: 200,
@@ -5267,14 +5265,13 @@ impl S3Service {
         encoding_type: Option<&str>,
     ) -> Result<ServiceResponse, S3Error> {
         let engine = self.engine.read();
-        if engine
+        let Some(bkt_meta) = engine
             .meta()
             .get_bucket(bucket)
             .map_err(|e| map_engine_error(e, bucket, ""))?
-            .is_none()
-        {
+        else {
             return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
-        }
+        };
         // max-keys=0 → 空页且 IsTruncated=false(AWS 语义)
         let max = max_keys.min(1000) as usize;
         let (page, truncated) = if max == 0 {
@@ -5294,7 +5291,8 @@ impl S3Service {
             None
         };
         let xml = xml::render_list_objects_v1(
-            &self.owner,
+            // Owner 回显 = 属主租户 canonical(M18 T2;同 v2/versions 口径)
+            &bkt_meta.owner,
             bucket,
             prefix,
             marker,
@@ -5329,14 +5327,13 @@ impl S3Service {
         encoding_type: Option<&str>,
     ) -> Result<ServiceResponse, S3Error> {
         let engine = self.engine.read();
-        if engine
+        let Some(bkt_meta) = engine
             .meta()
             .get_bucket(bucket)
             .map_err(|e| map_engine_error(e, bucket, ""))?
-            .is_none()
-        {
+        else {
             return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
-        }
+        };
         // continuation token 不透明化:base64(最后键);解码失败 → InvalidArgument
         let after = match continuation_token {
             Some(tok) => {
@@ -5388,7 +5385,8 @@ impl S3Service {
         };
         let key_count = page.items.len() + page.common_prefixes.len();
         let xml = xml::render_list_objects_v2(
-            &self.owner,
+            // Owner 回显 = 属主租户 canonical(M18 T2;fetch-owner 门控不变)
+            &bkt_meta.owner,
             bucket,
             prefix,
             continuation_token,
@@ -6213,14 +6211,13 @@ impl S3Service {
 
     fn op_get_object_acl(&self, bucket: &str, key: &str) -> Result<ServiceResponse, S3Error> {
         let engine = self.engine.read();
-        if engine
+        let Some(bkt_meta) = engine
             .meta()
             .get_bucket(bucket)
             .map_err(|e| map_engine_error(e, bucket, ""))?
-            .is_none()
-        {
+        else {
             return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
-        }
+        };
         if let Err(e) = engine.head_version(bucket, key, None) {
             return Err(match e {
                 CoreError::DeleteMarker(_) | CoreError::NotFound(_) => {
@@ -6229,7 +6226,10 @@ impl S3Service {
                 other => map_engine_error(other, bucket, key),
             });
         }
-        let xml = xml::render_access_control_policy(&self.owner);
+        // M18 T2(ADR-28 DI9.1):ACL Owner/Grantee 回显 = 属主租户
+        // canonical_id(BucketMeta.owner;不再回显首把凭据 access key,
+        // 行为变化见 compat)。
+        let xml = xml::render_access_control_policy(&bkt_meta.owner);
         Ok(ServiceResponse {
             status: 200,
             headers: vec![
@@ -6737,14 +6737,13 @@ impl S3Service {
     ) -> Result<ServiceResponse, S3Error> {
         let _ = req;
         let engine = self.engine.read();
-        if engine
+        let Some(bkt_meta) = engine
             .meta()
             .get_bucket(bucket)
             .map_err(|e| map_engine_error(e, bucket, ""))?
-            .is_none()
-        {
+        else {
             return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
-        }
+        };
         let max = (max_uploads.min(1000)) as usize;
         let uploads = engine
             .list_multipart_uploads(bucket, prefix, key_marker, upload_id_marker, max)
@@ -6774,7 +6773,8 @@ impl S3Service {
             key_marker,
             upload_id_marker,
             max_uploads.min(1000),
-            &self.owner,
+            // Initiator/Owner 回显 = 属主租户 canonical(M18 T2)
+            &bkt_meta.owner,
             &items,
             truncated,
             next_key.as_deref(),
@@ -6801,14 +6801,13 @@ impl S3Service {
     ) -> Result<ServiceResponse, S3Error> {
         let _ = (req, key);
         let engine = self.engine.read();
-        if engine
+        let Some(bkt_meta) = engine
             .meta()
             .get_bucket(bucket)
             .map_err(|e| map_engine_error(e, bucket, ""))?
-            .is_none()
-        {
+        else {
             return Err(S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket));
-        }
+        };
         if engine
             .meta()
             .get_multipart(upload_id)
@@ -6844,7 +6843,8 @@ impl S3Service {
             &page,
             truncated,
             next,
-            &self.owner,
+            // Initiator/Owner 回显 = 属主租户 canonical(M18 T2)
+            &bkt_meta.owner,
         );
         Ok(ServiceResponse {
             status: 200,

@@ -678,7 +678,9 @@ fn acl_and_list_owner() {
     svc.handle(&req("PUT", "/bkt1", vec![])).unwrap();
     svc.handle(&req("PUT", "/bkt1/k1", vec![1u8; 3])).unwrap();
 
-    // GetObjectAcl:owner(test) FULL_CONTROL
+    // GetObjectAcl:owner 拥有 FULL_CONTROL。M18 T2(ADR-28 DI9.1)起
+    // Owner = 属主租户 canonical_id;legacy 密钥建桶 → default 租户
+    // canonical "fasts3"(不再回显首把凭据 access key,行为变化见 compat)。
     let r = svc
         .handle(&req_q("GET", "/bkt1/k1", &[("acl", "")], vec![]))
         .unwrap();
@@ -688,7 +690,7 @@ fn acl_and_list_owner() {
     };
     assert!(xml.contains("<AccessControlPolicy"), "{xml}");
     assert!(
-        xml.contains("<Owner><ID>test</ID><DisplayName>test</DisplayName></Owner>"),
+        xml.contains("<Owner><ID>fasts3</ID><DisplayName>fasts3</DisplayName></Owner>"),
         "{xml}"
     );
     assert!(
@@ -703,7 +705,7 @@ fn acl_and_list_owner() {
         _ => panic!(),
     };
     assert!(
-        xml.contains("<Owner><ID>test</ID><DisplayName>test</DisplayName></Owner>"),
+        xml.contains("<Owner><ID>fasts3</ID><DisplayName>fasts3</DisplayName></Owner>"),
         "{xml}"
     );
 
@@ -11328,6 +11330,22 @@ fn req_creds(
     extra: &[(&str, &str)],
     body: Vec<u8>,
 ) -> S3Request {
+    req_creds_q(method, path, creds, &[], extra, body)
+}
+
+/// 带任意凭据 + query + 附加头的已签名请求(query/头均参与签名)。
+fn req_creds_q(
+    method: &str,
+    path: &str,
+    creds: &Credentials,
+    query: &[(&str, &str)],
+    extra: &[(&str, &str)],
+    body: Vec<u8>,
+) -> S3Request {
+    let query: Vec<(String, String)> = query
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
     let amz_date = auth::now_amz();
     let hash = hex::encode(Sha256::digest(&body));
     let mut headers: Vec<(String, String)> = Vec::new();
@@ -11350,7 +11368,7 @@ fn req_creds(
         "us-east-1",
         method,
         path,
-        &[],
+        &query,
         &headers,
         &amz_date,
         &auth::PayloadHash::HexSha256(hash),
@@ -11362,7 +11380,7 @@ fn req_creds(
         raw_path: path.into(),
         decoded_path: path.into(),
         host: "localhost".into(),
-        query: vec![],
+        query,
         headers,
         body,
     }
@@ -12870,6 +12888,195 @@ fn create_bucket_owner_is_caller_tenant() {
         .unwrap()
         .unwrap();
     assert_eq!(meta.owner, "fasts3", "legacy 建桶属主不变");
+}
+
+/// M18 T2(TODO 钉死用例;ADR-28 DI1.1/DI9.1):x-amz-expected-bucket-owner
+/// 比对对象 = 属主租户 canonical_id —— 租户 A 的桶接受 canon-a、拒绝
+/// canon-b 与 "fasts3"(M15 C2 从「恒 fasts3」升格);default 租户
+/// (legacy 密钥)的桶接受 "fasts3"、拒绝他租户 canonical;无头放行。
+#[test]
+fn expected_bucket_owner_matches_tenant_canonical_id() {
+    let (_d, svc) = setup();
+    let sa_alice = s3_tenant_sa(&svc, "ta", "canon-a", "alice", "AKIA_T2A", "t2a-secret");
+    let _sa_bob = s3_tenant_sa(&svc, "tb", "canon-b", "bob", "AKIA_T2B", "t2b-secret");
+    let r = svc.handle(&req_creds("PUT", "/t2bkt-a", &sa_alice, &[], vec![]));
+    assert_eq!(status(&r), 200, "alice 建桶: {r:?}");
+    // 头值 = 属主 canonical → 放行(读/写同判)
+    let r = svc.handle(&req_creds(
+        "GET",
+        "/t2bkt-a",
+        &sa_alice,
+        &[("x-amz-expected-bucket-owner", "canon-a")],
+        vec![],
+    ));
+    assert_eq!(status(&r), 200, "头值 = canon-a 放行: {r:?}");
+    let r = svc.handle(&req_creds(
+        "PUT",
+        "/t2bkt-a/k",
+        &sa_alice,
+        &[("x-amz-expected-bucket-owner", "canon-a")],
+        b"x".to_vec(),
+    ));
+    assert_eq!(status(&r), 200, "PUT 同口径放行: {r:?}");
+    // 头值 = 他租户 canonical 或 legacy "fasts3" → 403 AccessDenied
+    for wrong in ["canon-b", "fasts3"] {
+        let r = svc.handle(&req_creds(
+            "GET",
+            "/t2bkt-a",
+            &sa_alice,
+            &[("x-amz-expected-bucket-owner", wrong)],
+            vec![],
+        ));
+        let e = r.unwrap_err();
+        assert_eq!(e.status(), 403, "头值 {wrong} 拒绝: {e:?}");
+        assert_eq!(e.code, fs3_s3::S3ErrorCode::AccessDenied, "头值 {wrong}");
+    }
+    // default 租户(legacy 密钥)的桶:接受 "fasts3",拒绝他租户 canonical
+    assert_eq!(status(&svc.handle(&req("PUT", "/t2legacy", vec![]))), 200);
+    let r = svc.handle(&req_h(
+        "GET",
+        "/t2legacy",
+        &[("x-amz-expected-bucket-owner", "fasts3")],
+        vec![],
+    ));
+    assert_eq!(status(&r), 200, "default 桶接受 fasts3: {r:?}");
+    let r = svc.handle(&req_h(
+        "GET",
+        "/t2legacy",
+        &[("x-amz-expected-bucket-owner", "canon-a")],
+        vec![],
+    ));
+    assert_eq!(
+        err_code(&r),
+        "AccessDenied",
+        "default 桶拒绝 canon-a: {r:?}"
+    );
+    // 无头 → 放行
+    let r = svc.handle(&req_creds("GET", "/t2bkt-a", &sa_alice, &[], vec![]));
+    assert_eq!(status(&r), 200, "无头放行: {r:?}");
+}
+
+/// M18 T2(ADR-28 DI9.1):对象侧 Owner 回显 = 属主租户 canonical_id ——
+/// 租户 A 桶内对象,ListObjectsV1 / V2(fetch-owner=true)/ Versions /
+/// GetObjectAcl / ListMultipartUploads / ListParts 的 Owner(Initiator)
+/// ID/DisplayName 恒为 canon-a(ObjectMeta 不记录创建者身份,DisplayName
+/// 同 ID,compat 钉死;用户 display 升格 deferred)。
+#[test]
+fn object_owner_echo_is_bucket_tenant_canonical() {
+    let (_d, svc) = setup();
+    let sa_alice = s3_tenant_sa(&svc, "ta", "canon-a", "alice", "AKIA_T2C", "t2c-secret");
+    let r = svc.handle(&req_creds("PUT", "/t2echo", &sa_alice, &[], vec![]));
+    assert_eq!(status(&r), 200, "alice 建桶: {r:?}");
+    let r = svc.handle(&req_creds(
+        "PUT",
+        "/t2echo/k1",
+        &sa_alice,
+        &[],
+        b"data".to_vec(),
+    ));
+    assert_eq!(status(&r), 200, "写入: {r:?}");
+    let owner_a = "<Owner><ID>canon-a</ID><DisplayName>canon-a</DisplayName></Owner>";
+    let xml_of = |r: Result<ServiceResponse, fs3_s3::S3Error>| -> String {
+        match r.unwrap().body {
+            ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+            _ => panic!("unexpected body"),
+        }
+    };
+    // ListObjectsV1:Contents 恒带 Owner
+    let xml = xml_of(svc.handle(&req_creds("GET", "/t2echo", &sa_alice, &[], vec![])));
+    assert!(xml.contains("<Key>k1</Key>"), "{xml}");
+    assert!(xml.contains(owner_a), "v1 Contents Owner: {xml}");
+    // ListObjectsV2:fetch-owner=true 才输出
+    let xml = xml_of(svc.handle(&req_creds_q(
+        "GET",
+        "/t2echo",
+        &sa_alice,
+        &[("list-type", "2"), ("fetch-owner", "true")],
+        &[],
+        vec![],
+    )));
+    assert!(xml.contains(owner_a), "v2 fetch-owner Owner: {xml}");
+    let xml = xml_of(svc.handle(&req_creds_q(
+        "GET",
+        "/t2echo",
+        &sa_alice,
+        &[("list-type", "2")],
+        &[],
+        vec![],
+    )));
+    assert!(!xml.contains("<Owner>"), "v2 缺省无 Owner: {xml}");
+    // ListObjectVersions:Version 条目 Owner
+    let xml = xml_of(svc.handle(&req_creds_q(
+        "GET",
+        "/t2echo",
+        &sa_alice,
+        &[("versions", "")],
+        &[],
+        vec![],
+    )));
+    assert!(xml.contains(owner_a), "versions Owner: {xml}");
+    // GetObjectAcl:Owner/Grantee
+    let xml = xml_of(svc.handle(&req_creds_q(
+        "GET",
+        "/t2echo/k1",
+        &sa_alice,
+        &[("acl", "")],
+        &[],
+        vec![],
+    )));
+    assert!(xml.contains(owner_a), "ACL Owner: {xml}");
+    assert!(
+        xml.contains("xsi:type=\"CanonicalUser\"><ID>canon-a</ID><DisplayName>canon-a</DisplayName></Grantee>"),
+        "ACL Grantee: {xml}"
+    );
+    // multipart:CreateMultipartUpload → ListMultipartUploads / ListParts
+    // 的 Initiator/Owner 同口径
+    let xml = xml_of(svc.handle(&req_creds_q(
+        "POST",
+        "/t2echo/mp",
+        &sa_alice,
+        &[("uploads", "")],
+        &[],
+        vec![],
+    )));
+    let uid = xml
+        .split("<UploadId>")
+        .nth(1)
+        .unwrap()
+        .split("</UploadId>")
+        .next()
+        .unwrap()
+        .to_string();
+    let r = svc.handle(&req_creds_q(
+        "PUT",
+        "/t2echo/mp",
+        &sa_alice,
+        &[("partNumber", "1"), ("uploadId", &uid)],
+        &[],
+        b"part".to_vec(),
+    ));
+    assert_eq!(status(&r), 200, "上传分片: {r:?}");
+    let initiator_a = "<Initiator><ID>canon-a</ID><DisplayName>canon-a</DisplayName></Initiator>";
+    let xml = xml_of(svc.handle(&req_creds_q(
+        "GET",
+        "/t2echo",
+        &sa_alice,
+        &[("uploads", "")],
+        &[],
+        vec![],
+    )));
+    assert!(xml.contains(initiator_a), "uploads Initiator: {xml}");
+    assert!(xml.contains(owner_a), "uploads Owner: {xml}");
+    let xml = xml_of(svc.handle(&req_creds_q(
+        "GET",
+        "/t2echo/mp",
+        &sa_alice,
+        &[("uploadId", &uid)],
+        &[],
+        vec![],
+    )));
+    assert!(xml.contains(initiator_a), "parts Initiator: {xml}");
+    assert!(xml.contains(owner_a), "parts Owner: {xml}");
 }
 
 /// M18 S3(TODO 钉死用例;ADR-28 DI3.4):ListBuckets 隐式过滤 —— 租户 A

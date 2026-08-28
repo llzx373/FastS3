@@ -763,7 +763,8 @@ pub fn render_list_parts(
         escape_xml(key)
     );
     let _ = write!(xml, "<UploadId>{}</UploadId>", escape_xml(upload_id));
-    // M9/C4:Initiator/Owner 统一输出(单账号模型;与 ListMultipartUploads 同源)
+    // M9/C4:Initiator/Owner 统一输出(与 ListMultipartUploads 同源);
+    // M18 T2 起 owner 实参 = 属主租户 canonical_id(ADR-28 DI9.1)
     let _ = write!(
         xml,
         "<Initiator><ID>{}</ID><DisplayName>{}</DisplayName></Initiator>\
@@ -1042,6 +1043,8 @@ pub fn render_list_buckets(
 
 /// 对象列表项(Contents 元素;V1 恒带 Owner;V2 按 fetch-owner 门控,
 /// M9/C1/C4 与 AWS 一致:默认缺省、请求 fetch-owner=true 才输出)。
+/// M18 T2 起 owner = 属主租户 canonical_id(ADR-28 DI9.1,由调用方
+/// 从 BucketMeta.owner 解析传入)。
 fn render_contents(
     xml: &mut String,
     owner: &str,
@@ -1386,6 +1389,7 @@ pub fn render_versioning_not_enabled() -> String {
 }
 
 /// GetObjectAcl 响应(私有默认 ACL:owner 拥有 FULL_CONTROL)。
+/// M18 T2 起 owner = 属主租户 canonical_id(ADR-28 DI9.1)。
 pub fn render_access_control_policy(owner: &str) -> String {
     format!(
         concat!(
@@ -4530,7 +4534,7 @@ mod tests {
             "<Version><Key>a.txt</Key><VersionId>null</VersionId><IsLatest>true</IsLatest>"
         ));
         assert!(xml.contains("<Size>5</Size>"));
-        // M9/C4:Version 条目带 Owner(单账号模型统一输出)
+        // M9/C4:Version 条目带 Owner(统一输出;M18 T2 起 = 属主租户 canonical)
         assert!(xml.contains("<Owner><ID>o1</ID><DisplayName>o1</DisplayName></Owner>"));
         assert!(xml.contains(
             "<NextKeyMarker>a.txt</NextKeyMarker><NextVersionIdMarker>null</NextVersionIdMarker>"

@@ -268,7 +268,7 @@
 - [ ] T1 s3-tests 主/备配置两把不同 AK、两个 User;「单账号模型限制」表中
   `policy_multipart` / `copy_not_owned` / `404_with_policy` 等能出集的出集,其余逐名
   - 用例:README 恒排表更新;gate 意外失败 0
-- [ ] T2 Owner 回显 = 租户 canonical_id;expected-bucket-owner 按租户 ID(M15 C2 从「恒 fasts3」升格)
+- [x] T2 Owner 回显 = 租户 canonical_id;expected-bucket-owner 按租户 ID(M15 C2 从「恒 fasts3」升格)
   - 用例:`expected_bucket_owner_matches_tenant_canonical_id`
 
 ### M18 门禁(退出条件)
