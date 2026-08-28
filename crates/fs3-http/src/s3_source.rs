@@ -273,12 +273,12 @@ impl IngestSourceClient for S3SourceClient {
                 .find(|(k, _)| k == name)
                 .map(|(_, v)| v.clone())
         };
+        // 键保留 `x-amz-meta-` 全前缀(fs3-s3 服务层即以全前缀存
+        // ObjectMeta.user_meta,GET/HEAD 回显头名 = 存储键;取回即原样)
         let user_meta = headers
             .iter()
-            .filter_map(|(k, v)| {
-                k.strip_prefix("x-amz-meta-")
-                    .map(|mk| (mk.to_string(), v.clone()))
-            })
+            .filter(|(k, _)| k.starts_with("x-amz-meta-"))
+            .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         let tags = h("x-amz-tagging")
             .map(|s| parse_tagging(&s))
@@ -308,10 +308,8 @@ impl IngestSourceClient for S3SourceClient {
         }
         let user_meta = headers
             .iter()
-            .filter_map(|(k, v)| {
-                k.strip_prefix("x-amz-meta-")
-                    .map(|mk| (mk.to_string(), v.clone()))
-            })
+            .filter(|(k, _)| k.starts_with("x-amz-meta-"))
+            .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         Ok(IngestSourceObject {
             head: IngestSourceHead {

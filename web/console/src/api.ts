@@ -340,6 +340,35 @@ export interface IamCapabilities {
   can_diagnostics: boolean;
   can_audit: boolean;
   can_keys: boolean;
+  /** M19 M3:迁入向导(consoleAdmin 域;能力发现老版本缺省 → undefined 兜底 false) */
+  can_ingest?: boolean;
+}
+
+/** M19 M3(ADR-24):迁入任务。 */
+export interface IngestJob {
+  id: string;
+  source: {
+    endpoint: string;
+    region: string;
+    bucket: string;
+    prefix: string;
+    access_key: string;
+    secret_key: string;
+  };
+  dest_bucket: string;
+  preserve_mtime: boolean;
+  copy_bucket_config: boolean;
+  state: string;
+  created_at: number;
+  updated_at: number;
+  listed: number;
+  copied: number;
+  skipped: number;
+  failed: number;
+  bytes: number;
+  last_key: string;
+  failures: { kind: string; key: string; error: string; at: number }[];
+  error: string | null;
 }
 
 export interface IamUser {
@@ -502,6 +531,34 @@ export const api = {
       destBucket,
       keys,
     }),
+  // ── M19 M3:迁入向导(代理 admin /v1/admin/ingest/*)──
+  ingestJobs: () => request<{ jobs: IngestJob[] }>("GET", "/api/ingest/jobs"),
+  ingestJob: (id: string) =>
+    request<IngestJob>("GET", `/api/ingest/jobs/${encodeURIComponent(id)}`),
+  createIngestJob: (body: {
+    source: {
+      endpoint: string;
+      region?: string;
+      bucket: string;
+      prefix?: string;
+      access_key: string;
+      secret_key: string;
+    };
+    dest_bucket: string;
+    preserve_mtime?: boolean;
+    copy_bucket_config?: boolean;
+  }) => request<IngestJob>("POST", "/api/ingest/jobs", body),
+  ingestJobAction: (id: string, action: "pause" | "resume" | "cancel") =>
+    request<IngestJob>(
+      "POST",
+      `/api/ingest/jobs/${encodeURIComponent(id)}/${action}`,
+    ),
+  deleteIngestJob: (id: string) =>
+    request<{ deleted: string }>(
+      "DELETE",
+      `/api/ingest/jobs/${encodeURIComponent(id)}`,
+    ),
+
   /** M19 U2:勾选对象打包 zip 下载(二进制回包 → blob 保存;超限 413 文案直出)。 */
   downloadZip: async (bucket: string, keys: string[]): Promise<void> => {
     const headers: Record<string, string> = { "Content-Type": "application/json" };

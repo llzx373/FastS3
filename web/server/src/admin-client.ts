@@ -48,6 +48,24 @@ export interface AdminApi {
   }>;
   sessions(): Promise<{ sessions: SessionInfo[] }>;
   revokeSession(sessionId: string): Promise<Record<string, unknown>>;
+  /** M19 M1(ADR-24 DR5):迁入任务(保 mtime/元数据迁入向导)。 */
+  ingestJobs(): Promise<{ jobs: IngestJobInfo[] }>;
+  ingestJob(id: string): Promise<IngestJobInfo>;
+  createIngestJob(body: {
+    source: {
+      endpoint: string;
+      region?: string;
+      bucket: string;
+      prefix?: string;
+      access_key: string;
+      secret_key: string;
+    };
+    dest_bucket: string;
+    preserve_mtime?: boolean;
+    copy_bucket_config?: boolean;
+  }): Promise<IngestJobInfo>;
+  ingestJobAction(id: string, action: "pause" | "resume" | "cancel"): Promise<IngestJobInfo>;
+  deleteIngestJob(id: string): Promise<Record<string, unknown>>;
   /** M18 R1(ADR-28 DI5.2):STS AssumeRole(本租户角色;secret 仅一次回显)。 */
   assumeRole(body: {
     tenant: string;
@@ -599,6 +617,40 @@ export class AdminClient implements AdminApi {
     return this.expect("DELETE", `/v1/admin/sessions/${encodeURIComponent(sessionId)}`);
   }
 
+  // ── M19 M1(ADR-24 DR5):迁入任务 ──
+
+  ingestJobs(): Promise<{ jobs: IngestJobInfo[] }> {
+    return this.expect("GET", "/v1/admin/ingest/jobs");
+  }
+
+  ingestJob(id: string): Promise<IngestJobInfo> {
+    return this.expect("GET", `/v1/admin/ingest/jobs/${encodeURIComponent(id)}`);
+  }
+
+  createIngestJob(body: {
+    source: {
+      endpoint: string;
+      region?: string;
+      bucket: string;
+      prefix?: string;
+      access_key: string;
+      secret_key: string;
+    };
+    dest_bucket: string;
+    preserve_mtime?: boolean;
+    copy_bucket_config?: boolean;
+  }): Promise<IngestJobInfo> {
+    return this.expect("POST", "/v1/admin/ingest/jobs", body);
+  }
+
+  ingestJobAction(id: string, action: "pause" | "resume" | "cancel"): Promise<IngestJobInfo> {
+    return this.expect("POST", `/v1/admin/ingest/jobs/${encodeURIComponent(id)}/${action}`);
+  }
+
+  deleteIngestJob(id: string): Promise<Record<string, unknown>> {
+    return this.expect("DELETE", `/v1/admin/ingest/jobs/${encodeURIComponent(id)}`);
+  }
+
   /** M18 R1:AssumeRole(角色校验/授权在 Rust 侧;错误原样上抛)。 */
   assumeRole(body: {
     tenant: string;
@@ -871,6 +923,33 @@ export class AdminClient implements AdminApi {
 }
 
 /** M15 T1:会话信息(管理面展示;不含明文 secret)。 */
+/** M19 M1:迁入任务(admin 侧;secret_key 恒打码)。 */
+export interface IngestJobInfo {
+  id: string;
+  source: {
+    endpoint: string;
+    region: string;
+    bucket: string;
+    prefix: string;
+    access_key: string;
+    secret_key: string;
+  };
+  dest_bucket: string;
+  preserve_mtime: boolean;
+  copy_bucket_config: boolean;
+  state: string;
+  created_at: number;
+  updated_at: number;
+  listed: number;
+  copied: number;
+  skipped: number;
+  failed: number;
+  bytes: number;
+  last_key: string;
+  failures: { kind: string; key: string; error: string; at: number }[];
+  error: string | null;
+}
+
 export interface SessionInfo {
   session_id: string;
   temporary_access_key: string;

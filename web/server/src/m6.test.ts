@@ -8,11 +8,26 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { buildServer } from "./index.js";
 import { loadConfig } from "./config.js";
-import type { AdminApi, AuditQuery, ConfigPatchResult, AdminConfig } from "./admin-client.js";
+import type { AdminApi, AuditQuery, ConfigPatchResult, AdminConfig, IngestJobInfo } from "./admin-client.js";
 import { consoleAdminIam } from "./testkit.js";
 
 /** 记录每次 audit() 收到的过滤条件,供断言「透传」。 */
 class FakeAdmin implements AdminApi {
+  ingestJobs(): Promise<{ jobs: IngestJobInfo[] }> {
+    return Promise.resolve({ jobs: [] });
+  }
+  ingestJob(_id: string): Promise<IngestJobInfo> {
+    throw new Error("not implemented");
+  }
+  createIngestJob(_body: Parameters<AdminApi["createIngestJob"]>[0]): Promise<IngestJobInfo> {
+    throw new Error("not implemented");
+  }
+  ingestJobAction(_id: string, _action: "pause" | "resume" | "cancel"): Promise<IngestJobInfo> {
+    throw new Error("not implemented");
+  }
+  deleteIngestJob(_id: string): Promise<Record<string, unknown>> {
+    return Promise.resolve({ deleted: _id });
+  }
   statusData: Record<string, unknown> = {};
   auditCalls: AuditQuery[] = [];
   lastPatch: Record<string, unknown> | null = null;

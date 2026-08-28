@@ -15,6 +15,7 @@
  *   GET  /api/buckets/{name}/objects      对象浏览(数据面 ListObjectsV2)
  *   POST /api/buckets/{name}/presign      签发 PUT/GET 预签名 URL
  *   POST /api/buckets/{name}/objects/zip  M19 U2:勾选对象打包 zip 流式下载(超限 413)
+ *   M19 M3:GET/POST /api/ingest/jobs[...](迁入向导代理;ADR-24 DR5)
  *   POST /api/buckets/{name}/multipart/{init|complete|abort}
  *   M10:GET /api/buckets/{name}/versions;POST .../versions/action(restore/delete)
  *   M10:GET/PUT /api/buckets/{name}/versioning;GET/PUT/DELETE .../cors;GET/PUT/DELETE .../policy
@@ -1390,6 +1391,73 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     );
   }
 
+  // ── M19 M3:迁入向导(代理 admin /v1/admin/ingest/*;ADR-24 DR5)──
+  // 动作:List/Get = 管理面读(diagnostics 覆盖);Create/Update/Delete =
+  // consoleAdmin 域(迁入 = 集群写操作,与 admin:ClusterWrite 同级口径)。
+  app.get(
+    "/api/ingest/jobs",
+    { preHandler: requireIamAction(admin, "admin:ListIngestJobs") },
+    async (_req, reply) => {
+      try {
+        return await admin.ingestJobs();
+      } catch (e) {
+        return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+      }
+    },
+  );
+  app.get<{ Params: { id: string } }>(
+    "/api/ingest/jobs/:id",
+    { preHandler: requireIamAction(admin, "admin:GetIngestJob") },
+    async (req, reply) => {
+      try {
+        return await admin.ingestJob(req.params.id);
+      } catch (e) {
+        return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+      }
+    },
+  );
+  app.post(
+    "/api/ingest/jobs",
+    { preHandler: requireIamAction(admin, "admin:CreateIngestJob", ownTenant) },
+    async (req, reply) => {
+      try {
+        const body = req.body as unknown;
+        if (!body || typeof body !== "object") {
+          return reply.code(400).send({ error: { code: "bad_request", message: "JSON body required" } });
+        }
+        return await admin.createIngestJob(body as Parameters<AdminClient["createIngestJob"]>[0]);
+      } catch (e) {
+        return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+      }
+    },
+  );
+  app.post<{ Params: { id: string; action: string } }>(
+    "/api/ingest/jobs/:id/:action",
+    { preHandler: requireIamAction(admin, "admin:UpdateIngestJob", ownTenant) },
+    async (req, reply) => {
+      const { id, action } = req.params;
+      if (action !== "pause" && action !== "resume" && action !== "cancel") {
+        return reply.code(404).send({ error: { code: "not_found", message: `unknown action ${action}` } });
+      }
+      try {
+        return await admin.ingestJobAction(id, action);
+      } catch (e) {
+        return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+      }
+    },
+  );
+  app.delete<{ Params: { id: string } }>(
+    "/api/ingest/jobs/:id",
+    { preHandler: requireIamAction(admin, "admin:DeleteIngestJob", ownTenant) },
+    async (req, reply) => {
+      try {
+        return await admin.deleteIngestJob(req.params.id);
+      } catch (e) {
+        return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+      }
+    },
+  );
+
   // ── 密钥管理(M18 C1:legacy 无属主密钥映射 SA 动作族;见 compat) ──
   app.get(
     "/api/keys",
@@ -1791,6 +1859,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       can_diagnostics: await probe("admin:GetDashboard"),
       can_audit: await probe("admin:GetAudit"),
       can_keys: await probe("admin:ListServiceAccounts", caller.tenant),
+      // M19 M3:迁入向导(管理面任务;consoleAdmin 域)
+      can_ingest: await probe("admin:CreateIngestJob"),
     };
   });
 
