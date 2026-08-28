@@ -729,7 +729,9 @@ mod tests {
         let _ = std::fs::remove_file(&stub_rc);
         let _ = std::fs::remove_file(&args_mc);
         let _ = std::fs::remove_file(&args_rc);
-        const { assert!(DEFAULT_SYNC_CONCURRENCY >= 4); }
+        const {
+            assert!(DEFAULT_SYNC_CONCURRENCY >= 4);
+        }
     }
 
     fn stub_script_record(tag: &str, args_file: &std::path::Path) -> std::path::PathBuf {

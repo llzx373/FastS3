@@ -1452,7 +1452,12 @@ async fn concurrent_put_list_no_deadlock() {
                 let mut c = RawClient::connect(addr).await;
                 let key_path = format!("/dl-bucket/k-{i}");
                 let payload = format!("concurrent-payload-{i}").into_bytes();
-                let h = sigv4_headers_unsigned(&host, "PUT", &key_path, &[("content-type", "text/plain")]);
+                let h = sigv4_headers_unsigned(
+                    &host,
+                    "PUT",
+                    &key_path,
+                    &[("content-type", "text/plain")],
+                );
                 let (sp, _, pb) = c.send(render_chunked_put(&key_path, &h, &payload)).await;
                 let h = sigv4_headers(&host, "GET", "/dl-bucket", &[], &[], b"");
                 let (sl, _, _) = c.send(render_request("GET", "/dl-bucket", &h, b"")).await;
@@ -1490,4 +1495,3 @@ async fn concurrent_put_list_no_deadlock() {
     let (status, _, body) = client.send(render_request("GET", "/", &h, b"")).await;
     assert_eq!(status, 200, "ListBuckets after mix: {body:?}");
 }
-

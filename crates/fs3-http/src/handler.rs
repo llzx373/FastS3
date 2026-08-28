@@ -51,11 +51,9 @@ pub async fn serve_connection(
     service.set_peer(&peer);
     // 设备 fd 白名单:engine.read() 不得在 reactor 上取(与流式 PUT 写锁互等)
     let svc_fd = service.clone();
-    let (dev_fd, zc) = tokio::task::spawn_blocking(move || {
-        (svc_fd.device_fd(), svc_fd.zc_fds())
-    })
-    .await
-    .unwrap_or((0, Vec::new()));
+    let (dev_fd, zc) = tokio::task::spawn_blocking(move || (svc_fd.device_fd(), svc_fd.zc_fds()))
+        .await
+        .unwrap_or((0, Vec::new()));
     crate::zero_copy::register_trusted_fd(dev_fd);
     for fd in zc.into_iter().flatten() {
         crate::zero_copy::register_trusted_fd(fd);

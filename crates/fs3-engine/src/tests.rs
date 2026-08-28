@@ -2497,9 +2497,7 @@ fn g2_mixed_crash_reopen_200_rounds() {
             );
 
             let uid = e
-                .create_multipart(
-                    "b1", "mp", None, vec![], vec![], vec![], None, None, None,
-                )
+                .create_multipart("b1", "mp", None, vec![], vec![], vec![], None, None, None)
                 .unwrap();
             let up1 = e
                 .upload_part(&uid, 1, &mut Cursor::new(p1b.clone()), None, None)
@@ -2563,7 +2561,10 @@ fn g2_mixed_crash_reopen_200_rounds() {
 
             let mut out = Vec::new();
             e.get_to("b1", "cow-src", 0..COW as u64, &mut out).unwrap();
-            assert_eq!(out, cow, "round {round}: COW source torn after delete clone");
+            assert_eq!(
+                out, cow,
+                "round {round}: COW source torn after delete clone"
+            );
 
             out.clear();
             e.get_to("b1", "glac", 0..GLAC as u64, &mut out).unwrap();

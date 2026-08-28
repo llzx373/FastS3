@@ -783,10 +783,8 @@ mod tests {
         let live = pattern_bytes(2 * 1024 * 1024, 0x5A);
         e.put("b1", "fill0", &mut Cursor::new(fill.clone()))
             .unwrap();
-        e.put("b1", "fill1", &mut Cursor::new(fill))
-            .unwrap();
-        e.put("b1", "live", &mut Cursor::new(live.clone()))
-            .unwrap();
+        e.put("b1", "fill1", &mut Cursor::new(fill)).unwrap();
+        e.put("b1", "live", &mut Cursor::new(live.clone())).unwrap();
         e.delete("b1", "fill0").unwrap();
         e.delete("b1", "fill1").unwrap();
         let segs = e
@@ -917,23 +915,17 @@ mod tests {
             .and_then(|s| s.split("\n## ").next())
             .expect("M16 body");
         for id in [
-            "A0-1", "A1-1", "A1-2", "A1-3", "A2-1", "A2-2", "A2-3", "A2-4", "A3-1", "A3-2",
-            "A3-3", "A4-1", "A5-1", "A5-2", "A5-3", "A5-4", "R1-1", "R1-2", "R1-3", "R1-4",
-            "R1-5", "L1-1", "L1-2", "L1-3", "L1-4",
+            "A0-1", "A1-1", "A1-2", "A1-3", "A2-1", "A2-2", "A2-3", "A2-4", "A3-1", "A3-2", "A3-3",
+            "A4-1", "A5-1", "A5-2", "A5-3", "A5-4", "R1-1", "R1-2", "R1-3", "R1-4", "R1-5", "L1-1",
+            "L1-2", "L1-3", "L1-4",
         ] {
             let line = m16_body
                 .lines()
                 .find(|l| l.contains(id))
                 .unwrap_or_else(|| panic!("missing {id}"));
-            assert!(
-                line.contains("- [x]"),
-                "主力项 {id} 须已勾选: {line}"
-            );
+            assert!(line.contains("- [x]"), "主力项 {id} 须已勾选: {line}");
         }
-        let a52 = m16_body
-            .lines()
-            .find(|l| l.contains("A5-2"))
-            .expect("A5-2");
+        let a52 = m16_body.lines().find(|l| l.contains("A5-2")).expect("A5-2");
         assert!(
             !a52.contains("未复核"),
             "F8 完成后 A5-2 不得再写压缩并发未复核: {a52}"
@@ -971,7 +963,9 @@ mod tests {
             );
         }
         assert!(
-            panorama.contains("Batch") || panorama.contains("BPA") || panorama.contains("PublicAccessBlock"),
+            panorama.contains("Batch")
+                || panorama.contains("BPA")
+                || panorama.contains("PublicAccessBlock"),
             "残余缺口须仍列出 Batch/BPA"
         );
     }
@@ -980,10 +974,7 @@ mod tests {
     #[test]
     fn license_caliber_apache20_no_pending() {
         let readme = include_str!("../../../README.md");
-        assert!(
-            !readme.contains("待定"),
-            "README 不得再含「待定」"
-        );
+        assert!(!readme.contains("待定"), "README 不得再含「待定」");
         assert!(
             readme.contains("Apache-2.0"),
             "README 许可证节须声明 Apache-2.0"
@@ -1004,8 +995,14 @@ mod tests {
         );
         for (label, body) in [
             ("web", include_str!("../../../web/package.json")),
-            ("web/server", include_str!("../../../web/server/package.json")),
-            ("web/console", include_str!("../../../web/console/package.json")),
+            (
+                "web/server",
+                include_str!("../../../web/server/package.json"),
+            ),
+            (
+                "web/console",
+                include_str!("../../../web/console/package.json"),
+            ),
         ] {
             assert!(
                 body.contains("\"license\": \"Apache-2.0\""),
@@ -1062,8 +1059,7 @@ mod tests {
             "无环境须非零退出或明确 SKIP 计数"
         );
         assert!(
-            !sh.contains("exit 0")
-                || sh.contains("spark_trino_smoke: PASS"),
+            !sh.contains("exit 0") || sh.contains("spark_trino_smoke: PASS"),
             "exit 0 仅允许全绿 PASS 路径"
         );
         let probe_spark = sh
@@ -1158,18 +1154,12 @@ mod tests {
     #[test]
     fn s3_gap_m17_deadlock_hadoop_bpa_audit() {
         let gap = include_str!("../../../docs/S3-GAP.md");
-        let s9 = gap
-            .split("## 9. 已知问题与规避")
-            .nth(1)
-            .expect("S3-GAP §9");
+        let s9 = gap.split("## 9. 已知问题与规避").nth(1).expect("S3-GAP §9");
         assert!(
             s9.contains("已修复") && s9.contains("mc_mirror_concurrency.sh"),
             "§9 死锁须改为已修复并指向 D1 harness"
         );
-        assert!(
-            !s9.contains("待专项立项"),
-            "§9 不得再写死锁待立项"
-        );
+        assert!(!s9.contains("待专项立项"), "§9 不得再写死锁待立项");
         assert!(
             gap.contains("冒烟通过") && gap.contains("PublicAccessBlock **桶级 ✅ v2.3"),
             "Hadoop 冒烟与桶级 BPA 须同步"
@@ -1215,10 +1205,7 @@ mod tests {
             archive.contains("不以") && archive.contains("100%"),
             "归档行须明确不以 100% 声称: {archive}"
         );
-        assert!(
-            archive.contains("自有集成测试"),
-            "归档权威须为自有集成测试"
-        );
+        assert!(archive.contains("自有集成测试"), "归档权威须为自有集成测试");
         let notify = readme
             .lines()
             .find(|l| l.contains("通知(Notification)") || l.contains("Notification"))
@@ -1235,10 +1222,7 @@ mod tests {
             .lines()
             .find(|l| l.contains("N5 s3-tests"))
             .expect("N5");
-        assert!(
-            !n5.contains("且 100%"),
-            "N5 不得再写 s3-tests 100%: {n5}"
-        );
+        assert!(!n5.contains("且 100%"), "N5 不得再写 s3-tests 100%: {n5}");
         let a51 = include_str!("../../../docs/archive/TODO-v2.2.1.md")
             .lines()
             .find(|l| l.contains("A5-1 s3-tests"))
@@ -1307,10 +1291,7 @@ mod tests {
             "M15 报告须承接 M16 覆盖率 83.89%"
         );
         let m16 = include_str!("../../../docs/perf-M16.md");
-        assert!(
-            m16.contains("83.89%"),
-            "仓内 M16 报告须含门禁覆盖率 83.89%"
-        );
+        assert!(m16.contains("83.89%"), "仓内 M16 报告须含门禁覆盖率 83.89%");
         assert!(
             v21.contains("perf-M15.md") && v21.contains("perf-M16.md"),
             "CHANGELOG v2.1 须指向两份报告的承接关系"
@@ -1422,18 +1403,12 @@ mod tests {
             cl.contains("## v2.2.1 — 审查修复"),
             "CHANGELOG 须有 v2.2.1 节"
         );
-        assert!(
-            cl.contains("本版本不打 tag"),
-            "v2.2.1 须声明不打 tag"
-        );
+        assert!(cl.contains("本版本不打 tag"), "v2.2.1 须声明不打 tag");
         let rel = include_str!("../../../RELEASES.md");
         assert!(rel.contains("## v2.2.1 — 审查修复"));
         assert!(rel.contains("本版本不打 tag"));
         let todo = include_str!("../../../docs/archive/TODO-v2.2.1.md");
-        assert!(
-            todo.contains("- [x] D1 S8"),
-            "G6 要求债务轨道 D1 保持勾选"
-        );
+        assert!(todo.contains("- [x] D1 S8"), "G6 要求债务轨道 D1 保持勾选");
         assert!(todo.contains("- [x] G6 发布 v2.2.1"));
     }
 

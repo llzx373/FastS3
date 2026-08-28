@@ -610,6 +610,10 @@ mod tests {
         let e = drain_cqe_results(&[-5, 0, 32]).unwrap_err();
         assert_eq!(e.raw_os_error(), Some(5));
         let e = drain_cqe_results(&[4, -11, -22]).unwrap_err();
-        assert_eq!(e.raw_os_error(), Some(11), "must keep first error after draining rest");
+        assert_eq!(
+            e.raw_os_error(),
+            Some(11),
+            "must keep first error after draining rest"
+        );
     }
 }
