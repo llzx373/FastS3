@@ -12092,3 +12092,99 @@ fn i2_legacy_key_dual_read_orphan_auth_succeeds() {
     });
     assert_eq!(status(&r), 200, "孤儿密钥(legacy V1)鉴权成功: {r:?}");
 }
+
+// ───────────────────── M18 U1:IAM 用户数据面(ADR-28 DI2.4/DI7.3)─────────────────────
+
+/// M18 U1(ADR-28 DI2.4):User **无** SigV4 secret —— 以用户名 + 控制台
+/// 口令伪造 SigV4 签名必失败(无任何代码路径把 User 映射为数据面凭据),
+/// 协议码 InvalidAccessKeyId(TODO M18/U1 钉死用例名)。
+#[test]
+fn iam_user_cannot_sigv4_without_sa() {
+    let (_d, svc) = setup();
+    let salt = fs3_core::IamUser::new_password_salt().unwrap();
+    let alice = fs3_core::IamUser {
+        tenant_id: "default".into(),
+        name: "alice".into(),
+        enabled: true,
+        password_hash: Some(fs3_core::IamUser::hash_password(&salt, "console-pw")),
+        password_salt: Some(salt),
+        policies: vec![],
+        groups: vec![],
+        display_name: None,
+        created_at: 1_700_000_000,
+    };
+    svc.put_iam_user(&alice).unwrap();
+    // 用户名作 access_key、控制台口令作 secret → 拒绝(口令 ≠ 数据面 secret)
+    let creds = Credentials {
+        access_key: "alice".into(),
+        secret_key: "console-pw".into(),
+    };
+    let r = svc.handle(&req_creds("GET", "/", &creds, &[], vec![]));
+    assert_eq!(err_code(&r), "InvalidAccessKeyId", "{r:?}");
+    // 既存密钥不受影响
+    assert_eq!(status(&svc.handle(&req("GET", "/", vec![]))), 200);
+}
+
+/// M18 U1(ADR-28 DI7.3;TODO M18/U1):禁用用户 → 其全部 SA 鉴权失败,
+/// 协议码钉死 InvalidAccessKeyId(与密钥禁用/不存在同义),审计侧写
+/// user_disabled;重新启用即时恢复(无需重启);构造注入的存量密钥
+/// (无 `iu:` 属主记录)按 bootstrap 存活语义不受影响。
+#[test]
+fn disabled_user_sas_fail_auth() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/u1bkt", vec![]))), 200);
+    // 创建用户 + 其名下 SA(add_key_owned;S1 服务账号路径)
+    let alice = fs3_core::IamUser {
+        tenant_id: "default".into(),
+        name: "alice".into(),
+        enabled: true,
+        password_hash: None,
+        password_salt: None,
+        policies: vec![],
+        groups: vec![],
+        display_name: None,
+        created_at: 1_700_000_000,
+    };
+    svc.put_iam_user(&alice).unwrap();
+    svc.add_key_owned(
+        "AKIA_ALICE",
+        "alice-sa-secret",
+        None,
+        "default",
+        "alice",
+        Some("ci".into()),
+    )
+    .unwrap();
+    let sa = Credentials {
+        access_key: "AKIA_ALICE".into(),
+        secret_key: "alice-sa-secret".into(),
+    };
+    // SA 正常读写
+    let r = svc.handle(&req_creds("PUT", "/u1bkt/k", &sa, &[], b"x".to_vec()));
+    assert_eq!(status(&r), 200, "SA 启用时可写: {r:?}");
+    // 禁用用户 → SA 立即 InvalidAccessKeyId(读/写同判)
+    svc.set_iam_user_enabled("default", "alice", false).unwrap();
+    for (m, path) in [("GET", "/u1bkt/k"), ("PUT", "/u1bkt/k2")] {
+        let r = svc.handle(&req_creds(m, path, &sa, &[], b"y".to_vec()));
+        assert_eq!(err_code(&r), "InvalidAccessKeyId", "{m} {path}: {r:?}");
+    }
+    // 审计侧写 user_disabled(附着在 403 记录上;区别于 key_disabled)
+    let ring = svc.audit().search(&fs3_core::audit::AuditFilter::default());
+    assert_eq!(ring[0].status, 403);
+    assert_eq!(
+        ring[0].auth_note.as_deref(),
+        Some("user_disabled"),
+        "{:?}",
+        ring[0]
+    );
+    // 存量密钥(构造注入,无 iu: 属主)= bootstrap 存活语义,不受影响
+    assert_eq!(
+        status(&svc.handle(&req("GET", "/u1bkt/k", vec![]))),
+        200,
+        "legacy 密钥不受用户禁用影响"
+    );
+    // 重新启用 → 即时恢复
+    svc.set_iam_user_enabled("default", "alice", true).unwrap();
+    let r = svc.handle(&req_creds("GET", "/u1bkt/k", &sa, &[], vec![]));
+    assert_eq!(status(&r), 200, "重新启用即时恢复: {r:?}");
+}

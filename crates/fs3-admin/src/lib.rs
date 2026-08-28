@@ -19,6 +19,11 @@
 //! - `GET  /v1/iam/tenants/{id}`                租户详情
 //! - `PATCH /v1/iam/tenants/{id}`               更新 display_name/enabled
 //! - `DELETE /v1/iam/tenants/{id}`              删除租户(default/非空拒绝)
+//! - `GET  /v1/iam/users?tenant=`               用户列表(M18 U1;默认 default 租户)
+//! - `POST /v1/iam/users`                       创建用户(tenant/name/password?/display_name?;口令只收明文一次、只存加盐哈希)
+//! - `GET  /v1/iam/users/{tenant}/{name}`       用户详情(绝不含口令哈希)
+//! - `PATCH /v1/iam/users/{tenant}/{name}`      更新 enabled/password/display_name/policies(整表替换)
+//! - `DELETE /v1/iam/users/{tenant}/{name}`     删除用户(持有 SA → 409;bootstrap → 400)
 //! - `GET  /v1/admin/uploads`                   在途 multipart 会话
 //! - `POST /v1/admin/uploads/{id}/abort`        强制中止会话
 //! - `GET  /v1/admin/audit?limit=`              审计日志
@@ -463,7 +468,7 @@ impl AdminServer {
         }
         let rest = &segs[2..];
         if segs[1] == "iam" {
-            return self.dispatch_iam(method, rest, body);
+            return self.dispatch_iam(method, rest, query, body);
         }
         match (method.as_str(), rest) {
             ("GET", ["status"]) => self.handle_status(),
@@ -508,13 +513,25 @@ impl AdminServer {
 
     /// M18 I1(ADR-28 DI8):`/v1/iam/*` 路由。admin 通道 = root 可信
     /// (静态 Bearer token / unix 0600),`admin:*` IAM 授权细分属 C1。
-    fn dispatch_iam(&self, method: &Method, rest: &[&str], body: &[u8]) -> Response<String> {
+    fn dispatch_iam(
+        &self,
+        method: &Method,
+        rest: &[&str],
+        query: &[(String, String)],
+        body: &[u8],
+    ) -> Response<String> {
         match (method.as_str(), rest) {
             ("GET", ["tenants"]) => self.handle_tenants_list(),
             ("POST", ["tenants"]) => self.handle_tenant_create(body),
             ("GET", ["tenants", id]) => self.handle_tenant_get(id),
             ("PATCH", ["tenants", id]) => self.handle_tenant_patch(id, body),
             ("DELETE", ["tenants", id]) => self.handle_tenant_delete(id),
+            // M18 U1(ADR-28 DI2.1/DI8):用户 CRUD(租户内)
+            ("GET", ["users"]) => self.handle_users_list(query),
+            ("POST", ["users"]) => self.handle_user_create(body),
+            ("GET", ["users", tenant, name]) => self.handle_user_get(tenant, name),
+            ("PATCH", ["users", tenant, name]) => self.handle_user_patch(tenant, name, body),
+            ("DELETE", ["users", tenant, name]) => self.handle_user_delete(tenant, name),
             _ => json::err(StatusCode::NOT_FOUND, "not_found", "unknown iam endpoint"),
         }
     }
@@ -1573,6 +1590,371 @@ impl AdminServer {
                 "tenant_not_empty",
                 &format!("tenant {tenant_id} still has iam entities"),
             ),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    // ───────────────────── M18 U1:IAM 用户(ADR-28 DI2.1/DI7.3/DI8)─────────────────────
+
+    /// 用户 JSON 视图。**绝不含** password_hash/password_salt(口令材料
+    /// 零回显,同密钥列表不返回 secret 的红线)。
+    fn user_json(u: &fs3_core::IamUser) -> serde_json::Value {
+        serde_json::json!({
+            "tenant_id": u.tenant_id,
+            "name": u.name,
+            "enabled": u.enabled,
+            "display_name": u.display_name,
+            "policies": u.policies,
+            "groups": u.groups,
+            // 口令是否已设置(布尔,不回显哈希)
+            "has_password": u.password_hash.is_some(),
+            "created_at": u.created_at,
+        })
+    }
+
+    /// GET /v1/iam/users?tenant=:租户内用户列表(缺省 tenant = default)。
+    fn handle_users_list(&self, query: &[(String, String)]) -> Response<String> {
+        let tenant = query
+            .iter()
+            .find(|(k, _)| k == "tenant")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or(fs3_core::Tenant::DEFAULT_TENANT);
+        let engine = self.engine.read();
+        match engine.meta().list_iam_users_in(tenant) {
+            Ok(users) => json::ok(serde_json::json!({
+                "tenant_id": tenant,
+                "users": users.iter().map(Self::user_json).collect::<Vec<_>>(),
+            })),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    /// POST /v1/iam/users:创建用户。body:`name`(必填,字符集同
+    /// validate_iam_name)、`tenant`(可选,缺省 default;租户须已存在)、
+    /// `password`(可选;明文**仅此一次**入站,只存加盐哈希,响应零回显)、
+    /// `display_name`(可选)。同名 → 409。User 无 SigV4 secret(ADR-28
+    /// DI2.4:数据面访问走 SA,属 S1)。
+    fn handle_user_create(&self, body: &[u8]) -> Response<String> {
+        let parsed: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(_) => {
+                return json::err(StatusCode::BAD_REQUEST, "bad_request", "invalid JSON body")
+            }
+        };
+        let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if name.is_empty() {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "missing required field: name",
+            );
+        }
+        let tenant = parsed
+            .get("tenant")
+            .and_then(|v| v.as_str())
+            .unwrap_or(fs3_core::Tenant::DEFAULT_TENANT);
+        if let Err(e) = fs3_meta::keys::validate_iam_name(name) {
+            return json::err(StatusCode::BAD_REQUEST, "invalid_name", &e.to_string());
+        }
+        if let Err(e) = fs3_meta::keys::validate_iam_name(tenant) {
+            return json::err(StatusCode::BAD_REQUEST, "invalid_name", &e.to_string());
+        }
+        let display_name = parsed
+            .get("display_name")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        // 口令 → 加盐哈希(HMAC-SHA256;明文就此丢弃)
+        let (password_hash, password_salt) = match parsed.get("password") {
+            None | Some(serde_json::Value::Null) => (None, None),
+            Some(serde_json::Value::String(pw)) => {
+                if pw.is_empty() {
+                    return json::err(
+                        StatusCode::BAD_REQUEST,
+                        "bad_request",
+                        "password must be a non-empty string",
+                    );
+                }
+                let salt = match fs3_core::IamUser::new_password_salt() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return json::err(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "internal",
+                            &e.to_string(),
+                        )
+                    }
+                };
+                (
+                    Some(fs3_core::IamUser::hash_password(&salt, pw)),
+                    Some(salt),
+                )
+            }
+            Some(other) => {
+                return json::err(
+                    StatusCode::BAD_REQUEST,
+                    "bad_request",
+                    &format!("password must be a string or null, got {other}"),
+                )
+            }
+        };
+        let engine = self.engine.read();
+        match engine.meta().get_tenant(tenant) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return json::err(
+                    StatusCode::NOT_FOUND,
+                    "no_such_tenant",
+                    &format!("tenant {tenant}"),
+                )
+            }
+            Err(e) => {
+                return json::err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    &e.to_string(),
+                )
+            }
+        }
+        match engine.meta().get_iam_user(tenant, name) {
+            Ok(Some(_)) => {
+                return json::err(
+                    StatusCode::CONFLICT,
+                    "user_exists",
+                    &format!("user {tenant}/{name} already exists"),
+                )
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return json::err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    &e.to_string(),
+                )
+            }
+        }
+        drop(engine);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let user = fs3_core::IamUser {
+            tenant_id: tenant.to_string(),
+            name: name.to_string(),
+            enabled: true,
+            password_hash,
+            password_salt,
+            policies: Vec::new(),
+            groups: Vec::new(),
+            display_name,
+            created_at: now,
+        };
+        match self.service.put_iam_user(&user) {
+            Ok(()) => json::ok(Self::user_json(&user)),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    /// GET /v1/iam/users/{tenant}/{name}:单个用户(不存在 → 404)。
+    fn handle_user_get(&self, tenant: &str, name: &str) -> Response<String> {
+        let engine = self.engine.read();
+        match engine.meta().get_iam_user(tenant, name) {
+            Ok(Some(u)) => json::ok(Self::user_json(&u)),
+            Ok(None) => json::err(
+                StatusCode::NOT_FOUND,
+                "no_such_user",
+                &format!("user {tenant}/{name}"),
+            ),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    /// PATCH /v1/iam/users/{tenant}/{name}:body 可含 `enabled`(bool;
+    /// 禁用 → 其全部 SA 鉴权立即失败,DI7.3)、`password`(string = 重设
+    /// 口令[重新加盐哈希];null = 清除本地口令)、`display_name`
+    /// (string/null)、`policies`(string 数组 = **整表替换**,v1 语义;
+    /// 逐个按 validate_iam_name 校验)。`default/bootstrap` 隐藏引导用户
+    /// 恒拒绝(升级内部用途,不参与日常登录/禁用,DI7.1)。组成员编辑属
+    /// U2(groups 字段已存在,本端点不改)。
+    fn handle_user_patch(&self, tenant: &str, name: &str, body: &[u8]) -> Response<String> {
+        if tenant == fs3_core::Tenant::DEFAULT_TENANT && name == fs3_core::IamUser::BOOTSTRAP_USER {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "bootstrap user is upgrade-internal and cannot be modified (ADR-28 DI7.1)",
+            );
+        }
+        let parsed: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(_) => {
+                return json::err(StatusCode::BAD_REQUEST, "bad_request", "invalid JSON body")
+            }
+        };
+        let mut user = {
+            let engine = self.engine.read();
+            match engine.meta().get_iam_user(tenant, name) {
+                Ok(Some(u)) => u,
+                Ok(None) => {
+                    return json::err(
+                        StatusCode::NOT_FOUND,
+                        "no_such_user",
+                        &format!("user {tenant}/{name}"),
+                    )
+                }
+                Err(e) => {
+                    return json::err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal",
+                        &e.to_string(),
+                    )
+                }
+            }
+        };
+        let mut applied = Vec::new();
+        if let Some(enabled) = parsed.get("enabled").and_then(|v| v.as_bool()) {
+            user.enabled = enabled;
+            applied.push("enabled");
+        }
+        if let Some(v) = parsed.get("password") {
+            match v {
+                serde_json::Value::Null => {
+                    user.password_hash = None;
+                    user.password_salt = None;
+                    applied.push("password");
+                }
+                serde_json::Value::String(pw) if !pw.is_empty() => {
+                    let salt = match fs3_core::IamUser::new_password_salt() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return json::err(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "internal",
+                                &e.to_string(),
+                            )
+                        }
+                    };
+                    user.password_hash = Some(fs3_core::IamUser::hash_password(&salt, pw));
+                    user.password_salt = Some(salt);
+                    applied.push("password");
+                }
+                other => {
+                    return json::err(
+                        StatusCode::BAD_REQUEST,
+                        "bad_request",
+                        &format!("password must be a non-empty string or null, got {other}"),
+                    )
+                }
+            }
+        }
+        if let Some(v) = parsed.get("display_name") {
+            match v {
+                serde_json::Value::Null => {
+                    user.display_name = None;
+                    applied.push("display_name");
+                }
+                serde_json::Value::String(s) => {
+                    user.display_name = Some(s.clone());
+                    applied.push("display_name");
+                }
+                other => {
+                    return json::err(
+                        StatusCode::BAD_REQUEST,
+                        "bad_request",
+                        &format!("display_name must be a string or null, got {other}"),
+                    )
+                }
+            }
+        }
+        if let Some(v) = parsed.get("policies") {
+            match v.as_array() {
+                Some(arr) => {
+                    let mut policies = Vec::with_capacity(arr.len());
+                    for p in arr {
+                        match p.as_str() {
+                            Some(s) => {
+                                if let Err(e) = fs3_meta::keys::validate_iam_name(s) {
+                                    return json::err(
+                                        StatusCode::BAD_REQUEST,
+                                        "invalid_name",
+                                        &e.to_string(),
+                                    );
+                                }
+                                policies.push(s.to_string());
+                            }
+                            None => {
+                                return json::err(
+                                    StatusCode::BAD_REQUEST,
+                                    "bad_request",
+                                    "policies must be an array of strings",
+                                )
+                            }
+                        }
+                    }
+                    user.policies = policies;
+                    applied.push("policies");
+                }
+                None => {
+                    return json::err(
+                        StatusCode::BAD_REQUEST,
+                        "bad_request",
+                        "policies must be an array of strings",
+                    )
+                }
+            }
+        }
+        if applied.is_empty() {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "missing required field: enabled, password, display_name and/or policies",
+            );
+        }
+        match self.service.put_iam_user(&user) {
+            Ok(()) => json::ok(Self::user_json(&user)),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    /// DELETE /v1/iam/users/{tenant}/{name}:删除用户。持有 SA(属主等于
+    /// 本用户的 `k:` 密钥)→ 409(SA 须先吊销,无孤儿不变量);
+    /// `default/bootstrap` → 400(DI7.1);不存在 → 404。
+    fn handle_user_delete(&self, tenant: &str, name: &str) -> Response<String> {
+        if tenant == fs3_core::Tenant::DEFAULT_TENANT && name == fs3_core::IamUser::BOOTSTRAP_USER {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "bootstrap user cannot be deleted (ADR-28 DI7.1)",
+            );
+        }
+        match self.service.delete_iam_user(tenant, name) {
+            Ok(()) => json::ok(serde_json::json!({"deleted": name, "tenant_id": tenant})),
+            Err(fs3_core::Error::NotFound(_)) => json::err(
+                StatusCode::NOT_FOUND,
+                "no_such_user",
+                &format!("user {tenant}/{name}"),
+            ),
+            Err(fs3_core::Error::InvalidArgument(m)) => {
+                json::err(StatusCode::CONFLICT, "user_has_service_accounts", &m)
+            }
             Err(e) => json::err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",

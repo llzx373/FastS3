@@ -159,6 +159,17 @@ pub struct S3Service {
     /// 失效,CreateBucket/DeleteBucket 同步失效(防删桶重建后陈旧策略复活)。
     bucket_policies:
         std::sync::Mutex<std::collections::HashMap<String, Option<crate::policy::Policy>>>,
+    /// IAM 用户状态(M18 U1;ADR-28 DI7.3):(tenant, user) → enabled。
+    /// 启动时随 restore_keys_from_meta 加载;admin 用户 CRUD 经
+    /// put_iam_user/delete_iam_user 双写(meta + 本表),禁用即时生效。
+    /// 缺席 = 无 `iu:` 记录 → 按存活处理(预 M18 密钥无用户记录;
+    /// compat 钉死)。
+    iam_users: std::sync::Mutex<std::collections::HashMap<(String, String), bool>>,
+    /// 密钥 → IAM 属主(access_key → (tenant_id, owner_user))。与认证表
+    /// 同步维护(add_key_owned/remove_key/restore);缺席 = 构造注入的
+    /// 初始密钥(S3Service::new 的 keys 参数,无 `k:` 记录)→ bootstrap
+    /// 存活语义(compat 钉死)。
+    key_owners: std::sync::Mutex<std::collections::HashMap<String, (String, String)>>,
 }
 
 /// M12 W3-2:单请求 Object Lock 审计暂存(成功路径写入,handle 收割)。
@@ -225,6 +236,8 @@ impl S3Service {
             cache: None,
             policies: std::sync::Mutex::new(std::collections::HashMap::new()),
             bucket_policies: std::sync::Mutex::new(std::collections::HashMap::new()),
+            iam_users: std::sync::Mutex::new(std::collections::HashMap::new()),
+            key_owners: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_clock_secs: std::sync::atomic::AtomicI64::new(unix_now() as i64),
         }
     }
@@ -344,8 +357,38 @@ impl S3Service {
             .find(|k| k.access_key == ak);
         match rec {
             Some(r) if !r.enabled => Some("key_disabled".into()),
-            Some(_) => None, // 启用密钥:签名/时间等普通失败,不侧写
+            Some(r) => {
+                // M18 U1(ADR-28 DI7.3):密钥启用但属主用户已禁用 → 协议码
+                // 维持 InvalidAccessKeyId,侧写区分 user_disabled。属主无
+                // `iu:` 记录(legacy/孤儿)→ 按存活处理,不侧写。
+                if self.iam_user_disabled(&r.tenant_id, &r.owner_user) {
+                    Some("user_disabled".into())
+                } else {
+                    None // 启用密钥 + 存活用户:签名/时间等普通失败,不侧写
+                }
+            }
             None => Some("key_not_found".into()),
+        }
+    }
+
+    /// M18 U1(ADR-28 DI7.3):属主用户是否已禁用(仅「已知用户记录且
+    /// disabled」为真;无 `iu:` 记录 → false,按 bootstrap 存活处理)。
+    fn iam_user_disabled(&self, tenant: &str, user: &str) -> bool {
+        self.iam_users
+            .lock()
+            .unwrap()
+            .get(&(tenant.to_string(), user.to_string()))
+            .is_some_and(|enabled| !*enabled)
+    }
+
+    /// M18 U1(ADR-28 DI7.3):密钥属主用户是否已禁用(数据面强制执行
+    /// 判定)。密钥无属主记录(构造注入的初始密钥)或属主无 `iu:` 记录
+    /// → false(bootstrap 存活语义,compat 钉死)。
+    fn iam_owner_disabled(&self, access_key: &str) -> bool {
+        let owner = self.key_owners.lock().unwrap().get(access_key).cloned();
+        match owner {
+            Some((tenant, user)) => self.iam_user_disabled(&tenant, &user),
+            None => false,
         }
     }
 
@@ -448,6 +491,11 @@ impl S3Service {
                 secret_key: secret.to_string(),
             });
         }
+        // M18 U1:属主索引(DI7.3 禁用用户 → SA 失效判定用)
+        self.key_owners.lock().unwrap().insert(
+            access_key.to_string(),
+            (tenant_id.to_string(), owner_user.to_string()),
+        );
         Ok(rec)
     }
 
@@ -462,6 +510,7 @@ impl S3Service {
             .key_table()
             .write()
             .retain(|k| k.access_key != access_key);
+        self.key_owners.lock().unwrap().remove(access_key);
         Ok(())
     }
 
@@ -823,12 +872,26 @@ impl S3Service {
     }
 
     /// 从 meta 恢复全部运行时密钥到认证表(启动时调用;跳过禁用/解密失败)。
+    /// M18 U1 起同事恢复 IAM 用户状态表与密钥属主索引(DI7.3 禁用用户 →
+    /// 其 SA 鉴权失败的内存判定依据;重启后禁用语义不丢失)。
     pub fn restore_keys_from_meta(&self) -> Result<usize, S3Error> {
         let engine = self.engine.read();
         let seed = engine
             .meta()
             .seed_salt()
             .map_err(|e| map_engine_error(e, "", ""))?;
+        // IAM 用户状态全量加载(已知用户才参与禁用判定;缺席 = 存活)
+        {
+            let users = engine
+                .meta()
+                .list_iam_users()
+                .map_err(|e| map_engine_error(e, "", ""))?;
+            let mut map = self.iam_users.lock().unwrap();
+            map.clear();
+            for u in users {
+                map.insert((u.tenant_id, u.name), u.enabled);
+            }
+        }
         let mut restored = 0usize;
         let mut table = self.auth.key_table().write();
         let mut policies = self.policies.lock().unwrap();
@@ -843,6 +906,11 @@ impl S3Service {
                 rec.policy
                     .as_deref()
                     .and_then(|t| crate::policy::Policy::parse(t).ok()),
+            );
+            // M18 U1:属主索引(无论启用与否;审计侧写 auth_failure_note 用)
+            self.key_owners.lock().unwrap().insert(
+                rec.access_key.clone(),
+                (rec.tenant_id.clone(), rec.owner_user.clone()),
             );
             if !rec.enabled {
                 continue;
@@ -870,6 +938,55 @@ impl S3Service {
     /// 按 access key 查凭据(测试/管理面)。
     pub fn find_key_by_access(&self, access_key: &str) -> Option<Credentials> {
         self.auth.find_key_by_access(access_key)
+    }
+
+    // ── M18 U1:IAM 用户(ADR-28 DI2.1/DI7.3;meta + 内存状态表双写,
+    //    同 add_key/set_key_enabled 先例)。返回 fs3_core::Error 以便
+    //    admin 层按 NotFound/InvalidArgument 映射 404/400/409(同
+    //    租户 handler 直接消费 meta 错误的先例)。 ──
+
+    /// 创建/更新 IAM 用户(覆盖语义;meta 持久化 + 内存状态表即时生效)。
+    /// 口令哈希由调用方预置(IamUser::hash_password;明文永不落盘)。
+    pub fn put_iam_user(&self, user: &fs3_core::IamUser) -> Result<(), fs3_core::Error> {
+        self.engine.read().meta().commit_iam_user_put(user)?;
+        self.iam_users
+            .lock()
+            .unwrap()
+            .insert((user.tenant_id.clone(), user.name.clone()), user.enabled);
+        Ok(())
+    }
+
+    /// 启停 IAM 用户(DI7.3:禁用 → 其全部 SA 鉴权立即失败,无需重启;
+    /// 重新启用即时恢复)。不存在 → NotFound。
+    pub fn set_iam_user_enabled(
+        &self,
+        tenant: &str,
+        name: &str,
+        enabled: bool,
+    ) -> Result<fs3_core::IamUser, fs3_core::Error> {
+        let mut user = self
+            .engine
+            .read()
+            .meta()
+            .get_iam_user(tenant, name)?
+            .ok_or_else(|| fs3_core::Error::NotFound(format!("iam user {tenant}/{name}")))?;
+        user.enabled = enabled;
+        self.put_iam_user(&user)?;
+        Ok(user)
+    }
+
+    /// 删除 IAM 用户(meta 语义:不存在 → NotFound;持有 SA/bootstrap →
+    /// InvalidArgument;内存状态表同步移除)。
+    pub fn delete_iam_user(&self, tenant: &str, name: &str) -> Result<(), fs3_core::Error> {
+        self.engine
+            .read()
+            .meta()
+            .commit_iam_user_delete(tenant, name)?;
+        self.iam_users
+            .lock()
+            .unwrap()
+            .remove(&(tenant.to_string(), name.to_string()));
+        Ok(())
     }
 
     // ── M15 T1/T2:STS 临时凭证(ADR-18 D-E2) ──
@@ -1224,11 +1341,24 @@ impl S3Service {
                     &req.headers,
                 )?;
                 match outcome {
-                    AuthOutcome::Authenticated { access_key, .. } => Ok(Some(access_key)),
+                    AuthOutcome::Authenticated { access_key, .. } => {
+                        // M18 U1(ADR-28 DI7.3):属主用户禁用 → InvalidAccessKeyId
+                        if self.iam_owner_disabled(&access_key) {
+                            return Err(S3Error::new(S3ErrorCode::InvalidAccessKeyId)
+                                .with_message("The access key's owner user is disabled."));
+                        }
+                        Ok(Some(access_key))
+                    }
                     AuthOutcome::Anonymous => Ok(None),
                 }
             }
-            AuthOutcome::Authenticated { access_key, .. } => Ok(Some(access_key)),
+            AuthOutcome::Authenticated { access_key, .. } => {
+                if self.iam_owner_disabled(&access_key) {
+                    return Err(S3Error::new(S3ErrorCode::InvalidAccessKeyId)
+                        .with_message("The access key's owner user is disabled."));
+                }
+                Ok(Some(access_key))
+            }
         }
     }
 
@@ -1293,6 +1423,15 @@ impl S3Service {
                         )),
                     );
                 }
+                // M18 U1(ADR-28 DI7.3):基密钥属主用户被禁用 → 会话同失效
+                // (会话权限 ⊆ 基密钥;同基密钥禁用口径 InvalidToken)
+                if self.iam_owner_disabled(&base_ak) {
+                    return Err(
+                        S3Error::new(S3ErrorCode::InvalidToken).with_message(format!(
+                            "the owner user of the session's base key ({base_ak}) is disabled"
+                        )),
+                    );
+                }
                 drop(base);
                 // 派生临时 secret(确定性派生,数据面可重算验签;库中仅哈希)
                 let base_secret = self
@@ -1347,6 +1486,12 @@ impl S3Service {
                         )?;
                         match outcome {
                             AuthOutcome::Authenticated { access_key, .. } => {
+                                // M18 U1(DI7.3):属主用户禁用 →
+                                // InvalidAccessKeyId(同密钥禁用口径)
+                                if self.iam_owner_disabled(&access_key) {
+                                    return Err(S3Error::new(S3ErrorCode::InvalidAccessKeyId)
+                                        .with_message("The access key's owner user is disabled."));
+                                }
                                 Ok(Some(AuthIdentity {
                                     who: access_key,
                                     session: None,
@@ -1355,10 +1500,16 @@ impl S3Service {
                             AuthOutcome::Anonymous => Ok(None),
                         }
                     }
-                    AuthOutcome::Authenticated { access_key, .. } => Ok(Some(AuthIdentity {
-                        who: access_key,
-                        session: None,
-                    })),
+                    AuthOutcome::Authenticated { access_key, .. } => {
+                        if self.iam_owner_disabled(&access_key) {
+                            return Err(S3Error::new(S3ErrorCode::InvalidAccessKeyId)
+                                .with_message("The access key's owner user is disabled."));
+                        }
+                        Ok(Some(AuthIdentity {
+                            who: access_key,
+                            session: None,
+                        }))
+                    }
                 }
             }
         }
@@ -3589,6 +3740,12 @@ impl S3Service {
                 let policy =
                     crate::post::PostPolicy::parse(&crate::post::decode_policy_field(policy_b64)?)?;
                 policy.verify(bucket, &key, &form, unix_now() as i64)?;
+                // M18 U1(ADR-28 DI7.3):属主用户禁用 → InvalidAccessKeyId
+                // (同密钥禁用口径,compat 钉死)
+                if self.iam_owner_disabled(&access) {
+                    return Err(S3Error::new(S3ErrorCode::InvalidAccessKeyId)
+                        .with_message("The access key's owner user is disabled."));
+                }
                 Some(access)
             }
             None => {

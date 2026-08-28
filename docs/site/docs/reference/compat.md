@@ -140,9 +140,12 @@ meta-export/import 可见并可往返;真实类独立落 ObjectMeta v7 `storage_
 | 租户删除 | `default` 恒拒绝;非空租户(存在 `iu:`/`ig:`/`ip:`/`ir:` 实体,或存在 `tenant_id` 等于该租户的 `k:` 密钥,M18 I2 起)拒绝,不做级联删除 |
 | 密钥属主(M18 I2) | `k:` 值扩展 `tenant_id`/`owner_user`/`embedded_policy`/`sa_name`(ADR-28 DI7.1,postcard 尾部追加);**值版本双读单写**:旧记录读时补默认 tenant=`default`、owner=`bootstrap`、embedded_policy/sa_name=None,写时恒落新格式,不做在线重写 |
 | bootstrap 用户 | 升级迁移(MetaStore::open)创建的**隐藏用户** `iu:default\0bootstrap`:enabled、无控制台口令(display_name 标记 upgrade-internal),仅用于挂载存量孤儿密钥,不参与日常登录 |
-| 用户禁用语义 | 禁用 User → 其全部 SA(数据面 `k:`)鉴权失败,错误码钉死 **InvalidAccessKeyId**(与「密钥不存在/被禁用」同义,口径同上节密钥状态语义);禁用单把 SA 不影响 User 控制台登录(ADR-28 DI7.3;数据面强制执行属 M18 S2) |
+| 用户禁用语义 | 禁用 User → 其全部 SA(数据面 `k:`)鉴权失败,错误码钉死 **InvalidAccessKeyId**(与「密钥不存在/被禁用」同义,口径同上节密钥状态语义);审计侧写新增 `user_disabled` 变体;**强制执行自 M18 U1 起落地**(数据面内存用户状态表,启停即时生效、无需重启;派生会话同失效,口径 InvalidToken);禁用单把 SA 不影响 User 控制台登录(ADR-28 DI7.3) |
+| 缺失用户记录 | 密钥属主无对应 `iu:` 记录(legacy/构造注入密钥)→ **按 bootstrap 存活处理**,照常鉴权,不因缺席而拒绝(U1 钉死;孤儿密钥挂载语义不变) |
+| 用户删除(M18 U1) | 须先吊销其全部 SA(存在属主等于该用户的 `k:` 密钥 → 409);`default/bootstrap` 恒拒绝(400;孤儿密钥挂载点);不做级联删除 |
+| 用户管理面(M18 U1) | `/v1/iam/users` CRUD(root 可信通道):口令仅入站一次、只存加盐哈希、任何响应零回显(列表/详情仅 `has_password` 布尔);PATCH `policies` 为**整表替换**语义(v1);bootstrap 用户不可 PATCH/DELETE |
 | SA 嵌入策略 | `embedded_policy` 与属主生效策略**求交**,Deny 优先(与 policy.rs 现口径一致);完整评估属 M18 S2/U3,I2 仅落数据模型 |
-| 管理面 | Rust admin `/v1/iam/tenants` CRUD(root 可信通道;`admin:*` IAM 授权细分属 M18 C1) |
+| 管理面 | Rust admin `/v1/iam/tenants` + `/v1/iam/users` CRUD(root 可信通道;`admin:*` IAM 授权细分属 M18 C1) |
 | 备份 | meta-export v2 起含 `tenants` 字段,M18 I2 起含 `users` 字段(口令哈希可导出供灾备);旧导出缺省 = 仅 default 租户 + bootstrap 用户;`k:` 旧 JSON 缺属主字段 → 导入补 default/bootstrap;secret 明文仍零导出 |
 
 

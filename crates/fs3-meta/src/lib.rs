@@ -584,6 +584,15 @@ pub enum Op {
     IamUserPut {
         user: fs3_core::IamUser,
     },
+    /// 删除 IAM 用户(M18 U1;ADR-28 DI2.1/DI7.3)。不存在 → NotFound;
+    /// `default/bootstrap` 隐藏引导用户恒拒绝(InvalidArgument;存量
+    /// 孤儿密钥的挂载点,DI7.1);存在属主 (tenant_id, owner_user) 等于
+    /// 本用户的 `k:` 密钥 → InvalidArgument(SA 须先吊销,保持无孤儿
+    /// 不变量;双读:旧记录属主按 default/bootstrap 计)。
+    IamUserDelete {
+        tenant_id: String,
+        name: String,
+    },
     /// 删除 IAM 租户。**非空拒绝**:事务内扫描 `iu:`/`ig:`/`ip:`/`ir:`
     /// 租户子前缀与 `k:` 属主字段(M18 I2),存在任何 IAM 实体或本租户
     /// 持有的密钥 → InvalidArgument。
@@ -3064,6 +3073,15 @@ impl MetaStore {
         self.commit(&[Op::IamUserPut { user: user.clone() }])
     }
 
+    /// 删除 IAM 用户(M18 U1;不存在 → NotFound;bootstrap/持有 SA →
+    /// InvalidArgument,见 Op::IamUserDelete)。
+    pub fn commit_iam_user_delete(&self, tenant: &str, name: &str) -> Result<u64> {
+        self.commit(&[Op::IamUserDelete {
+            tenant_id: tenant.to_string(),
+            name: name.to_string(),
+        }])
+    }
+
     /// 读 IAM 用户。
     pub fn get_iam_user(&self, tenant: &str, name: &str) -> Result<Option<fs3_core::IamUser>> {
         let k = iam_user_key(tenant, name)?;
@@ -3084,6 +3102,24 @@ impl MetaStore {
         {
             let (k, v) = item.map_err(rocks_err)?;
             if !k.starts_with(PREFIX_IAM_USER) {
+                break;
+            }
+            out.push(decode(&v).map_err(|e| Error::Corrupt(format!("iam user record: {e}")))?);
+        }
+        Ok(out)
+    }
+
+    /// 列某租户全部 IAM 用户(M18 U1;`iu:{tenant}\0` 前缀扫描,按 name
+    /// 排序;非法 tenant → InvalidArgument)。
+    pub fn list_iam_users_in(&self, tenant: &str) -> Result<Vec<fs3_core::IamUser>> {
+        let prefix = iam_user_prefix(tenant)?;
+        let mut out = Vec::new();
+        for item in self
+            .db
+            .iterator(IteratorMode::From(&prefix, Direction::Forward))
+        {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(&prefix) {
                 break;
             }
             out.push(decode(&v).map_err(|e| Error::Corrupt(format!("iam user record: {e}")))?);
@@ -4422,6 +4458,37 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
                 tget(tx, &k)?;
                 tinsert(tx, k, encode(user)?)?;
             }
+            Op::IamUserDelete { tenant_id, name } => {
+                let k = iam_user_key(tenant_id, name)?;
+                if tget(tx, &k)?.is_none() {
+                    return Err(Error::NotFound(format!("iam user {tenant_id}/{name}")));
+                }
+                // 隐藏引导用户不可删(孤儿密钥挂载点,DI7.1)
+                if tenant_id == fs3_core::Tenant::DEFAULT_TENANT
+                    && name == fs3_core::IamUser::BOOTSTRAP_USER
+                {
+                    return Err(Error::InvalidArgument(
+                        "bootstrap user cannot be deleted (ADR-28 DI7.1)".into(),
+                    ));
+                }
+                // 无孤儿不变量:任一 `k:` 密钥属主 == 本用户 → 拒绝(SA 须
+                // 先吊销)。冲突集纪律同 TenantDelete 的 k: 属主扫描:迭代器
+                // 读不入冲突集,由上面的 tget(iu: 键)锚点检出并发变更。
+                let mut it = tx.iterator(IteratorMode::From(PREFIX_KEY, Direction::Forward));
+                for item in &mut it {
+                    let (kk, v) = item.map_err(rocks_err)?;
+                    if !kk.starts_with(PREFIX_KEY) {
+                        break;
+                    }
+                    let rec = decode_key_record(&v)?;
+                    if rec.tenant_id == *tenant_id && rec.owner_user == *name {
+                        return Err(Error::InvalidArgument(format!(
+                            "iam user {tenant_id}/{name} still owns service accounts"
+                        )));
+                    }
+                }
+                tremove(tx, &k)?;
+            }
         }
     }
 
@@ -5527,6 +5594,70 @@ mod tests {
             s.commit_iam_user_put(&bad),
             Err(Error::InvalidArgument(_))
         ));
+    }
+
+    /// M18 U1(ADR-28 DI2.1/DI7.3):用户删除 —— 往返;持有 SA(属主
+    /// (tenant, user) 的 `k:` 密钥)拒绝;bootstrap 恒拒;不存在 →
+    /// NotFound;list_iam_users_in 租户内前缀扫描。
+    #[test]
+    fn iam_user_delete_semantics() {
+        let (_d, s) = open_tmp();
+        let mk = |name: &str, tenant: &str| fs3_core::IamUser {
+            tenant_id: tenant.into(),
+            name: name.into(),
+            enabled: true,
+            password_hash: None,
+            password_salt: None,
+            policies: vec![],
+            groups: vec![],
+            display_name: None,
+            created_at: 1_700_000_000,
+        };
+        s.commit_iam_user_put(&mk("alice", "default")).unwrap();
+        s.commit_iam_user_put(&mk("bob", "acme")).unwrap();
+        // 租户内列表(含 open 迁移的 bootstrap;按 name 排序)
+        assert_eq!(
+            s.list_iam_users_in("default")
+                .unwrap()
+                .iter()
+                .map(|u| u.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alice", "bootstrap"]
+        );
+        assert_eq!(s.list_iam_users_in("acme").unwrap().len(), 1);
+        // 持有 SA → 拒绝(他租户/他人 SA 不拦截)
+        let sa = fs3_core::KeyRecord::new("AKIA_ALICE", "alice-secret", &[9u8; 32], None)
+            .unwrap()
+            .with_iam_owner("default", "alice", Some("ci".into()));
+        s.commit_key_put(&sa).unwrap();
+        s.commit_key_put(
+            &fs3_core::KeyRecord::new("AKIA_BOB", "bob-secret", &[9u8; 32], None)
+                .unwrap()
+                .with_iam_owner("acme", "bob", None),
+        )
+        .unwrap();
+        assert!(matches!(
+            s.commit_iam_user_delete("default", "alice"),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            s.commit_iam_user_delete("default", "bob"),
+            Err(Error::NotFound(_))
+        ));
+        // bootstrap 恒拒(孤儿密钥挂载点,DI7.1)
+        assert!(matches!(
+            s.commit_iam_user_delete("default", fs3_core::IamUser::BOOTSTRAP_USER),
+            Err(Error::InvalidArgument(_))
+        ));
+        // 吊销 SA 后可删;再删 → NotFound
+        s.commit_key_delete("AKIA_ALICE").unwrap();
+        s.commit_iam_user_delete("default", "alice").unwrap();
+        assert!(s.get_iam_user("default", "alice").unwrap().is_none());
+        assert!(matches!(
+            s.commit_iam_user_delete("default", "alice"),
+            Err(Error::NotFound(_))
+        ));
+        assert!(s.get_iam_user("acme", "bob").unwrap().is_some());
     }
 
     /// M18 I1 升级迁移(ADR-28 DI1.3):存量部署(已有 k: 密钥/桶/对象,

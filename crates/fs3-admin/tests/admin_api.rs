@@ -431,6 +431,182 @@ fn admin_iam_tenants_crud() {
     let _ = handle;
 }
 
+/// M18 U1(ADR-28 DI2.1/DI7.3/DI8):/v1/iam/users CRUD —— 创建(含口令,
+/// 响应零回显哈希/明文)/详情/列表(?tenant=)/PATCH(enabled 即时生效、
+/// password 重设、display_name、policies 整表替换)/删除(持有 SA →
+/// 409、bootstrap → 400、不存在 → 404)。
+#[test]
+fn admin_iam_users_crud() {
+    let (_d, img) = setup();
+    let cfg = EngineConfig {
+        devices: vec![img.clone()],
+        meta_dir: img.parent().unwrap().join("meta"),
+        ..Default::default()
+    };
+    let engine = Arc::new(RwLock::new(Engine::open(&cfg).unwrap()));
+    let service = Arc::new(S3Service::new(
+        engine.clone(),
+        vec![Credentials {
+            access_key: "ak".into(),
+            secret_key: "sk".into(),
+        }],
+        "us-east-1".into(),
+        false,
+    ));
+    let (sock, handle) = start_admin_with(&cfg, engine, service.clone(), "t", None);
+    let sock = sock.trim_start_matches("unix://");
+
+    // 升级迁移:bootstrap 用户已落地(default 租户)
+    let (code, body) = http_unix(sock, "GET", "/v1/iam/users", None, "t");
+    assert_eq!(code, 200, "list users failed: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let users = v["users"].as_array().unwrap();
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0]["name"], "bootstrap");
+
+    // 创建(含口令):响应有 has_password=true,但绝无 password/hash/salt 字段
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/users",
+        Some(r#"{"name":"alice","password":"pw123","display_name":"Alice"}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "create user failed: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["tenant_id"], "default");
+    assert_eq!(v["name"], "alice");
+    assert_eq!(v["enabled"], true);
+    assert_eq!(v["has_password"], true);
+    assert!(v.get("password").is_none(), "响应零口令材料: {body}");
+    assert!(v.get("password_hash").is_none());
+    assert!(v.get("password_salt").is_none());
+    // 口令哈希落库可校验;明文不可还原
+    {
+        let e = service.engine().read();
+        let u = e.meta().get_iam_user("default", "alice").unwrap().unwrap();
+        assert!(u.verify_password("pw123"));
+        assert!(!u.verify_password("wrong"));
+        assert_ne!(u.password_hash.as_deref(), Some("pw123"));
+    }
+    // 同名 → 409;非法名 → 400;缺 name → 400;不存在租户 → 404
+    let (code, _) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/users",
+        Some(r#"{"name":"alice"}"#),
+        "t",
+    );
+    assert_eq!(code, 409);
+    let (code, _) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/users",
+        Some(r#"{"name":"a b"}"#),
+        "t",
+    );
+    assert_eq!(code, 400);
+    let (code, _) = http_unix(sock, "POST", "/v1/iam/users", Some(r#"{}"#), "t");
+    assert_eq!(code, 400);
+    let (code, _) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/users",
+        Some(r#"{"tenant":"ghost","name":"bob"}"#),
+        "t",
+    );
+    assert_eq!(code, 404);
+
+    // 详情(不含口令材料)+ 列表(?tenant=)
+    let (code, body) = http_unix(sock, "GET", "/v1/iam/users/default/alice", None, "t");
+    assert_eq!(code, 200);
+    assert!(!body.contains("password_hash"), "{body}");
+    assert!(!body.contains("pw123"), "{body}");
+    let (code, body) = http_unix(sock, "GET", "/v1/iam/users?tenant=default", None, "t");
+    assert_eq!(code, 200);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["users"].as_array().unwrap().len(), 2);
+
+    // PATCH:禁用 + 显示名 + 策略整表替换 + 重设口令
+    let (code, body) = http_unix(
+        sock,
+        "PATCH",
+        "/v1/iam/users/default/alice",
+        Some(
+            r#"{"enabled":false,"display_name":"Alice Z","policies":["readwrite"],"password":"newpw"}"#,
+        ),
+        "t",
+    );
+    assert_eq!(code, 200, "patch user failed: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["enabled"], false);
+    assert_eq!(v["display_name"], "Alice Z");
+    assert_eq!(v["policies"], serde_json::json!(["readwrite"]));
+    {
+        let e = service.engine().read();
+        let u = e.meta().get_iam_user("default", "alice").unwrap().unwrap();
+        assert!(!u.enabled);
+        assert!(u.verify_password("newpw"), "口令重设生效");
+        assert!(!u.verify_password("pw123"));
+    }
+    // 空 PATCH → 400;非法策略名 → 400;不存在 → 404;bootstrap → 400
+    let (code, _) = http_unix(
+        sock,
+        "PATCH",
+        "/v1/iam/users/default/alice",
+        Some(r#"{}"#),
+        "t",
+    );
+    assert_eq!(code, 400);
+    let (code, _) = http_unix(
+        sock,
+        "PATCH",
+        "/v1/iam/users/default/alice",
+        Some(r#"{"policies":["a b"]}"#),
+        "t",
+    );
+    assert_eq!(code, 400);
+    let (code, _) = http_unix(
+        sock,
+        "PATCH",
+        "/v1/iam/users/default/ghost",
+        Some(r#"{"enabled":true}"#),
+        "t",
+    );
+    assert_eq!(code, 404);
+    let (code, _) = http_unix(
+        sock,
+        "PATCH",
+        "/v1/iam/users/default/bootstrap",
+        Some(r#"{"enabled":false}"#),
+        "t",
+    );
+    assert_eq!(code, 400);
+
+    // 持有 SA → 删除 409;吊销 SA 后 200;再删 → 404;bootstrap → 400
+    service
+        .add_key_owned(
+            "AKIA_ALICE",
+            "alice-sa-secret",
+            None,
+            "default",
+            "alice",
+            Some("ci".into()),
+        )
+        .unwrap();
+    let (code, _) = http_unix(sock, "DELETE", "/v1/iam/users/default/alice", None, "t");
+    assert_eq!(code, 409);
+    service.remove_key("AKIA_ALICE").unwrap();
+    let (code, _) = http_unix(sock, "DELETE", "/v1/iam/users/default/alice", None, "t");
+    assert_eq!(code, 200);
+    let (code, _) = http_unix(sock, "DELETE", "/v1/iam/users/default/alice", None, "t");
+    assert_eq!(code, 404);
+    let (code, _) = http_unix(sock, "DELETE", "/v1/iam/users/default/bootstrap", None, "t");
+    assert_eq!(code, 400);
+
+    let _ = handle;
+}
+
 #[test]
 fn admin_repair_endpoint() {
     let (_d, img) = setup();
