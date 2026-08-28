@@ -4565,8 +4565,9 @@ fn bucket_policy_malformed_rejected() {
         r#"{"Version":"2020-01-01","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":["*"]}]}"#,
         // NotPrincipal 不支持(显式报错)
         r#"{"Statement":[{"Effect":"Allow","NotPrincipal":{"AWS":"*"},"Action":"s3:*","Resource":["*"]}]}"#,
-        // 未知 Condition 操作符
-        r#"{"Statement":[{"Effect":"Allow","Action":"s3:*","Resource":["*"],"Condition":{"DateGreaterThan":{"aws:CurrentTime":"2026-01-01T00:00:00Z"}}}]}"#,
+        // M19 P(ADR-27):DateGreaterThan × aws:CurrentTime 已入白名单
+        // (合法);未知操作符样本换成变体 DateGreaterThanEquals
+        r#"{"Statement":[{"Effect":"Allow","Action":"s3:*","Resource":["*"],"Condition":{"DateGreaterThanEquals":{"aws:CurrentTime":"2026-01-01T00:00:00Z"}}}]}"#,
         // 未知 Condition 键
         r#"{"Statement":[{"Effect":"Allow","Action":"s3:*","Resource":["*"],"Condition":{"StringEquals":{"aws:username":"x"}}}]}"#,
         // 缺 Resource

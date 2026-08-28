@@ -57,7 +57,9 @@ OUT="$(mktemp /tmp/s3tests-gate.XXXXXX)"
 #    bucket-owner 新语义(create_bucket_object_writer 等跨账号 owner 断言)、匿名 public-read 族
 # ④ M10 S5 补充(2026-08-23,族出集后保留的文档化 token,逐用例核对):
 #    _v2(SigV2 预签名,未实现)|existing_tag|request_obj_tag|put_obj_grant|s3_noenc|
-#    copy_source|IfExists(桶策略 Condition 超集,显式 MalformedPolicy 红线)|
+#    copy_source|IfExists(桶策略 Condition 超集,显式 MalformedPolicy 红线;
+#    M19 P/ADR-27 起白名单已含 Date*×aws:CurrentTime 与 ${aws:username}
+#    Resource 变量,上游无依赖用例,排除集不变)|
 #    policy_acl|put_obj_acl(策略×ACL 组合,Put*Acl 501)|
 #    policy_multipart|policy_upload_part_copy|404_with_policy(M18 T1 起理由更新:
 #    alt 双身份已就位,但用例未关默认 BPA 即写 Principal * 公开策略 →

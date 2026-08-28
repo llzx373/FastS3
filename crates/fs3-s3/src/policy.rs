@@ -27,12 +27,16 @@
 //!   (单账号时代行为保留,compat 钉死);`Service`/`Federated`/
 //!   `CanonicalUser`/`NotPrincipal` → 解析错误(显式不支持,红线);
 //!   缺省 = 密钥附加策略(principal 恒为持钥者);
-//! - `Condition`(M10 S3 最小集 + M12 W3-1,超集一律解析错误):
+//! - `Condition`(M10 S3 最小集 + M12 W3-1 + M19 P/ADR-27,超集一律解析错误):
 //!   `IpAddress`/`NotIpAddress` × `s3:SourceIp`(CIDR 或单 IP,v4/v6);
 //!   `StringEquals`/`StringLike` × `s3:prefix`、`s3:delimiter`;
 //!   `StringEquals`/`Bool` × `s3:BypassGovernanceRetention`;
 //!   `NumericEquals`/`NumericNotEquals`/`NumericLessThan`/`NumericLessThanEquals`/
 //!   `NumericGreaterThan`/`NumericGreaterThanEquals` × `s3:ObjectLockRemainingRetentionDays`;
+//!   `DateGreaterThan`/`DateLessThan`/`DateEquals` × `aws:CurrentTime`
+//!   (值 = ISO 8601 或 unix 秒;时间源 = 引擎时钟,ADR-27 DR1);
+//!   `Resource` 支持 `${aws:username}` 求值期展开(调用者属主用户名;
+//!   匿名 → 不命中,ADR-27 DR2);
 //! - `Sid` 接受并忽略;`NotAction`/`NotResource` → 解析错误(显式不支持);
 //! - 求值语义:显式 Deny 优先;存在匹配 Allow 才放行;无匹配 → NoMatch
 //!   (默认拒绝由调用方按层间语义决定,见 service.rs authorize);
@@ -126,6 +130,9 @@ pub struct EvalCtx {
     pub remaining_retention_days: Option<i64>,
     /// 调用者身份(M18 U3;Principal 具名 IAM ARN 匹配用;匿名 = None)。
     pub caller: Option<CallerIdentity>,
+    /// 服务器当前时刻(unix 秒;M19 P/ADR-27 DR1:aws:CurrentTime 求值源,
+    /// policy_ctx 从引擎时钟取;密钥级兼容接口 = None → Date 条件不成立)。
+    pub now: Option<i64>,
 }
 
 /// IP 网段(CIDR 或单 IP;v4/v6)。
@@ -209,6 +216,33 @@ enum NumericOp {
     Gte,
 }
 
+/// M19 P(ADR-27 DR1):Date 操作符(恰三:Gt/Lt/Eq)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DateOp {
+    Gt,
+    Lt,
+    Eq,
+}
+
+impl DateOp {
+    fn from_name(op: &str) -> Option<Self> {
+        Some(match op {
+            "DateGreaterThan" => DateOp::Gt,
+            "DateLessThan" => DateOp::Lt,
+            "DateEquals" => DateOp::Eq,
+            _ => return None,
+        })
+    }
+
+    fn cmp(self, now: i64, want: i64) -> bool {
+        match self {
+            DateOp::Gt => now > want,
+            DateOp::Lt => now < want,
+            DateOp::Eq => now == want,
+        }
+    }
+}
+
 impl NumericOp {
     fn from_name(op: &str) -> Option<Self> {
         Some(match op {
@@ -250,6 +284,8 @@ enum Condition {
     Bool { expected: bool },
     /// Numeric* × s3:ObjectLockRemainingRetentionDays。
     Numeric { op: NumericOp, values: Vec<i64> },
+    /// M19 P(ADR-27 DR1):Date* × aws:CurrentTime(Gt/Lt/Eq)。
+    Date { op: DateOp, values: Vec<i64> },
 }
 
 impl Condition {
@@ -277,6 +313,13 @@ impl Condition {
                     return false;
                 };
                 values.iter().any(|w| op.cmp(have, *w))
+            }
+            Condition::Date { op, values } => {
+                // ADR-27 DR1.2:时间源不可用(键缺席语义)→ 条件不成立
+                let Some(now) = ctx.now else {
+                    return false;
+                };
+                values.iter().any(|w| op.cmp(now, *w))
             }
         }
     }
@@ -327,6 +370,60 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
     } else {
         pat.eq_ignore_ascii_case(value)
     }
+}
+
+/// M19 P(ADR-27 DR1.3):Date 条件值解析——ISO 8601(`2026-01-01T00:00:00Z`,
+/// 容忍小数秒与 ±HH:MM 偏移)或字符串整数(unix 秒)。
+fn parse_policy_date(s: &str) -> Option<i64> {
+    if let Ok(epoch) = s.trim().parse::<i64>() {
+        return Some(epoch);
+    }
+    let b = s.as_bytes();
+    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || (b[10] != b'T' && b[10] != b't') || b[13] != b':' || b[16] != b':'
+    {
+        return None;
+    }
+    let num = |a: usize, z: usize| -> Option<i64> { s.get(a..z)?.parse().ok() };
+    let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (h, mi, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    let mut rest = &s[19..];
+    // 小数秒(容忍;秒级精度截断)
+    if let Some(stripped) = rest.strip_prefix('.') {
+        let digits: usize = stripped.bytes().take_while(|c| c.is_ascii_digit()).count();
+        rest = &stripped[digits..];
+    }
+    // 时区:Z 或 ±HH:MM(缺省按 UTC;AWS 值必须带时区,宽进不改判)
+    let offset_secs: i64 = if rest == "Z" || rest == "z" || rest.is_empty() {
+        0
+    } else {
+        let sign = match rest.as_bytes()[0] {
+            b'+' => 1,
+            b'-' => -1,
+            _ => return None,
+        };
+        let tz = &rest[1..];
+        let (th, tm) = tz.split_once(':')?;
+        sign * (th.parse::<i64>().ok()? * 3600 + tm.parse::<i64>().ok()? * 60)
+    };
+    // civil → unix(Hinnant;与 fs3-engine 侧秒级换算同口径)
+    let y_adj = if mo <= 2 { y - 1 } else { y };
+    let era = y_adj.div_euclid(400);
+    let yoe = y_adj.rem_euclid(400);
+    let mp = if mo > 2 { mo - 3 } else { mo + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(days * 86400 + h * 3600 + mi * 60 + sec - offset_secs)
+}
+
+/// M19 P(ADR-27 DR2):Resource 中 `${aws:username}` 求值期展开。
+/// 调用者缺位(匿名)→ None(含变量的 Resource 永不匹配)。
+fn expand_username_var(pattern: &str, caller: Option<&CallerIdentity>) -> Option<String> {
+    if !pattern.contains("${aws:username}") {
+        return Some(pattern.to_string());
+    }
+    let user = caller.as_ref()?.user.as_str();
+    Some(pattern.replace("${aws:username}", user))
 }
 
 /// glob 匹配(StringLike 语义:`*` 任意串、`?` 单字符,可出现在任意位置)。
@@ -545,10 +642,32 @@ fn parse_condition(v: &Value, idx: usize) -> Result<Vec<Condition>, PolicyError>
                         values,
                     }
                 }
+                op_name if DateOp::from_name(op_name).is_some() => {
+                    // M19 P(ADR-27 DR1):恰 Date{Gt,Lt,Eq} × aws:CurrentTime
+                    if key_l != "aws:currenttime" {
+                        return Err(PolicyError(format!(
+                            "Statement[{idx}] {op} 仅支持 aws:CurrentTime,got {key}"
+                        )));
+                    }
+                    let values = parse_string_or_array(val, "Condition")?
+                        .iter()
+                        .map(|s| {
+                            parse_policy_date(s).ok_or_else(|| {
+                                PolicyError(format!(
+                                    "Statement[{idx}] Date 条件值必须是 ISO 8601 时间或 unix 秒整数,got {s}"
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Condition::Date {
+                        op: DateOp::from_name(op_name).unwrap(),
+                        values,
+                    }
+                }
                 other => {
                     return Err(PolicyError(format!(
                         "Statement[{idx}] 不支持的 Condition 操作符 {other}\
-                         (最小集:IpAddress/NotIpAddress/StringEquals/StringLike/Bool/Numeric*)"
+                         (最小集:IpAddress/NotIpAddress/StringEquals/StringLike/Bool/Numeric*/Date*)"
                     )))
                 }
             };
@@ -675,7 +794,13 @@ impl Policy {
                 continue;
             }
             let action_hit = st.actions.iter().any(|p| wildcard_match(p, &action));
-            let resource_hit = st.resources.iter().any(|p| wildcard_match(p, resource));
+            // M19 P(ADR-27 DR2):Resource 逐条做 ${aws:username} 展开;
+            // 变量不可解析(匿名)→ 该 Resource 不命中
+            let resource_hit = st.resources.iter().any(|p| {
+                expand_username_var(p, ctx.caller.as_ref())
+                    .map(|expanded| wildcard_match(&expanded, resource))
+                    .unwrap_or(false)
+            });
             if !(action_hit && resource_hit) {
                 continue;
             }
@@ -1194,11 +1319,144 @@ mod tests {
                 "Condition":{"StringEquals":{"aws:username":"x"}}}]}"#
         )
         .is_err());
+        // M19 P(ADR-27):DateGreaterThan × aws:CurrentTime 已入白名单
+        // (合法),见 condition_current_time_office_hours;
+        // 未知键 × Date* 仍拒绝:
         assert!(Policy::parse(
             r#"{"Statement":[{"Effect":"Allow","Action":"s3:*","Resource":["*"],
-                "Condition":{"DateGreaterThan":{"aws:CurrentTime":"2026-01-01T00:00:00Z"}}}]}"#
+                "Condition":{"DateGreaterThan":{"s3:prefix":"2026-01-01T00:00:00Z"}}}]}"#
         )
         .is_err());
+        // 非 ISO/epoch 值 → MalformedPolicy
+        assert!(Policy::parse(
+            r#"{"Statement":[{"Effect":"Allow","Action":"s3:*","Resource":["*"],
+                "Condition":{"DateLessThan":{"aws:CurrentTime":"tomorrow"}}}]}"#
+        )
+        .is_err());
+        // 变体操作符(DateGreaterThanEquals 等)仍拒绝
+        assert!(Policy::parse(
+            r#"{"Statement":[{"Effect":"Allow","Action":"s3:*","Resource":["*"],
+                "Condition":{"DateGreaterThanEquals":{"aws:CurrentTime":"2026-01-01T00:00:00Z"}}}]}"#
+        )
+        .is_err());
+    }
+
+    /// M19 P1(ADR-27 DR1;TODO M19/P1):工作时间 Allow、非工作时间 Deny
+    /// (DateGreaterThan + DateLessThan 组合),键缺席上下文不成立。
+    #[test]
+    fn condition_current_time_office_hours() {
+        let p = Policy::parse(
+            r#"{"Statement":[
+                {"Effect":"Allow","Action":"s3:GetObject","Resource":["arn:aws:s3:::b/*"],
+                 "Condition":{
+                    "DateGreaterThan":{"aws:CurrentTime":"2026-08-28T09:00:00Z"},
+                    "DateLessThan":{"aws:CurrentTime":"2026-08-28T18:00:00Z"}
+                 }}
+            ]}"#,
+        )
+        .unwrap();
+        let ctx = |epoch: i64| EvalCtx {
+            now: Some(epoch),
+            ..Default::default()
+        };
+        // 工作时间内(UTC 12:00)→ Allow
+        assert_eq!(
+            p.decide("GetObject", "arn:aws:s3:::b/k", true, &ctx(1_787_918_400)),
+            Decision::Allow
+        );
+        // 08:59(早于起点)→ NoMatch;18:30(晚于终点)→ NoMatch
+        assert_eq!(
+            p.decide("GetObject", "arn:aws:s3:::b/k", true, &ctx(1_787_907_540)),
+            Decision::NoMatch
+        );
+        assert_eq!(
+            p.decide("GetObject", "arn:aws:s3:::b/k", true, &ctx(1_787_941_800)),
+            Decision::NoMatch
+        );
+        // 密钥级兼容接口(now 缺席)→ 条件不成立
+        assert_eq!(
+            p.decide("GetObject", "arn:aws:s3:::b/k", true, &EvalCtx::default()),
+            Decision::NoMatch
+        );
+        // epoch 整数值等价
+        let p2 = Policy::parse(
+            r#"{"Statement":[
+                {"Effect":"Allow","Action":"s3:GetObject","Resource":["*"],
+                 "Condition":{"DateEquals":{"aws:CurrentTime":"1787918400"}}}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            p2.decide("GetObject", "arn:aws:s3:::b/k", true, &ctx(1_787_918_400)),
+            Decision::Allow
+        );
+    }
+
+    /// M19 P1(ADR-27 DR2;TODO M19/P1):${aws:username} 在 Resource 中
+    /// 展开——只命中调用者自己的前缀;他人/匿名不命中。
+    #[test]
+    fn policy_variable_username_in_resource() {
+        let p = Policy::parse(
+            r#"{"Statement":[
+                {"Effect":"Allow","Action":["s3:PutObject","s3:GetObject"],
+                 "Resource":["arn:aws:s3:::home/${aws:username}/*"]}
+            ]}"#,
+        )
+        .unwrap();
+        let caller = |user: &str| CallerIdentity {
+            tenant_canonical_id: "canon-1".into(),
+            user: user.into(),
+            access_key: "ak".into(),
+        };
+        let ctx = |u: &str| EvalCtx {
+            caller: Some(caller(u)),
+            ..Default::default()
+        };
+        // alice 只命中 home/alice/*
+        assert_eq!(
+            p.decide("PutObject", "arn:aws:s3:::home/alice/x", true, &ctx("alice")),
+            Decision::Allow
+        );
+        assert_eq!(
+            p.decide("GetObject", "arn:aws:s3:::home/alice/sub/y", true, &ctx("alice")),
+            Decision::Allow
+        );
+        // bob 访问 alice 前缀 → NoMatch(展开后前缀不符)
+        assert_eq!(
+            p.decide("PutObject", "arn:aws:s3:::home/alice/x", true, &ctx("bob")),
+            Decision::NoMatch
+        );
+        // 匿名(无 caller)→ 变量不可解析 → 不命中
+        assert_eq!(
+            p.decide("PutObject", "arn:aws:s3:::home/alice/x", false, &EvalCtx::default()),
+            Decision::NoMatch
+        );
+    }
+
+    /// Date 条件值解析:ISO 8601(含小数秒/偏移)与 epoch。
+    #[test]
+    fn policy_date_value_parsing() {
+        assert_eq!(parse_policy_date("1787990400"), Some(1_787_990_400));
+        assert_eq!(parse_policy_date("2026-01-01T00:00:00Z"), Some(1_767_225_600));
+        // 小数秒
+        assert_eq!(
+            parse_policy_date("2026-01-01T00:00:00.500Z"),
+            Some(1_767_225_600)
+        );
+        // 正偏移(东八)+08:00 → UTC 减 8h
+        assert_eq!(
+            parse_policy_date("2026-01-01T08:00:00+08:00"),
+            Some(1_767_225_600)
+        );
+        // 负偏移
+        assert_eq!(
+            parse_policy_date("2025-12-31T19:00:00-05:00"),
+            Some(1_767_225_600)
+        );
+        // 非法
+        assert_eq!(parse_policy_date("tomorrow"), None);
+        assert_eq!(parse_policy_date("2026-01-01"), None);
+        assert_eq!(parse_policy_date(""), None);
     }
 
     #[test]

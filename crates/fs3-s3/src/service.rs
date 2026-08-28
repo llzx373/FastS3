@@ -739,6 +739,12 @@ impl S3Service {
             remaining_retention_days,
             // 调用者身份由 authorize 按认证结果填充(本函数不感知认证)
             caller: None,
+            // M19 P(ADR-27 DR1.4):aws:CurrentTime 求值源 = 引擎时钟
+            // (与 M12 可信时钟同源;不读客户端时间头)
+            now: {
+                let engine = self.engine.read();
+                Some(engine.lock_now())
+            },
         }
     }
 
