@@ -28,6 +28,6 @@ if grep -n 'docker exec -it fasts3 fasts3d init' "$CT" "$CR" 2>/dev/null; then
     fail "容器文档不得再把 docker exec init 当安装步骤"
 fi
 grep -q '自动' "$CT" && grep -q 'init' "$CT" || fail "容器页须声明首启自动 init"
-grep -q 'fasts3:2.4.0' "$CT" "$CR" || fail "容器文档镜像标签须与 workspace 2.4.0 对齐"
+grep -q 'fasts3:2.5.0' "$CT" "$CR" || fail "容器文档镜像标签须与 workspace 2.5.0 对齐"
 
 echo "poc_docs: OK"

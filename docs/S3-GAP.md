@@ -25,6 +25,9 @@
 > 优先级:P0 = 缺失即被采购否决;P1 = 缺失即某类工作流失败;P2 = 增强。
 > 更新(2026-08-27):对照 v2.3.0 M17;BPA 桶级部分出集、审计导出代替 Logging、
 > Hadoop S3A 冒烟;残余缺口见 Batch / 内置 ?replication / IAM 多租户(M18)。
+> 更新(2026-08-29):对照 v2.5.0 M19;IAM 多租户(M18)已交付;Batch Operations
+> ✅(ADR-26,管理面 JSON)、Kafka 通知 ✅(ADR-25)、Condition Date*/变量补全 ✅
+> (ADR-27)、保 mtime 迁入向导 ✅(ADR-24);残余缺口见内置 ?replication 与持有组。
 
 | 域 | 特性 | 现状 | 优先级 | 路线归属 |
 | --- | --- | --- | --- | --- |
@@ -63,7 +66,7 @@
 | 认证安全 | STS 临时凭证 / Session Policy | ✅ v2.1(GetSessionToken/AssumeRole,会话策略求交;无角色派生) | P1(多租户) | — |
 | 认证安全 | LDAP / OpenID / IAM 联邦 | 🟢 部分(LDAP 目录同步 + OIDC SSO v2.2,ADR-21;IAM 联邦维持远期) | P1(企业 AD 集成) | 数据面仍认 access key(D-E2 延续) |
 | 认证安全 | SSE-KMS / DSSE-KMS | ⛔ | P2 | ❌ 不做(无 KMS 托管;参数显式拒绝) |
-| 认证安全 | 密钥级 IAM 策略子集 | 🟡 已补最小 Condition 集(ipAddress/prefix/bypass 键);超集显式 400 | P1 | 超集远期 |
+| 认证安全 | 密钥级 IAM 策略子集 | ✅ 桶级 + 最小 Condition 键集(v1.1);v2.5(ADR-27)补 `Date* × aws:CurrentTime` 与 `${aws:username}` Resource 展开;超集显式 400 | P1 | 超集远期 |
 | 数据保护 | 强一致 read-after-write | ✅(比 S3 官方更强) | P0 | — |
 | 数据保护 | 崩溃/断电一致性、账目收敛 | ✅(1000 轮 + 断电模拟) | P0 | — |
 | 数据保护 | 审计流水 | ✅ v1.2 持久化 + v2.3 JSONL 导出(`/v1/admin/audit/export`) | P1(合规) | Logging XML 不做 |
@@ -71,7 +74,7 @@
 | 生态集成 | aws cli / boto3 / mc / rclone | ✅(冒烟 + 迁移演练) | P0 | — |
 | 生态集成 | Hadoop S3A / Spark / Trino / 湖仓 | 🟡 Hadoop S3A **冒烟通过** v2.3(M17/C1,JDK 21+Hadoop 3.4.1);Spark 3.5.3 / Trino 476 骨架 SKIP | P0(数据湖场景) | Spark/Trino 发行版环境 |
 | 生态集成 | Terraform provider / K8s Operator | 🟡 评估完成,暂不立项(持有,投票 ≥10) | P2 | 持有(m14-ecosystem-eval) |
-| 生态集成 | 事件通知 Kafka/AMQP | ⛔ | P2 | 后置评估(Webhook 起步 v2.1) |
+| 生态集成 | 事件通知 Kafka/AMQP | 🟡 Kafka ✅ v2.5(ADR-25;kafka:// 目标、进程内线协议生产者、at-least-once、指标分账);AMQP ❌ 不做(ADR-25 边界) | P2 | AMQP 走中间适配服务 |
 | 性能规模 | HTTP/3 | ✅ v2.0(实验开关默认关) | P2 | — |
 | 性能规模 | 热对象缓存 | ✅ v2.0(默认关) | P2 | — |
 | 性能规模 | 多设备池 / 在线扩容 | ✅ v1.4 | P1 | — |
@@ -152,7 +155,7 @@
 | --- | --- | --- | --- |
 | Hadoop S3A / Spark / Trino | Hadoop S3A 冒烟通过(M17/C1);Spark/Trino 无环境 SKIP 计数(C2) | 数据湖/湖仓 | S3A Committer 全量与 Spark/Trino 真机属后续 |
 | Terraform / K8s Operator | 无 | IaC 管理;Operator 生态 | 🔜 v2.0 评估(§7.4) |
-| 事件通知(Kafka/AMQP) | 无 | 企业消息总线集成 | v2.x 评估(Webhook 起步) |
+| 事件通知(Kafka/AMQP) | Kafka ✅ v2.5(ADR-25);AMQP 不做 | 企业消息总线集成 | Kafka 目标与 Webhook 同源载荷双写 |
 | restic/Duplicati/Veeam | 未实测 | 备份场景验证 | 矩阵补测 |
 
 ### 3.6 性能与规模域
@@ -246,7 +249,7 @@
 
 | # | 门槛 | FastS3 现状 | 差距动作 |
 | --- | --- | --- | --- |
-| 19 | S3 Select / Inventory / Batch Operations | 🚫 Select 停售排除;Inventory ✅ v2.1;Batch Operations ⛔ 后置 | 残余:Batch |
+| 19 | S3 Select / Inventory / Batch Operations | 🚫 Select 停售排除;Inventory ✅ v2.1;Batch Operations ✅ v2.5(ADR-26:CreateJob/CSV+Inventory manifest/copy·delete·restore·replace-tag/报告与状态机/不绕过 Object Lock;管理面 JSON,不实现 S3 Control 端口) | `aws s3control` 客户端不承诺开箱(compat 登记) |
 | 20 | 目录桶/Express / Accelerate / Object Lambda / S3 Tables / DSSE-KMS | ❌ 明确不做(Express 定位 = FastS3 单机本体;Accelerate/Tables 与定位冲突;Object Lambda 叠加停售 2025-11-07;DSSE 无 KMS) | 文档化定位声明 |
 
 ## 6. 差距 → 路线图收敛映射

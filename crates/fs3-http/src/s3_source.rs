@@ -99,7 +99,10 @@ impl S3SourceClient {
         let amz_date = http_date_now();
         let payload_hash = sha256_hex(&[]);
         let mut signed_headers = vec![
-            ("host".to_string(), host_header(self.https, &self.host, self.port)),
+            (
+                "host".to_string(),
+                host_header(self.https, &self.host, self.port),
+            ),
             ("x-amz-content-sha256".to_string(), payload_hash.clone()),
             ("x-amz-date".to_string(), amz_date.clone()),
         ];
@@ -198,10 +201,17 @@ fn parse_endpoint(endpoint: &str) -> Result<(bool, String, u16)> {
     let default_port = if https { 443 } else { 80 };
     let (host, port) = match rest.rsplit_once(':') {
         Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => {
-            let port = p.parse::<u16>().map_err(|e| Error::InvalidArgument(format!("ingest bad port: {e}")))?;
+            let port = p
+                .parse::<u16>()
+                .map_err(|e| Error::InvalidArgument(format!("ingest bad port: {e}")))?;
             (h.trim_matches(['[', ']']).to_string(), port)
         }
-        _ => (rest.trim_matches(['[', ']']).trim_end_matches('/').to_string(), default_port),
+        _ => (
+            rest.trim_matches(['[', ']'])
+                .trim_end_matches('/')
+                .to_string(),
+            default_port,
+        ),
     };
     if host.is_empty() {
         return Err(Error::InvalidArgument(format!(
@@ -216,11 +226,8 @@ impl S3SourceClient {
     /// ?notification=;ADR-24 DR3 桶配置拷贝用)。404 = 无配置(None);
     /// 其余非 200 → Err。
     pub fn get_subresource(&mut self, sub: &str) -> Result<Option<Vec<u8>>> {
-        let (status, _headers, mut body) = self.request(
-            "GET",
-            &format!("/{}", uri_encode(&self.bucket, false)),
-            sub,
-        )?;
+        let (status, _headers, mut body) =
+            self.request("GET", &format!("/{}", uri_encode(&self.bucket, false)), sub)?;
         let data = body.read_all()?;
         if status == 404 {
             return Ok(None);
@@ -228,7 +235,10 @@ impl S3SourceClient {
         if status != 200 {
             return Err(Error::Meta(format!(
                 "ingest get {sub}: HTTP {status}: {}",
-                String::from_utf8_lossy(&data).chars().take(200).collect::<String>()
+                String::from_utf8_lossy(&data)
+                    .chars()
+                    .take(200)
+                    .collect::<String>()
             )));
         }
         Ok(Some(data))
@@ -245,20 +255,34 @@ impl IngestSourceClient for S3SourceClient {
             // after 严格大于:用 start-after(源端跳过游标)
             query.push_str(&format!("&start-after={}", uri_encode(after_key, true)));
         }
-        let (status, _headers, mut body) = self.request("GET", &format!("/{}", uri_encode(&self.bucket, false)), &query)?;
+        let (status, _headers, mut body) = self.request(
+            "GET",
+            &format!("/{}", uri_encode(&self.bucket, false)),
+            &query,
+        )?;
         let xml = body.read_all()?;
         if status != 200 {
             return Err(Error::Meta(format!(
                 "ingest ListObjectsV2: HTTP {status}: {}",
-                String::from_utf8_lossy(&xml).chars().take(200).collect::<String>()
+                String::from_utf8_lossy(&xml)
+                    .chars()
+                    .take(200)
+                    .collect::<String>()
             )));
         }
         Ok(parse_list_xml(&xml))
     }
 
     fn head(&mut self, key: &str) -> Result<Option<IngestSourceHead>> {
-        let (status, headers, mut body) =
-            self.request("HEAD", &format!("/{}/{}", uri_encode(&self.bucket, false), uri_encode(key, false)), "")?;
+        let (status, headers, mut body) = self.request(
+            "HEAD",
+            &format!(
+                "/{}/{}",
+                uri_encode(&self.bucket, false),
+                uri_encode(key, false)
+            ),
+            "",
+        )?;
         if status == 404 {
             let _ = body.read_all();
             return Ok(None);
@@ -284,9 +308,13 @@ impl IngestSourceClient for S3SourceClient {
             .map(|s| parse_tagging(&s))
             .unwrap_or_default();
         Ok(Some(IngestSourceHead {
-            size: h("content-length").and_then(|v| v.parse().ok()).unwrap_or(0),
+            size: h("content-length")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
             etag: h("etag").unwrap_or_default(),
-            mtime: h("last-modified").and_then(|v| parse_imf_fixdate(&v)).unwrap_or(0),
+            mtime: h("last-modified")
+                .and_then(|v| parse_imf_fixdate(&v))
+                .unwrap_or(0),
             content_type: h("content-type"),
             user_meta,
             tags,
@@ -295,12 +323,19 @@ impl IngestSourceClient for S3SourceClient {
     }
 
     fn get(&mut self, key: &str) -> Result<IngestSourceObject> {
-        let head = self.head(key)?.ok_or_else(|| {
-            Error::NotFound(format!("ingest source object {key}"))
-        })?;
+        let head = self
+            .head(key)?
+            .ok_or_else(|| Error::NotFound(format!("ingest source object {key}")))?;
         // 重开一条连接 GET 正文(head 连接已 Connection: close 消费完)
-        let (status, headers, body) =
-            self.request("GET", &format!("/{}/{}", uri_encode(&self.bucket, false), uri_encode(key, false)), "")?;
+        let (status, headers, body) = self.request(
+            "GET",
+            &format!(
+                "/{}/{}",
+                uri_encode(&self.bucket, false),
+                uri_encode(key, false)
+            ),
+            "",
+        )?;
         if status != 200 {
             let mut b = body;
             let _ = b.read_all();
@@ -417,10 +452,7 @@ fn sigv4_authorization(
 ) -> String {
     use hmac::{Hmac, Mac};
     type HmacSha256 = Hmac<sha2::Sha256>;
-    let canonical_headers: String = headers
-        .iter()
-        .map(|(k, v)| format!("{k}:{v}\n"))
-        .collect();
+    let canonical_headers: String = headers.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
     let signed_names: Vec<&str> = headers.iter().map(|(k, _)| k.as_str()).collect();
     // query 已按构建序给出(调用方负责字典序);此处再排序保险
     let mut q: Vec<(String, String)> = query
@@ -491,7 +523,11 @@ fn host_header(https: bool, host: &str, port: u16) -> String {
 fn civil_from_unix(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
     let days = secs.div_euclid(86400);
     let rem = secs.rem_euclid(86400);
-    let (h, mi, s) = ((rem / 3600) as u32, ((rem % 3600) / 60) as u32, (rem % 60) as u32);
+    let (h, mi, s) = (
+        (rem / 3600) as u32,
+        ((rem % 3600) / 60) as u32,
+        (rem % 60) as u32,
+    );
     // Howard Hinnant civil_from_days
     let z = days + 719468;
     let era = z.div_euclid(146097);
@@ -514,8 +550,18 @@ fn parse_imf_fixdate(s: &str) -> Option<i64> {
     }
     let day: i64 = parts[1].parse().ok()?;
     let mon = match parts[2] {
-        "Jan" => 1, "Feb" => 2, "Mar" => 3, "Apr" => 4, "May" => 5, "Jun" => 6,
-        "Jul" => 7, "Aug" => 8, "Sep" => 9, "Oct" => 10, "Nov" => 11, "Dec" => 12,
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
         _ => return None,
     };
     let y: i64 = parts[3].parse().ok()?;
@@ -588,11 +634,17 @@ fn parse_list_xml(xml: &[u8]) -> Vec<IngestListed> {
     let mut rest = xml.as_ref();
     while let Some(i) = rest.find("<Contents>") {
         let block = &rest[i + "<Contents>".len()..];
-        let Some(end) = block.find("</Contents>") else { break };
+        let Some(end) = block.find("</Contents>") else {
+            break;
+        };
         let item = &block[..end];
         let get = |tag: &str| -> String {
             item.find(&format!("<{tag}>"))
-                .and_then(|s| item[s + tag.len() + 2..].find(&format!("</{tag}>")).map(|e| item[s + tag.len() + 2..s + tag.len() + 2 + e].to_string()))
+                .and_then(|s| {
+                    item[s + tag.len() + 2..]
+                        .find(&format!("</{tag}>"))
+                        .map(|e| item[s + tag.len() + 2..s + tag.len() + 2 + e].to_string())
+                })
                 .unwrap_or_default()
         };
         let mtime = get("LastModified");

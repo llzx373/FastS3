@@ -379,7 +379,12 @@ fn parse_policy_date(s: &str) -> Option<i64> {
         return Some(epoch);
     }
     let b = s.as_bytes();
-    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || (b[10] != b'T' && b[10] != b't') || b[13] != b':' || b[16] != b':'
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || (b[10] != b'T' && b[10] != b't')
+        || b[13] != b':'
+        || b[16] != b':'
     {
         return None;
     }
@@ -1414,11 +1419,21 @@ mod tests {
         };
         // alice 只命中 home/alice/*
         assert_eq!(
-            p.decide("PutObject", "arn:aws:s3:::home/alice/x", true, &ctx("alice")),
+            p.decide(
+                "PutObject",
+                "arn:aws:s3:::home/alice/x",
+                true,
+                &ctx("alice")
+            ),
             Decision::Allow
         );
         assert_eq!(
-            p.decide("GetObject", "arn:aws:s3:::home/alice/sub/y", true, &ctx("alice")),
+            p.decide(
+                "GetObject",
+                "arn:aws:s3:::home/alice/sub/y",
+                true,
+                &ctx("alice")
+            ),
             Decision::Allow
         );
         // bob 访问 alice 前缀 → NoMatch(展开后前缀不符)
@@ -1428,7 +1443,12 @@ mod tests {
         );
         // 匿名(无 caller)→ 变量不可解析 → 不命中
         assert_eq!(
-            p.decide("PutObject", "arn:aws:s3:::home/alice/x", false, &EvalCtx::default()),
+            p.decide(
+                "PutObject",
+                "arn:aws:s3:::home/alice/x",
+                false,
+                &EvalCtx::default()
+            ),
             Decision::NoMatch
         );
     }
@@ -1437,7 +1457,10 @@ mod tests {
     #[test]
     fn policy_date_value_parsing() {
         assert_eq!(parse_policy_date("1787990400"), Some(1_787_990_400));
-        assert_eq!(parse_policy_date("2026-01-01T00:00:00Z"), Some(1_767_225_600));
+        assert_eq!(
+            parse_policy_date("2026-01-01T00:00:00Z"),
+            Some(1_767_225_600)
+        );
         // 小数秒
         assert_eq!(
             parse_policy_date("2026-01-01T00:00:00.500Z"),

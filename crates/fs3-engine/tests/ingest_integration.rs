@@ -13,9 +13,7 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 
 use fs3_core::{IngestJob, IngestJobState, IngestSource};
-use fs3_engine::ingest::{
-    IngestSourceClient, IngestSourceHead, IngestSourceObject, IngestWorker,
-};
+use fs3_engine::ingest::{IngestSourceClient, IngestSourceHead, IngestSourceObject, IngestWorker};
 use fs3_engine::lifecycle::DirectEngine;
 use fs3_engine::{CompactionConfig, Engine, EngineConfig};
 
@@ -60,7 +58,11 @@ struct FakeSource {
 }
 
 impl IngestSourceClient for FakeSource {
-    fn list(&mut self, after_key: &str, limit: usize) -> fs3_core::Result<Vec<fs3_core::IngestListed>> {
+    fn list(
+        &mut self,
+        after_key: &str,
+        limit: usize,
+    ) -> fs3_core::Result<Vec<fs3_core::IngestListed>> {
         Ok(self
             .objects
             .iter()
@@ -100,9 +102,7 @@ impl IngestSourceClient for FakeSource {
     }
 }
 
-fn fake_factory(
-    objects: BTreeMap<String, FakeObj>,
-) -> fs3_engine::ingest::ClientFactory {
+fn fake_factory(objects: BTreeMap<String, FakeObj>) -> fs3_engine::ingest::ClientFactory {
     Box::new(move |_src| {
         Ok(Box::new(FakeSource {
             objects: objects.clone(),
@@ -356,7 +356,7 @@ fn ingest_pause_cancel_take_effect() -> fs3_core::Result<()> {
         meta_arc.clone(),
         fake_factory(src_objects),
         1, // batch=1:每键重读状态
-        );
+    );
     // 先取消
     let mut j3 = meta_arc.get_ingest_job("ing-test-0003")?.unwrap();
     j3.state = IngestJobState::Cancelled;

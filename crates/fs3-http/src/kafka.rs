@@ -41,8 +41,10 @@ impl MinimalKafkaSender {
             .ok_or_else(|| format!("kafka: no address for {host}"))?;
         let tcp = std::net::TcpStream::connect_timeout(&addr, TIMEOUT)
             .map_err(|e| format!("kafka connect {host}:{port}: {e}"))?;
-        tcp.set_read_timeout(Some(TIMEOUT)).map_err(|e| e.to_string())?;
-        tcp.set_write_timeout(Some(TIMEOUT)).map_err(|e| e.to_string())?;
+        tcp.set_read_timeout(Some(TIMEOUT))
+            .map_err(|e| e.to_string())?;
+        tcp.set_write_timeout(Some(TIMEOUT))
+            .map_err(|e| e.to_string())?;
         if tls {
             tls::ensure_provider();
             let mut roots = rustls::RootCertStore::empty();
@@ -191,7 +193,13 @@ fn crc32c(data: &[u8]) -> u32 {
 }
 
 /// 构造 Produce v3 请求体(单 topic 单分区单记录,acks=1)。
-fn build_produce_body(topic: &str, partition: i32, key: &[u8], value: &[u8], now_ms: i64) -> Vec<u8> {
+fn build_produce_body(
+    topic: &str,
+    partition: i32,
+    key: &[u8],
+    value: &[u8],
+    now_ms: i64,
+) -> Vec<u8> {
     // record-batch(magic 2;单记录)
     let mut record = Vec::new();
     put_uvarint(&mut record, 0); // record attributes(int8)
@@ -360,7 +368,11 @@ impl KafkaSender for MinimalKafkaSender {
             client_id: self.client_id.clone(),
             correlation: 1,
         };
-        f2.send_request(0, 3, &build_produce_body(&target.topic, 0, key, payload, now_ms()))?;
+        f2.send_request(
+            0,
+            3,
+            &build_produce_body(&target.topic, 0, key, payload, now_ms()),
+        )?;
         let resp = f2.read_response()?;
         let ec = parse_produce_v3(&resp)?;
         if ec != 0 {
@@ -395,7 +407,9 @@ mod tests {
         assert_eq!(t.topic, "events");
         assert!(t.user.is_none() && !t.tls && t.sasl_env.is_none());
         // 多 broker + userinfo + query
-        let t = parse_kafka_url("kafka://prod@b1:9092,b2:9093/events?tls=1&sasl_env=FS3_KAFKA_PASS").unwrap();
+        let t =
+            parse_kafka_url("kafka://prod@b1:9092,b2:9093/events?tls=1&sasl_env=FS3_KAFKA_PASS")
+                .unwrap();
         assert_eq!(t.user.as_deref(), Some("prod"));
         assert_eq!(t.brokers.len(), 2);
         assert!(t.tls);
@@ -403,7 +417,10 @@ mod tests {
         // 非法
         assert!(parse_kafka_url("kafka://b1:9092").is_err(), "缺 topic");
         assert!(parse_kafka_url("kafka:///events").is_err(), "空 authority");
-        assert!(parse_kafka_url("kafka://b1:9092/events?foo=1").is_err(), "未知 query");
+        assert!(
+            parse_kafka_url("kafka://b1:9092/events?foo=1").is_err(),
+            "未知 query"
+        );
         assert!(parse_kafka_url("http://b1/x").is_err(), "非 kafka scheme");
         assert!(parse_kafka_url("kafka://b1:xx/events").is_err(), "端口非法");
     }
@@ -425,7 +442,11 @@ mod tests {
         assert_eq!(set_len, c.len());
         let _base_offset = take_i64(&mut c);
         let batch_len = take_i32(&mut c).unwrap() as usize;
-        assert_eq!(batch_len + 17, set_len, "batchLength = partitionLeaderEpoch 起到尾");
+        assert_eq!(
+            batch_len + 17,
+            set_len,
+            "batchLength = partitionLeaderEpoch 起到尾"
+        );
         let _leader_epoch = take_i32(&mut c);
         assert_eq!(take_i8(&mut c), Some(2), "magic");
         let crc_field = take_i32(&mut c).unwrap() as u32;

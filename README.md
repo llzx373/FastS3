@@ -95,6 +95,8 @@ FastS3 的对策:**不做底层已经做过的事**。工程力量全部投入�
 
 ✅ **M18 IAM 多租户完成(v2.4.0)。** MinIO 熟悉的用户/组/策略/服务账号 + 租户隔离,部门管理员自助不依赖 root;控制台授权切 IAM `admin:*`,STS AssumeRole 本租户角色实体,LDAP/OIDC 映射 IAM User;s3-tests alt 身份出集,崩溃演练 ≥200 轮零孤儿。任务见 [TODO.md](./TODO.md)。
 
+✅ **M19 好用的私有化完成(v2.5.0)。** 控制台文件柜(对象预览/勾选打包 zip/版本回滚/中英 i18n)、保 mtime/元数据迁入向导(ADR-24,第二实例真源端对账夹具)、Condition Date*×aws:CurrentTime 与 ${aws:username} 展开(ADR-27)、Kafka 通知(ADR-25,零新依赖线协议生产者)、S3 Batch Operations(ADR-26,CSV/Inventory manifest + 四操作 + 报告状态机 + Object Lock 不绕过)。任务见 [TODO.md](./TODO.md)。
+
 ✅ **M8 GA 发布(v1.0.0)。** 全量回归资产与本地实测(`tests/m8/regression.sh`:客户端 × OS × 内核 × 设备形态逐轴编排 + 汇总;CI 接入 regression.yml);RC1→RC2→GA 候选流程(`tests/m8/rc-gate.sh` + docs/ga/rc-flow.md + CHANGELOG.md);安全审计(自审 14 项全绿 + 外部审计范围,见 docs/ga/security-audit.md);发布流水线复核(签名 + SBOM 229 组件 + 供应链锁定,`tools/package/verify-release.sh` 实测 PASS,版本源统一为 Cargo.toml);官网与公告(文档站新增兼容矩阵/安全基线 CVE 响应/v1.0.0 公告页,mkdocs 0 警告);§1.1 开箱清单逐项证据表(docs/ga/checklist.md)+ 内置示例 `deploy/examples/backup-dir.sh`(实测);GA 检查单复核 → **v1.0.0 发布**(版本号全仓同步)。执行期门禁(真 NVMe §6.8 数值 / 外部审计执行 / rpm·ARM64 真机构建 / Beta 窗口)按 checklist.md 如实标注。RELEASES.md v1.0.0。
 
 ✅ **M7 文档与 Beta 完成(v0.8)。** 元数据快照体系(`fasts3d meta-export`/`meta-import` + 备份/恢复演练,与底层卷快照组合成完整备份);内嵌形态(`fasts3d serve --web-root <dist>` 数据面直托管控制台,SPA 回退 + S3 路径互不干扰)与 Node 管理面多实例无状态化验证(双实例演练实测通过);文档站完整(Admin Guide/调优/故障排查与 FAQ/备份恢复/迁移/API 参考/错误码速查);迁移脚本化(MinIO⇢FastS3 `mc mirror`、公有云⇢FastS3 `rclone`,双端点演练通过);Beta 反馈闭环就绪(Beta 计划/注册下载支持通道/评审清单/issue 模板)。**公开 Beta(v0.9)入口已就绪**:Beta 用户数与 P0/P1 清零为过程门禁,随公开 Beta 执行。RELEASES.md v0.8。
@@ -107,7 +109,7 @@ FastS3 的对策:**不做底层已经做过的事**。工程力量全部投入�
 | --- | --- |
 | [docs/DESIGN.md](./docs/DESIGN.md) | 总体架构、存储引擎、S3 协议、性能方案、管理面设计(含 ADR-1~5) |
 | [docs/ROADMAP.md](./docs/ROADMAP.md) | 实现规划、WBS 工作分解、里程碑计划、开箱即用验收标准 |
-| [TODO.md](./TODO.md) | 执行清单:M18 v2.4.0 已交付;当前 M19 好用的私有化;M15~v2.2.1 已归档 docs/archive/TODO-v2.2.1.md |
+| [TODO.md](./TODO.md) | 执行清单:M19 v2.5.0 已交付(M17–M19 私有化三部曲完成);M15~v2.2.1 已归档 docs/archive/TODO-v2.2.1.md |
 
 路线图:9 个里程碑(M0~M8,合计约 7 个月)→ v1.0 GA;v0.1 起逐版本发布(引擎 PoC → S3 核心 → 高级语义 → 管理面 → 加固 → 性能冲刺 → 打包开箱 → 文档与 Beta → GA)。
 

@@ -2849,13 +2849,7 @@ fn batch_job_create_get_list_cancel() {
     assert_eq!(code, 409);
 
     // 审计可检索 job id(J3):CreateBatchJob / CancelBatchJob
-    let (code, body) = http_unix(
-        sock.as_str(),
-        "GET",
-        "/v1/admin/audit?limit=50",
-        None,
-        "t",
-    );
+    let (code, body) = http_unix(sock.as_str(), "GET", "/v1/admin/audit?limit=50", None, "t");
     assert_eq!(code, 200, "{body}");
     assert!(body.contains("CreateBatchJob"), "audit must record create");
     assert!(body.contains("CancelBatchJob"), "audit must record cancel");

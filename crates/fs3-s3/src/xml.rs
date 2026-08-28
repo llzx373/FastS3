@@ -3348,7 +3348,8 @@ pub fn parse_notification_configuration(
                         // kafka://(Kafka 目标);其余(SQS/SNS/EventBridge
                         // ARN、AMQP 等)仍显式拒绝。kafka:// 形态校验在
                         // parse_kafka_url(投递侧再验一次,配置期快失败)。
-                        let is_http = target.starts_with("http://") || target.starts_with("https://");
+                        let is_http =
+                            target.starts_with("http://") || target.starts_with("https://");
                         if !is_http && !target.starts_with("kafka://") {
                             return Err(invalid(
                                 "unsupported notification target; FastS3 supports \
@@ -3358,8 +3359,7 @@ pub fn parse_notification_configuration(
                             ));
                         }
                         if target.starts_with("kafka://") {
-                            if let Err(e) = fs3_core::parse_kafka_url(&target)
-                            {
+                            if let Err(e) = fs3_core::parse_kafka_url(&target) {
                                 return Err(invalid(format!(
                                     "invalid kafka notification target: {e}"
                                 )));

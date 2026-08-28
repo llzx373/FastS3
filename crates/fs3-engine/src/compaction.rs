@@ -1434,7 +1434,8 @@ mod tests {
         );
     }
 
-    /// M18 门禁:CHANGELOG/RELEASES v2.4.0;workspace 2.4.0;不打 tag;M18 门禁勾选。
+    /// M18 门禁:CHANGELOG/RELEASES v2.4.0;不打 tag;M18 门禁勾选。
+    /// (workspace 版本钉由最新发布条目承担,历史条目不钉版本——同 g6 口径)
     #[test]
     fn m18_changelog_releases_v240_no_tag() {
         let cl = include_str!("../../../CHANGELOG.md");
@@ -1448,19 +1449,50 @@ mod tests {
         let rel = include_str!("../../../RELEASES.md");
         assert!(rel.contains("## v2.4.0 — M18"));
         assert!(rel.contains("本版本不打 tag"));
-        let cargo = include_str!("../../../Cargo.toml");
-        assert!(
-            cargo.contains("version = \"2.4.0\""),
-            "workspace.package.version = 2.4.0"
-        );
-        let cons = include_str!("../../../web/console/package.json");
-        let srv = include_str!("../../../web/server/package.json");
-        assert!(cons.contains("\"version\": \"2.4.0\""));
-        assert!(srv.contains("\"version\": \"2.4.0\""));
         let todo = include_str!("../../../TODO.md");
         assert!(
             todo.contains("- [x] A0-1 ADR-28") && todo.contains("### M18 门禁"),
             "M18 ADR-28 须已勾;门禁节须存在"
+        );
+    }
+
+    /// M19 门禁:CHANGELOG/RELEASES v2.5.0;workspace 2.5.0;不打 tag;M19 门禁勾选。
+    #[test]
+    fn m19_changelog_releases_v250_no_tag() {
+        let cl = include_str!("../../../CHANGELOG.md");
+        let v25 = cl
+            .split("## v2.5.0")
+            .nth(1)
+            .and_then(|s| s.split("\n## ").next())
+            .expect("CHANGELOG v2.5.0");
+        assert!(v25.contains("本版本不打 tag"), "v2.5.0 须声明不打 tag");
+        assert!(
+            v25.contains("ADR-24")
+                && v25.contains("ADR-25")
+                && v25.contains("ADR-26")
+                && v25.contains("ADR-27"),
+            "v2.5.0 须引用 ADR-24~27"
+        );
+        let rel = include_str!("../../../RELEASES.md");
+        assert!(rel.contains("## v2.5.0 — M19"));
+        assert!(rel.contains("本版本不打 tag"));
+        let cargo = include_str!("../../../Cargo.toml");
+        assert!(
+            cargo.contains("version = \"2.5.0\""),
+            "workspace.package.version = 2.5.0"
+        );
+        let cons = include_str!("../../../web/console/package.json");
+        let srv = include_str!("../../../web/server/package.json");
+        assert!(cons.contains("\"version\": \"2.5.0\""));
+        assert!(srv.contains("\"version\": \"2.5.0\""));
+        let todo = include_str!("../../../TODO.md");
+        assert!(
+            todo.contains("- [x] M0 ADR-24")
+                && todo.contains("- [x] K0 ADR-25")
+                && todo.contains("- [x] J0 ADR-26")
+                && todo.contains("- [x] P0 ADR-27")
+                && todo.contains("### M19 门禁"),
+            "M19 ADR-24~27 须已勾;门禁节须存在"
         );
     }
 

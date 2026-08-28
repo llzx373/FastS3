@@ -241,11 +241,7 @@ impl<E: EngineAccess> IngestWorker<E> {
                 return Ok(());
             }
         };
-        let mtime = if job.preserve_mtime {
-            head.mtime
-        } else {
-            now
-        };
+        let mtime = if job.preserve_mtime { head.mtime } else { now };
         let IngestSourceObject { head, mut body } = obj;
         let dest_bucket = job.dest_bucket.clone();
         let dest_key = listed.key.clone();
@@ -277,7 +273,9 @@ impl<E: EngineAccess> IngestWorker<E> {
                 job.consecutive_errors = 0;
                 job.updated_at = now;
                 self.stats.objects_copied.fetch_add(1, Ordering::Relaxed);
-                self.stats.bytes_copied.fetch_add(meta.size, Ordering::Relaxed);
+                self.stats
+                    .bytes_copied
+                    .fetch_add(meta.size, Ordering::Relaxed);
             }
             Err(e) => {
                 self.record_failure(job, "object", &listed.key, &e.to_string(), now);

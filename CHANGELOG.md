@@ -5,6 +5,45 @@
 > 详细发布记录见 [RELEASES.md](./RELEASES.md);RC/GA 候选流程见
 > [docs/ga/rc-flow.md](./docs/ga/rc-flow.md)。
 
+## v2.5.0 — M19 好用的私有化(2026-08-29)
+
+M19 全部任务与门禁完成(TODO.md M19 全勾选);ADR-24(迁入保真)/ADR-25(Kafka
+通知)/ADR-26(Batch Operations)/ADR-27(Condition 时间/变量)落盘 DESIGN.md
+§3.3;workspace + web console/server 版本 **2.5.0**。git tag / `tools/package/`
+属执行期步骤(**本版本不打 tag**,与 v2.4.0 同口径)。
+
+- **控制台文件柜**(U):对象预览(图片/文本/PDF,超阈值只下载,SSE-C 显式
+  提示仅下载)、勾选对象打包 zip 流式下载(超限 413)、版本对比/回滚
+  (服务端 Copy 自复制,历史保留)、中英 i18n(默认随浏览器,可手动覆盖)。
+- **保 mtime 迁入向导**(M,ADR-24):管理面迁入任务 CRUD + 执行器(流式
+  GET 源 + PUT 目标,节流/游标续跑);源 LastModified 目标回显 ±1s、用户
+  元数据/标签/内容类型/存储类保真;重跑幂等不双计容量;`ij:` 前缀三处同步;
+  控制台向导页 + E2E 夹具(第二 FastS3 真源端)。
+- **Condition 时间/变量补全**(P,ADR-27):`DateGreaterThan/DateLessThan/
+  DateEquals × aws:CurrentTime` 白名单与 `${aws:username}` Resource 变量展开;
+  非法键维持 MalformedPolicy 红线;上游 s3-tests 无相关用例,逐名记账。
+- **Kafka 通知**(K,ADR-25):`kafka://` 目标(bootstrap/topic/可选
+  SASL/TLS,密码仅 env);零新依赖线协议生产者(Metadata v1→Produce v3
+  record-batch);复用 `e:` 队列 at-least-once、N3 重试/死信;载荷与 Webhook
+  同源;`fasts3_notification_*` 指标按 target=webhook|kafka 分账;进程内
+  fake broker 真实 TCP 集成测试。
+- **S3 Batch Operations**(J,ADR-26):管理面 JSON API(`/v1/admin/batch/jobs`,
+  字段与 AWS CreateJob 同名,不实现 S3 Control 端口);manifest = 行内 CSV /
+  桶内 CSV 对象 / S3 Inventory manifest.json(列名容忍表头/列序,条目上限
+  1e6);操作 COPY/DELETE/RESTORE/REPLACE-TAGS 走引擎原语,**Object Lock
+  锁定对象 delete 记失败不绕过**;状态机 Submitted→Running→Completed/Failed/
+  Cancelled,游标持久化崩溃续跑;终态报告 CSV 对账;`jb:` 前缀三处同步;
+  控制台 Batch 视图 + 审计(operator = JWT 登录者)。
+- **门禁**:`cargo test --workspace` 全绿;`batch_job_create_get_list_cancel`/
+  `batch_delete_skips_locked`/`batch_restore_glacier_object`/
+  `ingest_preserves_mtime_and_usermeta`/`ingest_wizard_fixture_second_fasts3_source`
+  全部执行;s3-tests 全量意外失败 0(run_g4 终跑:461 passed / 94 skipped /
+  260 文档化排除,与 v2.4.0 持平);迁入向导夹具 mtime 与用户元数据对账绿;
+  Kafka 用例绿(fake broker 方案边界 ADR-25 钉死);clippy `-D warnings`;
+  cargo audit 0 漏洞;覆盖率 llvm-cov 行 **84.35%**(相对 v2.4.0 84.78%
+  -0.43pt,不回退 >1pt 达标;增量代码 batch/ingest/kafka 携带自有集成
+  测试,fs3d 装配与 XML 校验面摊薄)。
+
 ## v2.4.0 — M18 IAM 多租户(2026-08-28)
 
 M18 全部任务与门禁完成(TODO.md M18 全勾选);ADR-28 落盘 DESIGN.md §3.3

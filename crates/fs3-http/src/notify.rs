@@ -813,16 +813,23 @@ mod tests {
             filter: fs3_core::NotificationKeyFilter::default(),
         };
         let (_d, meta) = meta_with_rule(rule);
-        meta.commit(&[fs3_meta::Op::EventEnqueue { record: sample_event(0) }]).unwrap();
+        meta.commit(&[fs3_meta::Op::EventEnqueue {
+            record: sample_event(0),
+        }])
+        .unwrap();
         let kafka = Arc::new(MockKafka {
             calls: SyncMutex::new(Vec::new()),
             fail: false,
         });
-        let (mut worker, stats) = worker_with(meta.clone(), Arc::new(MockSender {
-            calls: SyncMutex::new(Vec::new()),
-            fail_first: 0,
-            fail_with: 500,
-        }), 3);
+        let (mut worker, stats) = worker_with(
+            meta.clone(),
+            Arc::new(MockSender {
+                calls: SyncMutex::new(Vec::new()),
+                fail_first: 0,
+                fail_with: 500,
+            }),
+            3,
+        );
         worker = worker.with_kafka_sender(kafka.clone());
         worker.run_round_blocking().unwrap();
 
@@ -869,12 +876,19 @@ mod tests {
             filter: fs3_core::NotificationKeyFilter::default(),
         };
         let (_d, meta) = meta_with_rule(rule);
-        meta.commit(&[fs3_meta::Op::EventEnqueue { record: sample_event(0) }]).unwrap();
-        let (mut worker, stats) = worker_with(meta.clone(), Arc::new(MockSender {
-            calls: SyncMutex::new(Vec::new()),
-            fail_first: 0,
-            fail_with: 500,
-        }), 1);
+        meta.commit(&[fs3_meta::Op::EventEnqueue {
+            record: sample_event(0),
+        }])
+        .unwrap();
+        let (mut worker, stats) = worker_with(
+            meta.clone(),
+            Arc::new(MockSender {
+                calls: SyncMutex::new(Vec::new()),
+                fail_first: 0,
+                fail_with: 500,
+            }),
+            1,
+        );
         worker = worker.with_kafka_sender(Arc::new(FailingKafka));
         worker.run_round_blocking().unwrap();
         let snap = stats.snapshot();

@@ -1,5 +1,49 @@
 # FastS3 发布记录
 
+## v2.5.0 — M19 好用的私有化(2026-08-29)
+
+> 发布状态:与 M19 交付同步;git tag/发布流水线属执行期步骤(与 v2.4.0
+> 同口径,**本版本不打 tag**)。决策记录:ADR-24/25/26/27
+> (docs/DESIGN.md §3.3,与实现无偏离;Batch Inventory manifest 语义
+> 2026-08-29 按 DR2.2 修正实现侧后复测)。
+
+### 变更(TODO M19 全项:U/M/P/K/J + 门禁)
+
+- **控制台文件柜**:对象预览(图片/文本/PDF,超阈值只下载)、勾选对象
+  流式 zip 打包(超限 413)、版本对比/回滚(历史保留)、中英 i18n
+  (默认随浏览器语言)。
+- **保 mtime 迁入向导**(ADR-24):管理面任务 `ij:` 落元数据 + 执行器
+  (SigV4 流式拉源、节流、游标续跑);mtime ±1s / 用户元数据 / 标签 /
+  存储类保真;重跑幂等;控制台向导页(MinIO/S3/OSS endpoint 预设)。
+- **Condition Date\*(ADR-27)**:`DateGreaterThan/DateLessThan/DateEquals ×
+  aws:CurrentTime` 白名单 + `${aws:username}` Resource 展开;超集键仍
+  MalformedPolicy。
+- **Kafka 通知**(ADR-25):`kafka://` 目标,零新依赖线协议生产者,
+  复用 `e:` 队列 at-least-once 与 N3 重试/死信,指标按 target 分账;
+  AMQP/MQTT/NSQ 不做。
+- **S3 Batch Operations**(ADR-26):`/v1/admin/batch/jobs` 管理面 JSON
+  (AWS 同名字段;不做 S3 Control 端口);manifest = CSV / Inventory
+  manifest.json;COPY/DELETE/RESTORE/REPLACE-TAGS;Object Lock 不绕过;
+  游标持久化崩溃续跑;报告 CSV 对账;`jb:` 三处同步;控制台视图 + 审计。
+- **门禁实测**:
+  - `cargo test --workspace` 全绿(2026-08-29 门禁复跑,29 套件;
+    batch_integration 8 例 / ingest 集成与 E2E / Kafka 5 例 / Condition
+    6 例 / `m19_changelog_releases_v250_no_tag` 版本钉全过);
+  - s3-tests 全量意外失败 0(run_g4 终跑 2026-08-29:passed=461 /
+    skipped=94 / excluded=260,与 v2.4.0 持平);Condition/Batch 按出集
+    或逐名(tests/s3-tests/README.md:M19 P 增量 + batch 族无上游用例记账);
+  - 迁入向导夹具 `ingest_wizard_fixture_second_fasts3_source` 绿
+    (第二 FastS3 真实 S3 HTTP 源 → 目标,mtime ±1s 与用户元数据对账,
+    重跑不双计,leaks 空);
+  - Kafka 用例绿(mock 方案 = 进程内 fake broker 真实 TCP,ADR-25 DR
+    钉死边界;`minimal_sender_produces_over_tcp` /
+    `kafka_target_gets_payload_with_key` / `kafka_delivery_failure_retries`);
+  - clippy `-D warnings`;cargo audit 0 漏洞(3 allowed 信息级警告:
+    RUSTSEC-2023-0089 / RUSTSEC-2025-0134 同 v2.4.0 集,chacha20 yanked
+    为 M11 SSE 既有依赖,非本版引入);
+  - 覆盖率 llvm-cov workspace 行 **84.35%**(相对 v2.4.0 84.78% -0.43pt,
+    回退 ≤1pt 达标;分支 78.26% / 函数 84.58%)。
+
 ## v2.4.0 — M18 IAM 多租户(2026-08-28)
 
 > 发布状态:与 M18 交付同步;git tag/发布流水线属执行期步骤(与 v2.3.0

@@ -390,7 +390,7 @@ FastS3 的终点不是一个能跑通的代码库,而是一个**陌生用户在�
 | v2.2 | 归档与复制 | 归档存储类 + RestoreObject(zstd 压缩档 + 生命周期 Transition);复制策略化(中心调度同步任务);LDAP/OpenID | M15;已交付 v2.2.0,审查修复 v2.2.1 |
 | v2.3 | 可交付私有化 | 许可证口径对齐、单容器开箱、退出路径演练、mc 高并发死锁根治、Public Access Block、Hadoop S3A/不可变仓库冒烟、审计导出(代替 Logging 叙事) | v2.2.1;任务见 TODO.md M17 |
 | v2.4 | IAM 多租户 | MinIO 熟悉的用户/组/策略/服务账号;租户隔离;部门管理员自助;STS 本租户 Role;LDAP 映射到 User(ADR-28) | M17;任务见 TODO.md M18 |
-| v2.5 | 好用的私有化 | 控制台文件柜(预览/批量 zip/版本回滚/i18n)、保 mtime 迁入向导、Condition Date*、Kafka 通知、S3 Batch Operations | M18;任务见 TODO.md M19 |
+| v2.5 | 好用的私有化 | 控制台文件柜(预览/批量 zip/版本回滚/i18n)、保 mtime 迁入向导(ADR-24)、Kafka 通知(ADR-25)、S3 Batch Operations(ADR-26)、Condition Date*(ADR-27) | M18;任务见 TODO.md M19 |
 | 持续 | 性能与适配 | 每版本性能回归报告;Gen5/CXL 新硬件适配;新内核矩阵;客户端兼容性滚动测试 | — |
 
 - **v2.0 目标形态**:云上多机 + 边缘多节点的统一管理入口,单机引擎仍保持零依赖可独立运行(不锁死用户到平台);

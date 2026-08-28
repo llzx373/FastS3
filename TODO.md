@@ -14,7 +14,8 @@
 
 ## 使用约定
 
-1. **当前执行面 = [M19 好用的私有化](#m19-v250-好用的私有化)**。M18 门禁已过(IAM 已交付,部门身份可自助);M19 各组首条 ADR 未落盘不得写实现。
+1. **当前执行面:M17–M19 私有化三部曲已全部交付**(M19 v2.5.0 门禁 2026-08-29 复跑通过)。
+   新增工作先过持有组门槛(§「持有组」)或走人工后置执行单,不在本清单插行。
 2. 按里程碑顺序推进;**门禁(退出条件)全部勾选**后方可进入下一里程碑(ROADMAP §5 纪律)。
 3. 每条任务标注所属 WBS 编号,完成时在提交/PR 描述中引用本文件条目。
 4. **决策纪律**:各组首条含 ADR 的必须先落盘——M17 = ADR-23(BPA);
@@ -43,7 +44,7 @@
 | --- | --- | --- | --- | --- |
 | [M17 可交付私有化](#m17-v230-可交付私有化) | v2.3.0 | ≈3 周 | 许可证对齐、单容器开箱、退出路径、mc 死锁、BPA、湖仓/不可变仓库冒烟、审计导出 | ✅ 已交付 |
 | [M18 IAM 多租户](#m18-v240-iam-多租户) | v2.4.0 | ≈4 周 | MinIO 熟悉的用户/组/策略/服务账号 + 租户隔离;部门管理员自助,不依赖 root | ✅ 已交付 |
-| [M19 好用的私有化](#m19-v250-好用的私有化) | v2.5.0 | ≈6 周 | 控制台文件柜、保元数据迁入向导、Condition Date*、Kafka 通知、S3 Batch Operations | ⬜ 未开始 |
+| [M19 好用的私有化](#m19-v250-好用的私有化) | v2.5.0 | ≈6 周 | 控制台文件柜、保元数据迁入向导、Condition Date*、Kafka 通知、S3 Batch Operations | ✅ 已交付 |
 
 已交付底座(不占排期,门禁不得回退):S3 核心读写、版本、Object Lock、SSE-S3/C、生命周期、
 归档 Restore、Webhook、STS、Inventory、LDAP/OIDC、中心纳管、策略化复制、配额/限速/Prometheus。
@@ -443,13 +444,31 @@
 
 ### M19 门禁(退出条件)
 
-- [ ] ADR-24/25/26/27 落盘,与实现无偏离
-- [ ] `cargo test --workspace` 全绿;本清单新增用例全部执行
-- [ ] s3-tests 全量意外失败 0;Condition/Batch 按出集或逐名
-- [ ] 迁入向导夹具:源 MinIO 或第二 FastS3 → 目标,mtime 与用户元数据对账
-- [ ] Kafka 用例绿(含 mock 方案则文档化边界)
-- [ ] clippy -D warnings;覆盖率不回退 >1pt;cargo audit 清零
-- [ ] 发布记录 v2.5.0:CHANGELOG/RELEASES + 版本 bump(**不打 tag / 不公网 Release**)
+- [x] ADR-24/25/26/27 落盘,与实现无偏离(ADR-26 DR2.2 Inventory manifest
+  语义在 J2 实现侧修正:manifest.json → `files[].key` 数据文件 →
+  `Bucket,Key,VersionId` 列名容忍表头/列序,2026-08-29 随 2dc356f 落地并复测)
+- [x] `cargo test --workspace` 全绿(2026-08-29 门禁复跑,29 套件 0 失败);
+  本清单新增用例全部执行(`batch_job_create_get_list_cancel` /
+  `batch_delete_skips_locked` / `batch_restore_glacier_object` /
+  `condition_current_time_office_hours` / `policy_variable_username_in_resource` /
+  `ingest_job_create_and_status` / `ingest_preserves_mtime_and_usermeta` /
+  `ingest_wizard_fixture_second_fasts3_source` / Kafka 5 例 / web
+  batch-routes 与 console 测试)
+- [x] s3-tests 全量意外失败 0(run_g4 终跑 2026-08-29:passed=461
+  skipped=94 excluded=260 unexpected=0,与 v2.4.0 持平);Condition/Batch
+  按出集或逐名(README:M19 P 增量「无 token 可移出」记账 + batch 族
+  无上游用例记账)
+- [x] 迁入向导夹具:第二 FastS3 真实 S3 HTTP 源 → 目标,mtime ±1s 与
+  用户元数据对账,重跑不双计容量,`leaks` 空
+  (`ingest_wizard_fixture_second_fasts3_source`)
+- [x] Kafka 用例绿(mock 方案 = 进程内 fake broker 真实 TCP,ADR-25 DR
+  钉死边界;Webhook 回归不破)
+- [x] clippy -D warnings;覆盖率不回退 >1pt(llvm-cov workspace 行
+  84.35%,对照 v2.4.0 84.78% -0.43pt 达标;分支 78.26% / 函数 84.58%);
+  cargo audit 清零(0 漏洞,3 allowed 信息级警告:2 unmaintained 同
+  v2.4.0 集,chacha20 yanked 为 M11 SSE 既有依赖)
+- [x] 发布记录 v2.5.0:CHANGELOG/RELEASES + 版本 bump(**不打 tag /
+  不公网 Release**)
 
 ---
 
