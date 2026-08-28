@@ -547,6 +547,17 @@ pub struct MetaExportFile {
     /// (无此字段)→ 空表,导入侧 ensure_bootstrap_user 兜底 bootstrap。
     #[serde(default)]
     pub users: Vec<fs3_core::IamUser>,
+    /// IAM 组(M18 U2;ADR-28 DI2.2 + 键前缀三处同步之二:`ig:` 登记于
+    /// fs3-meta keys.rs)。无秘密材料;旧导出(无此字段)→ 空表。导入
+    /// 顺序在 users 之后(成员存在性校验 + user.groups 反规范化同步由
+    /// commit_iam_group_put 事务保证,幂等不重复追加)。
+    #[serde(default)]
+    pub groups: Vec<fs3_core::IamGroup>,
+    /// IAM 自定义策略(M18 U2;ADR-28 DI2.3 + 键前缀三处同步之二:`ip:`
+    /// 登记于 fs3-meta keys.rs;canned 为代码常量不入导出)。策略文档
+    /// 无秘密材料;旧导出(无此字段)→ 空表。
+    #[serde(default)]
+    pub policies: Vec<fs3_core::IamPolicy>,
     pub objects: Vec<ObjectEntryDto>,
     pub uploads: Vec<UploadDto>,
 }
@@ -673,6 +684,10 @@ pub fn run_meta_export(
     // 供灾备,明文不出现 —— IamUser 只存哈希)
     let users = store.list_iam_users()?;
 
+    // M18 U2:IAM 组与自定义策略(canned 为代码常量,不入导出)
+    let groups = store.list_iam_groups()?;
+    let policies = store.list_iam_policies()?;
+
     // M10 V5-1:版本化桶逐版本条目导出(含删除标记与 null 槽),vk 不丢 ——
     // 键形态经 ObjectDto.version_id 承载(None/"null"/hex 三态)。
     let objects: Vec<ObjectEntryDto> = store
@@ -714,6 +729,8 @@ pub fn run_meta_export(
         keys,
         tenants,
         users,
+        groups,
+        policies,
         objects,
         uploads,
     };
@@ -723,11 +740,13 @@ pub fn run_meta_export(
 
     write_private(&args.output, json.as_bytes())?;
     println!(
-        "meta-export: {} buckets, {} keys, {} tenants, {} users, {} objects, {} uploads → {}",
+        "meta-export: {} buckets, {} keys, {} tenants, {} users, {} groups, {} policies, {} objects, {} uploads → {}",
         file.buckets.len(),
         file.keys.len(),
         file.tenants.len(),
         file.users.len(),
+        file.groups.len(),
+        file.policies.len(),
         file.objects.len(),
         file.uploads.len(),
         args.output.display()
@@ -914,6 +933,20 @@ pub fn run_meta_import(
     // (无 users 字段)→ 仅 bootstrap,语义等同「孤儿密钥挂 bootstrap」。
     for u in &file.users {
         store.commit_iam_user_put(u)?;
+    }
+
+    // 5d) IAM 自定义策略(M18 U2):原样恢复(覆盖语义;canned 为代码
+    // 常量不入导出)。先于组恢复(组记录可能挂载策略名;meta 层不校验
+    // 策略名存在性,顺序仅为直观)。
+    for p in &file.policies {
+        store.commit_iam_policy_put(p)?;
+    }
+
+    // 5e) IAM 组(M18 U2):原样恢复;成员存在性校验与 user.groups 反
+    // 规范化同步由 commit_iam_group_put 事务保证(users 已先恢复,
+    // groups 列表幂等不重复追加)。
+    for g in &file.groups {
+        store.commit_iam_group_put(g)?;
     }
 
     // 6) 对象:段校验(布局边界/对齐)+ 分配草稿 + 零统计增量
@@ -1904,6 +1937,24 @@ mod tests {
                 .with_iam_owner("default", "alice", Some("ci-bot".into()));
             e.meta().commit_key_put(&rec).unwrap();
             e.meta().commit_iam_user_put(&alice).unwrap();
+            // M18 U2:组 + 自定义策略随导出往返
+            e.meta()
+                .commit_iam_group_put(&fs3_core::IamGroup {
+                    tenant_id: "default".into(),
+                    name: "readers".into(),
+                    members: vec!["alice".into()],
+                    policies: vec!["team-ro".into()],
+                    created_at: 1_700_000_000,
+                })
+                .unwrap();
+            e.meta()
+                .commit_iam_policy_put(&fs3_core::IamPolicy {
+                    tenant_id: Some("default".into()),
+                    name: "team-ro".into(),
+                    document: r#"{"Version":"2012-10-17","Statement":[]}"#.into(),
+                    created_at: 1_700_000_000,
+                })
+                .unwrap();
             e.close().unwrap();
         }
         let export = dir.path().join("export.json");
@@ -1929,6 +1980,17 @@ mod tests {
         assert!(users.iter().any(|u| u["name"] == "alice"));
         assert_eq!(json["keys"][0]["owner_user"], "alice");
         assert_eq!(json["keys"][0]["sa_name"], "ci-bot");
+        // M18 U2:组与自定义策略随导出(canned 不入导出)
+        let groups = json["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["name"], "readers");
+        assert_eq!(groups[0]["members"], serde_json::json!(["alice"]));
+        let policies = json["policies"].as_array().unwrap();
+        assert_eq!(policies.len(), 1);
+        assert_eq!(policies[0]["name"], "team-ro");
+        // 反规范化保真:alice 的 groups 已被组事务同步
+        let alice_json = users.iter().find(|u| u["name"] == "alice").unwrap();
+        assert_eq!(alice_json["groups"], serde_json::json!(["readers"]));
 
         // 全量往返:users 与 key 属主字段原样恢复
         std::fs::copy(&img1, &img2).unwrap();
@@ -1942,10 +2004,22 @@ mod tests {
         )
         .unwrap();
         let store2 = MetaStore::open(&meta2, &MetaConfig::default()).unwrap();
+        let alice2 = store2.get_iam_user("default", "alice").unwrap().unwrap();
+        // 组导入幂等:user.groups 不重复追加
+        assert_eq!(alice2.groups, vec!["readers".to_string()]);
+        assert_eq!(alice2.policies, alice.policies);
         assert_eq!(
-            store2.get_iam_user("default", "alice").unwrap().as_ref(),
-            Some(&alice)
+            store2
+                .get_iam_group("default", "readers")
+                .unwrap()
+                .unwrap()
+                .members,
+            vec!["alice".to_string()]
         );
+        assert!(store2
+            .get_iam_policy("default", "team-ro")
+            .unwrap()
+            .is_some());
         assert!(store2
             .get_iam_user("default", "bootstrap")
             .unwrap()
@@ -1955,7 +2029,8 @@ mod tests {
         assert_eq!(rec2.sa_name.as_deref(), Some("ci-bot"));
         assert!(rec2.verify_secret(secret));
 
-        // 旧格式 JSON(I2 前:keys 无属主字段、顶层无 users)→ 双读补默认
+        // 旧格式 JSON(I2 前:keys 无属主字段、顶层无 users;U2 前:无
+        // groups/policies)→ 双读补默认
         let mut old = json.clone();
         for k in old["keys"].as_array_mut().unwrap() {
             let ko = k.as_object_mut().unwrap();
@@ -1963,7 +2038,10 @@ mod tests {
                 ko.remove(f);
             }
         }
-        old.as_object_mut().unwrap().remove("users");
+        let old_obj = old.as_object_mut().unwrap();
+        old_obj.remove("users");
+        old_obj.remove("groups");
+        old_obj.remove("policies");
         let old_path = dir.path().join("export-old.json");
         std::fs::write(&old_path, serde_json::to_string_pretty(&old).unwrap()).unwrap();
         run_meta_import(

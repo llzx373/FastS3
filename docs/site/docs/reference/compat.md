@@ -143,10 +143,16 @@ meta-export/import 可见并可往返;真实类独立落 ObjectMeta v7 `storage_
 | 用户禁用语义 | 禁用 User → 其全部 SA(数据面 `k:`)鉴权失败,错误码钉死 **InvalidAccessKeyId**(与「密钥不存在/被禁用」同义,口径同上节密钥状态语义);审计侧写新增 `user_disabled` 变体;**强制执行自 M18 U1 起落地**(数据面内存用户状态表,启停即时生效、无需重启;派生会话同失效,口径 InvalidToken);禁用单把 SA 不影响 User 控制台登录(ADR-28 DI7.3) |
 | 缺失用户记录 | 密钥属主无对应 `iu:` 记录(legacy/构造注入密钥)→ **按 bootstrap 存活处理**,照常鉴权,不因缺席而拒绝(U1 钉死;孤儿密钥挂载语义不变) |
 | 用户删除(M18 U1) | 须先吊销其全部 SA(存在属主等于该用户的 `k:` 密钥 → 409);`default/bootstrap` 恒拒绝(400;孤儿密钥挂载点);不做级联删除 |
-| 用户管理面(M18 U1) | `/v1/iam/users` CRUD(root 可信通道):口令仅入站一次、只存加盐哈希、任何响应零回显(列表/详情仅 `has_password` 布尔);PATCH `policies` 为**整表替换**语义(v1);bootstrap 用户不可 PATCH/DELETE |
+| 用户管理面(M18 U1) | `/v1/iam/users` CRUD(root 可信通道):口令仅入站一次、只存加盐哈希、任何响应零回显(列表/详情仅 `has_password` 布尔);PATCH `policies` 为**整表替换**语义(v1),M18 U2 起策略名须可解析(canned 或本租户既有自定义,否则 400 `no_such_policy`);bootstrap 用户不可 PATCH/DELETE |
+| 组管理面(M18 U2) | `/v1/iam/groups` CRUD:members/policies 均为**整表替换**;成员须是本租户既有用户(400),成员增减由 meta 单事务双端同步 `IamUser.groups`(崩溃安全);删除组同事务清理全部成员的 groups 列表,不做成员删除级联 |
+| canned 策略集(M18 U2;ADR-28 DI2.3) | `readonly`(s3:Get*/List*/Head*)·`readwrite`(s3:*)·`writeonly`(s3:Put*/Delete*/CreateBucket/Abort*/Restore*/Multipart)·`diagnostics`(admin:List*/Get* + s3 读)·`consoleAdmin`(admin:* + s3:*,集群范围)·`tenantAdmin`(租户内用户/组/策略/SA/角色管理 + s3:*);名与 MinIO 对齐,内容按 FastS3 动作翻译(Resource 用 `*` 而非 `arn:aws:s3:::*`——本引擎服务级动作资源为字面 `*`);canned 为代码常量:**只读、不落盘**(无 `ip:` 键),PATCH/DELETE → 400 `policy_readonly`,自定义撞名 → 400 `policy_name_reserved`;`tenantAdmin` 的租户边界(调用者租户 == 目标租户)在求值处强制,HTTP 接线属 C1 |
+| 自定义策略(M18 U2) | `/v1/iam/policies` CRUD;`document` 创建/PATCH 时经数据面同一严格解析器校验,非法(未知字段等)→ 400 **MalformedPolicy**;删除前置:本租户任一 user/group 仍挂载 → 409 `policy_attached`(须先解挂,无悬挂引用不变量) |
+| 策略授予规则(M18 U2) | root 可授任意策略;**非 root 不得授予 `consoleAdmin`**(含自持 tenantAdmin 的租户管理员);其余非 root 授予 v1 不做「granter 须自持该策略」限制(简化口径,C1 接线调用方身份后可收紧) |
+| `admin:*` 动作族(M18 U2;ADR-28 DI3.3) | 管理面/控制台授权动作词汇(`policy.rs` 独立族,不补 `s3:` 前缀):用户 CreateUser/ListUsers/GetUser/UpdateUser/DeleteUser,组 CreateGroup/ListGroups/GetGroup/UpdateGroup/DeleteGroup,策略 CreatePolicy/ListPolicies/GetPolicy/DeletePolicy/AttachPolicy,服务账号 CreateServiceAccount/ListServiceAccounts/DeleteServiceAccount,角色 CreateRole/ListRoles/GetRole/DeleteRole,审计 GetAudit(均带 `admin:` 前缀);U2 仅定义词汇与 canned 文档,HTTP 求值接线属 C1 |
+| 数据面身份层(M18 U2;ADR-28 DI3.1 首片) | 已认证请求生效策略 = (User 直挂 ∪ 所属组 policies)∩ SA 嵌入/密钥策略 ∩ 桶策略;身份层 Deny 优先,**有挂载须至少一个 Allow**(挂载后「无密钥策略 = 隐式全量」不再成立);**无挂载 → legacy 并集语义分毫不改**;挂载名无法解析(脏数据)→ fail-closed 拒绝 |
 | SA 嵌入策略 | `embedded_policy` 与属主生效策略**求交**,Deny 优先(与 policy.rs 现口径一致);完整评估属 M18 S2/U3,I2 仅落数据模型 |
-| 管理面 | Rust admin `/v1/iam/tenants` + `/v1/iam/users` CRUD(root 可信通道;`admin:*` IAM 授权细分属 M18 C1) |
-| 备份 | meta-export v2 起含 `tenants` 字段,M18 I2 起含 `users` 字段(口令哈希可导出供灾备);旧导出缺省 = 仅 default 租户 + bootstrap 用户;`k:` 旧 JSON 缺属主字段 → 导入补 default/bootstrap;secret 明文仍零导出 |
+| 管理面 | Rust admin `/v1/iam/tenants` + `/v1/iam/users` + `/v1/iam/groups` + `/v1/iam/policies` CRUD(root 可信通道;`admin:*` IAM 授权细分属 M18 C1) |
+| 备份 | meta-export v2 起含 `tenants` 字段,M18 I2 起含 `users` 字段(口令哈希可导出供灾备),M18 U2 起含 `groups`/`policies` 字段(canned 不入导出);旧导出缺省 = 仅 default 租户 + bootstrap 用户、无组/自定义策略;`k:` 旧 JSON 缺属主字段 → 导入补 default/bootstrap;secret 明文仍零导出 |
 
 
 

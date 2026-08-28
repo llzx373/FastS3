@@ -593,6 +593,34 @@ pub enum Op {
         tenant_id: String,
         name: String,
     },
+    /// 写/更新 IAM 组(`ig:{tenant}\0{group}` → IamGroup;M18 U2;ADR-28
+    /// DI2.2;覆盖语义,同 IamUserPut 先例)。成员反规范化同事务同步:
+    /// 新增成员须是本租户既有 IamUser(否则 InvalidArgument),其
+    /// IamUser.groups 补入本组;相对旧记录被移除的成员,事务内从其
+    /// groups 摘除本组。
+    IamGroupPut {
+        group: fs3_core::IamGroup,
+    },
+    /// 删除 IAM 组(M18 U2)。不存在 → NotFound;同事务清理全部成员的
+    /// IamUser.groups(单事务 = 崩溃安全,无半同步状态)。
+    IamGroupDelete {
+        tenant_id: String,
+        name: String,
+    },
+    /// 写/更新 IAM 策略(`ip:{tenant}\0{name}` → IamPolicy;M18 U2;
+    /// ADR-28 DI2.3;覆盖语义)。`tenant_id = None`(canned)→
+    /// InvalidArgument(canned 为代码常量,不落盘);文档语法校验在
+    /// 管理面(fs3-admin 经 fs3_s3::policy::Policy::parse),本层不解析。
+    IamPolicyPut {
+        policy: fs3_core::IamPolicy,
+    },
+    /// 删除 IAM 策略(M18 U2)。不存在 → NotFound;本租户任一
+    /// user/group 仍挂载该策略名 → InvalidArgument(须先解挂;冲突集
+    /// 纪律同 TenantDelete 的前缀扫描)。
+    IamPolicyDelete {
+        tenant_id: String,
+        name: String,
+    },
     /// 删除 IAM 租户。**非空拒绝**:事务内扫描 `iu:`/`ig:`/`ip:`/`ir:`
     /// 租户子前缀与 `k:` 属主字段(M18 I2),存在任何 IAM 实体或本租户
     /// 持有的密钥 → InvalidArgument。
@@ -3127,6 +3155,132 @@ impl MetaStore {
         Ok(out)
     }
 
+    // —— IAM 组(M18 U2;ADR-28 DI2.2) ——
+
+    /// 写/更新 IAM 组(覆盖语义;成员反规范化同步与成员存在性校验见
+    /// Op::IamGroupPut;非法名 → InvalidArgument)。
+    pub fn commit_iam_group_put(&self, group: &fs3_core::IamGroup) -> Result<u64> {
+        self.commit(&[Op::IamGroupPut {
+            group: group.clone(),
+        }])
+    }
+
+    /// 删除 IAM 组(不存在 → NotFound;同事务清理成员 groups 列表)。
+    pub fn commit_iam_group_delete(&self, tenant: &str, name: &str) -> Result<u64> {
+        self.commit(&[Op::IamGroupDelete {
+            tenant_id: tenant.to_string(),
+            name: name.to_string(),
+        }])
+    }
+
+    /// 读 IAM 组。
+    pub fn get_iam_group(&self, tenant: &str, name: &str) -> Result<Option<fs3_core::IamGroup>> {
+        let k = iam_group_key(tenant, name)?;
+        match self.db.get(&k).map_err(rocks_err)? {
+            Some(v) => Ok(Some(decode(&v).map_err(|e| {
+                Error::Corrupt(format!("iam group {tenant}/{name}: {e}"))
+            })?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 列全部 IAM 组(导出/灾备恢复用,同 list_iam_users 先例)。
+    pub fn list_iam_groups(&self) -> Result<Vec<fs3_core::IamGroup>> {
+        let mut out = Vec::new();
+        for item in self
+            .db
+            .iterator(IteratorMode::From(PREFIX_IAM_GROUP, Direction::Forward))
+        {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(PREFIX_IAM_GROUP) {
+                break;
+            }
+            out.push(decode(&v).map_err(|e| Error::Corrupt(format!("iam group record: {e}")))?);
+        }
+        Ok(out)
+    }
+
+    /// 列某租户全部 IAM 组(`ig:{tenant}\0` 前缀扫描,按 name 排序)。
+    pub fn list_iam_groups_in(&self, tenant: &str) -> Result<Vec<fs3_core::IamGroup>> {
+        let prefix = iam_group_prefix(tenant)?;
+        let mut out = Vec::new();
+        for item in self
+            .db
+            .iterator(IteratorMode::From(&prefix, Direction::Forward))
+        {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(&prefix) {
+                break;
+            }
+            out.push(decode(&v).map_err(|e| Error::Corrupt(format!("iam group record: {e}")))?);
+        }
+        Ok(out)
+    }
+
+    // —— IAM 策略(M18 U2;ADR-28 DI2.3) ——
+
+    /// 写/更新 IAM 自定义策略(覆盖语义;canned → InvalidArgument,见
+    /// Op::IamPolicyPut;非法名 → InvalidArgument)。
+    pub fn commit_iam_policy_put(&self, policy: &fs3_core::IamPolicy) -> Result<u64> {
+        self.commit(&[Op::IamPolicyPut {
+            policy: policy.clone(),
+        }])
+    }
+
+    /// 删除 IAM 自定义策略(不存在 → NotFound;仍被挂载 →
+    /// InvalidArgument,见 Op::IamPolicyDelete)。
+    pub fn commit_iam_policy_delete(&self, tenant: &str, name: &str) -> Result<u64> {
+        self.commit(&[Op::IamPolicyDelete {
+            tenant_id: tenant.to_string(),
+            name: name.to_string(),
+        }])
+    }
+
+    /// 读 IAM 自定义策略(canned 无 `ip:` 键,恒 None)。
+    pub fn get_iam_policy(&self, tenant: &str, name: &str) -> Result<Option<fs3_core::IamPolicy>> {
+        let k = iam_policy_key(tenant, name)?;
+        match self.db.get(&k).map_err(rocks_err)? {
+            Some(v) => Ok(Some(decode(&v).map_err(|e| {
+                Error::Corrupt(format!("iam policy {tenant}/{name}: {e}"))
+            })?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 列全部 IAM 自定义策略(导出/灾备恢复用,同 list_iam_users 先例)。
+    pub fn list_iam_policies(&self) -> Result<Vec<fs3_core::IamPolicy>> {
+        let mut out = Vec::new();
+        for item in self
+            .db
+            .iterator(IteratorMode::From(PREFIX_IAM_POLICY, Direction::Forward))
+        {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(PREFIX_IAM_POLICY) {
+                break;
+            }
+            out.push(decode(&v).map_err(|e| Error::Corrupt(format!("iam policy record: {e}")))?);
+        }
+        Ok(out)
+    }
+
+    /// 列某租户全部 IAM 自定义策略(`ip:{tenant}\0` 前缀扫描;不含
+    /// canned——canned 为代码常量,不入库)。
+    pub fn list_iam_policies_in(&self, tenant: &str) -> Result<Vec<fs3_core::IamPolicy>> {
+        let prefix = iam_policy_prefix(tenant)?;
+        let mut out = Vec::new();
+        for item in self
+            .db
+            .iterator(IteratorMode::From(&prefix, Direction::Forward))
+        {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(&prefix) {
+                break;
+            }
+            out.push(decode(&v).map_err(|e| Error::Corrupt(format!("iam policy record: {e}")))?);
+        }
+        Ok(out)
+    }
+
     /// 对象 PUT + 分配记录 + 桶统计(ADR-4 同事务)。
     pub fn commit_object_put(
         &self,
@@ -4458,6 +4612,109 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
                 tget(tx, &k)?;
                 tinsert(tx, k, encode(user)?)?;
             }
+            Op::IamGroupPut { group } => {
+                let k = iam_group_key(&group.tenant_id, &group.name)?;
+                // 成员反规范化同步(同事务):新增成员须存在且其
+                // IamUser.groups 补入本组;被移除成员从其 groups 摘除。
+                // tget(iu: 键)锚定用户记录,并发冲突经乐观事务重试。
+                let old: Option<fs3_core::IamGroup> = tget(tx, &k)?
+                    .map(|v| {
+                        decode(&v).map_err(|e| Error::Corrupt(format!("iam group record: {e}")))
+                    })
+                    .transpose()?;
+                for m in &group.members {
+                    let uk = iam_user_key(&group.tenant_id, m)?;
+                    let Some(uv) = tget(tx, &uk)? else {
+                        return Err(Error::InvalidArgument(format!(
+                            "iam group {}/{} member {m} is not an existing user",
+                            group.tenant_id, group.name
+                        )));
+                    };
+                    let mut u: fs3_core::IamUser =
+                        decode(&uv).map_err(|e| Error::Corrupt(format!("iam user record: {e}")))?;
+                    if !u.groups.iter().any(|g| g == &group.name) {
+                        u.groups.push(group.name.clone());
+                        tinsert(tx, uk, encode(&u)?)?;
+                    }
+                }
+                if let Some(old) = old {
+                    for m in old.members.iter().filter(|m| !group.members.contains(m)) {
+                        let uk = iam_user_key(&group.tenant_id, m)?;
+                        if let Some(uv) = tget(tx, &uk)? {
+                            let mut u: fs3_core::IamUser = decode(&uv)
+                                .map_err(|e| Error::Corrupt(format!("iam user record: {e}")))?;
+                            u.groups.retain(|g| g != &group.name);
+                            tinsert(tx, uk, encode(&u)?)?;
+                        }
+                    }
+                }
+                tinsert(tx, k, encode(group)?)?;
+            }
+            Op::IamGroupDelete { tenant_id, name } => {
+                let k = iam_group_key(tenant_id, name)?;
+                let Some(gv) = tget(tx, &k)? else {
+                    return Err(Error::NotFound(format!("iam group {tenant_id}/{name}")));
+                };
+                let g: fs3_core::IamGroup =
+                    decode(&gv).map_err(|e| Error::Corrupt(format!("iam group record: {e}")))?;
+                // 同事务清理全部成员的 IamUser.groups(崩溃安全:无半同步状态)
+                for m in &g.members {
+                    let uk = iam_user_key(tenant_id, m)?;
+                    if let Some(uv) = tget(tx, &uk)? {
+                        let mut u: fs3_core::IamUser = decode(&uv)
+                            .map_err(|e| Error::Corrupt(format!("iam user record: {e}")))?;
+                        u.groups.retain(|x| x != name);
+                        tinsert(tx, uk, encode(&u)?)?;
+                    }
+                }
+                tremove(tx, &k)?;
+            }
+            Op::IamPolicyPut { policy } => {
+                let tenant = policy.tenant_id.as_deref().ok_or_else(|| {
+                    Error::InvalidArgument(
+                        "canned policy is a code constant; custom policy requires tenant_id".into(),
+                    )
+                })?;
+                let k = iam_policy_key(tenant, &policy.name)?;
+                tget(tx, &k)?;
+                tinsert(tx, k, encode(policy)?)?;
+            }
+            Op::IamPolicyDelete { tenant_id, name } => {
+                let k = iam_policy_key(tenant_id, name)?;
+                if tget(tx, &k)?.is_none() {
+                    return Err(Error::NotFound(format!("iam policy {tenant_id}/{name}")));
+                }
+                // 无悬挂引用不变量:本租户任一 user/group 仍挂载 → 拒绝(须
+                // 先解挂)。冲突集纪律同 TenantDelete:迭代器读不入冲突集,
+                // 由上面的 tget(ip: 键)锚点检出并发变更。
+                for (prefix, is_user) in [
+                    (iam_user_prefix(tenant_id)?, true),
+                    (iam_group_prefix(tenant_id)?, false),
+                ] {
+                    let mut it = tx.iterator(IteratorMode::From(&prefix, Direction::Forward));
+                    for item in &mut it {
+                        let (kk, v) = item.map_err(rocks_err)?;
+                        if !kk.starts_with(&prefix) {
+                            break;
+                        }
+                        let attached: Vec<String> = if is_user {
+                            decode::<fs3_core::IamUser>(&v)
+                                .map_err(|e| Error::Corrupt(format!("iam user record: {e}")))?
+                                .policies
+                        } else {
+                            decode::<fs3_core::IamGroup>(&v)
+                                .map_err(|e| Error::Corrupt(format!("iam group record: {e}")))?
+                                .policies
+                        };
+                        if attached.iter().any(|p| p == name) {
+                            return Err(Error::InvalidArgument(format!(
+                                "iam policy {tenant_id}/{name} still attached (detach first)"
+                            )));
+                        }
+                    }
+                }
+                tremove(tx, &k)?;
+            }
             Op::IamUserDelete { tenant_id, name } => {
                 let k = iam_user_key(tenant_id, name)?;
                 if tget(tx, &k)?.is_none() {
@@ -5658,6 +5915,174 @@ mod tests {
             Err(Error::NotFound(_))
         ));
         assert!(s.get_iam_user("acme", "bob").unwrap().is_some());
+    }
+
+    /// M18 U2(ADR-28 DI2.2):IamGroup CRUD 往返 + 成员反规范化同步 ——
+    /// 建组(成员须是既有用户)同步成员 IamUser.groups;PATCH 成员
+    /// (覆盖语义)摘除被移成员;删组同事务清理全部成员 groups;成员
+    /// 不存在 → InvalidArgument;删除不存在 → NotFound。
+    #[test]
+    fn iam_group_crud_roundtrip() {
+        let (_d, s) = open_tmp();
+        let mk = |name: &str, tenant: &str| fs3_core::IamUser {
+            tenant_id: tenant.into(),
+            name: name.into(),
+            enabled: true,
+            password_hash: None,
+            password_salt: None,
+            policies: vec![],
+            groups: vec![],
+            display_name: None,
+            created_at: 1_700_000_000,
+        };
+        s.commit_iam_user_put(&mk("alice", "default")).unwrap();
+        s.commit_iam_user_put(&mk("bob", "default")).unwrap();
+        let group = fs3_core::IamGroup {
+            tenant_id: "default".into(),
+            name: "readers".into(),
+            members: vec!["alice".into()],
+            policies: vec!["readonly".into()],
+            created_at: 1_700_000_000,
+        };
+        s.commit_iam_group_put(&group).unwrap();
+        assert_eq!(
+            s.get_iam_group("default", "readers").unwrap().as_ref(),
+            Some(&group)
+        );
+        // 成员 groups 反规范化已同步
+        assert_eq!(
+            s.get_iam_user("default", "alice").unwrap().unwrap().groups,
+            vec!["readers".to_string()]
+        );
+        // 成员不存在 → InvalidArgument,组不落盘
+        let bad = fs3_core::IamGroup {
+            members: vec!["ghost".into()],
+            ..group.clone()
+        };
+        assert!(matches!(
+            s.commit_iam_group_put(&bad),
+            Err(Error::InvalidArgument(_))
+        ));
+        // 覆盖更新:alice 换 bob(新增成员补 groups,被移成员摘除)
+        let g2 = fs3_core::IamGroup {
+            members: vec!["bob".into()],
+            ..group.clone()
+        };
+        s.commit_iam_group_put(&g2).unwrap();
+        assert!(s
+            .get_iam_user("default", "alice")
+            .unwrap()
+            .unwrap()
+            .groups
+            .is_empty());
+        assert_eq!(
+            s.get_iam_user("default", "bob").unwrap().unwrap().groups,
+            vec!["readers".to_string()]
+        );
+        // 租户内列表
+        assert_eq!(s.list_iam_groups_in("default").unwrap().len(), 1);
+        assert!(s.list_iam_groups_in("acme").unwrap().is_empty());
+        // 幂等写同成员不重复追加 groups
+        s.commit_iam_group_put(&g2).unwrap();
+        assert_eq!(
+            s.get_iam_user("default", "bob").unwrap().unwrap().groups,
+            vec!["readers".to_string()]
+        );
+        // 删组:成员 groups 同事务清理;再删 → NotFound
+        s.commit_iam_group_delete("default", "readers").unwrap();
+        assert!(s.get_iam_group("default", "readers").unwrap().is_none());
+        assert!(s
+            .get_iam_user("default", "bob")
+            .unwrap()
+            .unwrap()
+            .groups
+            .is_empty());
+        assert!(matches!(
+            s.commit_iam_group_delete("default", "readers"),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    /// M18 U2(ADR-28 DI2.3):IamPolicy CRUD 往返 + 删除前置解挂 ——
+    /// 仍被本租户 user/group 挂载 → InvalidArgument(他租户同名挂载不
+    /// 拦截);解挂后可删;canned(tenant_id=None)→ InvalidArgument,
+    /// 不落盘。
+    #[test]
+    fn iam_policy_crud_roundtrip() {
+        let (_d, s) = open_tmp();
+        let pol = fs3_core::IamPolicy {
+            tenant_id: Some("default".into()),
+            name: "team-ro".into(),
+            document: r#"{"Version":"2012-10-17","Statement":[]}"#.into(),
+            created_at: 1_700_000_000,
+        };
+        s.commit_iam_policy_put(&pol).unwrap();
+        assert_eq!(
+            s.get_iam_policy("default", "team-ro").unwrap().as_ref(),
+            Some(&pol)
+        );
+        // canned(tenant_id=None)→ InvalidArgument,不落盘
+        let canned = fs3_core::IamPolicy {
+            tenant_id: None,
+            ..pol.clone()
+        };
+        assert!(matches!(
+            s.commit_iam_policy_put(&canned),
+            Err(Error::InvalidArgument(_))
+        ));
+        // 用户挂载 → 删除拒绝;他租户同名策略互不影响
+        let mut alice = fs3_core::IamUser {
+            tenant_id: "default".into(),
+            name: "alice".into(),
+            enabled: true,
+            password_hash: None,
+            password_salt: None,
+            policies: vec!["team-ro".into()],
+            groups: vec![],
+            display_name: None,
+            created_at: 1_700_000_000,
+        };
+        s.commit_iam_user_put(&alice).unwrap();
+        let pol_acme = fs3_core::IamPolicy {
+            tenant_id: Some("acme".into()),
+            ..pol.clone()
+        };
+        s.commit_iam_policy_put(&pol_acme).unwrap();
+        assert!(matches!(
+            s.commit_iam_policy_delete("default", "team-ro"),
+            Err(Error::InvalidArgument(_))
+        ));
+        // 组挂载同样拒绝
+        alice.policies = vec![];
+        alice.groups = vec!["readers".into()];
+        s.commit_iam_user_put(&alice).unwrap();
+        let g = fs3_core::IamGroup {
+            tenant_id: "default".into(),
+            name: "readers".into(),
+            members: vec![],
+            policies: vec!["team-ro".into()],
+            created_at: 1_700_000_000,
+        };
+        s.commit_iam_group_put(&g).unwrap();
+        assert!(matches!(
+            s.commit_iam_policy_delete("default", "team-ro"),
+            Err(Error::InvalidArgument(_))
+        ));
+        // 组解挂后可删;再删 → NotFound;他租户记录仍在
+        let g2 = fs3_core::IamGroup {
+            policies: vec![],
+            ..g.clone()
+        };
+        s.commit_iam_group_put(&g2).unwrap();
+        s.commit_iam_policy_delete("default", "team-ro").unwrap();
+        assert!(s.get_iam_policy("default", "team-ro").unwrap().is_none());
+        assert!(matches!(
+            s.commit_iam_policy_delete("default", "team-ro"),
+            Err(Error::NotFound(_))
+        ));
+        assert!(s.get_iam_policy("acme", "team-ro").unwrap().is_some());
+        assert_eq!(s.list_iam_policies_in("acme").unwrap().len(), 1);
+        assert!(s.list_iam_policies_in("default").unwrap().is_empty());
     }
 
     /// M18 I1 升级迁移(ADR-28 DI1.3):存量部署(已有 k: 密钥/桶/对象,

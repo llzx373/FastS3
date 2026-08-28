@@ -223,7 +223,7 @@
 
 - [x] U1 User CRUD(租户内):启用/禁用、控制台口令哈希、挂载 policy、加入 group;User **无** SigV4 secret
   - 用例:`iam_user_cannot_sigv4_without_sa`;禁用用户后其 SA 全部 403/InvalidAccessKeyId(口径与 ADR 一致)
-- [ ] U2 Group CRUD + 成员;Policy CRUD + **canned 只读**:
+- [x] U2 Group CRUD + 成员;Policy CRUD + **canned 只读**:
   `readonly` / `readwrite` / `writeonly` / `diagnostics` / `consoleAdmin` / `tenantAdmin`;
   自定义策略非法键继续 MalformedPolicy
   - 用例:`canned_readonly_get_ok_put_denied`;`tenant_admin_cannot_attach_consoleAdmin`

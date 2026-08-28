@@ -159,17 +159,47 @@ pub struct S3Service {
     /// 失效,CreateBucket/DeleteBucket 同步失效(防删桶重建后陈旧策略复活)。
     bucket_policies:
         std::sync::Mutex<std::collections::HashMap<String, Option<crate::policy::Policy>>>,
-    /// IAM 用户状态(M18 U1;ADR-28 DI7.3):(tenant, user) → enabled。
-    /// 启动时随 restore_keys_from_meta 加载;admin 用户 CRUD 经
-    /// put_iam_user/delete_iam_user 双写(meta + 本表),禁用即时生效。
-    /// 缺席 = 无 `iu:` 记录 → 按存活处理(预 M18 密钥无用户记录;
-    /// compat 钉死)。
-    iam_users: std::sync::Mutex<std::collections::HashMap<(String, String), bool>>,
+    /// IAM 用户状态(M18 U1/U2;ADR-28 DI7.3/DI3.1):(tenant, user) →
+    /// enabled + 直挂策略名 + 所属组名。启动时随 restore_keys_from_meta
+    /// 加载;admin 用户/组 CRUD 经 put_iam_user/put_iam_group 等双写
+    /// (meta + 本表),变更即时生效。缺席 = 无 `iu:` 记录 → 按存活处理
+    /// (预 M18 密钥无用户记录;compat 钉死)。
+    iam_users: std::sync::Mutex<std::collections::HashMap<(String, String), IamUserState>>,
+    /// IAM 组策略视图(M18 U2):(tenant, group) → 挂载策略名列表。
+    /// 与 iam_users 同口径双写;缺席 = 组不存在(不贡献策略)。
+    iam_groups: std::sync::Mutex<std::collections::HashMap<(String, String), Vec<String>>>,
+    /// 自定义 IAM 策略解析缓存(M18 U2):(tenant, name) → Policy。
+    /// 启动全量加载,put/delete_iam_policy 双写失效;canned 策略不在此
+    /// (代码常量,iam::canned_parsed)。挂载名在本表与 canned 均缺席 →
+    /// 求值 fail-closed 拒绝(绝不扩权,同会话策略解析失败口径)。
+    iam_policies:
+        std::sync::Mutex<std::collections::HashMap<(String, String), crate::policy::Policy>>,
     /// 密钥 → IAM 属主(access_key → (tenant_id, owner_user))。与认证表
     /// 同步维护(add_key_owned/remove_key/restore);缺席 = 构造注入的
     /// 初始密钥(S3Service::new 的 keys 参数,无 `k:` 记录)→ bootstrap
     /// 存活语义(compat 钉死)。
     key_owners: std::sync::Mutex<std::collections::HashMap<String, (String, String)>>,
+}
+
+/// M18 U2:IAM 用户内存视图(U1 仅 enabled;U2 起含策略/组,身份层
+/// 策略求值用,见 authorize 的 M18 U2 段)。
+#[derive(Debug, Clone)]
+struct IamUserState {
+    enabled: bool,
+    /// 直挂策略名(canned 或本租户自定义)。
+    policies: Vec<String>,
+    /// 所属组名(与 IamGroup.members 反规范化同步,由 meta 事务保证)。
+    groups: Vec<String>,
+}
+
+impl IamUserState {
+    fn from_user(u: &fs3_core::IamUser) -> Self {
+        IamUserState {
+            enabled: u.enabled,
+            policies: u.policies.clone(),
+            groups: u.groups.clone(),
+        }
+    }
 }
 
 /// M12 W3-2:单请求 Object Lock 审计暂存(成功路径写入,handle 收割)。
@@ -237,6 +267,8 @@ impl S3Service {
             policies: std::sync::Mutex::new(std::collections::HashMap::new()),
             bucket_policies: std::sync::Mutex::new(std::collections::HashMap::new()),
             iam_users: std::sync::Mutex::new(std::collections::HashMap::new()),
+            iam_groups: std::sync::Mutex::new(std::collections::HashMap::new()),
+            iam_policies: std::sync::Mutex::new(std::collections::HashMap::new()),
             key_owners: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_clock_secs: std::sync::atomic::AtomicI64::new(unix_now() as i64),
         }
@@ -378,7 +410,7 @@ impl S3Service {
             .lock()
             .unwrap()
             .get(&(tenant.to_string(), user.to_string()))
-            .is_some_and(|enabled| !*enabled)
+            .is_some_and(|s| !s.enabled)
     }
 
     /// M18 U1(ADR-28 DI7.3):密钥属主用户是否已禁用(数据面强制执行
@@ -748,6 +780,14 @@ impl S3Service {
     /// AWS session policy 语义一致)。会话策略不参与匿名路径(匿名无
     /// 会话)。
     ///
+    /// M18 U2(ADR-28 DI3.1 首片):已认证请求再多一层 **IAM 身份层** ——
+    /// 密钥属主用户的「直挂 policies ∪ 所属组 policies」(canned 或租户内
+    /// 自定义)求值:显式 Deny → 拒绝(跨层优先);有挂载且至少一个
+    /// Allow → 继续与密钥层求交;有挂载但无 Allow → 默认拒绝(挂载 IAM
+    /// 策略后「无密钥策略 = 隐式全量」不再成立);**无挂载 → 既有并集
+    /// 语义原样**(legacy 密钥/未挂策略用户行为分毫不改)。桶策略层
+    /// Principal 匹配细化属 U3。
+    ///
     /// `action` 为审计操作名(如 PutObject;经 s3_action_name 归一为 S3 动作);
     /// `bucket`/`key` 构成资源 ARN。无策略/未知密钥 → 放行(密钥有效性已由
     /// 认证把关)。PostObject 不经此入口(键在表单体内,op_post_object 自判)。
@@ -803,6 +843,16 @@ impl S3Service {
                 }
             }
         }
+        // M18 U2(ADR-28 DI3.1 首片):IAM 身份层 —— 属主用户的
+        // 「直挂 ∪ 组」策略求值。None = 无挂载 → 既有语义原样(legacy
+        // 密钥不受影响);Deny → 立即拒绝(Deny 优先,跨层生效)。
+        let iam_decision = match access {
+            Some(ak) => self.iam_identity_decision(ak, action, &resource, &ctx),
+            None => None,
+        };
+        if iam_decision == Some(Decision::Deny) {
+            return Err(denied());
+        }
         // —— 桶层(服务级操作无桶 → NoMatch)——
         let bucket_decision = if bucket.is_empty() {
             Decision::NoMatch
@@ -818,13 +868,31 @@ impl S3Service {
         match access {
             Some(_) => {
                 // 并集:无密钥策略(隐式放行)或任一层 Allow
-                if !key_has_policy
+                let union_ok = !key_has_policy
                     || key_decision == Decision::Allow
-                    || bucket_decision == Decision::Allow
-                {
-                    Ok(())
-                } else {
-                    Err(denied())
+                    || bucket_decision == Decision::Allow;
+                match iam_decision {
+                    // 无身份策略挂载:既有语义原样(legacy 密钥不变)
+                    None => {
+                        if union_ok {
+                            Ok(())
+                        } else {
+                            Err(denied())
+                        }
+                    }
+                    // 身份层已 Allow:与密钥(SA 嵌入)层求交(DI3.1:
+                    // 两层均须放行,Deny 已在上方优先短路)
+                    Some(Decision::Allow) => {
+                        if union_ok {
+                            Ok(())
+                        } else {
+                            Err(denied())
+                        }
+                    }
+                    // 有挂载但无 Allow 命中 → 默认拒绝(隐式放行在
+                    // 挂载 IAM 策略后不再成立)
+                    Some(Decision::NoMatch) => Err(denied()),
+                    Some(Decision::Deny) => unreachable!("deny short-circuits above"),
                 }
             }
             // 匿名:显式 Deny 已在上方拒绝;Allow/NoMatch 交 require_auth 判定
@@ -873,7 +941,8 @@ impl S3Service {
 
     /// 从 meta 恢复全部运行时密钥到认证表(启动时调用;跳过禁用/解密失败)。
     /// M18 U1 起同事恢复 IAM 用户状态表与密钥属主索引(DI7.3 禁用用户 →
-    /// 其 SA 鉴权失败的内存判定依据;重启后禁用语义不丢失)。
+    /// 其 SA 鉴权失败的内存判定依据;重启后禁用语义不丢失)。M18 U2 起
+    /// 同步恢复 IAM 组策略视图与自定义策略解析缓存(DI3.1 身份层求值)。
     pub fn restore_keys_from_meta(&self) -> Result<usize, S3Error> {
         let engine = self.engine.read();
         let seed = engine
@@ -889,7 +958,48 @@ impl S3Service {
             let mut map = self.iam_users.lock().unwrap();
             map.clear();
             for u in users {
-                map.insert((u.tenant_id, u.name), u.enabled);
+                map.insert(
+                    (u.tenant_id.clone(), u.name.clone()),
+                    IamUserState::from_user(&u),
+                );
+            }
+        }
+        // IAM 组策略视图(M18 U2)
+        {
+            let groups = engine
+                .meta()
+                .list_iam_groups()
+                .map_err(|e| map_engine_error(e, "", ""))?;
+            let mut map = self.iam_groups.lock().unwrap();
+            map.clear();
+            for g in groups {
+                map.insert((g.tenant_id, g.name), g.policies);
+            }
+        }
+        // 自定义策略解析缓存(M18 U2;解析失败 = 存量脏数据 → 缺席,
+        // 挂载即 fail-closed 拒绝,绝不扩权)
+        {
+            let policies = engine
+                .meta()
+                .list_iam_policies()
+                .map_err(|e| map_engine_error(e, "", ""))?;
+            let mut cache = self.iam_policies.lock().unwrap();
+            cache.clear();
+            for p in policies {
+                if let Some(tenant) = p.tenant_id.clone() {
+                    match crate::policy::Policy::parse(&p.document) {
+                        Ok(parsed) => {
+                            cache.insert((tenant, p.name), parsed);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "iam policy {}/{}: parse failed, skipped: {e}",
+                                tenant,
+                                p.name
+                            )
+                        }
+                    }
+                }
             }
         }
         let mut restored = 0usize;
@@ -947,12 +1057,15 @@ impl S3Service {
 
     /// 创建/更新 IAM 用户(覆盖语义;meta 持久化 + 内存状态表即时生效)。
     /// 口令哈希由调用方预置(IamUser::hash_password;明文永不落盘)。
+    /// 注意:组成员关系由 put_iam_group/delete_iam_group 维护(双端
+    /// 反规范化);本函数直写 user.groups,调用方(admin 用户端点)
+    /// 不改 groups 字段。
     pub fn put_iam_user(&self, user: &fs3_core::IamUser) -> Result<(), fs3_core::Error> {
         self.engine.read().meta().commit_iam_user_put(user)?;
-        self.iam_users
-            .lock()
-            .unwrap()
-            .insert((user.tenant_id.clone(), user.name.clone()), user.enabled);
+        self.iam_users.lock().unwrap().insert(
+            (user.tenant_id.clone(), user.name.clone()),
+            IamUserState::from_user(user),
+        );
         Ok(())
     }
 
@@ -987,6 +1100,193 @@ impl S3Service {
             .unwrap()
             .remove(&(tenant.to_string(), name.to_string()));
         Ok(())
+    }
+
+    /// 从 meta 回读单个用户并镜像到内存状态表(组变更后成员
+    /// groups 列表的内存同步用;meta 事务已保证双端一致)。
+    fn sync_iam_user_from_meta(&self, tenant: &str, name: &str) -> Result<(), fs3_core::Error> {
+        let user = self.engine.read().meta().get_iam_user(tenant, name)?;
+        let mut map = self.iam_users.lock().unwrap();
+        match user {
+            Some(u) => {
+                map.insert(
+                    (tenant.to_string(), name.to_string()),
+                    IamUserState::from_user(&u),
+                );
+            }
+            None => {
+                map.remove(&(tenant.to_string(), name.to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    // ── M18 U2:IAM 组(ADR-28 DI2.2/DI8;meta 事务 + 内存表双写,
+    //    同 IAM 用户先例) ──
+
+    /// 创建/更新 IAM 组(覆盖语义;meta 事务同步成员 IamUser.groups,
+    /// 成员须是既有用户 → 否则 InvalidArgument;内存表镜像成员变更)。
+    pub fn put_iam_group(&self, group: &fs3_core::IamGroup) -> Result<(), fs3_core::Error> {
+        let old = {
+            let engine = self.engine.read();
+            let old = engine.meta().get_iam_group(&group.tenant_id, &group.name)?;
+            engine.meta().commit_iam_group_put(group)?;
+            old
+        };
+        self.iam_groups.lock().unwrap().insert(
+            (group.tenant_id.clone(), group.name.clone()),
+            group.policies.clone(),
+        );
+        // 受影响成员(新增 ∪ 被移除)的内存 groups 列表镜像 meta
+        let mut affected = group.members.clone();
+        if let Some(old) = old {
+            for m in old.members {
+                if !affected.contains(&m) {
+                    affected.push(m);
+                }
+            }
+        }
+        for m in affected {
+            self.sync_iam_user_from_meta(&group.tenant_id, &m)?;
+        }
+        Ok(())
+    }
+
+    /// 删除 IAM 组(meta 事务同事务清理成员 groups;不存在 → NotFound;
+    /// 内存表镜像)。
+    pub fn delete_iam_group(&self, tenant: &str, name: &str) -> Result<(), fs3_core::Error> {
+        let members = {
+            let engine = self.engine.read();
+            let g = engine
+                .meta()
+                .get_iam_group(tenant, name)?
+                .ok_or_else(|| fs3_core::Error::NotFound(format!("iam group {tenant}/{name}")))?;
+            let members = g.members.clone();
+            engine.meta().commit_iam_group_delete(tenant, name)?;
+            members
+        };
+        self.iam_groups
+            .lock()
+            .unwrap()
+            .remove(&(tenant.to_string(), name.to_string()));
+        for m in members {
+            self.sync_iam_user_from_meta(tenant, &m)?;
+        }
+        Ok(())
+    }
+
+    // ── M18 U2:IAM 自定义策略(ADR-28 DI2.3/DI8;canned 为代码常量,
+    //    不经此路径,见 crate::iam) ──
+
+    /// 创建/更新 IAM 自定义策略(meta 持久化 + 解析缓存即时生效;
+    /// `tenant_id = None`(canned)→ InvalidArgument;canned 撞名保留
+    /// 校验在管理面)。文档解析失败(管理面创建已校验,防御脏数据)
+    /// → 缓存缺席 = 挂载即 fail-closed 拒绝。
+    pub fn put_iam_policy(&self, policy: &fs3_core::IamPolicy) -> Result<(), fs3_core::Error> {
+        let tenant = policy.tenant_id.clone().ok_or_else(|| {
+            fs3_core::Error::InvalidArgument(
+                "canned policy is a code constant; custom policy requires tenant_id".into(),
+            )
+        })?;
+        self.engine.read().meta().commit_iam_policy_put(policy)?;
+        let mut cache = self.iam_policies.lock().unwrap();
+        match crate::policy::Policy::parse(&policy.document) {
+            Ok(parsed) => {
+                cache.insert((tenant, policy.name.clone()), parsed);
+            }
+            Err(_) => {
+                cache.remove(&(tenant, policy.name.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    /// 删除 IAM 自定义策略(meta 语义:不存在 → NotFound;仍被本租户
+    /// user/group 挂载 → InvalidArgument;解析缓存同步失效)。
+    pub fn delete_iam_policy(&self, tenant: &str, name: &str) -> Result<(), fs3_core::Error> {
+        self.engine
+            .read()
+            .meta()
+            .commit_iam_policy_delete(tenant, name)?;
+        self.iam_policies
+            .lock()
+            .unwrap()
+            .remove(&(tenant.to_string(), name.to_string()));
+        Ok(())
+    }
+
+    /// M18 U2(ADR-28 DI3.1 首片):IAM 身份层策略求值 —— 密钥属主
+    /// 用户的「直挂 policies ∪ 所属组 policies」。
+    ///
+    /// 返回:
+    /// - `None`:无身份约束(密钥无属主记录 / 用户无挂载策略)→
+    ///   authorize 走既有密钥∪桶并集路径,legacy 行为分毫不改;
+    /// - `Some(Decision::Deny)`:任一挂载策略显式 Deny,或挂载名无法
+    ///   解析(脏数据)→ 保守拒绝(绝不扩权);
+    /// - `Some(Decision::Allow)`:至少一个 Allow 命中;
+    /// - `Some(Decision::NoMatch)`:有挂载但无 Allow → 调用方默认拒绝。
+    fn iam_identity_decision(
+        &self,
+        access_key: &str,
+        action: &str,
+        resource: &str,
+        ctx: &crate::policy::EvalCtx,
+    ) -> Option<crate::policy::Decision> {
+        use crate::policy::Decision;
+        let (tenant, user) = self.key_owners.lock().unwrap().get(access_key).cloned()?;
+        let ustate = self
+            .iam_users
+            .lock()
+            .unwrap()
+            .get(&(tenant.clone(), user))?
+            .clone();
+        // 直挂 ∪ 组挂载(去重,保序)
+        let mut names = ustate.policies.clone();
+        {
+            let groups = self.iam_groups.lock().unwrap();
+            for g in &ustate.groups {
+                if let Some(pols) = groups.get(&(tenant.clone(), g.clone())) {
+                    for p in pols {
+                        if !names.contains(p) {
+                            names.push(p.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if names.is_empty() {
+            return None;
+        }
+        let mut allowed = false;
+        for name in &names {
+            // 解析策略文档:canned = 代码常量(&'static);自定义 = 解析
+            // 缓存克隆(put/delete 双写失效;缺席 = 无法解析)。
+            let cached;
+            let policy = if crate::iam::is_canned(name) {
+                crate::iam::canned_parsed(name)
+            } else {
+                cached = self
+                    .iam_policies
+                    .lock()
+                    .unwrap()
+                    .get(&(tenant.clone(), name.clone()))
+                    .cloned();
+                cached.as_ref()
+            };
+            match policy {
+                Some(p) => match p.decide(action, resource, true, ctx) {
+                    Decision::Deny => return Some(Decision::Deny),
+                    Decision::Allow => allowed = true,
+                    Decision::NoMatch => {}
+                },
+                None => return Some(Decision::Deny),
+            }
+        }
+        Some(if allowed {
+            Decision::Allow
+        } else {
+            Decision::NoMatch
+        })
     }
 
     // ── M15 T1/T2:STS 临时凭证(ADR-18 D-E2) ──

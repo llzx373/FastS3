@@ -12188,3 +12188,121 @@ fn disabled_user_sas_fail_auth() {
     let r = svc.handle(&req_creds("GET", "/u1bkt/k", &sa, &[], vec![]));
     assert_eq!(status(&r), 200, "重新启用即时恢复: {r:?}");
 }
+
+// ───────────────────── M18 U2:IAM 身份层策略(ADR-28 DI2.3/DI3.1)─────────────────────
+
+/// M18 U2(TODO 钉死用例;ADR-28 DI2.3/DI3.1):canned `readonly` ——
+/// 直挂用户(alice)与组挂载(bob ∈ readers)两条路径,其名下 SA:
+/// GET 200,PUT 403 AccessDenied。无挂载用户(carol)与存量密钥行为
+/// 不变(legacy 隐式全量)。
+#[test]
+fn canned_readonly_get_ok_put_denied() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/u2bkt", vec![]))), 200);
+    assert_eq!(
+        status(&svc.handle(&req("PUT", "/u2bkt/k", b"data".to_vec()))),
+        200
+    );
+    let mk_user = |name: &str, policies: Vec<String>| fs3_core::IamUser {
+        tenant_id: "default".into(),
+        name: name.into(),
+        enabled: true,
+        password_hash: None,
+        password_salt: None,
+        policies,
+        groups: vec![],
+        display_name: None,
+        created_at: 1_700_000_000,
+    };
+    // ① 直挂:alice + canned readonly
+    svc.put_iam_user(&mk_user("alice", vec!["readonly".into()]))
+        .unwrap();
+    svc.add_key_owned("AKIA_RO", "ro-secret", None, "default", "alice", None)
+        .unwrap();
+    let sa_ro = Credentials {
+        access_key: "AKIA_RO".into(),
+        secret_key: "ro-secret".into(),
+    };
+    let r = svc.handle(&req_creds("GET", "/u2bkt/k", &sa_ro, &[], vec![]));
+    assert_eq!(status(&r), 200, "readonly GET 放行: {r:?}");
+    let r = svc.handle(&req_creds("PUT", "/u2bkt/k2", &sa_ro, &[], b"x".to_vec()));
+    assert_eq!(err_code(&r), "AccessDenied", "readonly PUT 拒绝: {r:?}");
+    // ② 组挂载:bob ∈ readers(组挂 readonly)→ 用户∪组生效策略
+    svc.put_iam_user(&mk_user("bob", vec![])).unwrap();
+    svc.put_iam_group(&fs3_core::IamGroup {
+        tenant_id: "default".into(),
+        name: "readers".into(),
+        members: vec!["bob".into()],
+        policies: vec!["readonly".into()],
+        created_at: 1_700_000_000,
+    })
+    .unwrap();
+    svc.add_key_owned("AKIA_BOB", "bob-secret", None, "default", "bob", None)
+        .unwrap();
+    let sa_bob = Credentials {
+        access_key: "AKIA_BOB".into(),
+        secret_key: "bob-secret".into(),
+    };
+    let r = svc.handle(&req_creds("GET", "/u2bkt/k", &sa_bob, &[], vec![]));
+    assert_eq!(status(&r), 200, "组挂载 GET 放行: {r:?}");
+    let r = svc.handle(&req_creds("PUT", "/u2bkt/k2", &sa_bob, &[], b"x".to_vec()));
+    assert_eq!(err_code(&r), "AccessDenied", "组挂载 PUT 拒绝: {r:?}");
+    // 组解挂(覆盖语义)→ bob 回退无挂载 = legacy 隐式全量
+    svc.put_iam_group(&fs3_core::IamGroup {
+        tenant_id: "default".into(),
+        name: "readers".into(),
+        members: vec![],
+        policies: vec!["readonly".into()],
+        created_at: 1_700_000_000,
+    })
+    .unwrap();
+    let r = svc.handle(&req_creds("PUT", "/u2bkt/k2", &sa_bob, &[], b"x".to_vec()));
+    assert_eq!(status(&r), 200, "解组后回退 legacy 语义: {r:?}");
+    // ③ 无挂载用户 carol:行为不变
+    svc.put_iam_user(&mk_user("carol", vec![])).unwrap();
+    svc.add_key_owned("AKIA_CAROL", "carol-secret", None, "default", "carol", None)
+        .unwrap();
+    let sa_carol = Credentials {
+        access_key: "AKIA_CAROL".into(),
+        secret_key: "carol-secret".into(),
+    };
+    let r = svc.handle(&req_creds(
+        "PUT",
+        "/u2bkt/k3",
+        &sa_carol,
+        &[],
+        b"x".to_vec(),
+    ));
+    assert_eq!(status(&r), 200, "无挂载用户不受影响: {r:?}");
+    // ④ 存量密钥(构造注入,无属主)不受影响
+    assert_eq!(status(&svc.handle(&req("GET", "/u2bkt/k", vec![]))), 200);
+    // ⑤ 自定义策略:创建 → 挂载 → 生效(替换 alice 的挂载);删除须先解挂
+    svc.put_iam_policy(&fs3_core::IamPolicy {
+        tenant_id: Some("default".into()),
+        name: "team-rw".into(),
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject"],"Resource":["arn:aws:s3:::u2bkt/*"]}]}"#.into(),
+        created_at: 1_700_000_000,
+    })
+    .unwrap();
+    let mut alice = mk_user("alice", vec!["team-rw".into()]);
+    alice.groups = vec![];
+    svc.put_iam_user(&alice).unwrap();
+    let r = svc.handle(&req_creds("PUT", "/u2bkt/k4", &sa_ro, &[], b"x".to_vec()));
+    assert_eq!(status(&r), 200, "自定义策略 PUT 放行: {r:?}");
+    let r = svc.handle(&req_creds(
+        "PUT",
+        "/other-bkt/k",
+        &sa_ro,
+        &[],
+        b"x".to_vec(),
+    ));
+    assert_eq!(err_code(&r), "AccessDenied", "资源外拒绝: {r:?}");
+    // 仍被 alice 挂载 → 删除拒绝;解挂后可删
+    assert!(svc.delete_iam_policy("default", "team-rw").is_err());
+    alice.policies = vec![];
+    svc.put_iam_user(&alice).unwrap();
+    svc.delete_iam_policy("default", "team-rw").unwrap();
+    // 解挂后 alice 回退 legacy
+    let r = svc.handle(&req_creds("PUT", "/u2bkt/k5", &sa_ro, &[], b"x".to_vec()));
+    assert_eq!(status(&r), 200, "解挂后回退 legacy: {r:?}");
+}

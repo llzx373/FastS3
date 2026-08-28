@@ -22,8 +22,18 @@
 //! - `GET  /v1/iam/users?tenant=`               用户列表(M18 U1;默认 default 租户)
 //! - `POST /v1/iam/users`                       创建用户(tenant/name/password?/display_name?;口令只收明文一次、只存加盐哈希)
 //! - `GET  /v1/iam/users/{tenant}/{name}`       用户详情(绝不含口令哈希)
-//! - `PATCH /v1/iam/users/{tenant}/{name}`      更新 enabled/password/display_name/policies(整表替换)
+//! - `PATCH /v1/iam/users/{tenant}/{name}`      更新 enabled/password/display_name/policies(整表替换;策略名须可解析)
 //! - `DELETE /v1/iam/users/{tenant}/{name}`     删除用户(持有 SA → 409;bootstrap → 400)
+//! - `GET  /v1/iam/groups?tenant=`              组列表(M18 U2)
+//! - `POST /v1/iam/groups`                      创建组(tenant/name/members?/policies?;成员须是既有用户)
+//! - `GET  /v1/iam/groups/{tenant}/{name}`      组详情
+//! - `PATCH /v1/iam/groups/{tenant}/{name}`     更新 members/policies(整表替换)
+//! - `DELETE /v1/iam/groups/{tenant}/{name}`    删除组(同事务清理成员 groups)
+//! - `GET  /v1/iam/policies?tenant=`            策略列表(M18 U2;自定义 + canned,canned 标记 "canned":true)
+//! - `POST /v1/iam/policies`                    创建自定义策略(document 经 Policy::parse 校验,非法 → 400 MalformedPolicy)
+//! - `GET  /v1/iam/policies/{tenant}/{name}`    策略详情(canned 可读)
+//! - `PATCH /v1/iam/policies/{tenant}/{name}`   替换自定义策略文档(canned → 400)
+//! - `DELETE /v1/iam/policies/{tenant}/{name}`  删除自定义策略(仍被挂载 → 409;canned → 400)
 //! - `GET  /v1/admin/uploads`                   在途 multipart 会话
 //! - `POST /v1/admin/uploads/{id}/abort`        强制中止会话
 //! - `GET  /v1/admin/audit?limit=`              审计日志
@@ -532,6 +542,18 @@ impl AdminServer {
             ("GET", ["users", tenant, name]) => self.handle_user_get(tenant, name),
             ("PATCH", ["users", tenant, name]) => self.handle_user_patch(tenant, name, body),
             ("DELETE", ["users", tenant, name]) => self.handle_user_delete(tenant, name),
+            // M18 U2(ADR-28 DI2.2/DI8):组 CRUD(成员 = 既有用户)
+            ("GET", ["groups"]) => self.handle_groups_list(query),
+            ("POST", ["groups"]) => self.handle_group_create(body),
+            ("GET", ["groups", tenant, name]) => self.handle_group_get(tenant, name),
+            ("PATCH", ["groups", tenant, name]) => self.handle_group_patch(tenant, name, body),
+            ("DELETE", ["groups", tenant, name]) => self.handle_group_delete(tenant, name),
+            // M18 U2(ADR-28 DI2.3/DI8):策略 CRUD(canned 只读)
+            ("GET", ["policies"]) => self.handle_policies_list(query),
+            ("POST", ["policies"]) => self.handle_policy_create(body),
+            ("GET", ["policies", tenant, name]) => self.handle_policy_get(tenant, name),
+            ("PATCH", ["policies", tenant, name]) => self.handle_policy_patch(tenant, name, body),
+            ("DELETE", ["policies", tenant, name]) => self.handle_policy_delete(tenant, name),
             _ => json::err(StatusCode::NOT_FOUND, "not_found", "unknown iam endpoint"),
         }
     }
@@ -1788,9 +1810,10 @@ impl AdminServer {
     /// 禁用 → 其全部 SA 鉴权立即失败,DI7.3)、`password`(string = 重设
     /// 口令[重新加盐哈希];null = 清除本地口令)、`display_name`
     /// (string/null)、`policies`(string 数组 = **整表替换**,v1 语义;
-    /// 逐个按 validate_iam_name 校验)。`default/bootstrap` 隐藏引导用户
-    /// 恒拒绝(升级内部用途,不参与日常登录/禁用,DI7.1)。组成员编辑属
-    /// U2(groups 字段已存在,本端点不改)。
+    /// 逐个按 validate_iam_name 校验且 M18 U2 起须可解析——canned 或
+    /// 本租户既有自定义,否则 400 no_such_policy)。`default/bootstrap`
+    /// 隐藏引导用户恒拒绝(升级内部用途,不参与日常登录/禁用,DI7.1)。
+    /// 组成员编辑走 /v1/iam/groups(本端点不改 groups 字段)。
     fn handle_user_patch(&self, tenant: &str, name: &str, body: &[u8]) -> Response<String> {
         if tenant == fs3_core::Tenant::DEFAULT_TENANT && name == fs3_core::IamUser::BOOTSTRAP_USER {
             return json::err(
@@ -1894,6 +1917,18 @@ impl AdminServer {
                                         &e.to_string(),
                                     );
                                 }
+                                // M18 U2:策略名须可解析(canned 或本租户
+                                // 既有自定义),不再接受悬挂名
+                                let engine = self.engine.read();
+                                if !Self::policy_name_resolves(engine.meta(), tenant, s) {
+                                    return json::err(
+                                        StatusCode::BAD_REQUEST,
+                                        "no_such_policy",
+                                        &format!(
+                                            "policy {s} is neither canned nor an existing custom policy in tenant {tenant}"
+                                        ),
+                                    );
+                                }
                                 policies.push(s.to_string());
                             }
                             None => {
@@ -1954,6 +1989,616 @@ impl AdminServer {
             ),
             Err(fs3_core::Error::InvalidArgument(m)) => {
                 json::err(StatusCode::CONFLICT, "user_has_service_accounts", &m)
+            }
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    // ───────────────────── M18 U2:IAM 组与策略(ADR-28 DI2.2/DI2.3/DI8)─────────────────────
+
+    /// 策略名是否可解析:canned(代码常量)或本租户既有自定义。
+    fn policy_name_resolves(meta: &fs3_meta::MetaStore, tenant: &str, name: &str) -> bool {
+        fs3_s3::iam::is_canned(name) || matches!(meta.get_iam_policy(tenant, name), Ok(Some(_)))
+    }
+
+    /// 解析并校验策略名数组(整表替换语义):逐个 validate_iam_name +
+    /// 可解析性(canned 或租户内自定义)。错误 → 400。
+    fn parse_policy_names(
+        meta: &fs3_meta::MetaStore,
+        tenant: &str,
+        v: &serde_json::Value,
+    ) -> Result<Vec<String>, Box<Response<String>>> {
+        let Some(arr) = v.as_array() else {
+            return Err(Box::new(json::err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "policies must be an array of strings",
+            )));
+        };
+        let mut out = Vec::with_capacity(arr.len());
+        for p in arr {
+            let Some(s) = p.as_str() else {
+                return Err(Box::new(json::err(
+                    StatusCode::BAD_REQUEST,
+                    "bad_request",
+                    "policies must be an array of strings",
+                )));
+            };
+            if let Err(e) = fs3_meta::keys::validate_iam_name(s) {
+                return Err(Box::new(json::err(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_name",
+                    &e.to_string(),
+                )));
+            }
+            if !Self::policy_name_resolves(meta, tenant, s) {
+                return Err(Box::new(json::err(
+                    StatusCode::BAD_REQUEST,
+                    "no_such_policy",
+                    &format!(
+                        "policy {s} is neither canned nor an existing custom policy in tenant {tenant}"
+                    ),
+                )));
+            }
+            out.push(s.to_string());
+        }
+        Ok(out)
+    }
+
+    /// 解析成员名数组:validate_iam_name;成员存在性由 meta 组事务
+    /// 强制(Op::IamGroupPut 单事务校验 + 反规范化同步)。
+    fn parse_member_names(v: &serde_json::Value) -> Result<Vec<String>, Box<Response<String>>> {
+        let Some(arr) = v.as_array() else {
+            return Err(Box::new(json::err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "members must be an array of strings",
+            )));
+        };
+        let mut out = Vec::with_capacity(arr.len());
+        for m in arr {
+            let Some(s) = m.as_str() else {
+                return Err(Box::new(json::err(
+                    StatusCode::BAD_REQUEST,
+                    "bad_request",
+                    "members must be an array of strings",
+                )));
+            };
+            if let Err(e) = fs3_meta::keys::validate_iam_name(s) {
+                return Err(Box::new(json::err(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_name",
+                    &e.to_string(),
+                )));
+            }
+            out.push(s.to_string());
+        }
+        Ok(out)
+    }
+
+    /// 组 JSON 视图。
+    fn group_json(g: &fs3_core::IamGroup) -> serde_json::Value {
+        serde_json::json!({
+            "tenant_id": g.tenant_id,
+            "name": g.name,
+            "members": g.members,
+            "policies": g.policies,
+            "created_at": g.created_at,
+        })
+    }
+
+    /// GET /v1/iam/groups?tenant=:租户内组列表(缺省 tenant = default)。
+    fn handle_groups_list(&self, query: &[(String, String)]) -> Response<String> {
+        let tenant = query
+            .iter()
+            .find(|(k, _)| k == "tenant")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or(fs3_core::Tenant::DEFAULT_TENANT);
+        let engine = self.engine.read();
+        match engine.meta().list_iam_groups_in(tenant) {
+            Ok(groups) => json::ok(serde_json::json!({
+                "tenant_id": tenant,
+                "groups": groups.iter().map(Self::group_json).collect::<Vec<_>>(),
+            })),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    /// POST /v1/iam/groups:创建组。body:`name`(必填)、`tenant`(可选,
+    /// 缺省 default;租户须已存在)、`members`(可选;须是本租户既有
+    /// 用户,meta 事务强制)、`policies`(可选;名须可解析)。同名 → 409。
+    fn handle_group_create(&self, body: &[u8]) -> Response<String> {
+        let parsed: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(_) => {
+                return json::err(StatusCode::BAD_REQUEST, "bad_request", "invalid JSON body")
+            }
+        };
+        let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if name.is_empty() {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "missing required field: name",
+            );
+        }
+        let tenant = parsed
+            .get("tenant")
+            .and_then(|v| v.as_str())
+            .unwrap_or(fs3_core::Tenant::DEFAULT_TENANT);
+        if let Err(e) = fs3_meta::keys::validate_iam_name(name) {
+            return json::err(StatusCode::BAD_REQUEST, "invalid_name", &e.to_string());
+        }
+        if let Err(e) = fs3_meta::keys::validate_iam_name(tenant) {
+            return json::err(StatusCode::BAD_REQUEST, "invalid_name", &e.to_string());
+        }
+        let members = match parsed.get("members") {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(v) => match Self::parse_member_names(v) {
+                Ok(m) => m,
+                Err(r) => return *r,
+            },
+        };
+        let engine = self.engine.read();
+        let policies = match parsed.get("policies") {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(v) => match Self::parse_policy_names(engine.meta(), tenant, v) {
+                Ok(p) => p,
+                Err(r) => return *r,
+            },
+        };
+        match engine.meta().get_tenant(tenant) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return json::err(
+                    StatusCode::NOT_FOUND,
+                    "no_such_tenant",
+                    &format!("tenant {tenant}"),
+                )
+            }
+            Err(e) => {
+                return json::err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    &e.to_string(),
+                )
+            }
+        }
+        match engine.meta().get_iam_group(tenant, name) {
+            Ok(Some(_)) => {
+                return json::err(
+                    StatusCode::CONFLICT,
+                    "group_exists",
+                    &format!("group {tenant}/{name} already exists"),
+                )
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return json::err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    &e.to_string(),
+                )
+            }
+        }
+        drop(engine);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let group = fs3_core::IamGroup {
+            tenant_id: tenant.to_string(),
+            name: name.to_string(),
+            members,
+            policies,
+            created_at: now,
+        };
+        match self.service.put_iam_group(&group) {
+            Ok(()) => json::ok(Self::group_json(&group)),
+            Err(fs3_core::Error::InvalidArgument(m)) => {
+                json::err(StatusCode::BAD_REQUEST, "bad_request", &m)
+            }
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    /// GET /v1/iam/groups/{tenant}/{name}:单个组(不存在 → 404)。
+    fn handle_group_get(&self, tenant: &str, name: &str) -> Response<String> {
+        let engine = self.engine.read();
+        match engine.meta().get_iam_group(tenant, name) {
+            Ok(Some(g)) => json::ok(Self::group_json(&g)),
+            Ok(None) => json::err(
+                StatusCode::NOT_FOUND,
+                "no_such_group",
+                &format!("group {tenant}/{name}"),
+            ),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    /// PATCH /v1/iam/groups/{tenant}/{name}:body 可含 `members`(string
+    /// 数组,整表替换;成员增减由 meta 事务双端同步 user.groups)与/或
+    /// `policies`(string 数组,整表替换;名须可解析)。空 PATCH → 400。
+    fn handle_group_patch(&self, tenant: &str, name: &str, body: &[u8]) -> Response<String> {
+        let parsed: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(_) => {
+                return json::err(StatusCode::BAD_REQUEST, "bad_request", "invalid JSON body")
+            }
+        };
+        let engine = self.engine.read();
+        let mut group = match engine.meta().get_iam_group(tenant, name) {
+            Ok(Some(g)) => g,
+            Ok(None) => {
+                return json::err(
+                    StatusCode::NOT_FOUND,
+                    "no_such_group",
+                    &format!("group {tenant}/{name}"),
+                )
+            }
+            Err(e) => {
+                return json::err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    &e.to_string(),
+                )
+            }
+        };
+        let mut applied = Vec::new();
+        if let Some(v) = parsed.get("members") {
+            match Self::parse_member_names(v) {
+                Ok(m) => {
+                    group.members = m;
+                    applied.push("members");
+                }
+                Err(r) => return *r,
+            }
+        }
+        if let Some(v) = parsed.get("policies") {
+            match Self::parse_policy_names(engine.meta(), tenant, v) {
+                Ok(p) => {
+                    group.policies = p;
+                    applied.push("policies");
+                }
+                Err(r) => return *r,
+            }
+        }
+        if applied.is_empty() {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "missing required field: members and/or policies",
+            );
+        }
+        drop(engine);
+        match self.service.put_iam_group(&group) {
+            Ok(()) => json::ok(Self::group_json(&group)),
+            Err(fs3_core::Error::InvalidArgument(m)) => {
+                json::err(StatusCode::BAD_REQUEST, "bad_request", &m)
+            }
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    /// DELETE /v1/iam/groups/{tenant}/{name}:删除组(meta 事务同事务
+    /// 清理全部成员的 groups 列表;不存在 → 404)。不做成员删除级联。
+    fn handle_group_delete(&self, tenant: &str, name: &str) -> Response<String> {
+        match self.service.delete_iam_group(tenant, name) {
+            Ok(()) => json::ok(serde_json::json!({"deleted": name, "tenant_id": tenant})),
+            Err(fs3_core::Error::NotFound(_)) => json::err(
+                StatusCode::NOT_FOUND,
+                "no_such_group",
+                &format!("group {tenant}/{name}"),
+            ),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    /// 策略 JSON 视图。`canned: true` = 内置只读(代码常量,不落盘;
+    /// tenant_id 为 null)。
+    fn policy_json(p: &fs3_core::IamPolicy, canned: bool) -> serde_json::Value {
+        serde_json::json!({
+            "tenant_id": p.tenant_id,
+            "name": p.name,
+            "document": p.document,
+            "canned": canned,
+            "created_at": p.created_at,
+        })
+    }
+
+    /// GET /v1/iam/policies?tenant=:策略列表 = 本租户自定义(按 name
+    /// 排序)+ 全部 canned(展示序,canned:true)。
+    fn handle_policies_list(&self, query: &[(String, String)]) -> Response<String> {
+        let tenant = query
+            .iter()
+            .find(|(k, _)| k == "tenant")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or(fs3_core::Tenant::DEFAULT_TENANT);
+        let engine = self.engine.read();
+        match engine.meta().list_iam_policies_in(tenant) {
+            Ok(custom) => {
+                let mut out: Vec<serde_json::Value> =
+                    custom.iter().map(|p| Self::policy_json(p, false)).collect();
+                out.extend(fs3_s3::iam::CANNED_NAMES.iter().map(|n| {
+                    Self::policy_json(
+                        &fs3_core::IamPolicy {
+                            tenant_id: None,
+                            name: (*n).to_string(),
+                            document: fs3_s3::iam::canned_policy(n).unwrap_or("").to_string(),
+                            created_at: 0,
+                        },
+                        true,
+                    )
+                }));
+                json::ok(serde_json::json!({
+                    "tenant_id": tenant,
+                    "policies": out,
+                }))
+            }
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    /// POST /v1/iam/policies:创建自定义策略。body:`name`(必填;canned
+    /// 名保留 → 400)、`tenant`(可选,缺省 default;租户须已存在)、
+    /// `document`(必填 string;严格解析 Policy::parse,非法 → 400
+    /// MalformedPolicy)。同名 → 409。
+    fn handle_policy_create(&self, body: &[u8]) -> Response<String> {
+        let parsed: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(_) => {
+                return json::err(StatusCode::BAD_REQUEST, "bad_request", "invalid JSON body")
+            }
+        };
+        let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if name.is_empty() {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "missing required field: name",
+            );
+        }
+        let tenant = parsed
+            .get("tenant")
+            .and_then(|v| v.as_str())
+            .unwrap_or(fs3_core::Tenant::DEFAULT_TENANT);
+        if let Err(e) = fs3_meta::keys::validate_iam_name(name) {
+            return json::err(StatusCode::BAD_REQUEST, "invalid_name", &e.to_string());
+        }
+        if let Err(e) = fs3_meta::keys::validate_iam_name(tenant) {
+            return json::err(StatusCode::BAD_REQUEST, "invalid_name", &e.to_string());
+        }
+        // canned 名保留(DI2.3:canned 只读,不落盘)
+        if fs3_s3::iam::is_canned(name) {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "policy_name_reserved",
+                &format!("policy name {name} is reserved (canned policy)"),
+            );
+        }
+        let document = match parsed.get("document").and_then(|v| v.as_str()) {
+            Some(d) if !d.is_empty() => d.to_string(),
+            _ => {
+                return json::err(
+                    StatusCode::BAD_REQUEST,
+                    "bad_request",
+                    "missing required field: document",
+                )
+            }
+        };
+        // 严格校验(未知字段/非法 Action 即拒绝;与数据面解析器同一份)
+        if let Err(e) = fs3_s3::policy::Policy::parse(&document) {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "MalformedPolicy",
+                &format!("invalid policy document: {e}"),
+            );
+        }
+        let engine = self.engine.read();
+        match engine.meta().get_tenant(tenant) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return json::err(
+                    StatusCode::NOT_FOUND,
+                    "no_such_tenant",
+                    &format!("tenant {tenant}"),
+                )
+            }
+            Err(e) => {
+                return json::err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    &e.to_string(),
+                )
+            }
+        }
+        match engine.meta().get_iam_policy(tenant, name) {
+            Ok(Some(_)) => {
+                return json::err(
+                    StatusCode::CONFLICT,
+                    "policy_exists",
+                    &format!("policy {tenant}/{name} already exists"),
+                )
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return json::err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    &e.to_string(),
+                )
+            }
+        }
+        drop(engine);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let policy = fs3_core::IamPolicy {
+            tenant_id: Some(tenant.to_string()),
+            name: name.to_string(),
+            document,
+            created_at: now,
+        };
+        match self.service.put_iam_policy(&policy) {
+            Ok(()) => json::ok(Self::policy_json(&policy, false)),
+            Err(fs3_core::Error::InvalidArgument(m)) => {
+                json::err(StatusCode::BAD_REQUEST, "bad_request", &m)
+            }
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    /// GET /v1/iam/policies/{tenant}/{name}:策略详情。自定义优先;
+    /// canned 按名可读(每租户可见,canned:true,tenant_id:null);
+    /// 均缺席 → 404。
+    fn handle_policy_get(&self, tenant: &str, name: &str) -> Response<String> {
+        let engine = self.engine.read();
+        match engine.meta().get_iam_policy(tenant, name) {
+            Ok(Some(p)) => json::ok(Self::policy_json(&p, false)),
+            Ok(None) => {
+                if let Some(doc) = fs3_s3::iam::canned_policy(name) {
+                    json::ok(Self::policy_json(
+                        &fs3_core::IamPolicy {
+                            tenant_id: None,
+                            name: name.to_string(),
+                            document: doc.to_string(),
+                            created_at: 0,
+                        },
+                        true,
+                    ))
+                } else {
+                    json::err(
+                        StatusCode::NOT_FOUND,
+                        "no_such_policy",
+                        &format!("policy {tenant}/{name}"),
+                    )
+                }
+            }
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    /// PATCH /v1/iam/policies/{tenant}/{name}:替换自定义策略文档
+    /// (`document` 整份替换,解析失败 → 400 MalformedPolicy)。canned
+    /// 只读 → 400;不存在 → 404。
+    fn handle_policy_patch(&self, tenant: &str, name: &str, body: &[u8]) -> Response<String> {
+        if fs3_s3::iam::is_canned(name) {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "policy_readonly",
+                &format!("canned policy {name} is read-only"),
+            );
+        }
+        let parsed: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(_) => {
+                return json::err(StatusCode::BAD_REQUEST, "bad_request", "invalid JSON body")
+            }
+        };
+        let document = match parsed.get("document").and_then(|v| v.as_str()) {
+            Some(d) if !d.is_empty() => d.to_string(),
+            _ => {
+                return json::err(
+                    StatusCode::BAD_REQUEST,
+                    "bad_request",
+                    "missing required field: document",
+                )
+            }
+        };
+        if let Err(e) = fs3_s3::policy::Policy::parse(&document) {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "MalformedPolicy",
+                &format!("invalid policy document: {e}"),
+            );
+        }
+        let engine = self.engine.read();
+        let mut policy = match engine.meta().get_iam_policy(tenant, name) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                return json::err(
+                    StatusCode::NOT_FOUND,
+                    "no_such_policy",
+                    &format!("policy {tenant}/{name}"),
+                )
+            }
+            Err(e) => {
+                return json::err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    &e.to_string(),
+                )
+            }
+        };
+        drop(engine);
+        policy.document = document;
+        match self.service.put_iam_policy(&policy) {
+            Ok(()) => json::ok(Self::policy_json(&policy, false)),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    /// DELETE /v1/iam/policies/{tenant}/{name}:删除自定义策略。canned
+    /// 只读 → 400;仍被本租户 user/group 挂载 → 409(须先解挂);
+    /// 不存在 → 404。
+    fn handle_policy_delete(&self, tenant: &str, name: &str) -> Response<String> {
+        if fs3_s3::iam::is_canned(name) {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "policy_readonly",
+                &format!("canned policy {name} is read-only"),
+            );
+        }
+        match self.service.delete_iam_policy(tenant, name) {
+            Ok(()) => json::ok(serde_json::json!({"deleted": name, "tenant_id": tenant})),
+            Err(fs3_core::Error::NotFound(_)) => json::err(
+                StatusCode::NOT_FOUND,
+                "no_such_policy",
+                &format!("policy {tenant}/{name}"),
+            ),
+            Err(fs3_core::Error::InvalidArgument(m)) => {
+                json::err(StatusCode::CONFLICT, "policy_attached", &m)
             }
             Err(e) => json::err(
                 StatusCode::INTERNAL_SERVER_ERROR,

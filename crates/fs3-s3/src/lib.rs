@@ -7,6 +7,7 @@ pub mod auth;
 pub mod checksum;
 pub mod chunked;
 pub mod error;
+pub mod iam;
 pub mod object_lock;
 pub mod policy;
 pub mod post;

@@ -607,6 +607,308 @@ fn admin_iam_users_crud() {
     let _ = handle;
 }
 
+/// M18 U2(ADR-28 DI2.2/DI8):/v1/iam/groups CRUD —— 创建(成员须是既有
+/// 用户;策略名须可解析)/详情/列表/PATCH(members·policies 整表替换,
+/// 成员增减双端同步 user.groups)/删除(同事务清理成员 groups)。
+#[test]
+fn admin_iam_groups_crud() {
+    let (_d, img) = setup();
+    let cfg = EngineConfig {
+        devices: vec![img.clone()],
+        meta_dir: img.parent().unwrap().join("meta"),
+        ..Default::default()
+    };
+    let (sock, handle) = start_admin(&cfg, "t");
+    let sock = sock.trim_start_matches("unix://");
+
+    // 前置:两个用户
+    for u in ["alice", "bob"] {
+        let (code, body) = http_unix(
+            sock,
+            "POST",
+            "/v1/iam/users",
+            Some(&format!(r#"{{"name":"{u}"}}"#)),
+            "t",
+        );
+        assert_eq!(code, 200, "create user {u} failed: {body}");
+    }
+    // 创建组(成员 alice + canned readonly)
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/groups",
+        Some(r#"{"name":"readers","members":["alice"],"policies":["readonly"]}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "create group failed: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["tenant_id"], "default");
+    assert_eq!(v["members"], serde_json::json!(["alice"]));
+    // 成员 groups 已双端同步
+    let (code, body) = http_unix(sock, "GET", "/v1/iam/users/default/alice", None, "t");
+    assert_eq!(code, 200);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["groups"], serde_json::json!(["readers"]));
+    // 同名 → 409;成员不存在 → 400;策略名不可解析 → 400;缺 name → 400
+    let (code, _) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/groups",
+        Some(r#"{"name":"readers"}"#),
+        "t",
+    );
+    assert_eq!(code, 409);
+    let (code, _) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/groups",
+        Some(r#"{"name":"g2","members":["ghost"]}"#),
+        "t",
+    );
+    assert_eq!(code, 400);
+    let (code, _) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/groups",
+        Some(r#"{"name":"g2","policies":["nosuchpolicy"]}"#),
+        "t",
+    );
+    assert_eq!(code, 400);
+    let (code, _) = http_unix(sock, "POST", "/v1/iam/groups", Some(r#"{}"#), "t");
+    assert_eq!(code, 400);
+
+    // PATCH:members 整表替换(alice → bob)
+    let (code, body) = http_unix(
+        sock,
+        "PATCH",
+        "/v1/iam/groups/default/readers",
+        Some(r#"{"members":["bob"]}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "patch group failed: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["members"], serde_json::json!(["bob"]));
+    let (_, body) = http_unix(sock, "GET", "/v1/iam/users/default/alice", None, "t");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["groups"], serde_json::json!([]), "被移成员 groups 摘除");
+    let (_, body) = http_unix(sock, "GET", "/v1/iam/users/default/bob", None, "t");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["groups"], serde_json::json!(["readers"]));
+    // 空 PATCH → 400;不存在 → 404
+    let (code, _) = http_unix(
+        sock,
+        "PATCH",
+        "/v1/iam/groups/default/readers",
+        Some(r#"{}"#),
+        "t",
+    );
+    assert_eq!(code, 400);
+    let (code, _) = http_unix(sock, "GET", "/v1/iam/groups/default/nope", None, "t");
+    assert_eq!(code, 404);
+
+    // 列表
+    let (code, body) = http_unix(sock, "GET", "/v1/iam/groups?tenant=default", None, "t");
+    assert_eq!(code, 200);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["groups"].as_array().unwrap().len(), 1);
+
+    // 删除:成员 groups 清理;再删 → 404
+    let (code, _) = http_unix(sock, "DELETE", "/v1/iam/groups/default/readers", None, "t");
+    assert_eq!(code, 200);
+    let (_, body) = http_unix(sock, "GET", "/v1/iam/users/default/bob", None, "t");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["groups"], serde_json::json!([]), "删组后成员 groups 清理");
+    let (code, _) = http_unix(sock, "DELETE", "/v1/iam/groups/default/readers", None, "t");
+    assert_eq!(code, 404);
+
+    let _ = handle;
+}
+
+/// M18 U2(ADR-28 DI2.3/DI8):/v1/iam/policies CRUD —— canned 列出
+/// (canned:true)且只读(PATCH/DELETE → 400);自定义创建(非法文档 →
+/// 400 MalformedPolicy;canned 撞名 → 400)/详情/PATCH 整份替换/删除
+/// (仍被挂载 → 409);用户 PATCH policies 挂未知名 → 400。
+#[test]
+fn admin_iam_policies_crud() {
+    let (_d, img) = setup();
+    let cfg = EngineConfig {
+        devices: vec![img.clone()],
+        meta_dir: img.parent().unwrap().join("meta"),
+        ..Default::default()
+    };
+    let (sock, handle) = start_admin(&cfg, "t");
+    let sock = sock.trim_start_matches("unix://");
+
+    // 列表:6 份 canned,标记 canned:true
+    let (code, body) = http_unix(sock, "GET", "/v1/iam/policies?tenant=default", None, "t");
+    assert_eq!(code, 200, "list policies failed: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let arr = v["policies"].as_array().unwrap();
+    assert_eq!(arr.len(), 6);
+    assert!(arr.iter().all(|p| p["canned"] == true));
+    for name in [
+        "readonly",
+        "readwrite",
+        "writeonly",
+        "diagnostics",
+        "consoleAdmin",
+        "tenantAdmin",
+    ] {
+        assert!(
+            arr.iter().any(|p| p["name"] == name),
+            "canned {name} in list: {body}"
+        );
+    }
+    // canned 详情可读
+    let (code, body) = http_unix(sock, "GET", "/v1/iam/policies/default/readonly", None, "t");
+    assert_eq!(code, 200);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["canned"], true);
+    assert!(v["document"].as_str().unwrap().contains("s3:Get*"));
+
+    // 创建自定义(合法文档)
+    let doc = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::bkt/*"]}]}"#;
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/policies",
+        Some(&format!(
+            r#"{{"name":"team-ro","document":{}}}"#,
+            serde_json::to_string(doc).unwrap()
+        )),
+        "t",
+    );
+    assert_eq!(code, 200, "create policy failed: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["canned"], false);
+    assert_eq!(v["tenant_id"], "default");
+    // 非法文档(未知字段)→ 400 MalformedPolicy;非法 JSON → 400;
+    // canned 撞名 → 400;同名 → 409
+    let bad_doc = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["*"],"Bogus":1}]}"#;
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/policies",
+        Some(&format!(
+            r#"{{"name":"bad","document":{}}}"#,
+            serde_json::to_string(bad_doc).unwrap()
+        )),
+        "t",
+    );
+    assert_eq!(code, 400, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["error"]["code"], "MalformedPolicy", "{body}");
+    let (code, _) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/policies",
+        Some(r#"{"name":"readonly","document":"{}"}"#),
+        "t",
+    );
+    assert_eq!(code, 400);
+    let (code, _) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/policies",
+        Some(&format!(
+            r#"{{"name":"team-ro","document":{}}}"#,
+            serde_json::to_string(doc).unwrap()
+        )),
+        "t",
+    );
+    assert_eq!(code, 409);
+
+    // PATCH 整份替换;canned PATCH/DELETE → 400;不存在 → 404
+    let doc2 = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject"],"Resource":["*"]}]}"#;
+    let (code, body) = http_unix(
+        sock,
+        "PATCH",
+        "/v1/iam/policies/default/team-ro",
+        Some(&format!(
+            r#"{{"document":{}}}"#,
+            serde_json::to_string(doc2).unwrap()
+        )),
+        "t",
+    );
+    assert_eq!(code, 200, "patch policy failed: {body}");
+    let (code, _) = http_unix(
+        sock,
+        "PATCH",
+        "/v1/iam/policies/default/readonly",
+        Some(&format!(
+            r#"{{"document":{}}}"#,
+            serde_json::to_string(doc2).unwrap()
+        )),
+        "t",
+    );
+    assert_eq!(code, 400, "canned PATCH 拒绝");
+    let (code, _) = http_unix(
+        sock,
+        "DELETE",
+        "/v1/iam/policies/default/consoleAdmin",
+        None,
+        "t",
+    );
+    assert_eq!(code, 400, "canned DELETE 拒绝");
+    let (code, _) = http_unix(sock, "DELETE", "/v1/iam/policies/default/nope", None, "t");
+    assert_eq!(code, 404);
+
+    // 用户挂载:挂载中删除 → 409;用户 PATCH 未知策略名 → 400
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/users",
+        Some(r#"{"name":"alice"}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "{body}");
+    let (code, body) = http_unix(
+        sock,
+        "PATCH",
+        "/v1/iam/users/default/alice",
+        Some(r#"{"policies":["team-ro"]}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "{body}");
+    let (code, body) = http_unix(
+        sock,
+        "DELETE",
+        "/v1/iam/policies/default/team-ro",
+        None,
+        "t",
+    );
+    assert_eq!(code, 409, "仍被挂载 → 409: {body}");
+    let (code, body) = http_unix(
+        sock,
+        "PATCH",
+        "/v1/iam/users/default/alice",
+        Some(r#"{"policies":["nosuchpolicy"]}"#),
+        "t",
+    );
+    assert_eq!(code, 400, "未知策略名 → 400: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["error"]["code"], "no_such_policy", "{body}");
+    // 解挂后可删
+    let (code, _) = http_unix(
+        sock,
+        "PATCH",
+        "/v1/iam/users/default/alice",
+        Some(r#"{"policies":[]}"#),
+        "t",
+    );
+    assert_eq!(code, 200);
+    let (code, _) = http_unix(
+        sock,
+        "DELETE",
+        "/v1/iam/policies/default/team-ro",
+        None,
+        "t",
+    );
+    assert_eq!(code, 200);
+
+    let _ = handle;
+}
+
 #[test]
 fn admin_repair_endpoint() {
     let (_d, img) = setup();
