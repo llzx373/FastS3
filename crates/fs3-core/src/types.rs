@@ -1779,15 +1779,19 @@ impl KeyRecord {
     }
 }
 
-/// STS 会话记录(M15 T1/T2;ADR-18 D-E2)。键 `s:session\0{session_id}` →
-/// postcard(SessionRecord)。语义:
-/// - 会话 = 基密钥(既有 `k:` 记录)+ 会话策略求交,无角色派生;
+/// STS 会话记录(M15 T1/T2;ADR-18 D-E2;M18 R1 起支持角色派生,
+/// ADR-28 DI5)。键 `s:session\0{session_id}` → postcard(SessionRecord)。
+/// 语义:
+/// - GetSessionToken 会话 = 基密钥(既有 `k:` 记录)+ 会话策略求交
+///   (不提权,D-E2 此条仍成立);AssumeRole 会话 = 角色策略(session_
+///   policy 承载)∩ 基密钥身份层/嵌入层(数据面分层强制,R1);
 /// - **secret 仅签发时一次回显、零落盘**:本记录只存 SHA-256 哈希比对子
 ///   (数据面校验 = 提交的临时 secret 哈希比对;明文绝不入 meta/日志/审计);
 /// - TTL 到期后数据面拒绝(InvalidToken),管理面可先行撤销(删键);
 /// - 会话撤销 = 删键;剩余 TTL 内新会话重签。
 ///
-/// 演进纪律:结构只许尾部追加字段/变体(postcard 序)。
+/// 演进纪律:结构只许尾部追加字段/变体(postcard 序;R1 追加
+/// role/user/tenant_id/inline_policy,旧值双读见 SessionRecordV1)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRecord {
     /// 会话主键(随机 32 hex;管理面生成,`x-amz-security-token` 的值)。
@@ -1798,6 +1802,8 @@ pub struct SessionRecord {
     /// 基密钥(会话权限的来源;`k:` 记录引用)。
     pub base_access_key: String,
     /// 会话策略 JSON(AWS 策略语法子集;可空 = 仅基密钥策略)。
+    /// M18 R1 起:AssumeRole 会话承载**角色策略**(作用域下限;与基密钥
+    /// 身份层/嵌入层求交由数据面分层强制,非策略代数,compat 钉死)。
     pub session_policy: Option<String>,
     /// 过期时刻(unix 秒;== 签发时刻 + TTL)。
     pub expires_at: i64,
@@ -1808,6 +1814,52 @@ pub struct SessionRecord {
     pub issued_at: i64,
     /// 签发者(管理面 access key;审计用)。
     pub issued_by: String,
+    /// M18 R1(ADR-28 DI5.4):AssumeRole 目标角色名(`ir:` 引用;
+    /// None = GetSessionToken 会话)。
+    pub role: Option<String>,
+    /// M18 R1:调用者用户(基密钥属主;审计/诊断用)。
+    pub user: Option<String>,
+    /// M18 R1:所属租户(角色与调用者恒同租户;无跨租户 Assume)。
+    pub tenant_id: Option<String>,
+    /// M18 R1:AssumeRole 内联策略(AWS `Policy` 参数;可空)。数据面
+    /// 作为第二个求交层(角色策略 ∩ 内联策略,均须显式 Allow)。
+    pub inline_policy: Option<String>,
+}
+
+/// M18 R1(ADR-28 DI5.4)双读回退用旧形态(R1 前字段集,无
+/// role/user/tenant_id/inline_policy)。仅 fs3-meta `decode_sts_session`
+/// 回退臂与旧值夹具构造使用;新代码一律写当前 `SessionRecord`(单写)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRecordV1 {
+    pub session_id: String,
+    pub temporary_access_key: String,
+    pub base_access_key: String,
+    pub session_policy: Option<String>,
+    pub expires_at: i64,
+    pub secret_hash: String,
+    pub issued_at: i64,
+    pub issued_by: String,
+}
+
+impl SessionRecordV1 {
+    /// 旧记录升级:R1 追加字段一律 None(GetSessionToken 会话语义,
+    /// 与既有行为逐字节一致)。
+    pub fn upgrade(self) -> SessionRecord {
+        SessionRecord {
+            session_id: self.session_id,
+            temporary_access_key: self.temporary_access_key,
+            base_access_key: self.base_access_key,
+            session_policy: self.session_policy,
+            expires_at: self.expires_at,
+            secret_hash: self.secret_hash,
+            issued_at: self.issued_at,
+            issued_by: self.issued_by,
+            role: None,
+            user: None,
+            tenant_id: None,
+            inline_policy: None,
+        }
+    }
 }
 
 impl SessionRecord {

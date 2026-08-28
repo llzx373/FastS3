@@ -243,7 +243,7 @@
 
 ### R. STS / LDAP / OIDC(≈1 pw)
 
-- [ ] R1 AssumeRole:本租户 `ir:` 角色;权限 = Role ∩ 调用者可 assume 约束;不能越租户、不能变 root;
+- [x] R1 AssumeRole:本租户 `ir:` 角色;权限 = Role ∩ 调用者可 assume 约束;不能越租户、不能变 root;
   GetSessionToken 仍不提权。compat 声明 D-E2「无角色」已被本条取代
   - 用例:`assume_role_same_tenant_ok`;`assume_role_cross_tenant_denied`
 - [ ] R2 LDAP 同步改为 User/Group + 策略挂载,**停止**「组→直接造 k:」;LDAP bind 登录控制台

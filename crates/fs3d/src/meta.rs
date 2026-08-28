@@ -558,6 +558,11 @@ pub struct MetaExportFile {
     /// 无秘密材料;旧导出(无此字段)→ 空表。
     #[serde(default)]
     pub policies: Vec<fs3_core::IamPolicy>,
+    /// IAM 角色(M18 R1;ADR-28 DI2.5/DI5 + 键前缀三处同步之二:`ir:`
+    /// 登记于 fs3-meta keys.rs)。角色策略文档无秘密材料;旧导出
+    /// (无此字段)→ 空表。
+    #[serde(default)]
+    pub roles: Vec<fs3_core::IamRole>,
     pub objects: Vec<ObjectEntryDto>,
     pub uploads: Vec<UploadDto>,
 }
@@ -688,6 +693,9 @@ pub fn run_meta_export(
     let groups = store.list_iam_groups()?;
     let policies = store.list_iam_policies()?;
 
+    // M18 R1:IAM 角色(策略文档无秘密材料,随导出)
+    let roles = store.list_iam_roles()?;
+
     // M10 V5-1:版本化桶逐版本条目导出(含删除标记与 null 槽),vk 不丢 ——
     // 键形态经 ObjectDto.version_id 承载(None/"null"/hex 三态)。
     let objects: Vec<ObjectEntryDto> = store
@@ -731,6 +739,7 @@ pub fn run_meta_export(
         users,
         groups,
         policies,
+        roles,
         objects,
         uploads,
     };
@@ -740,13 +749,14 @@ pub fn run_meta_export(
 
     write_private(&args.output, json.as_bytes())?;
     println!(
-        "meta-export: {} buckets, {} keys, {} tenants, {} users, {} groups, {} policies, {} objects, {} uploads → {}",
+        "meta-export: {} buckets, {} keys, {} tenants, {} users, {} groups, {} policies, {} roles, {} objects, {} uploads → {}",
         file.buckets.len(),
         file.keys.len(),
         file.tenants.len(),
         file.users.len(),
         file.groups.len(),
         file.policies.len(),
+        file.roles.len(),
         file.objects.len(),
         file.uploads.len(),
         args.output.display()
@@ -947,6 +957,13 @@ pub fn run_meta_import(
     // groups 列表幂等不重复追加)。
     for g in &file.groups {
         store.commit_iam_group_put(g)?;
+    }
+
+    // 5f) IAM 角色(M18 R1):原样恢复(覆盖语义;assumable_by 主体
+    // 存在性校验在管理面,meta 层不校验,顺序无关)。旧导出(无 roles
+    // 字段)→ 空表。
+    for r in &file.roles {
+        store.commit_iam_role_put(r)?;
     }
 
     // 6) 对象:段校验(布局边界/对齐)+ 分配草稿 + 零统计增量

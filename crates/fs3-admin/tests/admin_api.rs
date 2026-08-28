@@ -1105,6 +1105,394 @@ fn admin_iam_service_accounts_crud() {
     let _ = handle;
 }
 
+/// M18 R1(ADR-28 DI2.5/DI5):/v1/iam/roles CRUD —— 创建(策略经
+/// Policy::parse,非法 → 400 MalformedPolicy;assumable_by 须是本租户
+/// 既有 user/group;同名 → 409)、详情/列表/PATCH 整表替换/无条件删除
+/// (不存在 → 404)。
+#[test]
+fn admin_iam_roles_crud() {
+    let (_d, img) = setup();
+    let cfg = EngineConfig {
+        devices: vec![img.clone()],
+        meta_dir: img.parent().unwrap().join("meta"),
+        ..Default::default()
+    };
+    let (sock, handle) = start_admin(&cfg, "t");
+    let sock = sock.trim_start_matches("unix://");
+
+    let role_doc = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::bkt/*"]}]}"#;
+    // 前置:用户 alice + 组 readers
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/users",
+        Some(r#"{"name":"alice"}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "create user failed: {body}");
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/groups",
+        Some(r#"{"name":"readers","members":["alice"]}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "create group failed: {body}");
+
+    // 创建角色(assumable_by = user + group)
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/roles",
+        Some(&format!(
+            r#"{{"name":"reader","policy":{},"assumable_by":["alice","readers"]}}"#,
+            serde_json::to_string(role_doc).unwrap()
+        )),
+        "t",
+    );
+    assert_eq!(code, 200, "create role failed: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["tenant_id"], "default");
+    assert_eq!(v["assumable_by"], serde_json::json!(["alice", "readers"]));
+    // 非法策略 → 400 MalformedPolicy;assumable_by 主体不存在 → 400;
+    // 缺 policy/name → 400;同名 → 409;租户不存在 → 404
+    let bad_doc = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Bogus":1}]}"#;
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/roles",
+        Some(&format!(
+            r#"{{"name":"bad","policy":{}}}"#,
+            serde_json::to_string(bad_doc).unwrap()
+        )),
+        "t",
+    );
+    assert_eq!(code, 400, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["error"]["code"], "MalformedPolicy", "{body}");
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/roles",
+        Some(&format!(
+            r#"{{"name":"r2","policy":{},"assumable_by":["ghost"]}}"#,
+            serde_json::to_string(role_doc).unwrap()
+        )),
+        "t",
+    );
+    assert_eq!(code, 400, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["error"]["code"], "no_such_principal", "{body}");
+    let (code, _) = http_unix(sock, "POST", "/v1/iam/roles", Some(r#"{"name":"r2"}"#), "t");
+    assert_eq!(code, 400);
+    let (code, _) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/roles",
+        Some(&format!(
+            r#"{{"name":"reader","policy":{}}}"#,
+            serde_json::to_string(role_doc).unwrap()
+        )),
+        "t",
+    );
+    assert_eq!(code, 409);
+    let (code, _) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/roles",
+        Some(&format!(
+            r#"{{"tenant":"ghost","name":"r2","policy":{}}}"#,
+            serde_json::to_string(role_doc).unwrap()
+        )),
+        "t",
+    );
+    assert_eq!(code, 404);
+
+    // 详情 + 列表
+    let (code, body) = http_unix(sock, "GET", "/v1/iam/roles/default/reader", None, "t");
+    assert_eq!(code, 200);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["name"], "reader");
+    let (code, _) = http_unix(sock, "GET", "/v1/iam/roles/default/nope", None, "t");
+    assert_eq!(code, 404);
+    let (code, body) = http_unix(sock, "GET", "/v1/iam/roles?tenant=default", None, "t");
+    assert_eq!(code, 200);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["roles"].as_array().unwrap().len(), 1);
+
+    // PATCH:assumable_by 整表替换 + policy 替换;空 PATCH → 400;
+    // 非法策略 → 400;不存在 → 404
+    let (code, body) = http_unix(
+        sock,
+        "PATCH",
+        "/v1/iam/roles/default/reader",
+        Some(r#"{"assumable_by":["readers"]}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "patch role failed: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["assumable_by"], serde_json::json!(["readers"]));
+    let (code, _) = http_unix(
+        sock,
+        "PATCH",
+        "/v1/iam/roles/default/reader",
+        Some(r#"{}"#),
+        "t",
+    );
+    assert_eq!(code, 400);
+    let (code, _) = http_unix(
+        sock,
+        "PATCH",
+        "/v1/iam/roles/default/reader",
+        Some(r#"{"policy":"{not-json"}"#),
+        "t",
+    );
+    assert_eq!(code, 400);
+    let (code, _) = http_unix(
+        sock,
+        "PATCH",
+        "/v1/iam/roles/default/nope",
+        Some(r#"{"assumable_by":[]}"#),
+        "t",
+    );
+    assert_eq!(code, 404);
+
+    // 删除(无条件;已签发会话不回溯,见 assume-role 用例);再删 → 404
+    let (code, _) = http_unix(sock, "DELETE", "/v1/iam/roles/default/reader", None, "t");
+    assert_eq!(code, 200);
+    let (code, _) = http_unix(sock, "DELETE", "/v1/iam/roles/default/reader", None, "t");
+    assert_eq!(code, 404);
+
+    let _ = handle;
+}
+
+/// M18 R1(ADR-28 DI5.2):/v1/iam/assume-role —— 同租户签发(响应含临时
+/// AK/secret/expiration + role/user 回显;secret 仅一次);跨租户 → 403;
+/// 无 sts:AssumeRole 授予 → 403;越 assumable_by → 403;属主禁用 → 403;
+/// 配置注入密钥(无 k: 记录)→ 403;未知基密钥/角色 → 404。
+#[test]
+fn admin_iam_assume_role() {
+    let (_d, img) = setup();
+    let cfg = EngineConfig {
+        devices: vec![img.clone()],
+        meta_dir: img.parent().unwrap().join("meta"),
+        ..Default::default()
+    };
+    let (sock, handle) = start_admin(&cfg, "t");
+    let sock = sock.trim_start_matches("unix://");
+
+    // 前置:租户 tb;default 用户 alice(策略 Allow sts:AssumeRole on
+    // 角色 + s3:*);default canonical = "fasts3"(升级迁移钉死)
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/tenants",
+        Some(r#"{"tenant_id":"tb"}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "create tenant failed: {body}");
+    let caller_doc = r#"{"Version":"2012-10-17","Statement":[
+        {"Effect":"Allow","Action":["sts:AssumeRole"],"Resource":["arn:aws:iam::fasts3:role/*"]},
+        {"Effect":"Allow","Action":["s3:*"],"Resource":["*"]}
+    ]}"#;
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/policies",
+        Some(&format!(
+            r#"{{"name":"caller-pol","document":{}}}"#,
+            serde_json::to_string(caller_doc).unwrap()
+        )),
+        "t",
+    );
+    assert_eq!(code, 200, "create policy failed: {body}");
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/users",
+        Some(r#"{"name":"alice"}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "create alice failed: {body}");
+    let (code, body) = http_unix(
+        sock,
+        "PATCH",
+        "/v1/iam/users/default/alice",
+        Some(r#"{"policies":["caller-pol"]}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "attach alice policy failed: {body}");
+    // bob(tb,授予 sts:AssumeRole *)+ dave(default,仅 s3,无 sts 授予)
+    let caller_doc_b = r#"{"Version":"2012-10-17","Statement":[
+        {"Effect":"Allow","Action":["sts:AssumeRole"],"Resource":["*"]},
+        {"Effect":"Allow","Action":["s3:*"],"Resource":["*"]}
+    ]}"#;
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/policies",
+        Some(&format!(
+            r#"{{"tenant":"tb","name":"caller-pol","document":{}}}"#,
+            serde_json::to_string(caller_doc_b).unwrap()
+        )),
+        "t",
+    );
+    assert_eq!(code, 200, "{body}");
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/users",
+        Some(r#"{"tenant":"tb","name":"bob"}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "{body}");
+    let (code, body) = http_unix(
+        sock,
+        "PATCH",
+        "/v1/iam/users/tb/bob",
+        Some(r#"{"policies":["caller-pol"]}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "{body}");
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/users",
+        Some(r#"{"name":"dave"}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "{body}");
+    let (code, body) = http_unix(
+        sock,
+        "PATCH",
+        "/v1/iam/users/default/dave",
+        Some(r#"{"policies":["readwrite"]}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "{body}");
+    // 三把 SA
+    let sa_of = |owner: &str, tenant: Option<&str>| -> String {
+        let body = match tenant {
+            Some(t) => format!(r#"{{"tenant":"{t}","owner_user":"{owner}"}}"#),
+            None => format!(r#"{{"owner_user":"{owner}"}}"#),
+        };
+        let (code, body) = http_unix(sock, "POST", "/v1/iam/service-accounts", Some(&body), "t");
+        assert_eq!(code, 200, "create SA {owner} failed: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        v["access_key"].as_str().unwrap().to_string()
+    };
+    let ak_alice = sa_of("alice", None);
+    let ak_bob = sa_of("bob", Some("tb"));
+    let ak_dave = sa_of("dave", None);
+    // 角色 reader(default;assumable_by 空 = 不限制主体)+ guarded(仅 alice)
+    let role_doc = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::bkt/*"]}]}"#;
+    for (name, assumable) in [("reader", r#"[]"#), ("guarded", r#"["alice"]"#)] {
+        let (code, body) = http_unix(
+            sock,
+            "POST",
+            "/v1/iam/roles",
+            Some(&format!(
+                r#"{{"name":"{name}","policy":{},"assumable_by":{assumable}}}"#,
+                serde_json::to_string(role_doc).unwrap()
+            )),
+            "t",
+        );
+        assert_eq!(code, 200, "create role {name} failed: {body}");
+    }
+    let assume = |tenant: &str, role: &str, base: &str| -> (u16, String) {
+        http_unix(
+            sock,
+            "POST",
+            "/v1/iam/assume-role",
+            Some(&format!(
+                r#"{{"tenant":"{tenant}","role":"{role}","base_access_key":"{base}","session_name":"job-1"}}"#
+            )),
+            "t",
+        )
+    };
+
+    // ① 同租户签发:200,临时凭据 + role/user 回显,secret 仅本响应
+    let (code, body) = assume("default", "reader", &ak_alice);
+    assert_eq!(code, 200, "same-tenant assume failed: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(v["temporary_access_key"]
+        .as_str()
+        .unwrap()
+        .starts_with("FSST"));
+    assert!(v["secret_key"].as_str().is_some());
+    assert!(v["session_token"].as_str().is_some());
+    assert!(v["expires_at"].as_i64().unwrap() > v["issued_at"].as_i64().unwrap());
+    assert_eq!(v["role"], "reader");
+    assert_eq!(v["user"], "alice");
+    assert_eq!(v["tenant_id"], "default");
+    assert!(
+        v["assumed_role_arn"]
+            .as_str()
+            .unwrap()
+            .contains("assumed-role/reader/job-1"),
+        "{body}"
+    );
+    // ② 跨租户:bob(tb)→ default 的角色 → 403(即便策略点名 *)
+    let (code, body) = assume("default", "reader", &ak_bob);
+    assert_eq!(code, 403, "cross-tenant must be denied: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["error"]["code"], "access_denied", "{body}");
+    // ③ 无 sts:AssumeRole 授予:dave(readwrite 仅 s3)→ 403
+    let (code, _) = assume("default", "reader", &ak_dave);
+    assert_eq!(code, 403, "caller without sts grant must be denied");
+    // ④ assumable_by 强制:dave 不在 guarded 的 assumable_by;先给 dave
+    //    授 sts(换 caller-pol)→ 仍 403(assumable_by 先于/独立于授予)
+    let (code, _) = http_unix(
+        sock,
+        "PATCH",
+        "/v1/iam/users/default/dave",
+        Some(r#"{"policies":["caller-pol"]}"#),
+        "t",
+    );
+    assert_eq!(code, 200);
+    let (code, body) = assume("default", "guarded", &ak_dave);
+    assert_eq!(code, 403, "assumable_by must be enforced: {body}");
+    let (code, body) = assume("default", "guarded", &ak_alice);
+    assert_eq!(code, 200, "listed principal can assume: {body}");
+    // ⑤ 属主禁用 → 403;恢复
+    let (code, _) = http_unix(
+        sock,
+        "PATCH",
+        "/v1/iam/users/default/alice",
+        Some(r#"{"enabled":false}"#),
+        "t",
+    );
+    assert_eq!(code, 200);
+    let (code, body) = assume("default", "reader", &ak_alice);
+    assert_eq!(code, 403, "disabled owner must be denied: {body}");
+    let (code, _) = http_unix(
+        sock,
+        "PATCH",
+        "/v1/iam/users/default/alice",
+        Some(r#"{"enabled":true}"#),
+        "t",
+    );
+    assert_eq!(code, 200);
+    // ⑥ 配置注入密钥("ak",无 k: 记录)→ 403;未知基密钥 → 404;
+    //    未知角色 → 404;缺字段 → 400
+    let (code, body) = assume("default", "reader", "ak");
+    assert_eq!(code, 403, "config-injected key cannot assume: {body}");
+    let (code, _) = assume("default", "reader", "AKIA_GHOST");
+    assert_eq!(code, 404, "unknown base key → 404");
+    let (code, _) = assume("default", "ghost", &ak_alice);
+    assert_eq!(code, 404, "unknown role → 404");
+    let (code, _) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/assume-role",
+        Some(r#"{"tenant":"default"}"#),
+        "t",
+    );
+    assert_eq!(code, 400, "missing fields → 400");
+
+    let _ = handle;
+}
+
 #[test]
 fn admin_repair_endpoint() {
     let (_d, img) = setup();

@@ -102,7 +102,7 @@ meta-export/import 可见并可往返;真实类独立落 ObjectMeta v7 `storage_
 | 项 | 说明 |
 | --- | --- |
 | 管理面端点 | Node `POST /api/sts`(AWS Query API:`Action=GetSessionToken` / `AssumeRole`;boto3 sts client 指向该端点) |
-| 会话模型 | 会话 = 既有密钥(基密钥)∩ 会话策略求交,**无角色派生**(ADR-18 D-E2):`AssumeRole` 接受 RoleArn 但语义 = 按会话策略为管理面身份签发(范围声明,不引入角色实体);TTL 默认 1h,上限 36h(对齐 AWS GetSessionToken) |
+| 会话模型 | GetSessionToken:会话 = 既有密钥(基密钥)∩ 会话策略求交,**不提权**(ADR-18 D-E2 此条仍成立,R1 回归钉死 `get_session_token_no_elevation_after_r1`);AssumeRole(v2.4 M18 R1 起)= 本租户 `ir:` 角色派生,**D-E2「AssumeRole 不引入角色实体」已被 ADR-28 DI5 取代**(规则见下「IAM 多租户」节 AssumeRole 行);TTL 默认 1h,上限 36h(对齐 AWS GetSessionToken) |
 | 凭证形态 | 响应含 `AccessKeyId`/`SecretAccessKey`/`SessionToken` 三元组 + `Expiration`;**secret 仅签发时一次回显**(管理面 API 只下发一次,库中仅 SHA-256 哈希比对子,G1-3 语义) |
 | 数据面校验 | `x-amz-security-token` 头 = 会话主键;临时 AK 与会话绑定;过期/撤销/基密钥禁用 → `InvalidToken` 显式 403;SigV4 按 AWS 语义(临时 AK + 临时 secret 验签);匿名路径不受影响 |
 | 会话管理 | `GET /api/sessions`(列表,无明文 secret)/ `DELETE /api/sessions/{id}`(撤销,立即失效);Rust admin `POST/DELETE /v1/admin/sessions` |
@@ -158,8 +158,11 @@ meta-export/import 可见并可往返;真实类独立落 ObjectMeta v7 `storage_
 | 桶属主 = 创建者租户(M18 S3;ADR-28 DI3.4/DI9.1) | CreateBucket 落 `BucketMeta.owner` = 调用者 SA 所属租户的 `canonical_id`(SA → `k:` 属主 → 租户 canonical);无属主记录的 legacy 密钥解析到 default 租户 canonical = `"fasts3"`,存量桶与新建行为逐字节不变;`x-amz-expected-bucket-owner` 比对对象同步 = 属主 canonical(不再是恒 `"fasts3"`);幂等重建(无 ACL 历史)不覆盖属主 |
 | 跨租户默认拒绝(M18 S3;ADR-28 DI1.2/DI1.4) | 桶级/对象级操作:桶属主 canonical ≠ 调用者 canonical → 默认 403 AccessDenied,**唯一逃生口 = 桶策略 Principal 具名点名调用者 ARN 的显式 Allow**(U3);调用者自身身份层/密钥层策略 Allow **不跨租户桥接**(身份策略作用域 = 本租户);**无 `k:` 属主记录的构造注入密钥(升级前超管口径)不参与租户边界**,行为与 M18 前一致;桶不存在仍交下游 NoSuchBucket;匿名请求无租户身份,语义不变 |
 | ListBuckets 隐式过滤(M18 S3;ADR-28 DI3.4) | 只返回调用者可见的桶,**从不 403 整个 List**:可见 = ① 桶属主 canonical = 调用者 canonical(同租户);② 调用者身份层显式 Allow `s3:ListBucket` 于该桶 ARN;③ 桶策略具名 Principal 显式 Allow 调用者。响应 Owner 块 = 调用者租户 canonical(legacy/匿名 → `"fasts3"`,与 M18 前硬编码一致);legacy 构造注入密钥不过滤(全量);控制台/对象浏览器过滤属 C1 |
-| 管理面 | Rust admin `/v1/iam/tenants` + `/v1/iam/users` + `/v1/iam/groups` + `/v1/iam/policies` + `/v1/iam/service-accounts` CRUD(root 可信通道;`admin:*` IAM 授权细分属 M18 C1) |
-| 备份 | meta-export v2 起含 `tenants` 字段,M18 I2 起含 `users` 字段(口令哈希可导出供灾备),M18 U2 起含 `groups`/`policies` 字段(canned 不入导出);旧导出缺省 = 仅 default 租户 + bootstrap 用户、无组/自定义策略;`k:` 旧 JSON 缺属主字段 → 导入补 default/bootstrap;secret 明文仍零导出 |
+| IAM 角色(M18 R1;ADR-28 DI2.5/DI5) | `/v1/iam/roles` CRUD(root 可信通道):`policy` 创建/PATCH 经数据面同一严格解析器,非法 → 400 **MalformedPolicy**;`assumable_by` 每项须是本租户既有 user/group(否则 400 `no_such_principal`),PATCH 为**整表替换**;删除**无条件**(已签发会话持有自身存储的策略副本,删角色不回溯失效既有会话;会话撤销走 `DELETE /v1/admin/sessions/{id}`);角色视图内存双写,变更即时生效 |
+| AssumeRole(M18 R1;ADR-28 DI5.2,**取代 D-E2「无角色实体」**) | `POST /v1/iam/assume-role` + Node `/api/sts?Action=AssumeRole`:RoleArn `arn:aws:iam::{canonical}:role/{name}`(Node 按 canonical 扫租户表解析 tenant;**无 RoleArn → 兼容路径**,按会话策略为管理面身份签发,无角色派生)。规则:① 基密钥必须有 `k:` 记录——**配置注入超管密钥不能 Assume**(403),未知基密钥 → 404;② 基密钥禁用/属主用户禁用 → 403(与数据面 DI7.3 同档);③ **无跨租户**(角色租户 ≠ 调用者租户 → 403,即便策略显式点名);④ `assumable_by` 非空 → 调用者用户或其任一组须被列出;⑤ 调用者生效策略须显式 Allow **`sts:AssumeRole`**(`sts:` 为 `policy.rs` 独立动作族,不补 `s3:` 前缀)于该角色 ARN,SA 嵌入策略同须 Allow;**例外:bootstrap 属主 legacy 密钥(无挂载)= 超管口径放行,有用户记录但无挂载 → 403**(防「无策略 = 隐式全量」外溢到 STS)。最终权限 = 角色策略 ∩ 调用者身份层 ∩ 内联策略(`Policy` 参数):**交集 = 数据面分层强制**(会话 who = 基密钥,角色策略落 `SessionRecord.session_policy`、内联策略落 `inline_policy`,身份/嵌入层照旧生效),**非策略代数**;可缩权/换策略包,**永不扩权、永不变 root** |
+| 会话记录扩展(M18 R1;ADR-28 DI5.4) | `SessionRecord` 尾部追加 `role`/`user`/`tenant_id`/`inline_policy`(postcard 序);**值版本双读单写**:R1 前旧记录读时补 None(GetSessionToken 会话语义不变),写时恒落新格式(用例 `session_record_v1_dual_read_defaults`);secret 零落盘纪律不变 |
+| 管理面 | Rust admin `/v1/iam/tenants` + `/v1/iam/users` + `/v1/iam/groups` + `/v1/iam/policies` + `/v1/iam/service-accounts` + `/v1/iam/roles` CRUD + `POST /v1/iam/assume-role`(root 可信通道;`admin:*` IAM 授权细分属 M18 C1) |
+| 备份 | meta-export v2 起含 `tenants` 字段,M18 I2 起含 `users` 字段(口令哈希可导出供灾备),M18 U2 起含 `groups`/`policies` 字段(canned 不入导出),M18 R1 起含 `roles` 字段;旧导出缺省 = 仅 default 租户 + bootstrap 用户、无组/自定义策略/角色;`k:` 旧 JSON 缺属主字段 → 导入补 default/bootstrap;secret 明文仍零导出 |
 
 
 

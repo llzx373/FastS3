@@ -11457,6 +11457,10 @@ fn sts_session_data_plane_roundtrip() {
         secret_hash: SessionRecord::hash_secret("x"),
         issued_at: 0,
         issued_by: "admin".into(),
+        role: None,
+        user: None,
+        tenant_id: None,
+        inline_policy: None,
     };
     svc.engine().read().meta().put_session(&old).unwrap();
     let r = svc.handle(&req_creds(
@@ -11490,6 +11494,10 @@ fn sts_session_data_plane_roundtrip() {
         secret_hash: SessionRecord::hash_secret("y"),
         issued_at: 1,
         issued_by: "admin".into(),
+        role: None,
+        user: None,
+        tenant_id: None,
+        inline_policy: None,
     };
     let stale = SessionRecord {
         session_id: "feedface".into(),
@@ -11500,6 +11508,10 @@ fn sts_session_data_plane_roundtrip() {
         secret_hash: SessionRecord::hash_secret("z"),
         issued_at: 0,
         issued_by: "admin".into(),
+        role: None,
+        user: None,
+        tenant_id: None,
+        inline_policy: None,
     };
     {
         let e = svc.engine().read();
@@ -11569,6 +11581,10 @@ fn expired_sts_session_is_deleted_from_meta() {
         secret_hash: SessionRecord::hash_secret(short_secret),
         issued_at: now,
         issued_by: "admin".into(),
+        role: None,
+        user: None,
+        tenant_id: None,
+        inline_policy: None,
     };
     svc.engine().read().meta().put_session(&short).unwrap();
     assert!(svc
@@ -11621,6 +11637,10 @@ fn expired_sts_session_is_deleted_from_meta() {
         secret_hash: SessionRecord::hash_secret("z"),
         issued_at: 0,
         issued_by: "admin".into(),
+        role: None,
+        user: None,
+        tenant_id: None,
+        inline_policy: None,
     };
     {
         let e = svc.engine().read();
@@ -12994,4 +13014,301 @@ fn cross_tenant_access_default_denied() {
     // alice 同租户全程不受影响
     let r = svc.handle(&req_creds("GET", "/s7bkt/k", &sa_alice, &[], vec![]));
     assert_eq!(status(&r), 200, "属主租户不受影响: {r:?}");
+}
+
+// ───────────────────── M18 R1:STS AssumeRole 本租户角色实体(ADR-28 DI5;取代 D-E2「无角色实体」)─────────────────────
+
+/// R1 测试共用:租户 + 用户(挂载自定义策略)+ 名下 SA + 角色。
+/// `caller_doc` = 调用者策略(须含 sts:AssumeRole on 角色 ARN 才有权
+/// assume);`role_doc` = 角色策略(会话策略层 = 作用域下限)。
+#[allow(clippy::too_many_arguments)]
+fn r1_setup_role(
+    svc: &S3Service,
+    tenant: &str,
+    canonical: &str,
+    user: &str,
+    ak: &str,
+    secret: &str,
+    caller_doc: &str,
+    role_name: &str,
+    role_doc: &str,
+    assumable_by: Vec<String>,
+) -> Credentials {
+    svc.put_tenant(&fs3_core::Tenant {
+        tenant_id: tenant.into(),
+        display_name: tenant.into(),
+        canonical_id: canonical.into(),
+        enabled: true,
+        created_at: 1_700_000_000,
+    })
+    .unwrap();
+    svc.put_iam_policy(&fs3_core::IamPolicy {
+        tenant_id: Some(tenant.into()),
+        name: "caller-pol".into(),
+        document: caller_doc.into(),
+        created_at: 1_700_000_000,
+    })
+    .unwrap();
+    svc.put_iam_user(&s1_user(tenant, user, vec!["caller-pol".into()]))
+        .unwrap();
+    svc.add_key_owned(ak, secret, None, tenant, user, None, None)
+        .unwrap();
+    svc.put_iam_role(&fs3_core::IamRole {
+        tenant_id: tenant.into(),
+        name: role_name.into(),
+        policy: role_doc.into(),
+        assumable_by,
+        created_at: 1_700_000_000,
+    })
+    .unwrap();
+    Credentials {
+        access_key: ak.into(),
+        secret_key: secret.into(),
+    }
+}
+
+/// M18 R1(TODO 钉死用例;ADR-28 DI5.2):同租户 AssumeRole 全链 ——
+/// 租户 A 的 alice(策略 Allow sts:AssumeRole on 角色 + s3:*)承担角色
+/// reader(策略 = 仅 s3:GetObject on r1bkt/*)→ 临时凭据 GET r1bkt/k
+/// 200、PUT r1bkt/k2 403(角色策略 = 下限)、GET 他桶 403(角色策略
+/// 作用域外);SessionRecord 落 role/user/tenant_id;撤销后立即失效。
+/// 交集 = 分层强制(角色策略层 ∩ 基密钥身份层),非策略代数。
+#[test]
+fn assume_role_same_tenant_ok() {
+    let (_d, svc) = setup();
+    let caller_doc = r#"{"Version":"2012-10-17","Statement":[
+        {"Effect":"Allow","Action":["sts:AssumeRole"],"Resource":["arn:aws:iam::canon-a:role/reader"]},
+        {"Effect":"Allow","Action":["s3:*"],"Resource":["*"]}
+    ]}"#;
+    let role_doc = r#"{"Version":"2012-10-17","Statement":[
+        {"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::r1bkt/*"]}
+    ]}"#;
+    let sa_alice = r1_setup_role(
+        &svc,
+        "ta",
+        "canon-a",
+        "alice",
+        "AKIA_R1A",
+        "r1a-secret",
+        caller_doc,
+        "reader",
+        role_doc,
+        vec!["alice".into()],
+    );
+    // alice 建桶 + 写对象(身份层 s3:*;角色读者稍后只读)
+    let r = svc.handle(&req_creds("PUT", "/r1bkt", &sa_alice, &[], vec![]));
+    assert_eq!(status(&r), 200, "alice 建桶: {r:?}");
+    let r = svc.handle(&req_creds(
+        "PUT",
+        "/r1bkt/k",
+        &sa_alice,
+        &[],
+        b"data".to_vec(),
+    ));
+    assert_eq!(status(&r), 200, "alice 写对象: {r:?}");
+    let r = svc.handle(&req_creds("PUT", "/r1other", &sa_alice, &[], vec![]));
+    assert_eq!(status(&r), 200, "alice 建他桶: {r:?}");
+
+    // AssumeRole → 临时凭据
+    let (temp_ak, secret, rec) = svc
+        .assume_role("ta", "reader", "AKIA_R1A", Some(3600), None, "test-suite")
+        .unwrap();
+    assert_eq!(rec.base_access_key, "AKIA_R1A");
+    assert_eq!(rec.role.as_deref(), Some("reader"));
+    assert_eq!(rec.user.as_deref(), Some("alice"));
+    assert_eq!(rec.tenant_id.as_deref(), Some("ta"));
+    assert_eq!(
+        rec.session_policy.as_deref(),
+        Some(role_doc),
+        "会话策略层 = 角色策略"
+    );
+    // 库中只有哈希比对子,明文零落盘(同 GetSessionToken 纪律)
+    let stored = svc
+        .engine()
+        .read()
+        .meta()
+        .get_session(&rec.session_id)
+        .unwrap()
+        .expect("session persisted");
+    assert_eq!(
+        stored.secret_hash,
+        fs3_core::SessionRecord::hash_secret(&secret)
+    );
+    assert_ne!(stored.secret_hash, secret);
+
+    let creds = Credentials {
+        access_key: temp_ak.clone(),
+        secret_key: secret.clone(),
+    };
+    let tok: &[(&str, &str)] = &[("x-amz-security-token", &rec.session_id)];
+    // 角色策略内:GET r1bkt/k → 200
+    let r = svc.handle(&req_creds("GET", "/r1bkt/k", &creds, tok, vec![]));
+    assert_eq!(status(&r), 200, "角色策略内 GET 放行: {r:?}");
+    // 角色策略下限:PUT r1bkt/k2 → 403(角色仅 GetObject,即便身份层 s3:*)
+    let r = svc.handle(&req_creds("PUT", "/r1bkt/k2", &creds, tok, b"x".to_vec()));
+    assert_eq!(
+        err_code(&r),
+        "AccessDenied",
+        "角色策略收窄:PUT 拒绝(可缩权不扩权): {r:?}"
+    );
+    // 角色策略作用域外:GET r1other/k → 403(资源不在角色 Allow 内)
+    let r = svc.handle(&req_creds("GET", "/r1other/k", &creds, tok, vec![]));
+    assert_eq!(err_code(&r), "AccessDenied", "角色策略作用域外 403: {r:?}");
+    // 撤销 → 立即失效(InvalidToken,同 GetSessionToken 撤销口径)
+    svc.revoke_session(&rec.session_id).unwrap();
+    let r = svc.handle(&req_creds("GET", "/r1bkt/k", &creds, tok, vec![]));
+    assert_eq!(err_code(&r), "InvalidToken", "撤销后立即失效: {r:?}");
+}
+
+/// M18 R1(TODO 钉死用例;ADR-28 DI5.2 防提权):跨租户 AssumeRole 拒绝 ——
+/// 租户 B 的 bob(即便其策略 Allow sts:AssumeRole 点名 A 的角色 ARN)
+/// 承担租户 A 的角色 → AccessDenied;角色不存在/未在 assumable_by/无
+/// sts:AssumeRole 授予/属主禁用/配置注入密钥,同判 403(或 404)。
+#[test]
+fn assume_role_cross_tenant_denied() {
+    let (_d, svc) = setup();
+    let caller_doc_a = r#"{"Version":"2012-10-17","Statement":[
+        {"Effect":"Allow","Action":["sts:AssumeRole"],"Resource":["arn:aws:iam::canon-a:role/reader"]},
+        {"Effect":"Allow","Action":["s3:*"],"Resource":["*"]}
+    ]}"#;
+    let role_doc = r#"{"Version":"2012-10-17","Statement":[
+        {"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::r2bkt/*"]}
+    ]}"#;
+    r1_setup_role(
+        &svc,
+        "ta",
+        "canon-a",
+        "alice",
+        "AKIA_R2A",
+        "r2a-secret",
+        caller_doc_a,
+        "reader",
+        role_doc,
+        vec![],
+    );
+    // 租户 B bob:策略显式 Allow assume A 的角色(ARN 点名)→ 仍拒绝
+    let caller_doc_b = r#"{"Version":"2012-10-17","Statement":[
+        {"Effect":"Allow","Action":["sts:AssumeRole"],"Resource":["*"]},
+        {"Effect":"Allow","Action":["s3:*"],"Resource":["*"]}
+    ]}"#;
+    svc.put_tenant(&fs3_core::Tenant {
+        tenant_id: "tb".into(),
+        display_name: "tb".into(),
+        canonical_id: "canon-b".into(),
+        enabled: true,
+        created_at: 1_700_000_000,
+    })
+    .unwrap();
+    svc.put_iam_policy(&fs3_core::IamPolicy {
+        tenant_id: Some("tb".into()),
+        name: "caller-pol".into(),
+        document: caller_doc_b.into(),
+        created_at: 1_700_000_000,
+    })
+    .unwrap();
+    svc.put_iam_user(&s1_user("tb", "bob", vec!["caller-pol".into()]))
+        .unwrap();
+    svc.add_key_owned("AKIA_R2B", "r2b-secret", None, "tb", "bob", None, None)
+        .unwrap();
+    // 跨租户:bob → ta 的角色 → AccessDenied
+    let e = svc
+        .assume_role("ta", "reader", "AKIA_R2B", None, None, "test-suite")
+        .unwrap_err();
+    assert_eq!(e.code_name(), "AccessDenied", "跨租户拒绝: {e:?}");
+    // 角色不存在 → 错误(InvalidArgument,管理面预检映射 404)
+    let e = svc
+        .assume_role("ta", "ghost", "AKIA_R2A", None, None, "test-suite")
+        .unwrap_err();
+    assert_eq!(e.code_name(), "InvalidArgument", "角色不存在: {e:?}");
+    // assumable_by 不含 carol → 拒绝(carol 有 sts 授予)
+    svc.put_iam_user(&s1_user("ta", "carol", vec!["caller-pol".into()]))
+        .unwrap();
+    svc.add_key_owned("AKIA_R2C", "r2c-secret", None, "ta", "carol", None, None)
+        .unwrap();
+    svc.put_iam_role(&fs3_core::IamRole {
+        tenant_id: "ta".into(),
+        name: "guarded".into(),
+        policy: role_doc.into(),
+        assumable_by: vec!["alice".into()],
+        created_at: 1_700_000_000,
+    })
+    .unwrap();
+    let e = svc
+        .assume_role("ta", "guarded", "AKIA_R2C", None, None, "test-suite")
+        .unwrap_err();
+    assert_eq!(e.code_name(), "AccessDenied", "assumable_by 强制: {e:?}");
+    // 无 sts:AssumeRole 授予的挂载用户(dave 只挂 s3 读)→ 拒绝
+    svc.put_iam_policy(&fs3_core::IamPolicy {
+        tenant_id: Some("ta".into()),
+        name: "s3-only".into(),
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:*"],"Resource":["*"]}]}"#.into(),
+        created_at: 1_700_000_000,
+    })
+    .unwrap();
+    svc.put_iam_user(&s1_user("ta", "dave", vec!["s3-only".into()]))
+        .unwrap();
+    svc.add_key_owned("AKIA_R2D", "r2d-secret", None, "ta", "dave", None, None)
+        .unwrap();
+    let e = svc
+        .assume_role("ta", "reader", "AKIA_R2D", None, None, "test-suite")
+        .unwrap_err();
+    assert_eq!(e.code_name(), "AccessDenied", "无 sts 授予拒绝: {e:?}");
+    // 属主禁用 → 拒绝
+    svc.set_iam_user_enabled("ta", "alice", false).unwrap();
+    let e = svc
+        .assume_role("ta", "reader", "AKIA_R2A", None, None, "test-suite")
+        .unwrap_err();
+    assert_eq!(e.code_name(), "AccessDenied", "属主禁用拒绝: {e:?}");
+    svc.set_iam_user_enabled("ta", "alice", true).unwrap();
+    // 配置注入密钥(构造注入 "test",无 k: 记录)→ 不能 Assume(403)
+    let e = svc
+        .assume_role("ta", "reader", "test", None, None, "test-suite")
+        .unwrap_err();
+    assert_eq!(
+        e.code_name(),
+        "AccessDenied",
+        "配置注入超管密钥不参与角色派生: {e:?}"
+    );
+    // 未知密钥 → InvalidAccessKeyId(管理面映射 404)
+    let e = svc
+        .assume_role("ta", "reader", "AKIA_GHOST", None, None, "test-suite")
+        .unwrap_err();
+    assert_eq!(e.code_name(), "InvalidAccessKeyId", "未知基密钥: {e:?}");
+    // bootstrap 属主 legacy 密钥(超管口径)→ 可 Assume **本租户**
+    // (default)角色(例外仅放开 sts 授予检查,不开租户边界)
+    svc.put_iam_role(&fs3_core::IamRole {
+        tenant_id: "default".into(),
+        name: "ops".into(),
+        policy: role_doc.into(),
+        assumable_by: vec![],
+        created_at: 1_700_000_000,
+    })
+    .unwrap();
+    svc.add_key("AKIA_R2L", "r2l-secret", None).unwrap();
+    let (_, _, rec) = svc
+        .assume_role("default", "ops", "AKIA_R2L", None, None, "test-suite")
+        .unwrap();
+    assert_eq!(rec.user.as_deref(), Some("bootstrap"));
+    // bootstrap 密钥跨租户仍拒绝
+    let e = svc
+        .assume_role("ta", "reader", "AKIA_R2L", None, None, "test-suite")
+        .unwrap_err();
+    assert_eq!(e.code_name(), "AccessDenied", "超管例外不跨租户: {e:?}");
+}
+
+/// M18 R1 回归(ADR-28 DI5.1):GetSessionToken 不提权 —— 会话策略 ∩
+/// 基密钥策略语义不变(既有 sts_session_data_plane_roundtrip 已钉死
+/// 会话策略 PUT 拒绝/过期/撤销);此处补钉:R1 后 GetSessionToken 签发的
+/// 会话 role/user/tenant_id/inline_policy 全为 None(无角色派生)。
+#[test]
+fn get_session_token_no_elevation_after_r1() {
+    let (_d, svc) = setup();
+    svc.add_key("test", "secret123", None).unwrap();
+    let (_, _, rec) = svc
+        .issue_session("test", None, Some(3600), "admin")
+        .unwrap();
+    assert_eq!(rec.role, None, "GetSessionToken 无角色派生");
+    assert_eq!(rec.user, None);
+    assert_eq!(rec.tenant_id, None);
+    assert_eq!(rec.inline_policy, None);
 }

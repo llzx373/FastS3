@@ -308,10 +308,11 @@ pub struct Policy {
 
 /// 动作名规范化:"PutObject" → "s3:PutObject"(大小写不敏感)。
 /// M18 U2(ADR-28 DI3.3):`admin:` 前缀为独立动作族(管理面/控制台
-/// 授权),不补 `s3:` 前缀。
+/// 授权),不补 `s3:` 前缀。M18 R1(ADR-28 DI5.2):`sts:` 前缀同例
+/// 独立成族(STS AssumeRole 授权,如 `sts:AssumeRole`)。
 fn normalize_action(action: &str) -> String {
     let a = action.trim().to_ascii_lowercase();
-    if a.starts_with("s3:") || a.starts_with("admin:") {
+    if a.starts_with("s3:") || a.starts_with("admin:") || a.starts_with("sts:") {
         a
     } else {
         format!("s3:{a}")

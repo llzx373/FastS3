@@ -38,6 +38,12 @@
 //! - `POST /v1/iam/service-accounts`            创建 SA(owner_user 必填;access key 服务端生成;secret 仅一次回显)
 //! - `GET  /v1/iam/service-accounts/{access}`   SA 详情(元数据)
 //! - `DELETE /v1/iam/service-accounts/{access}` 吊销 SA
+//! - `GET  /v1/iam/roles?tenant=`               角色列表(M18 R1;ADR-28 DI2.5/DI5)
+//! - `POST /v1/iam/roles`                       创建角色(policy 经 Policy::parse;assumable_by 须是本租户既有 user/group)
+//! - `GET  /v1/iam/roles/{tenant}/{name}`       角色详情
+//! - `PATCH /v1/iam/roles/{tenant}/{name}`      更新 policy/assumable_by(整表替换)
+//! - `DELETE /v1/iam/roles/{tenant}/{name}`     删除角色(无条件;已签发会话持自身策略副本)
+//! - `POST /v1/iam/assume-role`                 STS AssumeRole(本租户角色;跨租户/无授予/越 assumable_by → 403)
 //! - `GET  /v1/admin/uploads`                   在途 multipart 会话
 //! - `POST /v1/admin/uploads/{id}/abort`        强制中止会话
 //! - `GET  /v1/admin/audit?limit=`              审计日志
@@ -574,6 +580,13 @@ impl AdminServer {
             ("POST", ["service-accounts"]) => self.handle_sa_create(body),
             ("GET", ["service-accounts", access]) => self.handle_sa_get(access),
             ("DELETE", ["service-accounts", access]) => self.handle_sa_delete(access),
+            // M18 R1(ADR-28 DI2.5/DI5):角色 CRUD + STS AssumeRole
+            ("GET", ["roles"]) => self.handle_roles_list(query),
+            ("POST", ["roles"]) => self.handle_role_create(body),
+            ("GET", ["roles", tenant, name]) => self.handle_role_get(tenant, name),
+            ("PATCH", ["roles", tenant, name]) => self.handle_role_patch(tenant, name, body),
+            ("DELETE", ["roles", tenant, name]) => self.handle_role_delete(tenant, name),
+            ("POST", ["assume-role"]) => self.handle_assume_role(body),
             _ => json::err(StatusCode::NOT_FOUND, "not_found", "unknown iam endpoint"),
         }
     }
@@ -2630,6 +2643,364 @@ impl AdminServer {
                 "internal",
                 &e.to_string(),
             ),
+        }
+    }
+
+    // ───────────────────── M18 R1:IAM 角色 + STS AssumeRole(ADR-28 DI2.5/DI5)─────────────────────
+
+    /// 角色 JSON 视图。
+    fn role_json(r: &fs3_core::IamRole) -> serde_json::Value {
+        serde_json::json!({
+            "tenant_id": r.tenant_id,
+            "name": r.name,
+            "policy": r.policy,
+            "assumable_by": r.assumable_by,
+            "created_at": r.created_at,
+        })
+    }
+
+    /// 解析 assumable_by 主体名数组:validate_iam_name + 每个主体须是
+    /// 本租户既有 user 或 group(否则 400 no_such_principal)。
+    fn parse_assumable_by(
+        meta: &fs3_meta::MetaStore,
+        tenant: &str,
+        v: &serde_json::Value,
+    ) -> Result<Vec<String>, Box<Response<String>>> {
+        let names = Self::parse_member_names(v)?;
+        for p in &names {
+            let is_user = meta
+                .get_iam_user(tenant, p)
+                .map(|u| u.is_some())
+                .unwrap_or(false);
+            let is_group = meta
+                .get_iam_group(tenant, p)
+                .map(|g| g.is_some())
+                .unwrap_or(false);
+            if !is_user && !is_group {
+                return Err(Box::new(json::err(
+                    StatusCode::BAD_REQUEST,
+                    "no_such_principal",
+                    &format!(
+                        "assumable_by principal {p} is neither an existing user nor group in tenant {tenant}"
+                    ),
+                )));
+            }
+        }
+        Ok(names)
+    }
+
+    /// GET /v1/iam/roles?tenant=:租户内角色列表(缺省 tenant = default)。
+    fn handle_roles_list(&self, query: &[(String, String)]) -> Response<String> {
+        let tenant = query
+            .iter()
+            .find(|(k, _)| k == "tenant")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or(fs3_core::Tenant::DEFAULT_TENANT);
+        let roles = self.service.list_iam_roles_in(tenant);
+        json::ok(serde_json::json!({
+            "tenant_id": tenant,
+            "roles": roles.iter().map(Self::role_json).collect::<Vec<_>>(),
+        }))
+    }
+
+    /// POST /v1/iam/roles:创建角色。body:`name`(必填)、`tenant`(可选,
+    /// 缺省 default;租户须已存在)、`policy`(必填 string;严格解析
+    /// Policy::parse,非法 → 400 MalformedPolicy)、`assumable_by`(可选;
+    /// 每项须是本租户既有 user/group)。同名 → 409。
+    fn handle_role_create(&self, body: &[u8]) -> Response<String> {
+        let parsed: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(_) => {
+                return json::err(StatusCode::BAD_REQUEST, "bad_request", "invalid JSON body")
+            }
+        };
+        let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if name.is_empty() {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "missing required field: name",
+            );
+        }
+        let tenant = parsed
+            .get("tenant")
+            .and_then(|v| v.as_str())
+            .unwrap_or(fs3_core::Tenant::DEFAULT_TENANT);
+        if let Err(e) = fs3_meta::keys::validate_iam_name(name) {
+            return json::err(StatusCode::BAD_REQUEST, "invalid_name", &e.to_string());
+        }
+        if let Err(e) = fs3_meta::keys::validate_iam_name(tenant) {
+            return json::err(StatusCode::BAD_REQUEST, "invalid_name", &e.to_string());
+        }
+        let policy = match parsed.get("policy").and_then(|v| v.as_str()) {
+            Some(d) if !d.is_empty() => d.to_string(),
+            _ => {
+                return json::err(
+                    StatusCode::BAD_REQUEST,
+                    "bad_request",
+                    "missing required field: policy",
+                )
+            }
+        };
+        // 严格校验(与数据面解析器同一份)
+        if let Err(e) = fs3_s3::policy::Policy::parse(&policy) {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "MalformedPolicy",
+                &format!("invalid role policy document: {e}"),
+            );
+        }
+        let engine = self.engine.read();
+        let assumable_by = match parsed.get("assumable_by") {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(v) => match Self::parse_assumable_by(engine.meta(), tenant, v) {
+                Ok(p) => p,
+                Err(r) => return *r,
+            },
+        };
+        match engine.meta().get_tenant(tenant) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return json::err(
+                    StatusCode::NOT_FOUND,
+                    "no_such_tenant",
+                    &format!("tenant {tenant}"),
+                )
+            }
+            Err(e) => {
+                return json::err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    &e.to_string(),
+                )
+            }
+        }
+        match engine.meta().get_iam_role(tenant, name) {
+            Ok(Some(_)) => {
+                return json::err(
+                    StatusCode::CONFLICT,
+                    "role_exists",
+                    &format!("role {tenant}/{name} already exists"),
+                )
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return json::err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    &e.to_string(),
+                )
+            }
+        }
+        drop(engine);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let role = fs3_core::IamRole {
+            tenant_id: tenant.to_string(),
+            name: name.to_string(),
+            policy,
+            assumable_by,
+            created_at: now,
+        };
+        match self.service.put_iam_role(&role) {
+            Ok(()) => json::ok(Self::role_json(&role)),
+            Err(fs3_core::Error::InvalidArgument(m)) => {
+                json::err(StatusCode::BAD_REQUEST, "bad_request", &m)
+            }
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    /// GET /v1/iam/roles/{tenant}/{name}:单个角色(不存在 → 404)。
+    fn handle_role_get(&self, tenant: &str, name: &str) -> Response<String> {
+        match self.service.get_iam_role(tenant, name) {
+            Some(r) => json::ok(Self::role_json(&r)),
+            None => json::err(
+                StatusCode::NOT_FOUND,
+                "no_such_role",
+                &format!("role {tenant}/{name}"),
+            ),
+        }
+    }
+
+    /// PATCH /v1/iam/roles/{tenant}/{name}:body 可含 `policy`(string,
+    /// 整份替换;解析失败 → 400 MalformedPolicy)与/或 `assumable_by`
+    /// (string 数组,整表替换;每项须是本租户既有 user/group)。
+    /// 空 PATCH → 400;不存在 → 404。
+    fn handle_role_patch(&self, tenant: &str, name: &str, body: &[u8]) -> Response<String> {
+        let parsed: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(_) => {
+                return json::err(StatusCode::BAD_REQUEST, "bad_request", "invalid JSON body")
+            }
+        };
+        let mut role = match self.service.get_iam_role(tenant, name) {
+            Some(r) => r,
+            None => {
+                return json::err(
+                    StatusCode::NOT_FOUND,
+                    "no_such_role",
+                    &format!("role {tenant}/{name}"),
+                )
+            }
+        };
+        let mut applied = Vec::new();
+        if let Some(v) = parsed.get("policy") {
+            let Some(d) = v.as_str() else {
+                return json::err(
+                    StatusCode::BAD_REQUEST,
+                    "bad_request",
+                    "policy must be a string",
+                );
+            };
+            if let Err(e) = fs3_s3::policy::Policy::parse(d) {
+                return json::err(
+                    StatusCode::BAD_REQUEST,
+                    "MalformedPolicy",
+                    &format!("invalid role policy document: {e}"),
+                );
+            }
+            role.policy = d.to_string();
+            applied.push("policy");
+        }
+        if let Some(v) = parsed.get("assumable_by") {
+            let engine = self.engine.read();
+            match Self::parse_assumable_by(engine.meta(), tenant, v) {
+                Ok(p) => {
+                    role.assumable_by = p;
+                    applied.push("assumable_by");
+                }
+                Err(r) => return *r,
+            }
+        }
+        if applied.is_empty() {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "missing required field: policy and/or assumable_by",
+            );
+        }
+        match self.service.put_iam_role(&role) {
+            Ok(()) => json::ok(Self::role_json(&role)),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    /// DELETE /v1/iam/roles/{tenant}/{name}:删除角色(**无条件**:已签发
+    /// 会话持有自身存储的策略副本,删角色不回溯失效既有会话,compat
+    /// 钉死;会话撤销走 DELETE /v1/admin/sessions/{id})。不存在 → 404。
+    fn handle_role_delete(&self, tenant: &str, name: &str) -> Response<String> {
+        match self.service.delete_iam_role(tenant, name) {
+            Ok(()) => json::ok(serde_json::json!({"deleted": name, "tenant_id": tenant})),
+            Err(fs3_core::Error::NotFound(_)) => json::err(
+                StatusCode::NOT_FOUND,
+                "no_such_role",
+                &format!("role {tenant}/{name}"),
+            ),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    /// POST /v1/iam/assume-role:STS AssumeRole(M18 R1;ADR-28 DI5.2)。
+    /// body:`tenant`(必填)、`role`(必填)、`base_access_key`(必填,
+    /// 调用者身份 = 该 `k:` 密钥属主)、`session_name`/`duration_secs`/
+    /// `policy`(内联收窄策略,可选)。规则与错误映射:
+    /// - 角色不存在 → 404 no_such_role;基密钥未知 → 404;基密钥禁用 /
+    ///   属主禁用 / 跨租户 / 越 assumable_by / 无 sts:AssumeRole 授予 /
+    ///   配置注入密钥 → 403 access_denied;
+    /// - 最终权限 = 角色策略 ∩ 调用者身份层 ∩ 内联策略(分层强制);
+    ///   secret 明文仅本响应一次(同会话签发红黑线)。
+    fn handle_assume_role(&self, body: &[u8]) -> Response<String> {
+        let parsed: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(_) => {
+                return json::err(StatusCode::BAD_REQUEST, "bad_request", "invalid JSON body")
+            }
+        };
+        let tenant = parsed.get("tenant").and_then(|v| v.as_str()).unwrap_or("");
+        let role = parsed.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        let base_access_key = parsed
+            .get("base_access_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if tenant.is_empty() || role.is_empty() || base_access_key.is_empty() {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "missing required field: tenant, role and/or base_access_key",
+            );
+        }
+        let session_name = parsed
+            .get("session_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("fasts3-session")
+            .to_string();
+        let duration_secs = parsed.get("duration_secs").and_then(|v| v.as_i64());
+        let policy = parsed
+            .get("policy")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        // 角色预检(404 语义;服务层仍复检,竞态安全)
+        if self.service.get_iam_role(tenant, role).is_none() {
+            return json::err(
+                StatusCode::NOT_FOUND,
+                "no_such_role",
+                &format!("role {tenant}/{role}"),
+            );
+        }
+        let issued_by = "admin";
+        match self.service.assume_role(
+            tenant,
+            role,
+            base_access_key,
+            duration_secs,
+            policy,
+            issued_by,
+        ) {
+            Ok((temporary_access_key, secret, rec)) => {
+                // 签发审计(不含任何密钥材料,同 IssueSession 口径)
+                self.service
+                    .audit()
+                    .push(issued_by, "AssumeRole", "", &rec.session_id, 200, "");
+                json::ok(serde_json::json!({
+                    "session_id": rec.session_id,
+                    "temporary_access_key": temporary_access_key,
+                    // 仅此一次下发明文(之后库中只有 SHA-256 哈希比对子)
+                    "secret_key": secret,
+                    "session_token": rec.session_id,
+                    "expires_at": rec.expires_at,
+                    "issued_at": rec.issued_at,
+                    "tenant_id": tenant,
+                    "role": role,
+                    "user": rec.user,
+                    "assumed_role_arn": format!(
+                        "arn:aws:sts::{tenant}:assumed-role/{role}/{session_name}"
+                    ),
+                }))
+            }
+            Err(e) => {
+                let (status, code) = match e.code_name().as_str() {
+                    "AccessDenied" => (StatusCode::FORBIDDEN, "access_denied"),
+                    "InvalidAccessKeyId" => (StatusCode::NOT_FOUND, "no_such_key"),
+                    "MalformedPolicy" => (StatusCode::BAD_REQUEST, "MalformedPolicy"),
+                    _ => (StatusCode::BAD_REQUEST, "bad_request"),
+                };
+                json::err(status, code, &e.describe())
+            }
         }
     }
 

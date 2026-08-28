@@ -181,6 +181,12 @@ pub struct S3Service {
     /// 求值 fail-closed 拒绝(绝不扩权,同会话策略解析失败口径)。
     iam_policies:
         std::sync::Mutex<std::collections::HashMap<(String, String), crate::policy::Policy>>,
+    /// IAM 角色视图(M18 R1;ADR-28 DI2.5/DI5):(tenant, name) → IamRole
+    /// 原文(策略文档在 assume 时解析——AssumeRole 为稀有管理面动作,
+    /// 非数据面热路径,同 issue_session 解析会话策略口径)。启动随
+    /// restore_keys_from_meta 全量加载;角色 CRUD 经 put/delete_iam_role
+    /// 双写即时生效。
+    iam_roles: std::sync::Mutex<std::collections::HashMap<(String, String), fs3_core::IamRole>>,
     /// 密钥 → IAM 属主(access_key → (tenant_id, owner_user))。与认证表
     /// 同步维护(add_key_owned/remove_key/restore);缺席 = 构造注入的
     /// 初始密钥(S3Service::new 的 keys 参数,无 `k:` 记录)→ bootstrap
@@ -283,6 +289,7 @@ impl S3Service {
             iam_users: std::sync::Mutex::new(std::collections::HashMap::new()),
             iam_groups: std::sync::Mutex::new(std::collections::HashMap::new()),
             iam_policies: std::sync::Mutex::new(std::collections::HashMap::new()),
+            iam_roles: std::sync::Mutex::new(std::collections::HashMap::new()),
             key_owners: std::sync::Mutex::new(std::collections::HashMap::new()),
             tenants: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_clock_secs: std::sync::atomic::AtomicI64::new(unix_now() as i64),
@@ -899,10 +906,14 @@ impl S3Service {
             }
         }
         // M15 T2:会话策略求交(显式 Deny → 拒绝;非显式 Allow → 拒绝;
-        // 会话 = 作用域下限)
+        // 会话 = 作用域下限)。M18 R1:AssumeRole 会话另加内联策略层
+        // (角色策略 ∩ 内联策略,两层均须显式 Allow)。
         if let Some(a) = auth {
             if let Some(sess) = &a.session {
-                if let Some(sp) = &sess.session_policy {
+                for sp in [&sess.session_policy, &sess.inline_policy]
+                    .into_iter()
+                    .flatten()
+                {
                     match crate::policy::Policy::parse(sp) {
                         Ok(p) => {
                             let sd = p.decide(action, &resource, true, &ctx);
@@ -1115,6 +1126,18 @@ impl S3Service {
                         }
                     }
                 }
+            }
+        }
+        // IAM 角色视图全量加载(M18 R1;AssumeRole 目标解析)
+        {
+            let roles = engine
+                .meta()
+                .list_iam_roles()
+                .map_err(|e| map_engine_error(e, "", ""))?;
+            let mut map = self.iam_roles.lock().unwrap();
+            map.clear();
+            for r in roles {
+                map.insert((r.tenant_id.clone(), r.name.clone()), r);
             }
         }
         let mut restored = 0usize;
@@ -1401,6 +1424,205 @@ impl S3Service {
         Ok(())
     }
 
+    // ── M18 R1:IAM 角色(ADR-28 DI2.5/DI5;meta + 内存角色视图双写,
+    //    同 IAM 组/策略先例) ──
+
+    /// 创建/更新 IAM 角色(覆盖语义;meta 持久化 + 内存视图即时生效)。
+    /// 策略文档语法与 assumable_by 主体存在性校验在管理面(fs3-admin);
+    /// 本层原文存储,assume 时解析(稀有路径)。
+    pub fn put_iam_role(&self, role: &fs3_core::IamRole) -> Result<(), fs3_core::Error> {
+        self.engine.read().meta().commit_iam_role_put(role)?;
+        self.iam_roles
+            .lock()
+            .unwrap()
+            .insert((role.tenant_id.clone(), role.name.clone()), role.clone());
+        Ok(())
+    }
+
+    /// 删除 IAM 角色(meta 语义:不存在 → NotFound;**无条件删除**——
+    /// 已签发会话持有自身存储的策略副本,删角色不回溯失效既有会话;
+    /// 内存视图同步移除)。
+    pub fn delete_iam_role(&self, tenant: &str, name: &str) -> Result<(), fs3_core::Error> {
+        self.engine
+            .read()
+            .meta()
+            .commit_iam_role_delete(tenant, name)?;
+        self.iam_roles
+            .lock()
+            .unwrap()
+            .remove(&(tenant.to_string(), name.to_string()));
+        Ok(())
+    }
+
+    /// 读 IAM 角色(内存视图;不存在 → None)。
+    pub fn get_iam_role(&self, tenant: &str, name: &str) -> Option<fs3_core::IamRole> {
+        self.iam_roles
+            .lock()
+            .unwrap()
+            .get(&(tenant.to_string(), name.to_string()))
+            .cloned()
+    }
+
+    /// 列某租户全部 IAM 角色(内存视图;admin 列表端点用)。
+    pub fn list_iam_roles_in(&self, tenant: &str) -> Vec<fs3_core::IamRole> {
+        let mut out: Vec<fs3_core::IamRole> = self
+            .iam_roles
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((t, _), _)| t == tenant)
+            .map(|(_, r)| r.clone())
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// M18 R1(ADR-28 DI5.2):STS AssumeRole —— 以 `base_access_key` 的
+    /// 身份承担本租户 `ir:` 角色,签发角色会话。规则(compat 钉死):
+    ///
+    /// - 基密钥必须有 `k:` 记录:**配置注入的超管密钥(无 `k:` 记录)
+    ///   不能 Assume**(AccessDenied);未知密钥 → InvalidAccessKeyId;
+    /// - 基密钥禁用 / 属主用户禁用 → AccessDenied(与数据面 DI7.3 同档);
+    /// - **无跨租户**:角色租户 ≠ 基密钥租户 → AccessDenied;
+    /// - `assumable_by` 非空 → 调用者用户或其任一组须被列出;
+    /// - 调用者生效策略须显式 Allow `sts:AssumeRole` 于
+    ///   `arn:aws:iam::{canonical}:role/{name}`(身份层 user∪group 求值;
+    ///   SA 嵌入策略作为作用域上限同样须 Allow);**例外口径**:无任何
+    ///   挂载策略的 bootstrap 属主 legacy 密钥 = 超管语义放行;有用户
+    ///   记录但无挂载 → 拒绝(防「无策略 = 隐式全量」外溢到 STS);
+    /// - 最终权限 = 角色策略 ∩ 调用者身份层/嵌入层 ∩ 内联策略:
+    ///   **交集由数据面分层强制**(会话策略层承载角色策略 + 内联策略层
+    ///   + 基密钥身份/嵌入层照旧生效,who = 基密钥),非策略代数;
+    /// - 可相对调用者缩权/换策略包,**永不扩权、永不变 root**(root =
+    ///   配置注入密钥,无 `k:` 记录,已在第一条例外)。
+    ///
+    /// 返回 (临时 AK, 临时 secret 明文[仅一次], SessionRecord)。
+    pub fn assume_role(
+        &self,
+        tenant: &str,
+        role: &str,
+        base_access_key: &str,
+        duration_secs: Option<i64>,
+        inline_policy: Option<String>,
+        issued_by: &str,
+    ) -> Result<(String, String, fs3_core::SessionRecord), S3Error> {
+        // 1) 基密钥必须落 k: 记录
+        let base = {
+            let engine = self.engine.read();
+            engine
+                .meta()
+                .get_key(base_access_key)
+                .map_err(|e| map_engine_error(e, "", ""))?
+        };
+        let Some(base) = base else {
+            // 配置注入密钥(认证表有、meta 无)= 超管口径,不参与角色派生
+            if self.auth.find_key_by_access(base_access_key).is_some() {
+                return Err(
+                    S3Error::new(S3ErrorCode::AccessDenied).with_message(format!(
+                    "config-injected key {base_access_key} has no k: record and cannot assume roles"
+                )),
+                );
+            }
+            return Err(S3Error::new(S3ErrorCode::InvalidAccessKeyId)
+                .with_message(format!("base key {base_access_key} does not exist")));
+        };
+        if !base.enabled {
+            return Err(S3Error::new(S3ErrorCode::AccessDenied)
+                .with_message(format!("base key {base_access_key} is disabled")));
+        }
+        let caller_tenant = base.tenant_id.clone();
+        let caller_user = base.owner_user.clone();
+        // 属主用户禁用 → 拒绝(DI7.3;缺席 = 存活,同数据面口径)
+        let caller_groups = {
+            let users = self.iam_users.lock().unwrap();
+            match users.get(&(caller_tenant.clone(), caller_user.clone())) {
+                Some(u) if !u.enabled => {
+                    return Err(
+                        S3Error::new(S3ErrorCode::AccessDenied).with_message(format!(
+                            "owner user {caller_tenant}/{caller_user} is disabled"
+                        )),
+                    );
+                }
+                Some(u) => u.groups.clone(),
+                None => Vec::new(),
+            }
+        };
+        // 2) 角色必须存在于指定租户
+        let role_rec = self.get_iam_role(tenant, role).ok_or_else(|| {
+            S3Error::new(S3ErrorCode::InvalidArgument)
+                .with_message(format!("role {tenant}/{role} does not exist"))
+        })?;
+        // 3) 无跨租户(DI5.2 防提权)
+        if role_rec.tenant_id != caller_tenant {
+            return Err(
+                S3Error::new(S3ErrorCode::AccessDenied).with_message(format!(
+                "cross-tenant assume denied: caller tenant {caller_tenant}, role tenant {tenant}"
+            )),
+            );
+        }
+        // 4) assumable_by 非空 → 调用者用户或其组须被列出
+        if !role_rec.assumable_by.is_empty()
+            && !role_rec.assumable_by.iter().any(|p| p == &caller_user)
+            && !caller_groups
+                .iter()
+                .any(|g| role_rec.assumable_by.contains(g))
+        {
+            return Err(
+                S3Error::new(S3ErrorCode::AccessDenied).with_message(format!(
+                    "principal {caller_tenant}/{caller_user} is not in role {role} assumable_by"
+                )),
+            );
+        }
+        // 5) sts:AssumeRole 授权:调用者生效策略须显式 Allow
+        let canonical = self
+            .tenants
+            .lock()
+            .unwrap()
+            .get(&caller_tenant)
+            .cloned()
+            .unwrap_or_else(|| fs3_core::Tenant::DEFAULT_CANONICAL_ID.to_string());
+        let role_arn = format!("arn:aws:iam::{canonical}:role/{role}");
+        let ctx = crate::policy::EvalCtx::default();
+        match self.iam_identity_decision(base_access_key, "sts:AssumeRole", &role_arn, &ctx) {
+            Some(crate::policy::Decision::Allow) => {}
+            Some(_) => {
+                return Err(
+                    S3Error::new(S3ErrorCode::AccessDenied).with_message(format!(
+                        "caller is not authorized for sts:AssumeRole on {role_arn}"
+                    )),
+                );
+            }
+            // 无身份约束:bootstrap 属主 legacy 密钥 = 超管口径放行;
+            // 其余(有用户记录但无挂载)→ 拒绝(防隐式全量外溢)
+            None => {
+                if caller_user != fs3_core::IamUser::BOOTSTRAP_USER {
+                    return Err(S3Error::new(S3ErrorCode::AccessDenied).with_message(
+                        "caller has no attached policy granting sts:AssumeRole".to_string(),
+                    ));
+                }
+            }
+        }
+        // SA 嵌入策略 = 作用域上限,对 sts:AssumeRole 同样须显式 Allow
+        if let Some(Some(p)) = self.embedded_policies.lock().unwrap().get(base_access_key) {
+            if p.decide("sts:AssumeRole", &role_arn, true, &ctx) != crate::policy::Decision::Allow {
+                return Err(S3Error::new(S3ErrorCode::AccessDenied).with_message(
+                    "caller embedded policy does not allow sts:AssumeRole".to_string(),
+                ));
+            }
+        }
+        // 6) 签发角色会话:session_policy = 角色策略;身份层/嵌入层由数据
+        //    面照旧强制(交集 = 分层强制)
+        let (ak, secret, rec) = self.issue_session_inner(
+            base_access_key,
+            Some(role_rec.policy.clone()),
+            inline_policy,
+            duration_secs,
+            issued_by,
+            Some((role.to_string(), caller_user, caller_tenant)),
+        )?;
+        Ok((ak, secret, rec))
+    }
+
     /// M18 U2(ADR-28 DI3.1 首片):IAM 身份层策略求值 —— 密钥属主
     /// 用户的「直挂 policies ∪ 所属组 policies」。
     ///
@@ -1482,7 +1704,8 @@ impl S3Service {
 
     /// 签发会话(T1;管理面经 admin API 调用):基于既有密钥签发临时
     /// 凭证。语义(ADR-18 D-E2):
-    /// - 会话 = 基密钥 + 会话策略求交,无角色派生;
+    /// - 会话 = 基密钥 + 会话策略求交,无角色派生(AssumeRole 派生走
+    ///   assume_role → issue_session_inner,M18 R1);
     /// - **临时 secret = HMAC-SHA256(基密钥 secret, "fasts3-session:" +
     ///   会话 id)确定性派生**——数据面可重算验签、明文零落盘;本函数
     ///   只回显一次派生值,库中仅存 SHA-256 哈希比对子;
@@ -1496,6 +1719,30 @@ impl S3Service {
         session_policy: Option<String>,
         ttl_secs: Option<i64>,
         issued_by: &str,
+    ) -> Result<(String, String, fs3_core::SessionRecord), S3Error> {
+        self.issue_session_inner(
+            base_access_key,
+            session_policy,
+            None,
+            ttl_secs,
+            issued_by,
+            None,
+        )
+    }
+
+    /// 签发会话完整形态(M18 R1):`inline_policy` = AssumeRole 内联策略
+    /// (第二个求交层);`role_ctx` = Some((role, user, tenant)) 标记角色
+    /// 派生会话(SessionRecord 尾部字段,审计/诊断)。GetSessionToken
+    /// 口径 = 两者皆 None(不提权,D-E2 此条仍成立)。
+    #[allow(clippy::too_many_arguments)]
+    fn issue_session_inner(
+        &self,
+        base_access_key: &str,
+        session_policy: Option<String>,
+        inline_policy: Option<String>,
+        ttl_secs: Option<i64>,
+        issued_by: &str,
+        role_ctx: Option<(String, String, String)>,
     ) -> Result<(String, String, fs3_core::SessionRecord), S3Error> {
         // 基密钥必须存在且启用(会话不能建立在幽灵密钥上)
         let engine = self.engine.read();
@@ -1515,6 +1762,13 @@ impl S3Service {
             if crate::policy::Policy::parse(p).is_err() {
                 return Err(S3Error::new(S3ErrorCode::MalformedPolicy)
                     .with_message("session policy is not a valid AWS policy document"));
+            }
+        }
+        // M18 R1:AssumeRole 内联策略同口径校验(第二个求交层)
+        if let Some(p) = &inline_policy {
+            if crate::policy::Policy::parse(p).is_err() {
+                return Err(S3Error::new(S3ErrorCode::MalformedPolicy)
+                    .with_message("inline policy is not a valid AWS policy document"));
             }
         }
         let ttl = ttl_secs.unwrap_or(Self::STS_TTL_DEFAULT_SECS);
@@ -1556,6 +1810,10 @@ impl S3Service {
             })?;
         let secret = derive_session_secret(&base_secret, &session_id);
         let now = unix_now() as i64;
+        let (role, user, tenant_id) = match role_ctx {
+            Some((r, u, t)) => (Some(r), Some(u), Some(t)),
+            None => (None, None, None),
+        };
         let record = fs3_core::SessionRecord {
             session_id: session_id.clone(),
             temporary_access_key: temporary_access_key.clone(),
@@ -1565,6 +1823,10 @@ impl S3Service {
             secret_hash: fs3_core::SessionRecord::hash_secret(&secret),
             issued_at: now,
             issued_by: issued_by.to_string(),
+            role,
+            user,
+            tenant_id,
+            inline_policy,
         };
         meta.put_session(&record)
             .map_err(|e| map_engine_error(e, "", ""))?;

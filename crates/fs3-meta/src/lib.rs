@@ -621,6 +621,20 @@ pub enum Op {
         tenant_id: String,
         name: String,
     },
+    /// 写/更新 IAM 角色(`ir:{tenant}\0{role}` → IamRole;M18 R1;
+    /// ADR-28 DI2.5/DI5;覆盖语义,同 IamPolicyPut 先例)。策略文档语法
+    /// 与 assumable_by 主体存在性校验在管理面(fs3-admin),本层不解析。
+    IamRolePut {
+        role: fs3_core::IamRole,
+    },
+    /// 删除 IAM 角色(M18 R1)。不存在 → NotFound;**无条件删除**:
+    /// 已签发的会话持有自身存储的策略副本(SessionRecord.session_policy),
+    /// 删角色不回溯失效既有会话(compat 钉死;会话撤销走 DELETE
+    /// /v1/admin/sessions/{id})。
+    IamRoleDelete {
+        tenant_id: String,
+        name: String,
+    },
     /// 删除 IAM 租户。**非空拒绝**:事务内扫描 `iu:`/`ig:`/`ip:`/`ir:`
     /// 租户子前缀与 `k:` 属主字段(M18 I2),存在任何 IAM 实体或本租户
     /// 持有的密钥 → InvalidArgument。
@@ -917,12 +931,16 @@ fn decode_event_record(v: &[u8]) -> Result<fs3_core::EventRecord> {
 
 /// M15 T1 会话值解码(ADR-18 D-E2;双读:新格式优先,失败回退初版——
 /// 结构尾部只追加字段,零迁移;照 decode_event_record 先例)。
+/// M18 R1(ADR-28 DI5.4):尾部追加 role/user/tenant_id/inline_policy,
+/// 回退臂补 None(GetSessionToken 会话语义,与 R1 前行为逐字节一致)。
 fn decode_sts_session(v: &[u8]) -> Result<fs3_core::SessionRecord> {
     match postcard::from_bytes::<fs3_core::SessionRecord>(v) {
         Ok(r) => Ok(r),
-        Err(e) => Err(Error::Corrupt(format!(
-            "postcard decode session record: {e}"
-        ))),
+        Err(_) => {
+            let old: fs3_core::SessionRecordV1 = postcard::from_bytes(v)
+                .map_err(|e| Error::Corrupt(format!("postcard decode session record: {e}")))?;
+            Ok(old.upgrade())
+        }
     }
 }
 
@@ -3281,6 +3299,65 @@ impl MetaStore {
         Ok(out)
     }
 
+    // —— IAM 角色(M18 R1;ADR-28 DI2.5/DI5) ——
+
+    /// 写/更新 IAM 角色(覆盖语义;非法名 → InvalidArgument)。
+    pub fn commit_iam_role_put(&self, role: &fs3_core::IamRole) -> Result<u64> {
+        self.commit(&[Op::IamRolePut { role: role.clone() }])
+    }
+
+    /// 删除 IAM 角色(不存在 → NotFound;无条件删除,见 Op::IamRoleDelete)。
+    pub fn commit_iam_role_delete(&self, tenant: &str, name: &str) -> Result<u64> {
+        self.commit(&[Op::IamRoleDelete {
+            tenant_id: tenant.to_string(),
+            name: name.to_string(),
+        }])
+    }
+
+    /// 读 IAM 角色。
+    pub fn get_iam_role(&self, tenant: &str, name: &str) -> Result<Option<fs3_core::IamRole>> {
+        let k = iam_role_key(tenant, name)?;
+        match self.db.get(&k).map_err(rocks_err)? {
+            Some(v) => Ok(Some(decode(&v).map_err(|e| {
+                Error::Corrupt(format!("iam role {tenant}/{name}: {e}"))
+            })?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 列全部 IAM 角色(导出/灾备恢复用,同 list_iam_users 先例)。
+    pub fn list_iam_roles(&self) -> Result<Vec<fs3_core::IamRole>> {
+        let mut out = Vec::new();
+        for item in self
+            .db
+            .iterator(IteratorMode::From(PREFIX_IAM_ROLE, Direction::Forward))
+        {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(PREFIX_IAM_ROLE) {
+                break;
+            }
+            out.push(decode(&v).map_err(|e| Error::Corrupt(format!("iam role record: {e}")))?);
+        }
+        Ok(out)
+    }
+
+    /// 列某租户全部 IAM 角色(`ir:{tenant}\0` 前缀扫描,按 name 排序)。
+    pub fn list_iam_roles_in(&self, tenant: &str) -> Result<Vec<fs3_core::IamRole>> {
+        let prefix = iam_role_prefix(tenant)?;
+        let mut out = Vec::new();
+        for item in self
+            .db
+            .iterator(IteratorMode::From(&prefix, Direction::Forward))
+        {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(&prefix) {
+                break;
+            }
+            out.push(decode(&v).map_err(|e| Error::Corrupt(format!("iam role record: {e}")))?);
+        }
+        Ok(out)
+    }
+
     /// 对象 PUT + 分配记录 + 桶统计(ADR-4 同事务)。
     pub fn commit_object_put(
         &self,
@@ -4715,6 +4792,18 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
                 }
                 tremove(tx, &k)?;
             }
+            Op::IamRolePut { role } => {
+                let k = iam_role_key(&role.tenant_id, &role.name)?;
+                tget(tx, &k)?;
+                tinsert(tx, k, encode(role)?)?;
+            }
+            Op::IamRoleDelete { tenant_id, name } => {
+                let k = iam_role_key(tenant_id, name)?;
+                if tget(tx, &k)?.is_none() {
+                    return Err(Error::NotFound(format!("iam role {tenant_id}/{name}")));
+                }
+                tremove(tx, &k)?;
+            }
             Op::IamUserDelete { tenant_id, name } => {
                 let k = iam_user_key(tenant_id, name)?;
                 if tget(tx, &k)?.is_none() {
@@ -6083,6 +6172,107 @@ mod tests {
         assert!(s.get_iam_policy("acme", "team-ro").unwrap().is_some());
         assert_eq!(s.list_iam_policies_in("acme").unwrap().len(), 1);
         assert!(s.list_iam_policies_in("default").unwrap().is_empty());
+    }
+
+    /// M18 R1(ADR-28 DI2.5/DI5):IAM 角色 op 往返 —— put/get/list/list_in
+    /// 保真,覆盖语义,删除无条件(已签发会话持自身策略副本,不回溯),
+    /// 再删 → NotFound;他租户同名角色互不影响。
+    #[test]
+    fn iam_role_crud_roundtrip() {
+        let (_d, s) = open_tmp();
+        let role = fs3_core::IamRole {
+            tenant_id: "default".into(),
+            name: "app".into(),
+            policy: r#"{"Version":"2012-10-17","Statement":[]}"#.into(),
+            assumable_by: vec!["alice".into(), "readers".into()],
+            created_at: 1_700_000_000,
+        };
+        s.commit_iam_role_put(&role).unwrap();
+        assert_eq!(
+            s.get_iam_role("default", "app").unwrap().as_ref(),
+            Some(&role)
+        );
+        // 覆盖语义
+        let role2 = fs3_core::IamRole {
+            assumable_by: vec!["alice".into()],
+            ..role.clone()
+        };
+        s.commit_iam_role_put(&role2).unwrap();
+        assert_eq!(
+            s.get_iam_role("default", "app").unwrap().as_ref(),
+            Some(&role2)
+        );
+        // 他租户同名角色互不影响;list_in 按租户隔离
+        let role_acme = fs3_core::IamRole {
+            tenant_id: "acme".into(),
+            ..role.clone()
+        };
+        s.commit_iam_role_put(&role_acme).unwrap();
+        assert_eq!(s.list_iam_roles().unwrap().len(), 2);
+        assert_eq!(s.list_iam_roles_in("default").unwrap(), vec![role2]);
+        assert_eq!(s.list_iam_roles_in("acme").unwrap(), vec![role_acme]);
+        assert!(s.list_iam_roles_in("ghost").unwrap().is_empty());
+        // 无条件删除;再删 → NotFound
+        s.commit_iam_role_delete("default", "app").unwrap();
+        assert!(s.get_iam_role("default", "app").unwrap().is_none());
+        assert!(matches!(
+            s.commit_iam_role_delete("default", "app"),
+            Err(Error::NotFound(_))
+        ));
+        assert!(s.get_iam_role("acme", "app").unwrap().is_some());
+    }
+
+    /// M18 R1(ADR-28 DI5.4)值版本双读单写:R1 前旧形态(SessionRecordV1)
+    /// 字节经 decode_sts_session / get_session 补默认(role/user/
+    /// tenant_id/inline_policy = None;照 key_record_vN_roundtrip_owner
+    /// 先例);新结构读写往返保真(单写侧)。
+    #[test]
+    fn session_record_v1_dual_read_defaults() {
+        let (_d, s) = open_tmp();
+        // 构造 R1 前旧形态字节并直写 s:session(模拟存量库)
+        let v1 = fs3_core::SessionRecordV1 {
+            session_id: "sessv1".into(),
+            temporary_access_key: "FSSTV1000000".into(),
+            base_access_key: "AKIA_BASE".into(),
+            session_policy: Some(r#"{"Statement":[]}"#.into()),
+            expires_at: 2_000_000_000,
+            secret_hash: fs3_core::SessionRecord::hash_secret("v1-secret"),
+            issued_at: 1_700_000_000,
+            issued_by: "admin".into(),
+        };
+        let raw = postcard::to_allocvec(&v1).unwrap();
+        s.db.put(sts_session_key("sessv1"), &raw).unwrap();
+        // 双读:补 None;鉴权材料完好
+        let got = s.get_session("sessv1").unwrap().unwrap();
+        assert_eq!(got.role, None);
+        assert_eq!(got.user, None);
+        assert_eq!(got.tenant_id, None);
+        assert_eq!(got.inline_policy, None);
+        assert!(got.verify_secret("v1-secret"));
+        assert_eq!(got.base_access_key, "AKIA_BASE");
+        // list_sessions 同走双读
+        assert!(s.list_sessions().unwrap().contains(&got));
+        // 单写:任何写路径落当前结构,之后按新格式解码成功
+        s.put_session(&got).unwrap();
+        let raw2 = s.db.get(sts_session_key("sessv1")).unwrap().unwrap();
+        assert!(postcard::from_bytes::<fs3_core::SessionRecord>(&raw2).is_ok());
+        // 新结构往返保真(含 R1 角色字段)
+        let rec = fs3_core::SessionRecord {
+            session_id: "sessv2".into(),
+            temporary_access_key: "FSSTV2000000".into(),
+            base_access_key: "AKIA_BASE".into(),
+            session_policy: Some(r#"{"Statement":[]}"#.into()),
+            expires_at: 2_000_000_000,
+            secret_hash: fs3_core::SessionRecord::hash_secret("v2-secret"),
+            issued_at: 1_700_000_001,
+            issued_by: "admin".into(),
+            role: Some("app".into()),
+            user: Some("alice".into()),
+            tenant_id: Some("default".into()),
+            inline_policy: None,
+        };
+        s.put_session(&rec).unwrap();
+        assert_eq!(s.get_session("sessv2").unwrap().unwrap(), rec);
     }
 
     /// M18 I1 升级迁移(ADR-28 DI1.3):存量部署(已有 k: 密钥/桶/对象,
