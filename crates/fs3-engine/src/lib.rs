@@ -13,13 +13,15 @@
 //! 段 CRC 随对象元数据(verify_reads 双来源)。放弃旧布局前置兼容:布局版本 2,
 //! 旧设备直接拒绝。
 
+/// M19 Batch Operations 执行器(ADR-26;TODO M19/J1 J2)。
+pub mod batch;
 pub mod compaction;
+/// M19 迁入执行器(ADR-24;TODO M19/M1/M2)。
+pub mod ingest;
 pub mod inventory;
 pub mod io;
 pub mod lifecycle;
 pub mod restore;
-/// M19 迁入执行器(ADR-24;TODO M19/M1/M2)。
-pub mod ingest;
 pub mod worker;
 
 #[cfg(test)]

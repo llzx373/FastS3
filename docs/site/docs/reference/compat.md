@@ -97,6 +97,17 @@ meta-export/import 可见并可往返;真实类独立落 ObjectMeta v7 `storage_
 | 队列语义 | 事件入队与数据操作**同事务提交**(崩溃零漂移,ADR-18 D-E1);有界持久化环形(上限可配),投递 at-least-once,重试指数退避 + 死信留存;投递失败不影响数据面请求语义 |
 | 幂等 | 载荷含 `eventId`(= 事件 seq,单调),目标端可依此去重 |
 
+## Batch Operations(v2.5 M19 起;ADR-26)
+
+| 项 | 语义 |
+| --- | --- |
+| API 形态 | **管理面 JSON**(`/v1/admin/batch/jobs`,admin 通道):Create/Describe/List/Cancel;操作字段与 AWS S3 Control `CreateJob` 同名映射(Operation/Manifest/Report);**不实现** S3 Control 端口,`aws s3control` 不承诺开箱(ADR-26 DR1) |
+| Manifest | CSV(`bucket,key[,versionId]`,容忍首行表头)或本机桶内对象引用(同一 CSV / S3 Inventory `manifest.json`);行内 ≤ 1 MiB |
+| 操作 | COPY(目标桶/前缀)/ DELETE(版本寻址;**Object Lock 锁定对象记失败,不绕过**)/ RESTORE(days/tier,复用恢复状态机)/ REPLACE-TAGS(整体替换);无 Lambda 操作 |
+| 报告 | CSV(`bucket,key,versionId,status,error` + 汇总行)写入 report.bucket(前缀默认 `batch-reports/`);Cancelled 生成已处理部分 |
+| 状态机 | Submitted → Running → Completed/Failed/Cancelled;崩溃续跑(游标持久化,逐项幂等) |
+| 审计 | CreateBatchJob / CancelBatchJob(who = 控制台登录者,由 Node 代理注入 operator;admin 通道直连 = `admin`) |
+
 ## STS 临时凭证(v2.1 M15 起)
 
 | 项 | 说明 |

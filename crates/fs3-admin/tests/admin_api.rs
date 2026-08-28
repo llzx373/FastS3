@@ -2638,7 +2638,13 @@ fn ingest_job_create_and_status() {
         "preserve_mtime": true,
         "copy_bucket_config": false
     }"#;
-    let (code, body) = http_unix(sock.as_str(), "POST", "/v1/admin/ingest/jobs", Some(create_body), "t");
+    let (code, body) = http_unix(
+        sock.as_str(),
+        "POST",
+        "/v1/admin/ingest/jobs",
+        Some(create_body),
+        "t",
+    );
     assert_eq!(code, 200, "{body}");
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     let id = v["id"].as_str().unwrap().to_string();
@@ -2649,7 +2655,13 @@ fn ingest_job_create_and_status() {
 
     // 目标桶不存在 → 404
     let bad = create_body.replace("\"dest\"", "\"nope\"");
-    let (code, body) = http_unix(sock.as_str(), "POST", "/v1/admin/ingest/jobs", Some(&bad), "t");
+    let (code, body) = http_unix(
+        sock.as_str(),
+        "POST",
+        "/v1/admin/ingest/jobs",
+        Some(&bad),
+        "t",
+    );
     assert_eq!(code, 404, "{body}");
 
     // 缺字段 → 400
@@ -2681,7 +2693,11 @@ fn ingest_job_create_and_status() {
     assert!(body.contains(&id), "list must contain the job");
 
     // pause → Paused;resume → Running;cancel → Cancelled
-    for (action, want) in [("pause", "Paused"), ("resume", "Running"), ("cancel", "Cancelled")] {
+    for (action, want) in [
+        ("pause", "Paused"),
+        ("resume", "Running"),
+        ("cancel", "Cancelled"),
+    ] {
         let (code, body) = http_unix(
             sock.as_str(),
             "POST",
@@ -2716,6 +2732,148 @@ fn ingest_job_create_and_status() {
         sock.as_str(),
         "GET",
         &format!("/v1/admin/ingest/jobs/{id}"),
+        None,
+        "t",
+    );
+    assert_eq!(code, 404);
+}
+
+/// M19 J1(ADR-26 DR1;TODO M19/J1):Batch 任务 CRUD 往返
+/// (batch_job_create_get_list_cancel)。
+#[test]
+fn batch_job_create_get_list_cancel() {
+    let (dir, img) = setup();
+    let cfg = EngineConfig {
+        devices: vec![img.clone()],
+        meta_dir: dir.path().join("meta"),
+        compaction: fs3_engine::CompactionConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let (sock, _h) = start_admin(&cfg, "t");
+    let _keep = &img;
+
+    // 报告桶
+    let (code, body) = http_unix(
+        sock.as_str(),
+        "POST",
+        "/v1/admin/buckets",
+        Some(r#"{"name":"reports"}"#),
+        "t",
+    );
+    assert!(code == 200 || code == 409, "{code} {body}");
+
+    // 创建 DELETE 任务(行内 manifest)
+    let create_body = r#"{
+        "operation": {"type": "DELETE"},
+        "manifest": {"inline_csv": "reports,k1\nreports,k2\n"},
+        "report": {"bucket": "reports", "prefix": "br/"},
+        "operator": "console-user-1"
+    }"#;
+    let (code, body) = http_unix(
+        sock.as_str(),
+        "POST",
+        "/v1/admin/batch/jobs",
+        Some(create_body),
+        "t",
+    );
+    assert_eq!(code, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let id = v["id"].as_str().unwrap().to_string();
+    assert!(id.starts_with("batch-"), "{body}");
+    assert_eq!(v["state"], "Submitted");
+
+    // 非法操作 → 400
+    let (code, _) = http_unix(
+        sock.as_str(),
+        "POST",
+        "/v1/admin/batch/jobs",
+        Some(
+            r#"{"operation":{"type":"LAMBDA"},"manifest":{"inline_csv":"a,b\n"},"report":{"bucket":"reports"}}"#,
+        ),
+        "t",
+    );
+    assert_eq!(code, 400, "unknown operation rejected");
+    // 缺 manifest → 400
+    let (code, _) = http_unix(
+        sock.as_str(),
+        "POST",
+        "/v1/admin/batch/jobs",
+        Some(r#"{"operation":{"type":"DELETE"},"report":{"bucket":"reports"}}"#),
+        "t",
+    );
+    assert_eq!(code, 400);
+    // 报告桶不存在 → 404
+    let (code, _) = http_unix(
+        sock.as_str(),
+        "POST",
+        "/v1/admin/batch/jobs",
+        Some(
+            r#"{"operation":{"type":"DELETE"},"manifest":{"inline_csv":"a,b\n"},"report":{"bucket":"nope"}}"#,
+        ),
+        "t",
+    );
+    assert_eq!(code, 404);
+
+    // Get / List
+    let (code, body) = http_unix(
+        sock.as_str(),
+        "GET",
+        &format!("/v1/admin/batch/jobs/{id}"),
+        None,
+        "t",
+    );
+    assert_eq!(code, 200, "{body}");
+    let (code, body) = http_unix(sock.as_str(), "GET", "/v1/admin/batch/jobs", None, "t");
+    assert_eq!(code, 200);
+    assert!(body.contains(&id), "list must contain the job");
+
+    // Cancel(幂等性:二次取消 409)
+    let (code, body) = http_unix(
+        sock.as_str(),
+        "POST",
+        &format!("/v1/admin/batch/jobs/{id}/cancel"),
+        None,
+        "t",
+    );
+    assert_eq!(code, 200, "{body}");
+    let (code, _) = http_unix(
+        sock.as_str(),
+        "POST",
+        &format!("/v1/admin/batch/jobs/{id}/cancel"),
+        None,
+        "t",
+    );
+    assert_eq!(code, 409);
+
+    // 审计可检索 job id(J3):CreateBatchJob / CancelBatchJob
+    let (code, body) = http_unix(
+        sock.as_str(),
+        "GET",
+        "/v1/admin/audit?limit=50",
+        None,
+        "t",
+    );
+    assert_eq!(code, 200, "{body}");
+    assert!(body.contains("CreateBatchJob"), "audit must record create");
+    assert!(body.contains("CancelBatchJob"), "audit must record cancel");
+    assert!(body.contains(&id), "audit entries must reference job id");
+
+    // 删除
+    let (code, _) = http_unix(
+        sock.as_str(),
+        "DELETE",
+        &format!("/v1/admin/batch/jobs/{id}"),
+        None,
+        "t",
+    );
+    assert_eq!(code, 200);
+    let (code, _) = http_unix(
+        sock.as_str(),
+        "GET",
+        &format!("/v1/admin/batch/jobs/{id}"),
         None,
         "t",
     );

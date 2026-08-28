@@ -121,6 +121,11 @@ pub const PREFIX_IAM_ROLE: &[u8] = b"ir:";
 /// 同 `e:`/`x:` 不导出口径)、check 可达性扫描(只读 `o:`/`p:` 段引用键,
 /// 任务值不含 extent 引用,对 `ij:` 天然安全,登记于注释)。
 pub const PREFIX_INGEST_JOB: &[u8] = b"ij:";
+/// Batch 任务(M19 J,ADR-26 DR5:`jb:{job_id}` → postcard BatchJob;
+/// 状态/游标/统计持久化,batch worker 崩溃续跑)。三处同步同 `ij:` 口径:
+/// 前缀表(本处)、meta-export/import DTO(显式不导出,运维瞬态)、
+/// check 可达性扫描(任务值不含 extent 引用,天然安全,登记于注释)。
+pub const PREFIX_BATCH_JOB: &[u8] = b"jb:";
 
 /// 系统单调计数器(每个事务 +1,单点序列化;ADR-5)。
 pub const SYS_SEQ: &[u8] = b"s:seq";
@@ -799,6 +804,27 @@ pub fn parse_ingest_job_key(raw: &[u8]) -> Result<String> {
         .strip_prefix(PREFIX_INGEST_JOB)
         .ok_or_else(|| Error::Corrupt("ingest job key missing prefix".into()))?;
     String::from_utf8(body.to_vec()).map_err(|_| Error::Corrupt("ingest job id not utf8".into()))
+}
+
+/// Batch 任务键:`jb:{job_id}`(M19 J,ADR-26 DR5)。
+pub fn batch_job_key(job_id: &str) -> Result<Vec<u8>> {
+    if job_id.is_empty() || job_id.len() > 128 || job_id.bytes().any(|b| b == 0x00) {
+        return Err(Error::InvalidArgument(format!(
+            "batch job id {job_id:?}: must be 1..=128 bytes without NUL"
+        )));
+    }
+    let mut k = Vec::with_capacity(PREFIX_BATCH_JOB.len() + job_id.len());
+    k.extend_from_slice(PREFIX_BATCH_JOB);
+    k.extend_from_slice(job_id.as_bytes());
+    Ok(k)
+}
+
+/// 解析 `jb:` 键 → job_id。
+pub fn parse_batch_job_key(raw: &[u8]) -> Result<String> {
+    let body = raw
+        .strip_prefix(PREFIX_BATCH_JOB)
+        .ok_or_else(|| Error::Corrupt("batch job key missing prefix".into()))?;
+    String::from_utf8(body.to_vec()).map_err(|_| Error::Corrupt("batch job id not utf8".into()))
 }
 
 #[cfg(test)]

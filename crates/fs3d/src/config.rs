@@ -33,6 +33,20 @@ pub struct RootConfig {
     /// 即跑,无任务零动作;关 = 任务仍可 CRUD/暂停,但不推进)。
     #[serde(default)]
     pub ingest: IngestConfig,
+    /// M19 J(ADR-26):Batch Operations worker(`[batch]`;默认启用)。
+    #[serde(default)]
+    pub batch: BatchConfig,
+}
+
+/// M19 J:`[batch]` 段(Batch worker;ADR-26 DR4)。
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+pub struct BatchConfig {
+    /// 总开关(默认 true;只读引擎不启动)。
+    pub enabled: Option<bool>,
+    /// 每 tick 处理条目数上限(默认 256)。
+    pub batch: Option<usize>,
+    /// 轮询周期秒(默认 1;下限 0.1)。
+    pub poll_secs: Option<f64>,
 }
 
 /// M19 M:`[ingest]` 段(迁入 worker;ADR-24 DR4)。

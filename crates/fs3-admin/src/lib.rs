@@ -555,6 +555,12 @@ impl AdminServer {
             ("POST", ["ingest", "jobs", id, "cancel"]) => {
                 self.handle_ingest_job_state(id, fs3_core::IngestJobState::Cancelled)
             }
+            // M19 J1(ADR-26 DR1):Batch Operations(管理面 JSON + AWS 同名字段)
+            ("GET", ["batch", "jobs"]) => self.handle_batch_jobs_list(),
+            ("POST", ["batch", "jobs"]) => self.handle_batch_job_create(body),
+            ("GET", ["batch", "jobs", id]) => self.handle_batch_job_get(id),
+            ("DELETE", ["batch", "jobs", id]) => self.handle_batch_job_delete(id),
+            ("POST", ["batch", "jobs", id, "cancel"]) => self.handle_batch_job_cancel(id),
             _ => json::err(StatusCode::NOT_FOUND, "not_found", "unknown admin endpoint"),
         }
     }
@@ -725,7 +731,11 @@ impl AdminServer {
                     "jobs": jobs.iter().map(Self::ingest_job_json).collect::<Vec<_>>()
                 }))
             }
-            Err(e) => json::err(StatusCode::INTERNAL_SERVER_ERROR, "internal", &e.to_string()),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
         }
     }
 
@@ -733,8 +743,16 @@ impl AdminServer {
         let engine = self.engine.read();
         match engine.meta_arc().get_ingest_job(id) {
             Ok(Some(job)) => json::ok(Self::ingest_job_json(&job)),
-            Ok(None) => json::err(StatusCode::NOT_FOUND, "not_found", &format!("ingest job {id}")),
-            Err(e) => json::err(StatusCode::INTERNAL_SERVER_ERROR, "internal", &e.to_string()),
+            Ok(None) => json::err(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                &format!("ingest job {id}"),
+            ),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
         }
     }
 
@@ -745,7 +763,9 @@ impl AdminServer {
     fn handle_ingest_job_create(&self, body: &[u8]) -> Response<String> {
         let parsed: serde_json::Value = match serde_json::from_slice(body) {
             Ok(v) => v,
-            Err(_) => return json::err(StatusCode::BAD_REQUEST, "bad_request", "invalid JSON body"),
+            Err(_) => {
+                return json::err(StatusCode::BAD_REQUEST, "bad_request", "invalid JSON body")
+            }
         };
         let get_str = |v: &serde_json::Value, k: &str| -> String {
             v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
@@ -775,7 +795,11 @@ impl AdminServer {
         }
         let dest_bucket = get_str(&parsed, "dest_bucket");
         if dest_bucket.is_empty() {
-            return json::err(StatusCode::BAD_REQUEST, "bad_request", "dest_bucket is required");
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "dest_bucket is required",
+            );
         }
         let preserve_mtime = parsed
             .get("preserve_mtime")
@@ -801,14 +825,21 @@ impl AdminServer {
                     )
                 }
                 Err(e) => {
-                    return json::err(StatusCode::INTERNAL_SERVER_ERROR, "internal", &e.to_string())
+                    return json::err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal",
+                        &e.to_string(),
+                    )
                 }
             }
         }
         let now = Self::unix_now();
         let mut rnd = [0u8; 4];
         let _ = fs3_core::random_bytes(&mut rnd);
-        let id = format!("ing-{:x}-{:02x}{:02x}{:02x}{:02x}", now, rnd[0], rnd[1], rnd[2], rnd[3]);
+        let id = format!(
+            "ing-{:x}-{:02x}{:02x}{:02x}{:02x}",
+            now, rnd[0], rnd[1], rnd[2], rnd[3]
+        );
         let mut job = fs3_core::IngestJob {
             id: id.clone(),
             source,
@@ -835,7 +866,11 @@ impl AdminServer {
         let engine = self.engine.read();
         match engine.meta_arc().put_ingest_job(&job) {
             Ok(_) => json::ok(Self::ingest_job_json(&job)),
-            Err(e) => json::err(StatusCode::INTERNAL_SERVER_ERROR, "internal", &e.to_string()),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
         }
     }
 
@@ -895,12 +930,10 @@ impl AdminServer {
         match client.get_subresource("lifecycle=") {
             Ok(Some(doc)) => match fs3_s3::xml::parse_lifecycle_configuration(&doc) {
                 Ok(rules) => {
-                    if let Err(e) =
-                        meta.commit(&[fs3_meta::Op::LifecycleRulesReplace {
-                            bucket: dest_bucket.to_string(),
-                            rules,
-                        }])
-                    {
+                    if let Err(e) = meta.commit(&[fs3_meta::Op::LifecycleRulesReplace {
+                        bucket: dest_bucket.to_string(),
+                        rules,
+                    }]) {
                         record(job, "lifecycle", &e.to_string());
                     }
                 }
@@ -911,21 +944,17 @@ impl AdminServer {
         }
         // ④ 通知配置(解析为规则集整体替换)
         match client.get_subresource("notification=") {
-            Ok(Some(doc)) => {
-                match fs3_s3::xml::parse_notification_configuration(&doc) {
-                    Ok(rules) => {
-                        if let Err(e) =
-                            meta.commit(&[fs3_meta::Op::NotificationRulesReplace {
-                                bucket: dest_bucket.to_string(),
-                                rules,
-                            }])
-                        {
-                            record(job, "notification", &e.to_string());
-                        }
+            Ok(Some(doc)) => match fs3_s3::xml::parse_notification_configuration(&doc) {
+                Ok(rules) => {
+                    if let Err(e) = meta.commit(&[fs3_meta::Op::NotificationRulesReplace {
+                        bucket: dest_bucket.to_string(),
+                        rules,
+                    }]) {
+                        record(job, "notification", &e.to_string());
                     }
-                    Err(e) => record(job, "notification", &e.to_string()),
                 }
-            }
+                Err(e) => record(job, "notification", &e.to_string()),
+            },
             Ok(None) => {}
             Err(e) => record(job, "notification", &e.to_string()),
         }
@@ -967,8 +996,16 @@ impl AdminServer {
                     }
                 }
             }
-            Ok(None) => json::err(StatusCode::NOT_FOUND, "not_found", &format!("ingest job {id}")),
-            Err(e) => json::err(StatusCode::INTERNAL_SERVER_ERROR, "internal", &e.to_string()),
+            Ok(None) => json::err(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                &format!("ingest job {id}"),
+            ),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
         }
     }
 
@@ -976,7 +1013,324 @@ impl AdminServer {
         let engine = self.engine.read();
         match engine.meta_arc().delete_ingest_job(id) {
             Ok(_) => json::ok(serde_json::json!({ "deleted": id })),
-            Err(e) => json::err(StatusCode::INTERNAL_SERVER_ERROR, "internal", &e.to_string()),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    // ── M19 J1(ADR-26 DR1):Batch Operations admin API ──
+
+    /// Batch 任务 JSON(与 ingest 同口径的运维视图)。
+    fn batch_job_json(job: &fs3_core::BatchJob) -> serde_json::Value {
+        serde_json::json!({
+            "id": job.id,
+            "operation": {
+                "type": job.operation.as_str(),
+                "dest_bucket": match &job.operation {
+                    fs3_core::BatchOperation::Copy { dest_bucket, .. } => Some(dest_bucket.clone()),
+                    _ => None,
+                },
+                "dest_prefix": match &job.operation {
+                    fs3_core::BatchOperation::Copy { dest_prefix, .. } => Some(dest_prefix.clone()),
+                    _ => None,
+                },
+                "days": match &job.operation {
+                    fs3_core::BatchOperation::Restore { days, .. } => Some(*days),
+                    _ => None,
+                },
+                "tier": match &job.operation {
+                    fs3_core::BatchOperation::Restore { tier, .. } => Some(tier.clone()),
+                    _ => None,
+                },
+                "tags": match &job.operation {
+                    fs3_core::BatchOperation::ReplaceTags { tags } => Some(
+                        tags.iter().map(|(k, v)| serde_json::json!({"key": k, "value": v}))
+                            .collect::<Vec<_>>(),
+                    ),
+                    _ => None,
+                },
+            },
+            "manifest": match &job.manifest {
+                fs3_core::BatchManifestSpec::InlineCsv { csv } => serde_json::json!({"type": "inline_csv", "bytes": csv.len()}),
+                fs3_core::BatchManifestSpec::S3Ref { bucket, key } => serde_json::json!({"type": "s3_ref", "bucket": bucket, "key": key}),
+            },
+            "report_bucket": job.report_bucket,
+            "report_prefix": job.report_prefix,
+            "report_key": job.report_key,
+            "state": job.state.as_str(),
+            "created_at": job.created_at,
+            "updated_at": job.updated_at,
+            "total": job.total,
+            "processed": job.processed,
+            "succeeded": job.succeeded,
+            "failed": job.failed,
+            "cursor": job.cursor,
+            "failures": job.failures.iter().map(|f| serde_json::json!({
+                "kind": f.kind, "key": f.key, "error": f.error, "at": f.at,
+            })).collect::<Vec<_>>(),
+            "error": job.error,
+        })
+    }
+
+    fn handle_batch_jobs_list(&self) -> Response<String> {
+        let engine = self.engine.read();
+        match engine.meta_arc().list_batch_jobs() {
+            Ok(mut jobs) => {
+                jobs.sort_by_key(|j| std::cmp::Reverse(j.created_at));
+                json::ok(serde_json::json!({
+                    "jobs": jobs.iter().map(Self::batch_job_json).collect::<Vec<_>>()
+                }))
+            }
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    fn handle_batch_job_get(&self, id: &str) -> Response<String> {
+        let engine = self.engine.read();
+        match engine.meta_arc().get_batch_job(id) {
+            Ok(Some(job)) => json::ok(Self::batch_job_json(&job)),
+            Ok(None) => json::err(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                &format!("batch job {id}"),
+            ),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    /// 解析操作 JSON(ADR-26 DR1:字段与 AWS CreateJob 同名映射)。
+    fn parse_batch_operation(
+        v: &serde_json::Value,
+    ) -> std::result::Result<fs3_core::BatchOperation, String> {
+        let t = v
+            .get("type")
+            .and_then(|x| x.as_str())
+            .ok_or("operation.type required")?
+            .to_ascii_uppercase();
+        let str_of = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+        Ok(match t.as_str() {
+            "COPY" => fs3_core::BatchOperation::Copy {
+                dest_bucket: str_of("dest_bucket"),
+                dest_prefix: str_of("dest_prefix"),
+            },
+            "DELETE" => fs3_core::BatchOperation::Delete,
+            "RESTORE" => fs3_core::BatchOperation::Restore {
+                days: v
+                    .get("days")
+                    .and_then(|x| x.as_u64())
+                    .filter(|d| (1..=365).contains(d))
+                    .ok_or("operation.days must be 1..=365")? as u32,
+                tier: if str_of("tier").is_empty() {
+                    "Standard".into()
+                } else {
+                    str_of("tier")
+                },
+            },
+            "REPLACE-TAGS" | "REPLACE_TAGS" => {
+                let mut tags = Vec::new();
+                for tv in v
+                    .get("tags")
+                    .and_then(|x| x.as_array())
+                    .ok_or("operation.tags array required")?
+                {
+                    let k = tv
+                        .get("key")
+                        .and_then(|x| x.as_str())
+                        .ok_or("tag key required")?;
+                    let val = tv.get("value").and_then(|x| x.as_str()).unwrap_or("");
+                    tags.push((k.to_string(), val.to_string()));
+                }
+                fs3_core::BatchOperation::ReplaceTags { tags }
+            }
+            other => return Err(format!("unknown operation {other}")),
+        })
+    }
+
+    /// 创建 Batch 任务(ADR-26 DR1/DR2):operator = 控制台调用者
+    /// (Node 代理注入;审计 who 用——admin 通道信任该归属,compat 记载)。
+    fn handle_batch_job_create(&self, body: &[u8]) -> Response<String> {
+        let parsed: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(_) => {
+                return json::err(StatusCode::BAD_REQUEST, "bad_request", "invalid JSON body")
+            }
+        };
+        let operation = match Self::parse_batch_operation(
+            parsed.get("operation").unwrap_or(&serde_json::Value::Null),
+        ) {
+            Ok(op) => op,
+            Err(e) => return json::err(StatusCode::BAD_REQUEST, "bad_operation", &e),
+        };
+        let manifest = match parsed.get("manifest") {
+            Some(m) => match m.get("inline_csv").and_then(|x| x.as_str()) {
+                Some(csv) => fs3_core::BatchManifestSpec::InlineCsv {
+                    csv: csv.to_string(),
+                },
+                None => {
+                    let b = m
+                        .get("s3_ref")
+                        .and_then(|x| x.get("bucket"))
+                        .and_then(|x| x.as_str());
+                    let k = m
+                        .get("s3_ref")
+                        .and_then(|x| x.get("key"))
+                        .and_then(|x| x.as_str());
+                    match (b, k) {
+                        (Some(b), Some(k)) => fs3_core::BatchManifestSpec::S3Ref {
+                            bucket: b.to_string(),
+                            key: k.to_string(),
+                        },
+                        _ => {
+                            return json::err(
+                                StatusCode::BAD_REQUEST,
+                                "bad_manifest",
+                                "manifest needs inline_csv or s3_ref{bucket,key}",
+                            )
+                        }
+                    }
+                }
+            },
+            None => return json::err(StatusCode::BAD_REQUEST, "bad_manifest", "manifest required"),
+        };
+        let report_bucket = parsed
+            .get("report")
+            .and_then(|r| r.get("bucket"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let report_prefix = parsed
+            .get("report")
+            .and_then(|r| r.get("prefix"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("batch-reports/")
+            .to_string();
+        if report_bucket.is_empty() {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "report.bucket required",
+            );
+        }
+        // report 桶必须存在(报告生成期才写,前置校验快失败)
+        {
+            let engine = self.engine.read();
+            if matches!(engine.meta_arc().get_bucket(&report_bucket), Ok(None)) {
+                return json::err(
+                    StatusCode::NOT_FOUND,
+                    "no_such_bucket",
+                    &format!("report bucket {report_bucket} does not exist"),
+                );
+            }
+        }
+        let now = Self::unix_now();
+        let mut rnd = [0u8; 4];
+        let _ = fs3_core::random_bytes(&mut rnd);
+        let id = format!(
+            "batch-{:x}-{:02x}{:02x}{:02x}{:02x}",
+            now, rnd[0], rnd[1], rnd[2], rnd[3]
+        );
+        let job = fs3_core::BatchJob {
+            id: id.clone(),
+            operation,
+            manifest,
+            report_bucket,
+            report_prefix,
+            state: fs3_core::BatchJobState::Submitted,
+            created_at: now,
+            updated_at: now,
+            total: 0,
+            processed: 0,
+            succeeded: 0,
+            failed: 0,
+            cursor: 0,
+            failures: Vec::new(),
+            report_key: None,
+            error: None,
+        };
+        // J3:审计(who = operator,op = CreateBatchJob,key = job id)
+        let operator = parsed
+            .get("operator")
+            .and_then(|x| x.as_str())
+            .unwrap_or("admin")
+            .to_string();
+        self.service
+            .audit()
+            .push(&operator, "CreateBatchJob", "", &id, 200, "");
+        let engine = self.engine.read();
+        match engine.meta_arc().put_batch_job(&job) {
+            Ok(_) => json::ok(Self::batch_job_json(&job)),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    fn handle_batch_job_cancel(&self, id: &str) -> Response<String> {
+        let engine = self.engine.read();
+        let meta = engine.meta_arc();
+        match meta.get_batch_job(id) {
+            Ok(Some(mut job)) => {
+                use fs3_core::BatchJobState;
+                match job.state {
+                    BatchJobState::Completed | BatchJobState::Failed | BatchJobState::Cancelled => {
+                        json::err(
+                            StatusCode::CONFLICT,
+                            "already_terminal",
+                            &format!("batch job {id} is {}", job.state.as_str()),
+                        )
+                    }
+                    _ => {
+                        job.state = BatchJobState::Cancelled;
+                        job.updated_at = Self::unix_now();
+                        self.service
+                            .audit()
+                            .push("admin", "CancelBatchJob", "", id, 200, "");
+                        match meta.put_batch_job(&job) {
+                            Ok(_) => json::ok(Self::batch_job_json(&job)),
+                            Err(e) => json::err(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "internal",
+                                &e.to_string(),
+                            ),
+                        }
+                    }
+                }
+            }
+            Ok(None) => json::err(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                &format!("batch job {id}"),
+            ),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    fn handle_batch_job_delete(&self, id: &str) -> Response<String> {
+        let engine = self.engine.read();
+        match engine.meta_arc().delete_batch_job(id) {
+            Ok(_) => json::ok(serde_json::json!({ "deleted": id })),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
         }
     }
 

@@ -21,6 +21,9 @@ tracing.workspace = true
 zeroize = "1"
 # M13 Z1 数据压缩(zstd crate;压缩=compression,区别于 compaction)
 zstd.workspace = true
+# M19 Batch(ADR-26 DR2.3):Inventory manifest.json 解析(仅 admin/worker
+# 路径,非热路径)
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

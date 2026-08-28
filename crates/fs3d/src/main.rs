@@ -874,6 +874,24 @@ fn cmd_serve(
         None
     };
 
+    // M19 J(ADR-26 DR4):Batch Operations worker(默认启用;无 `jb:` 任务
+    // 零动作;只读引擎不启动)。报告对象生成走正常 put 入账。
+    let batch_worker = if !engine_cfg.read_only && cfg.batch.enabled.unwrap_or(true) {
+        let bpoll = Duration::from_secs_f64(cfg.batch.poll_secs.unwrap_or(1.0).max(0.1));
+        let (meta, throttle) = {
+            let e = engine.read();
+            (e.meta_arc(), e.throttle())
+        };
+        let worker = fs3_engine::batch::BatchWorker::new(
+            SharedEngine(engine.clone()),
+            meta,
+            cfg.batch.batch.unwrap_or(256),
+        );
+        Some((worker, throttle, bpoll))
+    } else {
+        None
+    };
+
     // M6 / K4:优雅停机标志(SIGTERM/SIGINT → 排空 → 引擎收尾)。
     // 提前创建供 admin/agent 等后台模块注入(agent 循环每周期观测)。
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -1011,6 +1029,11 @@ fn cmd_serve(
     // M19 M:迁入 worker 启动(独立线程 + 全局共享令牌桶;轮询 = ingest.poll_secs)
     let mut ingest_worker = ingest_worker.map(|(worker, throttle, poll)| {
         fs3_engine::worker::WorkerHandle::spawn("fs3-ingest", worker, throttle, poll)
+    });
+
+    // M19 J:Batch worker 启动(独立线程;轮询 = batch.poll_secs)
+    let mut batch_worker = batch_worker.map(|(worker, throttle, poll)| {
+        fs3_engine::worker::WorkerHandle::spawn("fs3-batch", worker, throttle, poll)
     });
 
     let addr: std::net::SocketAddr = listen
@@ -1156,6 +1179,10 @@ fn cmd_serve(
     }
     // M19 M:迁入 worker 停止(任务游标已持久化,重启续跑)
     if let Some(mut h) = ingest_worker.take() {
+        h.stop();
+    }
+    // M19 J:Batch worker 停止(游标已持久化,重启续跑)
+    if let Some(mut h) = batch_worker.take() {
         h.stop();
     }
     tracing::info!("http workers drained; finalizing engine (checkpoint + meta close)");

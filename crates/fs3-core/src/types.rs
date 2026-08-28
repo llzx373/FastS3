@@ -3522,7 +3522,9 @@ pub fn parse_kafka_url(url: &str) -> std::result::Result<KafkaTarget, String> {
         }
         let (h, p) = match hp.rsplit_once(':') {
             Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
-                let port = p.parse::<u16>().map_err(|e| format!("kafka bad port: {e}"))?;
+                let port = p
+                    .parse::<u16>()
+                    .map_err(|e| format!("kafka bad port: {e}"))?;
                 (h, port)
             }
             // 有冒号但端口非数字 → 显式错误(不静默当默认端口)
@@ -3563,3 +3565,109 @@ pub fn parse_kafka_url(url: &str) -> std::result::Result<KafkaTarget, String> {
     })
 }
 
+// ─────────────────────────── M19 Batch Operations(ADR-26,TODO M19/J) ───────────────────────────
+
+/// Batch 操作集(ADR-26 DR3,起步四类;Lambda 不做)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BatchOperation {
+    /// 服务端复制(目标桶 + 可选前缀替换)。
+    Copy {
+        dest_bucket: String,
+        dest_prefix: String,
+    },
+    /// 删除(manifest 带 versionId = 物理删版本;Object Lock 锁定 → 记失败)。
+    Delete,
+    /// 归档恢复。
+    Restore { days: u32, tier: String },
+    /// 整体替换标签集。
+    ReplaceTags { tags: Vec<(String, String)> },
+}
+
+impl BatchOperation {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BatchOperation::Copy { .. } => "COPY",
+            BatchOperation::Delete => "DELETE",
+            BatchOperation::Restore { .. } => "RESTORE",
+            BatchOperation::ReplaceTags { .. } => "REPLACE-TAGS",
+        }
+    }
+}
+
+/// manifest 来源(ADR-26 DR2)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BatchManifestSpec {
+    /// 行内 CSV(≤ 1 MiB;行 = bucket,key[,versionId],容忍首行表头)。
+    InlineCsv { csv: String },
+    /// 本机桶内 CSV / Inventory manifest.json 对象引用。
+    S3Ref { bucket: String, key: String },
+}
+
+/// 单条失败记录(样本封顶;kind = "manifest" | "item" | "report")。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchFailure {
+    pub kind: String,
+    /// 对象键 / manifest 行。
+    pub key: String,
+    pub error: String,
+    pub at: i64,
+}
+
+/// Batch 任务状态机(ADR-26 DR4.2)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BatchJobState {
+    Submitted,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl BatchJobState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BatchJobState::Submitted => "Submitted",
+            BatchJobState::Running => "Running",
+            BatchJobState::Completed => "Completed",
+            BatchJobState::Failed => "Failed",
+            BatchJobState::Cancelled => "Cancelled",
+        }
+    }
+}
+
+/// Batch 任务(`jb:{job_id}` → postcard 本结构;ADR-26 DR4.3/DR5:
+/// 状态/游标/统计持久化,worker 崩溃续跑;逐项幂等)。演进 = 尾部追加
+/// + serde default。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchJob {
+    pub id: String,
+    pub operation: BatchOperation,
+    pub manifest: BatchManifestSpec,
+    /// 报告对象目标桶/前缀(报告 = CSV 行;完成/取消时生成)。
+    pub report_bucket: String,
+    pub report_prefix: String,
+    pub state: BatchJobState,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// 进度(manifest 材料化后的条目总数;processed/succeeded/failed 计数)。
+    pub total: u64,
+    pub processed: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+    /// 已处理游标 = 材料化条目数组的下标(u64;重跑从下标继续)。
+    pub cursor: u64,
+    pub failures: Vec<BatchFailure>,
+    /// 报告对象键(生成后回填,供 admin/控制台直达)。
+    pub report_key: Option<String>,
+    /// 终态错误摘要。
+    pub error: Option<String>,
+}
+
+/// 材料化后的单条目(worker 内存态;不落盘——落盘即 manifest 原文 +
+/// 游标,重放重建)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchItem {
+    pub bucket: String,
+    pub key: String,
+    pub vk: Option<[u8; 16]>,
+}

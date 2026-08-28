@@ -473,6 +473,14 @@ pub enum Op {
     IngestJobDelete {
         id: String,
     },
+    /// Batch 任务写入(M19 J,ADR-26 DR5;覆盖语义)。
+    BatchJobPut {
+        job: fs3_core::BatchJob,
+    },
+    /// Batch 任务删除(幂等)。
+    BatchJobDelete {
+        id: String,
+    },
     /// 对象标签单事务读改写(M10 S1;PutObjectTagging/DeleteObjectTagging
     /// 落地):`vk = None` → 未版本化单键 `o:{b}\0{k}`;`Some(vk)` → 版本键
     /// (含 VK_NULL null 槽)。仅 tags 字段变更,不触碰数据段/统计;
@@ -908,6 +916,14 @@ fn decode_ingest_job(v: &[u8]) -> Result<fs3_core::IngestJob> {
     match postcard::from_bytes::<fs3_core::IngestJob>(v) {
         Ok(j) => Ok(j),
         Err(e) => Err(Error::Corrupt(format!("postcard decode ingest job: {e}"))),
+    }
+}
+
+/// M19 Batch 任务值解码(ADR-26 DR5;同 decode_ingest_job 口径)。
+fn decode_batch_job(v: &[u8]) -> Result<fs3_core::BatchJob> {
+    match postcard::from_bytes::<fs3_core::BatchJob>(v) {
+        Ok(j) => Ok(j),
+        Err(e) => Err(Error::Corrupt(format!("postcard decode batch job: {e}"))),
     }
 }
 
@@ -2923,6 +2939,42 @@ impl MetaStore {
         self.commit(&[Op::IngestJobDelete { id: id.to_string() }])
     }
 
+    // ── M19 Batch 任务(ADR-26 DR5;`jb:` 域,不导出) ──
+
+    /// 读单条任务(None = 不存在)。
+    pub fn get_batch_job(&self, id: &str) -> Result<Option<fs3_core::BatchJob>> {
+        match self.db.get(batch_job_key(id)?).map_err(rocks_err)? {
+            Some(v) => Ok(Some(decode_batch_job(&v)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 写入(覆盖语义)。
+    pub fn put_batch_job(&self, job: &fs3_core::BatchJob) -> Result<u64> {
+        self.commit(&[Op::BatchJobPut { job: job.clone() }])
+    }
+
+    /// 删除(幂等)。
+    pub fn delete_batch_job(&self, id: &str) -> Result<u64> {
+        self.commit(&[Op::BatchJobDelete { id: id.to_string() }])
+    }
+
+    /// 全量列表(按 job_id 字典序)。
+    pub fn list_batch_jobs(&self) -> Result<Vec<fs3_core::BatchJob>> {
+        let mut out = Vec::new();
+        for item in self
+            .db
+            .iterator(IteratorMode::From(PREFIX_BATCH_JOB, Direction::Forward))
+        {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(PREFIX_BATCH_JOB) {
+                break;
+            }
+            out.push(decode_batch_job(&v)?);
+        }
+        Ok(out)
+    }
+
     /// 全量列表(按 job_id 字典序;数量为运维量级,无分页)。
     pub fn list_ingest_jobs(&self) -> Result<Vec<fs3_core::IngestJob>> {
         let mut out = Vec::new();
@@ -4389,6 +4441,12 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
             }
             Op::IngestJobDelete { id } => {
                 tremove(tx, &ingest_job_key(id)?)?;
+            }
+            Op::BatchJobPut { job } => {
+                tinsert(tx, batch_job_key(&job.id)?, encode(job)?)?;
+            }
+            Op::BatchJobDelete { id } => {
+                tremove(tx, &batch_job_key(id)?)?;
             }
             Op::ObjectSetTags {
                 bucket,

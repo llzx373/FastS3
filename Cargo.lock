@@ -619,6 +619,7 @@ dependencies = [
  "md-5",
  "parking_lot",
  "proptest",
+ "serde_json",
  "tempfile",
  "tracing",
  "zeroize",
