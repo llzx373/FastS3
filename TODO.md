@@ -236,7 +236,7 @@
 - [x] S1 Service Account = `k:` 属主必填;用户自助创建/列出/吊销**自己的** SA(无需 root);
   tenantAdmin 可代管本租户;嵌入策略求交
   - 用例:`user_self_service_sa_put_in_allowed_prefix`;嵌入 Deny 覆盖用户 readwrite
-- [ ] S2 数据面热路径:SigV4 → KeyRecord → 加载 User/Group 算生效策略(内存表,IAM 变更立即生效)
+- [x] S2 数据面热路径:SigV4 → KeyRecord → 加载 User/Group 算生效策略(内存表,IAM 变更立即生效)
   - 用例:`policy_detach_takes_effect_on_next_put`;perf 关闭 IAM 复杂策略时相对 v2.3 不回退 >5%(简单 AK 路径)
 - [ ] S3 ListBuckets / CreateBucket:只列可见桶;新桶属主 = 调用者租户;跨租户默认 403
   - 用例:`list_buckets_filtered_by_iam`;`create_bucket_owner_is_caller_tenant`

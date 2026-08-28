@@ -12701,3 +12701,52 @@ fn embedded_policy_survives_restart() {
     assert_eq!(rec.embedded_policy.as_deref(), Some(embedded));
     assert_eq!(rec.sa_name.as_deref(), Some("persisted"));
 }
+
+// ───────────────────── M18 S2:数据面热路径 —— IAM 变更即时生效(ADR-28 DI3.1)─────────────────────
+
+/// M18 S2(TODO 钉死用例;ADR-28 DI3.1):**策略解挂即时生效** ——
+/// alice + 其 SA,挂载 canned readwrite 时 PUT/GET 均 200;经服务面
+/// `put_iam_user` 解挂 readwrite(覆盖语义改挂 readonly)后,**紧接着
+/// 的下一个 PUT** 即 403 AccessDenied(身份层仍有挂载但无 Allow →
+/// 默认拒绝;无需重启、无传播延迟,内存表双写即时生效),GET 仍 200
+/// (证明命中的是策略层而非鉴权失效);重新挂载 readwrite 后下一个
+/// PUT 立即恢复 200。全程同进程、无重启。
+#[test]
+fn policy_detach_takes_effect_on_next_put() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/s4bkt", vec![]))), 200);
+    svc.put_iam_user(&s1_user("default", "alice", vec!["readwrite".into()]))
+        .unwrap();
+    svc.add_key_owned("AKIA_S4", "s4-secret", None, "default", "alice", None, None)
+        .unwrap();
+    let sa = Credentials {
+        access_key: "AKIA_S4".into(),
+        secret_key: "s4-secret".into(),
+    };
+    // readwrite 挂载中:PUT/GET 放行
+    let r = svc.handle(&req_creds("PUT", "/s4bkt/k", &sa, &[], b"x".to_vec()));
+    assert_eq!(status(&r), 200, "readwrite 挂载中 PUT 放行: {r:?}");
+    // 解挂 readwrite(改挂 readonly)→ 下一个 PUT 立即 403(无重启、无延迟)
+    svc.put_iam_user(&s1_user("default", "alice", vec!["readonly".into()]))
+        .unwrap();
+    let r = svc.handle(&req_creds("PUT", "/s4bkt/k2", &sa, &[], b"y".to_vec()));
+    assert_eq!(
+        err_code(&r),
+        "AccessDenied",
+        "解挂后下一个 PUT 立即拒绝: {r:?}"
+    );
+    // GET 仍放行(readonly Allow;佐证 403 来自策略层而非鉴权失败)
+    let r = svc.handle(&req_creds("GET", "/s4bkt/k", &sa, &[], vec![]));
+    assert_eq!(status(&r), 200, "readonly 下 GET 仍放行: {r:?}");
+    // 重新挂载 readwrite → 下一个 PUT 立即恢复
+    svc.put_iam_user(&s1_user("default", "alice", vec!["readwrite".into()]))
+        .unwrap();
+    let r = svc.handle(&req_creds("PUT", "/s4bkt/k3", &sa, &[], b"z".to_vec()));
+    assert_eq!(status(&r), 200, "重新挂载后下一个 PUT 恢复: {r:?}");
+    // legacy 密钥(构造注入,无属主)全程不受影响
+    assert_eq!(
+        status(&svc.handle(&req("PUT", "/s4bkt/k4", b"x".to_vec()))),
+        200,
+        "legacy 密钥不受解挂影响"
+    );
+}

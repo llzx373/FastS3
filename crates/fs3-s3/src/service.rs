@@ -838,6 +838,14 @@ impl S3Service {
     /// 中桶策略可 Deny(跨层 Deny 优先短路)且可凭具名 Allow 补足并集,
     /// 与 AWS 同账号「身份策略 ∩ 资源策略」语义对齐。
     ///
+    /// M18 S2(热路径口径):各层求值全部命中内存表(`policies` /
+    /// `embedded_policies` / `key_owners` / `iam_users` / `iam_groups` /
+    /// `iam_policies` 解析缓存 / `bucket_policies` 缓存),无逐请求策略
+    /// 解析(解析仅发生在 add/restore/put 写路径);IAM 变更经管理面
+    /// 双写即时生效(下一个请求即见,无需重启)。无属主记录或无挂载的
+    /// legacy 简单 AK 路径 = 数次哈希查找 + 少量小字符串分配即返回
+    /// (量级见 #[ignore] 微基准 authorize_hotpath_microbench)。
+    ///
     /// `action` 为审计操作名(如 PutObject;经 s3_action_name 归一为 S3 动作);
     /// `bucket`/`key` 构成资源 ARN。无策略/未知密钥 → 放行(密钥有效性已由
     /// 认证把关)。PostObject 不经此入口(键在表单体内,op_post_object 自判)。
@@ -1382,15 +1390,20 @@ impl S3Service {
         ctx: &crate::policy::EvalCtx,
     ) -> Option<crate::policy::Decision> {
         use crate::policy::Decision;
+        // 属主快查:无属主记录(legacy 密钥)→ None,单次哈希查找、零分配。
         let (tenant, user) = self.key_owners.lock().unwrap().get(access_key).cloned()?;
-        let ustate = self
-            .iam_users
-            .lock()
-            .unwrap()
-            .get(&(tenant.clone(), user))?
-            .clone();
+        // 无挂载快路(M18 S2 热路径口径):用户无直挂且无组 → 无身份约束,
+        // 不克隆用户状态/策略名(简单 AK 路径 = 两次哈希查找即返回)。
+        let ustate = {
+            let users = self.iam_users.lock().unwrap();
+            let u = users.get(&(tenant.clone(), user))?;
+            if u.policies.is_empty() && u.groups.is_empty() {
+                return None;
+            }
+            u.clone()
+        };
         // 直挂 ∪ 组挂载(去重,保序)
-        let mut names = ustate.policies.clone();
+        let mut names = ustate.policies;
         {
             let groups = self.iam_groups.lock().unwrap();
             for g in &ustate.groups {
@@ -1403,31 +1416,25 @@ impl S3Service {
                 }
             }
         }
-        if names.is_empty() {
-            return None;
-        }
         let mut allowed = false;
         for name in &names {
-            // 解析策略文档:canned = 代码常量(&'static);自定义 = 解析
-            // 缓存克隆(put/delete 双写失效;缺席 = 无法解析)。
-            let cached;
-            let policy = if crate::iam::is_canned(name) {
-                crate::iam::canned_parsed(name)
+            // 解析策略文档:canned = 代码常量(&'static);自定义 = 解析缓存
+            // 持锁求值(decide 为纯 CPU、不触服务锁;put/delete 双写失效;
+            // 缺席 = 无法解析)。不逐请求克隆策略文档(热路径口径)。
+            let decision = if crate::iam::is_canned(name) {
+                crate::iam::canned_parsed(name).map(|p| p.decide(action, resource, true, ctx))
             } else {
-                cached = self
-                    .iam_policies
+                self.iam_policies
                     .lock()
                     .unwrap()
                     .get(&(tenant.clone(), name.clone()))
-                    .cloned();
-                cached.as_ref()
+                    .map(|p| p.decide(action, resource, true, ctx))
             };
-            match policy {
-                Some(p) => match p.decide(action, resource, true, ctx) {
-                    Decision::Deny => return Some(Decision::Deny),
-                    Decision::Allow => allowed = true,
-                    Decision::NoMatch => {}
-                },
+            match decision {
+                Some(Decision::Deny) => return Some(Decision::Deny),
+                Some(Decision::Allow) => allowed = true,
+                Some(Decision::NoMatch) => {}
+                // 挂载名无法解析(脏数据)→ 保守拒绝(绝不扩权)
                 None => return Some(Decision::Deny),
             }
         }
@@ -1816,6 +1823,8 @@ impl S3Service {
     /// 派生临时 secret 验签 → 基密钥 + 会话策略求交);无 token = 常驻
     /// 密钥路径(与 authenticate 逐字节等价)。返回身份:审计 who =
     /// 基密钥;authorize 用 [`AuthIdentity::session`] 施加会话策略求交。
+    /// 两条路径(及预签名 query 分支)均施加 M18 U1 属主用户禁用检查
+    /// (key_owners → iam_users 内存快查,DI7.3,InvalidAccessKeyId)。
     ///
     /// **临时 secret 确定性派生**(数据面可重算验签、明文零落盘):
     /// `session_secret = HMAC-SHA256(base_secret, "fasts3-session:" +
@@ -8554,5 +8563,150 @@ mod tests {
             .unwrap();
         assert_eq!(id2, format!("{rid2}/{}", service.host_id()));
         assert_ne!(id2, "fasts3");
+    }
+
+    // ── M18 S2:数据面热路径微基准(手动运行,非门禁) ──
+
+    /// M18 S2 热路径微基准(`cargo test -p fs3-s3 --lib -- --ignored
+    /// --nocapture authorize_hotpath_microbench`):测量 authorize 单调用
+    /// 耗时(ns/call),三种形态 ——
+    /// ① legacy 密钥 + IAM 表空(≈ v2.3 等价路径 + 新增各层快查);
+    /// ② legacy 密钥 + IAM 表已填充(64 用户/组/自定义策略 + 64 个
+    ///    带挂载的 SA 密钥,均与调用者无关)→ 核验填充后简单 AK 路径
+    ///    不回退;
+    /// ③ 挂载 canned readwrite 的 SA(身份层全链路求值,参照系)。
+    /// 回归门禁(简单 AK 路径 vs v2.3 吞吐回退 <5%)以真实服务器对比
+    /// 为准(tests/bench/perf-m18-iam-compare.sh);本微基准只给新增层
+    /// 的绝对开销量级。
+    #[test]
+    #[ignore = "手动微基准,非 CI 用例"]
+    fn authorize_hotpath_microbench() {
+        use std::time::Instant;
+        let (_d, _e, svc) = service_fixture();
+        let legacy = AuthIdentity {
+            who: "test".into(),
+            session: None,
+        };
+        const N: u32 = 100_000;
+        // svc_level=true → bucket/key 为空(服务级操作):跳过 policy_ctx
+        // 的引擎读与桶策略层,隔离出纯认证/授权层(IAM 新增层)成本
+        let timeit = |auth: &AuthIdentity, svc_level: bool, label: &str| {
+            let (bucket, key) = if svc_level {
+                ("", "")
+            } else {
+                ("bench-bkt", "k")
+            };
+            let req = S3Request {
+                method: "GET".into(),
+                raw_path: format!("/{bucket}/{key}"),
+                decoded_path: format!("/{bucket}/{key}"),
+                host: "localhost".into(),
+                query: vec![],
+                headers: vec![],
+                body: vec![],
+            };
+            // 预热(桶策略缓存穿透等一次性成本)
+            for _ in 0..1_000 {
+                std::hint::black_box(svc.authorize(Some(auth), "GetObject", bucket, key, &req))
+                    .ok();
+            }
+            let t0 = Instant::now();
+            for _ in 0..N {
+                std::hint::black_box(svc.authorize(Some(auth), "GetObject", bucket, key, &req))
+                    .ok();
+            }
+            let ns = t0.elapsed().as_nanos() as f64 / f64::from(N);
+            println!("{label}: {ns:.0} ns/call");
+            ns
+        };
+        let empty_svc = timeit(&legacy, true, "①a legacy / 空表   / 服务级(纯授权层)");
+        let empty_obj = timeit(&legacy, false, "①b legacy / 空表   / 对象级(含引擎读) ");
+        // 填充 IAM 表(噪声数据,均与调用者无关):64 用户(挂 readonly
+        // + 组)、8 组、4 自定义策略、64 个带属主与嵌入策略的 SA 密钥
+        for i in 0..8u32 {
+            svc.put_iam_group(&fs3_core::IamGroup {
+                tenant_id: "default".into(),
+                name: format!("noise-grp-{i}"),
+                members: vec![],
+                policies: vec!["readonly".into()],
+                created_at: 1_700_000_000,
+            })
+            .unwrap();
+        }
+        for i in 0..4u32 {
+            svc.put_iam_policy(&fs3_core::IamPolicy {
+                tenant_id: Some("default".into()),
+                name: format!("noise-pol-{i}"),
+                document: r#"{"Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["*"]}]}"#
+                    .into(),
+                created_at: 1_700_000_000,
+            })
+            .unwrap();
+        }
+        for i in 0..64u32 {
+            svc.put_iam_user(&fs3_core::IamUser {
+                tenant_id: "default".into(),
+                name: format!("noise-user-{i}"),
+                enabled: true,
+                password_hash: None,
+                password_salt: None,
+                policies: vec!["readonly".into(), format!("noise-pol-{}", i % 4)],
+                groups: vec![format!("noise-grp-{}", i % 8)],
+                display_name: None,
+                created_at: 1_700_000_000,
+            })
+            .unwrap();
+            svc.add_key_owned(
+                &format!("AKIA_NOISE_{i}"),
+                "noise-secret",
+                None,
+                "default",
+                &format!("noise-user-{i}"),
+                None,
+                Some(
+                    r#"{"Statement":[{"Effect":"Allow","Action":["s3:*"],"Resource":["*"]}]}"#
+                        .into(),
+                ),
+            )
+            .unwrap();
+        }
+        let full_svc = timeit(&legacy, true, "②a legacy / 填充后 / 服务级(纯授权层)");
+        let full_obj = timeit(&legacy, false, "②b legacy / 填充后 / 对象级(含引擎读) ");
+        // ③ 挂载 canned readwrite 的 SA(身份层全链路)
+        svc.put_iam_user(&fs3_core::IamUser {
+            tenant_id: "default".into(),
+            name: "mb-alice".into(),
+            enabled: true,
+            password_hash: None,
+            password_salt: None,
+            policies: vec!["readwrite".into()],
+            groups: vec![],
+            display_name: None,
+            created_at: 1_700_000_000,
+        })
+        .unwrap();
+        svc.add_key_owned(
+            "AKIA_MB",
+            "mb-secret",
+            None,
+            "default",
+            "mb-alice",
+            None,
+            None,
+        )
+        .unwrap();
+        let sa_auth = AuthIdentity {
+            who: "AKIA_MB".into(),
+            session: None,
+        };
+        timeit(&sa_auth, false, "③  SA+readwrite / 对象级(身份层全链路)");
+        println!(
+            "纯授权层:IAM 表填充对 legacy 简单 AK 路径增量 {:+.0} ns/call(空表基线 {empty_svc:.0})",
+            full_svc - empty_svc
+        );
+        println!(
+            "对象级:IAM 表填充对 legacy 简单 AK 路径增量 {:+.0} ns/call(空表基线 {empty_obj:.0})",
+            full_obj - empty_obj
+        );
     }
 }
