@@ -142,6 +142,28 @@ class FakeAdmin implements AdminApi {
   async iamUser(): Promise<never> {
     throw new Error("not used");
   }
+  // M18 R2:IAM 用户/组 CRUD(测试未直接使用;接口占位)
+  async iamUsers(): Promise<never> {
+    throw new Error("not used");
+  }
+  async createIamUser(): Promise<never> {
+    throw new Error("not used");
+  }
+  async patchIamUser(): Promise<never> {
+    throw new Error("not used");
+  }
+  async iamGroups(): Promise<never> {
+    throw new Error("not used");
+  }
+  async iamGroup(): Promise<never> {
+    throw new Error("not used");
+  }
+  async createIamGroup(): Promise<never> {
+    throw new Error("not used");
+  }
+  async patchIamGroup(): Promise<never> {
+    throw new Error("not used");
+  }
   async iamTenants(): Promise<never> {
     throw new Error("not used");
   }

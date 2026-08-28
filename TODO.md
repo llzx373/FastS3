@@ -246,9 +246,11 @@
 - [x] R1 AssumeRole:本租户 `ir:` 角色;权限 = Role ∩ 调用者可 assume 约束;不能越租户、不能变 root;
   GetSessionToken 仍不提权。compat 声明 D-E2「无角色」已被本条取代
   - 用例:`assume_role_same_tenant_ok`;`assume_role_cross_tenant_denied`
-- [ ] R2 LDAP 同步改为 User/Group + 策略挂载,**停止**「组→直接造 k:」;LDAP bind 登录控制台
+- [x] R2 LDAP 同步改为 User/Group + 策略挂载,**停止**「组→直接造 k:」;LDAP bind 登录控制台
   (目录无 User 则拒);OIDC `sub` 映射 User,JIT 必须落入默认组,禁止默默 consoleAdmin
   - 用例:`ldap_sync_creates_user_not_raw_key`;`ldap_bind_login_issues_jwt`;`oidc_jit_not_console_admin`
+  - 范围判定:DI5.3 的 AssumeRoleWithLDAPIdentity/WebIdentity 两个 STS 变体**本版未接线**(需管理面按
+    Role/用户生效策略签发的额外通路,会显著扩大 diff),compat 已登记;控制台登录路径覆盖 DI6 全部三条
 
 ### C. 控制台委托(≈1.5 pw)
 

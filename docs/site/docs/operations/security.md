@@ -49,13 +49,14 @@
 **联系渠道**:GitHub Security Advisory(私有报告)优先;issue 模板含
 「疑似安全缺陷」标记路径。外部安全审计计划见 GA 检查单 ④(docs/ga/checklist.md)。
 
-## 4. 身份集成(ADR-21;LDAP 目录同步 + OIDC 控制台 SSO)
+## 4. 身份集成(ADR-28 DI6;LDAP 目录同步 + bind 登录 + OIDC 控制台 SSO)
 
-> 管理面特性,数据面零改动(数据面仍只认 access key)。配置位于
+> 管理面特性,数据面零改动(数据面仍只认 access key / SA)。配置位于
 > web/server config.json(`ldap` / `oidc` 段)或 `FS3_LDAP_*` /
-> `FS3_OIDC_*` 环境变量。
+> `FS3_OIDC_*` 环境变量。M18 R2 起同步产物是 **IAM User/Group**,
+> 不再「组 → 直接造 k: 密钥」(应用密钥由用户自助建服务账号)。
 
-### 4.1 LDAP 目录同步(组 → 密钥生命周期)
+### 4.1 LDAP 目录同步(用户/组 → IAM User/Group)
 
 ```json
 {
@@ -66,7 +67,10 @@
     "base_dn": "ou=groups,dc=corp",
     "group_filter": "(objectClass=groupOfNames)",
     "groups": ["s3-admin", "s3-backup"],
-    "key_prefix": "ldap-",
+    "user_filter": "(objectClass=inetOrgPerson)",
+    "user_base_dn": "ou=users,dc=corp",
+    "tenant": "default",
+    "group_policies": { "s3-admin": ["readwrite"], "s3-backup": ["readonly"] },
     "sync_interval_secs": 300
   }
 }
@@ -74,15 +78,33 @@
 
 - **bind 密码只允许环境变量 `FS3_LDAP_BIND_PASSWORD`**:配置文件若含
   `bind_password` 字段则加载时忽略并告警,落盘序列化会剥掉该字段。
-- 每个配置组对应一个数据面 access key(`<key_prefix><组名>`);
-  组存在且有成员 → 自动创建/启用密钥;组消失或无成员 → 禁用密钥
-  (不删除);组从配置移除 → 删除密钥。
+- 目录用户 → IAM User(`tenant` 可配,默认 `default`):新建用户
+  `display_name = "ldap:<dn>"`(托管标记);目录消失 → **禁用不删除**;
+  重现 → 重新启用。同名但无 `ldap:` 标记的本地用户(含 bootstrap)
+  **不接管**,记 `user.conflict` 事件。
+- 目录组 → IAM Group:members = 目录成员 ∩ 租户内既有用户;policies =
+  `group_policies` 配置(**整表接管**)。组在目录中消失 → 清空成员,
+  组与已挂策略保留;组从 `groups` 配置移除 → 不动 IAM 组(防误删)。
 - **bind 密码仅进程内存持有**,不落盘、不进数据面、不进审计
-  (G1-3 同构)。
-- 目录不可达/绑定失败 → 本轮跳过(不动任何密钥,防误删),状态见
+  (G1-3 同构;ADR-21 DL1.3 保持)。
+- 目录不可达/绑定失败 → 本轮跳过(不动任何 IAM 实体,防误禁),状态见
   `GET /api/ldap/status`,事件见 `GET /api/identity-events`。
+- 存量 `ldap-*` k: 密钥(R2 前同步所造)为 bootstrap 属主遗留,**不自动
+  删除**,由管理员审计后手动吊销。
+- `key_prefix` 配置字段已废弃(仅为兼容旧配置文件保留,不再生效)。
 
-### 4.2 OIDC 控制台 SSO
+### 4.2 LDAP bind 登录控制台(ADR-28 DI6.2)
+
+- `POST /api/login` 顺序:**先本地口令用户**,未命中且 LDAP 启用 → 以
+  `cn=<username>,<user_base_dn>` 对目录 BIND(口令仅此一刻内存持有)。
+- bind 成功 → 查找同名 IAM User(ldap.tenant):**无对应 User → 401 拒绝**
+  (先同步后登录,防幽灵账号);User 已禁用 → 403;存在且启用 → 签发
+  既有会话 JWT(8h),`sub` = 用户名。
+- C1 前过渡口径:JWT `role` 由 IAM 挂载推导(挂 `consoleAdmin`/
+  `tenantAdmin` → `admin`,否则 `readonly`);bind 失败/目录不可达 →
+  回退结果 = 本地兜底后的 401(不静默放行)。
+
+### 4.3 OIDC 控制台 SSO(sub → IAM User,JIT 落默认组)
 
 ```json
 {
@@ -94,27 +116,38 @@
     "role_claim": "roles",
     "admin_values": ["fasts3-admin"],
     "readonly_values": ["fasts3-viewer"],
-    "fallback_role": ""
+    "fallback_role": "",
+    "default_tenant": "default",
+    "default_group": "sso-users"
   }
 }
 ```
 
 - 登录页出现「使用 OIDC 单点登录」:跳转 issuer authorize(implicit
   flow,`response_type=id_token`)→ 浏览器回跳携带 id_token → 服务端
-  校验(iss/aud/exp/nonce + JWKS RS256 或 HS256 client_secret)→ 签发
-  既有本地会话 JWT(8h,与账号密码登录共存)。
-- 角色映射 = `role_claim` 取值命中 `admin_values` / `readonly_values`;
-  未命中且 `fallback_role` 为空 → 拒绝登录。
+  校验(iss/aud/exp/nonce + JWKS RS256 或 HS256 client_secret)。
+- **M18 R2 起 `sub` 映射 IAM User**:已存在且启用 → 角色由 IAM 挂载推导
+  (同上过渡口径);已禁用 → 403;未知 sub → **JIT 建号**并落入
+  `default_group`(**该组须预先存在**,否则 403 `oidc_jit_no_default_group`;
+  未配置 `default_group` → 403 `oidc_jit_disabled` 不建号)。JIT 用户
+  `display_name = "oidc:<sub>"`,**永不直挂策略、永不得 consoleAdmin**——
+  权限完全来自默认组挂载。
+- role_claim 映射仅用于判定「允许登录」:**命中 admin_values 也不再升为
+  admin**(封顶 readonly),`fallback_role: "admin"` 同样封顶;未命中且
+  `fallback_role` 为空 → 拒绝登录。
 - issuer 不可达 → 明确报错,回退本地账号登录;会话生命周期不依赖
   issuer 在线(无状态 HS256)。
 - 取舍:不做 authorization code + PKCE(内网管理面 implicit 够用,
-  ADR-21 DL4 范围外)。
+  ADR-21 DL4 范围外);STS `AssumeRoleWithLDAPIdentity/WebIdentity`
+  (ADR-28 DI5.3)本版未接线,见 compat「IAM 多租户」节。
 
-### 4.3 身份审计
+### 4.4 身份审计
 
-- `GET /api/identity-events?limit=N`:LDAP 密钥创建/启用/禁用/删除/
-  同步跳过与 OIDC 登录事件(内存环形缓冲 ≤500 条,进程重启即失,
-  文档化;需要持久化请接日志采集)。
+- `GET /api/identity-events?limit=N`:LDAP 用户/组对账(user.created /
+  user.disabled / user.enabled / user.conflict / group.created /
+  group.updated / group.emptied / sync.skipped)、bind 登录与 OIDC
+  登录/JIT 事件(内存环形缓冲 ≤500 条,进程重启即失,文档化;需要
+  持久化请接日志采集)。
 
 ## 5. 发布产物信任链
 

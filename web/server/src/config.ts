@@ -16,7 +16,7 @@ export interface UserConfig {
   role: "admin" | "readonly";
 }
 
-/** LDAP 目录同步配置(ADR-21 DL1;bind 密码仅内存持有,不进数据面) */
+/** LDAP 目录同步配置(ADR-28 DI6:用户/组 → IAM User/Group;bind 密码仅内存持有,不进数据面) */
 export interface LdapConfig {
   enabled: boolean;
   url: string;
@@ -24,12 +24,22 @@ export interface LdapConfig {
   bind_password: string;
   base_dn: string;
   group_filter: string;
+  /** 纳入同步的目录组名清单 */
   groups: string[];
+  /** 用户搜索过滤(默认 inetOrgPerson) */
+  user_filter: string;
+  /** 用户子树 base(空 = 复用 base_dn);bind 登录 DN = cn=<username>,<user_base_dn> */
+  user_base_dn: string;
+  /** 同步落入的 IAM 租户(默认 default) */
+  tenant: string;
+  /** 目录组名 → 挂载策略名清单(同步整表接管该组 policies) */
+  group_policies: Record<string, string[]>;
+  /** 已废弃(M18 R2 起同步不再创建 k: 密钥;存量 ldap-* 密钥由管理员手动吊销) */
   key_prefix: string;
   sync_interval_secs: number;
 }
 
-/** OIDC 控制台 SSO 配置(ADR-21 DL3) */
+/** OIDC 控制台 SSO 配置(ADR-21 DL3 + ADR-28 DI6.3:sub → IAM User,JIT 落默认组) */
 export interface OidcConfig {
   enabled: boolean;
   issuer: string;
@@ -40,6 +50,10 @@ export interface OidcConfig {
   admin_values: string[];
   readonly_values: string[];
   fallback_role: "" | "admin" | "readonly";
+  /** JIT/映射落入的 IAM 租户(默认 default) */
+  default_tenant: string;
+  /** JIT 新建用户落入的默认组(须预先存在;空 = 禁止 JIT,未知 sub 拒绝登录) */
+  default_group: string;
 }
 
 export interface WebConfig {
@@ -163,6 +177,12 @@ export function loadConfig(opts?: LoadConfigOpts): WebConfig {
       base_dn: pick(env, "FS3_LDAP_BASE_DN", file?.ldap?.base_dn, ""),
       group_filter: pick(env, "FS3_LDAP_GROUP_FILTER", file?.ldap?.group_filter, "(objectClass=groupOfNames)"),
       groups: file?.ldap?.groups ?? [],
+      user_filter: pick(env, "FS3_LDAP_USER_FILTER", file?.ldap?.user_filter, "(objectClass=inetOrgPerson)"),
+      user_base_dn: pick(env, "FS3_LDAP_USER_BASE_DN", file?.ldap?.user_base_dn, ""),
+      tenant: pick(env, "FS3_LDAP_TENANT", file?.ldap?.tenant, "default"),
+      group_policies:
+        parseGroupPolicies(env.FS3_LDAP_GROUP_POLICIES) ?? file?.ldap?.group_policies ?? {},
+      // 已废弃(M18 R2):不再创建 ldap-* 密钥;字段保留仅为兼容旧配置文件
       key_prefix: pick(env, "FS3_LDAP_KEY_PREFIX", file?.ldap?.key_prefix, "ldap-"),
       sync_interval_secs: Number(pick(env, "FS3_LDAP_SYNC_INTERVAL", file?.ldap?.sync_interval_secs, 300)) || 300,
     },
@@ -176,8 +196,26 @@ export function loadConfig(opts?: LoadConfigOpts): WebConfig {
       admin_values: file?.oidc?.admin_values ?? ["admin", "fasts3-admin"],
       readonly_values: file?.oidc?.readonly_values ?? ["readonly", "viewer"],
       fallback_role: (pick(env, "FS3_OIDC_FALLBACK_ROLE", file?.oidc?.fallback_role, "") as "" | "admin" | "readonly") ?? "",
+      default_tenant: pick(env, "FS3_OIDC_DEFAULT_TENANT", file?.oidc?.default_tenant, "default"),
+      default_group: pick(env, "FS3_OIDC_DEFAULT_GROUP", file?.oidc?.default_group, ""),
     },
   };
+}
+
+/** FS3_LDAP_GROUP_POLICIES:JSON 对象 {目录组名: [策略名…]};解析失败 → undefined(回落配置文件)。 */
+function parseGroupPolicies(v: string | undefined): Record<string, string[]> | undefined {
+  if (!v) return undefined;
+  try {
+    const parsed = JSON.parse(v) as unknown;
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const out: Record<string, string[]> = {};
+    for (const [g, ps] of Object.entries(parsed as Record<string, unknown>)) {
+      if (Array.isArray(ps) && ps.every((p) => typeof p === "string")) out[g] = ps as string[];
+    }
+    return out;
+  } catch {
+    return undefined;
+  }
 }
 
 export function listenHostPort(listen: string): { host: string; port: number } {

@@ -5,9 +5,10 @@
  * id_token)→ 浏览器 URL fragment 取 id_token → POST /api/oidc/login。
  * 服务端:discovery(.well-known/openid-configuration)→ JWKS 取公钥
  * (RS256;HS256 用 client_secret)→ 校验 iss/aud/exp/nonce + 签名 →
- * 角色映射(role_claim 取值 → admin/readonly)→ 签发既有本地会话 JWT。
- * issuer 不可达/JWKS 失败 → 明确报错(回退本地账号登录);id_token
- * 非法 → 401 不签发。
+ * subject 提取;**M18 R2 起角色映射封顶 readonly**(claim 不再能换来
+ * admin——是否管理员由 IAM User 挂载策略决定,见 index.ts OIDC 登录路由;
+ * ADR-28 DI6.3 禁止默默 consoleAdmin)。issuer 不可达/JWKS 失败 → 明确
+ * 报错(回退本地账号登录);id_token 非法 → 401 不签发。
  */
 
 import { createPublicKey, createHmac, timingSafeEqual, verify as nodeCryptoVerify } from "node:crypto";
@@ -21,13 +22,13 @@ export interface OidcConfig {
   client_secret?: string;
   /** 登录页跳转回 URI(须与 issuer 登记一致) */
   redirect_uri: string;
-  /** 角色映射 claim 名(默认 roles) */
+  /** 角色映射 claim 名(默认 roles;仅判定"允许登录",不再产出 admin) */
   role_claim: string;
-  /** claim 值 → admin 角色 */
+  /** claim 值 → 允许登录(M18 R2 起封顶 readonly,不再升为 admin) */
   admin_values: string[];
-  /** claim 值 → readonly 角色 */
+  /** claim 值 → 允许登录(readonly) */
   readonly_values: string[];
-  /** 登录后签发本地会话的角色(claim 未命中时;空 = 拒绝) */
+  /** claim 未命中时是否放行(空 = 拒绝;"admin" 同样封顶 readonly) */
   fallback_role: "" | "admin" | "readonly";
 }
 
@@ -146,26 +147,25 @@ export class OidcVerifier {
       throw new OidcError(`unsupported id_token alg ${alg}`);
     }
 
-    // 角色映射
+    // 角色映射(M18 R2;ADR-28 DI6.3):claim 命中仅证明"可登录",封顶
+    // readonly —— admin_values 命中也不再升为 admin;fallback_role 配置
+    // "admin" 同样按 readonly 封顶。是否管理员以 IAM User 挂载策略为准
+    // (登录路由按 consoleAdmin/tenantAdmin 挂载推导,C1 前过渡口径)。
     const claimVal = claims[this.cfg.role_claim];
     const values: string[] = Array.isArray(claimVal)
       ? (claimVal as unknown[]).map(String)
       : typeof claimVal === "string"
         ? [claimVal]
         : [];
-    let role: "admin" | "readonly";
-    if (values.some((v) => this.cfg.admin_values.includes(v))) {
-      role = "admin";
-    } else if (values.some((v) => this.cfg.readonly_values.includes(v))) {
-      role = "readonly";
-    } else if (this.cfg.fallback_role) {
-      role = this.cfg.fallback_role;
-    } else {
+    const matched =
+      values.some((v) => this.cfg.admin_values.includes(v)) ||
+      values.some((v) => this.cfg.readonly_values.includes(v));
+    if (!matched && !this.cfg.fallback_role) {
       throw new OidcError("role claim not matched");
     }
     return {
       subject: String(claims.sub ?? claims.email ?? "oidc-user"),
-      role,
+      role: "readonly",
       email: typeof claims.email === "string" ? claims.email : undefined,
     };
   }

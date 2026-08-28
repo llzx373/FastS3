@@ -316,8 +316,10 @@ export interface LdapStatus {
   last_ok: boolean;
   last_error: string;
   fail_streak: number;
-  groups: { name: string; members: number; key: string; state: string }[];
-  keys_total: number;
+  /** M18 R2:同步产物 = IAM 用户/组(不再创建密钥) */
+  users: { name: string; state: string }[];
+  groups: { name: string; members: number; policies: string[]; state: string }[];
+  users_total: number;
 }
 
 export interface IdentityEvent {

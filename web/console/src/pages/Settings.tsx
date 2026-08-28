@@ -455,7 +455,8 @@ function OpsPanels() {
         {ldap ? (
           <p className="muted" style={{ fontSize: 12 }}>
             {ldap.enabled ? "已启用" : "未启用"} · 上次同步 {ldap.last_sync_at ? fmtTime(ldap.last_sync_at) : "—"} ·{" "}
-            {ldap.last_ok ? "成功" : ldap.last_error || "失败"} · 组 {ldap.groups?.length ?? 0} · 密钥 {ldap.keys_total}
+            {ldap.last_ok ? "成功" : ldap.last_error || "失败"} · 组 {ldap.groups?.length ?? 0} · 用户{" "}
+            {ldap.users_total}
           </p>
         ) : (
           <p className="muted" style={{ fontSize: 12 }}>LDAP 状态不可用</p>

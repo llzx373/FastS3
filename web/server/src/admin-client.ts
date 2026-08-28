@@ -95,6 +95,39 @@ export interface AdminApi {
   }): Promise<ServiceAccountInfo & { secret_key: string }>;
   /** 吊销 SA。 */
   deleteServiceAccount(accessKey: string): Promise<Record<string, unknown>>;
+  // M18 R2(ADR-28 DI6):IAM 用户/组 CRUD(LDAP/OIDC 同步与登录映射用)
+  /** 租户内用户列表(缺省 tenant = default)。 */
+  iamUsers(tenant?: string): Promise<{ tenant_id: string; users: IamUserInfo[] }>;
+  /** 创建用户(409 同名由调用方处理;口令明文仅此一次入站)。 */
+  createIamUser(body: {
+    tenant?: string;
+    name: string;
+    password?: string;
+    display_name?: string;
+  }): Promise<IamUserInfo>;
+  /** 更新用户(enabled/display_name/policies 整表替换)。 */
+  patchIamUser(
+    tenant: string,
+    name: string,
+    patch: { enabled?: boolean; display_name?: string | null; policies?: string[]; password?: string | null },
+  ): Promise<IamUserInfo>;
+  /** 租户内组列表。 */
+  iamGroups(tenant?: string): Promise<{ tenant_id: string; groups: IamGroupInfo[] }>;
+  /** 单个组(不存在 → null)。 */
+  iamGroup(tenant: string, name: string): Promise<IamGroupInfo | null>;
+  /** 创建组(members 须是本租户既有用户)。 */
+  createIamGroup(body: {
+    tenant?: string;
+    name: string;
+    members?: string[];
+    policies?: string[];
+  }): Promise<IamGroupInfo>;
+  /** 更新组(members/policies 整表替换)。 */
+  patchIamGroup(
+    tenant: string,
+    name: string,
+    patch: { members?: string[]; policies?: string[] },
+  ): Promise<IamGroupInfo>;
 }
 
 /** 审计查询过滤(J5:与 limit 并存的 query 参数,全部转发 Rust 侧)。 */
@@ -188,6 +221,8 @@ export interface IamUserInfo {
   tenant_id: string;
   name: string;
   enabled: boolean;
+  /** LDAP/OIDC 同步标记约定:`ldap:<dn>` / `oidc:<sub>` 前缀 = 外部身份源托管(R2) */
+  display_name?: string | null;
   policies: string[];
   groups: string[];
 }
@@ -198,6 +233,25 @@ export interface IamTenantInfo {
   display_name?: string;
   canonical_id?: string;
   enabled?: boolean;
+}
+
+/** M18 R2(ADR-28 DI2.2):IAM 组视图(members/policies 均为整表替换语义)。 */
+export interface IamGroupInfo {
+  tenant_id: string;
+  name: string;
+  members: string[];
+  policies: string[];
+}
+
+/**
+ * C1 前过渡口径:IAM 用户 → 控制台 JWT 二元角色。
+ * 挂 consoleAdmin/tenantAdmin → "admin",其余 → "readonly";C1 起废除二元角色、
+ * 授权改查 IAM admin:* 动作族(ADR-28 DI3.3)。
+ */
+export function consoleRoleFor(user: IamUserInfo): "admin" | "readonly" {
+  return user.policies.some((p) => p === "consoleAdmin" || p === "tenantAdmin")
+    ? "admin"
+    : "readonly";
 }
 
 /** M18 S1(ADR-28 DI2.4):服务账号元数据(绝不含 secret 材料)。 */
@@ -562,6 +616,71 @@ export class AdminClient implements AdminApi {
     return this.expect(
       "DELETE",
       `/v1/iam/service-accounts/${encodeURIComponent(accessKey)}`
+    );
+  }
+
+  // ── M18 R2:IAM 用户/组(ADR-28 DI6;LDAP/OIDC 映射到 User/Group) ──
+
+  iamUsers(tenant = "default"): Promise<{ tenant_id: string; users: IamUserInfo[] }> {
+    return this.expect("GET", `/v1/iam/users?tenant=${encodeURIComponent(tenant)}`);
+  }
+
+  createIamUser(body: {
+    tenant?: string;
+    name: string;
+    password?: string;
+    display_name?: string;
+  }): Promise<IamUserInfo> {
+    return this.expect("POST", "/v1/iam/users", body);
+  }
+
+  patchIamUser(
+    tenant: string,
+    name: string,
+    patch: { enabled?: boolean; display_name?: string | null; policies?: string[]; password?: string | null },
+  ): Promise<IamUserInfo> {
+    return this.expect(
+      "PATCH",
+      `/v1/iam/users/${encodeURIComponent(tenant)}/${encodeURIComponent(name)}`,
+      patch,
+    );
+  }
+
+  iamGroups(tenant = "default"): Promise<{ tenant_id: string; groups: IamGroupInfo[] }> {
+    return this.expect("GET", `/v1/iam/groups?tenant=${encodeURIComponent(tenant)}`);
+  }
+
+  /** 单个组;404 → null(同步 upsert 判定用)。 */
+  async iamGroup(tenant: string, name: string): Promise<IamGroupInfo | null> {
+    const res = await this.request(
+      "GET",
+      `/v1/iam/groups/${encodeURIComponent(tenant)}/${encodeURIComponent(name)}`
+    );
+    if (res.status === 404) return null;
+    if (res.status !== 200) {
+      throw new Error(`admin GET iam group: HTTP ${res.status}: ${res.text}`);
+    }
+    return res.json as IamGroupInfo;
+  }
+
+  createIamGroup(body: {
+    tenant?: string;
+    name: string;
+    members?: string[];
+    policies?: string[];
+  }): Promise<IamGroupInfo> {
+    return this.expect("POST", "/v1/iam/groups", body);
+  }
+
+  patchIamGroup(
+    tenant: string,
+    name: string,
+    patch: { members?: string[]; policies?: string[] },
+  ): Promise<IamGroupInfo> {
+    return this.expect(
+      "PATCH",
+      `/v1/iam/groups/${encodeURIComponent(tenant)}/${encodeURIComponent(name)}`,
+      patch,
     );
   }
 }

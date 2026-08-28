@@ -2,7 +2,10 @@
  * FastS3 Web 管理面入口(I1~I3):Fastify + TS。
  *
  * 端点(设计 §7.3):
- *   POST /api/login                       登录(JWT HS256,admin/readonly 角色)
+ *   POST /api/login                       登录(JWT HS256;先本地口令用户,未命中且 LDAP 启用 → LDAP bind,
+ *                                         身份须为已同步 IAM User,ADR-28 DI6.2)
+ *   POST /api/oidc/login                  OIDC SSO(sub → IAM User;未知 sub JIT 落 oidc.default_group,
+ *                                         永不默默 consoleAdmin,ADR-28 DI6.3)
  *   GET  /api/bootstrap                   首启探测(无认证;first_run=keys==0&&buckets==0)
  *   GET  /api/health                      自身健康检查
  *   GET  /api/dashboard                   聚合概览
@@ -36,9 +39,9 @@ import { readFileSync } from "node:fs";
 import { WebSocketServer } from "ws";
 import { loadConfig, listenHostPort, type WebConfig } from "./config.js";
 import { authPlugin, issueToken, requireRole, verifyJwt, type JwtClaims } from "./auth.js";
-import { IdentityEvents, LdapSync, type LdapSyncConfig } from "./ldap-sync.js";
+import { IdentityEvents, LdapSync, ldapBindLogin, type LdapSyncConfig } from "./ldap-sync.js";
 import { OidcVerifier, OidcError, type OidcConfig } from "./oidc.js";
-import { AdminClient } from "./admin-client.js";
+import { AdminClient, consoleRoleFor, type IamUserInfo } from "./admin-client.js";
 import { AdminWsClient } from "./admin-ws.js";
 import { S3Client, S3M10Client, type BucketCorsRule, type LifecycleRule, type ObjectLockConfig, type S3Tag, type NotificationRule, type InventoryRule } from "./s3-client.js";
 import { createHash } from "node:crypto";
@@ -98,18 +101,58 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     identity.ldap.stop();
   });
 
-  // ── 登录(无认证) ──
+  // ── 登录(无认证):先本地口令用户,未命中且 LDAP 启用 → LDAP bind(DI6.2) ──
   app.post("/api/login", async (req, reply) => {
     const body = req.body as { username?: string; password?: string } | null;
     const username = body?.username ?? "";
     const password = body?.password ?? "";
     const user = cfg.users.find((u) => u.username === username && u.password === password);
-    if (!user) {
-      return reply.code(401).send({
-        error: { code: "invalid_credentials", message: "用户名或密码错误" },
-      });
+    if (user) {
+      return { token: issueToken(user, cfg.jwtSecret), role: user.role, username: user.username };
     }
-    return { token: issueToken(user, cfg.jwtSecret), role: user.role, username: user.username };
+    if (cfg.ldap.enabled && username && password) {
+      // LDAP bind 登录(ADR-28 DI6.2):bind 成功仅证明目录凭据有效;
+      // 身份必须是已同步的 IAM User,否则拒绝(先同步后登录,防幽灵账号)。
+      try {
+        await ldapBindLogin(cfg.ldap, username, password);
+      } catch {
+        return reply.code(401).send({
+          error: { code: "invalid_credentials", message: "用户名或密码错误" },
+        });
+      }
+      const tenant = cfg.ldap.tenant || "default";
+      let iam: IamUserInfo | null;
+      try {
+        iam = await admin.iamUser(tenant, username);
+      } catch (e) {
+        return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+      }
+      if (!iam) {
+        identity.events.push({
+          source: "ldap",
+          action: "login.rejected",
+          detail: `${username}: bind 成功但无对应 IAM User(防幽灵)`,
+        });
+        return reply.code(401).send({
+          error: { code: "no_such_user", message: "目录账号尚未同步为 FastS3 用户,请等待同步或联系管理员" },
+        });
+      }
+      if (!iam.enabled) {
+        identity.events.push({
+          source: "ldap",
+          action: "login.rejected",
+          detail: `${tenant}/${username}: IAM User 已禁用`,
+        });
+        return reply.code(403).send({ error: { code: "user_disabled", message: "用户已禁用" } });
+      }
+      // C1 前过渡口径:角色从 IAM 挂载推导(consoleAdmin/tenantAdmin → admin)
+      const role = consoleRoleFor(iam);
+      identity.events.push({ source: "ldap", action: "login", detail: `${tenant}/${username} role=${role}` });
+      return { token: issueToken({ username, password: "", role }, cfg.jwtSecret), role, username };
+    }
+    return reply.code(401).send({
+      error: { code: "invalid_credentials", message: "用户名或密码错误" },
+    });
   });
 
   // ── OIDC 控制台 SSO(ADR-21 DL3;登录一刻身份证明,无认证) ──
@@ -144,13 +187,74 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     }
     try {
       const r = await identity.oidc.verifyIdToken(idToken, nonce);
-      const user = { username: r.subject, password: "", role: r.role } as never;
+      // ADR-28 DI6.3:sub → IAM User;未知 sub 可 JIT,但必须落入配置的
+      // 默认组,且永不挂 consoleAdmin/tenantAdmin(角色由 IAM 挂载推导,
+      // verifyIdToken 的 claim 映射已封顶 readonly)。
+      const tenant = cfg.oidc.default_tenant || "default";
+      let iam: IamUserInfo | null;
+      try {
+        iam = await admin.iamUser(tenant, r.subject);
+      } catch (e) {
+        return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+      }
+      let role: "admin" | "readonly";
+      if (iam) {
+        if (!iam.enabled) {
+          return reply.code(403).send({ error: { code: "user_disabled", message: "用户已禁用" } });
+        }
+        role = consoleRoleFor(iam);
+      } else {
+        const group = cfg.oidc.default_group;
+        if (!group) {
+          return reply.code(403).send({
+            error: { code: "oidc_jit_disabled", message: "未知用户且未配置 oidc.default_group,禁止自动建号" },
+          });
+        }
+        let g;
+        try {
+          g = await admin.iamGroup(tenant, group);
+        } catch (e) {
+          return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+        }
+        if (!g) {
+          return reply.code(403).send({
+            error: { code: "oidc_jit_no_default_group", message: `默认组 ${tenant}/${group} 不存在,请先创建` },
+          });
+        }
+        try {
+          iam = await admin.createIamUser({ tenant, name: r.subject, display_name: `oidc:${r.subject}` });
+        } catch {
+          // 并发 JIT 撞名:重查一次
+          iam = await admin.iamUser(tenant, r.subject).catch(() => null);
+          if (!iam) {
+            return reply.code(403).send({
+              error: { code: "oidc_jit_failed", message: `JIT 创建用户 ${r.subject} 失败(名非法或冲突)` },
+            });
+          }
+          if (!iam.enabled) {
+            return reply.code(403).send({ error: { code: "user_disabled", message: "用户已禁用" } });
+          }
+        }
+        if (!g.members.includes(r.subject)) {
+          await admin.patchIamGroup(tenant, group, { members: [...g.members, r.subject] });
+        }
+        identity.events.push({
+          source: "oidc",
+          action: "user.jit",
+          detail: `${tenant}/${r.subject} → 默认组 ${group}(策略经组挂载,不直挂)`,
+        });
+        role = consoleRoleFor(iam); // JIT 用户无直挂策略 → readonly
+      }
       identity.events.push({
         source: "oidc",
         action: "login",
-        detail: `subject=${r.subject} role=${r.role}${r.email ? ` email=${r.email}` : ""}`,
+        detail: `subject=${r.subject} role=${role}${r.email ? ` email=${r.email}` : ""}`,
       });
-      return reply.send({ token: issueToken(user, cfg.jwtSecret), role: r.role, username: r.subject });
+      return reply.send({
+        token: issueToken({ username: r.subject, password: "", role }, cfg.jwtSecret),
+        role,
+        username: r.subject,
+      });
     } catch (e) {
       const status = e instanceof OidcError ? e.status : 500;
       return reply.code(status).send({ error: { code: "oidc_login_failed", message: (e as Error).message } });

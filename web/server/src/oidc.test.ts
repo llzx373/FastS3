@@ -96,7 +96,7 @@ function cfg(over: Partial<OidcConfig> = {}): OidcConfig {
   };
 }
 
-test("oidc: RS256 id_token 校验 + 角色映射(admin/readonly/拒绝)", async (t) => {
+test("oidc: RS256 id_token 校验 + 角色映射封顶 readonly(M18 R2:claim 不再换 admin)", async (t) => {
   const mock = new MockIssuer();
   await mock.listen();
   t.after(() => mock.close());
@@ -109,9 +109,9 @@ test("oidc: RS256 id_token 校验 + 角色映射(admin/readonly/拒绝)", async 
     sub: "alice@corp",
   };
 
-  // admin
+  // admin claim 命中 → 仍封顶 readonly(是否管理员由 IAM User 挂载决定)
   let r = await verifier.verifyIdToken(mock.signIdToken({ ...base, roles: ["admin"] }), "n1");
-  assert.equal(r.role, "admin");
+  assert.equal(r.role, "readonly");
   assert.equal(r.subject, "alice@corp");
 
   // readonly(数组外单值)
@@ -158,13 +158,10 @@ test("oidc: RS256 id_token 校验 + 角色映射(admin/readonly/拒绝)", async 
   );
 });
 
-test("oidc: 回退角色配置生效", async (t) => {
+test("oidc: 回退角色配置生效(admin 回退同样封顶 readonly)", async (t) => {
   const mock = new MockIssuer();
   await mock.listen();
   t.after(() => mock.close());
-  const verifier = new OidcVerifier(
-    cfg({ issuer: `http://127.0.0.1:${mock.port}`, fallback_role: "readonly" }),
-  );
   const base = {
     iss: `http://127.0.0.1:${mock.port}`,
     aud: "fasts3-console",
@@ -172,7 +169,17 @@ test("oidc: 回退角色配置生效", async (t) => {
     nonce: "n",
     sub: "bob",
   };
-  const r = await verifier.verifyIdToken(mock.signIdToken({ ...base, roles: ["nobody"] }), "n");
+  // fallback readonly
+  let verifier = new OidcVerifier(
+    cfg({ issuer: `http://127.0.0.1:${mock.port}`, fallback_role: "readonly" }),
+  );
+  let r = await verifier.verifyIdToken(mock.signIdToken({ ...base, roles: ["nobody"] }), "n");
+  assert.equal(r.role, "readonly");
+  // fallback "admin" 也封顶 readonly(ADR-28 DI6.3:不默默 consoleAdmin)
+  verifier = new OidcVerifier(
+    cfg({ issuer: `http://127.0.0.1:${mock.port}`, fallback_role: "admin" }),
+  );
+  r = await verifier.verifyIdToken(mock.signIdToken({ ...base, roles: ["nobody"] }), "n");
   assert.equal(r.role, "readonly");
 });
 
@@ -190,7 +197,7 @@ test("oidc: HS256 client_secret 校验", async (t) => {
   };
   const token = mock.signHmac({ ...base, roles: ["admin"] }, "hs-secret");
   const r = await verifier.verifyIdToken(token, "n");
-  assert.equal(r.role, "admin");
+  assert.equal(r.role, "readonly", "HS256 同样封顶 readonly");
   // 错误 secret → 签名无效
   const bad = mock.signHmac({ ...base, roles: ["admin"] }, "wrong-secret");
   await assert.rejects(verifier.verifyIdToken(bad, "n"), /signature invalid/);
