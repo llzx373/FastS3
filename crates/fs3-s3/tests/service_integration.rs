@@ -12750,3 +12750,248 @@ fn policy_detach_takes_effect_on_next_put() {
         "legacy 密钥不受解挂影响"
     );
 }
+
+// ───────────────────── M18 S3:桶属主租户化 / ListBuckets 隐式过滤 / 跨租户默认拒绝(ADR-28 DI1.2/DI1.4/DI3.4/DI9.1)─────────────────────
+
+/// S3 测试共用:租户 + enabled 用户(无策略挂载)+ 名下 SA,返回数据面凭据。
+/// 无挂载 = 身份层 None,同租户内走 legacy 并集语义——隔离力完全来自
+/// 租户边界本身,便于钉死 DI1.4。
+fn s3_tenant_sa(
+    svc: &S3Service,
+    tenant: &str,
+    canonical: &str,
+    user: &str,
+    ak: &str,
+    secret: &str,
+) -> Credentials {
+    svc.put_tenant(&fs3_core::Tenant {
+        tenant_id: tenant.into(),
+        display_name: tenant.into(),
+        canonical_id: canonical.into(),
+        enabled: true,
+        created_at: 1_700_000_000,
+    })
+    .unwrap();
+    svc.put_iam_user(&s1_user(tenant, user, vec![])).unwrap();
+    svc.add_key_owned(ak, secret, None, tenant, user, None, None)
+        .unwrap();
+    Credentials {
+        access_key: ak.into(),
+        secret_key: secret.into(),
+    }
+}
+
+/// ListBuckets 响应 XML(已认证调用者)。
+fn s3_list_xml(svc: &S3Service, creds: &Credentials) -> String {
+    let r = svc
+        .handle(&req_creds("GET", "/", creds, &[], vec![]))
+        .unwrap();
+    match r.body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!("unexpected body"),
+    }
+}
+
+/// M18 S3(TODO 钉死用例;ADR-28 DI3.4/DI9.1):CreateBucket 属主 = 调用者
+/// 租户 canonical_id —— 租户 A 的 alice SA 建桶,BucketMeta.owner 落
+/// `canon-a`;`x-amz-expected-bucket-owner` 比对对象同步升格(头值 =
+/// canon-a 放行、= "fasts3" 拒绝)。legacy 密钥建桶属主仍 "fasts3"
+/// (存量语义不变);幂等重建不覆盖属主。
+#[test]
+fn create_bucket_owner_is_caller_tenant() {
+    let (_d, svc) = setup();
+    let sa_alice = s3_tenant_sa(&svc, "ta", "canon-a", "alice", "AKIA_S5A", "s5a-secret");
+    let r = svc.handle(&req_creds("PUT", "/s5bkt", &sa_alice, &[], vec![]));
+    assert_eq!(status(&r), 200, "租户 SA 建桶: {r:?}");
+    let meta = svc
+        .engine()
+        .read()
+        .meta()
+        .get_bucket("s5bkt")
+        .unwrap()
+        .unwrap();
+    assert_eq!(meta.owner, "canon-a", "新桶属主 = 调用者租户 canonical");
+    // expected-bucket-owner 比对对象 = 属主 canonical(M15 C2 从「恒
+    // fasts3」升格;T2 的协议面钉死,S3 先落语义)
+    let r = svc.handle(&req_creds(
+        "GET",
+        "/s5bkt",
+        &sa_alice,
+        &[("x-amz-expected-bucket-owner", "canon-a")],
+        vec![],
+    ));
+    assert_eq!(status(&r), 200, "头值 = 属主 canonical 放行: {r:?}");
+    let r = svc.handle(&req_creds(
+        "GET",
+        "/s5bkt",
+        &sa_alice,
+        &[("x-amz-expected-bucket-owner", "fasts3")],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "AccessDenied", "头值 ≠ 属主 403: {r:?}");
+    // 同租户幂等重建(无 ACL 历史)→ 200 no-op,属主不被覆盖
+    let r = svc.handle(&req_creds("PUT", "/s5bkt", &sa_alice, &[], vec![]));
+    assert_eq!(status(&r), 200, "幂等重建: {r:?}");
+    let meta = svc
+        .engine()
+        .read()
+        .meta()
+        .get_bucket("s5bkt")
+        .unwrap()
+        .unwrap();
+    assert_eq!(meta.owner, "canon-a", "幂等重建不覆盖属主");
+    // legacy 密钥(构造注入,无属主记录)建桶 → owner 仍 "fasts3"
+    assert_eq!(status(&svc.handle(&req("PUT", "/s5legacy", vec![]))), 200);
+    let meta = svc
+        .engine()
+        .read()
+        .meta()
+        .get_bucket("s5legacy")
+        .unwrap()
+        .unwrap();
+    assert_eq!(meta.owner, "fasts3", "legacy 建桶属主不变");
+}
+
+/// M18 S3(TODO 钉死用例;ADR-28 DI3.4):ListBuckets 隐式过滤 —— 租户 A
+/// (alice) 建 a1/a2,租户 B (bob) 建 b1:bob 的 List 只含 b1,alice 的
+/// 只含 a1/a2(从不 403 整个 List);Owner 块 = 调用者 canonical。legacy
+/// 构造注入密钥(无属主记录,超管口径)→ 全量三桶,行为不变。桶策略
+/// 具名 `arn:aws:iam::{B}:user/bob` Allow s3:ListBucket 后(DI1.4 逃生
+/// 口),bob 的 List 增见 a1(仍不见 a2)。
+#[test]
+fn list_buckets_filtered_by_iam() {
+    let (_d, svc) = setup();
+    let sa_alice = s3_tenant_sa(&svc, "ta", "canon-a", "alice", "AKIA_S6A", "s6a-secret");
+    let sa_bob = s3_tenant_sa(&svc, "tb", "canon-b", "bob", "AKIA_S6B", "s6b-secret");
+    for b in ["s6a1", "s6a2"] {
+        let p = format!("/{b}");
+        let r = svc.handle(&req_creds("PUT", &p, &sa_alice, &[], vec![]));
+        assert_eq!(status(&r), 200, "alice 建 {b}: {r:?}");
+    }
+    let r = svc.handle(&req_creds("PUT", "/s6b1", &sa_bob, &[], vec![]));
+    assert_eq!(status(&r), 200, "bob 建 s6b1: {r:?}");
+    // bob → 仅 b1;Owner = canon-b
+    let xml = s3_list_xml(&svc, &sa_bob);
+    assert!(xml.contains("<Name>s6b1</Name>"), "{xml}");
+    assert!(!xml.contains("<Name>s6a1</Name>"), "{xml}");
+    assert!(!xml.contains("<Name>s6a2</Name>"), "{xml}");
+    assert!(
+        xml.contains("<Owner><ID>canon-b</ID><DisplayName>canon-b</DisplayName></Owner>"),
+        "{xml}"
+    );
+    // alice → a1/a2;Owner = canon-a
+    let xml = s3_list_xml(&svc, &sa_alice);
+    assert!(xml.contains("<Name>s6a1</Name>"), "{xml}");
+    assert!(xml.contains("<Name>s6a2</Name>"), "{xml}");
+    assert!(!xml.contains("<Name>s6b1</Name>"), "{xml}");
+    assert!(
+        xml.contains("<Owner><ID>canon-a</ID><DisplayName>canon-a</DisplayName></Owner>"),
+        "{xml}"
+    );
+    // legacy 构造注入密钥(无 k: 属主记录)→ 全量 + Owner "fasts3"(不变)
+    let r = svc.handle(&req("GET", "/", vec![])).unwrap();
+    let xml = match r.body {
+        ResponseBody::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => panic!("unexpected body"),
+    };
+    for b in ["s6a1", "s6a2", "s6b1"] {
+        assert!(xml.contains(&format!("<Name>{b}</Name>")), "{xml}");
+    }
+    assert!(
+        xml.contains("<Owner><ID>fasts3</ID><DisplayName>fasts3</DisplayName></Owner>"),
+        "{xml}"
+    );
+    // DI1.4 逃生口:a1 桶策略具名 bob 的 ARN Allow s3:ListBucket →
+    // bob 的 List 增见 a1(a2 仍不可见;不过滤整个 List、不 403)
+    let doc = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::canon-b:user/bob"},"Action":"s3:ListBucket","Resource":["arn:aws:s3:::s6a1"]}]}"#;
+    assert_eq!(
+        status(&svc.handle(&req_q(
+            "PUT",
+            "/s6a1",
+            &[("policy", "")],
+            doc.as_bytes().to_vec()
+        ))),
+        204
+    );
+    let xml = s3_list_xml(&svc, &sa_bob);
+    assert!(xml.contains("<Name>s6b1</Name>"), "{xml}");
+    assert!(
+        xml.contains("<Name>s6a1</Name>"),
+        "具名 Allow 后可见: {xml}"
+    );
+    assert!(!xml.contains("<Name>s6a2</Name>"), "未点名仍不可见: {xml}");
+}
+
+/// M18 S3(ADR-28 DI1.2/DI1.4):跨租户默认 403 —— bob(租户 B)对 alice
+/// (租户 A)的桶 GET/PUT/列举一律 AccessDenied;**即便 bob 身份层挂
+/// canned readwrite 也不跨租户桥接**(身份策略作用域 = 本租户,唯一逃生
+/// 口 = 桶策略具名 Principal);alice 同租户读写不受影响;legacy 构造注入
+/// 密钥(无属主记录)不参与租户边界。桶策略点名 bob 的 ARN Allow 后
+/// GET/PUT 即时 200(DI1.4 可选能力)。
+#[test]
+fn cross_tenant_access_default_denied() {
+    let (_d, svc) = setup();
+    let sa_alice = s3_tenant_sa(&svc, "ta", "canon-a", "alice", "AKIA_S7A", "s7a-secret");
+    let sa_bob = s3_tenant_sa(&svc, "tb", "canon-b", "bob", "AKIA_S7B", "s7b-secret");
+    let r = svc.handle(&req_creds("PUT", "/s7bkt", &sa_alice, &[], vec![]));
+    assert_eq!(status(&r), 200, "alice 建桶: {r:?}");
+    let r = svc.handle(&req_creds(
+        "PUT",
+        "/s7bkt/k",
+        &sa_alice,
+        &[],
+        b"data".to_vec(),
+    ));
+    assert_eq!(status(&r), 200, "同租户写入: {r:?}");
+    // 跨租户默认拒绝:读/写/列举/Head 同判
+    for (m, path, body) in [
+        ("GET", "/s7bkt/k", vec![]),
+        ("PUT", "/s7bkt/k2", b"x".to_vec()),
+        ("GET", "/s7bkt", vec![]),
+        ("HEAD", "/s7bkt", vec![]),
+    ] {
+        let r = svc.handle(&req_creds(m, path, &sa_bob, &[], body));
+        assert_eq!(err_code(&r), "AccessDenied", "{m} {path} 跨租户 403: {r:?}");
+    }
+    // bob 身份层挂 readwrite:自身身份策略 Allow 不跨租户桥接,仍 403
+    svc.put_iam_user(&s1_user("tb", "bob", vec!["readwrite".into()]))
+        .unwrap();
+    let r = svc.handle(&req_creds("GET", "/s7bkt/k", &sa_bob, &[], vec![]));
+    assert_eq!(
+        err_code(&r),
+        "AccessDenied",
+        "身份层 readwrite 不跨租户桥接: {r:?}"
+    );
+    // bob 自己租户的桶照常(readwrite 在同租户内生效)
+    let r = svc.handle(&req_creds("PUT", "/s7bob", &sa_bob, &[], vec![]));
+    assert_eq!(status(&r), 200, "同租户建桶: {r:?}");
+    let r = svc.handle(&req_creds("PUT", "/s7bob/k", &sa_bob, &[], b"y".to_vec()));
+    assert_eq!(status(&r), 200, "同租户写入: {r:?}");
+    // legacy 构造注入密钥(无属主记录)= 超管口径,不参与租户边界
+    assert_eq!(
+        status(&svc.handle(&req("GET", "/s7bkt/k", vec![]))),
+        200,
+        "legacy 密钥行为不变"
+    );
+    // DI1.4 逃生口:桶策略具名 bob ARN Allow Get/Put → 即时放行
+    let doc = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::canon-b:user/bob"},"Action":["s3:GetObject","s3:PutObject"],"Resource":["arn:aws:s3:::s7bkt/*"]}]}"#;
+    assert_eq!(
+        status(&svc.handle(&req_q(
+            "PUT",
+            "/s7bkt",
+            &[("policy", "")],
+            doc.as_bytes().to_vec()
+        ))),
+        204
+    );
+    let r = svc.handle(&req_creds("GET", "/s7bkt/k", &sa_bob, &[], vec![]));
+    assert_eq!(status(&r), 200, "具名 Allow 后 GET 放行: {r:?}");
+    let r = svc.handle(&req_creds("PUT", "/s7bkt/k2", &sa_bob, &[], b"z".to_vec()));
+    assert_eq!(status(&r), 200, "具名 Allow 后 PUT 放行: {r:?}");
+    // 未被点名的动作(DeleteObject)仍默认拒绝
+    let r = svc.handle(&req_creds("DELETE", "/s7bkt/k", &sa_bob, &[], vec![]));
+    assert_eq!(err_code(&r), "AccessDenied", "未点名动作仍 403: {r:?}");
+    // alice 同租户全程不受影响
+    let r = svc.handle(&req_creds("GET", "/s7bkt/k", &sa_alice, &[], vec![]));
+    assert_eq!(status(&r), 200, "属主租户不受影响: {r:?}");
+}

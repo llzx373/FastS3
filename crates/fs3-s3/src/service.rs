@@ -938,6 +938,35 @@ impl S3Service {
         if bucket_decision == Decision::Deny {
             return Err(denied());
         }
+        // M18 S3(ADR-28 DI1.2/DI1.4):跨租户默认拒绝 —— 桶属主 canonical ≠
+        // 调用者 canonical 时,唯一放行来源 = 桶策略显式 Allow(Principal 具名
+        // 点名调用者 ARN,U3;已 Allow 则不进此分支);legacy「无密钥策略 =
+        // 隐式放行」与调用者自身身份/密钥策略 Allow 均不跨租户桥接(身份
+        // 策略作用域 = 本租户)。无 `k:` 属主记录的构造注入密钥(升级前
+        // 超管口径)不参与租户边界,行为与 M18 前逐字节一致;桶不存在交
+        // 下游 NoSuchBucket;匿名无租户身份,不介入。
+        if let Some(caller) = &ctx.caller {
+            if !bucket.is_empty()
+                && bucket_decision != Decision::Allow
+                && self
+                    .key_owners
+                    .lock()
+                    .unwrap()
+                    .contains_key(&caller.access_key)
+            {
+                let cross_tenant = self
+                    .engine
+                    .read()
+                    .meta()
+                    .get_bucket(bucket)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|m| m.owner != caller.tenant_canonical_id);
+                if cross_tenant {
+                    return Err(denied());
+                }
+            }
+        }
         match access {
             Some(_) => {
                 // 并集:无密钥策略(隐式放行)或任一层 Allow
@@ -3243,6 +3272,37 @@ impl S3Service {
         if let Some(m) = marker {
             buckets.retain(|(n, _)| n.as_str() > m.as_str());
         }
+        // M18 S3(ADR-28 DI3.4):ListBuckets 隐式过滤 —— 只保留调用者可见的
+        // 桶,从不 403 整个 List。可见 = ① 桶属主 canonical = 调用者
+        // canonical(同租户);② 调用者身份层显式 Allow s3:ListBucket 于该桶
+        // ARN;③ 桶策略具名 Principal 显式 Allow 调用者(DI1.4 跨租户逃生
+        // 口)。无 `k:` 属主记录的构造注入密钥(升级前超管口径)与匿名请求
+        // 不过滤——存量桶皆 "fasts3" 属主 = default canonical,规则①天然
+        // 全保留,legacy 行为分毫不改。
+        let caller = self
+            .authenticate_full(req)
+            .ok()
+            .flatten()
+            .map(|a| self.caller_identity(&a.who));
+        let tenant_bound = caller
+            .as_ref()
+            .is_some_and(|c| self.key_owners.lock().unwrap().contains_key(&c.access_key));
+        if tenant_bound {
+            let caller = caller.as_ref().unwrap();
+            let mut ctx = self.policy_ctx(req, "", "");
+            ctx.caller = Some(caller.clone());
+            buckets.retain(|(name, meta)| {
+                if meta.owner == caller.tenant_canonical_id {
+                    return true;
+                }
+                let arn = resource_arn(name, "");
+                self.iam_identity_decision(&caller.access_key, "ListBucket", &arn, &ctx)
+                    == Some(crate::policy::Decision::Allow)
+                    || self.bucket_policy(name).is_some_and(|p| {
+                        p.decide("ListBucket", &arn, true, &ctx) == crate::policy::Decision::Allow
+                    })
+            });
+        }
         let truncated = match max {
             Some(m) if buckets.len() > m => {
                 buckets.truncate(m);
@@ -3255,7 +3315,12 @@ impl S3Service {
         } else {
             None
         };
-        let owner = "fasts3";
+        // Owner 块 = 调用者租户 canonical(legacy/匿名 → default canonical
+        // "fasts3",与 M18 前硬编码一致;T2 负责其余 Owner 回显点升格)
+        let owner = caller
+            .as_ref()
+            .map(|c| c.tenant_canonical_id.as_str())
+            .unwrap_or("fasts3");
         let xml = xml::render_list_buckets(owner, &buckets, truncated, next.as_deref());
         let mut headers = vec![("Content-Type".into(), "application/xml".into())];
         headers.push(("Content-Length".into(), xml.len().to_string()));
@@ -3310,9 +3375,23 @@ impl S3Service {
                     .with_message("PublicAccessBlock BlockPublicAcls denies public canned ACL."));
             }
         }
+        // M18 S3(ADR-28 DI3.4/DI9.1):新桶属主 = 调用者租户 canonical_id
+        // (SA → k: 属主 → 租户 canonical;无属主记录的 legacy 密钥解析到
+        // default 租户 canonical = "fasts3",存量行为逐字节不变)。
+        let caller = self
+            .authenticate_full(req)
+            .ok()
+            .flatten()
+            .map(|a| self.caller_identity(&a.who));
+        let owner = if let Some(c) = &caller {
+            c.tenant_canonical_id.clone()
+        } else {
+            // 匿名/认证失败(到不了这里,require_auth 已拦)→ 保持旧串
+            fs3_core::Tenant::DEFAULT_CANONICAL_ID.to_string()
+        };
         let mut meta = BucketMeta {
             created: now_ts(),
-            owner: "fasts3".into(),
+            owner,
             stats: Default::default(),
             quota: None,
             created_with_acl: has_acl_headers(req),
