@@ -260,7 +260,7 @@
 - [x] C2 部门自助演练(门禁剧本):root 建租户 A + tenantAdmin → 管理员登录建用户 `alice` 挂 readwrite
   → alice 自助建 SA → SA 读写 A 的桶 → 租户 B 的桶 List/GET 失败
   - 用例:脚本 `tests/iam/delegated_admin_drill.sh` 全绿,全程不用 root 数据面 AK
-- [ ] C3 文档:MinIO 运维对照表(`mc admin user/group/policy` 概念 → FastS3 控制台/API);
+- [x] C3 文档:MinIO 运维对照表(`mc admin user/group/policy` 概念 → FastS3 控制台/API);
   写明 **不支持** `mc admin` 二进制;生产「root 只引导」清单
 
 ### T. 协议与测试

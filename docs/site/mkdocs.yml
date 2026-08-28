@@ -29,6 +29,7 @@ nav:
       - 容器: deployment/container.md
   - 运维:
       - 管理员指南: operations/admin-guide.md
+      - IAM 多租户运维: operations/iam.md
       - 升级与回滚: operations/upgrade.md
       - 备份/恢复: operations/backup-restore.md
       - 审计导出(代替 Logging): operations/audit-export.md
