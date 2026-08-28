@@ -329,6 +329,68 @@ export interface IdentityEvent {
   detail: string;
 }
 
+// ── M18 C1(ADR-28 DI8.2):IAM 管理视图(授权在服务端经 IAM admin:* 求值) ──
+
+/** 能力发现(导航显隐;每位由服务端逐动作求值,不读 JWT role claim)。 */
+export interface IamCapabilities {
+  tenant: string;
+  name: string;
+  is_console_admin: boolean;
+  can_iam: boolean;
+  can_diagnostics: boolean;
+  can_audit: boolean;
+  can_keys: boolean;
+}
+
+export interface IamUser {
+  tenant_id: string;
+  name: string;
+  enabled: boolean;
+  display_name?: string | null;
+  policies: string[];
+  groups: string[];
+}
+
+export interface IamGroup {
+  tenant_id: string;
+  name: string;
+  members: string[];
+  policies: string[];
+}
+
+export interface IamPolicy {
+  tenant_id: string | null;
+  name: string;
+  document: string;
+  canned?: boolean;
+}
+
+export interface IamRole {
+  tenant_id: string;
+  name: string;
+  policy: string;
+  assumable_by: string[];
+}
+
+export interface IamTenant {
+  tenant_id: string;
+  display_name?: string;
+  canonical_id?: string;
+  enabled?: boolean;
+}
+
+export interface ServiceAccount {
+  access_key: string;
+  tenant_id: string;
+  owner_user: string;
+  sa_name: string | null;
+  enabled: boolean;
+  created: number;
+  policy: string | null;
+  embedded_policy: string | null;
+  note: string | null;
+}
+
 const TOKEN_KEY = "fasts3_token";
 
 export function getToken(): string | null {
@@ -649,6 +711,89 @@ export const api = {
   ldapStatus: () => request<LdapStatus>("GET", "/api/ldap/status"),
   identityEvents: (limit = 100) =>
     request<{ total: number; events: IdentityEvent[] }>("GET", `/api/identity-events?limit=${limit}`),
+
+  // ── M18 C1:IAM 管理(ADR-28 DI8.2;授权 = 服务端 IAM admin:* 求值) ──
+  iamCapabilities: () => request<IamCapabilities>("GET", "/api/iam/capabilities"),
+
+  iamUsers: (tenant?: string) =>
+    request<{ tenant_id: string; users: IamUser[] }>(
+      "GET",
+      `/api/iam/users${tenant ? `?tenant=${encodeURIComponent(tenant)}` : ""}`
+    ),
+  iamCreateUser: (body: { tenant?: string; name: string; password?: string; display_name?: string }) =>
+    request<IamUser>("POST", "/api/iam/users", body),
+  iamPatchUser: (
+    tenant: string,
+    name: string,
+    patch: { enabled?: boolean; display_name?: string | null; policies?: string[]; password?: string | null }
+  ) => request<IamUser>("PATCH", `/api/iam/users/${encodeURIComponent(tenant)}/${encodeURIComponent(name)}`, patch),
+  iamDeleteUser: (tenant: string, name: string) =>
+    request<Record<string, unknown>>("DELETE", `/api/iam/users/${encodeURIComponent(tenant)}/${encodeURIComponent(name)}`),
+
+  iamGroups: (tenant?: string) =>
+    request<{ tenant_id: string; groups: IamGroup[] }>(
+      "GET",
+      `/api/iam/groups${tenant ? `?tenant=${encodeURIComponent(tenant)}` : ""}`
+    ),
+  iamCreateGroup: (body: { tenant?: string; name: string; members?: string[]; policies?: string[] }) =>
+    request<IamGroup>("POST", "/api/iam/groups", body),
+  iamPatchGroup: (tenant: string, name: string, patch: { members?: string[]; policies?: string[] }) =>
+    request<IamGroup>("PATCH", `/api/iam/groups/${encodeURIComponent(tenant)}/${encodeURIComponent(name)}`, patch),
+  iamDeleteGroup: (tenant: string, name: string) =>
+    request<Record<string, unknown>>("DELETE", `/api/iam/groups/${encodeURIComponent(tenant)}/${encodeURIComponent(name)}`),
+
+  iamPolicies: (tenant?: string) =>
+    request<{ tenant_id: string; policies: IamPolicy[] }>(
+      "GET",
+      `/api/iam/policies${tenant ? `?tenant=${encodeURIComponent(tenant)}` : ""}`
+    ),
+  iamCreatePolicy: (body: { tenant?: string; name: string; document: string }) =>
+    request<IamPolicy>("POST", "/api/iam/policies", body),
+  iamPatchPolicy: (tenant: string, name: string, document: string) =>
+    request<IamPolicy>("PATCH", `/api/iam/policies/${encodeURIComponent(tenant)}/${encodeURIComponent(name)}`, {
+      document,
+    }),
+  iamDeletePolicy: (tenant: string, name: string) =>
+    request<Record<string, unknown>>("DELETE", `/api/iam/policies/${encodeURIComponent(tenant)}/${encodeURIComponent(name)}`),
+
+  iamRoles: (tenant?: string) =>
+    request<{ tenant_id: string; roles: IamRole[] }>(
+      "GET",
+      `/api/iam/roles${tenant ? `?tenant=${encodeURIComponent(tenant)}` : ""}`
+    ),
+  iamCreateRole: (body: { tenant?: string; name: string; policy: string; assumable_by?: string[] }) =>
+    request<IamRole>("POST", "/api/iam/roles", body),
+  iamPatchRole: (tenant: string, name: string, patch: { policy?: string; assumable_by?: string[] }) =>
+    request<IamRole>("PATCH", `/api/iam/roles/${encodeURIComponent(tenant)}/${encodeURIComponent(name)}`, patch),
+  iamDeleteRole: (tenant: string, name: string) =>
+    request<Record<string, unknown>>("DELETE", `/api/iam/roles/${encodeURIComponent(tenant)}/${encodeURIComponent(name)}`),
+
+  iamTenants: () => request<{ tenants: IamTenant[] }>("GET", "/api/iam/tenants"),
+  iamCreateTenant: (body: { tenant_id: string; display_name?: string }) =>
+    request<IamTenant>("POST", "/api/iam/tenants", body),
+  iamPatchTenant: (tenantId: string, patch: { display_name?: string; enabled?: boolean }) =>
+    request<IamTenant>("PATCH", `/api/iam/tenants/${encodeURIComponent(tenantId)}`, patch),
+  iamDeleteTenant: (tenantId: string) =>
+    request<Record<string, unknown>>("DELETE", `/api/iam/tenants/${encodeURIComponent(tenantId)}`),
+
+  serviceAccounts: (tenant?: string, owner?: string) => {
+    const q = new URLSearchParams();
+    if (tenant) q.set("tenant", tenant);
+    if (owner) q.set("owner", owner);
+    const qs = q.toString();
+    return request<{ service_accounts: ServiceAccount[] }>(
+      "GET",
+      `/api/iam/service-accounts${qs ? `?${qs}` : ""}`
+    );
+  },
+  createServiceAccount: (body: {
+    tenant?: string;
+    owner_user?: string;
+    name?: string;
+    embedded_policy?: string | null;
+  }) => request<ServiceAccount & { secret_key: string }>("POST", "/api/iam/service-accounts", body),
+  deleteServiceAccount: (accessKey: string) =>
+    request<Record<string, unknown>>("DELETE", `/api/iam/service-accounts/${encodeURIComponent(accessKey)}`),
 
   getBucketTags: (bucket: string) =>
     request<{ tags: S3Tag[] }>("GET", `/api/buckets/${encodeURIComponent(bucket)}/bucket-tags`),

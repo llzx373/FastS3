@@ -16,9 +16,18 @@ import assert from "node:assert/strict";
 import { buildServer } from "./index.js";
 import { loadConfig } from "./config.js";
 import type { AdminApi, SessionInfo } from "./admin-client.js";
+import { consoleAdminIam } from "./testkit.js";
+
+/** M18 C1:会话列表/撤销走 IAM 授权(admin:ListSessions / admin:ClusterWrite)。 */
+const iamApi = consoleAdminIam();
 
 /** 记录签发请求的 FakeAdmin(验证透传参数)。 */
 class FakeAdmin implements Partial<AdminApi> {
+  // M18 C1:调用者解析/授权(配置 admin = consoleAdmin,升级同步完成态)
+  iamUser = iamApi.iamUser;
+  iamAuthorize = iamApi.iamAuthorize;
+  createIamUser = iamApi.createIamUser;
+  patchIamUser = iamApi.patchIamUser;
   createCalls: Array<{ base: string; policy: string | null; ttl: number }> = [];
   assumeCalls: Array<{
     tenant: string;

@@ -15,12 +15,14 @@ import {
   type S3Tag,
 } from "./s3-client.js";
 import type { FastifyInstance } from "fastify";
+import { consoleAdminIam } from "./testkit.js";
 
 const cfg = loadConfig();
 
 function makeApp(opts: { admin?: Record<string, unknown>; s3?: Record<string, unknown>; s3m10?: Partial<S3M10Client> }) {
   return buildServer({
-    admin: (opts.admin ?? {}) as never,
+    // M18 C1:守卫路由需 IAM 调用者;缺省 admin = consoleAdmin(可被 opts.admin 覆盖)
+    admin: { ...consoleAdminIam(), ...(opts.admin ?? {}) } as never,
     s3: (opts.s3 ?? {}) as never,
     s3m10: (opts.s3m10 ?? {}) as S3M10Client,
     cfg,

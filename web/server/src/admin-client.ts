@@ -128,6 +128,52 @@ export interface AdminApi {
     name: string,
     patch: { members?: string[]; policies?: string[] },
   ): Promise<IamGroupInfo>;
+  /** 删除用户(持有 SA → 409 由调用方处理)。 */
+  deleteIamUser(tenant: string, name: string): Promise<Record<string, unknown>>;
+  /** 删除组。 */
+  deleteIamGroup(tenant: string, name: string): Promise<Record<string, unknown>>;
+  // M18 C1(ADR-28 DI3.3/DI8.2):策略/角色/租户 CRUD + 管理面授权求值
+  /** 策略列表(自定义 + canned,canned 标记 canned:true)。 */
+  iamPolicies(tenant?: string): Promise<{ tenant_id: string; policies: IamPolicyInfo[] }>;
+  /** 创建自定义策略(document 非法 → 400 由调用方处理)。 */
+  createIamPolicy(body: { tenant?: string; name: string; document: string }): Promise<IamPolicyInfo>;
+  /** 替换自定义策略文档(canned → 400)。 */
+  patchIamPolicy(tenant: string, name: string, document: string): Promise<IamPolicyInfo>;
+  /** 删除自定义策略(仍被挂载/canned → 409/400)。 */
+  deleteIamPolicy(tenant: string, name: string): Promise<Record<string, unknown>>;
+  /** 租户内角色列表。 */
+  iamRoles(tenant?: string): Promise<{ tenant_id: string; roles: IamRoleInfo[] }>;
+  /** 创建角色(policy 非法 → 400)。 */
+  createIamRole(body: {
+    tenant?: string;
+    name: string;
+    policy: string;
+    assumable_by?: string[];
+  }): Promise<IamRoleInfo>;
+  /** 更新角色(policy/assumable_by 整表替换)。 */
+  patchIamRole(
+    tenant: string,
+    name: string,
+    patch: { policy?: string; assumable_by?: string[] },
+  ): Promise<IamRoleInfo>;
+  /** 删除角色。 */
+  deleteIamRole(tenant: string, name: string): Promise<Record<string, unknown>>;
+  /** 创建租户(canonical_id 服务端生成)。 */
+  createIamTenant(body: { tenant_id: string; display_name?: string }): Promise<IamTenantInfo>;
+  /** 更新租户 display_name/enabled。 */
+  patchIamTenant(
+    tenantId: string,
+    patch: { display_name?: string; enabled?: boolean },
+  ): Promise<IamTenantInfo>;
+  /** 删除租户(default/非空 → 400/409 由调用方处理)。 */
+  deleteIamTenant(tenantId: string): Promise<Record<string, unknown>>;
+  /** 管理面授权求值(DI3.3;结果 {allow},语义在 Rust 侧钉死)。 */
+  iamAuthorize(body: {
+    tenant: string;
+    user: string;
+    action: string;
+    target_tenant?: string;
+  }): Promise<{ allow: boolean }>;
 }
 
 /** 审计查询过滤(J5:与 limit 并存的 query 参数,全部转发 Rust 侧)。 */
@@ -243,10 +289,28 @@ export interface IamGroupInfo {
   policies: string[];
 }
 
+/** M18 C1(ADR-28 DI2.3):IAM 策略视图(canned 标记 canned:true、tenant_id:null)。 */
+export interface IamPolicyInfo {
+  tenant_id: string | null;
+  name: string;
+  document: string;
+  created_at?: number;
+  canned?: boolean;
+}
+
+/** M18 C1(ADR-28 DI2.5):IAM 角色视图。 */
+export interface IamRoleInfo {
+  tenant_id: string;
+  name: string;
+  policy: string;
+  assumable_by: string[];
+  created_at?: number;
+}
+
 /**
- * C1 前过渡口径:IAM 用户 → 控制台 JWT 二元角色。
- * 挂 consoleAdmin/tenantAdmin → "admin",其余 → "readonly";C1 起废除二元角色、
- * 授权改查 IAM admin:* 动作族(ADR-28 DI3.3)。
+ * M18 C1 起仅作 **UI 提示**(JWT role claim;控制台导航显隐):IAM 用户 →
+ * 控制台二元角色。授权真相一律是 IAM `admin:*` 求值(/v1/iam/authorize),
+ * 任何授权决策不得读此函数的返回值(ADR-28 DI3.3)。
  */
 export function consoleRoleFor(user: IamUserInfo): "admin" | "readonly" {
   return user.policies.some((p) => p === "consoleAdmin" || p === "tenantAdmin")
@@ -682,6 +746,101 @@ export class AdminClient implements AdminApi {
       `/v1/iam/groups/${encodeURIComponent(tenant)}/${encodeURIComponent(name)}`,
       patch,
     );
+  }
+
+  deleteIamUser(tenant: string, name: string): Promise<Record<string, unknown>> {
+    return this.expect(
+      "DELETE",
+      `/v1/iam/users/${encodeURIComponent(tenant)}/${encodeURIComponent(name)}`,
+    );
+  }
+
+  deleteIamGroup(tenant: string, name: string): Promise<Record<string, unknown>> {
+    return this.expect(
+      "DELETE",
+      `/v1/iam/groups/${encodeURIComponent(tenant)}/${encodeURIComponent(name)}`,
+    );
+  }
+
+  // ── M18 C1:策略/角色/租户 CRUD + 授权求值(ADR-28 DI3.3/DI8.2) ──
+
+  iamPolicies(tenant = "default"): Promise<{ tenant_id: string; policies: IamPolicyInfo[] }> {
+    return this.expect("GET", `/v1/iam/policies?tenant=${encodeURIComponent(tenant)}`);
+  }
+
+  createIamPolicy(body: { tenant?: string; name: string; document: string }): Promise<IamPolicyInfo> {
+    return this.expect("POST", "/v1/iam/policies", body);
+  }
+
+  patchIamPolicy(tenant: string, name: string, document: string): Promise<IamPolicyInfo> {
+    return this.expect(
+      "PATCH",
+      `/v1/iam/policies/${encodeURIComponent(tenant)}/${encodeURIComponent(name)}`,
+      { document },
+    );
+  }
+
+  deleteIamPolicy(tenant: string, name: string): Promise<Record<string, unknown>> {
+    return this.expect(
+      "DELETE",
+      `/v1/iam/policies/${encodeURIComponent(tenant)}/${encodeURIComponent(name)}`,
+    );
+  }
+
+  iamRoles(tenant = "default"): Promise<{ tenant_id: string; roles: IamRoleInfo[] }> {
+    return this.expect("GET", `/v1/iam/roles?tenant=${encodeURIComponent(tenant)}`);
+  }
+
+  createIamRole(body: {
+    tenant?: string;
+    name: string;
+    policy: string;
+    assumable_by?: string[];
+  }): Promise<IamRoleInfo> {
+    return this.expect("POST", "/v1/iam/roles", body);
+  }
+
+  patchIamRole(
+    tenant: string,
+    name: string,
+    patch: { policy?: string; assumable_by?: string[] },
+  ): Promise<IamRoleInfo> {
+    return this.expect(
+      "PATCH",
+      `/v1/iam/roles/${encodeURIComponent(tenant)}/${encodeURIComponent(name)}`,
+      patch,
+    );
+  }
+
+  deleteIamRole(tenant: string, name: string): Promise<Record<string, unknown>> {
+    return this.expect(
+      "DELETE",
+      `/v1/iam/roles/${encodeURIComponent(tenant)}/${encodeURIComponent(name)}`,
+    );
+  }
+
+  createIamTenant(body: { tenant_id: string; display_name?: string }): Promise<IamTenantInfo> {
+    return this.expect("POST", "/v1/iam/tenants", body);
+  }
+
+  patchIamTenant(
+    tenantId: string,
+    patch: { display_name?: string; enabled?: boolean },
+  ): Promise<IamTenantInfo> {
+    return this.expect("PATCH", `/v1/iam/tenants/${encodeURIComponent(tenantId)}`, patch);
+  }
+
+  deleteIamTenant(tenantId: string): Promise<Record<string, unknown>> {
+    return this.expect("DELETE", `/v1/iam/tenants/${encodeURIComponent(tenantId)}`);
+  }
+
+  iamAuthorize(body: {
+    tenant: string;
+    user: string;
+    action: string;
+    target_tenant?: string;
+  }): Promise<{ allow: boolean }> {
+    return this.expect("POST", "/v1/iam/authorize", body);
   }
 }
 

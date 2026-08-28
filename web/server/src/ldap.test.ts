@@ -11,6 +11,7 @@ import { test } from "node:test";
 import { berEnum, berInt, berStr, berTag, LdapClient } from "./ldap.js";
 import { IdentityEvents, LdapSync, type LdapSyncConfig } from "./ldap-sync.js";
 import type { IamGroupInfo, IamUserInfo } from "./admin-client.js";
+import { evaluateIam } from "./testkit.js";
 
 interface FakeKey {
   access_key: string;
@@ -110,6 +111,23 @@ export class FakeAdmin {
     if (patch.members !== undefined) g.members = [...patch.members];
     if (patch.policies !== undefined) g.policies = [...patch.policies];
     return g;
+  }
+  // M18 C1:调用者跨租户解析与授权求值(镜像 Rust /v1/iam/authorize;
+  // 自定义策略文档不在本 fake 范围,未知名 fail-closed)。
+  async iamTenants() {
+    const ids = new Set<string>(["default"]);
+    for (const u of this.userList) ids.add(u.tenant_id);
+    return { tenants: [...ids].map((id) => ({ tenant_id: id })) };
+  }
+  async iamAuthorize(body: { tenant: string; user: string; action: string; target_tenant?: string }) {
+    return {
+      allow: evaluateIam(
+        body,
+        (t, n) => this.userList.find((x) => x.tenant_id === t && x.name === n),
+        (t, g) => this.groupList.find((x) => x.tenant_id === t && x.name === g),
+        () => undefined,
+      ),
+    };
   }
   get = (n: string) => this.keyList.find((k) => k.access_key === n);
   user = (n: string) => this.userList.find((u) => u.name === n);

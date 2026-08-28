@@ -1,11 +1,13 @@
 /**
- * M18 S1(ADR-28 DI2.4;TODO M18/S1):/api/iam/service-accounts 自助/代管
- * 路由测试 —— FakeAdmin 内存实现 + 直接签发 JWT(buildServer +
+ * M18 S1+C1(ADR-28 DI2.4/DI3.3;TODO M18/S1):/api/iam/service-accounts
+ * 自助/代管路由测试 —— FakeAdmin 内存实现(IAM 授权委托 testkit.FakeIam,
+ * 镜像 Rust /v1/iam/authorize 语义)+ 直接签发 JWT(buildServer +
  * app.inject,同 identity-routes.test.ts 模式)。
  *
- * 口径:配置文件用户映射租户 `default` 同名 IAM User(无 → 409 防幽灵
- * 账户);owner 强制 = JWT sub,tenantAdmin 可代管本租户、consoleAdmin
- * 集群范围;跨租户/他人 SA → 403。
+ * 口径:JWT 只证明身份;配置文件用户映射租户 `default` 同名 IAM User
+ * (无 → 409 防幽灵账户);自助 owner = 自己且本租户;代管/宽列表查
+ * IAM admin:*ServiceAccount* 动作(tenantAdmin 本租户、consoleAdmin
+ * 集群范围,边界由求值器强制);跨租户/他人 SA → 403。
  */
 
 import assert from "node:assert/strict";
@@ -14,35 +16,29 @@ import { buildServer } from "./index.js";
 import { loadConfig } from "./config.js";
 import { signJwt } from "./auth.js";
 import type {
-  IamTenantInfo,
-  IamUserInfo,
   ServiceAccountInfo,
 } from "./admin-client.js";
+import { FakeIam } from "./testkit.js";
 
-type UserRec = IamUserInfo;
+type UserRec = { tenant_id: string; name: string; enabled: boolean; policies: string[]; groups: string[] };
 
-/** 内存 FakeAdmin:IAM 用户 + SA 仓库(仅实现 SA 路由用到的方法)。 */
+/** 内存 FakeAdmin:IAM 用户/授权委托 testkit.FakeIam(镜像 Rust 求值),
+ *  SA 仓库本地实现。 */
 function makeFakeAdmin() {
-  const users = new Map<string, UserRec>();
-  const tenants: IamTenantInfo[] = [{ tenant_id: "default" }];
+  const iam = new FakeIam();
   const sas = new Map<string, ServiceAccountInfo>();
   let seq = 0;
-  const ukey = (tenant: string, name: string) => `${tenant}${name}`;
   return {
-    users,
+    iam,
+    users: iam.users,
     sas,
     addTenant(id: string) {
-      tenants.push({ tenant_id: id });
+      iam.addTenant(id);
     },
     addUser(u: UserRec) {
-      users.set(ukey(u.tenant_id, u.name), u);
+      iam.addUser(u.tenant_id, u.name, u.policies, u.groups);
     },
-    async iamTenants() {
-      return { tenants };
-    },
-    async iamUser(tenant: string, name: string) {
-      return users.get(ukey(tenant, name)) ?? null;
-    },
+    ...iam.methods(),
     async serviceAccounts(filter: { tenant?: string; owner?: string } = {}) {
       let list = [...sas.values()];
       if (filter.tenant) list = list.filter((s) => s.tenant_id === filter.tenant);
@@ -60,7 +56,7 @@ function makeFakeAdmin() {
       policy?: string | null;
     }) {
       const tenant = body.tenant ?? "default";
-      const u = users.get(ukey(tenant, body.owner_user));
+      const u = iam.users.get(`${tenant}${body.owner_user}`);
       if (!u) {
         throw new Error(`admin POST /v1/iam/service-accounts: HTTP 404: user ${tenant}/${body.owner_user}`);
       }

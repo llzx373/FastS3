@@ -19,9 +19,12 @@
  *   M10:GET /api/buckets/{name}/object-tags;POST .../object-tags/action(put)
  *   M11:GET/PUT/DELETE /api/buckets/{name}/lifecycle;GET/PUT/DELETE .../encryption(仅 AES256)
  *   M12:GET/PUT /api/buckets/{name}/object-lock;GET/PUT .../object-lock/{retention,legal-hold}
- *   GET/POST/DELETE /api/keys[/{id}]      密钥管理(代理)
+ *   GET/POST/DELETE /api/keys[/{id}]      密钥管理(代理;C1 起映射 SA 动作族)
  *   PUT  /api/keys/{access}/policy        密钥策略文档(代理 admin PATCH)
- *   GET/POST/DELETE /api/iam/service-accounts[/{access}]  SA 自助/代管(M18 S1;C1 前过渡口径)
+ *   GET/POST/DELETE /api/iam/service-accounts[/{access}]  SA 自助/代管(M18 S1;C1 起代管查 admin:*)
+ *   GET  /api/iam/capabilities            能力发现(M18 C1;控制台导航显隐,逐位 authorize 求值)
+ *   GET/POST/PATCH/DELETE /api/iam/users|groups|policies|roles[...]  IAM 管理(M18 C1;admin:* 授权)
+ *   GET/POST/PATCH/DELETE /api/iam/tenants[/{id}]  租户管理(M18 C1;仅 consoleAdmin,Rust 强制)
  *   GET  /api/uploads;POST /api/uploads/{id}/abort
  *   GET  /api/audit                       审计查询(limit/since/until/op/bucket/key/who/status/bypass 透传)
  *   GET  /api/audit/export                审计 JSONL 下载(同过滤;截断头透传)
@@ -38,10 +41,19 @@ import { createServer } from "node:http";
 import { readFileSync } from "node:fs";
 import { WebSocketServer } from "ws";
 import { loadConfig, listenHostPort, type WebConfig } from "./config.js";
-import { authPlugin, issueToken, requireRole, verifyJwt, type JwtClaims } from "./auth.js";
+import { authPlugin, issueToken, verifyJwt, type JwtClaims } from "./auth.js";
 import { IdentityEvents, LdapSync, ldapBindLogin, type LdapSyncConfig } from "./ldap-sync.js";
 import { OidcVerifier, OidcError, type OidcConfig } from "./oidc.js";
 import { AdminClient, consoleRoleFor, type IamUserInfo } from "./admin-client.js";
+import {
+  authorizeAdmin,
+  ownTenant,
+  requireIamAction,
+  resolveCaller,
+  syncConfigUsers,
+  withCaller,
+  type CallerIdentity,
+} from "./iam-authz.js";
 import { AdminWsClient } from "./admin-ws.js";
 import { S3Client, S3M10Client, type BucketCorsRule, type LifecycleRule, type ObjectLockConfig, type S3Tag, type NotificationRule, type InventoryRule } from "./s3-client.js";
 import { createHash } from "node:crypto";
@@ -261,20 +273,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     }
   });
 
-  // ── 身份集成状态/事件(管理面;JWT) ──
-  app.get("/api/ldap/status", async (_req, reply) => {
-    try {
-      return reply.send(identity.ldap.status());
-    } catch (e) {
-      return reply.code(502).send({ error: { code: "bad_config", message: (e as Error).message } });
-    }
-  });
-
-  app.get("/api/identity-events", async (req, reply) => {
-    const q = req.query as Record<string, string>;
-    const limit = Math.min(Number(q.limit ?? "100") || 100, 500);
-    return reply.send({ total: identity.events.list(limit).length, events: identity.events.list(limit) });
-  });
+  // ── 身份集成状态/事件:M18 C1 起需认证 + diagnostics 级授权
+  //    (admin:GetDashboard;见下方 authPlugin 之后的注册)。 ──
 
   // ── 健康检查(无认证) ──
   app.get("/api/health", async () => {
@@ -317,32 +317,75 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     };
   });
 
-  // ── 以下全部需要 JWT ──
+  // ── 以下全部需要 JWT;M18 C1 起授权查 IAM admin:*(iam-authz.ts) ──
   authPlugin(app, cfg.jwtSecret);
 
-  // Dashboard(admin/readonly 皆可)
-  app.get("/api/dashboard", async (_req, reply) => {
-    try {
-      return await buildDashboard(admin);
-    } catch (e) {
-      return reply.code(502).send({
-        error: { code: "admin_unreachable", message: (e as Error).message },
-      });
+  // 身份集成状态/事件(diagnostics 级读:admin:GetDashboard)
+  app.get(
+    "/api/ldap/status",
+    { preHandler: requireIamAction(admin, "admin:GetDashboard") },
+    async (_req, reply) => {
+      try {
+        return reply.send(identity.ldap.status());
+      } catch (e) {
+        return reply.code(502).send({ error: { code: "bad_config", message: (e as Error).message } });
+      }
     }
-  });
+  );
+
+  app.get(
+    "/api/identity-events",
+    { preHandler: requireIamAction(admin, "admin:GetDashboard") },
+    async (req, reply) => {
+      const q = req.query as Record<string, string>;
+      const limit = Math.min(Number(q.limit ?? "100") || 100, 500);
+      return reply.send({ total: identity.events.list(limit).length, events: identity.events.list(limit) });
+    }
+  );
+
+  // Dashboard(诊断读:admin:GetDashboard;diagnostics/consoleAdmin 持有者可读)
+  app.get(
+    "/api/dashboard",
+    { preHandler: requireIamAction(admin, "admin:GetDashboard") },
+    async (_req, reply) => {
+      try {
+        return await buildDashboard(admin);
+      } catch (e) {
+        return reply.code(502).send({
+          error: { code: "admin_unreachable", message: (e as Error).message },
+        });
+      }
+    }
+  );
 
   // ── 桶管理 ──
-  app.get("/api/buckets", async (_req, reply) => {
-    try {
-      return await admin.buckets();
-    } catch (e) {
-      return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+  // GET:数据面读动作(s3:ListAllMyBuckets;readonly/diagnostics 皆可通过)。
+  // DI3.4:非 consoleAdmin 只回本租户属主的桶(owner = 租户 canonical_id;
+  // 存量桶属主 "fasts3" = default canonical,天然命中)。
+  app.get(
+    "/api/buckets",
+    { preHandler: requireIamAction(admin, "s3:ListAllMyBuckets") },
+    async (req, reply) => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const caller = (req as any).caller as CallerIdentity;
+      try {
+        const all = await admin.buckets();
+        if (await authorizeAdmin(admin, caller, "admin:ListTenants")) {
+          return all; // consoleAdmin:集群范围
+        }
+        const { tenants } = await admin.iamTenants();
+        const canonical =
+          tenants.find((t) => t.tenant_id === caller.tenant)?.canonical_id ?? "fasts3";
+        return { buckets: all.buckets.filter((b) => b.owner === canonical) };
+      } catch (e) {
+        return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+      }
     }
-  });
+  );
 
   app.post<{ Body: { name?: string; quota?: number } }>(
     "/api/buckets",
-    { preHandler: requireRole("admin") },
+    { preHandler: requireIamAction(admin, "admin:CreateBucket", ownTenant) },
     async (req, reply) => {
       const name = req.body?.name;
       if (!name) {
@@ -358,7 +401,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
   app.patch<{ Params: { name: string }; Body: { quota?: number | null } }>(
     "/api/buckets/:name",
-    { preHandler: requireRole("admin") },
+    { preHandler: requireIamAction(admin, "admin:UpdateBucket", ownTenant) },
     async (req, reply) => {
       try {
         return await admin.setBucketQuota(req.params.name, req.body?.quota ?? null);
@@ -370,7 +413,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
   app.delete<{ Params: { name: string }; Querystring: { force?: string } }>(
     "/api/buckets/:name",
-    { preHandler: requireRole("admin") },
+    { preHandler: requireIamAction(admin, "admin:DeleteBucket", ownTenant) },
     async (req, reply) => {
       try {
         return await admin.deleteBucket(req.params.name, req.query.force === "true");
@@ -566,7 +609,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     // 版本操作:restore(CopyObject 自复制恢复)/ delete(永久删除指定版本)
     app.post<{ Params: { name: string }; Body: { action?: string; key?: string; versionId?: string } }>(
       "/api/buckets/:name/versions/action",
-      { preHandler: requireRole("admin") },
+      { preHandler: requireIamAction(admin, "admin:UpdateBucket", ownTenant) },
       async (req, reply) => {
         const { name } = req.params;
         const { action, key, versionId } = req.body ?? {};
@@ -597,7 +640,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       Body: { key?: string; days?: number; tier?: string };
     }>(
       "/api/buckets/:name/objects/restore",
-      { preHandler: requireRole("admin") },
+      { preHandler: requireIamAction(admin, "admin:UpdateBucket", ownTenant) },
       async (req, reply) => {
         const { name } = req.params;
         const { key, days, tier } = req.body ?? {};
@@ -631,7 +674,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
     app.put<{ Params: { name: string }; Body: { Status?: string } }>(
       "/api/buckets/:name/versioning",
-      { preHandler: requireRole("admin") },
+      { preHandler: requireIamAction(admin, "admin:UpdateBucket", ownTenant) },
       async (req, reply) => {
         const status = req.body?.Status;
         if (status !== "Enabled" && status !== "Suspended") {
@@ -659,7 +702,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
     app.put<{ Params: { name: string }; Body: { CORSRules?: unknown } }>(
       "/api/buckets/:name/cors",
-      { preHandler: requireRole("admin") },
+      { preHandler: requireIamAction(admin, "admin:UpdateBucket", ownTenant) },
       async (req, reply) => {
         const rules = req.body?.CORSRules;
         if (!Array.isArray(rules) || rules.length === 0) {
@@ -678,7 +721,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
     app.delete<{ Params: { name: string } }>(
       "/api/buckets/:name/cors",
-      { preHandler: requireRole("admin") },
+      { preHandler: requireIamAction(admin, "admin:UpdateBucket", ownTenant) },
       async (req, reply) => {
         try {
           await m10.deleteBucketCors(req.params.name);
@@ -700,7 +743,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
     app.put<{ Params: { name: string }; Body: { Policy?: unknown } }>(
       "/api/buckets/:name/policy",
-      { preHandler: requireRole("admin") },
+      { preHandler: requireIamAction(admin, "admin:UpdateBucket", ownTenant) },
       async (req, reply) => {
         const policy = req.body?.Policy;
         if (typeof policy !== "string" || policy.trim() === "") {
@@ -724,7 +767,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
     app.delete<{ Params: { name: string } }>(
       "/api/buckets/:name/policy",
-      { preHandler: requireRole("admin") },
+      { preHandler: requireIamAction(admin, "admin:UpdateBucket", ownTenant) },
       async (req, reply) => {
         try {
           await m10.deleteBucketPolicy(req.params.name);
@@ -746,7 +789,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
     app.put<{ Params: { name: string }; Body: { Rules?: unknown } }>(
       "/api/buckets/:name/lifecycle",
-      { preHandler: requireRole("admin") },
+      { preHandler: requireIamAction(admin, "admin:UpdateBucket", ownTenant) },
       async (req, reply) => {
         const rules = req.body?.Rules;
         if (!Array.isArray(rules) || rules.length === 0) {
@@ -779,7 +822,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
     app.delete<{ Params: { name: string } }>(
       "/api/buckets/:name/lifecycle",
-      { preHandler: requireRole("admin") },
+      { preHandler: requireIamAction(admin, "admin:UpdateBucket", ownTenant) },
       async (req, reply) => {
         try {
           await m10.deleteBucketLifecycle(req.params.name);
@@ -801,7 +844,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
     app.put<{ Params: { name: string }; Body: { SSEAlgorithm?: unknown } }>(
       "/api/buckets/:name/encryption",
-      { preHandler: requireRole("admin") },
+      { preHandler: requireIamAction(admin, "admin:UpdateBucket", ownTenant) },
       async (req, reply) => {
         if (req.body?.SSEAlgorithm !== "AES256") {
           return reply.code(400).send({
@@ -819,7 +862,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
     app.delete<{ Params: { name: string } }>(
       "/api/buckets/:name/encryption",
-      { preHandler: requireRole("admin") },
+      { preHandler: requireIamAction(admin, "admin:UpdateBucket", ownTenant) },
       async (req, reply) => {
         try {
           await m10.deleteBucketEncryption(req.params.name);
@@ -847,7 +890,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       };
     }>(
       "/api/buckets/:name/object-lock",
-      { preHandler: requireRole("admin") },
+      { preHandler: requireIamAction(admin, "admin:UpdateBucket", ownTenant) },
       async (req, reply) => {
         if (req.body?.ObjectLockEnabled !== true) {
           return reply.code(400).send({
@@ -910,7 +953,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       };
     }>(
       "/api/buckets/:name/object-lock/retention",
-      { preHandler: requireRole("admin") },
+      { preHandler: requireIamAction(admin, "admin:UpdateBucket", ownTenant) },
       async (req, reply) => {
         const key = typeof req.body?.key === "string" ? req.body.key : "";
         if (!key) {
@@ -962,7 +1005,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       Body: { key?: unknown; versionId?: unknown; Status?: unknown };
     }>(
       "/api/buckets/:name/object-lock/legal-hold",
-      { preHandler: requireRole("admin") },
+      { preHandler: requireIamAction(admin, "admin:UpdateBucket", ownTenant) },
       async (req, reply) => {
         const key = typeof req.body?.key === "string" ? req.body.key : "";
         if (!key) {
@@ -1000,7 +1043,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     // 对象标签操作:put = 整体替换(空数组即清空)
     app.post<{ Params: { name: string }; Body: { action?: string; key?: string; tags?: unknown } }>(
       "/api/buckets/:name/object-tags/action",
-      { preHandler: requireRole("admin") },
+      { preHandler: requireIamAction(admin, "admin:UpdateBucket", ownTenant) },
       async (req, reply) => {
         const { name } = req.params;
         const { action, key, tags } = req.body ?? {};
@@ -1040,7 +1083,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     });
     app.put<{ Params: { name: string }; Body: { tags?: S3Tag[] } }>(
       "/api/buckets/:name/bucket-tags",
-      { preHandler: requireRole("admin") },
+      { preHandler: requireIamAction(admin, "admin:UpdateBucket", ownTenant) },
       async (req, reply) => {
         const tags = req.body?.tags;
         if (!Array.isArray(tags)) {
@@ -1056,7 +1099,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     );
     app.delete<{ Params: { name: string } }>(
       "/api/buckets/:name/bucket-tags",
-      { preHandler: requireRole("admin") },
+      { preHandler: requireIamAction(admin, "admin:UpdateBucket", ownTenant) },
       async (req, reply) => {
         try {
           await m10.deleteBucketTagging(req.params.name);
@@ -1076,7 +1119,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     });
     app.put<{ Params: { name: string }; Body: { ObjectOwnership?: string } }>(
       "/api/buckets/:name/ownership",
-      { preHandler: requireRole("admin") },
+      { preHandler: requireIamAction(admin, "admin:UpdateBucket", ownTenant) },
       async (req, reply) => {
         const o = req.body?.ObjectOwnership;
         if (o !== "BucketOwnerEnforced" && o !== "BucketOwnerPreferred" && o !== "ObjectWriter") {
@@ -1100,7 +1143,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     });
     app.put<{ Params: { name: string }; Body: { rules?: NotificationRule[] } }>(
       "/api/buckets/:name/notification",
-      { preHandler: requireRole("admin") },
+      { preHandler: requireIamAction(admin, "admin:UpdateBucket", ownTenant) },
       async (req, reply) => {
         const rules = req.body?.rules;
         if (!Array.isArray(rules)) {
@@ -1117,7 +1160,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     );
     app.delete<{ Params: { name: string } }>(
       "/api/buckets/:name/notification",
-      { preHandler: requireRole("admin") },
+      { preHandler: requireIamAction(admin, "admin:UpdateBucket", ownTenant) },
       async (req, reply) => {
         try {
           await m10.deleteBucketNotification(req.params.name);
@@ -1137,7 +1180,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     });
     app.put<{ Params: { name: string }; Body: InventoryRule }>(
       "/api/buckets/:name/inventory",
-      { preHandler: requireRole("admin") },
+      { preHandler: requireIamAction(admin, "admin:UpdateBucket", ownTenant) },
       async (req, reply) => {
         const rule = req.body;
         if (!rule?.Id || !rule.DestinationBucket) {
@@ -1161,7 +1204,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     );
     app.delete<{ Params: { name: string }; Querystring: { id?: string } }>(
       "/api/buckets/:name/inventory",
-      { preHandler: requireRole("admin") },
+      { preHandler: requireIamAction(admin, "admin:UpdateBucket", ownTenant) },
       async (req, reply) => {
         const id = req.query.id;
         if (!id) return reply.code(400).send({ error: { code: "bad_request", message: "id required" } });
@@ -1200,8 +1243,11 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     );
   }
 
-  // ── 密钥管理 ──
-  app.get("/api/keys", async (_req, reply) => {
+  // ── 密钥管理(M18 C1:legacy 无属主密钥映射 SA 动作族;见 compat) ──
+  app.get(
+    "/api/keys",
+    { preHandler: requireIamAction(admin, "admin:ListServiceAccounts", ownTenant) },
+    async (_req, reply) => {
     try {
       return await admin.keys();
     } catch (e) {
@@ -1310,7 +1356,10 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     }
   });
 
-  app.get("/api/sessions", async (_req, reply) => {
+  app.get(
+    "/api/sessions",
+    { preHandler: requireIamAction(admin, "admin:ListSessions") },
+    async (_req, reply) => {
     try {
       return await admin.sessions();
     } catch (e) {
@@ -1320,7 +1369,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
   app.post<{ Body: { base_access_key?: string; session_policy?: string | null; ttl_secs?: number } }>(
     "/api/sessions",
-    { preHandler: requireRole("admin") },
+    { preHandler: requireIamAction(admin, "admin:ClusterWrite", ownTenant) },
     async (req, reply) => {
       const base = req.body?.base_access_key || sessionBaseKey(cfg);
       try {
@@ -1333,7 +1382,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
   app.delete<{ Params: { id: string } }>(
     "/api/sessions/:id",
-    { preHandler: requireRole("admin") },
+    { preHandler: requireIamAction(admin, "admin:ClusterWrite", ownTenant) },
     async (req, reply) => {
       try {
         return await admin.revokeSession(req.params.id);
@@ -1345,7 +1394,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
   app.post<{ Body: { access_key?: string; note?: string } }>(
     "/api/keys",
-    { preHandler: requireRole("admin") },
+    { preHandler: requireIamAction(admin, "admin:CreateServiceAccount", ownTenant) },
     async (req, reply) => {
       const accessKey = req.body?.access_key;
       if (!accessKey) {
@@ -1361,7 +1410,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
   app.delete<{ Params: { id: string } }>(
     "/api/keys/:id",
-    { preHandler: requireRole("admin") },
+    { preHandler: requireIamAction(admin, "admin:DeleteServiceAccount", ownTenant) },
     async (req, reply) => {
       try {
         return await admin.deleteKey(req.params.id);
@@ -1373,7 +1422,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
   app.patch<{ Params: { id: string }; Body: { enabled?: boolean } }>(
     "/api/keys/:id",
-    { preHandler: requireRole("admin") },
+    { preHandler: requireIamAction(admin, "admin:UpdateServiceAccount", ownTenant) },
     async (req, reply) => {
       // REVIEW §4.16:空 body 不得默认「禁用」——enabled 必须显式给出,
       // 避免前端漏传字段时误禁用密钥。
@@ -1393,7 +1442,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // J4:密钥策略文档(string JSON 或 null 清空);代理到 admin PATCH,由 Rust 侧持久化
   app.put<{ Params: { access: string }; Body: { policy?: string | null } }>(
     "/api/keys/:access/policy",
-    { preHandler: requireRole("admin") },
+    { preHandler: requireIamAction(admin, "admin:UpdateServiceAccount", ownTenant) },
     async (req, reply) => {
       const policy = req.body?.policy ?? null;
       if (policy !== null && typeof policy !== "string") {
@@ -1409,83 +1458,35 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     }
   );
 
-  // ── M18 S1:服务账号自助(ADR-28 DI2.4;完整 IAM admin:* 授权属 C1) ──
-  // 过渡口径(C1 前):JWT 只证明「谁登录」;配置文件用户映射到租户
-  // `default` 的同名 IAM User。无对应 IAM User → 409(不自动建号,
-  // 防幽灵账户;由 root/tenantAdmin 先建用户)。tenantAdmin/consoleAdmin
-  // 可代管本租户(consoleAdmin 集群范围)用户的 SA;其余用户只能
-  // 操作自己(owner = JWT sub)名下的 SA。本组路由对一切已认证用户
-  // 开放(自助语义),不使用 requireRole("admin")。
-  const callerIam = async (sub: string) => {
-    // 配置文件用户(pre-IAM)先映射租户 `default` 同名 IAM User;不存在
-    // 则跨租户按同名查找(找到首个即归属;过渡期无多租户同名歧义处理,
-    // C1 以 IAM 登录身份为准)。
-    let u = await admin.iamUser("default", sub);
-    if (!u) {
-      const { tenants } = await admin.iamTenants();
-      for (const t of tenants) {
-        if (t.tenant_id === "default") continue;
-        u = await admin.iamUser(t.tenant_id, sub);
-        if (u) break;
-      }
-    }
-    if (!u) return null;
-    const pols = u.policies ?? [];
-    return {
-      tenant: u.tenant_id || "default",
-      name: u.name || sub,
-      enabled: u.enabled !== false,
-      isTenantAdmin: pols.includes("tenantAdmin") || pols.includes("consoleAdmin"),
-      isClusterAdmin: pols.includes("consoleAdmin"),
-    };
-  };
-  const noIamUser = (reply: FastifyReply, sub: string) =>
-    reply.code(409).send({
-      error: {
-        code: "no_iam_user",
-        message: `no IAM user for console account "${sub}" in tenant default; ask an admin to create it first`,
-      },
-    });
-  // 调用者解析:不存在 → 409;禁用 → 403;否则返回身份视图
-  const resolveCaller = async (
-    req: FastifyRequest,
-    reply: FastifyReply
-  ): Promise<NonNullable<Awaited<ReturnType<typeof callerIam>>> | null> => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const sub = ((req as any).user as JwtClaims | undefined)?.sub ?? "";
-    const caller = await callerIam(sub);
-    if (!caller) {
-      await noIamUser(reply, sub);
-      return null;
-    }
-    if (!caller.enabled) {
-      await reply.code(403).send({
-        error: { code: "user_disabled", message: `IAM user ${caller.tenant}/${caller.name} is disabled` },
-      });
-      return null;
-    }
-    return caller;
-  };
-
+  // ── M18 S1+C1:服务账号自助/代管(ADR-28 DI2.4/DI3.3) ──
+  // JWT 只证明「谁登录」;调用者解析(iam-authz.resolveCaller):配置文件
+  // 用户映射租户 `default` 同名 IAM User,无 → 409(不自动建号,防幽灵
+  // 账户)。自助(owner = 自己、本租户)对一切已认证 IAM 用户开放;任何
+  // 更宽操作(他人 owner / 跨租户 / 代管)查 IAM admin: 动作求值
+  // (tenantAdmin 本租户、consoleAdmin 集群范围,边界在 Rust 侧强制)。
   app.get<{ Querystring: { tenant?: string; owner?: string } }>(
     "/api/iam/service-accounts",
     async (req, reply) => {
-      let caller;
+      let caller: CallerIdentity | null;
       try {
-        caller = await resolveCaller(req, reply);
+        caller = await withCaller(admin, req, reply);
       } catch (e) {
         return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
       }
       if (!caller) return;
-      // tenantAdmin:可列本租户任意属主;consoleAdmin:集群范围;
-      // 其余:强制只看自己
-      if (!caller.isClusterAdmin && req.query.tenant && req.query.tenant !== caller.tenant) {
+      const tenant = req.query.tenant ?? caller.tenant;
+      // 宽列表(他人 owner / 显式租户)须 admin:ListServiceAccounts 于目标租户;
+      // 否则强制只看自己
+      let canList = false;
+      try {
+        canList = await authorizeAdmin(admin, caller, "admin:ListServiceAccounts", tenant);
+      } catch (e) {
+        return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+      }
+      if (tenant !== caller.tenant && !canList) {
         return reply.code(403).send({ error: { code: "forbidden", message: "cross-tenant listing denied" } });
       }
-      const tenant = caller.isClusterAdmin
-        ? req.query.tenant ?? caller.tenant
-        : caller.tenant;
-      const owner = caller.isTenantAdmin ? req.query.owner : caller.name;
+      const owner = canList ? req.query.owner : caller.name;
       try {
         return await admin.serviceAccounts({ tenant, owner });
       } catch (e) {
@@ -1503,23 +1504,29 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       policy?: string | null;
     };
   }>("/api/iam/service-accounts", async (req, reply) => {
-    let caller;
+    let caller: CallerIdentity | null;
     try {
-      caller = await resolveCaller(req, reply);
+      caller = await withCaller(admin, req, reply);
     } catch (e) {
       return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
     }
     if (!caller) return;
     const tenant = req.body?.tenant ?? caller.tenant;
     const owner = req.body?.owner_user ?? caller.name;
-    // 自助:owner 强制 = 自己;代管:tenantAdmin 同租户 / consoleAdmin 任意租户
+    // 自助:owner = 自己且本租户;代管:admin:CreateServiceAccount 于目标租户
     const selfService = owner === caller.name && tenant === caller.tenant;
-    const delegated =
-      (caller.isTenantAdmin && tenant === caller.tenant) || caller.isClusterAdmin;
-    if (!selfService && !delegated) {
-      return reply.code(403).send({
-        error: { code: "forbidden", message: "cannot create service accounts for other users/tenants" },
-      });
+    if (!selfService) {
+      let allow = false;
+      try {
+        allow = await authorizeAdmin(admin, caller, "admin:CreateServiceAccount", tenant);
+      } catch (e) {
+        return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+      }
+      if (!allow) {
+        return reply.code(403).send({
+          error: { code: "forbidden", message: "cannot create service accounts for other users/tenants" },
+        });
+      }
     }
     try {
       return await admin.createServiceAccount({
@@ -1537,10 +1544,10 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   app.delete<{ Params: { access: string } }>(
     "/api/iam/service-accounts/:access",
     async (req, reply) => {
-      let caller;
+      let caller: CallerIdentity | null;
       let sa;
       try {
-        caller = await resolveCaller(req, reply);
+        caller = await withCaller(admin, req, reply);
         sa = caller ? await admin.serviceAccount(req.params.access) : null;
       } catch (e) {
         return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
@@ -1550,10 +1557,16 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         return reply.code(404).send({ error: { code: "no_such_key", message: `service account ${req.params.access}` } });
       }
       const own = sa.owner_user === caller.name && sa.tenant_id === caller.tenant;
-      const delegated =
-        (caller.isTenantAdmin && sa.tenant_id === caller.tenant) || caller.isClusterAdmin;
-      if (!own && !delegated) {
-        return reply.code(403).send({ error: { code: "forbidden", message: "not the owner of this service account" } });
+      if (!own) {
+        let allow = false;
+        try {
+          allow = await authorizeAdmin(admin, caller, "admin:DeleteServiceAccount", sa.tenant_id);
+        } catch (e) {
+          return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+        }
+        if (!allow) {
+          return reply.code(403).send({ error: { code: "forbidden", message: "not the owner of this service account" } });
+        }
       }
       try {
         return await admin.deleteServiceAccount(req.params.access);
@@ -1563,8 +1576,394 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     }
   );
 
+  // ── M18 C1:IAM 管理路由(ADR-28 DI8.2;/api/iam/* 代理 Rust admin) ──
+  // 授权:一切决策经 /v1/iam/authorize;目标租户缺省 = 调用者租户,显式
+  // 指定他租户须 consoleAdmin(Rust 侧租户边界强制,Node 不重复实现)。
+  // 租户生命周期(列表/建/改/删)= consoleAdmin 专属(TENANT_ACTIONS,
+  // Rust 求值处强制;控制台租户页仅 root 语义的实现点)。
+  /** 处理器公共开头:解析调用者(错误已响应 → null;admin 异常 → 502 已响应)。 */
+  const iamCaller = async (
+    req: FastifyRequest,
+    reply: FastifyReply
+  ): Promise<CallerIdentity | null> => {
+    try {
+      return await withCaller(admin, req, reply);
+    } catch (e) {
+      await reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+      return null;
+    }
+  };
+  /** 授权检查:拒绝/异常已响应(403/502)→ false。 */
+  const iamAllow = async (
+    reply: FastifyReply,
+    caller: CallerIdentity,
+    action: string,
+    targetTenant?: string
+  ): Promise<boolean> => {
+    let allow = false;
+    try {
+      allow = await authorizeAdmin(admin, caller, action, targetTenant);
+    } catch (e) {
+      await reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
+      return false;
+    }
+    if (!allow) {
+      await reply.code(403).send({
+        error: { code: "forbidden", message: `IAM policy denies ${action}` },
+      });
+    }
+    return allow;
+  };
+  /** admin 调用错误 → 最近似状态码(404/409/400 透传,其余 502)。 */
+  const iamProxyErr = (e: unknown, reply: FastifyReply) => {
+    const msg = (e as Error).message;
+    const m = /HTTP (\d{3})/.exec(msg);
+    const status = m && ["400", "404", "409"].includes(m[1]) ? Number(m[1]) : 502;
+    return reply.code(status).send({ error: { code: "iam_proxy_error", message: msg } });
+  };
+
+  // 能力发现(控制台导航显隐;每个位 = 一次 authorize 求值,冷路径):
+  // is_console_admin = 可列租户(租户动作仅 consoleAdmin,Rust 强制);
+  // can_iam = 本租户用户管理;can_diagnostics = 集群可观测读;
+  // can_audit = 审计读;can_keys = 密钥/SA 管理。
+  app.get("/api/iam/capabilities", async (req, reply) => {
+    const caller = await iamCaller(req, reply);
+    if (!caller) return;
+    const probe = async (action: string, target?: string) => {
+      try {
+        return await authorizeAdmin(admin, caller, action, target);
+      } catch {
+        return false;
+      }
+    };
+    return {
+      tenant: caller.tenant,
+      name: caller.name,
+      is_console_admin: await probe("admin:ListTenants"),
+      can_iam: await probe("admin:ListUsers", caller.tenant),
+      can_diagnostics: await probe("admin:GetDashboard"),
+      can_audit: await probe("admin:GetAudit"),
+      can_keys: await probe("admin:ListServiceAccounts", caller.tenant),
+    };
+  });
+
+  // 用户
+  app.get<{ Querystring: { tenant?: string } }>("/api/iam/users", async (req, reply) => {
+    const caller = await iamCaller(req, reply);
+    if (!caller) return;
+    const tenant = req.query.tenant ?? caller.tenant;
+    if (!(await iamAllow(reply, caller, "admin:ListUsers", tenant))) return;
+    try {
+      return await admin.iamUsers(tenant);
+    } catch (e) {
+      return iamProxyErr(e, reply);
+    }
+  });
+  app.post<{ Body: { tenant?: string; name?: string; password?: string; display_name?: string } }>(
+    "/api/iam/users",
+    async (req, reply) => {
+      const caller = await iamCaller(req, reply);
+      if (!caller) return;
+      const tenant = req.body?.tenant ?? caller.tenant;
+      if (!req.body?.name) {
+        return reply.code(400).send({ error: { code: "bad_request", message: "missing name" } });
+      }
+      if (!(await iamAllow(reply, caller, "admin:CreateUser", tenant))) return;
+      try {
+        return await admin.createIamUser({
+          tenant,
+          name: req.body.name,
+          password: req.body.password,
+          display_name: req.body.display_name,
+        });
+      } catch (e) {
+        return iamProxyErr(e, reply);
+      }
+    }
+  );
+  app.patch<{
+    Params: { tenant: string; name: string };
+    Body: { enabled?: boolean; display_name?: string | null; policies?: string[]; password?: string | null };
+  }>("/api/iam/users/:tenant/:name", async (req, reply) => {
+    const caller = await iamCaller(req, reply);
+    if (!caller) return;
+    const { tenant, name } = req.params;
+    if (!(await iamAllow(reply, caller, "admin:UpdateUser", tenant))) return;
+    // 挂载/解挂 = 细分动作 admin:AttachPolicy(DI3.3 词汇表)
+    if (req.body?.policies !== undefined) {
+      if (!(await iamAllow(reply, caller, "admin:AttachPolicy", tenant))) return;
+    }
+    try {
+      return await admin.patchIamUser(tenant, name, req.body ?? {});
+    } catch (e) {
+      return iamProxyErr(e, reply);
+    }
+  });
+  app.delete<{ Params: { tenant: string; name: string } }>(
+    "/api/iam/users/:tenant/:name",
+    async (req, reply) => {
+      const caller = await iamCaller(req, reply);
+      if (!caller) return;
+      const { tenant, name } = req.params;
+      if (!(await iamAllow(reply, caller, "admin:DeleteUser", tenant))) return;
+      try {
+        return await admin.deleteIamUser(tenant, name);
+      } catch (e) {
+        return iamProxyErr(e, reply);
+      }
+    }
+  );
+
+  // 组
+  app.get<{ Querystring: { tenant?: string } }>("/api/iam/groups", async (req, reply) => {
+    const caller = await iamCaller(req, reply);
+    if (!caller) return;
+    const tenant = req.query.tenant ?? caller.tenant;
+    if (!(await iamAllow(reply, caller, "admin:ListGroups", tenant))) return;
+    try {
+      return await admin.iamGroups(tenant);
+    } catch (e) {
+      return iamProxyErr(e, reply);
+    }
+  });
+  app.post<{ Body: { tenant?: string; name?: string; members?: string[]; policies?: string[] } }>(
+    "/api/iam/groups",
+    async (req, reply) => {
+      const caller = await iamCaller(req, reply);
+      if (!caller) return;
+      const tenant = req.body?.tenant ?? caller.tenant;
+      if (!req.body?.name) {
+        return reply.code(400).send({ error: { code: "bad_request", message: "missing name" } });
+      }
+      if (!(await iamAllow(reply, caller, "admin:CreateGroup", tenant))) return;
+      try {
+        return await admin.createIamGroup({
+          tenant,
+          name: req.body.name,
+          members: req.body.members,
+          policies: req.body.policies,
+        });
+      } catch (e) {
+        return iamProxyErr(e, reply);
+      }
+    }
+  );
+  app.patch<{
+    Params: { tenant: string; name: string };
+    Body: { members?: string[]; policies?: string[] };
+  }>("/api/iam/groups/:tenant/:name", async (req, reply) => {
+    const caller = await iamCaller(req, reply);
+    if (!caller) return;
+    const { tenant, name } = req.params;
+    if (!(await iamAllow(reply, caller, "admin:UpdateGroup", tenant))) return;
+    if (req.body?.policies !== undefined) {
+      if (!(await iamAllow(reply, caller, "admin:AttachPolicy", tenant))) return;
+    }
+    try {
+      return await admin.patchIamGroup(tenant, name, req.body ?? {});
+    } catch (e) {
+      return iamProxyErr(e, reply);
+    }
+  });
+  app.delete<{ Params: { tenant: string; name: string } }>(
+    "/api/iam/groups/:tenant/:name",
+    async (req, reply) => {
+      const caller = await iamCaller(req, reply);
+      if (!caller) return;
+      const { tenant, name } = req.params;
+      if (!(await iamAllow(reply, caller, "admin:DeleteGroup", tenant))) return;
+      try {
+        return await admin.deleteIamGroup(tenant, name);
+      } catch (e) {
+        return iamProxyErr(e, reply);
+      }
+    }
+  );
+
+  // 策略(文档替换走 CreateRole 同例:PATCH 映射 admin:CreatePolicy,compat 钉死)
+  app.get<{ Querystring: { tenant?: string } }>("/api/iam/policies", async (req, reply) => {
+    const caller = await iamCaller(req, reply);
+    if (!caller) return;
+    const tenant = req.query.tenant ?? caller.tenant;
+    if (!(await iamAllow(reply, caller, "admin:ListPolicies", tenant))) return;
+    try {
+      return await admin.iamPolicies(tenant);
+    } catch (e) {
+      return iamProxyErr(e, reply);
+    }
+  });
+  app.post<{ Body: { tenant?: string; name?: string; document?: string } }>(
+    "/api/iam/policies",
+    async (req, reply) => {
+      const caller = await iamCaller(req, reply);
+      if (!caller) return;
+      const tenant = req.body?.tenant ?? caller.tenant;
+      if (!req.body?.name || typeof req.body.document !== "string" || req.body.document === "") {
+        return reply.code(400).send({ error: { code: "bad_request", message: "missing name and/or document" } });
+      }
+      if (!(await iamAllow(reply, caller, "admin:CreatePolicy", tenant))) return;
+      try {
+        return await admin.createIamPolicy({ tenant, name: req.body.name, document: req.body.document });
+      } catch (e) {
+        return iamProxyErr(e, reply);
+      }
+    }
+  );
+  app.patch<{ Params: { tenant: string; name: string }; Body: { document?: string } }>(
+    "/api/iam/policies/:tenant/:name",
+    async (req, reply) => {
+      const caller = await iamCaller(req, reply);
+      if (!caller) return;
+      const { tenant, name } = req.params;
+      if (typeof req.body?.document !== "string" || req.body.document === "") {
+        return reply.code(400).send({ error: { code: "bad_request", message: "missing document" } });
+      }
+      if (!(await iamAllow(reply, caller, "admin:CreatePolicy", tenant))) return;
+      try {
+        return await admin.patchIamPolicy(tenant, name, req.body.document);
+      } catch (e) {
+        return iamProxyErr(e, reply);
+      }
+    }
+  );
+  app.delete<{ Params: { tenant: string; name: string } }>(
+    "/api/iam/policies/:tenant/:name",
+    async (req, reply) => {
+      const caller = await iamCaller(req, reply);
+      if (!caller) return;
+      const { tenant, name } = req.params;
+      if (!(await iamAllow(reply, caller, "admin:DeletePolicy", tenant))) return;
+      try {
+        return await admin.deleteIamPolicy(tenant, name);
+      } catch (e) {
+        return iamProxyErr(e, reply);
+      }
+    }
+  );
+
+  // 角色(PATCH 同策略例:映射 admin:CreateRole)
+  app.get<{ Querystring: { tenant?: string } }>("/api/iam/roles", async (req, reply) => {
+    const caller = await iamCaller(req, reply);
+    if (!caller) return;
+    const tenant = req.query.tenant ?? caller.tenant;
+    if (!(await iamAllow(reply, caller, "admin:ListRoles", tenant))) return;
+    try {
+      return await admin.iamRoles(tenant);
+    } catch (e) {
+      return iamProxyErr(e, reply);
+    }
+  });
+  app.post<{ Body: { tenant?: string; name?: string; policy?: string; assumable_by?: string[] } }>(
+    "/api/iam/roles",
+    async (req, reply) => {
+      const caller = await iamCaller(req, reply);
+      if (!caller) return;
+      const tenant = req.body?.tenant ?? caller.tenant;
+      if (!req.body?.name || typeof req.body.policy !== "string" || req.body.policy === "") {
+        return reply.code(400).send({ error: { code: "bad_request", message: "missing name and/or policy" } });
+      }
+      if (!(await iamAllow(reply, caller, "admin:CreateRole", tenant))) return;
+      try {
+        return await admin.createIamRole({
+          tenant,
+          name: req.body.name,
+          policy: req.body.policy,
+          assumable_by: req.body.assumable_by,
+        });
+      } catch (e) {
+        return iamProxyErr(e, reply);
+      }
+    }
+  );
+  app.patch<{
+    Params: { tenant: string; name: string };
+    Body: { policy?: string; assumable_by?: string[] };
+  }>("/api/iam/roles/:tenant/:name", async (req, reply) => {
+    const caller = await iamCaller(req, reply);
+    if (!caller) return;
+    const { tenant, name } = req.params;
+    if (!(await iamAllow(reply, caller, "admin:CreateRole", tenant))) return;
+    try {
+      return await admin.patchIamRole(tenant, name, req.body ?? {});
+    } catch (e) {
+      return iamProxyErr(e, reply);
+    }
+  });
+  app.delete<{ Params: { tenant: string; name: string } }>(
+    "/api/iam/roles/:tenant/:name",
+    async (req, reply) => {
+      const caller = await iamCaller(req, reply);
+      if (!caller) return;
+      const { tenant, name } = req.params;
+      if (!(await iamAllow(reply, caller, "admin:DeleteRole", tenant))) return;
+      try {
+        return await admin.deleteIamRole(tenant, name);
+      } catch (e) {
+        return iamProxyErr(e, reply);
+      }
+    }
+  );
+
+  // 租户(仅 consoleAdmin;无 target_tenant —— TENANT_ACTIONS 在 Rust 侧
+  // 对非 consoleAdmin 一律拒绝,控制台「租户页仅 root」语义的实现点)
+  app.get("/api/iam/tenants", async (req, reply) => {
+    const caller = await iamCaller(req, reply);
+    if (!caller) return;
+    if (!(await iamAllow(reply, caller, "admin:ListTenants"))) return;
+    try {
+      return await admin.iamTenants();
+    } catch (e) {
+      return iamProxyErr(e, reply);
+    }
+  });
+  app.post<{ Body: { tenant_id?: string; display_name?: string } }>(
+    "/api/iam/tenants",
+    async (req, reply) => {
+      const caller = await iamCaller(req, reply);
+      if (!caller) return;
+      if (!req.body?.tenant_id) {
+        return reply.code(400).send({ error: { code: "bad_request", message: "missing tenant_id" } });
+      }
+      if (!(await iamAllow(reply, caller, "admin:CreateTenant"))) return;
+      try {
+        return await admin.createIamTenant({
+          tenant_id: req.body.tenant_id,
+          display_name: req.body.display_name,
+        });
+      } catch (e) {
+        return iamProxyErr(e, reply);
+      }
+    }
+  );
+  app.patch<{ Params: { id: string }; Body: { display_name?: string; enabled?: boolean } }>(
+    "/api/iam/tenants/:id",
+    async (req, reply) => {
+      const caller = await iamCaller(req, reply);
+      if (!caller) return;
+      if (!(await iamAllow(reply, caller, "admin:UpdateTenant"))) return;
+      try {
+        return await admin.patchIamTenant(req.params.id, req.body ?? {});
+      } catch (e) {
+        return iamProxyErr(e, reply);
+      }
+    }
+  );
+  app.delete<{ Params: { id: string } }>("/api/iam/tenants/:id", async (req, reply) => {
+    const caller = await iamCaller(req, reply);
+    if (!caller) return;
+    if (!(await iamAllow(reply, caller, "admin:DeleteTenant"))) return;
+    try {
+      return await admin.deleteIamTenant(req.params.id);
+    } catch (e) {
+      return iamProxyErr(e, reply);
+    }
+  });
+
   // I4:指标历史查询(最近 N 个快照,旧→新)
-  app.get<{ Querystring: { limit?: string } }>("/api/metrics/history", async (req) => {
+  app.get<{ Querystring: { limit?: string } }>(
+    "/api/metrics/history",
+    { preHandler: requireIamAction(admin, "admin:GetDashboard") },
+    async (req) => {
     const limit = Number(req.query.limit ?? 200);
     const n = Number.isFinite(limit)
       ? Math.max(1, Math.min(Math.floor(limit), history.capacity))
@@ -1573,7 +1972,10 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   });
 
   // ── 在途 multipart 会话 ──
-  app.get("/api/uploads", async (_req, reply) => {
+  app.get(
+    "/api/uploads",
+    { preHandler: requireIamAction(admin, "admin:GetDashboard") },
+    async (_req, reply) => {
     try {
       return await admin.uploads();
     } catch (e) {
@@ -1583,7 +1985,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
   app.post<{ Params: { id: string } }>(
     "/api/uploads/:id/abort",
-    { preHandler: requireRole("admin") },
+    { preHandler: requireIamAction(admin, "admin:UpdateBucket", ownTenant) },
     async (req, reply) => {
       try {
         return await admin.abortUpload(req.params.id);
@@ -1606,7 +2008,10 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       status?: string;
       bypass?: string;
     };
-  }>("/api/audit", async (req, reply) => {
+  }>(
+    "/api/audit",
+    { preHandler: requireIamAction(admin, "admin:GetAudit") },
+    async (req, reply) => {
     try {
       const q = req.query;
       const num = (v: string | undefined): number | undefined => {
@@ -1646,7 +2051,10 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       status?: string;
       bypass?: string;
     };
-  }>("/api/audit/export", async (req, reply) => {
+  }>(
+    "/api/audit/export",
+    { preHandler: requireIamAction(admin, "admin:GetAudit") },
+    async (req, reply) => {
     try {
       const q = req.query;
       const num = (v: string | undefined): number | undefined => {
@@ -1680,7 +2088,10 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   });
 
   // ── 运行时配置(J5,代理 admin GET/PATCH /v1/admin/config) ──
-  app.get("/api/config", async (_req, reply) => {
+  app.get(
+    "/api/config",
+    { preHandler: requireIamAction(admin, "admin:GetDashboard") },
+    async (_req, reply) => {
     try {
       return await admin.getConfig();
     } catch (e) {
@@ -1690,7 +2101,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
   app.patch<{ Body: Record<string, unknown> }>(
     "/api/config",
-    { preHandler: requireRole("admin") },
+    { preHandler: requireIamAction(admin, "admin:ClusterWrite", ownTenant) },
     async (req, reply) => {
       const body = (req.body ?? {}) as Record<string, unknown>;
       if (typeof body !== "object" || Array.isArray(body)) {
@@ -1706,7 +2117,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   );
 
   // ── 配置热重载(M4/H3:POST /v1/admin/config/reload) ──
-  app.post("/api/config/reload", { preHandler: requireRole("admin") }, async (_req, reply) => {
+  app.post("/api/config/reload", { preHandler: requireIamAction(admin, "admin:ClusterWrite", ownTenant) }, async (_req, reply) => {
     try {
       return await admin.reloadConfig();
     } catch (e) {
@@ -1717,7 +2128,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // ── 泄漏修复 ──
   app.post<{ Body: { confirm?: boolean } }>(
     "/api/repair",
-    { preHandler: requireRole("admin") },
+    { preHandler: requireIamAction(admin, "admin:ClusterWrite", ownTenant) },
     async (req, reply) => {
       if (req.body?.confirm !== true) {
         return reply.code(400).send({
@@ -1732,14 +2143,17 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     }
   );
 
-  app.get("/api/sse/status", async (_req, reply) => {
+  app.get(
+    "/api/sse/status",
+    { preHandler: requireIamAction(admin, "admin:GetDashboard") },
+    async (_req, reply) => {
     try {
       return await admin.sseStatus();
     } catch (e) {
       return reply.code(502).send({ error: { code: "admin_unreachable", message: (e as Error).message } });
     }
   });
-  app.post("/api/sse/rotate", { preHandler: requireRole("admin") }, async (_req, reply) => {
+  app.post("/api/sse/rotate", { preHandler: requireIamAction(admin, "admin:ClusterWrite", ownTenant) }, async (_req, reply) => {
     try {
       return await admin.sseRotate();
     } catch (e) {
@@ -1748,7 +2162,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   });
   app.post<{ Body: { path?: string; force?: boolean } }>(
     "/api/devices/add",
-    { preHandler: requireRole("admin") },
+    { preHandler: requireIamAction(admin, "admin:ClusterWrite", ownTenant) },
     async (req, reply) => {
       const path = req.body?.path ?? "";
       if (!path) return reply.code(400).send({ error: { code: "bad_request", message: "path required" } });
@@ -1759,6 +2173,14 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       }
     }
   );
+
+  // M18 C1 升级路径(ADR-28 DI3.3/DI4):配置文件登录用户 → IAM User
+  // (default 租户,admin→consoleAdmin / readonly→readonly;仅无挂载时挂载,
+  // 幂等,细节见 iam-authz.syncConfigUsers)。失败只告警不阻断启动;
+  // 测试可 await (app as any).configUserSync 等待落地。
+  const configUserSync = syncConfigUsers(admin, cfg.users, (m) => app.log.warn(m));
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (app as any).configUserSync = configUserSync;
 
   return app;
 }

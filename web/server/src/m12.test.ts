@@ -6,6 +6,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { buildServer } from "./index.js";
 import { loadConfig } from "./config.js";
+import { consoleAdminIam } from "./testkit.js";
 import {
   parseLegalHoldXml,
   parseObjectLockXml,
@@ -22,7 +23,7 @@ const cfg = loadConfig();
 
 function makeApp(fake: Partial<S3M10Client>) {
   return buildServer({
-    admin: {} as never,
+    admin: consoleAdminIam() as never,
     s3: {} as never,
     s3m10: fake as S3M10Client,
     cfg,

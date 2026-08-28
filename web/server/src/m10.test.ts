@@ -5,6 +5,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { buildServer } from "./index.js";
 import { loadConfig } from "./config.js";
+import { consoleAdminIam } from "./testkit.js";
 import type { S3M10Client } from "./s3-client.js";
 import type { FastifyInstance } from "fastify";
 
@@ -12,7 +13,8 @@ const cfg = loadConfig();
 
 function makeApp(fake: Partial<S3M10Client>) {
   return buildServer({
-    admin: {} as never,
+    // M18 C1:守卫路由需 IAM 调用者;配置 admin = consoleAdmin(升级同步完成态)
+    admin: consoleAdminIam() as never,
     s3: {} as never,
     s3m10: fake as S3M10Client,
     cfg,

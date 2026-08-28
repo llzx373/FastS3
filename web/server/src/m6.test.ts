@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import { buildServer } from "./index.js";
 import { loadConfig } from "./config.js";
 import type { AdminApi, AuditQuery, ConfigPatchResult, AdminConfig } from "./admin-client.js";
+import { consoleAdminIam } from "./testkit.js";
 
 /** 记录每次 audit() 收到的过滤条件,供断言「透传」。 */
 class FakeAdmin implements AdminApi {
@@ -139,33 +140,82 @@ class FakeAdmin implements AdminApi {
   async deviceAdd(): Promise<never> {
     throw new Error("not used");
   }
-  async iamUser(): Promise<never> {
+  // M18 C1:IAM 授权求值(配置 admin 用户 = consoleAdmin,升级同步完成态;
+  // 授权路由经 iamUser + iamAuthorize,见 iam-authz.ts)
+  private iamApi = consoleAdminIam();
+  async iamUser(tenant: string, name: string) {
+    return this.iamApi.iamUser(tenant, name);
+  }
+  // M18 R2:IAM 用户/组 CRUD(测试未直接使用;委托内存 IAM)
+  async iamUsers(tenant?: string) {
+    return this.iamApi.iamUsers(tenant);
+  }
+  async createIamUser(body: { tenant?: string; name: string; password?: string; display_name?: string }) {
+    return this.iamApi.createIamUser(body);
+  }
+  async patchIamUser(
+    tenant: string,
+    name: string,
+    patch: { enabled?: boolean; display_name?: string | null; policies?: string[]; password?: string | null },
+  ) {
+    return this.iamApi.patchIamUser(tenant, name, patch);
+  }
+  async iamGroups(tenant?: string) {
+    return this.iamApi.iamGroups(tenant);
+  }
+  async iamGroup(tenant: string, name: string) {
+    return this.iamApi.iamGroup(tenant, name);
+  }
+  async createIamGroup(body: { tenant?: string; name: string; members?: string[]; policies?: string[] }) {
+    return this.iamApi.createIamGroup(body);
+  }
+  async patchIamGroup(tenant: string, name: string, patch: { members?: string[]; policies?: string[] }) {
+    return this.iamApi.patchIamGroup(tenant, name, patch);
+  }
+  async iamTenants() {
+    return this.iamApi.iamTenants();
+  }
+  async deleteIamUser(tenant: string, name: string) {
+    return this.iamApi.deleteIamUser(tenant, name);
+  }
+  async deleteIamGroup(tenant: string, name: string) {
+    return this.iamApi.deleteIamGroup(tenant, name);
+  }
+  async iamPolicies(tenant?: string) {
+    return this.iamApi.iamPolicies(tenant);
+  }
+  async createIamPolicy(body: { tenant?: string; name: string; document: string }) {
+    return this.iamApi.createIamPolicy(body);
+  }
+  async patchIamPolicy(tenant: string, name: string, document: string) {
+    return this.iamApi.patchIamPolicy(tenant, name, document);
+  }
+  async deleteIamPolicy(tenant: string, name: string) {
+    return this.iamApi.deleteIamPolicy(tenant, name);
+  }
+  async iamRoles(tenant?: string) {
+    return this.iamApi.iamRoles(tenant);
+  }
+  async createIamRole(): Promise<never> {
     throw new Error("not used");
   }
-  // M18 R2:IAM 用户/组 CRUD(测试未直接使用;接口占位)
-  async iamUsers(): Promise<never> {
+  async patchIamRole(): Promise<never> {
     throw new Error("not used");
   }
-  async createIamUser(): Promise<never> {
+  async deleteIamRole(): Promise<never> {
     throw new Error("not used");
   }
-  async patchIamUser(): Promise<never> {
-    throw new Error("not used");
+  async createIamTenant(body: { tenant_id: string; display_name?: string }) {
+    return this.iamApi.createIamTenant(body);
   }
-  async iamGroups(): Promise<never> {
-    throw new Error("not used");
+  async patchIamTenant(tenantId: string, patch: { display_name?: string; enabled?: boolean }) {
+    return this.iamApi.patchIamTenant(tenantId, patch);
   }
-  async iamGroup(): Promise<never> {
-    throw new Error("not used");
+  async deleteIamTenant(tenantId: string) {
+    return this.iamApi.deleteIamTenant(tenantId);
   }
-  async createIamGroup(): Promise<never> {
-    throw new Error("not used");
-  }
-  async patchIamGroup(): Promise<never> {
-    throw new Error("not used");
-  }
-  async iamTenants(): Promise<never> {
-    throw new Error("not used");
+  async iamAuthorize(body: { tenant: string; user: string; action: string; target_tenant?: string }) {
+    return this.iamApi.iamAuthorize(body);
   }
   async serviceAccounts(): Promise<never> {
     throw new Error("not used");
@@ -324,7 +374,7 @@ test("PATCH /api/config forwards body and passes applied/restart_required throug
   assert.deepEqual(out.restart_required, ["storage.sync_mode"]);
 });
 
-test("POST /api/config/reload requires admin role and forwards", async () => {
+test("POST /api/config/reload requires IAM admin:ClusterWrite and forwards", async () => {
   const fake = new FakeAdmin();
   const app = makeApp(fake);
   const anon = await app.inject({ method: "POST", url: "/api/config/reload" });

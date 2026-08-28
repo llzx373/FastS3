@@ -14,7 +14,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { buildServer } from "./index.js";
 import { loadConfig, type WebConfig } from "./config.js";
-import { verifyJwt } from "./auth.js";
+import { signJwt, verifyJwt } from "./auth.js";
 import { IdentityEvents, LdapSync } from "./ldap-sync.js";
 import { OidcVerifier } from "./oidc.js";
 import { MockIssuer } from "./oidc.test.js";
@@ -26,7 +26,25 @@ const JWT_SECRET = loadConfig().jwtSecret;
 
 function makeCfg(over: Record<string, unknown> = {}): WebConfig {
   const cfg = loadConfig();
-  return { ...cfg, ...over } as WebConfig;
+  // M18 C1:users: [] 使启动配置用户同步成为 no-op(identity 测试的
+  // FakeAdmin userList 断言不计入同步产物);守卫端点一律用锻造 token。
+  return { ...cfg, users: [], ...over } as WebConfig;
+}
+
+/** 伪造管理会话 token(C1 起 role claim 仅 UI 提示;授权查 IAM)+ 预置
+ *  consoleAdmin IAM 用户(守卫端点 admin:GetDashboard/identity-events 用)。 */
+function adminToken(admin: FakeAdmin): string {
+  if (!admin.userList.some((u) => u.tenant_id === "default" && u.name === "admin")) {
+    admin.userList.push({
+      tenant_id: "default",
+      name: "admin",
+      enabled: true,
+      policies: ["consoleAdmin"],
+      groups: [],
+    });
+  }
+  const now = Math.floor(Date.now() / 1000);
+  return signJwt({ sub: "admin", role: "admin", iat: now, exp: now + 3600 }, JWT_SECRET);
 }
 
 function ldapCfg(over: Record<string, unknown> = {}): WebConfig["ldap"] {
@@ -169,13 +187,8 @@ test("identity routes: oidc 未启用 → 404;启用后 discovery + login 全流
   });
   assert.equal(r.statusCode, 401);
 
-  // 身份事件可检索(管理面;先取本地会话 token)
-  const lr = await app.inject({
-    method: "POST",
-    url: "/api/login",
-    payload: { username: "admin", password: "admin123" },
-  });
-  const ltoken = (lr.json() as { token: string }).token;
+  // 身份事件可检索(管理面;C1 起需 admin:GetDashboard —— 伪造 consoleAdmin 会话)
+  const ltoken = adminToken(admin);
   r = await app.inject({
     method: "GET",
     url: "/api/identity-events",
@@ -243,6 +256,9 @@ test("ldap_bind_login_issues_jwt", async (t) => {
     admin: admin as never,
     s3: {} as never,
     cfg: makeCfg({
+      // 本用例覆盖本地口令用户优先路径:保留配置用户(启动同步会为其建
+      // IAM User 并挂 consoleAdmin,不影响本用例断言)
+      users: [{ username: "admin", password: "admin123", role: "admin" }],
       ldap: ldapCfg({ enabled: true, url: `ldap://127.0.0.1:${mock.port}` }),
     }),
     identity: {
@@ -458,12 +474,7 @@ test("ldap_sync_events_visible_on_identity_events_endpoint", async (t) => {
     }),
   });
   t.after(() => app.close());
-  const lr = await app.inject({
-    method: "POST",
-    url: "/api/login",
-    payload: { username: "admin", password: "admin123" },
-  });
-  const token = (lr.json() as { token: string }).token;
+  const token = adminToken(admin);
   const deadline = Date.now() + 5000;
   let evs: { source: string; action: string }[] = [];
   while (Date.now() < deadline) {

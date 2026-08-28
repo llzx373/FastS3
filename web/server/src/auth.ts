@@ -1,7 +1,12 @@
 /**
- * JWT(HS256)手写实现 + 登录 + 角色守卫(设计 §7.3:会话无状态,多实例)。
+ * JWT(HS256)手写实现 + 登录(设计 §7.3:会话无状态,多实例)。
  *
  * 依赖最小化:HS256 用 node:crypto 30 行实现,不引入 jsonwebtoken。
+ *
+ * M18 C1(ADR-28 DI3.3):JWT 只证明「谁登录」(sub);`role` claim 仅为
+ * UI 提示(控制台导航显隐),授权真相 = IAM `admin:*` 求值
+ * (iam-authz.ts → Rust /v1/iam/authorize)。原 requireRole 二元角色
+ * 守卫已废除。
  */
 import { createHmac, randomBytes } from "node:crypto";
 import type { FastifyReply, FastifyRequest } from "fastify";
@@ -84,22 +89,6 @@ export function authPlugin(app: {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (req as any).user = claims;
   });
-}
-
-/** 角色守卫:readonly 用户只能读。 */
-export function requireRole(role: "admin" | "readonly") {
-  return async (req: FastifyRequest, reply: FastifyReply): Promise<void> => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const user = (req as any).user as JwtClaims | undefined;
-    if (!user) {
-      return reply.code(401).send({ error: { code: "unauthorized", message: "no session" } });
-    }
-    if (role === "admin" && user.role !== "admin") {
-      return reply.code(403).send({
-        error: { code: "forbidden", message: "admin role required" },
-      });
-    }
-  };
 }
 
 export const randomId = () => randomBytes(16).toString("hex");
