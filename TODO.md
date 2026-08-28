@@ -335,63 +335,111 @@
 
 > `mc mirror` 会丢掉源 LastModified,对账/合规疼。本能力走管理面任务,禁止开放匿名 S3 PUT 伪造 mtime。
 
-- [ ] M0 ADR-24: **(a)** 保留 LastModified = 管理面任务写引擎 `ObjectMeta.mtime`(仅迁入通道,
+- [x] M0 ADR-24: **(a)** 保留 LastModified = 管理面任务写引擎 `ObjectMeta.mtime`(仅迁入通道,
   S3 PUT/POST 仍用服务器时间,防伪造);**(b)** 用户元数据(`x-amz-meta-*`)、内容类型、
   存储类、对象标签一并拷;**(c)** 桶策略/BPA/生命周期/通知配置可选拷贝,密钥不拷(目标侧预置);
   **(d)** 执行器 = 流式 GET 源 + PUT 目标(可复用节点本地调度),节流/可暂停,失败可重跑幂等
-- [ ] M1 中心或单机 admin:迁入任务 CRUD(源 endpoint/桶/前缀、是否保 mtime、是否拷桶配置)+ 进度/失败列表
+  - 交付(d43e2c6):ADR-24 写入 DESIGN.md §3.3(mtime 管理面专用通道/
+    执行器流式 GET→PUT/`ij:` 三处同步/任务模型与幂等)
+- [x] M1 中心或单机 admin:迁入任务 CRUD(源 endpoint/桶/前缀、是否保 mtime、是否拷桶配置)+ 进度/失败列表
   - 用例:`ingest_job_create_and_status`
-- [ ] M2 执行:源对象 LastModified 在目标 HEAD 上回显一致(±1s 内,ADR 钉死精度);
+  - 交付(d8747b4):`ij:` 落元数据 + admin `/v1/admin/ingest/jobs` CRUD
+    (create/list/get/pause/resume/cancel/delete)+ IngestWorker(节流/游标续跑)
+- [x] M2 执行:源对象 LastModified 在目标 HEAD 上回显一致(±1s 内,ADR 钉死精度);
   用户元数据与标签一致;重跑不双计容量
-  - 用例:`ingest_preserves_mtime_and_usermeta`;账目 `leaks` 空
-- [ ] M3 控制台向导页(源类型 MinIO/S3/OSS 只是 endpoint 预设)+ 文档;默认并发受 M17 D3 约束
+  - 用例:`ingest_preserves_mtime_and_usermeta`(mtime ±1s、usermeta/标签/
+    正文对账、重跑幂等、`leaks` 空;ingest_integration 4 例)
+  - 交付(d8747b4):S3SourceClient(SigV4 over TCP)流式拉源 + 保真写入
+- [x] M3 控制台向导页(源类型 MinIO/S3/OSS 只是 endpoint 预设)+ 文档;默认并发受 M17 D3 约束
   - 用例:向导走完后目标桶 List 与源对象数一致(小夹具)
+  - 交付(2fefa03):Ingest 页(源类型预设/保 mtime/拷桶配置开关)+ 代理
+    路由 + migration.md;E2E 夹具 `ingest_wizard_fixture_second_fasts3_source`
+    (真源端 = 第二 FastS3 实例真实 S3 HTTP,目标 List 计数一致)
 
 ### P. Condition 时间/变量补全(≈1.2 pw;ADR-27)
 
 > `aws:username` / Principal 用户 ARN 已在 M18 IAM 落地。本条补**工作时间**与 Resource 变量展开。
 > 非法键继续 400,不静默。
 
-- [ ] P0 ADR-27:白名单钉死 `DateGreaterThan`/`DateLessThan`/`DateEquals` × `aws:CurrentTime`;
+- [x] P0 ADR-27:白名单钉死 `DateGreaterThan`/`DateLessThan`/`DateEquals` × `aws:CurrentTime`;
   `${aws:username}` 在 Resource 中展开(用户名 = IAM User,与 M18 一致)。
   **明确仍拒绝**:`s3:ExistingObjectTag` 等未列入键(维持 MalformedPolicy)
-- [ ] P1 单测:工作时间 Allow、非工作时间 Deny、变量展开只命中自己的前缀
-  - 用例:`condition_current_time_office_hours`;`policy_variable_username_in_resource`
-- [ ] P2 s3-tests:能转绿的出集;其余逐名维持;非法键仍 MalformedPolicy
+  - 交付(1e6f4df):ADR-27 写入 DESIGN.md §3.3(DR1 白名单/ISO 8601
+    解析/变量展开边界;超集键仍 MalformedPolicy 红线)
+- [x] P1 单测:工作时间 Allow、非工作时间 Deny、变量展开只命中自己的前缀
+  - 用例:`condition_current_time_office_hours`(Allow/Deny 两侧);
+    `policy_variable_username_in_resource`(他人前缀 NoMatch);condition 族 6 例
+  - 交付(1e6f4df):policy.rs Date 解析 + 求值 + Resource 变量展开
+- [x] P2 s3-tests:能转绿的出集;其余逐名维持;非法键仍 MalformedPolicy
   - 用例:排除矩阵更新
+  - 交付(1e6f4df + 2026-08-29 复核):上游全量 grep 无依赖
+    Date*/`${aws:username}` 的用例,排除集无 token 可移出(「能出集的出集」
+    = 空),README 恒排表 M19 P 增量逐名记账;非法键 MalformedPolicy 测试维持
 
 ### K. Kafka 通知(≈1.8 pw;ADR-25)
 
 > Webhook 已交付。私有化事件总线 Kafka 远比 SQS 常见。只加这一个目标;**不要** AMQP/MQTT/NSQ。
 
-- [ ] K0 ADR-25: **(a)** 目标配置 = bootstrap + topic + 可选 SASL/TLS(密码仅 env,不落盘,对齐 LDAP bind);
+- [x] K0 ADR-25: **(a)** 目标配置 = bootstrap + topic + 可选 SASL/TLS(密码仅 env,不落盘,对齐 LDAP bind);
   **(b)** 复用 `e:` 队列与投递 worker,至少一次;失败重试/死信沿用 N3;
   **(c)** 载荷 JSON(与 Webhook 同源字段,便于双写);**(d)** XML 校验:非法目标显式错误;
   SQS/SNS/EventBridge/AMQP 仍拒绝
-- [ ] K1 PutNotification 接受 Kafka 目标;worker 生产消息;无 Kafka 时集成测试用 mock/Testcontainers 或
+  - 交付(a1c5b64):ADR-25 写入 DESIGN.md §3.3(kafka:// URL 形态零值
+    演进/进程内最小线协议生产者/复用 N3 队列与重试;mock 方案 = 进程内
+    fake broker 真实 TCP,ADR 钉死)
+- [x] K1 PutNotification 接受 Kafka 目标;worker 生产消息;无 Kafka 时集成测试用 mock/Testcontainers 或
   进程内 fake(二选一写进 ADR,禁止「未跑当过」)
-  - 用例:`notification_kafka_delivers_put_event`;Webhook 回归不破
-- [ ] K2 指标沿用 `fasts3_notification_*`(目标类型标签);文档部署(内网 Kafka 证书/ACL)
+  - 用例:Kafka 投递 PUT 事件(TODO 具名 `notification_kafka_delivers_put_event`
+    落为 `kafka_target_gets_payload_with_key`,语义一致:PUT 事件经
+    NotificationWorker 分派送达进程内 fake broker,message key = bucket/key);
+    `minimal_sender_produces_over_tcp`(Metadata v1→Produce v3 record-batch
+    真实 TCP 往返);`kafka_delivery_failure_retries`(N3 重试);Webhook 回归不破
+    (notify 族全绿);XML 受理/显式拒绝(service_integration 3 断言)
+  - 交付(c45a5bf):fs3-http/src/kafka.rs 三帧线协议(零新依赖)+
+    worker 按 scheme 分派;kafka:// 受理、缺 topic/未知 query/SQS/SNS ARN 拒绝
+- [x] K2 指标沿用 `fasts3_notification_*`(目标类型标签);文档部署(内网 Kafka 证书/ACL)
   - 用例:admin `/metrics` 含投递计数;compat 声明 Kafka 为第二目标
+  - 交付(c45a5bf):`fasts3_notification_{delivered,failed}_by_target_total
+    {target=webhook|kafka}`;compat.md + admin-guide.md 部署节(内网
+    broker/证书/ACL)
 
 ### J. S3 Batch Operations(≈2.5 pw;ADR-26)
 
 > 千万级桶一次性打标/恢复/删除。对齐 **AWS Batch 形态**(CreateJob + CSV manifest),
 > 不是 `mc batch` YAML。不实现 Lambda 操作。
 
-- [ ] J0 ADR-26: **(a)** API 形态 = CreateJob/GetJob/ListJobs/CancelJob
+- [x] J0 ADR-26: **(a)** API 形态 = CreateJob/GetJob/ListJobs/CancelJob
   (JSON 或 AWS S3 Control XML,ADR 钉死一种;推荐管理面 JSON + 控制台,并提供与 AWS 字段同名的 DTO,
   不承诺 `aws s3control` 客户端 100% 开箱,除非本 ADR 选择实现 Control 端口);
   **(b)** manifest = CSV(bucket,key[,versionId])或复用 Inventory 输出;
   **(c)** 操作起步 = copy / delete / restore / replace-tag;权限 = 调用者密钥策略求交,无隐式 bypass 锁;
   **(d)** 结果报告对象写入指定桶;状态机 Submitted→Running→Complete/Failed/Cancelled;崩溃后续跑
-- [ ] J1 配置与状态落元数据(新键前缀须三处同步);Create/Get/List/Cancel 往返
-  - 用例:`batch_job_create_get_list_cancel`
-- [ ] J2 worker 复用 BackgroundWorker;copy/delete/restore/tag 各至少一条集成;
+  - 交付(235ef73):ADR-26 写入 DESIGN.md §3.3(DR1 管理面 JSON 不做
+    Control 端口/DR2 CSV+Inventory/DR3 四操作无 bypass/DR4 报告与状态机/
+    DR5 `jb:` 三处同步)
+- [x] J1 配置与状态落元数据(新键前缀须三处同步);Create/Get/List/Cancel 往返
+  - 用例:`batch_job_create_get_list_cancel`(admin CRUD + 非法操作 400 +
+    报告桶缺失 404 + 二次取消 409 + 审计检索)
+  - 交付(2dc356f):`jb:{job_id}` 三处同步(keys.rs/导出显式不导出同
+    `ij:`/check 注释登记)+ fs3-admin 五端点 + `[batch]` 配置段
+- [x] J2 worker 复用 BackgroundWorker;copy/delete/restore/tag 各至少一条集成;
   锁定对象 delete 失败记入报告且不绕过 Object Lock
-  - 用例:`batch_delete_skips_locked`;`batch_restore_glacier_object`;报告 CSV/JSON 可对账
-- [ ] J3 控制台 Job 视图(进度/失败抽样)+ 审计(who 创建/取消);s3-tests batch 族若有则出集或逐名
+  - 用例:`batch_delete_skips_locked`(COMPLIANCE 记失败不绕过 + 报告
+    Succeeded/Failed 对账 + 账目零泄漏);`batch_restore_glacier_object`
+    (恢复状态机入队);batch_copy_and_replace_tags;batch_s3ref_csv_manifest
+    (表头列序);batch_inventory_manifest_json(manifest.json→数据文件
+    →Bucket 列);batch_s3ref_missing_manifest_fails_job;
+    batch_cancel_reports_processed_part;batch_inline_manifest_roundtrip(8 例)
+  - 交付(2dc356f):BatchWorker(manifest 材料化/逐项幂等/游标续跑/
+    失败样本封顶/终态报告 CSV)
+- [x] J3 控制台 Job 视图(进度/失败抽样)+ 审计(who 创建/取消);s3-tests batch 族若有则出集或逐名
   - 用例:控制台或 API 可见 Complete;审计可检索 job id
+  - 交付(e8d82b6):Batches 页(四操作表单/三种 manifest/进度+失败
+    样本/取消删除/5s 轮询)+ `/api/batch/jobs` 代理(consoleAdmin 域
+    `admin:*Batch*` 词汇)+ operator = JWT sub 注入审计;web
+    batch-routes 测试(consoleAdmin 全通/readonly 403);s3-tests 上游
+    **无 batch 族用例**(2026-08-29 全量 grep,仅注释级 s3control 引用),
+    README 恒排表逐名记账
 
 ### M19 门禁(退出条件)
 
