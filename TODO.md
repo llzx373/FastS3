@@ -305,17 +305,31 @@
 
 > 现状:运维台够用(桶/对象/密钥/审计),不是文件产品。全在 Node/React,零热路径。
 
-- [ ] U1 对象预览:图片/文本/PDF(浏览器原生或轻量组件);超大小阈值只给下载;SSE-C 对象不预览明文到浏览器以外
+- [x] U1 对象预览:图片/文本/PDF(浏览器原生或轻量组件);超大小阈值只给下载;SSE-C 对象不预览明文到浏览器以外
   - 用例:控制台测或 Playwright:小文本预览可见正文;超限显示「请下载」
-- [ ] U2 批量下载 zip:勾选多个对象 → 管理面流式打包(不经数据热路径缓冲整桶);
+  - 交付(d6e30e7):`web/console/src/lib/preview.ts` 纯函数决策 + PreviewModal
+    (图片 `<img>`/PDF `<iframe>`/文本 fetch,直连数据面不过 Node);文本 2 MiB /
+    媒体 64 MiB 阈值超限回退下载;SSE-C(无密钥 HEAD 400)显式提示仅下载;
+    node:test 7 用例
+- [x] U2 批量下载 zip:勾选多个对象 → 管理面流式打包(不经数据热路径缓冲整桶);
   单请求上限(文件数/总字节)可配,超限 413
   - 用例:`console_zip_selected_objects`;超限拒绝
-- [ ] U3 版本 diff/回滚:版本化对象列出版本;任选一版「恢复为当前」(服务端 Copy 到同 key,不静默删历史);
+  - 交付(61bd0d4):零依赖流式 zip(store+data descriptor,CRC 边流边算);
+    `POST /api/buckets/:name/objects/zip` 预检 HEAD 并发 8,数量/字节超限 413
+    (`FS3_ZIP_MAX_FILES`/`FS3_ZIP_MAX_BYTES`,默认 500/1 GiB),缺键 404,
+    SSE-C 400 显式拒绝;zip-stream 5 单测 + 路由 5 测试
+- [x] U3 版本 diff/回滚:版本化对象列出版本;任选一版「恢复为当前」(服务端 Copy 到同 key,不静默删历史);
   控制台展示 LastModified/ETag/size 对比,不做二进制 GUI diff
   - 用例:回滚后 GET 当前版正文等于所选历史;ListObjectVersions 历史仍在
-- [ ] U4 中文 i18n:控制台 UI 中/英切换(默认随浏览器 `Accept-Language`,可手动覆盖);
+  - 交付(3d2ff49):对象行「版本」入口 + VersionsModal(当前版 vs 所选版
+    LastModified/ETag/size 对比);恢复 = 既有服务端 CopyObject 同键自复制
+    (M10 已实现并测试),历史全保留
+- [x] U4 中文 i18n:控制台 UI 中/英切换(默认随浏览器 `Accept-Language`,可手动覆盖);
   关键运维文案(告警、删除确认、锁/合规)必须翻译
   - 用例:切换后导航与删除确认不是英文硬编码
+  - 交付(1818b06):`i18n.ts` 双语就地 t()/tf(),默认随 navigator.languages、
+    localStorage 覆盖;侧栏切换;导航 14 项/全部 confirm 确认框/客户端告警/锁合规
+    全量双语 + 360 处页面文案;node:test 4 用例
 
 ### M. 保 mtime/元数据/策略的迁入向导(≈2.5 pw;ADR-24)
 
