@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, fmtBytes, type ListResult, type BucketInfo, type ObjectVersion, type S3Tag, type ObjectRetention, type ObjectHead } from "../api";
+import { decidePreview, looksLikeSseCError, type PreviewDecision } from "../lib/preview";
 
 const PART_SIZE = 8 * 1024 * 1024; // 8MiB/片(>5MiB 下限)
 const STORAGE_CLASSES = ["STANDARD", "GLACIER_IR", "GLACIER", "DEEP_ARCHIVE"] as const;
@@ -38,6 +39,7 @@ export default function Objects() {
   const [restoreKey, setRestoreKey] = useState<string | null>(null);
   const [restoreDays, setRestoreDays] = useState("1");
   const [restoreTier, setRestoreTier] = useState("Standard");
+  const [previewKey, setPreviewKey] = useState<string | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
 
   const load = useCallback(async (token?: string) => {
@@ -351,6 +353,9 @@ export default function Objects() {
                       )}
                     </td>
                     <td>
+                      <button className="ghost small" onClick={() => setPreviewKey(o.key)}>
+                        预览
+                      </button>{" "}
                       <button className="ghost small" onClick={() => download(o.key)}>
                         下载
                       </button>{" "}
@@ -483,6 +488,8 @@ export default function Objects() {
           onClose={() => setMetaObj(null)}
         />
       )}
+
+      {previewKey && <PreviewModal bucket={bucket} objKey={previewKey} onClose={() => setPreviewKey(null)} />}
     </div>
   );
 }
@@ -935,4 +942,151 @@ function LockPanel({ bucket, objKey }: { bucket: string; objKey: string }) {
       )}
     </div>
   );
+}
+
+/**
+ * M19 U1:对象预览弹窗(图片/文本/PDF)。
+ * 元数据经 HEAD 判定;正文经预签名 URL 直连数据面(流量不过 Node)。
+ * SSE-C 对象(无密钥 HEAD 即 400)不预览,仅提示下载;超大小阈值只给下载。
+ */
+function PreviewModal({ bucket, objKey, onClose }: { bucket: string; objKey: string; onClose: () => void }) {
+  const [head, setHead] = useState<ObjectHead | null>(null);
+  const [headErr, setHeadErr] = useState<string | null>(null);
+  const [text, setText] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    api
+      .objectHead(bucket, objKey)
+      .then(setHead)
+      .catch((e) => setHeadErr((e as Error).message));
+  }, [bucket, objKey]);
+
+  const decision: PreviewDecision | null = head
+    ? decidePreview({ contentType: head.contentType, size: head.contentLength, key: objKey })
+    : null;
+
+  useEffect(() => {
+    if (decision?.kind !== "text") return;
+    let cancelled = false;
+    api
+      .presign(bucket, objKey, "GET", 600)
+      .then((u) => fetch(u.url))
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.text();
+      })
+      .then((t) => {
+        if (!cancelled) setText(t);
+      })
+      .catch((e) => {
+        if (!cancelled) setError((e as Error).message);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [decision?.kind, bucket, objKey]);
+
+  const downloadNow = async () => {
+    try {
+      const u = await api.presign(bucket, objKey, "GET", 600);
+      const a = document.createElement("a");
+      a.href = u.url;
+      a.download = objKey.split("/").pop() ?? objKey;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
+
+  let body: React.ReactNode;
+  if (headErr) {
+    body = looksLikeSseCError(headErr) ? (
+      <div className="muted">
+        该对象为 SSE-C 加密,控制台不以预览通道读取明文。请使用「下载」并在上方工具栏提供 SSE-C 密钥。
+      </div>
+    ) : (
+      <div className="alert">{headErr}</div>
+    );
+  } else if (!head || !decision) {
+    body = <div className="muted">加载中…</div>;
+  } else if (decision.kind === "image") {
+    body = (
+      <PreviewImage bucket={bucket} objKey={objKey} onError={setError} />
+    );
+  } else if (decision.kind === "pdf") {
+    body = <PreviewFrame bucket={bucket} objKey={objKey} onError={setError} />;
+  } else if (decision.kind === "text") {
+    body = text === null ? <div className="muted">加载中…</div> : <pre className="mono" style={{ maxHeight: 420, overflow: "auto", whiteSpace: "pre-wrap" }}>{text}</pre>;
+  } else if (decision.kind === "sse-c") {
+    body = <div className="muted">该对象为 SSE-C 加密,控制台不以预览通道读取明文。请使用「下载」并自备密钥。</div>;
+  } else {
+    body = (
+      <div className="muted">
+        {decision.reason === "over-limit"
+          ? `对象超过预览大小上限(${fmtBytes(head.contentLength)}),请下载后查看。`
+          : "该类型不支持预览,请下载后查看。"}
+        <div style={{ marginTop: 8 }}>
+          <button className="ghost small" onClick={() => void downloadNow()}>
+            下载
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()} style={{ width: 760 }}>
+        <h3>预览:{objKey}</h3>
+        {head && (
+          <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
+            {head.contentType || "application/octet-stream"} · {fmtBytes(head.contentLength)}
+          </div>
+        )}
+        {error && <div className="alert">{error}</div>}
+        {body}
+        <div className="actions">
+          <button className="ghost" onClick={onClose}>
+            关闭
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** 图片预览:预签名 URL 交 <img>,加载失败转提示。 */
+function PreviewImage({ bucket, objKey, onError }: { bucket: string; objKey: string; onError: (m: string) => void }) {
+  const [src, setSrc] = useState<string | null>(null);
+  useEffect(() => {
+    api
+      .presign(bucket, objKey, "GET", 600)
+      .then((u) => setSrc(u.url))
+      .catch((e) => onError((e as Error).message));
+  }, [bucket, objKey, onError]);
+  if (!src) return <div className="muted">加载中…</div>;
+  return (
+    <img
+      src={src}
+      alt={objKey}
+      style={{ maxWidth: "100%", maxHeight: 480 }}
+      onError={() => onError("图片加载失败(对象可能不可读)")}
+    />
+  );
+}
+
+/** PDF 预览:浏览器原生查看器(iframe 直连数据面)。 */
+function PreviewFrame({ bucket, objKey, onError }: { bucket: string; objKey: string; onError: (m: string) => void }) {
+  const [src, setSrc] = useState<string | null>(null);
+  useEffect(() => {
+    api
+      .presign(bucket, objKey, "GET", 600)
+      .then((u) => setSrc(u.url))
+      .catch((e) => onError((e as Error).message));
+  }, [bucket, objKey, onError]);
+  if (!src) return <div className="muted">加载中…</div>;
+  return <iframe src={src} title={objKey} style={{ width: "100%", height: 480, border: "1px solid var(--border)" }} />;
 }

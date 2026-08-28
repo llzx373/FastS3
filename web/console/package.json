@@ -3,12 +3,13 @@
   "private": true,
   "version": "2.4.0",
   "type": "module",
-  "description": "FastS3 Web \u63a7\u5236\u53f0(React + Vite + uPlot)",
+  "description": "FastS3 Web 控制台(React + Vite + uPlot)",
   "license": "Apache-2.0",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:unit": "node --test --import tsx \"src/**/*.test.ts\""
   },
   "dependencies": {
     "react": "^18.3.1",
@@ -16,9 +17,11 @@
     "uplot": "^1.6.31"
   },
   "devDependencies": {
+    "@types/node": "^26.2.0",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
+    "tsx": "^4.23.12",
     "typescript": "^5.6.3",
     "vite": "^6.0.3"
   }
