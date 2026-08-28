@@ -227,7 +227,7 @@
   `readonly` / `readwrite` / `writeonly` / `diagnostics` / `consoleAdmin` / `tenantAdmin`;
   自定义策略非法键继续 MalformedPolicy
   - 用例:`canned_readonly_get_ok_put_denied`;`tenant_admin_cannot_attach_consoleAdmin`
-- [ ] U3 桶策略 Principal 匹配 `arn:aws:iam::{canonical_id}:user/{name}` 与 `:root`;
+- [x] U3 桶策略 Principal 匹配 `arn:aws:iam::{canonical_id}:user/{name}` 与 `:root`;
   生效策略 = 用户∪组 ∩ SA 嵌入 ∩ 桶策略,Deny 优先
   - 用例:`bucket_policy_allows_named_user_denies_other_tenant`
 

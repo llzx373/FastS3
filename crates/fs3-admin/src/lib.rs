@@ -1490,7 +1490,10 @@ impl AdminServer {
             enabled: true,
             created_at: now,
         };
-        match engine.meta().commit_tenant_put(&tenant) {
+        // M18 U3:经 S3Service 双写(meta + 数据面 canonical 缓存),
+        // 保 Principal ARN 匹配的调用者 canonical 解析即时一致
+        drop(engine);
+        match self.service.put_tenant(&tenant) {
             Ok(_) => json::ok(Self::tenant_json(&tenant)),
             Err(e) => json::err(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1579,7 +1582,9 @@ impl AdminServer {
                 "missing required field: display_name and/or enabled",
             );
         }
-        match engine.meta().commit_tenant_put(&tenant) {
+        // M18 U3:经 S3Service 双写(同 create 路径,保 canonical 缓存一致)
+        drop(engine);
+        match self.service.put_tenant(&tenant) {
             Ok(_) => json::ok(Self::tenant_json(&tenant)),
             Err(e) => json::err(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1599,8 +1604,8 @@ impl AdminServer {
                 "default tenant cannot be deleted (ADR-28 DI1.3)",
             );
         }
-        let engine = self.engine.read();
-        match engine.meta().commit_tenant_delete(tenant_id) {
+        // M18 U3:经 S3Service 双写(meta 删除 + canonical 缓存移除)
+        match self.service.delete_tenant(tenant_id) {
             Ok(_) => json::ok(serde_json::json!({"deleted": tenant_id})),
             Err(fs3_core::Error::NotFound(_)) => json::err(
                 StatusCode::NOT_FOUND,

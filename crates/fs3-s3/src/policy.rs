@@ -17,11 +17,16 @@
 //! - `Effect`:`Allow` / `Deny`(缺省语句 → 解析失败,策略视为无效);
 //! - `Action`:字符串或数组,支持 `s3:*` 通配(`s3:List*` 前缀通配亦支持);
 //! - `Resource`:字符串或数组,支持尾缀 `*` 通配(如 `arn:aws:s3:::b/*`)、`*`;
-//! - `Principal`(M10 S3 最小集):`"*"` 或 `{"AWS": "*"}` → 任意请求者(含
-//!   匿名);`{"AWS": "<arn|account>"}` 或其数组 → 单账号模型下匹配任意
-//!   **已认证**请求者(所有密钥同属一账号,无法进一步区分 IAM 身份),不
-//!   匹配匿名;`Service`/`Federated`/`CanonicalUser`/`NotPrincipal` →
-//!   解析错误(显式不支持,红线);缺省 = 密钥附加策略(principal 恒为持钥者);
+//! - `Principal`(M10 S3 最小集 + M18 U3 IAM ARN 精确匹配,ADR-28 DI3.2):
+//!   `"*"` 或 `{"AWS": "*"}` → 任意请求者(含匿名);
+//!   `{"AWS": "arn:aws:iam::{canonical_id}:user/{name}"}` → 精确匹配该租户
+//!   该用户身份;`arn:aws:iam::{canonical_id}:root` → 该 canonical 租户内
+//!   **任意已认证身份**;数组 = 任一命中;**匿名(caller=None)永不匹配具名
+//!   Principal**。裸账号 ID 与未识别 ARN 形态(非 `arn:aws:iam::` 前缀、
+//!   `user|root` 以外资源段)→ legacy 语义:匹配任意**已认证**请求者
+//!   (单账号时代行为保留,compat 钉死);`Service`/`Federated`/
+//!   `CanonicalUser`/`NotPrincipal` → 解析错误(显式不支持,红线);
+//!   缺省 = 密钥附加策略(principal 恒为持钥者);
 //! - `Condition`(M10 S3 最小集 + M12 W3-1,超集一律解析错误):
 //!   `IpAddress`/`NotIpAddress` × `s3:SourceIp`(CIDR 或单 IP,v4/v6);
 //!   `StringEquals`/`StringLike` × `s3:prefix`、`s3:delimiter`;
@@ -51,22 +56,59 @@ enum Effect {
     Deny,
 }
 
-/// Principal(最小集,语义见模块注释)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Principal(语义见模块注释;M18 U3 起具名 IAM ARN 保留并精确匹配)。
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Principal {
     /// `"*"` / `{"AWS": "*"}`:任意请求者(含匿名)。
     Any,
-    /// `{"AWS": [arn/account...]}`:任意已认证请求者(单账号模型)。
-    Authenticated,
+    /// `{"AWS": [...]}`:逐项匹配,任一命中即匹配。
+    Aws(Vec<AwsPrincipal>),
+}
+
+/// `{"AWS": ...}` 单项(M18 U3;ADR-28 DI3.2)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AwsPrincipal {
+    /// 裸账号 ID / 未识别 ARN 形态:legacy 单账号语义,匹配任意已认证
+    /// 请求者(仅 well-formed `arn:aws:iam::{id}:user|root/...` 精确化,
+    /// 其余形态保持 M10~M17 既有行为,compat 钉死)。
+    LegacyAuthenticated,
+    /// `arn:aws:iam::{canonical_id}:root`:该 canonical 租户内任意已认证身份。
+    Root(String),
+    /// `arn:aws:iam::{canonical_id}:user/{name}`:精确到用户。
+    User(String, String),
+}
+
+impl AwsPrincipal {
+    fn matches(&self, authenticated: bool, caller: Option<&CallerIdentity>) -> bool {
+        match self {
+            AwsPrincipal::LegacyAuthenticated => authenticated,
+            AwsPrincipal::Root(id) => caller.is_some_and(|c| c.tenant_canonical_id == *id),
+            AwsPrincipal::User(id, name) => {
+                caller.is_some_and(|c| c.tenant_canonical_id == *id && c.user == *name)
+            }
+        }
+    }
 }
 
 impl Principal {
-    fn matches(self, authenticated: bool) -> bool {
+    fn matches(&self, authenticated: bool, caller: Option<&CallerIdentity>) -> bool {
         match self {
             Principal::Any => true,
-            Principal::Authenticated => authenticated,
+            Principal::Aws(list) => list.iter().any(|p| p.matches(authenticated, caller)),
         }
     }
+}
+
+/// 调用者身份(M18 U3;ADR-28 DI3.2):桶策略 Principal IAM ARN 精确匹配
+/// 的比对对象。匿名请求 = None(具名 Principal 永不匹配匿名)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallerIdentity {
+    /// 调用者所属租户的 canonical_id(ARN 账号段比对对象)。
+    pub tenant_canonical_id: String,
+    /// 属主用户名(SA 的 owner_user;无属主记录的 legacy 密钥 = bootstrap)。
+    pub user: String,
+    /// 数据面 access key(审计/诊断用;不参与匹配)。
+    pub access_key: String,
 }
 
 /// 请求求值上下文(Condition 求值;M10 S3 + M12 W3-1)。
@@ -82,6 +124,8 @@ pub struct EvalCtx {
     pub bypass_governance: bool,
     /// 目标对象剩余保留整天数(ceil;无保留 = None 键缺席;已到期 = Some(0))。
     pub remaining_retention_days: Option<i64>,
+    /// 调用者身份(M18 U3;Principal 具名 IAM ARN 匹配用;匿名 = None)。
+    pub caller: Option<CallerIdentity>,
 }
 
 /// IP 网段(CIDR 或单 IP;v4/v6)。
@@ -335,6 +379,34 @@ fn parse_string_or_array(v: &Value, field: &str) -> Result<Vec<String>, PolicyEr
     }
 }
 
+/// `{"AWS": ...}` 单项解析(M18 U3):well-formed
+/// `arn:aws:iam::{canonical_id}:root` / `:user/{name}` 保留为精确匹配项;
+/// 其余形态(裸账号 ID、未识别 ARN)→ LegacyAuthenticated(compat 钉死,
+/// 不报错——保持 M10~M17 存量策略可解析)。
+fn parse_aws_principal(s: &str) -> AwsPrincipal {
+    let legacy = || AwsPrincipal::LegacyAuthenticated;
+    let Some(rest) = s.strip_prefix("arn:aws:iam::") else {
+        return legacy();
+    };
+    let Some((id, resource)) = rest.split_once(':') else {
+        return legacy();
+    };
+    if id.is_empty() {
+        return legacy();
+    }
+    if resource == "root" {
+        AwsPrincipal::Root(id.to_string())
+    } else if let Some(name) = resource.strip_prefix("user/") {
+        if name.is_empty() {
+            legacy()
+        } else {
+            AwsPrincipal::User(id.to_string(), name.to_string())
+        }
+    } else {
+        legacy()
+    }
+}
+
 /// Principal 解析(最小集;不支持的形态显式报错,见模块注释)。
 fn parse_principal(v: &Value, idx: usize) -> Result<Principal, PolicyError> {
     match v {
@@ -356,14 +428,18 @@ fn parse_principal(v: &Value, idx: usize) -> Result<Principal, PolicyError> {
             }
             match val {
                 Value::String(s) if s == "*" => Ok(Principal::Any),
-                Value::String(_) => Ok(Principal::Authenticated),
+                Value::String(s) => Ok(Principal::Aws(vec![parse_aws_principal(s)])),
                 Value::Array(arr) => {
                     if arr.is_empty() || !arr.iter().all(|x| x.is_string()) {
                         return Err(PolicyError(format!(
                             "Statement[{idx}] Principal.AWS 数组必须是非空字符串数组"
                         )));
                     }
-                    Ok(Principal::Authenticated)
+                    Ok(Principal::Aws(
+                        arr.iter()
+                            .map(|x| parse_aws_principal(x.as_str().unwrap()))
+                            .collect(),
+                    ))
                 }
                 other => Err(PolicyError(format!(
                     "Statement[{idx}] Principal.AWS 必须是字符串或数组,got {other}"
@@ -576,8 +652,9 @@ impl Policy {
 
     /// 求值(三态;M10 S3):动作/资源/Principal/Condition 全部命中才应用语句;
     /// 显式 Deny 立即返回;否则记录 Allow;全程无命中 → NoMatch。
-    /// `authenticated` = 请求是否已认证(Principal::Authenticated 匹配依据);
-    /// `ctx` 为条件上下文(密钥级求值可传默认)。
+    /// `authenticated` = 请求是否已认证(legacy Principal 匹配依据);
+    /// `ctx` 为条件上下文,M18 U3 起 `ctx.caller` 承载调用者身份(具名
+    /// IAM ARN 精确匹配依据;匿名 = None)。密钥级求值可传默认。
     pub fn decide(
         &self,
         action: &str,
@@ -590,7 +667,8 @@ impl Policy {
         for st in &self.statements {
             if !st
                 .principal
-                .map(|p| p.matches(authenticated))
+                .as_ref()
+                .map(|p| p.matches(authenticated, ctx.caller.as_ref()))
                 .unwrap_or(true)
             {
                 continue;
@@ -632,7 +710,7 @@ impl Policy {
     pub fn grants_anonymous_public_access(&self) -> bool {
         const TARGETS: [&str; 3] = ["s3:getobject", "s3:putobject", "s3:listbucket"];
         self.statements.iter().any(|st| {
-            if st.effect != Effect::Allow || st.principal != Some(Principal::Any) {
+            if st.effect != Effect::Allow || st.principal.as_ref() != Some(&Principal::Any) {
                 return false;
             }
             st.actions.iter().any(|pat| {
@@ -752,9 +830,10 @@ mod tests {
                 "{doc}"
             );
         }
-        // 具体 AWS principal(arn / account / 数组)→ 仅匹配已认证
+        // 具体 AWS principal 的 legacy 形态(裸账号 ID,或含裸账号 ID 的数组)
+        // → 仅匹配已认证(M18 U3:未精确化形态保持单账号时代语义)
         for doc in [
-            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::12345:root"},"Action":"s3:GetObject","Resource":["*"]}]}"#,
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"123456789012"},"Action":"s3:GetObject","Resource":["*"]}]}"#,
             r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":["123456789012","arn:aws:iam::12345:user/x"]},"Action":"s3:GetObject","Resource":["*"]}]}"#,
         ] {
             let p = Policy::parse(doc).unwrap();
@@ -800,6 +879,174 @@ mod tests {
             r#"{"Statement":[{"Effect":"Allow","Principal":{},"Action":"s3:*","Resource":["*"]}]}"#,
         ] {
             assert!(Policy::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// M18 U3(ADR-28 DI3.2):具名 IAM ARN 精确匹配 —— user ARN 精确到
+    /// canonical+用户;root ARN 匹配本 canonical 租户任意身份;数组任一
+    /// 命中;匿名(caller=None)永不匹配具名 Principal;未识别 ARN 形态
+    /// 保持 legacy「任意已认证」。
+    #[test]
+    fn principal_iam_arn_matching() {
+        let caller = |canonical: &str, user: &str| EvalCtx {
+            caller: Some(CallerIdentity {
+                tenant_canonical_id: canonical.into(),
+                user: user.into(),
+                access_key: "AKTEST".into(),
+            }),
+            ..Default::default()
+        };
+        let anon = EvalCtx::default();
+
+        // user ARN:canonical + 用户名均须精确相等
+        let p = Policy::parse(
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::cA:user/alice"},
+                "Action":"s3:GetObject","Resource":["*"]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            p.decide(
+                "GetObject",
+                "arn:aws:s3:::b/k",
+                true,
+                &caller("cA", "alice")
+            ),
+            Decision::Allow
+        );
+        assert_eq!(
+            p.decide("GetObject", "arn:aws:s3:::b/k", true, &caller("cA", "bob")),
+            Decision::NoMatch,
+            "用户名不匹配"
+        );
+        assert_eq!(
+            p.decide(
+                "GetObject",
+                "arn:aws:s3:::b/k",
+                true,
+                &caller("cB", "alice")
+            ),
+            Decision::NoMatch,
+            "canonical 不匹配(跨租户不外溢)"
+        );
+        assert_eq!(
+            p.decide("GetObject", "arn:aws:s3:::b/k", false, &anon),
+            Decision::NoMatch,
+            "匿名永不匹配具名 Principal"
+        );
+
+        // root ARN:本 canonical 租户内任意已认证身份
+        let p = Policy::parse(
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::cA:root"},
+                "Action":"s3:GetObject","Resource":["*"]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            p.decide(
+                "GetObject",
+                "arn:aws:s3:::b/k",
+                true,
+                &caller("cA", "alice")
+            ),
+            Decision::Allow
+        );
+        assert_eq!(
+            p.decide(
+                "GetObject",
+                "arn:aws:s3:::b/k",
+                true,
+                &caller("cA", "carol")
+            ),
+            Decision::Allow
+        );
+        assert_eq!(
+            p.decide(
+                "GetObject",
+                "arn:aws:s3:::b/k",
+                true,
+                &caller("cB", "alice")
+            ),
+            Decision::NoMatch
+        );
+        assert_eq!(
+            p.decide("GetObject", "arn:aws:s3:::b/k", false, &anon),
+            Decision::NoMatch
+        );
+
+        // 数组:任一命中;未识别形态项不干扰精确项
+        let p = Policy::parse(
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":["arn:aws:iam::cA:user/alice","arn:aws:iam::cB:root"]},
+                "Action":"s3:GetObject","Resource":["*"]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            p.decide("GetObject", "arn:aws:s3:::b/k", true, &caller("cB", "dave")),
+            Decision::Allow
+        );
+        assert_eq!(
+            p.decide("GetObject", "arn:aws:s3:::b/k", true, &caller("cC", "dave")),
+            Decision::NoMatch
+        );
+
+        // 具名 Deny 同样精确(Deny 优先跨语句生效)
+        let p = Policy::parse(
+            r#"{"Statement":[
+                {"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::cA:root"},"Action":"s3:*","Resource":["*"]},
+                {"Effect":"Deny","Principal":{"AWS":"arn:aws:iam::cA:user/mallory"},"Action":"s3:*","Resource":["*"]}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            p.decide(
+                "GetObject",
+                "arn:aws:s3:::b/k",
+                true,
+                &caller("cA", "mallory")
+            ),
+            Decision::Deny
+        );
+        assert_eq!(
+            p.decide(
+                "GetObject",
+                "arn:aws:s3:::b/k",
+                true,
+                &caller("cA", "alice")
+            ),
+            Decision::Allow
+        );
+        assert_eq!(
+            p.decide(
+                "GetObject",
+                "arn:aws:s3:::b/k",
+                true,
+                &caller("cB", "mallory")
+            ),
+            Decision::NoMatch,
+            "他租户同名用户不受影响"
+        );
+
+        // 未识别 ARN 形态(iam group / 非 iam 前缀 / 空资源段)→ legacy
+        // 「任意已认证」语义(compat 钉死,不精确化、不报错)
+        for doc in [
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::cA:group/dev"},"Action":"s3:GetObject","Resource":["*"]}]}"#,
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:s3:::b/k"},"Action":"s3:GetObject","Resource":["*"]}]}"#,
+            r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::cA:user/"},"Action":"s3:GetObject","Resource":["*"]}]}"#,
+        ] {
+            let p = Policy::parse(doc).unwrap();
+            assert_eq!(
+                p.decide(
+                    "GetObject",
+                    "arn:aws:s3:::b/k",
+                    true,
+                    &caller("cX", "anyone")
+                ),
+                Decision::Allow,
+                "{doc}"
+            );
+            assert_eq!(
+                p.decide("GetObject", "arn:aws:s3:::b/k", false, &anon),
+                Decision::NoMatch,
+                "{doc}"
+            );
         }
     }
 

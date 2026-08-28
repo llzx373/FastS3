@@ -12306,3 +12306,140 @@ fn canned_readonly_get_ok_put_denied() {
     let r = svc.handle(&req_creds("PUT", "/u2bkt/k5", &sa_ro, &[], b"x".to_vec()));
     assert_eq!(status(&r), 200, "解挂后回退 legacy: {r:?}");
 }
+
+// ───────────────────── M18 U3:桶策略 Principal IAM ARN(ADR-28 DI3.1/DI3.2)─────────────────────
+
+/// M18 U3(TODO 钉死用例;ADR-28 DI3.1/DI3.2/DI1.4):桶策略 Principal
+/// `arn:aws:iam::{canonical_id}:user/{name}` 精确匹配 —— 点名租户 A 的
+/// alice → 其 SA GET 200;租户 B 的 bob 不被该 Allow 覆盖 → 403(跨租户
+/// 默认拒绝,具名 Allow 不外溢)。`arn:aws:iam::{canonical_id}:root` =
+/// 该 canonical 租户内任意身份:换成 `{B}:root` 后 alice 不再匹配(403)、
+/// bob 匹配(200,DI1.4 显式点名他租户 ARN 的跨租户放行能力);叠加具名
+/// Deny 验证 Deny 优先。匿名永不匹配具名 Principal;legacy 密钥不变。
+#[test]
+fn bucket_policy_allows_named_user_denies_other_tenant() {
+    let (_d, svc) = setup();
+    // 租户 A/B(经 S3Service 双写路径,canonical 缓存即时生效)
+    let mk_tenant = |id: &str, canonical: &str| fs3_core::Tenant {
+        tenant_id: id.into(),
+        display_name: id.into(),
+        canonical_id: canonical.into(),
+        enabled: true,
+        created_at: 1_700_000_000,
+    };
+    svc.put_tenant(&mk_tenant("ta", "canon-a")).unwrap();
+    svc.put_tenant(&mk_tenant("tb", "canon-b")).unwrap();
+    // 用户 + 名下 SA(身份层挂 canned readwrite → 身份层对 GET Allow)
+    let mk_user = |tenant: &str, name: &str| fs3_core::IamUser {
+        tenant_id: tenant.into(),
+        name: name.into(),
+        enabled: true,
+        password_hash: None,
+        password_salt: None,
+        policies: vec!["readwrite".into()],
+        groups: vec![],
+        display_name: None,
+        created_at: 1_700_000_000,
+    };
+    svc.put_iam_user(&mk_user("ta", "alice")).unwrap();
+    svc.put_iam_user(&mk_user("tb", "bob")).unwrap();
+    svc.add_key_owned("AKIA_ALICE", "alice-secret", None, "ta", "alice", None)
+        .unwrap();
+    svc.add_key_owned("AKIA_BOB", "bob-secret", None, "tb", "bob", None)
+        .unwrap();
+    let sa_alice = Credentials {
+        access_key: "AKIA_ALICE".into(),
+        secret_key: "alice-secret".into(),
+    };
+    let sa_bob = Credentials {
+        access_key: "AKIA_BOB".into(),
+        secret_key: "bob-secret".into(),
+    };
+    // 双方 SA 嵌入/密钥策略仅 Allow 无关资源 → 目标桶上 NoMatch:
+    // 桶策略是唯一可能的 Allow 来源(放行必由 Principal 匹配贡献)
+    let scoped = r#"{"Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::elsewhere/*"]}]}"#;
+    svc.set_key_policy("AKIA_ALICE", Some(scoped.into()))
+        .unwrap();
+    svc.set_key_policy("AKIA_BOB", Some(scoped.into())).unwrap();
+    // 桶 + 对象(常驻 test 密钥创建)
+    assert_eq!(status(&svc.handle(&req("PUT", "/u3bkt", vec![]))), 200);
+    assert_eq!(
+        status(&svc.handle(&req("PUT", "/u3bkt/k", b"data".to_vec()))),
+        200
+    );
+    // 无桶策略:两人均 403(密钥策略 NoMatch + 桶 NoMatch → 并集为空)
+    for sa in [&sa_alice, &sa_bob] {
+        let r = svc.handle(&req_creds("GET", "/u3bkt/k", sa, &[], vec![]));
+        assert_eq!(err_code(&r), "AccessDenied", "无桶策略默认拒绝: {r:?}");
+    }
+    // 桶策略:Allow Principal 点名租户 A 的 alice
+    let doc = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::canon-a:user/alice"},"Action":"s3:GetObject","Resource":["arn:aws:s3:::u3bkt/*"]}]}"#;
+    assert_eq!(
+        status(&svc.handle(&req_q(
+            "PUT",
+            "/u3bkt",
+            &[("policy", "")],
+            doc.as_bytes().to_vec()
+        ))),
+        204
+    );
+    let r = svc.handle(&req_creds("GET", "/u3bkt/k", &sa_alice, &[], vec![]));
+    assert_eq!(status(&r), 200, "具名 user ARN 放行 alice: {r:?}");
+    let r = svc.handle(&req_creds("GET", "/u3bkt/k", &sa_bob, &[], vec![]));
+    assert_eq!(
+        err_code(&r),
+        "AccessDenied",
+        "他租户 bob 不被具名 Allow 外溢: {r:?}"
+    );
+    // 匿名(caller=None)永不匹配具名 Principal
+    let r = svc.handle(&anon_req_q("GET", "/u3bkt/k", &[], vec![]));
+    assert_eq!(
+        err_code(&r),
+        "AccessDenied",
+        "匿名不匹配具名 Principal: {r:?}"
+    );
+    // legacy 常驻密钥(无属主 → default/bootstrap):未被点名,密钥层
+    // 无策略 = 隐式放行,行为不变
+    assert_eq!(
+        status(&svc.handle(&req("GET", "/u3bkt/k", vec![]))),
+        200,
+        "legacy 密钥行为不变"
+    );
+    // `:root` = 本 canonical 租户内任意身份;换成 {B}:root:
+    // alice(租户 A)不再匹配 → 403;bob(租户 B)匹配 → 200(DI1.4
+    // 显式点名他租户 ARN 的跨租户放行)
+    let doc2 = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::canon-b:root"},"Action":"s3:GetObject","Resource":["arn:aws:s3:::u3bkt/*"]}]}"#;
+    assert_eq!(
+        status(&svc.handle(&req_q(
+            "PUT",
+            "/u3bkt",
+            &[("policy", "")],
+            doc2.as_bytes().to_vec()
+        ))),
+        204
+    );
+    let r = svc.handle(&req_creds("GET", "/u3bkt/k", &sa_alice, &[], vec![]));
+    assert_eq!(
+        err_code(&r),
+        "AccessDenied",
+        "他租户 :root 不匹配 alice: {r:?}"
+    );
+    let r = svc.handle(&req_creds("GET", "/u3bkt/k", &sa_bob, &[], vec![]));
+    assert_eq!(status(&r), 200, ":root 匹配本租户任意身份: {r:?}");
+    // 具名 Deny 精确且优先:Allow {B}:root + Deny {B}:user/bob → bob 403
+    let doc3 = r#"{"Version":"2012-10-17","Statement":[
+        {"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::canon-b:root"},"Action":"s3:GetObject","Resource":["arn:aws:s3:::u3bkt/*"]},
+        {"Effect":"Deny","Principal":{"AWS":"arn:aws:iam::canon-b:user/bob"},"Action":"s3:GetObject","Resource":["arn:aws:s3:::u3bkt/*"]}
+    ]}"#;
+    assert_eq!(
+        status(&svc.handle(&req_q(
+            "PUT",
+            "/u3bkt",
+            &[("policy", "")],
+            doc3.as_bytes().to_vec()
+        ))),
+        204
+    );
+    let r = svc.handle(&req_creds("GET", "/u3bkt/k", &sa_bob, &[], vec![]));
+    assert_eq!(err_code(&r), "AccessDenied", "具名 Deny 优先: {r:?}");
+}

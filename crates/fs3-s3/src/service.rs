@@ -179,6 +179,12 @@ pub struct S3Service {
     /// 初始密钥(S3Service::new 的 keys 参数,无 `k:` 记录)→ bootstrap
     /// 存活语义(compat 钉死)。
     key_owners: std::sync::Mutex<std::collections::HashMap<String, (String, String)>>,
+    /// 租户 canonical_id 缓存(M18 U3;ADR-28 DI3.2):tenant_id →
+    /// canonical_id,桶策略 Principal ARN 匹配的调用者 canonical 解析用。
+    /// 启动随 restore_keys_from_meta 全量加载;租户 CRUD 经
+    /// put_tenant/delete_tenant 双写即时生效。缺席(未知租户)→ 按
+    /// default 租户 canonical 处理(compat 钉死)。
+    tenants: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 /// M18 U2:IAM 用户内存视图(U1 仅 enabled;U2 起含策略/组,身份层
@@ -270,6 +276,7 @@ impl S3Service {
             iam_groups: std::sync::Mutex::new(std::collections::HashMap::new()),
             iam_policies: std::sync::Mutex::new(std::collections::HashMap::new()),
             key_owners: std::sync::Mutex::new(std::collections::HashMap::new()),
+            tenants: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_clock_secs: std::sync::atomic::AtomicI64::new(unix_now() as i64),
         }
     }
@@ -699,6 +706,8 @@ impl S3Service {
             delimiter: q("delimiter"),
             bypass_governance: crate::object_lock::bypass_governance(&req.headers),
             remaining_retention_days,
+            // 调用者身份由 authorize 按认证结果填充(本函数不感知认证)
+            caller: None,
         }
     }
 
@@ -785,8 +794,14 @@ impl S3Service {
     /// 自定义)求值:显式 Deny → 拒绝(跨层优先);有挂载且至少一个
     /// Allow → 继续与密钥层求交;有挂载但无 Allow → 默认拒绝(挂载 IAM
     /// 策略后「无密钥策略 = 隐式全量」不再成立);**无挂载 → 既有并集
-    /// 语义原样**(legacy 密钥/未挂策略用户行为分毫不改)。桶策略层
-    /// Principal 匹配细化属 U3。
+    /// 语义原样**(legacy 密钥/未挂策略用户行为分毫不改)。
+    ///
+    /// M18 U3(ADR-28 DI3.2):桶策略层 Principal 具名 IAM ARN
+    /// (`arn:aws:iam::{canonical_id}:user/{name}` / `:root`)按调用者
+    /// 身份精确匹配(ctx.caller);层间合成沿用 U2 口径 —— 对挂载身份的
+    /// 调用者 = union_ok(密钥 ∪ 桶)且身份层 Allow,DI3.1「∩ 桶策略」
+    /// 中桶策略可 Deny(跨层 Deny 优先短路)且可凭具名 Allow 补足并集,
+    /// 与 AWS 同账号「身份策略 ∩ 资源策略」语义对齐。
     ///
     /// `action` 为审计操作名(如 PutObject;经 s3_action_name 归一为 S3 动作);
     /// `bucket`/`key` 构成资源 ARN。无策略/未知密钥 → 放行(密钥有效性已由
@@ -802,8 +817,12 @@ impl S3Service {
         use crate::policy::Decision;
         let resource = resource_arn(bucket, key);
         let action = s3_action_name(action, bucket, key);
-        let ctx = self.policy_ctx(req, bucket, key);
+        let mut ctx = self.policy_ctx(req, bucket, key);
         let access = auth.map(|a| a.who.as_str());
+        // M18 U3(ADR-28 DI3.2):桶策略 Principal 具名 IAM ARN 精确匹配的
+        // 调用者身份;匿名 = None(具名 Principal 永不匹配)。会话请求
+        // who = 基密钥,自然解析到基密钥属主。
+        ctx.caller = access.map(|ak| self.caller_identity(ak));
         let denied = || {
             S3Error::new(S3ErrorCode::AccessDenied).with_message(format!(
                 "access key {} is not authorized for {action} on {resource}",
@@ -943,12 +962,25 @@ impl S3Service {
     /// M18 U1 起同事恢复 IAM 用户状态表与密钥属主索引(DI7.3 禁用用户 →
     /// 其 SA 鉴权失败的内存判定依据;重启后禁用语义不丢失)。M18 U2 起
     /// 同步恢复 IAM 组策略视图与自定义策略解析缓存(DI3.1 身份层求值)。
+    /// M18 U3 起同步恢复租户 canonical 缓存(DI3.2 Principal ARN 匹配)。
     pub fn restore_keys_from_meta(&self) -> Result<usize, S3Error> {
         let engine = self.engine.read();
         let seed = engine
             .meta()
             .seed_salt()
             .map_err(|e| map_engine_error(e, "", ""))?;
+        // 租户 canonical 缓存全量加载(M18 U3;Principal ARN 匹配用)
+        {
+            let tenants = engine
+                .meta()
+                .list_tenants()
+                .map_err(|e| map_engine_error(e, "", ""))?;
+            let mut map = self.tenants.lock().unwrap();
+            map.clear();
+            for t in tenants {
+                map.insert(t.tenant_id, t.canonical_id);
+            }
+        }
         // IAM 用户状态全量加载(已知用户才参与禁用判定;缺席 = 存活)
         {
             let users = engine
@@ -1048,6 +1080,61 @@ impl S3Service {
     /// 按 access key 查凭据(测试/管理面)。
     pub fn find_key_by_access(&self, access_key: &str) -> Option<Credentials> {
         self.auth.find_key_by_access(access_key)
+    }
+
+    // ── M18 U3:租户(ADR-28 DI1.1/DI3.2;meta + canonical 缓存双写,
+    //    同 IAM 用户先例;fs3-admin 租户 handler 经此路径保缓存一致) ──
+
+    /// 创建/更新租户(覆盖语义;meta 持久化 + canonical 缓存即时生效)。
+    /// canonical_id 不可改由调用方保证(管理面 PATCH 显式拒绝),缓存恒以
+    /// 最新写入为准。
+    pub fn put_tenant(&self, tenant: &fs3_core::Tenant) -> Result<(), fs3_core::Error> {
+        self.engine.read().meta().commit_tenant_put(tenant)?;
+        self.tenants
+            .lock()
+            .unwrap()
+            .insert(tenant.tenant_id.clone(), tenant.canonical_id.clone());
+        Ok(())
+    }
+
+    /// 删除租户(meta 语义:不存在 → NotFound;非空 → InvalidArgument;
+    /// canonical 缓存同步移除)。
+    pub fn delete_tenant(&self, tenant_id: &str) -> Result<(), fs3_core::Error> {
+        self.engine.read().meta().commit_tenant_delete(tenant_id)?;
+        self.tenants.lock().unwrap().remove(tenant_id);
+        Ok(())
+    }
+
+    /// 调用者身份解析(M18 U3;ADR-28 DI3.2):access key → key_owners 属主
+    /// (tenant, user)→ tenants 缓存 canonical。会话请求的 who = 基密钥,
+    /// 自然解析到基密钥属主。无属主记录(构造注入 legacy 密钥)→
+    /// default/bootstrap(DI1.3/DI7.1 孤儿挂载口径);租户缓存未命中 →
+    /// default 租户 canonical(compat 钉死)。
+    fn caller_identity(&self, access_key: &str) -> crate::policy::CallerIdentity {
+        let (tenant, user) = self
+            .key_owners
+            .lock()
+            .unwrap()
+            .get(access_key)
+            .cloned()
+            .unwrap_or_else(|| {
+                (
+                    fs3_core::Tenant::DEFAULT_TENANT.to_string(),
+                    fs3_core::IamUser::BOOTSTRAP_USER.to_string(),
+                )
+            });
+        let canonical = self
+            .tenants
+            .lock()
+            .unwrap()
+            .get(&tenant)
+            .cloned()
+            .unwrap_or_else(|| fs3_core::Tenant::DEFAULT_CANONICAL_ID.to_string());
+        crate::policy::CallerIdentity {
+            tenant_canonical_id: canonical,
+            user,
+            access_key: access_key.to_string(),
+        }
     }
 
     // ── M18 U1:IAM 用户(ADR-28 DI2.1/DI7.3;meta + 内存状态表双写,
