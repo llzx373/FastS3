@@ -1,7 +1,7 @@
 {
   "name": "@fasts3/web-server",
   "private": true,
-  "version": "2.3.0",
+  "version": "2.4.0",
   "description": "FastS3 \u7ba1\u7406 API(Fastify + TS):JWT \u767b\u5f55\u3001admin \u901a\u9053\u4ee3\u7406\u3001dashboard \u805a\u5408\u3001presign\u3001multipart \u7f16\u6392",
   "license": "Apache-2.0",
   "type": "module",

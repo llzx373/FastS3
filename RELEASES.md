@@ -1,5 +1,33 @@
 # FastS3 发布记录
 
+## v2.4.0 — M18 IAM 多租户(2026-08-28)
+
+> 发布状态:与 M18 交付同步;git tag/发布流水线属执行期步骤(与 v2.3.0
+> 同口径,**本版本不打 tag**)。决策记录:ADR-28(docs/DESIGN.md §3.3;
+> DI4.4 修正、DI5.3/DI9.1 延期记录 2026-08-28 随门禁落盘)。
+
+### 变更(TODO M18 全项:A0/I/U/S/R/C/T + 门禁)
+
+- **IAM 多租户**:Tenant/User/Group/Policy/Service Account/Role 一等实体
+  (MinIO 熟悉的概念与 canned 策略名);租户隔离(跨租户默认拒绝、
+  ListBuckets 隐式过滤);控制台授权切 IAM `admin:*`,JWT 只证明身份;
+  STS AssumeRole 本租户角色实体(取代 D-E2「无角色实体」);LDAP 同步/bind
+  登录与 OIDC JIT 映射 IAM User;部门管理员自助,日常不依赖 root。
+- **门禁实测**:
+  - `cargo test --workspace` 全绿(2026-08-28 门禁复跑);
+  - C2 `tests/iam/delegated_admin_drill.sh` ALL PASS(全程零 root 数据面 AK,
+    跨租户读写/IAM 均 403);LDAP/OIDC mock 绿(web 单测 108 pass / 1
+    FS3_INTEG 门控 skip;`ldap_sync_creates_user_not_raw_key` /
+    `ldap_bind_login_issues_jwt` / `oidc_jit_not_console_admin`);
+  - s3-tests 全量意外失败 0(T1 终跑 5c4d362:461 passed / 94 skipped / 260
+    文档化排除;alt 身份双 AK 双 User 出集见 tests/s3-tests/README.md);
+  - 崩溃混载 200 轮(162 kills)零撕裂、无孤儿 `k:`/`iu:`
+    (`tests/crash/run_crash_m18.sh`,e37f561);
+  - clippy `-D warnings`;cargo audit 0 漏洞(2 allowed unmaintained 警告与
+    v2.3.0 相同);
+  - 覆盖率 llvm-cov workspace 行 **84.78%**(相对 v2.3.0 84.55% +0.23pt,
+    回退门禁 ≤1pt;分支 78.74% / 函数 84.96%)。
+
 ## v2.3.0 — M17 可交付私有化(2026-08-27)
 
 > 发布状态:与 M17 交付同步;git tag/发布流水线属执行期步骤(与 v2.2.1

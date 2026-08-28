@@ -14,7 +14,7 @@
 
 ## 使用约定
 
-1. **当前执行面 = [M18 IAM 多租户](#m18-v240-iam-多租户)**。M17 门禁已过;M18 未开始前不得抢跑实现。M19 不得在 IAM 未交付前当「部门自助」宣传。
+1. **当前执行面 = [M19 好用的私有化](#m19-v250-好用的私有化)**。M18 门禁已过(IAM 已交付,部门身份可自助);M19 各组首条 ADR 未落盘不得写实现。
 2. 按里程碑顺序推进;**门禁(退出条件)全部勾选**后方可进入下一里程碑(ROADMAP §5 纪律)。
 3. 每条任务标注所属 WBS 编号,完成时在提交/PR 描述中引用本文件条目。
 4. **决策纪律**:各组首条含 ADR 的必须先落盘——M17 = ADR-23(BPA);
@@ -42,7 +42,7 @@
 | 里程碑 | 版本 | 工期(2 人并行) | 核心交付 | 状态 |
 | --- | --- | --- | --- | --- |
 | [M17 可交付私有化](#m17-v230-可交付私有化) | v2.3.0 | ≈3 周 | 许可证对齐、单容器开箱、退出路径、mc 死锁、BPA、湖仓/不可变仓库冒烟、审计导出 | ✅ 已交付 |
-| [M18 IAM 多租户](#m18-v240-iam-多租户) | v2.4.0 | ≈4 周 | MinIO 熟悉的用户/组/策略/服务账号 + 租户隔离;部门管理员自助,不依赖 root | ⬜ 未开始 |
+| [M18 IAM 多租户](#m18-v240-iam-多租户) | v2.4.0 | ≈4 周 | MinIO 熟悉的用户/组/策略/服务账号 + 租户隔离;部门管理员自助,不依赖 root | ✅ 已交付 |
 | [M19 好用的私有化](#m19-v250-好用的私有化) | v2.5.0 | ≈6 周 | 控制台文件柜、保元数据迁入向导、Condition Date*、Kafka 通知、S3 Batch Operations | ⬜ 未开始 |
 
 已交付底座(不占排期,门禁不得回退):S3 核心读写、版本、Object Lock、SSE-S3/C、生命周期、
@@ -273,13 +273,23 @@
 
 ### M18 门禁(退出条件)
 
-- [ ] ADR-28 与实现无偏离;compat 记载 D-E2 角色实体变更与 canned 策略名
-- [ ] `cargo test --workspace` 全绿;C2 委托演练 + LDAP mock 绿
-- [ ] s3-tests 全量意外失败 0;DI9 出集或逐名
-- [ ] 崩溃 ≥200 轮(IAM 用户/SA 建删 + PUT 混载)零撕裂、无孤儿 `k:`/`iu:`
-  (演练:`tests/crash/run_crash_m18.sh`)
-- [ ] clippy -D warnings;覆盖率不回退 >1pt;cargo audit 清零
-- [ ] 发布记录 v2.4.0:CHANGELOG/RELEASES + 版本 bump(**不打 tag / 不公网 Release**)
+- [x] ADR-28 与实现无偏离(DI4.4 `auth_note=root` 修正、DI5.3 两 STS 变体延期、
+  DI9.1 display 部分延期,修正/延期记录 2026-08-28 落盘 DESIGN.md §3.3,b0e3010);
+  compat 记载 D-E2 角色实体变更与 canned 策略名
+- [x] `cargo test --workspace` 全绿(2026-08-28 门禁复跑);C2 委托演练
+  `tests/iam/delegated_admin_drill.sh` ALL PASS(全程零 root 数据面 AK);
+  LDAP mock 绿(web 单测 108 pass / 1 FS3_INTEG 门控 skip:
+  `ldap_sync_creates_user_not_raw_key` / `ldap_bind_login_issues_jwt` /
+  `oidc_jit_not_console_admin`)
+- [x] s3-tests 全量意外失败 0(T1 终跑 5c4d362:passed=461 skipped=94
+  excluded=260 unexpected=0;门禁期仅 docs/版本钉/单测钉改动后复跑仍 0);
+  DI9 出集或逐名
+- [x] 崩溃 ≥200 轮(IAM 用户/SA 建删 + PUT 混载)零撕裂、无孤儿 `k:`/`iu:`:
+  `tests/crash/run_crash_m18.sh` 200 轮 162 kills(e37f561)
+- [x] clippy -D warnings;覆盖率不回退 >1pt(llvm-cov workspace 行 84.78%,
+  对照 v2.3.0 84.55% +0.23pt);cargo audit 清零(0 漏洞,2 allowed
+  unmaintained 警告同 v2.3.0)
+- [x] 发布记录 v2.4.0:CHANGELOG/RELEASES + 版本 bump(**不打 tag / 不公网 Release**)
 
 ---
 

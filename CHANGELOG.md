@@ -5,6 +5,37 @@
 > 详细发布记录见 [RELEASES.md](./RELEASES.md);RC/GA 候选流程见
 > [docs/ga/rc-flow.md](./docs/ga/rc-flow.md)。
 
+## v2.4.0 — M18 IAM 多租户(2026-08-28)
+
+M18 全部任务与门禁完成(TODO.md M18 全勾选);ADR-28 落盘 DESIGN.md §3.3
+(DI4.4 `auth_note=root` 修正、DI5.3 两 STS 变体与 DI9.1 display 部分延期,
+修正/延期记录 2026-08-28 随门禁补齐);workspace + web console/server 版本
+**2.4.0**。git tag / `tools/package/` 属执行期步骤(**本版本不打 tag**,
+与 v2.3.0 同口径)。
+
+- **身份实体**(I/U):Tenant/User/Group/Policy/Service Account CRUD;
+  `KeyRecord` 增 tenant_id/owner_user/embedded_policy(值版本双读单写);
+  canned 策略集 readonly/readwrite/writeonly/diagnostics/consoleAdmin/
+  tenantAdmin 与 MinIO 对齐;桶策略 Principal IAM ARN 精确匹配,生效策略 =
+  (用户 ∪ 组) ∩ SA 嵌入 ∩ 桶策略,Deny 优先。
+- **数据面**(S):SA = 唯一数据面身份,用户自助建/列/吊销自己的 SA(无需
+  root);IAM 变更下一请求即生效;ListBuckets 隐式过滤、CreateBucket 属主 =
+  调用者租户、跨租户默认 403。
+- **STS / LDAP / OIDC**(R):AssumeRole 走本租户 `ir:` 角色实体(取代 ADR-18
+  D-E2「无角色实体」;GetSessionToken 不提权不变);LDAP 同步改映射
+  User/Group、允许 bind 登录控制台;OIDC sub JIT 落默认组、永不直挂
+  consoleAdmin。AssumeRoleWithLDAPIdentity/WebIdentity 两变体本版未接线
+  (延期记录见 ADR-28 DI5.3)。
+- **控制台**(C):JWT 只证明身份,授权查 IAM `admin:*`;新增 IAM 用户/组/
+  策略/服务账号/角色页,租户页仅 root;IAM 用户口令登录;MinIO 运维对照表
+  与「root 只引导」生产清单。
+- **测试**(T):s3-tests alt 身份双 AK 双 User,能出集的出集、其余逐名,
+  全量意外失败 0;Owner 回显升格租户 canonical_id;IAM 混载崩溃演练 200 轮
+  零撕裂零孤儿;部门自助委托演练全程不用 root 数据面 AK。
+- **门禁**:`cargo test --workspace` 全绿;C2 委托演练 + LDAP/OIDC mock 绿;
+  clippy `-D warnings`;cargo audit 清零;覆盖率对照 v2.3.0 llvm-cov 行
+  **84.78%**(+0.23pt,不回退 >1pt)。
+
 ## v2.3.0 — M17 可交付私有化(2026-08-27)
 
 M17 全部任务与门禁完成(TODO.md M17 全勾选);ADR-23 落盘 DESIGN.md §3.3;
