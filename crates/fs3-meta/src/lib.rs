@@ -573,6 +573,18 @@ pub enum Op {
     KeyDelete {
         access_key: String,
     },
+    /// 写/更新 IAM 租户(`tn:{tenant_id}` → Tenant;M18 I1;ADR-28 DI1;
+    /// 覆盖语义,同 KeyPut 先例)。canonical_id 不可改由调用方保证
+    /// (本臂不比对旧值)。
+    TenantPut {
+        tenant: fs3_core::Tenant,
+    },
+    /// 删除 IAM 租户。**非空拒绝**:事务内扫描 `iu:`/`ig:`/`ip:`/`ir:`
+    /// 租户子前缀,存在任何 IAM 实体 → InvalidArgument。
+    /// TODO(M18/I2):`k:` 属主字段落地后补「该租户仍持有密钥」拒绝检查。
+    TenantDelete {
+        tenant_id: String,
+    },
 }
 
 /// 元数据层运行统计(H2 指标:WAL 组提交)。
@@ -1346,7 +1358,7 @@ impl MetaStore {
         } else {
             None
         };
-        Ok(MetaStore {
+        let store = MetaStore {
             db,
             sync_mode: cfg.sync_mode,
             write_opts,
@@ -1355,7 +1367,11 @@ impl MetaStore {
             lifecycle_cache: Mutex::new(HashMap::new()),
             notification_cache: Mutex::new(HashMap::new()),
             event_queue_max: cfg.event_queue_max.max(1),
-        })
+        };
+        // M18 I1(ADR-28 DI1.3)升级迁移:存量部署隐式落入租户 default
+        // (canonical_id 钉死 "fasts3");幂等,首次打开即落地。
+        store.ensure_default_tenant()?;
+        Ok(store)
     }
 
     /// 显式落盘:WAL write + fsync(组提交窗口外的确定性刷盘)。
@@ -2907,6 +2923,82 @@ impl MetaStore {
         Ok(out)
     }
 
+    // —— IAM 租户(M18 I1;ADR-28 DI1:root-only CRUD,admin 通道) ——
+
+    /// 写/更新租户(覆盖语义;非法 tenant_id → InvalidArgument)。
+    pub fn commit_tenant_put(&self, tenant: &fs3_core::Tenant) -> Result<u64> {
+        self.commit(&[Op::TenantPut {
+            tenant: tenant.clone(),
+        }])
+    }
+
+    /// 删除租户(不存在 → NotFound;非空 → InvalidArgument,见 Op::TenantDelete)。
+    pub fn commit_tenant_delete(&self, tenant_id: &str) -> Result<u64> {
+        self.commit(&[Op::TenantDelete {
+            tenant_id: tenant_id.to_string(),
+        }])
+    }
+
+    /// 读租户。
+    pub fn get_tenant(&self, tenant_id: &str) -> Result<Option<fs3_core::Tenant>> {
+        let k = tenant_key(tenant_id)?;
+        match self.db.get(&k).map_err(rocks_err)? {
+            Some(v) => {
+                Ok(Some(decode(&v).map_err(|e| {
+                    Error::Corrupt(format!("tenant {tenant_id}: {e}"))
+                })?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// 列全部租户(按 tenant_id 排序)。
+    pub fn list_tenants(&self) -> Result<Vec<fs3_core::Tenant>> {
+        let mut out = Vec::new();
+        for item in self
+            .db
+            .iterator(IteratorMode::From(PREFIX_TENANT, Direction::Forward))
+        {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(PREFIX_TENANT) {
+                break;
+            }
+            out.push(decode(&v).map_err(|e| Error::Corrupt(format!("tenant record: {e}")))?);
+        }
+        Ok(out)
+    }
+
+    /// 升级迁移(M18 I1;ADR-28 DI1.3):`tn:default` 缺席 → 创建 default
+    /// 租户(canonical_id 钉死 "fasts3",沿用单账号时代硬编码 Owner 字符串;
+    /// compat 钉死)。幂等;MetaStore::open 单点调用,存量部署首次打开
+    /// 新二进制即落地,存量 `k:`/对象键不受影响。
+    pub fn ensure_default_tenant(&self) -> Result<()> {
+        if self
+            .db
+            .get(tenant_key(fs3_core::Tenant::DEFAULT_TENANT)?)
+            .map_err(rocks_err)?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let tenant = fs3_core::Tenant {
+            tenant_id: fs3_core::Tenant::DEFAULT_TENANT.to_string(),
+            display_name: fs3_core::Tenant::DEFAULT_TENANT.to_string(),
+            canonical_id: fs3_core::Tenant::DEFAULT_CANONICAL_ID.to_string(),
+            enabled: true,
+            created_at: now,
+        };
+        // 直写 + fsync(照 seed_salt 先例;open 单点、幂等,不经事务不增 seq)
+        self.db
+            .put(tenant_key(&tenant.tenant_id)?, encode(&tenant)?)
+            .map_err(rocks_err)?;
+        self.db.flush_wal(true).map_err(rocks_err)
+    }
+
     /// 对象 PUT + 分配记录 + 桶统计(ADR-4 同事务)。
     pub fn commit_object_put(
         &self,
@@ -3605,6 +3697,17 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
     fn tremove(tx: &Transaction<OptimisticTransactionDB>, key: &[u8]) -> Result<()> {
         tx.delete(key).map_err(rocks_err)
     }
+    /// 事务内前缀非空判定(M18 I1;TenantDelete 非空拒绝用)。
+    /// 冲突集纪律同 tscan_lifecycle_rule_keys:调用臂先 tget(tn:{id})
+    /// 锚定租户记录,乐观冲突经租户键检出重试。
+    fn tprefix_nonempty(tx: &Transaction<OptimisticTransactionDB>, prefix: &[u8]) -> Result<bool> {
+        let mut it = tx.iterator(IteratorMode::From(prefix, Direction::Forward));
+        if let Some(item) = it.next() {
+            let (k, _v) = item.map_err(rocks_err)?;
+            return Ok(k.starts_with(prefix));
+        }
+        Ok(false)
+    }
     /// 事务内枚举桶生命周期规则键(M11 L1;`r:{bucket}\0` 前缀)。
     /// 冲突集纪律:r: 键域的全部写路径(本函数调用方各事务臂)都先
     /// tget(b:{bucket}) 锚定桶记录,乐观冲突经桶键检出重试;迭代器读
@@ -4169,6 +4272,32 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
                 let k = key_key(access_key);
                 if tget(tx, &k)?.is_none() {
                     return Err(Error::NotFound(format!("key {access_key}")));
+                }
+                tremove(tx, &k)?;
+            }
+            Op::TenantPut { tenant } => {
+                let k = tenant_key(&tenant.tenant_id)?;
+                tget(tx, &k)?;
+                tinsert(tx, k, encode(tenant)?)?;
+            }
+            Op::TenantDelete { tenant_id } => {
+                let k = tenant_key(tenant_id)?;
+                if tget(tx, &k)?.is_none() {
+                    return Err(Error::NotFound(format!("tenant {tenant_id}")));
+                }
+                // 非空拒绝:租户下存在任何 IAM 实体 → 拒绝(DI1 隔离边界,
+                // 不做级联删除)。`k:` 属主检查待 I2(KeyRecord 尚无 tenant 字段)。
+                for prefix in [
+                    iam_user_prefix(tenant_id)?,
+                    iam_group_prefix(tenant_id)?,
+                    iam_policy_prefix(tenant_id)?,
+                    iam_role_prefix(tenant_id)?,
+                ] {
+                    if tprefix_nonempty(tx, &prefix)? {
+                        return Err(Error::InvalidArgument(format!(
+                            "tenant {tenant_id} not empty (iam entities exist)"
+                        )));
+                    }
                 }
                 tremove(tx, &k)?;
             }
@@ -5065,6 +5194,107 @@ mod tests {
             b"x-000000000000000000000000000000000000000000000000"
         );
         assert_ne!(salt, st.seed_salt().unwrap());
+    }
+
+    /// M18 I1(ADR-28 DI1):Tenant CRUD 事务口径——写/读/列/删;
+    /// 非法名拒绝;非空租户删除拒绝(default 租户的管理面保护在 admin 层)。
+    #[test]
+    fn tenant_crud_roundtrip() {
+        let (_d, s) = open_tmp();
+        // open 迁移已落地 default 租户
+        let dflt = s.get_tenant("default").unwrap().unwrap();
+        assert_eq!(dflt.canonical_id, "fasts3");
+        assert!(dflt.enabled);
+
+        let t = fs3_core::Tenant {
+            tenant_id: "acme".into(),
+            display_name: "ACME 部门".into(),
+            canonical_id: "a".repeat(64),
+            enabled: true,
+            created_at: 1_700_000_000,
+        };
+        s.commit_tenant_put(&t).unwrap();
+        assert_eq!(s.get_tenant("acme").unwrap().as_ref(), Some(&t));
+        assert_eq!(
+            s.list_tenants()
+                .unwrap()
+                .iter()
+                .map(|t| t.tenant_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["acme", "default"]
+        );
+        // 覆盖更新(display_name/enabled 可改)
+        let mut t2 = t.clone();
+        t2.display_name = "ACME".into();
+        t2.enabled = false;
+        s.commit_tenant_put(&t2).unwrap();
+        assert_eq!(s.get_tenant("acme").unwrap().unwrap(), t2);
+        // 非法 tenant_id 拒绝(字符集钉死,见 keys.rs validate_iam_name)
+        let bad = fs3_core::Tenant {
+            tenant_id: "a b".into(),
+            ..t.clone()
+        };
+        assert!(matches!(
+            s.commit_tenant_put(&bad),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(s.get_tenant("a b").is_err());
+        // 删除:空租户可删;不存在 → NotFound
+        s.commit_tenant_delete("acme").unwrap();
+        assert!(s.get_tenant("acme").unwrap().is_none());
+        assert!(matches!(
+            s.commit_tenant_delete("acme"),
+            Err(Error::NotFound(_))
+        ));
+        // 非空拒绝:租户下存在 IAM 实体键 → InvalidArgument(IAM 实体 CRUD
+        // 属 U 系列条目;此处直写 iu: 键模拟存量实体)
+        s.commit_tenant_put(&t).unwrap();
+        s.db.put(iam_user_key("acme", "alice").unwrap(), encode(&t).unwrap())
+            .unwrap();
+        assert!(matches!(
+            s.commit_tenant_delete("acme"),
+            Err(Error::InvalidArgument(_))
+        ));
+        s.db.delete(iam_user_key("acme", "alice").unwrap()).unwrap();
+        s.commit_tenant_delete("acme").unwrap();
+    }
+
+    /// M18 I1 升级迁移(ADR-28 DI1.3):存量部署(已有 k: 密钥/桶/对象,
+    /// 无 tn: 键)打开新二进制 → default 租户落地(canonical_id 钉死
+    /// "fasts3"),存量键原样可列可校验;幂等(重开不覆盖、不重复)。
+    #[test]
+    fn tenant_default_migration_preserves_existing_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let rec = fs3_core::KeyRecord::new("AKIA_LEGACY", "legacy-secret", seed, None).unwrap();
+        {
+            // 模拟 I1 前存量库:回退掉 open 自动落地的 tn:default,只留 k:
+            let s = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
+            s.db.delete(tenant_key("default").unwrap()).unwrap();
+            assert!(s.get_tenant("default").unwrap().is_none());
+            s.commit_key_put(&rec).unwrap();
+        }
+        // 升级后首次打开:迁移落地 default 租户,存量密钥完好
+        let s = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
+        let dflt = s.get_tenant("default").unwrap().unwrap();
+        assert_eq!(dflt.tenant_id, "default");
+        assert_eq!(dflt.canonical_id, "fasts3");
+        assert!(dflt.enabled);
+        assert_eq!(s.list_tenants().unwrap().len(), 1);
+        let got = s.get_key("AKIA_LEGACY").unwrap().unwrap();
+        assert_eq!(got, rec);
+        assert!(got.verify_secret("legacy-secret"));
+        assert_eq!(got.decrypt_secret(seed).unwrap(), "legacy-secret");
+        assert_eq!(
+            s.list_keys()
+                .unwrap()
+                .iter()
+                .map(|k| k.access_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["AKIA_LEGACY"]
+        );
+        // 迁移不经事务:序号不被迁移本身推动
+        assert_eq!(s.last_seq().unwrap(), 1);
     }
 
     #[test]

@@ -14,6 +14,11 @@
 //! - `POST /v1/admin/keys`                      创建密钥(secret 只下发一次)
 //! - `DELETE /v1/admin/keys/{access}`           删除密钥
 //! - `PATCH /v1/admin/keys/{access}`            启用/禁用
+//! - `GET  /v1/iam/tenants`                     租户列表(M18 I1;ADR-28 DI8)
+//! - `POST /v1/iam/tenants`                     创建租户(canonical_id 服务端生成,不可改)
+//! - `GET  /v1/iam/tenants/{id}`                租户详情
+//! - `PATCH /v1/iam/tenants/{id}`               更新 display_name/enabled
+//! - `DELETE /v1/iam/tenants/{id}`              删除租户(default/非空拒绝)
 //! - `GET  /v1/admin/uploads`                   在途 multipart 会话
 //! - `POST /v1/admin/uploads/{id}/abort`        强制中止会话
 //! - `GET  /v1/admin/audit?limit=`              审计日志
@@ -452,11 +457,14 @@ impl AdminServer {
             .split('/')
             .filter(|s| !s.is_empty())
             .collect();
-        // 全部端点带 /v1/admin 前缀
-        if segs.len() < 2 || segs[0] != "v1" || segs[1] != "admin" {
+        // 全部端点带 /v1/admin 前缀;M18 I1 起 IAM 端点带 /v1/iam 前缀
+        if segs.len() < 2 || segs[0] != "v1" || (segs[1] != "admin" && segs[1] != "iam") {
             return json::err(StatusCode::NOT_FOUND, "not_found", "unknown admin endpoint");
         }
         let rest = &segs[2..];
+        if segs[1] == "iam" {
+            return self.dispatch_iam(method, rest, body);
+        }
         match (method.as_str(), rest) {
             ("GET", ["status"]) => self.handle_status(),
             ("GET", ["metrics"]) => self.handle_metrics(),
@@ -495,6 +503,19 @@ impl AdminServer {
             ("POST", ["sse", "rotate"]) => self.handle_sse_rotate(),
             ("GET", ["sse", "status"]) => self.handle_sse_status(),
             _ => json::err(StatusCode::NOT_FOUND, "not_found", "unknown admin endpoint"),
+        }
+    }
+
+    /// M18 I1(ADR-28 DI8):`/v1/iam/*` 路由。admin 通道 = root 可信
+    /// (静态 Bearer token / unix 0600),`admin:*` IAM 授权细分属 C1。
+    fn dispatch_iam(&self, method: &Method, rest: &[&str], body: &[u8]) -> Response<String> {
+        match (method.as_str(), rest) {
+            ("GET", ["tenants"]) => self.handle_tenants_list(),
+            ("POST", ["tenants"]) => self.handle_tenant_create(body),
+            ("GET", ["tenants", id]) => self.handle_tenant_get(id),
+            ("PATCH", ["tenants", id]) => self.handle_tenant_patch(id, body),
+            ("DELETE", ["tenants", id]) => self.handle_tenant_delete(id),
+            _ => json::err(StatusCode::NOT_FOUND, "not_found", "unknown iam endpoint"),
         }
     }
 
@@ -1331,6 +1352,233 @@ impl AdminServer {
             );
         }
         json::ok(resp)
+    }
+
+    // ───────────────────── M18 I1:IAM 租户(ADR-28 DI1/DI8)─────────────────────
+
+    /// 租户 JSON 视图(canonical_id 稳定不可改,可回显;无任何秘密材料)。
+    fn tenant_json(t: &fs3_core::Tenant) -> serde_json::Value {
+        serde_json::json!({
+            "tenant_id": t.tenant_id,
+            "display_name": t.display_name,
+            "canonical_id": t.canonical_id,
+            "enabled": t.enabled,
+            "created_at": t.created_at,
+        })
+    }
+
+    /// GET /v1/iam/tenants:全部租户(按 tenant_id 排序)。
+    fn handle_tenants_list(&self) -> Response<String> {
+        let engine = self.engine.read();
+        match engine.meta().list_tenants() {
+            Ok(tenants) => json::ok(serde_json::json!({
+                "tenants": tenants.iter().map(Self::tenant_json).collect::<Vec<_>>(),
+            })),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    /// POST /v1/iam/tenants:创建租户。body:`tenant_id`(必填,字符集同
+    /// AWS IAM NameRegexString,compat 钉死)、`display_name`(可选,缺省 =
+    /// tenant_id)。canonical_id 由服务端创建时生成(随机 64 hex,稳定不
+    /// 可改;仅 default 租户钉死 "fasts3")。同名 → 409。
+    fn handle_tenant_create(&self, body: &[u8]) -> Response<String> {
+        let parsed: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(_) => {
+                return json::err(StatusCode::BAD_REQUEST, "bad_request", "invalid JSON body")
+            }
+        };
+        let tenant_id = parsed
+            .get("tenant_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if tenant_id.is_empty() {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "missing required field: tenant_id",
+            );
+        }
+        let display_name = parsed
+            .get("display_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(tenant_id)
+            .to_string();
+        let engine = self.engine.read();
+        if let Err(e) = fs3_meta::keys::validate_iam_name(tenant_id) {
+            return json::err(StatusCode::BAD_REQUEST, "invalid_name", &e.to_string());
+        }
+        match engine.meta().get_tenant(tenant_id) {
+            Ok(Some(_)) => {
+                return json::err(
+                    StatusCode::CONFLICT,
+                    "tenant_exists",
+                    &format!("tenant {tenant_id} already exists"),
+                )
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return json::err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    &e.to_string(),
+                )
+            }
+        }
+        // canonical_id:创建时随机 32 字节 hex(稳定、不可改;仅 default
+        // 租户钉死 "fasts3",ADR-28 DI1.1/1.3)
+        let mut raw = [0u8; 32];
+        if let Err(e) = fs3_core::random_bytes(&mut raw) {
+            return json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            );
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let tenant = fs3_core::Tenant {
+            tenant_id: tenant_id.to_string(),
+            display_name,
+            canonical_id: hex::encode(raw),
+            enabled: true,
+            created_at: now,
+        };
+        match engine.meta().commit_tenant_put(&tenant) {
+            Ok(_) => json::ok(Self::tenant_json(&tenant)),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    /// GET /v1/iam/tenants/{id}:单个租户(不存在 → 404)。
+    fn handle_tenant_get(&self, tenant_id: &str) -> Response<String> {
+        let engine = self.engine.read();
+        match engine.meta().get_tenant(tenant_id) {
+            Ok(Some(t)) => json::ok(Self::tenant_json(&t)),
+            Ok(None) => json::err(
+                StatusCode::NOT_FOUND,
+                "no_such_tenant",
+                &format!("tenant {tenant_id}"),
+            ),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    /// PATCH /v1/iam/tenants/{id}:body 可含 `display_name`(string)与/或
+    /// `enabled`(bool);canonical_id 不可改(ADR-28 DI1.1,显式拒绝)。
+    fn handle_tenant_patch(&self, tenant_id: &str, body: &[u8]) -> Response<String> {
+        let parsed: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(_) => {
+                return json::err(StatusCode::BAD_REQUEST, "bad_request", "invalid JSON body")
+            }
+        };
+        if parsed.get("canonical_id").is_some() {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "canonical_id is immutable (ADR-28 DI1.1)",
+            );
+        }
+        let engine = self.engine.read();
+        let mut tenant = match engine.meta().get_tenant(tenant_id) {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                return json::err(
+                    StatusCode::NOT_FOUND,
+                    "no_such_tenant",
+                    &format!("tenant {tenant_id}"),
+                )
+            }
+            Err(e) => {
+                return json::err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    &e.to_string(),
+                )
+            }
+        };
+        let mut applied = Vec::new();
+        if let Some(v) = parsed.get("display_name") {
+            match v.as_str() {
+                Some(s) if !s.is_empty() => {
+                    tenant.display_name = s.to_string();
+                    applied.push("display_name");
+                }
+                _ => {
+                    return json::err(
+                        StatusCode::BAD_REQUEST,
+                        "bad_request",
+                        "display_name must be a non-empty string",
+                    )
+                }
+            }
+        }
+        if let Some(enabled) = parsed.get("enabled").and_then(|v| v.as_bool()) {
+            tenant.enabled = enabled;
+            applied.push("enabled");
+        }
+        if applied.is_empty() {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "missing required field: display_name and/or enabled",
+            );
+        }
+        match engine.meta().commit_tenant_put(&tenant) {
+            Ok(_) => json::ok(Self::tenant_json(&tenant)),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
+    }
+
+    /// DELETE /v1/iam/tenants/{id}:删除租户。`default` 恒拒绝(升级兼容
+    /// 锚点,DI1.3);非空(存在 IAM 实体)→ 409;不存在 → 404。
+    fn handle_tenant_delete(&self, tenant_id: &str) -> Response<String> {
+        if tenant_id == fs3_core::Tenant::DEFAULT_TENANT {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "default tenant cannot be deleted (ADR-28 DI1.3)",
+            );
+        }
+        let engine = self.engine.read();
+        match engine.meta().commit_tenant_delete(tenant_id) {
+            Ok(_) => json::ok(serde_json::json!({"deleted": tenant_id})),
+            Err(fs3_core::Error::NotFound(_)) => json::err(
+                StatusCode::NOT_FOUND,
+                "no_such_tenant",
+                &format!("tenant {tenant_id}"),
+            ),
+            Err(fs3_core::Error::InvalidArgument(_)) => json::err(
+                StatusCode::CONFLICT,
+                "tenant_not_empty",
+                &format!("tenant {tenant_id} still has iam entities"),
+            ),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &e.to_string(),
+            ),
+        }
     }
 
     // ───────────────────── M15 T1:STS 会话(ADR-18 D-E2)─────────────────────

@@ -534,6 +534,13 @@ pub struct MetaExportFile {
     pub seed_salt_hex: String,
     pub buckets: Vec<BucketDto>,
     pub keys: Vec<KeyRecord>,
+    /// IAM 租户(M18 I1;ADR-28 DI1 + 键前缀三处同步之二:`tn:` 登记于
+    /// fs3-meta keys.rs(一处);本字段承载租户记录(二处);check 可达性
+    /// 扫描只读 `o:`/`p:` 段引用键,对 `tn:` 天然安全(三处))。
+    /// Tenant 无秘密材料(canonical_id/display_name/状态);旧导出(v2
+    /// 无此字段)→ 空表,导入侧 ensure_default_tenant 已兜底 default。
+    #[serde(default)]
+    pub tenants: Vec<fs3_core::Tenant>,
     pub objects: Vec<ObjectEntryDto>,
     pub uploads: Vec<UploadDto>,
 }
@@ -653,6 +660,9 @@ pub fn run_meta_export(
 
     let keys = store.list_keys()?;
 
+    // M18 I1:IAM 租户(含迁移落地的 default;无秘密材料,随导出)
+    let tenants = store.list_tenants()?;
+
     // M10 V5-1:版本化桶逐版本条目导出(含删除标记与 null 槽),vk 不丢 ——
     // 键形态经 ObjectDto.version_id 承载(None/"null"/hex 三态)。
     let objects: Vec<ObjectEntryDto> = store
@@ -692,6 +702,7 @@ pub fn run_meta_export(
         seed_salt_hex: hex::encode(&seed_salt),
         buckets,
         keys,
+        tenants,
         objects,
         uploads,
     };
@@ -701,9 +712,10 @@ pub fn run_meta_export(
 
     write_private(&args.output, json.as_bytes())?;
     println!(
-        "meta-export: {} buckets, {} keys, {} objects, {} uploads → {}",
+        "meta-export: {} buckets, {} keys, {} tenants, {} objects, {} uploads → {}",
         file.buckets.len(),
         file.keys.len(),
+        file.tenants.len(),
         file.objects.len(),
         file.uploads.len(),
         args.output.display()
@@ -816,7 +828,10 @@ pub fn run_meta_import(
             (fs3_meta::BucketConf::Cors, &b.cors),
             (fs3_meta::BucketConf::Ownership, &b.ownership_controls),
             (fs3_meta::BucketConf::Policy, &b.policy),
-            (fs3_meta::BucketConf::PublicAccessBlock, &b.public_access_block),
+            (
+                fs3_meta::BucketConf::PublicAccessBlock,
+                &b.public_access_block,
+            ),
         ] {
             if let Some(doc) = doc {
                 store.commit_bucket_conf_put(&b.name, conf, doc.as_bytes())?;
@@ -871,6 +886,14 @@ pub fn run_meta_import(
     // 5) 访问密钥(secret_hash/salt/密文原样;种子盐已恢复,可解密)
     for k in &file.keys {
         store.commit_key_put(k)?;
+    }
+
+    // 5b) IAM 租户(M18 I1):原样恢复(覆盖语义;MetaStore::open 的
+    // ensure_default_tenant 已先落地 default,导出中的 default 记录以其
+    // 原值覆盖——created_at 等保真)。旧导出(无 tenants 字段)→ 仅
+    // default,语义等同「存量隐式 default」迁移。
+    for t in &file.tenants {
+        store.commit_tenant_put(t)?;
     }
 
     // 6) 对象:段校验(布局边界/对齐)+ 分配草稿 + 零统计增量
@@ -1743,6 +1766,88 @@ mod tests {
         assert_eq!(
             json["objects"][0]["meta"]["sse"]["kind"],
             serde_json::json!("SseS3")
+        );
+    }
+
+    /// M18 I1(ADR-28 DI1 + 键前缀三处同步之二):IAM 租户随 export/import
+    /// 往返(含迁移落地的 default,canonical_id 钉死 "fasts3");导出 JSON
+    /// **不含 secret 明文**——密钥只以加盐哈希 + AES-GCM 密文形态出现
+    /// (同 export_never_leaks_sse_kek_seed 红线口径)。
+    #[test]
+    fn tenants_export_import_roundtrip_no_plaintext_secret() {
+        let (dir, img1, img2) = tmp_devices();
+        let meta1 = dir.path().join("meta1");
+        let meta2 = dir.path().join("meta2");
+        let secret = "plaintext-secret-never-exported-0123456789";
+        let tenant = fs3_core::Tenant {
+            tenant_id: "acme".into(),
+            display_name: "ACME".into(),
+            canonical_id: "c".repeat(64),
+            enabled: true,
+            created_at: 1_700_000_000,
+        };
+        {
+            let mut e = fs3_engine::Engine::open(&engine_cfg(&img1, &meta1)).unwrap();
+            let rec =
+                fs3_core::KeyRecord::new("AKIA_EXP", secret, &e.meta().seed_salt().unwrap(), None)
+                    .unwrap();
+            e.meta().commit_key_put(&rec).unwrap();
+            e.meta().commit_tenant_put(&tenant).unwrap();
+            e.close().unwrap();
+        }
+        let export = dir.path().join("export.json");
+        run_meta_export(
+            &img1,
+            &meta1,
+            &MetaExportArgs {
+                output: export.clone(),
+            },
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&export).unwrap();
+        // 红线:secret 明文零导出(哈希/密文形态不受本断言约束)
+        assert!(!text.contains(secret), "导出含 secret 明文");
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let tenants = json["tenants"].as_array().unwrap();
+        assert_eq!(tenants.len(), 2, "default(迁移落地)+ acme");
+        assert!(tenants
+            .iter()
+            .any(|t| t["tenant_id"] == "default" && t["canonical_id"] == "fasts3"));
+        assert!(tenants
+            .iter()
+            .any(|t| t["tenant_id"] == "acme" && t["canonical_id"] == "c".repeat(64)));
+
+        // 导入:租户原样恢复(default 以导出原值覆盖 ensure 兜底值);
+        // 密钥可解(种子盐已恢复)
+        run_meta_import(
+            &img2,
+            &meta2,
+            &MetaImportArgs {
+                input: export.clone(),
+                force: false,
+            },
+        )
+        .unwrap();
+        let store = MetaStore::open(&meta2, &MetaConfig::default()).unwrap();
+        let restored = store.list_tenants().unwrap();
+        assert_eq!(restored.len(), 2);
+        assert_eq!(
+            restored.iter().find(|t| t.tenant_id == "acme").unwrap(),
+            &tenant
+        );
+        assert_eq!(
+            restored
+                .iter()
+                .find(|t| t.tenant_id == "default")
+                .unwrap()
+                .canonical_id,
+            "fasts3"
+        );
+        let rec = store.get_key("AKIA_EXP").unwrap().unwrap();
+        assert!(rec.verify_secret(secret));
+        assert_eq!(
+            rec.decrypt_secret(&store.seed_salt().unwrap()).unwrap(),
+            secret
         );
     }
 

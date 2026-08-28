@@ -21,6 +21,10 @@
 //! - `e:{seq be64}` 事件队列条目(M15 N2;ADR-18 D-E1;值 = postcard
 //!   EventRecord;be64 字典序 = 写入序;有界环形批量截断;入队与数据
 //!   操作同事务——崩溃零漂移)
+//! - `tn:{tenant_id}` IAM 租户(M18 I1;ADR-28 DI1)
+//! - `iu:{tenant}\0{user}` / `ig:{tenant}\0{group}` / `ip:{tenant}\0{name}` /
+//!   `ir:{tenant}\0{role}` IAM 用户/组/策略/角色(M18 I1;ADR-28 DI2;
+//!   名受限字符集,不转义,见 validate_iam_name)
 //!
 //! s: 前缀下的系统键:`s:seq`(单调计数器)、`s:key_seed_salt`(M3)、
 //! `s:value_rewrite_v3_done`(M10 V5-3 值格式重写完成标记)、
@@ -91,6 +95,25 @@ pub const PREFIX_INVENTORY: &[u8] = b"iv:";
 /// `e:` 事件队列口径)、check 可达性扫描(只读 `o:`/`p:` 段引用键,对
 /// `x:` 天然安全,登记于注释)。
 pub const PREFIX_RESTORE_JOB: &[u8] = b"x:";
+/// IAM 租户(M18 I1;ADR-28 DI1:`tn:{tenant_id}` → postcard Tenant;
+/// 租户 = 隔离边界,一级实体)。新一级前缀:三处同步——keys.rs 前缀表
+/// (本处)、meta-export/import DTO(fs3d/meta.rs `tenants` 字段,I1 起入
+/// 导出)、check 可达性扫描(只读 `o:`/`p:` 段引用键,对 `tn:` 天然安全,
+/// 登记于注释)。
+pub const PREFIX_TENANT: &[u8] = b"tn:";
+/// IAM 用户(M18 I1;ADR-28 DI2:`iu:{tenant}\0{user}` → postcard IamUser)。
+/// 三处同步同 `tn:` 口径:前缀表(本处)已登记;DTO 随 U1 落;check 扫描
+/// 天然安全(同上)。
+pub const PREFIX_IAM_USER: &[u8] = b"iu:";
+/// IAM 组(M18 I1;ADR-28 DI2:`ig:{tenant}\0{group}` → postcard IamGroup)。
+/// 三处同步同 `iu:` 口径。
+pub const PREFIX_IAM_GROUP: &[u8] = b"ig:";
+/// IAM 策略(M18 I1;ADR-28 DI2:`ip:{tenant}\0{name}` → postcard IamPolicy;
+/// 内置 canned 无 `ip:` 键,tenant_id = None,不落盘)。三处同步同 `iu:` 口径。
+pub const PREFIX_IAM_POLICY: &[u8] = b"ip:";
+/// IAM 角色(M18 I1;ADR-28 DI2/DI5:`ir:{tenant}\0{role}` → postcard
+/// IamRole;STS AssumeRole 目标)。三处同步同 `iu:` 口径。
+pub const PREFIX_IAM_ROLE: &[u8] = b"ir:";
 
 /// 系统单调计数器(每个事务 +1,单点序列化;ADR-5)。
 pub const SYS_SEQ: &[u8] = b"s:seq";
@@ -600,6 +623,155 @@ pub fn parse_key_key(raw: &[u8]) -> Result<String> {
     String::from_utf8(body.to_vec()).map_err(|_| Error::Corrupt("access key not utf8".into()))
 }
 
+// —— IAM 多租户(M18 I1;ADR-28 DI1/DI2) ——
+
+/// IAM 名(tenant_id / user / group / policy / role)长度上限(字节)。
+pub const IAM_NAME_MAX: usize = 128;
+
+/// IAM 名合法字符集(ADR-28 DI2;compat 钉死):对齐 AWS IAM
+/// NameRegexString `[\w+=,.@-]`——ASCII 字母数字 + `_ + = , . @ -`;
+/// 长度 1..=128 字节。**不转义、直接拒绝非法名**(IAM 名是管理面标识符,
+/// 非任意字节 S3 对象键;拒绝 0x00/0xFF 保证 `\0` 分隔符唯一可辨,
+/// 拒绝 `:` 保证与前缀边界不串)。
+pub fn validate_iam_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > IAM_NAME_MAX {
+        return Err(Error::InvalidArgument(format!(
+            "iam name length must be 1..={IAM_NAME_MAX}, got {}",
+            name.len()
+        )));
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"_+=,.@-".contains(&b))
+    {
+        return Err(Error::InvalidArgument(format!(
+            "iam name {name:?}: charset must be [A-Za-z0-9_+=,.@-]"
+        )));
+    }
+    Ok(())
+}
+
+/// 租户键:`tn:{tenant_id}`。
+pub fn tenant_key(tenant_id: &str) -> Result<Vec<u8>> {
+    validate_iam_name(tenant_id)?;
+    let mut k = Vec::with_capacity(PREFIX_TENANT.len() + tenant_id.len());
+    k.extend_from_slice(PREFIX_TENANT);
+    k.extend_from_slice(tenant_id.as_bytes());
+    Ok(k)
+}
+
+/// 解析 `tn:` 键 → tenant_id。
+pub fn parse_tenant_key(raw: &[u8]) -> Result<String> {
+    let body = raw
+        .strip_prefix(PREFIX_TENANT)
+        .ok_or_else(|| Error::Corrupt("tenant key missing prefix".into()))?;
+    let id = String::from_utf8(body.to_vec())
+        .map_err(|_| Error::Corrupt("tenant id not utf8".into()))?;
+    validate_iam_name(&id)?;
+    Ok(id)
+}
+
+/// IAM 两段式实体键:`{prefix}{tenant}\0{name}`(同 `r:`/`n:` 两段式先例;
+/// tenant/name 均经 validate_iam_name,不含 0x00/0xFF/`:`,分隔符唯一可辨)。
+fn iam_entity_key(prefix: &[u8], tenant: &str, name: &str) -> Result<Vec<u8>> {
+    validate_iam_name(tenant)?;
+    validate_iam_name(name)?;
+    let mut k = Vec::with_capacity(prefix.len() + tenant.len() + 1 + name.len());
+    k.extend_from_slice(prefix);
+    k.extend_from_slice(tenant.as_bytes());
+    k.push(0x00);
+    k.extend_from_slice(name.as_bytes());
+    Ok(k)
+}
+
+/// IAM 实体租户前缀:`{prefix}{tenant}\0`(租户级扫描边界;租间天然隔离)。
+fn iam_entity_prefix(prefix: &[u8], tenant: &str) -> Result<Vec<u8>> {
+    validate_iam_name(tenant)?;
+    let mut k = Vec::with_capacity(prefix.len() + tenant.len() + 1);
+    k.extend_from_slice(prefix);
+    k.extend_from_slice(tenant.as_bytes());
+    k.push(0x00);
+    Ok(k)
+}
+
+/// 解析 IAM 两段式键 → (tenant, name)。
+fn parse_iam_entity_key(prefix: &[u8], raw: &[u8]) -> Result<(String, String)> {
+    let body = raw
+        .strip_prefix(prefix)
+        .ok_or_else(|| Error::Corrupt("iam key missing prefix".into()))?;
+    let sep = body
+        .iter()
+        .position(|&b| b == 0x00)
+        .ok_or_else(|| Error::Corrupt("iam key missing separator".into()))?;
+    let tenant = String::from_utf8(body[..sep].to_vec())
+        .map_err(|_| Error::Corrupt("iam tenant not utf8".into()))?;
+    let name = String::from_utf8(body[sep + 1..].to_vec())
+        .map_err(|_| Error::Corrupt("iam name not utf8".into()))?;
+    validate_iam_name(&tenant)?;
+    validate_iam_name(&name)?;
+    Ok((tenant, name))
+}
+
+/// IAM 用户键:`iu:{tenant}\0{user}`。
+pub fn iam_user_key(tenant: &str, user: &str) -> Result<Vec<u8>> {
+    iam_entity_key(PREFIX_IAM_USER, tenant, user)
+}
+
+/// 租户级 IAM 用户前缀:`iu:{tenant}\0`(租户非空判定/列表扫描边界)。
+pub fn iam_user_prefix(tenant: &str) -> Result<Vec<u8>> {
+    iam_entity_prefix(PREFIX_IAM_USER, tenant)
+}
+
+/// 解析 `iu:` 键 → (tenant, user)。
+pub fn parse_iam_user_key(raw: &[u8]) -> Result<(String, String)> {
+    parse_iam_entity_key(PREFIX_IAM_USER, raw)
+}
+
+/// IAM 组键:`ig:{tenant}\0{group}`。
+pub fn iam_group_key(tenant: &str, group: &str) -> Result<Vec<u8>> {
+    iam_entity_key(PREFIX_IAM_GROUP, tenant, group)
+}
+
+/// 租户级 IAM 组前缀:`ig:{tenant}\0`。
+pub fn iam_group_prefix(tenant: &str) -> Result<Vec<u8>> {
+    iam_entity_prefix(PREFIX_IAM_GROUP, tenant)
+}
+
+/// 解析 `ig:` 键 → (tenant, group)。
+pub fn parse_iam_group_key(raw: &[u8]) -> Result<(String, String)> {
+    parse_iam_entity_key(PREFIX_IAM_GROUP, raw)
+}
+
+/// IAM 策略键:`ip:{tenant}\0{name}`。
+pub fn iam_policy_key(tenant: &str, name: &str) -> Result<Vec<u8>> {
+    iam_entity_key(PREFIX_IAM_POLICY, tenant, name)
+}
+
+/// 租户级 IAM 策略前缀:`ip:{tenant}\0`。
+pub fn iam_policy_prefix(tenant: &str) -> Result<Vec<u8>> {
+    iam_entity_prefix(PREFIX_IAM_POLICY, tenant)
+}
+
+/// 解析 `ip:` 键 → (tenant, name)。
+pub fn parse_iam_policy_key(raw: &[u8]) -> Result<(String, String)> {
+    parse_iam_entity_key(PREFIX_IAM_POLICY, raw)
+}
+
+/// IAM 角色键:`ir:{tenant}\0{role}`。
+pub fn iam_role_key(tenant: &str, role: &str) -> Result<Vec<u8>> {
+    iam_entity_key(PREFIX_IAM_ROLE, tenant, role)
+}
+
+/// 租户级 IAM 角色前缀:`ir:{tenant}\0`。
+pub fn iam_role_prefix(tenant: &str) -> Result<Vec<u8>> {
+    iam_entity_prefix(PREFIX_IAM_ROLE, tenant)
+}
+
+/// 解析 `ir:` 键 → (tenant, role)。
+pub fn parse_iam_role_key(raw: &[u8]) -> Result<(String, String)> {
+    parse_iam_entity_key(PREFIX_IAM_ROLE, raw)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -819,6 +991,99 @@ mod tests {
         assert!(parse_event_seq(SYS_SEQ).is_err());
     }
 
+    #[test]
+    fn iam_key_byte_level_and_prefix_isolation() {
+        // M18 I1(ADR-28 DI1/DI2):`tn:` 单段式 + `iu:`/`ig:`/`ip:`/`ir:`
+        // 两段式形态钉死(逐字节)
+        assert_eq!(tenant_key("default").unwrap(), b"tn:default".as_slice());
+        assert_eq!(
+            iam_user_key("default", "alice").unwrap(),
+            b"iu:default\x00alice".as_slice()
+        );
+        assert_eq!(
+            iam_group_key("t1", "ops").unwrap(),
+            b"ig:t1\x00ops".as_slice()
+        );
+        assert_eq!(
+            iam_policy_key("t1", "readonly").unwrap(),
+            b"ip:t1\x00readonly".as_slice()
+        );
+        assert_eq!(
+            iam_role_key("t1", "app").unwrap(),
+            b"ir:t1\x00app".as_slice()
+        );
+        assert_eq!(
+            iam_user_prefix("default").unwrap(),
+            b"iu:default\x00".as_slice()
+        );
+        // 解析往返
+        assert_eq!(parse_tenant_key(b"tn:default").unwrap(), "default");
+        assert_eq!(
+            parse_iam_user_key(b"iu:t1\x00bob").unwrap(),
+            ("t1".to_string(), "bob".to_string())
+        );
+        assert_eq!(
+            parse_iam_role_key(b"ir:t1\x00app").unwrap(),
+            ("t1".to_string(), "app".to_string())
+        );
+        // 实体键恒落本租户前缀;不串租户(含同头租户 t1/t12)
+        let uk = iam_user_key("t1", "bob").unwrap();
+        assert!(uk.starts_with(&iam_user_prefix("t1").unwrap()));
+        assert!(!uk.starts_with(&iam_user_prefix("t12").unwrap()));
+        assert!(!iam_user_key("t12", "b")
+            .unwrap()
+            .starts_with(&iam_user_prefix("t1").unwrap()));
+        // 非法名直接拒绝(不转义):空、超长、0x00/0xFF、`:`、空格、中文
+        for bad in ["", "a b", "a:b", "a\x00b", "a\u{FF}b", "租户"] {
+            assert!(tenant_key(bad).is_err(), "tenant {bad:?}");
+            assert!(iam_user_key(bad, "u").is_err(), "tenant {bad:?}");
+            assert!(iam_user_key("t", bad).is_err(), "user {bad:?}");
+        }
+        let long = "a".repeat(IAM_NAME_MAX + 1);
+        assert!(tenant_key(&long).is_err());
+        assert!(tenant_key(&"a".repeat(IAM_NAME_MAX)).is_ok());
+        // 合法字符集全量(对齐 AWS IAM NameRegexString)
+        assert!(iam_user_key("t", "A_z9+=,.@-").is_ok());
+        // 解析侧同样拒绝非法形态(缺前缀/缺分隔符/非法名/尾部空名)
+        assert!(parse_tenant_key(b"o:t").is_err());
+        assert!(parse_iam_user_key(b"iu:t1").is_err());
+        assert!(parse_iam_user_key(b"iu:t1\x00").is_err());
+        assert!(parse_iam_user_key(b"iu:t 1\x00u").is_err());
+        // 与既有前缀域逐对不相交(新五前缀 × 代表旧前缀)
+        let news = [
+            tenant_key("t").unwrap(),
+            iam_user_key("t", "u").unwrap(),
+            iam_group_key("t", "g").unwrap(),
+            iam_policy_key("t", "p").unwrap(),
+            iam_role_key("t", "r").unwrap(),
+        ];
+        let olds = [
+            object_key("b", "k"),
+            key_key("ak"),
+            bucket_key("b"),
+            txn_key(0x3AFF), // t: 族第二字节恒 ':'(0x3A),与 tn: 的 'n' 不相交
+            lifecycle_rule_key("b", "r"),
+            notification_rule_key("b", "n"),
+            inventory_config_key("b", "i"),
+            event_key(1),
+            restore_job_key(1),
+            session_key("u1"),
+        ];
+        for n in &news {
+            for o in &olds {
+                assert!(!n.starts_with(o.as_slice()), "{n:?} vs {o:?}");
+                assert!(!o.starts_with(n.as_slice()), "{o:?} vs {n:?}");
+            }
+        }
+        // 五前缀两两不相交(iu:/ig:/ip:/ir: 第二字节互异;tn: 独立)
+        for (i, a) in news.iter().enumerate() {
+            for b in news.iter().skip(i + 1) {
+                assert!(!a.starts_with(b.as_slice()));
+                assert!(!b.starts_with(a.as_slice()));
+            }
+        }
+    }
+
     proptest::proptest! {
         #[test]
         fn escape_roundtrip_prop(data: Vec<u8>) {
@@ -866,6 +1131,32 @@ mod tests {
                 if vk != VK_NULL {
                     prop_assert!(vk_key < object_version_key(&bucket, &key, &VK_NULL));
                 }
+            }
+        }
+
+        #[test]
+        fn iam_key_roundtrip_prop(tenant: String, name: String) {
+            // M18 I1:合法名(受限字符集)构造/解析必须往返;租户前缀扫描
+            // 不串租户
+            if validate_iam_name(&tenant).is_ok() && validate_iam_name(&name).is_ok() {
+                let tk = tenant_key(&tenant).unwrap();
+                prop_assert_eq!(parse_tenant_key(&tk).unwrap(), tenant.clone());
+                let uk = iam_user_key(&tenant, &name).unwrap();
+                prop_assert_eq!(
+                    parse_iam_user_key(&uk).unwrap(),
+                    (tenant.clone(), name.clone())
+                );
+                prop_assert!(uk.starts_with(&iam_user_prefix(&tenant).unwrap()));
+                for (k, p) in [
+                    (iam_group_key(&tenant, &name).unwrap(), iam_group_prefix(&tenant).unwrap()),
+                    (iam_policy_key(&tenant, &name).unwrap(), iam_policy_prefix(&tenant).unwrap()),
+                    (iam_role_key(&tenant, &name).unwrap(), iam_role_prefix(&tenant).unwrap()),
+                ] {
+                    prop_assert!(k.starts_with(&p));
+                }
+            } else {
+                // 非法名恒拒绝(不转义、不静默规范化)
+                prop_assert!(tenant_key(&tenant).is_err() || iam_user_key(&tenant, &name).is_err());
             }
         }
     }

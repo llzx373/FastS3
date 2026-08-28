@@ -129,7 +129,19 @@ meta-export/import 可见并可往返;真实类独立落 ObjectMeta v7 `storage_
 | `x-amz-expected-bucket-owner` | 单账号模型语义:头值 = 桶属主(`fasts3`)→ 放行;≠ 自身 → 403 AccessDenied(显式,不静默);桶级/对象级 op 通用。s3-tests 同名用例仍排除:前置 `PutBucketAcl(public-read-write)` = Put*Acl 501 红线 |
 | 密钥状态语义(S3-GAP §3.7 #7) | 禁用 vs 不存在在 admin/审计面可区分:认证失败审计条目落 `auth_note`(`key_disabled` / `key_not_found` / `session_token_invalid`);**协议错误码维持 AWS 同义**(禁用/不存在均 InvalidAccessKeyId,会话失效 InvalidToken),侧写仅落 admin/审计面 |
 
-## 用审计导出代替 S3 Server Access Logging
+## IAM 多租户(v2.4 M18 起)
+
+| 项 | 说明 |
+| --- | --- |
+| 默认租户 | 存量部署升级后隐式落入租户 `default`(ADR-28 DI1.3);其 `canonical_id` **钉死 `"fasts3"`**——与单账号时代硬编码 Owner 字符串一致,Owner 回显与 `x-amz-expected-bucket-owner` 比对行为不变 |
+| canonical_id | 对外账号 ID(Owner/expected-bucket-owner 比对对象),**稳定不可改**;新建租户 = 创建时服务端随机 64 hex,仅 `default` 钉死 `"fasts3"`;`PATCH` 改 canonical_id 显式 400 |
+| IAM 命名字符集 | tenant_id / user / group / policy / role 名 = `[A-Za-z0-9_+=,.@-]{1,128}`(对齐 AWS IAM NameRegexString);**不转义、非法名直接拒绝**(InvalidArgument);`tn:` 单段式键,`iu:`/`ig:`/`ip:`/`ir:` 为 `{tenant}\0{name}` 两段式键 |
+| 控制台口令哈希 | 加盐 HMAC-SHA256(`HMAC-SHA256(salt, password)`,16 字节随机盐;与 `k:` secret 哈希同方案同档——ADR-28 DI2.1「Argon2id 或与现网同档」取后者,不引入新依赖);恒定时间比较;口令仅用于控制台登录,User 无 SigV4 secret |
+| 租户删除 | `default` 恒拒绝;非空租户(存在 `iu:`/`ig:`/`ip:`/`ir:` 实体)拒绝,不做级联删除 |
+| 管理面 | Rust admin `/v1/iam/tenants` CRUD(root 可信通道;`admin:*` IAM 授权细分属 M18 C1) |
+| 备份 | meta-export v2 起含 `tenants` 字段(旧导出缺省 = 仅 default);IAM 口令哈希可导出供灾备,secret 明文仍零导出 |
+
+
 
 `PUT`/`GET`/`DELETE` `?logging` 维持 **501 NotImplemented**,不实现 Logging XML。
 访问日志交接 = admin `GET /v1/admin/audit/export`(时间窗 + 可选桶/键前缀,JSONL,

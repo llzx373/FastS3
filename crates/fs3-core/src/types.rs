@@ -1748,6 +1748,147 @@ fn sha256_hex(data: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(data))
 }
 
+// ──────────────────────── IAM 多租户(M18 I1;ADR-28) ────────────────────────
+
+/// IAM 租户(M18 I1;ADR-28 DI1)。键 `tn:{tenant_id}` → postcard(Tenant)。
+///
+/// `canonical_id` = 对外账号 ID(Owner / `x-amz-expected-bucket-owner` 比对
+/// 对象),**稳定、不可改**;升级迁移的 `default` 租户钉死 `"fasts3"`
+/// (沿用单账号时代硬编码 Owner 字符串,compat 钉死),新建租户 = 创建时
+/// 随机 64 hex。
+///
+/// 演进纪律:结构只许尾部追加字段/变体(postcard 序,同 SessionRecord)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tenant {
+    /// 租户主键(`tn:{tenant_id}`;validate_iam_name 字符集)。
+    pub tenant_id: String,
+    /// 展示名(可改)。
+    pub display_name: String,
+    /// 对外账号 ID(不可改;见结构注释)。
+    pub canonical_id: String,
+    /// 是否启用(禁用后该租户全部身份鉴权拒绝;同 KeyRecord.enabled 口径)。
+    pub enabled: bool,
+    /// 创建时间(unix 秒)。
+    pub created_at: i64,
+}
+
+impl Tenant {
+    /// 升级迁移的默认租户 id 与钉死 canonical_id(ADR-28 DI1.3;compat 钉死)。
+    pub const DEFAULT_TENANT: &'static str = "default";
+    pub const DEFAULT_CANONICAL_ID: &'static str = "fasts3";
+}
+
+/// IAM 用户(M18 I1;ADR-28 DI2.1)。键 `iu:{tenant}\0{user}` →
+/// postcard(IamUser)。**User 没有 SigV4 secret**(数据面身份 = SA/`k:`,
+/// S1 落地);password 仅控制台登录。
+///
+/// 口令哈希方案 = 加盐 HMAC-SHA256(与 `k:` secret 同档,现网同档;
+/// ADR-28 DI2.1「Argon2id 或与现网同档」取后者,不引新依赖;compat 钉死)。
+///
+/// 演进纪律:结构只许尾部追加字段/变体(postcard 序,同 SessionRecord)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IamUser {
+    /// 所属租户(`tn:` 引用)。
+    pub tenant_id: String,
+    /// 用户名(租户内唯一;validate_iam_name 字符集)。
+    pub name: String,
+    /// 是否启用(禁用 → 登录拒绝 + 其全部 SA 鉴权失败;DI7.3)。
+    pub enabled: bool,
+    /// 控制台口令的加盐哈希(hex;HMAC-SHA256(salt, password))。
+    /// None = 无本地口令(纯 LDAP/OIDC 身份)。
+    pub password_hash: Option<String>,
+    /// 口令随机盐(hex;password_hash 为 Some 时必有)。
+    pub password_salt: Option<String>,
+    /// 挂载的策略名列表(canned 或本租户自定义)。
+    pub policies: Vec<String>,
+    /// 所属组名列表。
+    pub groups: Vec<String>,
+    /// 展示名(可选;Owner 显示用,DI9)。
+    pub display_name: Option<String>,
+    /// 创建时间(unix 秒)。
+    pub created_at: i64,
+}
+
+impl IamUser {
+    /// 计算口令加盐哈希:HMAC-SHA256(salt, password) → hex(复用
+    /// KeyRecord::hash_secret 同一份实现,方案同档钉死于 compat)。
+    pub fn hash_password(salt: &str, password: &str) -> String {
+        KeyRecord::hash_secret(salt, password)
+    }
+
+    /// 生成随机口令盐(hex 16 字节,同 KeyRecord::new 先例)。
+    pub fn new_password_salt() -> Result<String> {
+        let mut salt_bytes = [0u8; 16];
+        crate::random_bytes(&mut salt_bytes)?;
+        Ok(hex::encode(salt_bytes))
+    }
+
+    /// 校验控制台口令(恒定时间比较;无本地口令 → 恒 false)。
+    pub fn verify_password(&self, password: &str) -> bool {
+        match (&self.password_hash, &self.password_salt) {
+            (Some(hash), Some(salt)) => {
+                let got = Self::hash_password(salt, password);
+                got.len() == hash.len() && constant_time_eq(got.as_bytes(), hash.as_bytes())
+            }
+            _ => false,
+        }
+    }
+}
+
+/// IAM 组(M18 I1;ADR-28 DI2.2)。键 `ig:{tenant}\0{group}` →
+/// postcard(IamGroup)。
+///
+/// 演进纪律:结构只许尾部追加字段/变体(postcard 序,同 SessionRecord)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IamGroup {
+    /// 所属租户(`tn:` 引用)。
+    pub tenant_id: String,
+    /// 组名(租户内唯一)。
+    pub name: String,
+    /// 成员用户名列表(本租户 IamUser 名)。
+    pub members: Vec<String>,
+    /// 挂载的策略名列表。
+    pub policies: Vec<String>,
+    /// 创建时间(unix 秒)。
+    pub created_at: i64,
+}
+
+/// IAM 策略(M18 I1;ADR-28 DI2.3)。键 `ip:{tenant}\0{name}` →
+/// postcard(IamPolicy);`tenant_id = None` = 内置 canned(只读,不落盘,
+/// 代码内置;名与 MinIO 对齐,compat 给对照表)。
+///
+/// 演进纪律:结构只许尾部追加字段/变体(postcard 序,同 SessionRecord)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IamPolicy {
+    /// 所属租户;None = 内置 canned(无 `ip:` 键)。
+    pub tenant_id: Option<String>,
+    /// 策略名(canned:readonly/readwrite/writeonly/diagnostics/consoleAdmin/
+    /// tenantAdmin;自定义:租户内唯一)。
+    pub name: String,
+    /// IAM JSON 文档(Statement:Effect/Action/Resource/Condition/Principal)。
+    pub document: String,
+    /// 创建时间(unix 秒)。
+    pub created_at: i64,
+}
+
+/// IAM 角色(M18 I1;ADR-28 DI2.5/DI5)。键 `ir:{tenant}\0{role}` →
+/// postcard(IamRole)。STS AssumeRole 目标 = 策略包;无跨租户 Assume。
+///
+/// 演进纪律:结构只许尾部追加字段/变体(postcard 序,同 SessionRecord)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IamRole {
+    /// 所属租户(`tn:` 引用)。
+    pub tenant_id: String,
+    /// 角色名(租户内唯一)。
+    pub name: String,
+    /// 策略文档(IAM JSON;AssumeRole 后生效 = 本文档 ∩ 调用者约束)。
+    pub policy: String,
+    /// 可 Assume 的主体(本租户 user/group 名;无跨租户,DI5 防提权)。
+    pub assumable_by: Vec<String>,
+    /// 创建时间(unix 秒)。
+    pub created_at: i64,
+}
+
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -2882,6 +3023,88 @@ mod tests {
         let dec: KeyRecord = postcard::from_bytes(&enc).unwrap();
         assert_eq!(rec, dec);
         assert_eq!(dec.decrypt_secret(seed).unwrap(), "s3cr3t-value");
+    }
+
+    /// M18 I1(ADR-28 DI1/DI2):IAM 实体 postcard 往返 + 口令哈希语义。
+    #[test]
+    fn iam_records_postcard_roundtrip() {
+        let tenant = Tenant {
+            tenant_id: "default".into(),
+            display_name: "default".into(),
+            canonical_id: Tenant::DEFAULT_CANONICAL_ID.into(),
+            enabled: true,
+            created_at: 1_700_000_000,
+        };
+        let enc = postcard::to_allocvec(&tenant).unwrap();
+        assert_eq!(postcard::from_bytes::<Tenant>(&enc).unwrap(), tenant);
+        // 钉死:default 租户 canonical_id = "fasts3"(compat 钉死)
+        assert_eq!(Tenant::DEFAULT_TENANT, "default");
+        assert_eq!(Tenant::DEFAULT_CANONICAL_ID, "fasts3");
+
+        let salt = IamUser::new_password_salt().unwrap();
+        let user = IamUser {
+            tenant_id: "default".into(),
+            name: "alice".into(),
+            enabled: true,
+            password_hash: Some(IamUser::hash_password(&salt, "p@ssw0rd")),
+            password_salt: Some(salt),
+            policies: vec!["readwrite".into()],
+            groups: vec!["ops".into()],
+            display_name: Some("Alice".into()),
+            created_at: 1_700_000_001,
+        };
+        assert!(user.verify_password("p@ssw0rd"));
+        assert!(!user.verify_password("wrong"));
+        let enc = postcard::to_allocvec(&user).unwrap();
+        let dec: IamUser = postcard::from_bytes(&enc).unwrap();
+        assert_eq!(user, dec);
+        assert!(dec.verify_password("p@ssw0rd"));
+        // 无本地口令(LDAP/OIDC 身份)→ 恒拒绝
+        let no_pw = IamUser {
+            password_hash: None,
+            password_salt: None,
+            ..user.clone()
+        };
+        assert!(!no_pw.verify_password("p@ssw0rd"));
+
+        let group = IamGroup {
+            tenant_id: "default".into(),
+            name: "ops".into(),
+            members: vec!["alice".into(), "bob".into()],
+            policies: vec!["readonly".into()],
+            created_at: 1_700_000_002,
+        };
+        let enc = postcard::to_allocvec(&group).unwrap();
+        assert_eq!(postcard::from_bytes::<IamGroup>(&enc).unwrap(), group);
+
+        // canned(tenant_id = None)与租户自定义两形态
+        for policy in [
+            IamPolicy {
+                tenant_id: None,
+                name: "readonly".into(),
+                document: r#"{"Version":"2012-10-17","Statement":[]}"#.into(),
+                created_at: 1_700_000_003,
+            },
+            IamPolicy {
+                tenant_id: Some("default".into()),
+                name: "custom".into(),
+                document: "{}".into(),
+                created_at: 1_700_000_004,
+            },
+        ] {
+            let enc = postcard::to_allocvec(&policy).unwrap();
+            assert_eq!(postcard::from_bytes::<IamPolicy>(&enc).unwrap(), policy);
+        }
+
+        let role = IamRole {
+            tenant_id: "default".into(),
+            name: "app".into(),
+            policy: r#"{"Version":"2012-10-17","Statement":[]}"#.into(),
+            assumable_by: vec!["alice".into(), "ops".into()],
+            created_at: 1_700_000_005,
+        };
+        let enc = postcard::to_allocvec(&role).unwrap();
+        assert_eq!(postcard::from_bytes::<IamRole>(&enc).unwrap(), role);
     }
 }
 

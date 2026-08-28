@@ -323,6 +323,114 @@ fn admin_keys_crud_secret_once() {
     let _ = handle;
 }
 
+/// M18 I1(ADR-28 DI1/DI8):/v1/iam/tenants CRUD;default 租户升级迁移落地
+/// (canonical_id 钉死 "fasts3")且不可删;canonical_id 不可改;非空删除
+/// 拒绝在 fs3-meta 层覆盖(tenant_crud_roundtrip;IAM 实体 API 属 U1)。
+#[test]
+fn admin_iam_tenants_crud() {
+    let (_d, img) = setup();
+    let cfg = EngineConfig {
+        devices: vec![img.clone()],
+        meta_dir: img.parent().unwrap().join("meta"),
+        ..Default::default()
+    };
+    let (sock, handle) = start_admin(&cfg, "t");
+    let sock = sock.trim_start_matches("unix://");
+
+    // 升级迁移:default 租户已落地,canonical_id 钉死 "fasts3"
+    let (code, body) = http_unix(sock, "GET", "/v1/iam/tenants", None, "t");
+    assert_eq!(code, 200, "list tenants failed: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let tenants = v["tenants"].as_array().unwrap();
+    assert_eq!(tenants.len(), 1);
+    assert_eq!(tenants[0]["tenant_id"], "default");
+    assert_eq!(tenants[0]["canonical_id"], "fasts3");
+    assert_eq!(tenants[0]["enabled"], true);
+
+    // 创建:canonical_id 服务端生成(64 hex,≠ fasts3)
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/tenants",
+        Some(r#"{"tenant_id":"acme","display_name":"ACME"}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "create tenant failed: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["tenant_id"], "acme");
+    assert_eq!(v["display_name"], "ACME");
+    let canonical = v["canonical_id"].as_str().unwrap().to_string();
+    assert_eq!(canonical.len(), 64);
+    assert_ne!(canonical, "fasts3");
+    // 同名 → 409;非法名 → 400;缺字段 → 400
+    let (code, _) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/tenants",
+        Some(r#"{"tenant_id":"acme"}"#),
+        "t",
+    );
+    assert_eq!(code, 409);
+    let (code, _) = http_unix(
+        sock,
+        "POST",
+        "/v1/iam/tenants",
+        Some(r#"{"tenant_id":"a b"}"#),
+        "t",
+    );
+    assert_eq!(code, 400);
+    let (code, _) = http_unix(sock, "POST", "/v1/iam/tenants", Some(r#"{}"#), "t");
+    assert_eq!(code, 400);
+
+    // 详情 + PATCH(display_name/enabled)
+    let (code, body) = http_unix(sock, "GET", "/v1/iam/tenants/acme", None, "t");
+    assert_eq!(code, 200);
+    assert!(body.contains("\"canonical_id\""));
+    let (code, body) = http_unix(
+        sock,
+        "PATCH",
+        "/v1/iam/tenants/acme",
+        Some(r#"{"display_name":"ACME 部门","enabled":false}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "patch tenant failed: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["display_name"], "ACME 部门");
+    assert_eq!(v["enabled"], false);
+    assert_eq!(v["canonical_id"].as_str().unwrap(), canonical);
+    // canonical_id 不可改 → 400;空 PATCH → 400;不存在 → 404
+    let (code, _) = http_unix(
+        sock,
+        "PATCH",
+        "/v1/iam/tenants/acme",
+        Some(r#"{"canonical_id":"x"}"#),
+        "t",
+    );
+    assert_eq!(code, 400);
+    let (code, _) = http_unix(sock, "PATCH", "/v1/iam/tenants/acme", Some(r#"{}"#), "t");
+    assert_eq!(code, 400);
+    let (code, _) = http_unix(sock, "GET", "/v1/iam/tenants/nope", None, "t");
+    assert_eq!(code, 404);
+
+    // default 不可删;普通租户可删;再删 → 404
+    let (code, _) = http_unix(sock, "DELETE", "/v1/iam/tenants/default", None, "t");
+    assert_eq!(code, 400);
+    let (code, _) = http_unix(sock, "DELETE", "/v1/iam/tenants/acme", None, "t");
+    assert_eq!(code, 200);
+    let (code, _) = http_unix(sock, "DELETE", "/v1/iam/tenants/acme", None, "t");
+    assert_eq!(code, 404);
+
+    // 既有 /v1/admin 前缀不受影响;未知前缀仍 404
+    let (code, _) = http_unix(sock, "GET", "/v1/admin/status", None, "t");
+    assert_eq!(code, 200);
+    let (code, _) = http_unix(sock, "GET", "/v1/iam/nope", None, "t");
+    assert_eq!(code, 404);
+    let (code, _) = http_unix(sock, "GET", "/v2/iam/tenants", None, "t");
+    assert_eq!(code, 404);
+
+    let _ = handle;
+}
+
 #[test]
 fn admin_repair_endpoint() {
     let (_d, img) = setup();
