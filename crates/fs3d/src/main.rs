@@ -899,8 +899,7 @@ fn cmd_serve(
     // M20 A2(ADR-29 KR5):[kms.deploy] 托管 KMS 服务——生成配置 + 子进程
     // 监督 + 首启引导(init/unseal key 只向操作者一次性交付,不进日志)。
     // 显式 opt-in:配置在场但拉起失败 = 启动失败(不静默降级)。
-    // (A3 接管:改名 kms_manager 并注入 admin /v1/admin/kms/service/*)
-    let _kms_manager: Option<Arc<fs3_kms::KmsServiceManager>> = match &cfg.kms.deploy {
+    let kms_manager: Option<Arc<fs3_kms::KmsServiceManager>> = match &cfg.kms.deploy {
         Some(d) => {
             let shares = d.init_key_shares.unwrap_or(5);
             let mc = fs3_kms::ManagedConfig {
@@ -984,12 +983,17 @@ fn cmd_serve(
             });
             f
         });
-        let admin = fs3_admin::AdminServer::new(engine.clone(), service.clone(), admin_cfg)
-            .with_reload(reload)
-            .with_lifecycle_stats(lifecycle_stats)
-            .with_notification_stats(notification_stats.clone())
-            .with_inventory_stats(inventory_stats.clone())
-            .with_restore_stats(restore_stats.clone());
+        let admin =
+            fs3_admin::AdminServer::new(engine.clone(), service.clone(), admin_cfg)
+                .with_reload(reload)
+                .with_lifecycle_stats(lifecycle_stats)
+                .with_notification_stats(notification_stats.clone())
+                .with_inventory_stats(inventory_stats.clone())
+                .with_restore_stats(restore_stats.clone())
+                // M20 A3(ADR-29 KR5):KMS 托管服务控制面(未配置 = None → 501)
+                .with_kms_service(kms_manager.clone().map(|m| {
+                    Arc::new(KmsServiceAdapter(m)) as Arc<dyn fs3_admin::KmsServiceControl>
+                }));
         // M6 / J5:设置页供应器(admin GET/PATCH /v1/admin/config)
         let provider = Arc::new(settings::SettingsProvider::new(
             config_path.clone(),
@@ -1651,4 +1655,26 @@ fn parse_range(s: Option<&str>) -> fs3_core::Result<std::ops::Range<u64>> {
 
 fn mbps(bytes: u64, dt: std::time::Duration) -> f64 {
     bytes as f64 / dt.as_secs_f64() / (1024.0 * 1024.0)
+}
+
+/// M20 A3:fs3-admin KmsServiceControl 适配(持有 KmsServiceManager;
+/// Report/Status 经 serde_json 序列化;密钥材料仅经响应一次性交付,不入审计)。
+struct KmsServiceAdapter(Arc<fs3_kms::KmsServiceManager>);
+
+impl fs3_admin::KmsServiceControl for KmsServiceAdapter {
+    fn deploy(&self) -> Result<serde_json::Value, String> {
+        serde_json::to_value(self.0.deploy().map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+    }
+
+    fn start(&self) -> Result<serde_json::Value, String> {
+        serde_json::to_value(self.0.start().map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+    }
+
+    fn stop(&self) -> Result<serde_json::Value, String> {
+        serde_json::to_value(self.0.stop().map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+    }
+
+    fn status(&self) -> Result<serde_json::Value, String> {
+        serde_json::to_value(self.0.status().map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+    }
 }

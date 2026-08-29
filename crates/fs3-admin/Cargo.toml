@@ -29,3 +29,5 @@ parking_lot.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 fs3-device.workspace = true
+# A3 集成测试:注入真 KmsServiceManager(vault 车道)
+fs3-kms.workspace = true

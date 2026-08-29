@@ -122,7 +122,6 @@ struct Inner {
     cfg: ManagedConfig,
     desc: Descriptor,
     state: Mutex<State>,
-    http: reqwest::blocking::Client,
 }
 
 /// 托管管理器句柄(Arc 语义;Drop = 优雅终止子进程 + 停监督线程)。
@@ -145,10 +144,6 @@ impl KmsServiceManager {
         cfg.validate()?;
         std::fs::create_dir_all(&cfg.data_dir).map_err(KmsError::Io)?;
         let desc = cfg.flavor.descriptor();
-        let http = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_millis(cfg.timeout_ms.max(500)))
-            .build()
-            .map_err(|e| KmsError::Config(format!("http client: {e}")))?;
         Ok(KmsServiceManager {
             inner: Arc::new(Inner {
                 state: Mutex::new(State {
@@ -160,7 +155,6 @@ impl KmsServiceManager {
                 }),
                 cfg,
                 desc,
-                http,
             }),
         })
     }
@@ -394,18 +388,18 @@ impl KmsServiceManager {
     }
 
     /// `/v1/sys/health` → (http_code, sealed);不可达 = None。
+    /// (TcpStream 极简客户端:本函数可能经 admin async 上下文调用,禁止
+    /// reqwest::blocking——其私有 runtime 在 async 内 drop 会 panic)
     fn health_now(&self) -> Option<(u16, Option<bool>)> {
-        let r = self
-            .inner
-            .http
-            .get(format!("{}/v1/sys/health", self.addr()))
-            .send()
-            .ok()?;
-        let code = r.status().as_u16();
-        let sealed = r
-            .json::<serde_json::Value>()
-            .ok()
-            .and_then(|v| v.get("sealed").and_then(|s| s.as_bool()));
+        let (code, body) = http_request(
+            &self.addr(),
+            "GET",
+            "/v1/sys/health",
+            None,
+            self.inner.cfg.timeout_ms.max(500),
+        )?;
+        let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+        let sealed = v.get("sealed").and_then(|s| s.as_bool());
         Some((code, sealed))
     }
 
@@ -591,21 +585,18 @@ impl KmsServiceManager {
 
     fn probe_token_ttl(addr: &str, token_file: &Path) -> Option<i64> {
         let token = std::fs::read_to_string(token_file).ok()?;
-        let token = token.trim();
+        let token = token.trim().to_string();
         if token.is_empty() {
             return None;
         }
-        let http = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_millis(1500))
-            .build()
-            .ok()?;
-        let v: serde_json::Value = http
-            .post(format!("{addr}/v1/auth/token/lookup-self"))
-            .header("X-Vault-Token", token)
-            .send()
-            .ok()?
-            .json()
-            .ok()?;
+        let (_, body) = http_request(
+            addr,
+            "POST",
+            "/v1/auth/token/lookup-self",
+            Some(&token),
+            1500,
+        )?;
+        let v: serde_json::Value = serde_json::from_str(&body).ok()?;
         v["data"]["ttl"].as_i64()
     }
 
@@ -689,17 +680,62 @@ fn supervise(inner: Arc<Inner>) {
 }
 
 fn health_probe(inner: &Inner) -> Option<(u16, Option<bool>)> {
-    let r = inner
-        .http
-        .get(format!("http://127.0.0.1:{}/v1/sys/health", inner.cfg.port))
-        .send()
-        .ok()?;
-    let code = r.status().as_u16();
-    let sealed = r
-        .json::<serde_json::Value>()
-        .ok()
-        .and_then(|v| v.get("sealed").and_then(|s| s.as_bool()));
+    let addr = format!("http://127.0.0.1:{}", inner.cfg.port);
+    let (code, body) = http_request(
+        &addr,
+        "GET",
+        "/v1/sys/health",
+        None,
+        inner.cfg.timeout_ms.max(500),
+    )?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let sealed = v.get("sealed").and_then(|s| s.as_bool());
     Some((code, sealed))
+}
+
+/// 极简 HTTP/1.1 客户端(回环管理探测专用):Connection: close,应答体直读
+/// 至 EOF。返回 (状态码, 响应体);超时/连接失败 = None。
+/// (admin async 上下文内禁止 reqwest::blocking——其私有 runtime 在 async
+/// 内 drop 会 panic,故用裸 TcpStream)
+fn http_request(
+    addr: &str,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    timeout_ms: u64,
+) -> Option<(u16, String)> {
+    // addr = http://host:port
+    let hostport = addr
+        .strip_prefix("http://")
+        .or_else(|| addr.strip_prefix("https://"))?;
+    let stream = std::net::TcpStream::connect(hostport).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(timeout_ms)))
+        .ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_millis(timeout_ms)))
+        .ok()?;
+    let auth = token
+        .map(|t| format!("X-Vault-Token: {t}\r\n"))
+        .unwrap_or_default();
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {hostport}\r\n{auth}Connection: close\r\nContent-Length: 0\r\n\r\n"
+    );
+    use std::io::Read as _;
+    let mut sock = stream;
+    sock.write_all(req.as_bytes()).ok()?;
+    let mut buf = String::new();
+    sock.read_to_string(&mut buf).ok()?;
+    // 状态行:HTTP/1.1 200 OK
+    let status = buf
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())?;
+    let body = buf
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
+    Some((status, body))
 }
 
 fn spawn_for_supervise(inner: &Inner, bin: &Path) -> Result<(), KmsError> {

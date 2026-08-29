@@ -140,6 +140,19 @@ pub struct AdminServer {
     /// 归档恢复指标(M16 A2;worker 启用时由 fs3d 注入;None = 未启用,
     /// /metrics 相应指标组缺席)。
     restore_stats: Option<Arc<fs3_engine::restore::RestoreStats>>,
+    /// M20 A3(ADR-29 KR5):KMS 托管服务控制面(fs3d 注入;None = 未配置
+    /// [kms.deploy],kms/service/* 返回 501)。
+    kms_service: Option<Arc<dyn KmsServiceControl>>,
+}
+
+/// M20 A3:KMS 托管服务控制抽象(fs3d 以 KmsServiceManager 适配实现;
+/// 放 trait 是为避免 fs3-admin → fs3-kms 依赖)。错误以字符串承载
+/// (管理面 JSON 语义;不含任何密钥材料)。
+pub trait KmsServiceControl: Send + Sync {
+    fn deploy(&self) -> Result<serde_json::Value, String>;
+    fn start(&self) -> Result<serde_json::Value, String>;
+    fn stop(&self) -> Result<serde_json::Value, String>;
+    fn status(&self) -> Result<serde_json::Value, String>;
 }
 
 impl AdminServer {
@@ -155,7 +168,14 @@ impl AdminServer {
             notification_stats: None,
             inventory_stats: None,
             restore_stats: None,
+            kms_service: None,
         }
+    }
+
+    /// 注入 KMS 托管服务控制面(M20 A3;fs3d 装配 [kms.deploy] 时调用)。
+    pub fn with_kms_service(mut self, ctrl: Option<Arc<dyn KmsServiceControl>>) -> Self {
+        self.kms_service = ctrl;
+        self
     }
 
     /// 注入配置热重载回调(H3)。
@@ -286,6 +306,7 @@ impl AdminServer {
             notification_stats: self.notification_stats.clone(),
             inventory_stats: self.inventory_stats.clone(),
             restore_stats: self.restore_stats.clone(),
+            kms_service: self.kms_service.clone(),
         })
     }
 
@@ -561,7 +582,51 @@ impl AdminServer {
             ("GET", ["batch", "jobs", id]) => self.handle_batch_job_get(id),
             ("DELETE", ["batch", "jobs", id]) => self.handle_batch_job_delete(id),
             ("POST", ["batch", "jobs", id, "cancel"]) => self.handle_batch_job_cancel(id),
+            // M20 A3(ADR-29 KR5):KMS 托管服务控制(未注入 = 501)
+            ("POST", ["kms", "service", "deploy"]) => self.handle_kms_service("deploy", body),
+            ("POST", ["kms", "service", "start"]) => self.handle_kms_service("start", body),
+            ("POST", ["kms", "service", "stop"]) => self.handle_kms_service("stop", body),
+            ("GET", ["kms", "service", "status"]) => self.handle_kms_service("status", b""),
             _ => json::err(StatusCode::NOT_FOUND, "not_found", "unknown admin endpoint"),
+        }
+    }
+
+    /// KMS 托管服务控制(M20 A3)。审计:who = operator(Node 代理注入,
+    /// 沿 M19 J3 先例);只记变更动作 deploy/start/stop,status 不记;
+    /// **审计/日志永不携带密钥材料**(红线:ServiceReport 的 init/unseal
+    /// key 经响应一次性交付给控制台,不入审计)。
+    fn handle_kms_service(&self, action: &str, body: &[u8]) -> Response<String> {
+        let Some(ctrl) = &self.kms_service else {
+            return json::err(
+                StatusCode::NOT_IMPLEMENTED,
+                "not_implemented",
+                "kms 托管未配置([kms.deploy] 缺失)",
+            );
+        };
+        let operator = serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| {
+                v.get("operator")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| "admin".into());
+        let result = match action {
+            "deploy" => ctrl.deploy(),
+            "start" => ctrl.start(),
+            "stop" => ctrl.stop(),
+            "status" => ctrl.status(),
+            _ => unreachable!("route 已收敛 action"),
+        };
+        match result {
+            Ok(v) => {
+                if action != "status" {
+                    let op = format!("KmsService{}", action[..1].to_uppercase() + &action[1..]);
+                    self.service.audit().push(&operator, &op, "", "", 200, "");
+                }
+                json::ok(v)
+            }
+            Err(e) => json::err(StatusCode::INTERNAL_SERVER_ERROR, "kms_service_error", &e),
         }
     }
 
