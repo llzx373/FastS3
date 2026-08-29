@@ -1567,6 +1567,8 @@ impl Engine {
             default_encryption: None,
             object_lock: false,
             default_retention: None,
+            // M20 D2(ADR-29 KR6.2):无桶默认 KMS key
+            default_kms_key: None,
         };
         self.meta.commit_bucket_put(name, &meta)?;
         Ok(())
@@ -7014,6 +7016,8 @@ impl Engine {
             default_encryption: None,
             object_lock: false,
             default_retention: None,
+            // M20 D2(ADR-29 KR6.2):无桶默认 KMS key
+            default_kms_key: None,
         };
         self.meta.commit_bucket_put(name, &meta)?;
         Ok(())

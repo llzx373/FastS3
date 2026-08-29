@@ -1042,12 +1042,18 @@ pub struct BucketMeta {
     /// v1.3 填充(ADR-13):桶默认保留;None = 无默认(Enabled 仍可无 Rule)。
     /// 尾部追加,decode 双读无该字段的 v2 存量。
     pub default_retention: Option<ObjectLockDefaultRetention>,
+    /// M20 D2(ADR-29 KR6.2):桶默认 KMS key 名(仅 default_encryption =
+    /// Kms 时有意义;None = 后端默认 key)。v4 尾部字段,v3 存量补 None。
+    pub default_kms_key: Option<String>,
 }
 
 /// 桶元数据值格式版本(ADR-11 + M16 A1:`[version: u8 = 3] + postcard(
 /// BucketMeta)`;v2 存量双读回退,写入恒 v3;存量 v1.x 值无版本字节,
 /// decode_value 双读回退)。
-pub const BUCKET_META_VERSION: u8 = 3;
+pub const BUCKET_META_VERSION: u8 = 4;
+
+/// v3 桶值格式(M20 D2:无 default_kms_key 尾部字段;双读回退格式)。
+pub const BUCKET_META_VERSION_V3: u8 = 3;
 
 /// v2 桶值格式(M16 A1:无 stats.by_class 尾部字段;双读回退格式)。
 pub const BUCKET_META_VERSION_V2: u8 = 2;
@@ -1418,14 +1424,14 @@ impl BucketMeta {
     /// 0x02/0x03 —— 实际不存在,故 2/3 首字节可安全判为版本字节。
     pub fn decode_value(buf: &[u8]) -> Result<Self> {
         match buf.first() {
-            Some(&BUCKET_META_VERSION) => {
-                if let Ok(m) = postcard::from_bytes::<BucketMeta>(&buf[1..]) {
-                    return Ok(m);
+            Some(&BUCKET_META_VERSION) => postcard::from_bytes::<BucketMeta>(&buf[1..])
+                .map_err(|e| Error::Corrupt(format!("postcard decode bucket meta: {e}"))),
+            // v3 双读回退(M20 D2:无 default_kms_key 尾部字段 → None;
+            // 解码失败回退全缓冲存量形态,论证同 v2/v1)
+            Some(&BUCKET_META_VERSION_V3) => {
+                if let Ok(m) = postcard::from_bytes::<BucketMetaV3>(&buf[1..]) {
+                    return Ok(m.into());
                 }
-                // v3 解码失败:损坏或 1970 年理论歧义(created ≤ 63 时
-                // zigzag 首字节恰为 2/3);回退存量形态时用**全缓冲**
-                // (版本字节本属 zigzag 数据,载荷切分会错位)——真实
-                // 存量值首字节 ≥ 0x80 必走 _ 臂,此路径无歧义。
                 BucketMeta::decode_legacy(buf)
             }
             Some(&BUCKET_META_VERSION_V2) => {
@@ -1456,6 +1462,39 @@ impl BucketMeta {
                     .map_err(|e| Error::Corrupt(format!("postcard decode bucket meta: {e}")))?;
                 Ok(l.into())
             }
+        }
+    }
+}
+
+/// BucketMeta v3 桶值格式(M16 A1..M19 形状;M20 D2 双读回退用,
+/// 无 default_kms_key 尾部字段)。
+#[derive(Serialize, Deserialize)]
+struct BucketMetaV3 {
+    created: i64,
+    owner: String,
+    stats: BucketStats,
+    quota: Option<u64>,
+    created_with_acl: bool,
+    versioning: VersioningState,
+    default_encryption: Option<SseAlgorithm>,
+    object_lock: bool,
+    default_retention: Option<ObjectLockDefaultRetention>,
+}
+
+impl From<BucketMetaV3> for BucketMeta {
+    fn from(l: BucketMetaV3) -> Self {
+        BucketMeta {
+            created: l.created,
+            owner: l.owner,
+            stats: l.stats,
+            quota: l.quota,
+            created_with_acl: l.created_with_acl,
+            versioning: l.versioning,
+            default_encryption: l.default_encryption,
+            object_lock: l.object_lock,
+            default_retention: l.default_retention,
+            // M20 D2:存量 v3 值无桶默认 KMS key → None
+            default_kms_key: None,
         }
     }
 }
@@ -1497,6 +1536,8 @@ impl From<BucketMetaV2> for BucketMeta {
             default_encryption: l.default_encryption,
             object_lock: l.object_lock,
             default_retention: l.default_retention,
+            // M20 D2:存量 v2 值无桶默认 KMS key → None
+            default_kms_key: None,
         }
     }
 }
@@ -1530,6 +1571,8 @@ impl From<BucketMetaV2NoDefault> for BucketMeta {
             default_encryption: l.default_encryption,
             object_lock: l.object_lock,
             default_retention: None,
+            // M20 D2:存量值无桶默认 KMS key → None
+            default_kms_key: None,
         }
     }
 }
@@ -1560,6 +1603,8 @@ impl From<BucketMetaV1> for BucketMeta {
             default_encryption: None,
             object_lock: false,
             default_retention: None,
+            // M20 D2:存量值无桶默认 KMS key → None
+            default_kms_key: None,
         }
     }
 }
@@ -1589,6 +1634,8 @@ impl From<LegacyBucketMeta> for BucketMeta {
             default_encryption: None,
             object_lock: false,
             default_retention: None,
+            // M20 D2:存量值无桶默认 KMS key → None
+            default_kms_key: None,
         }
     }
 }
@@ -3083,11 +3130,49 @@ mod tests {
                 unit: RetentionPeriodUnit::Days,
                 n: 30,
             }),
+            default_kms_key: None,
         };
         let v = m.encode_value().unwrap();
         assert_eq!(v[0], BUCKET_META_VERSION);
-        assert_eq!(v[0], 3, "M16 A1 起写入恒 v3");
+        assert_eq!(v[0], 4, "M20 D2 起写入恒 v4(默认 KMS key 尾部字段)");
         assert_eq!(BucketMeta::decode_value(&v).unwrap(), m);
+        // v3 存量值(M20 之前,无 default_kms_key)双读 → 补 None
+        {
+            #[derive(serde::Serialize)]
+            struct BucketMetaV3Legacy {
+                created: i64,
+                owner: String,
+                stats: BucketStats,
+                quota: Option<u64>,
+                created_with_acl: bool,
+                versioning: VersioningState,
+                default_encryption: Option<SseAlgorithm>,
+                object_lock: bool,
+                default_retention: Option<ObjectLockDefaultRetention>,
+            }
+            let mut b3 = vec![BUCKET_META_VERSION_V3];
+            b3.extend(
+                postcard::to_allocvec(&BucketMetaV3Legacy {
+                    created: m.created,
+                    owner: m.owner.clone(),
+                    stats: BucketStats {
+                        objects: m.stats.objects,
+                        bytes: m.stats.bytes,
+                        by_class: m.stats.by_class.clone(),
+                    },
+                    quota: m.quota,
+                    created_with_acl: m.created_with_acl,
+                    versioning: m.versioning,
+                    default_encryption: m.default_encryption,
+                    object_lock: m.object_lock,
+                    default_retention: m.default_retention.clone(),
+                })
+                .unwrap(),
+            );
+            let back3 = BucketMeta::decode_value(&b3).unwrap();
+            assert_eq!(back3.created, m.created);
+            assert_eq!(back3.default_kms_key, None, "v3 存量补 None");
+        }
         // v2 存量值(带 default_retention、无 by_class)→ 补空表
         {
             #[derive(serde::Serialize)]

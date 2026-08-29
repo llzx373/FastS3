@@ -92,11 +92,11 @@ pub enum Operation {
     DeleteBucketPolicy {
         bucket: String,
     },
-    // —— 桶默认加密(M11 K1-2;ADR-12 DS2/DS3,BucketMeta v2 字段填充) ——
-    /// PUT ?encryption:XML 路由层已解析校验(仅 AES256;KMS 类显式拒绝)。
+    // —— 桶默认加密(M11 K1-2;M20 D2 起 aws:kms + KMSMasterKeyID 受理) ——
+    /// PUT ?encryption:XML 路由层已解析校验(AES256 / aws:kms)。
     PutBucketEncryption {
         bucket: String,
-        algorithm: fs3_core::SseAlgorithm,
+        config: crate::xml::BucketEncryptionConfig,
     },
     GetBucketEncryption {
         bucket: String,
@@ -690,7 +690,7 @@ impl Router {
                 return match method {
                     "PUT" => Ok(Operation::PutBucketEncryption {
                         bucket,
-                        algorithm: crate::xml::parse_bucket_encryption(body)?,
+                        config: crate::xml::parse_bucket_encryption(body)?,
                     }),
                     "GET" => Ok(Operation::GetBucketEncryption { bucket }),
                     "DELETE" => Ok(Operation::DeleteBucketEncryption { bucket }),

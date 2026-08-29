@@ -290,6 +290,8 @@ mod tests {
             default_encryption: None,
             object_lock: false,
             default_retention: None,
+            // M20 D2:无桶默认 KMS key
+            default_kms_key: None,
         }
     }
 

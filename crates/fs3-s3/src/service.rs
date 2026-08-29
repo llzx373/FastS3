@@ -2722,8 +2722,8 @@ impl S3Service {
             Operation::GetBucketPolicy { bucket } => Ok(self.op_get_bucket_policy(&bucket)?),
             Operation::DeleteBucketPolicy { bucket } => Ok(self.op_delete_bucket_policy(&bucket)?),
             // —— M11 K1-2:桶默认加密(ADR-12 DS2/DS3;BucketMeta v2 字段) ——
-            Operation::PutBucketEncryption { bucket, algorithm } => {
-                Ok(self.op_put_bucket_encryption(&bucket, algorithm)?)
+            Operation::PutBucketEncryption { bucket, config } => {
+                Ok(self.op_put_bucket_encryption(&bucket, config.algorithm, config.kms_key)?)
             }
             Operation::GetBucketEncryption { bucket } => {
                 Ok(self.op_get_bucket_encryption(&bucket)?)
@@ -3770,6 +3770,8 @@ impl S3Service {
             default_encryption: None,
             object_lock: false,
             default_retention: None,
+            // M20 D2(ADR-29 KR6.2):无桶默认 KMS key
+            default_kms_key: None,
         };
         if let Some(raw) = header(req, "x-amz-bucket-object-lock-enabled") {
             let on = raw.eq_ignore_ascii_case("true");
@@ -4224,18 +4226,19 @@ impl S3Service {
 
     // ───────────────── M11 K1-2:桶默认加密(ADR-12 DS2/DS3;BucketMeta v2 字段) ─────────────────
 
-    /// PutBucketEncryption:仅 AES256(路由层已解析校验;KMS 类参数已显式
-    /// 拒绝);落 BucketMeta.default_encryption(DS3:填 D0 预留字段,无独立
-    /// 键)。AWS 返回 200(空 body)。
+    /// PutBucketEncryption:M20 D2 起 AES256 与 aws:kms 双受理(路由层已
+    /// 解析校验);落 BucketMeta.default_encryption + default_kms_key(DS3:
+    /// 填 D0 预留字段 + V4 尾部字段,无独立键)。AWS 返回 200(空 body)。
     fn op_put_bucket_encryption(
         &self,
         bucket: &str,
         algorithm: fs3_core::SseAlgorithm,
+        kms_key: Option<String>,
     ) -> Result<ServiceResponse, S3Error> {
         let engine = self.engine.write();
         engine
             .meta()
-            .commit_bucket_set_encryption(bucket, Some(algorithm))
+            .commit_bucket_set_encryption_kms(bucket, Some(algorithm), kms_key)
             .map_err(|e| map_engine_error(e, bucket, ""))?;
         Ok(ServiceResponse {
             status: 200,
@@ -4257,7 +4260,10 @@ impl S3Service {
                 S3Error::new(S3ErrorCode::NoSuchBucket).with_extra("BucketName", bucket)
             })?;
         match bkt.default_encryption {
-            Some(alg) => Ok(Self::xml_response(xml::render_bucket_encryption(alg))),
+            Some(alg) => Ok(Self::xml_response(xml::render_bucket_encryption(
+                alg,
+                bkt.default_kms_key.as_deref(),
+            ))),
             None => Err(
                 S3Error::new(S3ErrorCode::ServerSideEncryptionConfigurationNotFoundError)
                     .with_extra("BucketName", bucket),
@@ -4270,9 +4276,10 @@ impl S3Service {
     /// 幂等同例;不返 ServerSideEncryptionConfigurationNotFoundError)。
     fn op_delete_bucket_encryption(&self, bucket: &str) -> Result<ServiceResponse, S3Error> {
         let engine = self.engine.write();
+        // M20 D2:删除同时清 default_kms_key(不留陈旧 KMS key 名)
         engine
             .meta()
-            .commit_bucket_set_encryption(bucket, None)
+            .commit_bucket_set_encryption_kms(bucket, None, None)
             .map_err(|e| map_engine_error(e, bucket, ""))?;
         Ok(ServiceResponse {
             status: 204,
@@ -8970,6 +8977,8 @@ mod tests {
                         default_encryption: None,
                         object_lock: false,
                         default_retention: None,
+                        // M20 D2:无桶默认 KMS key
+                        default_kms_key: None,
                     },
                 )
                 .unwrap();

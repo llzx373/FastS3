@@ -1923,13 +1923,23 @@ pub fn parse_cors_configuration(body: &[u8]) -> Result<Vec<CorsRule>, S3Error> {
 /// <SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule>
 /// </ServerSideEncryptionConfiguration>`。
 ///
-/// 显式拒绝口径(不静默):
-/// - `SSEAlgorithm` ≠ `AES256`(含 `aws:kms`)→ InvalidEncryptionAlgorithmError
-///   (与对象头/ SSE-C 算法值同口径,AWS 标准码);
-/// - `KMSKeyID` / `BucketKeyEnabled` 元素(SSE-KMS 类参数,DS4 不做)→
-///   InvalidArgument 显式拒绝;
-/// - 零/多 Rule、缺 SSEAlgorithm、结构损坏 → MalformedXML。
-pub fn parse_bucket_encryption(body: &[u8]) -> Result<fs3_core::SseAlgorithm, S3Error> {
+/// 桶默认加密解析结果(D2,ADR-29 KR6.2):算法 + 可选 transit key 名
+/// (仅 aws:kms;ARN 已归一化为裸名)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketEncryptionConfig {
+    pub algorithm: fs3_core::SseAlgorithm,
+    /// KMSMasterKeyID(aws:kms 时可配;None = 后端默认 key)。
+    pub kms_key: Option<String>,
+}
+
+/// PutBucketEncryption 请求体解析(M11 K1-2;M20 D2 起 aws:kms 受理,
+/// ADR-29 KR6.2):
+/// - AES256:KMSMasterKeyID/BucketKeyEnabled 任意在场 → InvalidArgument
+///   (不静默丢弃 KMS 参数,AWS 口径);
+/// - aws:kms:KMSMasterKeyID 可选(裸名或 ARN 归一化)、BucketKeyEnabled
+///   可选(true/false);ARN 形态不符 → InvalidArgument;
+/// - 零/多 Rule、缺 SSEAlgorithm → MalformedXML(不变)。
+pub fn parse_bucket_encryption(body: &[u8]) -> Result<BucketEncryptionConfig, S3Error> {
     let malformed = |m: String| S3Error::new(S3ErrorCode::MalformedXML).with_message(m);
     if body.iter().all(|&b| b.is_ascii_whitespace()) {
         return Err(malformed(
@@ -1942,6 +1952,8 @@ pub fn parse_bucket_encryption(body: &[u8]) -> Result<fs3_core::SseAlgorithm, S3
     let mut saw_root = false;
     let mut rules = 0usize;
     let mut algorithm: Option<fs3_core::SseAlgorithm> = None;
+    let mut kms_key: Option<String> = None;
+    let mut bucket_key_enabled: Option<bool> = None;
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(quick_xml::events::Event::Start(e)) => {
@@ -1957,41 +1969,44 @@ pub fn parse_bucket_encryption(body: &[u8]) -> Result<fs3_core::SseAlgorithm, S3
                     b"Rule" => rules += 1,
                     b"SSEAlgorithm" => {
                         let v = text(&mut reader)?;
-                        // DS2/DS4:仅 AES256;aws:kms 与其余值显式拒绝
-                        algorithm = Some(if v == "AES256" {
-                            fs3_core::SseAlgorithm::Aes256
-                        } else {
-                            return Err(S3Error::new(S3ErrorCode::InvalidEncryptionAlgorithmError));
+                        algorithm = Some(match v.as_str() {
+                            "AES256" => fs3_core::SseAlgorithm::Aes256,
+                            "aws:kms" => fs3_core::SseAlgorithm::Kms,
+                            _ => {
+                                return Err(S3Error::new(
+                                    S3ErrorCode::InvalidEncryptionAlgorithmError,
+                                ))
+                            }
                         });
                     }
-                    b"KMSKeyID" => {
-                        // DS4:SSE-KMS 不做,元素在场即显式拒绝(不静默丢弃)
-                        let _ = text(&mut reader)?;
-                        return Err(S3Error::new(S3ErrorCode::InvalidArgument).with_message(
-                            "SSE-KMS (KMSKeyID) is not supported; only AES256 (SSE-S3) is supported.",
-                        ));
+                    // AWS 元素名 = KMSMasterKeyID;兼容 KMSKeyID 拼写
+                    b"KMSMasterKeyID" | b"KMSKeyID" => {
+                        let v = text(&mut reader)?;
+                        kms_key = Some(v);
                     }
                     b"BucketKeyEnabled" => {
-                        let _ = text(&mut reader)?;
-                        return Err(S3Error::new(S3ErrorCode::InvalidArgument).with_message(
-                            "BucketKeyEnabled is an SSE-KMS parameter and is not supported.",
-                        ));
+                        let v = text(&mut reader)?;
+                        bucket_key_enabled = Some(match v.as_str() {
+                            "true" | "True" => true,
+                            "false" | "False" => false,
+                            _ => {
+                                return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                                    .with_message("BucketKeyEnabled must be true or false."))
+                            }
+                        });
                     }
                     _ => {}
                 }
             }
-            Ok(quick_xml::events::Event::Empty(e)) => {
-                match e.name().as_ref() {
-                    b"ServerSideEncryptionConfiguration" => saw_root = true,
-                    // 空元素形态的 KMS 参数同样显式拒绝
-                    b"KMSKeyID" | b"BucketKeyEnabled" => {
-                        return Err(S3Error::new(S3ErrorCode::InvalidArgument).with_message(
-                            "SSE-KMS parameters are not supported; only AES256 (SSE-S3) is supported.",
-                        ));
-                    }
-                    _ => {}
+            Ok(quick_xml::events::Event::Empty(e)) => match e.name().as_ref() {
+                b"ServerSideEncryptionConfiguration" => saw_root = true,
+                b"KMSMasterKeyID" | b"KMSKeyID" => kms_key = Some(String::new()),
+                b"BucketKeyEnabled" => {
+                    return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                        .with_message("BucketKeyEnabled must be true or false."))
                 }
-            }
+                _ => {}
+            },
             Ok(quick_xml::events::Event::Eof) => break,
             Err(e) => return Err(malformed(format!("malformed XML: {e}"))),
             _ => {}
@@ -2008,7 +2023,35 @@ pub fn parse_bucket_encryption(body: &[u8]) -> Result<fs3_core::SseAlgorithm, S3
             "ServerSideEncryptionConfiguration requires exactly one Rule".into(),
         ));
     }
-    algorithm.ok_or_else(|| malformed("Rule requires SSEAlgorithm".into()))
+    let algorithm = algorithm.ok_or_else(|| malformed("Rule requires SSEAlgorithm".into()))?;
+    let cfg = match algorithm {
+        // AES256 + 任何 KMS 参数 → 显式拒绝(不静默丢弃)
+        fs3_core::SseAlgorithm::Aes256 => {
+            if kms_key.is_some() || bucket_key_enabled.is_some() {
+                return Err(S3Error::new(S3ErrorCode::InvalidArgument).with_message(
+                    "KMSMasterKeyID and BucketKeyEnabled are only valid with SSEAlgorithm aws:kms.",
+                ));
+            }
+            BucketEncryptionConfig {
+                algorithm,
+                kms_key: None,
+            }
+        }
+        fs3_core::SseAlgorithm::Kms => {
+            // KMSMasterKeyID:归一化(裸名/ARN);空元素 → None
+            let key = match kms_key {
+                None => None,
+                Some(k) if k.is_empty() => None,
+                Some(k) => Some(crate::sse::parse_kms_key_id(&k)?),
+            };
+            BucketEncryptionConfig {
+                algorithm,
+                kms_key: key,
+            }
+        }
+    };
+    let _ = bucket_key_enabled; // 接受 + 落 meta 的格优化不做(回显由对象头承载)
+    Ok(cfg)
 }
 
 /// PutObjectLockConfiguration 请求体解析(M12 W2-2,ADR-13):
@@ -2169,15 +2212,21 @@ pub fn render_object_lock_configuration(
     xml
 }
 
-/// GetBucketEncryption 响应(规范化渲染;仅 AES256 单 Rule,与
-/// PutBucketEncryption 受理形态互逆)。
-pub fn render_bucket_encryption(alg: fs3_core::SseAlgorithm) -> String {
+/// GetBucketEncryption 响应(规范化渲染;单 Rule,与 PutBucketEncryption
+/// 受理形态互逆;aws:kms 带 KMSMasterKeyID 时渲染同名字段)。
+pub fn render_bucket_encryption(alg: fs3_core::SseAlgorithm, kms_key: Option<&str>) -> String {
     let name = match alg {
         fs3_core::SseAlgorithm::Aes256 => "AES256",
         fs3_core::SseAlgorithm::Kms => "aws:kms",
     };
+    let kms_elem = match (alg, kms_key) {
+        (fs3_core::SseAlgorithm::Kms, Some(k)) if !k.is_empty() => {
+            format!("<KMSMasterKeyID>{k}</KMSMasterKeyID>")
+        }
+        _ => String::new(),
+    };
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ServerSideEncryptionConfiguration xmlns=\"{XMLNS}\"><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>{name}</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>"
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ServerSideEncryptionConfiguration xmlns=\"{XMLNS}\"><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>{name}</SSEAlgorithm>{kms_elem}</ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>"
     )
 }
 
@@ -4277,6 +4326,8 @@ mod tests {
             default_encryption: None,
             object_lock: false,
             default_retention: None,
+            // M20 D2:无桶默认 KMS key
+            default_kms_key: None,
         };
         let xml = render_list_buckets("owner1", &[("b1".into(), meta)], false, None);
         assert!(xml.contains(

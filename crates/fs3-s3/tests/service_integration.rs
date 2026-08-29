@@ -8579,6 +8579,60 @@ fn object_lock_audit_bypass_and_retention() {
     assert!(hits[0].retain_until_after.is_none());
 }
 
+/// M20 D2(ADR-29 KR6.2):桶默认加密 aws:kms 往返——PUT 接受
+/// aws:kms + KMSMasterKeyID(ARN 归一化),GET 规范化渲染,DELETE 幂等清键;
+/// AES256 + KMS 参数同现仍显式拒绝。
+#[test]
+fn ssekms_bucket_default_encryption_roundtrip() {
+    let (_d, svc) = setup();
+    assert_eq!(status(&svc.handle(&req("PUT", "/enc", vec![]))), 200);
+    let q = &[("encryption", "")];
+
+    // PUT aws:kms + KMSMasterKeyID(ARN → 裸名)→ 200
+    let body = br#"<ServerSideEncryptionConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm><KMSMasterKeyID>arn:aws:kms:us-east-1:1:key/bkt-default</KMSMasterKeyID></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>"#.to_vec();
+    let r = svc.handle(&req_q("PUT", "/enc", q, body));
+    assert_eq!(status(&r), 200, "{r:?}");
+
+    // GET → 规范化 XML(算法 aws:kms + 归一化 key 名)
+    let r = svc.handle(&req_q("GET", "/enc", q, vec![])).unwrap();
+    assert_eq!(r.status, 200, "{r:?}");
+    let body = body_str(&r);
+    assert!(
+        body.contains("<SSEAlgorithm>aws:kms</SSEAlgorithm>"),
+        "{body}"
+    );
+    assert!(
+        body.contains("<KMSMasterKeyID>bkt-default</KMSMasterKeyID>"),
+        "{body}"
+    );
+
+    // PUT aws:kms 无 key(= 后端默认 key)→ 200;GET 无 KMSMasterKeyID 元素
+    let body = br#"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>"#.to_vec();
+    let r = svc.handle(&req_q("PUT", "/enc", q, body));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let r = svc.handle(&req_q("GET", "/enc", q, vec![])).unwrap();
+    let body = body_str(&r);
+    assert!(
+        body.contains("aws:kms") && !body.contains("KMSMasterKeyID"),
+        "{body}"
+    );
+
+    // AES256 + KMSMasterKeyID → 400 InvalidArgument(不静默丢弃 KMS 参数)
+    let body = br#"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm><KMSMasterKeyID>k</KMSMasterKeyID></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>"#.to_vec();
+    let r = svc.handle(&req_q("PUT", "/enc", q, body));
+    assert_eq!(err_code(&r), "InvalidArgument", "{r:?}");
+
+    // DELETE → 204;再 GET → 404 ServerSideEncryptionConfigurationNotFound
+    let r = svc.handle(&req_q("DELETE", "/enc", q, vec![]));
+    assert_eq!(status(&r), 204, "{r:?}");
+    let r = svc.handle(&req_q("GET", "/enc", q, vec![]));
+    assert_eq!(
+        err_code(&r),
+        "ServerSideEncryptionConfigurationNotFoundError",
+        "{r:?}"
+    );
+}
+
 /// K1-4 拒绝矩阵 → M20 D1 更新(ADR-29 KR6):aws:kms 受理进意愿裁决
 /// (写路径在 KMS 后端接线前显式 501 NotImplemented,不静默);key-id/
 /// bucket-key-enabled 单独在场(无 aws:kms)→ 400 InvalidArgument;
@@ -8655,14 +8709,8 @@ fn sse_kms_explicit_rejection_matrix() {
     ));
     assert_eq!(err_code(&r), "InvalidArgument", "{r:?}");
 
-    // —— PutBucketEncryption 的 KMS 元素 → 400 InvalidArgument ——
-    let kms_alg = b"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>".to_vec();
-    let r = svc.handle(&req_q("PUT", "/enc", q, kms_alg));
-    assert_eq!(err_code(&r), "InvalidEncryptionAlgorithmError", "{r:?}");
-    let kms_key = b"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm><KMSKeyID>arn:aws:kms:x</KMSKeyID></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>".to_vec();
-    let r = svc.handle(&req_q("PUT", "/enc", q, kms_key));
-    assert_eq!(err_code(&r), "InvalidEncryptionAlgorithmError", "{r:?}");
-    // KMSKeyID 与合法 AES256 同现也显式拒绝(不静默丢弃 KMS 参数)
+    // —— PutBucketEncryption:M20 D2 起 aws:kms 受理(D2 往返用例覆盖);
+    //    AES256 + KMS 参数同现仍显式拒绝(不静默丢弃 KMS 参数)——
     let kms_key2 = b"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm><KMSKeyID>arn:x</KMSKeyID></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>".to_vec();
     let r = svc.handle(&req_q("PUT", "/enc", q, kms_key2));
     assert_eq!(err_code(&r), "InvalidArgument", "{r:?}");

@@ -153,7 +153,7 @@
   优化不做)+ `-encryption-context`;未知 key 显式 KMS 错误(不静默)
   - 用例:`ssekms_put_get_head_roundtrip_aws_cli`;`ssekms_arn_and_bare_key_id_accepted`;
     `ssekms_bucket_key_enabled_echoed`
-- [ ] D2 桶默认加密:`parse_bucket_encryption` 收 `aws:kms` + `KMSMasterKeyID`
+- [x] D2 桶默认加密:`parse_bucket_encryption` 收 `aws:kms` + `KMSMasterKeyID`
   (xml.rs:1932,当前 AES256-only);`BucketMeta.default_encryption` 扩 Kms;
   意愿裁决三分支 = 显式头 > 桶默认 > 无(sse.rs:75-86);Get/DeleteBucketEncryption 往返
   - 用例:`ssekms_bucket_default_enforces_kms`(无头 PUT 落 aws:kms;HEAD 回显)

@@ -701,6 +701,8 @@ mod tests {
             default_encryption: None,
             object_lock: false,
             default_retention: None,
+            // M20 D2:无桶默认 KMS key
+            default_kms_key: None,
         };
         meta.commit_bucket_put("b1", &bucket_meta).unwrap();
         meta.put_notification_rules("b1", std::slice::from_ref(&rule))

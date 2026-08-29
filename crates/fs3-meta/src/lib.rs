@@ -371,6 +371,14 @@ pub enum Op {
         name: String,
         default: Option<fs3_core::SseAlgorithm>,
     },
+    /// 桶默认加密 + KMS key(M20 D2,ADR-29 KR6.2):新变体(尾部追加,
+    /// 不改旧变体形状——升级期旧日志回放安全);AES256 时 kms_key 恒 None,
+    /// DeleteBucketEncryption = (None, None)。
+    BucketSetEncryptionKms {
+        name: String,
+        default: Option<fs3_core::SseAlgorithm>,
+        kms_key: Option<String>,
+    },
     /// 桶 Object Lock 配置(M12 W2-2,ADR-13):enabled 恒 true(不可关闭);
     /// 开启时同时把 versioning 置 Enabled;只改这两处 + default_retention,
     /// 其余字段原样保留;桶不存在 → NotFound。
@@ -2502,6 +2510,21 @@ impl MetaStore {
         }])
     }
 
+    /// 桶默认加密 + KMS key 更新(M20 D2,ADR-29 KR6.2;新事务变体——
+    /// 保留旧变体以兼容升级期旧日志回放,postcard 变体序不重排版)。
+    pub fn commit_bucket_set_encryption_kms(
+        &self,
+        name: &str,
+        default: Option<fs3_core::SseAlgorithm>,
+        kms_key: Option<String>,
+    ) -> Result<u64> {
+        self.commit(&[Op::BucketSetEncryptionKms {
+            name: name.to_string(),
+            default,
+            kms_key,
+        }])
+    }
+
     /// 桶 Object Lock 启用 + 默认保留(单事务;开启连带 versioning=Enabled;
     /// PutObjectLockConfiguration 落地路径)。
     pub fn commit_bucket_set_object_lock(
@@ -4307,6 +4330,18 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
                 meta.default_encryption = *default;
                 tinsert(tx, k, meta.encode_value()?)?;
             }
+            Op::BucketSetEncryptionKms {
+                name,
+                default,
+                kms_key,
+            } => {
+                let k = bucket_key(name);
+                let cur = tget(tx, &k)?.ok_or_else(|| Error::NotFound(format!("bucket {name}")))?;
+                let mut meta = decode_bucket(&cur)?;
+                meta.default_encryption = *default;
+                meta.default_kms_key = kms_key.clone();
+                tinsert(tx, k, meta.encode_value()?)?;
+            }
             Op::BucketSetObjectLock {
                 name,
                 default_retention,
@@ -4985,6 +5020,8 @@ mod tests {
             default_encryption: None,
             object_lock: false,
             default_retention: None,
+            // M20 D2:无桶默认 KMS key
+            default_kms_key: None,
         }
     }
 

@@ -472,6 +472,10 @@ pub struct BucketDto {
     /// v1.2 填充:桶默认加密(ADR-11 D0;v1 导出无此字段 → None)。
     #[serde(default)]
     pub default_encryption: Option<fs3_core::SseAlgorithm>,
+    /// M20 D2(ADR-29 KR6.2):桶默认 KMS key 名(v4 尾部字段;serde(default)
+    /// 兼容 v1 导出文件)。
+    #[serde(default)]
+    pub default_kms_key: Option<String>,
     /// v1.3 填充:Object Lock 启用位(ADR-11 D0;v1 导出无此字段 → false)。
     #[serde(default)]
     pub object_lock: bool,
@@ -671,6 +675,7 @@ pub fn run_meta_export(
                 created_with_acl: m.created_with_acl,
                 versioning: m.versioning,
                 default_encryption: m.default_encryption,
+                default_kms_key: m.default_kms_key,
                 object_lock: m.object_lock,
                 default_retention: m.default_retention.clone(),
                 tagging: conf(fs3_meta::BucketConf::Tagging),
@@ -857,9 +862,10 @@ pub fn run_meta_import(
             quota: b.quota,
             created_with_acl: b.created_with_acl,
             // M10 V5-1:BucketMeta v2 字段原样恢复(v1 导出经 serde 默认
-            // 双读为 Off/None/false)
+            // 双读为 Off/None/false;M20 D2 起导出文件含 default_kms_key)
             versioning: b.versioning,
             default_encryption: b.default_encryption,
+            default_kms_key: b.default_kms_key.clone(),
             object_lock: b.object_lock,
             default_retention: b.default_retention.clone(),
         };
