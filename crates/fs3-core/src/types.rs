@@ -253,6 +253,27 @@ pub enum SseKind {
     SseC,
     /// SSE-S3:KEK/DEK 两级(§4.3 DS1;Phase K 填充)。
     SseS3,
+    /// SSE-KMS(M20,ADR-29):KEK 在外置 KMS 进程(Vault/OpenBao transit);
+    /// `wrapped_dek` = V2 载荷([0x02] + postcard(KmsDekV2)),`key_name`
+    /// /`context_binding` 随载荷落盘,`kek_id` 约定恒 0。
+    SseKms,
+}
+
+/// SSE-KMS DEK 载荷值版本字节(ADR-29 KR4 落地质:V2 = 0x02;SSE-C/S3
+/// 载荷无版本字节、形状永不变)。
+pub const SSE_KMS_DEK_VERSION: u8 = 2;
+
+/// SSE-KMS wrapped_dek V2 载荷(ADR-29 KR4:`key_name`/`wrapped_dek`/
+/// `context_binding` 三字段;context = canonical(bucket, key, algo) 绑定,
+/// 搬移对象即解包失败)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KmsDekV2 {
+    /// transit key 名(裸名;无 arn 前缀)。
+    pub key_name: String,
+    /// transit 密文(`vault:v1:…` ASCII,原样落盘)。
+    pub ciphertext: String,
+    /// 上下文绑定标签(mint 时随 associated_data 送 KMS)。
+    pub context_binding: String,
 }
 
 /// 服务端加密信息(v1.2 填充,ADR-11 D0;§4.3 DS1 两级密钥 KEK/DEK)。
@@ -324,6 +345,52 @@ impl SseInfo {
             chunk_tags,
             key_md5: [0u8; 16],
         }
+    }
+
+    /// SSE-KMS V2 形态构造(M20,ADR-29 KR4):`wrapped_dek` = V2 载荷
+    /// (`[SSE_KMS_DEK_VERSION] + postcard(KmsDekV2)`);`key_md5` 恒零
+    /// (同 SSE-S3 约定:无客户校验子概念)。**新写只写 V2**。
+    pub fn sse_kms(
+        key_name: &str,
+        wrapped_dek: &str,
+        nonce_base: [u8; 12],
+        chunk_tags: Vec<[u8; 16]>,
+        context_binding: &str,
+    ) -> Self {
+        let payload = KmsDekV2 {
+            key_name: key_name.to_string(),
+            ciphertext: wrapped_dek.to_string(),
+            context_binding: context_binding.to_string(),
+        };
+        let mut buf = vec![SSE_KMS_DEK_VERSION];
+        buf.extend(postcard::to_allocvec(&payload).expect("KmsDekV2 postcard encode infallible"));
+        SseInfo {
+            kind: SseKind::SseKms,
+            kek_id: 0,
+            wrapped_dek: buf,
+            nonce_base,
+            chunk_tags,
+            key_md5: [0u8; 16],
+        }
+    }
+
+    /// 读路径解包 SSE-KMS V2 载荷(kind != SseKms 或版本不符 → Corrupt/
+    /// InvalidArgument;**不支持其它版本 = 显式报错,不静默降级**)。
+    pub fn kms_parts(&self) -> Result<KmsDekV2> {
+        if self.kind != SseKind::SseKms {
+            return Err(Error::InvalidArgument("sse kind is not SSE-KMS".into()));
+        }
+        let (&ver, rest) = self
+            .wrapped_dek
+            .split_first()
+            .ok_or_else(|| Error::Corrupt("kms wrapped_dek empty".into()))?;
+        if ver != SSE_KMS_DEK_VERSION {
+            return Err(Error::Corrupt(format!(
+                "kms wrapped_dek version {ver} unsupported (expected {SSE_KMS_DEK_VERSION})"
+            )));
+        }
+        postcard::from_bytes::<KmsDekV2>(rest)
+            .map_err(|e| Error::Corrupt(format!("kms wrapped_dek decode: {e}")))
     }
 }
 
@@ -2472,6 +2539,49 @@ impl CheckpointData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sse_info_v2_dual_read_keeps_v1_objects_readable() {
+        // V1 形状(现结构 6 字段,SSE-C/S3)= 旧二进制写出的字节,必须可读
+        let v1_s3 = SseInfo {
+            kind: SseKind::SseS3,
+            kek_id: 7,
+            wrapped_dek: vec![0xAA; 60],
+            nonce_base: [0x07; 12],
+            chunk_tags: vec![[0x08; 16]],
+            key_md5: [0u8; 16],
+        };
+        let bytes = postcard::to_allocvec(&v1_s3).unwrap();
+        let back: SseInfo = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, v1_s3);
+        assert!(back.kms_parts().is_err(), "V1 对象无 KMS 载荷,显式报错");
+
+        // V2(SSE-KMS):roundtrip + 版本字节在位
+        let v2 = SseInfo::sse_kms(
+            "fasts3-default",
+            "vault:v1:QQ==",
+            [0x09; 12],
+            vec![[0x0A; 16]],
+            "fasts3-ssekms-v1\u{1f}b\u{1f}k\u{1f}aws:kms",
+        );
+        let bytes2 = postcard::to_allocvec(&v2).unwrap();
+        let back2: SseInfo = postcard::from_bytes(&bytes2).unwrap();
+        assert_eq!(back2, v2);
+        assert_eq!(back2.kind, SseKind::SseKms);
+        let parts = back2.kms_parts().unwrap();
+        assert_eq!(parts.key_name, "fasts3-default");
+        assert_eq!(parts.ciphertext, "vault:v1:QQ==");
+        assert!(parts.context_binding.ends_with("aws:kms"));
+
+        // 未知版本字节 → Corrupt(不静默降级)
+        let mut tampered = back2.clone();
+        tampered.wrapped_dek[0] = 0x09;
+        assert!(matches!(tampered.kms_parts(), Err(Error::Corrupt(_))));
+        // kind 字节保持稳定:SseC=0 / SseS3=1 / SseKms=2(尾部追加纪律)
+        assert_eq!(postcard::to_allocvec(&SseKind::SseC).unwrap(), vec![0]);
+        assert_eq!(postcard::to_allocvec(&SseKind::SseS3).unwrap(), vec![1]);
+        assert_eq!(postcard::to_allocvec(&SseKind::SseKms).unwrap(), vec![2]);
+    }
 
     #[test]
     fn superblock_roundtrip() {

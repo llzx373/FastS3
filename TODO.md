@@ -136,12 +136,12 @@
 
 ### C. 类型与信封(≈1 pw;ADR-29)
 
-- [ ] C1 `SseWriteKey` 增 `SseKms` variant(ssec.rs:461-515 三分派:data_key / key_md5 /
+- [x] C1 `SseWriteKey` 增 `SseKms` variant(ssec.rs:461-515 三分派:data_key / key_md5 /
   build_sse_info);`SseInfo` V2 值版本字节 + 双读单写(红线:V1 对象必须可读,新写只写 V2);
   字段 key_name + wrapped_dek(`vault:v1:` 密文)+ context_binding
   - 用例:`sse_info_v2_dual_read_keeps_v1_objects_readable`;
     `ssekms_write_key_dispatch_all_three_variants`
-- [ ] C2 网格不动:64KiB ChunkedGcm、密文 CRC/MD5 顺序(engine lib.rs:2011-2017)、
+- [x] C2 网格不动:64KiB ChunkedGcm、密文 CRC/MD5 顺序(engine lib.rs:2011-2017)、
   零拷贝互斥(meta.sse 非 None 自动用户态臂)零改动回归
   - 用例:`ssekms_chunked_gcm_roundtrip`;既有 SSE-S3/C 全量回归不破
 

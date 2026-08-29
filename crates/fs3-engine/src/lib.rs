@@ -3687,6 +3687,10 @@ impl Engine {
                 })?
                 .data_key()),
             fs3_core::SseKind::SseS3 => self.sse_s3_unwrap(sse.kek_id, &sse.wrapped_dek),
+            // M20 E2(ADR-29):RootKms 逐次在线 unwrap;接线前的显式错误不静默
+            fs3_core::SseKind::SseKms => Err(Error::Unsupported(
+                "SSE-KMS unwrap not wired yet (M20 E2)".into(),
+            )),
         }
     }
 
@@ -6367,6 +6371,13 @@ impl Engine {
                         true
                     }
                     (fs3_core::SseKind::SseS3, fs3_core::SseWriteKey::SseC(_)) => true,
+                    // M20 E2(ADR-29):KMS 源/目标 = 解密后按目标 key 重加密;
+                    // 接线前显式拒绝不静默
+                    (fs3_core::SseKind::SseKms, _) | (_, fs3_core::SseWriteKey::SseKms(_)) => {
+                        return Err(Error::Unsupported(
+                            "SSE-KMS copy re-encrypt not wired yet (M20 E2)".into(),
+                        ))
+                    }
                 },
             }
         } || force_data_path;
@@ -7848,6 +7859,11 @@ impl ExtentWriter {
                         fs3_core::SseKind::SseS3,
                         w.kek_id(),
                         w.wrapped_dek().to_vec(),
+                    ),
+                    fs3_core::SseWriteKey::SseKms(w) => (
+                        fs3_core::SseKind::SseKms,
+                        0,
+                        w.wrapped_dek().as_bytes().to_vec(),
                     ),
                 };
                 Some(SseWriteState {

@@ -1427,7 +1427,8 @@ mod tests {
         let rel = include_str!("../../../RELEASES.md");
         assert!(rel.contains("## v2.3.0 — M17"));
         assert!(rel.contains("本版本不打 tag"));
-        let todo = include_str!("../../../TODO.md");
+        // M20 立项时 M17~M19 清单归档至 docs/archive/TODO-v2.5.0.md(2026-08-29)
+        let todo = include_str!("../../../docs/archive/TODO-v2.5.0.md");
         assert!(
             todo.contains("- [x] A0-1 ADR-23") && todo.contains("### M17 门禁"),
             "M17 ADR-23 须已勾;门禁节须存在"
@@ -1449,7 +1450,7 @@ mod tests {
         let rel = include_str!("../../../RELEASES.md");
         assert!(rel.contains("## v2.4.0 — M18"));
         assert!(rel.contains("本版本不打 tag"));
-        let todo = include_str!("../../../TODO.md");
+        let todo = include_str!("../../../docs/archive/TODO-v2.5.0.md");
         assert!(
             todo.contains("- [x] A0-1 ADR-28") && todo.contains("### M18 门禁"),
             "M18 ADR-28 须已勾;门禁节须存在"
@@ -1485,7 +1486,7 @@ mod tests {
         let srv = include_str!("../../../web/server/package.json");
         assert!(cons.contains("\"version\": \"2.5.0\""));
         assert!(srv.contains("\"version\": \"2.5.0\""));
-        let todo = include_str!("../../../TODO.md");
+        let todo = include_str!("../../../docs/archive/TODO-v2.5.0.md");
         assert!(
             todo.contains("- [x] M0 ADR-24")
                 && todo.contains("- [x] K0 ADR-25")

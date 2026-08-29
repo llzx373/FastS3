@@ -452,38 +452,100 @@ impl std::fmt::Debug for SseS3WriteKey {
     }
 }
 
+/// SSE-KMS 写密钥(M20,ADR-29 KR3):mint 产物 —— 本地随机 DEK(明文仅
+/// 内存、Drop zeroize)+ transit 密文与 key_name/context(落 SseInfo V2
+/// 载荷)。数据面与 SSE-C/S3 同一 ChunkedGcm 网格。
+#[derive(Clone)]
+pub struct SseKmsWriteKey {
+    key_name: String,
+    wrapped_dek: String,
+    context_binding: String,
+    data_key: [u8; 32],
+}
+
+impl SseKmsWriteKey {
+    pub fn new(
+        key_name: String,
+        wrapped_dek: String,
+        context_binding: String,
+        data_key: [u8; 32],
+    ) -> Self {
+        SseKmsWriteKey {
+            key_name,
+            wrapped_dek,
+            context_binding,
+            data_key,
+        }
+    }
+
+    pub fn key_name(&self) -> &str {
+        &self.key_name
+    }
+
+    pub fn wrapped_dek(&self) -> &str {
+        &self.wrapped_dek
+    }
+
+    pub fn context_binding(&self) -> &str {
+        &self.context_binding
+    }
+
+    pub fn data_key(&self) -> [u8; 32] {
+        self.data_key
+    }
+}
+
+impl Drop for SseKmsWriteKey {
+    fn drop(&mut self) {
+        self.data_key.zeroize();
+    }
+}
+
+impl std::fmt::Debug for SseKmsWriteKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 不输出密钥材料(wrapped_dek 属密文但同样不打印——纪律从紧)
+        f.write_str("SseKmsWriteKey(..)")
+    }
+}
+
 /// 写路径 SSE 密钥(M11 K1-1 泛化;原 `Option<&SseCKey>` 的并集表达):
 /// - SSE-C:客户密钥(请求期借用,零落盘;HKDF 派生 data_key);
-/// - SSE-S3:服务端 KEK 体系签发的每对象 DEK(明文仅内存持有)。
+/// - SSE-S3:服务端 KEK 体系签发的每对象 DEK(明文仅内存持有);
+/// - SSE-KMS:外置 KMS transit 包裹的每对象 DEK(M20,ADR-29)。
 ///
-/// 两型共用同一 64KiB 分块网格与落盘 `SseInfo` 形态(读路径按 kind 分派
+/// 三型共用同一 64KiB 分块网格与落盘 `SseInfo` 形态(读路径按 kind 分派
 /// 密钥来源,数据面零分叉)。
+#[derive(Debug)]
 pub enum SseWriteKey<'a> {
     SseC(&'a SseCKey),
     SseS3(&'a SseS3WriteKey),
+    SseKms(SseKmsWriteKey),
 }
 
 impl SseWriteKey<'_> {
-    /// 数据密钥(SSE-C = HKDF(customer_key);SSE-S3 = DEK 本体)。
+    /// 数据密钥(SSE-C = HKDF(customer_key);SSE-S3 = DEK 本体;
+    /// SSE-KMS = mint 的本地 DEK)。
     /// 输出为密钥材料,调用方消化(ChunkedGcm by-value 接管)。
     pub fn data_key(&self) -> [u8; 32] {
         match self {
             SseWriteKey::SseC(k) => k.data_key(),
             SseWriteKey::SseS3(w) => w.data_key(),
+            SseWriteKey::SseKms(w) => w.data_key(),
         }
     }
 
-    /// D-E5 校验子(SSE-C = 客户密钥 MD5;SSE-S3 = 全零约定,DEK 由服务端
-    /// KEK 体系持有,无客户校验子概念)。
+    /// D-E5 校验子(SSE-C = 客户密钥 MD5;SSE-S3/SSE-KMS = 全零约定,DEK
+    /// 由服务端/KMS 密钥体系持有,无客户校验子概念)。
     pub fn key_md5(&self) -> [u8; 16] {
         match self {
             SseWriteKey::SseC(k) => k.key_md5(),
             SseWriteKey::SseS3(_) => [0u8; 16],
+            SseWriteKey::SseKms(_) => [0u8; 16],
         }
     }
 
     /// 按类型构造落盘 SseInfo(SSE-C:kek_id=0/wrapped_dek 空;SSE-S3:
-    /// kek_id=当前代、wrapped_dek=包裹值)。
+    /// kek_id=当前代、wrapped_dek=包裹值;SSE-KMS:V2 载荷)。
     pub fn build_sse_info(
         &self,
         nonce_base: [u8; 12],
@@ -498,6 +560,13 @@ impl SseWriteKey<'_> {
                 w.wrapped_dek().to_vec(),
                 nonce_base,
                 chunk_tags,
+            ),
+            SseWriteKey::SseKms(w) => crate::types::SseInfo::sse_kms(
+                w.key_name(),
+                w.wrapped_dek(),
+                nonce_base,
+                chunk_tags,
+                w.context_binding(),
             ),
         }
     }
@@ -800,5 +869,80 @@ mod tests {
         // Debug 不泄漏 DEK/包裹值
         let dbg = format!("{s3key:?}");
         assert!(!dbg.contains("77") && dbg.contains("kek_id=3"), "{dbg}");
+
+        // M20 C1(ADR-29 KR3/KR4):SseKms 三分派全臂
+        let dek_k = [0x11u8; 32];
+        let kmskey = SseKmsWriteKey::new(
+            "fasts3-default".into(),
+            "vault:v1:AAAA".into(),
+            "fasts3-ssekms-v1\u{1f}b\u{1f}k\u{1f}aws:kms".into(),
+            dek_k,
+        );
+        let wk_k = SseWriteKey::SseKms(kmskey);
+        assert_eq!(wk_k.data_key(), dek_k, "SSE-KMS data_key = mint DEK");
+        assert_eq!(wk_k.key_md5(), [0u8; 16], "SSE-KMS 校验子恒零");
+        let info = wk_k.build_sse_info([0x05; 12], vec![[0x06; 16]]);
+        assert_eq!(info.kind, crate::types::SseKind::SseKms);
+        assert_eq!(info.kek_id, 0);
+        assert_eq!(info.key_md5, [0u8; 16]);
+        // V2 载荷首字节 = 版本字节 0x02;解包回三字段
+        assert_eq!(info.wrapped_dek[0], crate::types::SSE_KMS_DEK_VERSION);
+        let parts = info.kms_parts().unwrap();
+        assert_eq!(parts.key_name, "fasts3-default");
+        assert_eq!(parts.ciphertext, "vault:v1:AAAA");
+        assert!(parts.context_binding.starts_with("fasts3-ssekms-v1"));
+        // Debug 不泄漏
+        let dbg = format!("{wk_k:?}");
+        assert!(!dbg.contains("AAAA"), "{dbg}");
+    }
+
+    /// C2(M20;ADR-29 KR3.1/KR6.4):三型密钥共用同一 64KiB ChunkedGcm
+    /// 网格——SSE-KMS 与 SSE-C/SSE-S3 的密文/Tag/CRC 语义零分叉。
+    #[test]
+    fn ssekms_chunked_gcm_roundtrip() {
+        let dek = [0x5Au8; 32];
+        let wk = SseWriteKey::SseKms(SseKmsWriteKey::new(
+            "fasts3-default".into(),
+            "vault:v1:Q0lQSEVS".into(),
+            "ctx".into(),
+            dek,
+        ));
+        let nonce_base = [0x0Fu8; 12];
+
+        // 网格口径:64KiB×2 + 尾部半 chunk(= 3 tag,ceil 语义)
+        let plain = vec![0xCDu8; SSE_CHUNK_SIZE * 2 + 1024];
+        let mut cipher = ChunkedGcm::new(wk.data_key(), nonce_base);
+        let mut tags = Vec::new();
+        let mut ct_all = Vec::new();
+        for (no, chunk) in plain.chunks(SSE_CHUNK_SIZE).enumerate() {
+            let (ct, tag) = cipher.encrypt_chunk(no as u64, chunk);
+            ct_all.extend_from_slice(&ct);
+            tags.push(tag);
+        }
+        assert_eq!(tags.len(), 3, "ceil(size/64KiB) = 3 tag(尾部半 chunk 亦有)");
+
+        // 落盘 info 与读路径解密:同一 data_key + nonce_base 逐 chunk 验 tag
+        let info = wk.build_sse_info(nonce_base, tags);
+        assert_eq!(info.kind, crate::types::SseKind::SseKms);
+        let parts = info.kms_parts().unwrap();
+        assert_eq!(parts.ciphertext, "vault:v1:Q0lQSEVS");
+        let dec = ChunkedGcm::new(wk.data_key(), info.nonce_base);
+        let mut plain_back = Vec::with_capacity(plain.len());
+        for (no, chunk) in ct_all.chunks(SSE_CHUNK_SIZE).enumerate() {
+            let pt = dec
+                .decrypt_chunk(no as u64, chunk, &info.chunk_tags[no])
+                .expect("chunk decrypt");
+            plain_back.extend_from_slice(&pt);
+        }
+        assert_eq!(plain_back, plain);
+        // 篡改任一 tag → 认证失败(网格语义不变)
+        let mut bad_tags = info.chunk_tags.clone();
+        bad_tags[1][0] ^= 1;
+        let dec = ChunkedGcm::new(wk.data_key(), info.nonce_base);
+        let mid = &ct_all[SSE_CHUNK_SIZE..SSE_CHUNK_SIZE * 2];
+        assert!(matches!(
+            dec.decrypt_chunk(1, mid, &bad_tags[1]),
+            Err(SseError::AuthenticationFailed)
+        ));
     }
 }

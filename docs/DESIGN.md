@@ -1939,7 +1939,14 @@ s3-tests batch 族无上游用例(逐名记账,不虚称出集);审计可检索 
    `key_md5` 语义不变(SSE-KMS:`key_md5` 置零,同 SSE-S3 约定);
 3. 新键前缀(如有)三处同步(keys.rs 前缀表、meta-export/import DTO、
    check 可达性扫描);wrapped_dek 属密文可导出(同现口径),
-   **seed/token 永不导出**。
+   **seed/token 永不导出**;
+4. **落地质(C1 实现注记,2026-08-30)**:`SseInfo` 的 postcard 结构保持
+   六字段稳定(避免 bump ObjectMeta V8 波及 v4~v7 全部回退臂的
+   `sse: Option<SseInfo>` 逐臂重排版);V2 版本字节落在 `SseKind::SseKms`
+   的 `wrapped_dek` 载荷首字节(`0x02`),V2 载荷 =
+   `postcard(KmsDekV2{key_name, ciphertext, context_binding})`;
+   SSE-C/S3 载荷无版本字节(V1 形状永不变)。双读单写语义不变:
+   V1 存量(SSE-C/S3 对象)字节级可读,新写只写 V2。
 
 **KR5(托管形态 = fs3d 子进程监督 vault/bao,非自建 KMS)**:
 
