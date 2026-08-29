@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -162,6 +162,86 @@ impl VaultKms {
 
     pub fn metrics(&self) -> &KmsMetrics {
         &self.metrics
+    }
+
+    /// 签发 fasts3-kms periodic service token(管理面;G2 向导/F3 复用)。
+    /// 返回 token 明文 —— 调用方落 token_file(0600),不进日志。
+    pub fn create_service_token(&self, period: &str) -> Result<String, KmsError> {
+        let c = &self.client;
+        let token = self.rt.block_on(async {
+            use vaultrs::api::token::requests::CreateTokenRequest;
+            let mut b = CreateTokenRequest::builder();
+            // 不剥 default policy:auth/token/lookup-self 的自省能力依赖它
+            b.policies(vec!["fasts3-kms".to_string()]);
+            b.period(period.to_string());
+            vaultrs::token::new(c, Some(&mut b))
+                .await
+                .map_err(map_client_err)
+        })?;
+        Ok(token.client_token)
+    }
+
+    /// B2:periodic service token 后台续期线程(照 engine worker.rs 样板:
+    /// stop 标志 + 周期检查)。ttl 低于 `renew_before` 时 renew-self 重置周期;
+    /// ttl=0(非周期 token)跳过;失败仅告警重试(永不打印 token)。
+    /// 装配:cmd_serve 在构造 VaultKms 后 spawn(见 E/G1 接线)。
+    pub fn spawn_token_renewer(
+        self: &Arc<Self>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        check_interval: Duration,
+        renew_before: Duration,
+    ) -> std::thread::JoinHandle<()> {
+        let kms = self.clone();
+        std::thread::Builder::new()
+            .name("fs3-kms-token-renewer".into())
+            .spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // 分片睡眠,快速响应 stop
+                    let mut waited = Duration::ZERO;
+                    while waited < check_interval {
+                        std::thread::sleep(Duration::from_millis(200));
+                        waited += Duration::from_millis(200);
+                        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
+                        }
+                    }
+                    let ttl = {
+                        let c = &kms.client;
+                        match kms.rt.block_on(vaultrs::token::lookup_self(c)) {
+                            Ok(t) => i64::try_from(t.ttl).unwrap_or(0),
+                            Err(e) => {
+                                tracing::warn!("kms token lookup 失败(下轮重试): {e}");
+                                continue;
+                            }
+                        }
+                    };
+                    if ttl == 0 {
+                        continue; // 非周期 token,无需续期
+                    }
+                    if Duration::from_secs(ttl as u64) <= renew_before {
+                        // vaultrs 0.8 RenewTokenSelfRequest 的 path 常量含 tab 字符
+                        // (库缺陷)→ 404;续期走自有回环 HTTP 客户端
+                        match crate::managed::http_request(
+                            &kms.cfg.addr,
+                            "POST",
+                            "/v1/auth/token/renew-self",
+                            Some(&kms.cfg.token),
+                            kms.cfg.timeout_ms.max(500),
+                        ) {
+                            Some((200, _)) => {
+                                tracing::info!("kms periodic token 已续期(原余 {ttl}s)")
+                            }
+                            Some((code, _)) => {
+                                tracing::warn!("kms token renew-self 失败 http {code}(下轮重试)")
+                            }
+                            None => {
+                                tracing::warn!("kms token renew-self 不可达(下轮重试)")
+                            }
+                        }
+                    }
+                }
+            })
+            .expect("spawn token renewer")
     }
 
     pub fn config(&self) -> &VaultKmsConfig {

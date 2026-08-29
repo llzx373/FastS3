@@ -697,7 +697,7 @@ fn health_probe(inner: &Inner) -> Option<(u16, Option<bool>)> {
 /// 至 EOF。返回 (状态码, 响应体);超时/连接失败 = None。
 /// (admin async 上下文内禁止 reqwest::blocking——其私有 runtime 在 async
 /// 内 drop 会 panic,故用裸 TcpStream)
-fn http_request(
+pub(crate) fn http_request(
     addr: &str,
     method: &str,
     path: &str,

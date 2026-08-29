@@ -123,7 +123,7 @@
   `unwrap`(transit/decrypt)/`create_key`/`rotate_key`/`describe_key`/`list_keys`(管理面转调);
   VaultKms 实现(vaultrs);TLS 可配 CA + mTLS 客户端证书;超时/重试/熔断
   - 用例:`kms_vault_mtls_client_cert_roundtrip`;`kms_error_map_404_403_503`
-- [ ] B2 密钥纪律:明文 DEK zeroize、**永不缓存**(只缓存 KeyMetadata 类非敏感元数据);
+- [x] B2 密钥纪律:明文 DEK zeroize、**永不缓存**(只缓存 KeyMetadata 类非敏感元数据);
   unwrap 必须在线逐次打 KMS;token `renew-self` 后台续期(照 worker.rs 样板,进 cmd_serve 装配)
   - 用例:`kms_unwrap_requires_vault_online`(KMS 停机 → 解密失败,重启后恢复);
     `kms_token_renewal_before_expiry`
