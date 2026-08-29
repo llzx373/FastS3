@@ -10,12 +10,14 @@
 //! unwrap 逐次在线打 KMS,Vault 停机 → 解密失败,不降级(RustFS #1490 反例)。
 
 pub mod context;
+pub mod descriptor;
 pub mod error;
 pub mod kms;
 pub mod metrics;
 pub mod vault;
 
 pub use context::KmsContext;
+pub use descriptor::{Descriptor, Flavor};
 pub use error::KmsError;
 pub use kms::{DataKey, KeyMetadata, KmsStatus, MintedKey, RootKms};
 pub use metrics::KmsMetrics;
