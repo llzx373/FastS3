@@ -1881,6 +1881,103 @@ s3-tests batch 族无上游用例(逐名记账,不虚称出集);审计可检索 
 
 ---
 
+#### ADR-29(M20 立项决策):SSE-KMS 密钥托管——后端范围 / 依赖 / DEK 面 / 元数据演进 / 托管形态 / 行为口径
+
+> 背景:持有组 H8 门槛触发(等保/密评强制**密钥出存储进程**;SSE-S3 的 KEK seed
+> 在引擎进程内派生,不满足口径)。目标:已有 Vault/OpenBao 的企业填地址接入;
+> 没有的企业从控制台向导一键拉起并获得完整 SSE-KMS。KEK 永不出 KMS 进程。
+> 对标:RustFS `crates/kms`(vaultrs + transit + associated_data);其 open issue
+> #1278(后端显示 aws:kms 实际未密文落盘)与 #1490(Vault 离线仍可解密)写入
+> 本 ADR 安全断言(TODO H2)。
+
+**KR1(后端 = Vault / OpenBao transit,双后端通吃)**:
+
+1. 只接**真 transit 引擎**的 `transit/encrypt` / `transit/decrypt`;Vault 与
+   OpenBao 的 transit REST API 同构,一套客户端通吃(OpenBao 为 Vault 的
+   MPL-2.0 分叉,API 兼容);license 差异记档:OpenBao = MPL-2.0 纯开源可
+   再分发,Vault 2.0.x = BUSL-1.1 内网自用合法、不随 FastS3 分发;
+2. **不接 KES、不自建 key store**——「SSE-KMS 空壳」排除语义不变
+   (TODO 排除清单);fs3d 对 vault/bao 只做**进程托管**(KR5),密钥能力
+   全部来自真 transit 引擎;
+3. transit key 的创建/轮换/列举经 admin 面**转调** transit 引擎
+   (`transit/keys/*`),FastS3 不维护自有密钥账本。
+
+**KR2(依赖 = `vaultrs` + `reqwest`,对 AGENT §9.3 依赖最小化的显式例外)**:
+
+1. 客户端选 `vaultrs`(tokio + reqwest 生态),不复刻手写 HTTP——transit
+   调用是安全关键路径,mTLS 客户端证书、连接池、超时/重试的手写实现风险
+   面大于收益(M15 webhook 手写客户端先例不覆盖 mTLS 场景;RustFS 同款选择);
+2. `reqwest` 用 **rustls backend**(`default-features = false`,
+   `rustls-tls`),为 Vault mTLS `Identity` 保留能力;新依赖纳入
+   `cargo audit` 门禁与 SBOM;
+3. fs3-kms crate 内部用 tokio runtime(单实例、仅 KMS 调用),引擎数据面
+   同步代码经阻塞桥调用——**不改变 fs3d/数据面无 tokio 的现状**。
+
+**KR3(DEK 面 = 本地随机 DEK + associated_data 上下文绑定)**:
+
+1. 写对象时本地 CSPRNG 生成 32B DEK(AES-256-GCM 数据密钥,与 SSE-S3 同
+   ChunkedGcm 网格),调 `transit/encrypt`(key_name, plaintext=DEK,
+   **associated_data = canonical(bucket, key, algo) 上下文**)得到 wrapped_dek
+   (`vault:v1:` 前缀密文,原样落 meta);
+2. 解密调 `transit/decrypt` 传同一上下文——**wrapped_dek 搬移到其它对象即
+   解包失败**(上下文绑定,断言 `kms_context_binding_rejects_transplant`);
+3. **不用** `transit/datakey`(多一次往返且弱化绑定语义);轮换 =
+   transit key **版本化历史**(旧 wrapped_dek 原样可解,无需重加密);
+   **不用** `transit/rewrap`(**不支持 associated_data**,RustFS 已踩坑);
+4. **明文 DEK 永不缓存、zeroize 丢弃;unwrap 必须逐次在线打 KMS**——
+   Vault 停机时解密必须失败(红线,RustFS #1490 反例),断言
+   `ssekms_vault_down_blocks_decrypt` / `kms_unwrap_requires_vault_online`。
+
+**KR4(元数据 = SseInfo V2 值版本字节 + 双读单写)**:
+
+1. `SseKind` 尾部追加 `SseKms`(postcard 编码序纪律);`SseInfo` 值加
+   **V2 版本字节**:V2 增字段 `key_name`(transit key 名)、
+   `context_binding`(上下文绑定标签);V1(现结构)双读兼容,
+   **新写只写 V2**;V1 存量对象(SSE-C/SSE-S3)必须可读;
+2. `wrapped_dek` 字段沿用(Vault 密文为 `vault:v1:…` ASCII,替换
+   SSE-S3 的本地 wrapped 语义);`nonce_base` / `chunk_tags` /
+   `key_md5` 语义不变(SSE-KMS:`key_md5` 置零,同 SSE-S3 约定);
+3. 新键前缀(如有)三处同步(keys.rs 前缀表、meta-export/import DTO、
+   check 可达性扫描);wrapped_dek 属密文可导出(同现口径),
+   **seed/token 永不导出**。
+
+**KR5(托管形态 = fs3d 子进程监督 vault/bao,非自建 KMS)**:
+
+1. `[kms.deploy]`(flavor=vault|openbao):生成 config.hcl → 子进程拉起 →
+   健康检查 `/v1/sys/health` → 崩溃退避重启 → 优雅停止;fs3d 永不经手
+   KEK(init/unseal key 只向操作者交付一次:控制台展示 + 0600 文件,
+   不进日志/审计/指标);
+2. 首启引导(一次性):operator init → unseal → enable transit + file
+   audit → 写 `fasts3-kms` policy → 签发 **periodic service token** 落
+   token_file(0600);`auto_unseal` 默认关(开启须显式 key_file 并文档
+   写明代价:单机便利 vs 密钥进程隔离弱化);
+3. **不自建 KMS 管理 API 面,`kms:` 动作族不做**——密钥门禁 = Vault
+   policy + 桶绑定 + `s3:*` 数据面策略;admin 转调走 `admin:*` 族
+   (key CRUD/rotate/服务启停是管理面动作,不是 AWS `kms:` 语义);
+4. 版本探测:descriptor 收敛 vault/bao 差异(二进制名/默认路径/版本
+   探测),不兼容版本显式报错不静默。
+
+**KR6(行为口径)**:
+
+1. `x-amz-server-side-encryption = aws:kms` + `-aws-kms-key-id`(裸名或
+   `arn:aws:kms:…:key/名` 双写法)+ `-bucket-key-enabled`(**接受 + 回显 +
+   落 meta,格优化不做**——对齐 MinIO/RustFS 事实标准)+ `-encryption-context`
+   (透传 transit associated_data 的补充绑定);未知 KMS 头显式报错;
+2. 桶默认加密:`SseAlgorithm` 尾部追加 `Kms` 变体,`KMSMasterKeyID`
+   受理;意愿裁决三分支 = 显式头 > 桶默认 > 无;
+3. KMS 故障映射 AWS 风格 XML:`KMS.NotFoundException`(key 不存在)/
+   `KMS.DisabledException` / `KMS.UnavailableException`(停机/超时);
+   静默忽略 KMS 头 = 拒绝合入;
+4. 全 op 接线:PUT/GET/HEAD/CopyObject(源 KMS 解密→目标 key 重加密)/
+   UploadPartCopy/CreateMultipartUpload/UploadPart/Complete(一次解密 +
+   重加密)/ingest 通道;密文网格/ETag 口径不动(KR3.1)。
+
+**门禁口径**(TODO M20):`kms_wizard_console_flow` 走通 OpenBao 与 Vault;
+H1/H2 安全断言全绿(落盘密文抽样、Vault 停机阻断解密、崩溃 ≥200 轮可解);
+s3-tests kms 族出集或逐名;`kms_context_binding_rejects_transplant` 绿。
+
+---
+
 ## 4. 存储引擎设计(Rust)
 
 ### 4.1 设备抽象

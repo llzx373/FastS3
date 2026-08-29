@@ -67,7 +67,7 @@
 
 ### A0 决策落盘
 
-- [ ] A0-1 ADR-29 写入 DESIGN.md §3.3,钉死六件事(偏离再走 ADR):
+- [x] A0-1 ADR-29 写入 DESIGN.md §3.3,钉死六件事(偏离再走 ADR):
   **(a)** 后端 = Vault / OpenBao **transit**(两者 REST API 同构,客户端通吃;
   OpenBao = MPL-2.0 纯开源、Vault 2.0.4 = BUSL-1.1 内网自用,license 差异记档);
   不接 KES、不做自建 key store(「空壳 KMS」排除语义不变);
