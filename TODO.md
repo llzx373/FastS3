@@ -100,7 +100,7 @@
   `docs/vault.md`(部署/运维/备份口径:file storage 停机冷拷;license 差异记档);
   `.gitignore` 登记 KMS 数据目录
   - 用例:脚本一键起常驻实例(非 dev)跑通 transit 往返;audit log 有操作留痕
-- [ ] A2 fs3d 托管管理器:`[kms.deploy]`(flavor=vault|openbao、binary 自动探测
+- [x] A2 fs3d 托管管理器:`[kms.deploy]`(flavor=vault|openbao、binary 自动探测
   `vault`/`bao` 或显式路径、port、data_dir、init_key_shares、auto_unseal 默认 false);
   生成配置 → 子进程拉起/监督(健康检查 `/v1/sys/health`、崩溃退避重启、优雅停止);
   首启引导:operator init → unseal → enable transit+audit → 写 policy → 签发 periodic token

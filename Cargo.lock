@@ -834,6 +834,7 @@ dependencies = [
  "fs3-device",
  "fs3-engine",
  "fs3-http",
+ "fs3-kms",
  "fs3-meta",
  "fs3-s3",
  "hex",

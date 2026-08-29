@@ -36,6 +36,36 @@ pub struct RootConfig {
     /// M19 J(ADR-26):Batch Operations worker(`[batch]`;默认启用)。
     #[serde(default)]
     pub batch: BatchConfig,
+    /// M20(ADR-29):SSE-KMS 密钥托管(`[kms]`;G1 补 backend/external 字段)。
+    #[serde(default)]
+    pub kms: KmsConfig,
+}
+
+/// M20 A2(ADR-29 KR5):`[kms]` 段。
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+pub struct KmsConfig {
+    /// `[kms.deploy]` 托管子段(配置 = fs3d 托管 vault/bao;None = 不托管)。
+    #[serde(default)]
+    pub deploy: Option<KmsDeployConfig>,
+}
+
+/// M20 A2:`[kms.deploy]` —— fs3d 子进程监督 vault/bao。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct KmsDeployConfig {
+    /// vault | openbao(descriptor 差异见 fs3-kms descriptor)。
+    pub flavor: String,
+    /// 二进制显式路径;省略 = 自动探测(vault/bao)。
+    pub binary: Option<String>,
+    /// 监听端口(默认 8200;仅回环)。
+    pub port: Option<u16>,
+    /// transit 存储/审计/token 目录(托管所有权)。
+    pub data_dir: String,
+    /// init key shares(默认 5)。
+    pub init_key_shares: Option<u32>,
+    /// auto unseal(默认 false;true 须 key_file——密钥隔离弱化,docs/vault.md §6)。
+    pub auto_unseal: Option<bool>,
+    /// auto_unseal 的 unseal key 文件(0600)。
+    pub key_file: Option<String>,
 }
 
 /// M19 J:`[batch]` 段(Batch worker;ADR-26 DR4)。

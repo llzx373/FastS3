@@ -29,6 +29,8 @@ fs3-engine.workspace = true
 fs3-s3.workspace = true
 fs3-http.workspace = true
 fs3-admin.workspace = true
+# M20(ADR-29):SSE-KMS 密钥托管——fs3-kms 客户端 + 托管管理器
+fs3-kms.workspace = true
 # M14 G1-1(ADR-17 DV1):纳管 agent 可选模块;feature 默认关,
 # 关闭时本 crate 不参与编译(默认二进制与 v1.x 行为/性能零差异,门禁)
 fs3-agent = { workspace = true, optional = true }

@@ -54,7 +54,7 @@ impl Default for VaultKmsConfig {
             tls_client: None,
             timeout_ms: 3000,
             mount: "transit".into(),
-            default_key: "fasts3-default".into(),
+            default_key: crate::managed::DEFAULT_TRANSIT_KEY.into(),
             retry_max: 2,
             breaker_threshold: 5,
             breaker_cooldown_ms: 10_000,

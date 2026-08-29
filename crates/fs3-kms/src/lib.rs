@@ -13,6 +13,7 @@ pub mod context;
 pub mod descriptor;
 pub mod error;
 pub mod kms;
+pub mod managed;
 pub mod metrics;
 pub mod vault;
 
@@ -20,5 +21,6 @@ pub use context::KmsContext;
 pub use descriptor::{Descriptor, Flavor};
 pub use error::KmsError;
 pub use kms::{DataKey, KeyMetadata, KmsStatus, MintedKey, RootKms};
+pub use managed::{KmsServiceManager, ManagedConfig, ServiceReport, ServiceStatus};
 pub use metrics::KmsMetrics;
 pub use vault::{VaultKms, VaultKmsConfig};
