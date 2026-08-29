@@ -160,27 +160,36 @@ pub fn parse_semver(text: &str) -> Option<(u32, u32, u32)> {
         if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
             continue;
         }
-        let s = &text[i + 1..];
-        let num = |s: &str| -> Option<(u32, &str)> {
-            let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
-            if end == 0 {
-                return None;
-            }
-            Some((s[..end].parse().ok()?, &s[end..]))
-        };
-        let parsed = (|| {
-            let (maj, rest) = num(s)?;
-            let rest = rest.strip_prefix('.')?;
-            let (min, rest) = num(rest)?;
-            let rest = rest.strip_prefix('.')?;
-            let (pat, _) = num(rest)?;
-            Some((maj, min, pat))
-        })();
-        if parsed.is_some() {
-            return parsed;
+        if let Some(v) = parse_at(&text[i + 1..]) {
+            return Some(v);
         }
     }
     None
+}
+
+/// 解析 `MAJOR.MINOR.PATCH` 前缀(容忍 `+ent` / ` (hash)` 后缀)。
+fn parse_at(s: &str) -> Option<(u32, u32, u32)> {
+    let end_of = |s: &str| -> usize { s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()) };
+    let first_end = end_of(s);
+    if first_end == 0 {
+        return None;
+    }
+    let maj: u32 = s[..first_end].parse().ok()?;
+    let rest = &s[first_end..];
+    let rest = rest.strip_prefix('.')?;
+    let second_end = end_of(rest);
+    if second_end == 0 {
+        return None;
+    }
+    let min: u32 = rest[..second_end].parse().ok()?;
+    let rest = &rest[second_end..];
+    let rest = rest.strip_prefix('.')?;
+    let third_end = end_of(rest);
+    if third_end == 0 {
+        return None;
+    }
+    let pat: u32 = rest[..third_end].parse().ok()?;
+    Some((maj, min, pat))
 }
 
 #[cfg(test)]
