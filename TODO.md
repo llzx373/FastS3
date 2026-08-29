@@ -127,7 +127,7 @@
   unwrap 必须在线逐次打 KMS;token `renew-self` 后台续期(照 worker.rs 样板,进 cmd_serve 装配)
   - 用例:`kms_unwrap_requires_vault_online`(KMS 停机 → 解密失败,重启后恢复);
     `kms_token_renewal_before_expiry`
-- [ ] B3 测试形态:scripted/snapshot 契约单测(照 RustFS scripted_vault 形态,离线跑)+
+- [x] B3 测试形态:scripted/snapshot 契约单测(照 RustFS scripted_vault 形态,离线跑)+
   真 Vault 车道(`vault server -dev`/`bao server -dev` 动态端口);
   **轮换/版本化用例一律真车道**(对标 RustFS AGENTS.md 纪律:stub 会让 capability 分支
   绿灯假通过)
