@@ -1,0 +1,26 @@
+[package]
+name = "fs3-kms"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# M20/B1(ADR-29 KR2):vaultrs(transit 客户端)+ reqwest(rustls,健康检查/mTLS
+# Identity 保留)。对 AGENT §9.3 依赖最小化的例外与理由见 ADR-29。
+vaultrs = "0.8"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking", "json"] }
+# KMS 调用是异步生态,fs3-kms 内部持私有单线程 runtime;数据面同步代码经阻塞桥
+# 调用(ADR-29 KR2.3),不把 tokio 引入 fs3d/引擎其余部分。
+tokio = { version = "1", default-features = false, features = ["rt", "time"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+base64 = { workspace = true }
+# B2 密钥纪律:明文 DEK 用后即焚(zeroize);永不缓存。
+zeroize = "1.8"
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

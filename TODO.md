@@ -118,7 +118,7 @@
 
 ### B. fs3-kms crate:客户端与 RootKms(≈1.5 pw;ADR-29)
 
-- [ ] B1 新 crate `crates/fs3-kms`:`RootKms` trait =
+- [x] B1 新 crate `crates/fs3-kms`:`RootKms` trait =
   `mint`(本地 DEK → transit/encrypt + associated_data)/
   `unwrap`(transit/decrypt)/`create_key`/`rotate_key`/`describe_key`/`list_keys`(管理面转调);
   VaultKms 实现(vaultrs);TLS 可配 CA + mTLS 客户端证书;超时/重试/熔断
