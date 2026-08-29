@@ -204,7 +204,7 @@ mod tests {
         assert_eq!(v.bin_name, "vault");
         assert_eq!(b.bin_name, "bao");
         assert_eq!(v.default_port, b.default_port);
-        assert_eq!(v.min_version != b.min_version, true);
+        assert_ne!(v.min_version, b.min_version);
     }
 
     #[test]
