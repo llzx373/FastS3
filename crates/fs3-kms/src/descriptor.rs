@@ -148,30 +148,37 @@ impl Descriptor {
 }
 
 /// 从任意文本提取首个 `vMAJOR.MINOR.PATCH`(容忍 `Vault v2.0.4 (hash)` /
-/// `OpenBao v2.1.0+ent` / 日期后缀)。
+/// `OpenBao v2.1.0+ent` / 日期后缀);v 必须处于标识符边界(前一字符非
+/// 字母/数字),候选解析失败则继续扫描。
 pub fn parse_semver(text: &str) -> Option<(u32, u32, u32)> {
     let bytes = text.as_bytes();
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        // v 后首字符必须是数字,且 v 不处于更长标识符中间(如 "hv2")
-        if (bytes[i] == b'v' || bytes[i] == b'V') && bytes[i + 1].is_ascii_digit() {
-            let s = &text[i + 1..];
-            let num = |s: &str| -> Option<(u32, usize)> {
-                let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
-                if end == 0 {
-                    return None;
-                }
-                let v: u32 = s[..end].parse().ok()?;
-                Some((v, end))
-            };
-            let (maj, l1) = num(s)?;
-            let rest = &s[l1 + 1..]; // 跳过 '.'
-            let (min, l2) = num(rest)?;
-            let rest2 = &rest[l2 + 1..]; // 跳过 '.'
-            let (pat, _) = num(rest2)?;
-            return Some((maj, min, pat));
+    for i in 0..bytes.len() {
+        if bytes[i] != b'v' && bytes[i] != b'V' {
+            continue;
         }
-        i += 1;
+        // 边界检查:v 不处于更长标识符中间(如 "hv2" 不算)
+        if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+            continue;
+        }
+        let s = &text[i + 1..];
+        let num = |s: &str| -> Option<(u32, &str)> {
+            let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+            if end == 0 {
+                return None;
+            }
+            Some((s[..end].parse().ok()?, &s[end..]))
+        };
+        let parsed = (|| {
+            let (maj, rest) = num(s)?;
+            let rest = rest.strip_prefix('.')?;
+            let (min, rest) = num(rest)?;
+            let rest = rest.strip_prefix('.')?;
+            let (pat, _) = num(rest)?;
+            Some((maj, min, pat))
+        })();
+        if parsed.is_some() {
+            return parsed;
+        }
     }
     None
 }
