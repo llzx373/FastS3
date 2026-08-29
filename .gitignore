@@ -27,3 +27,8 @@ web/server/config.json
 /fasts3-data/
 /fasts3.toml
 *.pid
+# KMS 密钥托管本地数据(M20/A1:transit 存储、unseal key、service token、audit)
+deploy/vault/data/
+deploy/vault/init-keys.json
+deploy/vault/token_file
+deploy/vault/audit.log

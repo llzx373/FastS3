@@ -93,7 +93,7 @@
 > 企业缺 KMS 时,控制台向导替代运维手册。fs3d 只做进程监督与配置生成,永远不经手 KEK;
 > 这是「进程托管」,不是「自建 KMS」——密钥能力全部来自真 transit 引擎。
 
-- [ ] A1 deploy 样板与文档:`deploy/vault/` config.hcl(file storage、`127.0.0.1:8200`、
+- [x] A1 deploy 样板与文档:`deploy/vault/` config.hcl(file storage、`127.0.0.1:8200`、
   `disable_mlock=true` + WSL2 注记、TLS/mTLS 可选)、init/unseal 脚本、`fasts3-kms` policy
   (transit encrypt/decrypt/keys 仅 update+read;Vault 2.0.x 起 HCL 重复属性硬报错,
   文件保持干净)、periodic service token 落 token_file(0600)、file audit 设备;
