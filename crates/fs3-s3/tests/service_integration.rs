@@ -8579,17 +8579,19 @@ fn object_lock_audit_bypass_and_retention() {
     assert!(hits[0].retain_until_after.is_none());
 }
 
-/// K1-4:SSE-KMS 显式拒绝矩阵(钉住,不静默)——aws:kms 算法值全入口
-/// 400 InvalidEncryptionAlgorithmError;KMS 参数头族 501 NotImplemented;
-/// PutBucketEncryption 的 KMSKeyID/BucketKeyEnabled 元素 400
-/// InvalidArgument;非受理 op 携带 SSE-S3 头 400 InvalidArgument(AWS 口径)。
+/// K1-4 拒绝矩阵 → M20 D1 更新(ADR-29 KR6):aws:kms 受理进意愿裁决
+/// (写路径在 KMS 后端接线前显式 501 NotImplemented,不静默);key-id/
+/// bucket-key-enabled 单独在场(无 aws:kms)→ 400 InvalidArgument;
+/// 垃圾算法值仍 400 InvalidEncryptionAlgorithmError;PutBucketEncryption
+/// 的 KMS 元素仍拒绝(D2 出表)。非受理 op 携带 SSE 头 400 不变。
 #[test]
 fn sse_kms_explicit_rejection_matrix() {
     let (_d, svc) = setup();
     assert_eq!(status(&svc.handle(&req("PUT", "/enc", vec![]))), 200);
     let q = &[("encryption", "")];
 
-    // —— 对象头 aws:kms(PUT/CreateMultipart/CopyObject)→ 400 ——
+    // —— 对象头 aws:kms(PUT/CreateMultipart/CopyObject)→ 501(KMS
+    //    后端未配置/未接线;D3+E 后换真实现)——
     for r in [
         ssec_req_q(
             "PUT",
@@ -8614,10 +8616,10 @@ fn sse_kms_explicit_rejection_matrix() {
         ),
     ] {
         let r = svc.handle(&r);
-        assert_eq!(err_code(&r), "InvalidEncryptionAlgorithmError", "{r:?}");
-        assert_eq!(status(&r), 400);
+        assert_eq!(err_code(&r), "NotImplemented", "{r:?}");
+        assert_eq!(status(&r), 501);
     }
-    // 垃圾算法值同码(显式,不静默)
+    // 垃圾算法值仍显式拒绝(显式,不静默)
     let r = svc.handle(&ssec_req_q(
         "PUT",
         "/enc/k",
@@ -8627,7 +8629,7 @@ fn sse_kms_explicit_rejection_matrix() {
     ));
     assert_eq!(err_code(&r), "InvalidEncryptionAlgorithmError", "{r:?}");
 
-    // —— KMS 参数头族 → 501(头表保留,K1-4 显式拒绝路径)——
+    // —— KMS 参数头单独在场(无 aws:kms)→ 400 InvalidArgument ——
     for h in [
         "x-amz-server-side-encryption-aws-kms-key-id",
         "x-amz-server-side-encryption-context",
@@ -8640,9 +8642,18 @@ fn sse_kms_explicit_rejection_matrix() {
             &[(h, "v")],
             b"x".to_vec(),
         ));
-        assert_eq!(err_code(&r), "NotImplemented", "header {h}: {r:?}");
-        assert_eq!(status(&r), 501);
+        assert_eq!(err_code(&r), "InvalidArgument", "header {h}: {r:?}");
+        assert_eq!(status(&r), 400);
     }
+    // 非受理 op(GET)携带 KMS 参数头 → 400(op 级门控,不静默忽略)
+    let r = svc.handle(&ssec_req_q(
+        "GET",
+        "/enc/k",
+        &[],
+        &[("x-amz-server-side-encryption-aws-kms-key-id", "v")],
+        vec![],
+    ));
+    assert_eq!(err_code(&r), "InvalidArgument", "{r:?}");
 
     // —— PutBucketEncryption 的 KMS 元素 → 400 InvalidArgument ——
     let kms_alg = b"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>".to_vec();

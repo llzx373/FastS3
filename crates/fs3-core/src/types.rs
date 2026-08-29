@@ -1061,11 +1061,14 @@ pub enum VersioningState {
     Suspended,
 }
 
-/// 桶默认加密算法(v1.2 填充,ADR-11 D0;§4.3 DS3:仅 SSE-S3 AES256,
-/// KMS 参数显式拒绝。变体序 = postcard 编码序,只允许尾部追加)。
+/// 桶默认加密算法(v1.2 填充,ADR-11 D0;M20 起增 SSE-KMS,ADR-29 KR6.2。
+/// 变体序 = postcard 编码序,只允许尾部追加;旧值 0 = Aes256 字节稳定)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SseAlgorithm {
     Aes256,
+    /// SSE-KMS(M20,ADR-29):KEK = Vault/OpenBao transit key;桶默认加密
+    /// 可声明(put-bucket-encryption `aws:kms` + 可选 KMSMasterKeyID)。
+    Kms,
 }
 
 // ───────────────────── 生命周期规则(M11 L1;ADR-12 DL1)─────────────────────

@@ -2174,6 +2174,7 @@ pub fn render_object_lock_configuration(
 pub fn render_bucket_encryption(alg: fs3_core::SseAlgorithm) -> String {
     let name = match alg {
         fs3_core::SseAlgorithm::Aes256 => "AES256",
+        fs3_core::SseAlgorithm::Kms => "aws:kms",
     };
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ServerSideEncryptionConfiguration xmlns=\"{XMLNS}\"><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>{name}</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>"

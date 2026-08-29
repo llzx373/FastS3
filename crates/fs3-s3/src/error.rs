@@ -116,6 +116,14 @@ pub enum S3ErrorCode {
     NoSuchVersion,
     NotImplemented,
     NotModified,
+    /// M20 D3(ADR-29 KR6.3):KMS key 不存在(transit 404)。
+    KmsNotFoundException,
+    /// M20 D3:key 配置不可解密(min_decryption_version 高于密文版本等)。
+    KmsDisabledException,
+    /// M20 D3:KMS 停机/超时/5xx(红线:解密必须失败,不降级)。
+    KmsUnavailableException,
+    /// M20 D3:token 无权 / policy 缺失。
+    KmsAccessDeniedException,
     /// 预留:website hosting 未实现(x-amz-website-redirect-location 在
     /// 501 表显式拒绝)。
     NoSuchWebsiteConfiguration,
@@ -237,6 +245,10 @@ impl S3ErrorCode {
             NoSuchUpload => "The specified multipart upload does not exist. The upload ID might be invalid, or the multipart upload might have been aborted or completed.",
             NoSuchVersion => "The version ID specified in the request does not match an existing version.",
             NotImplemented => "A header you provided implies functionality that is not implemented.",
+            KmsNotFoundException => "The specified KMS key does not exist.",
+            KmsDisabledException => "The specified KMS key is not usable for decryption.",
+            KmsUnavailableException => "The KMS backend is unavailable; decryption is blocked until it recovers.",
+            KmsAccessDeniedException => "Access to the KMS backend was denied (token/policy).",
             NotModified => "Not Modified",
             NoSuchWebsiteConfiguration => "The specified bucket does not have a website configuration",
             OperationAborted => "A conflicting conditional operation is currently in progress against this resource. Try again.",
@@ -315,6 +327,8 @@ impl S3ErrorCode {
             InternalError => 500,
             ServiceUnavailable | SlowDown => 503,
             NotImplemented => 501,
+            KmsNotFoundException | KmsDisabledException | KmsAccessDeniedException => 400,
+            KmsUnavailableException => 503,
             RequestTimeout => 400,
             PermanentRedirect | TemporaryRedirect | Redirect => 307,
             _ => 400,

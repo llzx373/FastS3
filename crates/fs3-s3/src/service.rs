@@ -2377,9 +2377,9 @@ impl S3Service {
     ///   (UploadPart/CompleteMultipartUpload 等)携带 → 显式 400(见各 op)。
     fn check_unimplemented_headers(&self, req: &S3Request) -> Result<(), S3Error> {
         const UNSUPPORTED: &[&str] = &[
-            "x-amz-server-side-encryption-aws-kms-key-id",
-            "x-amz-server-side-encryption-context",
-            "x-amz-server-side-encryption-bucket-key-enabled",
+            // M20 D1:aws-kms-key-id / context / bucket-key-enabled 出表受理
+            // (sse.rs 解析 + op 级门控);`x-amz-sse-kms-key-id` 非真实 AWS
+            // 头,维持 501 拒绝
             "x-amz-sse-kms-key-id",
             // M12 W2-3:x-amz-object-lock-* 出表实现(PutObject / CreateMultipart /
             // CopyObject 受理;其余 op 由 handle_inner 门控 400)
@@ -2628,6 +2628,19 @@ impl S3Service {
         {
             return Err(S3Error::new(S3ErrorCode::InvalidArgument)
                 .with_message("SSE-S3 header is not accepted for this operation."));
+        }
+        // M20 D1(ADR-29 KR6.1):SSE-KMS 参数头受理范围 = PutObject/
+        // CreateMultipartUpload/CopyObject(UploadPart/Complete 等由会话
+        // 承载,不逐请求带头);其余 op 携带 → 显式 400(不静默忽略)
+        if !matches!(
+            op,
+            Operation::PutObject { .. }
+                | Operation::CreateMultipartUpload { .. }
+                | Operation::CopyObject { .. }
+        ) && crate::sse::parse_sse_kms_headers(req)?.is_some()
+        {
+            return Err(S3Error::new(S3ErrorCode::InvalidArgument)
+                .with_message("SSE-KMS headers are not accepted for this operation."));
         }
         // M12 W2-3/W2-4:对象级 Object Lock 头——写路径受理 mode/until/hold;
         // PutObjectRetention / DELETE / DeleteObjects 仅受理 bypass。
@@ -3177,19 +3190,27 @@ impl S3Service {
         // M11 K1-2/K1-3:SSE-S3 意愿——Object 目标 = 显式 AES256 头 > 桶
         // 默认(SSE-C 优先,同现显式拒绝);Part 目标 = 会话承载(Create 已
         // 定),带头 → 显式拒绝(不静默忽略,红线)
-        let use_s3 = match &target {
+        let intent = match &target {
             StreamTarget::Object { .. } => {
-                crate::sse::sse_s3_write_intent(req, ssec.as_ref(), bkt.default_encryption)?
+                crate::sse::sse_write_intent(req, ssec.as_ref(), bkt.default_encryption)?
             }
             StreamTarget::Part { .. } => {
-                if crate::sse::has_sse_s3_header(req) {
+                if crate::sse::has_sse_s3_header(req)
+                    || crate::sse::parse_sse_kms_headers(req)?.is_some()
+                {
                     return Err(S3Error::new(S3ErrorCode::InvalidArgument).with_message(
                         "x-amz-server-side-encryption is only valid on CreateMultipartUpload; the upload session carries the encryption setting.",
                     ));
                 }
-                false
+                crate::sse::SseWriteIntent::None
             }
         };
+        // M20 D3/E:SSE-KMS 写密钥经 RootKms mint;接线前显式 501 不静默
+        if matches!(intent, crate::sse::SseWriteIntent::SseKms(_)) {
+            return Err(S3Error::new(S3ErrorCode::NotImplemented)
+                .with_message("SSE-KMS write path is not wired on this call site (M20 D3)."));
+        }
+        let use_s3 = matches!(intent, crate::sse::SseWriteIntent::SseS3);
 
         // 载荷哈希处理(M9/D3:与缓冲 PUT 同一认证语义——header 认证
         // 失败/缺席时回退预签名 query 认证,保证匿名+预签名流式 PUT 与
@@ -5502,7 +5523,12 @@ impl S3Service {
         // M11 K1-2/K1-3(DS2/DS3):SSE-S3 意愿 = 显式 AES256 头 > 桶默认
         // (SSE-C 头优先;两者同现显式拒绝;x-amz-server-side-encryption 非
         // AES256 值已在本调用内显式拒绝,K1-4)
-        let use_s3 = crate::sse::sse_s3_write_intent(req, ssec.as_ref(), bkt.default_encryption)?;
+        let intent = crate::sse::sse_write_intent(req, ssec.as_ref(), bkt.default_encryption)?;
+        if matches!(intent, crate::sse::SseWriteIntent::SseKms(_)) {
+            return Err(S3Error::new(S3ErrorCode::NotImplemented)
+                .with_message("SSE-KMS write path is not wired on this call site (M20 D3)."));
+        }
+        let use_s3 = matches!(intent, crate::sse::SseWriteIntent::SseS3);
 
         // M9/A1 配套:ACL 家族头显式校验(接受但不生效,单账号私有默认语义;
         // 非法值显式报错,不静默)。BPA 读 ba: 必须在引擎写锁之外(否则
@@ -6285,7 +6311,12 @@ impl S3Service {
         let ssec = crate::sse::parse_customer_headers(req)?;
         // M11 K1-2/K1-3(DS2/DS3):SSE-S3 意愿 = 显式 AES256 头 > 桶默认
         // (SSE-C 优先,同现显式互斥 400)
-        let use_s3 = crate::sse::sse_s3_write_intent(req, ssec.as_ref(), bkt.default_encryption)?;
+        let intent = crate::sse::sse_write_intent(req, ssec.as_ref(), bkt.default_encryption)?;
+        if matches!(intent, crate::sse::SseWriteIntent::SseKms(_)) {
+            return Err(S3Error::new(S3ErrorCode::NotImplemented)
+                .with_message("SSE-KMS write path is not wired on this call site (M20 D3)."));
+        }
+        let use_s3 = matches!(intent, crate::sse::SseWriteIntent::SseS3);
         // M11 K1-1:签发会话级 DEK(当前代 KEK 包裹;只存包裹值,DEK 明文
         // 零落盘——part 请求时按 kek_id 派生 KEK 现解现用)
         let sess_s3 = if use_s3 {
@@ -7089,8 +7120,13 @@ impl S3Service {
         // M11 K1-2/K1-3(DS2/DS3):目标侧 SSE-S3 意愿 = 显式 AES256 头 >
         // 目标桶默认(SSE-C 头优先,同现显式互斥 400;aws:kms 等非法值已在
         // 解析内显式拒绝,K1-4)
-        let dst_use_s3 =
-            crate::sse::sse_s3_write_intent(req, dst_ssec.as_ref(), dst_bkt.default_encryption)?;
+        let dst_intent =
+            crate::sse::sse_write_intent(req, dst_ssec.as_ref(), dst_bkt.default_encryption)?;
+        if matches!(dst_intent, crate::sse::SseWriteIntent::SseKms(_)) {
+            return Err(S3Error::new(S3ErrorCode::NotImplemented)
+                .with_message("SSE-KMS write path is not wired on this call site (M20 D3)."));
+        }
+        let dst_use_s3 = matches!(dst_intent, crate::sse::SseWriteIntent::SseS3);
         if engine
             .meta()
             .get_bucket(&copy_source.bucket)
@@ -8756,15 +8792,10 @@ mod tests {
     #[test]
     fn unimplemented_headers_explicitly_rejected() {
         let (_d, _engine, service) = service_fixture();
-        // A1:SSE-KMS 参数头族 + website 重定向 → 501 NotImplemented
-        // (M12 W2-3:x-amz-object-lock-* 已实现,出表)
-        for h in [
-            "x-amz-server-side-encryption-aws-kms-key-id",
-            "x-amz-server-side-encryption-context",
-            "x-amz-server-side-encryption-bucket-key-enabled",
-            "x-amz-sse-kms-key-id",
-            "x-amz-website-redirect-location",
-        ] {
+        // A1:website 重定向 + 非标 x-amz-sse-kms-key-id → 501 NotImplemented
+        // (M12 W2-3:x-amz-object-lock-* 已实现,出表;M20 D1:SSE-KMS 参数
+        // 头族出表受理——sse.rs 解析 + op 级门控 + 意愿裁决)
+        for h in ["x-amz-sse-kms-key-id", "x-amz-website-redirect-location"] {
             let req = headers_req(&[(h, "some-value")]);
             let err = service.check_unimplemented_headers(&req).unwrap_err();
             assert_eq!(err.code, S3ErrorCode::NotImplemented, "header {h}");

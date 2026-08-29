@@ -2144,6 +2144,12 @@ impl Engine {
                 Some(fs3_core::SseAlgorithm::Aes256) => {
                     Some(fs3_core::SseWriteKey::SseS3(&self.sse_s3_mint_write_key()?))
                 }
+                // M20 E2(ADR-29):ingest 通道 KMS 默认加密分派;接线前显式拒绝
+                Some(fs3_core::SseAlgorithm::Kms) => {
+                    return Err(Error::Unsupported(
+                        "SSE-KMS ingest not wired yet (M20 E2)".into(),
+                    ))
+                }
                 None => None,
             }
         };

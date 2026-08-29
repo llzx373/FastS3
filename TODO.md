@@ -147,7 +147,7 @@
 
 ### D. S3 协议层(≈1.5 pw;ADR-29)
 
-- [ ] D1 头解析与意愿裁决:摘除 aws:kms 拒绝(sse.rs:52)与 KMS 参数 501 表
+- [x] D1 头解析与意愿裁决:摘除 aws:kms 拒绝(sse.rs:52)与 KMS 参数 501 表
   (service.rs:2378-2396);受理 `aws:kms` + `-aws-kms-key-id`(裸名或
   `arn:aws:kms:…:key/名` 双写法)+ `-bucket-key-enabled`(接受 + 回显 + 落 meta,
   优化不做)+ `-encryption-context`;未知 key 显式 KMS 错误(不静默)
