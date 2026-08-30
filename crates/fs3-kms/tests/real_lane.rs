@@ -144,6 +144,58 @@ fn kms_vault_real_lane_mint_unwrap_roundtrip() {
         .expect("unwrap named");
 }
 
+/// M20 H1:轮换后旧 wrapped_dek 原样可解(transit 版本历史,无 rewrap)。
+/// 「对象」= 落盘信封(wrapped_dek);rotate 只升 latest_version,
+/// min_decryption_version 保持 1,旧密文不解包重包裹。
+#[test]
+fn ssekms_rotate_key_old_objects_readable() {
+    let Some(v) = spawn_dev_vault() else {
+        skip("ssekms_rotate_key_old_objects_readable")
+    };
+    let c = kms(&v.addr);
+    c.create_key("rotate-obj-key").expect("create_key");
+    let ctx = KmsContext::object("bkt", "obj/v1");
+    let old = c
+        .mint(Some("rotate-obj-key"), &ctx)
+        .expect("mint before rotate");
+    assert!(
+        old.wrapped_dek.starts_with("vault:v1:"),
+        "首铸应为 v1: {}",
+        old.wrapped_dek
+    );
+    let old_dek = old.data_key.expose().to_vec();
+    let wrapped = old.wrapped_dek.clone();
+    drop(old);
+
+    let meta = c.rotate_key("rotate-obj-key").expect("rotate");
+    assert!(
+        meta.latest_version >= 2,
+        "rotate 后 latest_version={}",
+        meta.latest_version
+    );
+    assert_eq!(
+        meta.min_decryption_version, 1,
+        "不得抬 min_decryption_version(那会逼 rewrap)"
+    );
+
+    let back = c
+        .unwrap_dek("rotate-obj-key", &wrapped, &ctx)
+        .expect("old wrapped_dek still decrypts after rotate (no rewrap)");
+    assert_eq!(back.expose(), old_dek.as_slice());
+
+    let new = c
+        .mint(Some("rotate-obj-key"), &ctx)
+        .expect("mint after rotate");
+    assert!(
+        new.wrapped_dek.contains("vault:v2:") || new.wrapped_dek.starts_with("vault:v2:"),
+        "新铸应走 v2: {}",
+        new.wrapped_dek
+    );
+    assert_ne!(new.wrapped_dek, wrapped);
+    c.unwrap_dek("rotate-obj-key", &new.wrapped_dek, &ctx)
+        .expect("new unwrap");
+}
+
 #[test]
 fn kms_context_binding_rejects_transplant() {
     let Some(v) = spawn_dev_vault() else {

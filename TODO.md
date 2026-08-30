@@ -202,7 +202,7 @@
 
 ### H. 测试与安全断言(≈1.5 pw)
 
-- [ ] H1 集成 harness:自起 `vault server -dev` / `bao server -dev`(动态端口)+ fs3d 指向,
+- [x] H1 集成 harness:自起 `vault server -dev` / `bao server -dev`(动态端口)+ fs3d 指向,
   跑通 D/E/G 具名用例;轮换/版本化一律真车道(B3)
   - 用例:`ssekms_rotate_key_old_objects_readable`(transit 版本历史,无 rewrap)
 - [ ] H2 安全断言(对标 RustFS #1278/#1490 反例):**落盘密文抽样比对**(同明文两次写
