@@ -107,7 +107,7 @@
 
 ### B. 复制口与复制槽(≈2 pw;设计 §3.2/§3.3/§6.1;ADR-33)
 
-- [ ] B1 复制服务端:独立监听(默认 9445),rustls **mTLS 强制**(客户端证书 CN =
+- [x] B1 复制服务端:独立监听(默认 9445),rustls **mTLS 强制**(客户端证书 CN =
   node_id,复用 fs3-agent `load_client_tls` 与 center 验证逻辑);手写 HTTP/1.1 服务
   复用 agent `http1.rs` 样板;端点 `GET /v1/repl/v1/{binlog,extent-data,slots}` +
   `POST /v1/repl/v1/{snapshot,hello}`
