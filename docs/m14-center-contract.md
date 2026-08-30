@@ -67,6 +67,15 @@
 
 ## 6. 同步任务(ADR-20 复制策略化;M16)
 
+> **口径更新(2026-08-31,ADR-33 / TODO M21)**:本节 `sync.run`(中心调度
+> mc/rclone 外部二进制)是 ADR-20 的**占位方案**;实例级/桶级主备异步复制
+> 已立项为**数据面内置能力**(M21,设计权威 =
+> [replication-design.md](./replication-design.md)),替代该占位形态。
+> 中心侧职责演进为**编排视图(二期,不在 M21 范围)**:拓扑聚合、逐槽
+> 延迟展示、promote 意图下发。AWS `?replication` 配置语义维持 501 排除
+> 不变(ADR-20 DR5 旁注,DESIGN.md §3.3)。本节 `sync_tasks`/`sync.run`
+> 机制契约在二期改造前继续有效。
+
 - **模型**:复制不内置(数据面无 `?replication`,501 显式);同步 = 中心
   配置(desired)+ 节点本地执行(实际);任务存中心 SQLite `sync_tasks`:
   `{id, name, source_node/bucket, dest_node/bucket, mode,

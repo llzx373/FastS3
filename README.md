@@ -20,6 +20,7 @@ FastS3 的对策:**不做底层已经做过的事**。工程力量全部投入�
 - **存储底座**:裸块设备(`/dev/nvme0n1`)与磁盘镜像文件两种模式,同一套引擎与磁盘布局,差异仅在零拷贝路径
 - **S3 语义(与 [兼容矩阵](./docs/site/docs/reference/compat.md) 同口径)**:桶 / 对象 CRUD、Multipart、服务端复制(COW 零数据搬运)、预签名 URL、POST 表单上传、SigV4 鉴权、密钥级 IAM 策略 × 桶策略(Deny 优先、最小 Condition 键集)、Range / 条件头、版本化 / Object Lock / SSE / 归档 Restore / 事件通知 / STS / Inventory;停售与定位性不做项见兼容矩阵,不以「完整 S3」声称
 - **强一致**:元数据单点序列化,强 read-after-write 一致性,比 S3 官方语义更强
+- **主备复制(M21 进行中,ADR-33)**:实例级/桶级异步复制(binlog + GTID + 复制槽),一主多备/级联拓扑、备端只读、手动 promote 切换;AWS `?replication` 桶复制配置语义维持 501 排除(设计权威:[docs/replication-design.md](./docs/replication-design.md))
 - **崩溃安全**:进程任意时刻 kill -9 / 断电,不撕裂对象、不丢已应答数据、空间账目不漂移
 - **极低资源**:空载内存 < 256MiB,单一二进制(glibc 动态链接;C 运行时依赖见容器文档),无 GC 停顿,边缘设备可用
 - **开箱即用**:systemd / 容器双形态,Web 控制台,`fasts3 init` 交互向导 5 分钟内装好配好用起来

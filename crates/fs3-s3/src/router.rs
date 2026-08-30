@@ -1197,6 +1197,11 @@ mod tests {
         let q = vec![("website".into(), "".into())];
         let err = r.route("GET", "localhost", "/b1", &q, b"").unwrap_err();
         assert_eq!(err.code, S3ErrorCode::NotImplemented);
+        // M21/F4 回归:AWS `?replication` 桶复制配置语义维持 501 排除
+        // (ADR-20 DR5 / ADR-33:实例级主备复制走运维面,两者不混淆)
+        let q = vec![("replication".into(), "".into())];
+        let err = r.route("GET", "localhost", "/b1", &q, b"").unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::NotImplemented);
         // M11 L1:?lifecycle 三方法分流(XML 路由层解析校验)
         let q = vec![("lifecycle".into(), "".into())];
         let op = r.route("GET", "localhost", "/b1", &q, b"").unwrap();
