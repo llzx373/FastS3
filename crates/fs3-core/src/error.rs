@@ -127,6 +127,11 @@ pub enum Error {
     /// Object Lock 阻止删除(M12 W2-4;S3 层映射 403 AccessDenied)。
     #[error("access denied: {0}")]
     AccessDenied(String),
+
+    /// M21 C4:standby 读路径命中复制待回填对象(段数据尚未本地化;
+    /// S3 层映射 503 ServiceUnavailable + Retry-After,或同步拉取后放行)。
+    #[error("replication data pending: {0}")]
+    ReplDataPending(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

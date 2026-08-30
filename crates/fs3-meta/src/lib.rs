@@ -2844,6 +2844,33 @@ impl MetaStore {
         self.db.get(key).map_err(rocks_err)
     }
 
+    /// 对象 data-pending 标记点读(M21 C4;standby 读路径探针,单次
+    /// RocksDB 点读;无标记 = false)。
+    pub fn repl_object_data_pending(&self, bucket: &str, key: &str) -> Result<bool> {
+        Ok(self
+            .db
+            .get(repl_pending_obj_key(bucket, key))
+            .map_err(rocks_err)?
+            .is_some())
+    }
+
+    /// 对象全形态条目(base 键 + 全部版本键;M21 C4 按需拉取的段匹配
+    /// 输入)。过滤条件 k == base 或 k 以 base+0x00 为前缀——防 "abc"
+    /// 误匹 "abcd"(esc(key) 不含裸 0x00,版本分隔符唯一可辨)。
+    pub fn repl_object_entries(&self, bucket: &str, key: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let base = object_key(bucket, key);
+        let mut out = Vec::new();
+        if let Some(v) = self.db.get(&base).map_err(rocks_err)? {
+            out.push((base.clone(), v));
+        }
+        let mut prefix = base;
+        prefix.push(0x00);
+        for item in scan_prefix(&self.db, &prefix) {
+            out.push(item?);
+        }
+        Ok(out)
+    }
+
     // —— 段回填清算(M21 C3;ADR-33 RP4.2;设计稿 §3.2/§4.2) ——
     //
     // 语义钉死(实现注释 = 唯一事实补充,偏离走 ADR):
@@ -2870,13 +2897,17 @@ impl MetaStore {
     /// 段回填清算(单个乐观事务;语义见上方小节注释)。返回替换段数
     /// (观测/测试用)。`alloc_seq` = 分配记录挂载位点(回填池 =
     /// 待回填条目的 gtid.seq,恢复重放语义同 import_repl_batch 的
-    /// import_seq 口径)。
+    /// import_seq 口径)。`clear_markers`(M21 C4)= 同事务摘除的对象级
+    /// data-pending 标记键:tx.get 锚定读集 + 删除——并发 apply 对同键
+    /// 重新打标必与本事务冲突 → ObjectChanged 交调用方重组,标记与段表
+    /// 零漂移。
     pub fn repl_localize_segments(
         &self,
         items: &[ReplLocalizeItem],
         consumed: &[(Gtid, repl::DataRef)],
         alloc: Option<&AllocDraft>,
         alloc_seq: u64,
+        clear_markers: &[Vec<u8>],
     ) -> Result<u64> {
         let tx = self.db.transaction_opt(&self.write_opts, &self.txn_opts);
         let mut substituted = 0u64;
@@ -2991,6 +3022,14 @@ impl MetaStore {
                 tx.put(&pk, encode(&pending)?).map_err(rocks_err)?;
             }
         }
+        // 对象级 data-pending 标记摘除(M21 C4):get 锚定读集——并发
+        // apply 重新打标同键必冲突 → ObjectChanged 重组(防「段已本地化
+        // 但标记被新写重立」与「标记已清但段仍是上游引用」两向漂移)
+        for mk in clear_markers {
+            if tx.get(mk).map_err(rocks_err)?.is_some() {
+                tx.delete(mk).map_err(rocks_err)?;
+            }
+        }
         // 本地段分配记录(RMW 合并,同 import_repl_batch 口径)
         if let Some(d) = alloc {
             if !d.is_empty() {
@@ -3084,6 +3123,22 @@ impl MetaStore {
             if !rec.data_refs.is_empty() {
                 tx.put(repl_pending_key(gtid), encode(&rec.data_refs)?)
                     .map_err(rocks_err)?;
+                // 对象级旁路标记(M21 C4):standby 读路径据此判定「元数据
+                // 已 apply、段数据未回填」→ 503/同步拉取;p: 分片不打标
+                // (备端写 501,分片永不直接读)。空值标记,清算事务摘除
+                for op in &rec.ops {
+                    let target = match op {
+                        Op::ObjectPut { bucket, key, .. }
+                        | Op::ObjectPutVersion { bucket, key, .. }
+                        | Op::ObjectMigrate { bucket, key, .. } => {
+                            Some((bucket.as_str(), key.as_str()))
+                        }
+                        _ => None,
+                    };
+                    if let Some((b, k)) = target {
+                        tx.put(repl_pending_obj_key(b, k), []).map_err(rocks_err)?;
+                    }
+                }
             }
             match tx.commit() {
                 Ok(()) => {
@@ -7015,6 +7070,12 @@ mod tests {
             )
             .unwrap();
             assert_eq!(meta.list_repl_pending(100).unwrap().len(), 1);
+            // M21 C4:带引用的 ObjectPut apply 同事务打对象级 pending 标记
+            assert!(meta.repl_object_data_pending("b1", "big").unwrap());
+            assert!(
+                !meta.repl_object_data_pending("b1", "other").unwrap(),
+                "未写对象无标记"
+            );
 
             // ② 身份失配(不存在的上游段)→ ObjectChanged,零副作用
             let stale = DataRef {
@@ -7030,6 +7091,7 @@ mod tests {
                     &[],
                     None,
                     2,
+                    &[],
                 )
                 .unwrap_err();
             assert!(
@@ -7037,12 +7099,14 @@ mod tests {
                 "失配必须显式失败: {err}"
             );
             assert_eq!(meta.list_repl_pending(100).unwrap().len(), 1);
+            assert!(meta.repl_object_data_pending("b1", "big").unwrap());
             assert_eq!(
                 meta.get_object("b1", "big").unwrap().unwrap().extents,
                 vec![up_seg.clone()]
             );
 
-            // ① 清算:段表本地化 + pending 引空删键 + a:/t: 记录
+            // ① 清算:段表本地化 + pending 引空删键 + 标记同事务摘除
+            //    + a:/t: 记录
             let alloc = AllocDraft {
                 alloc: vec![(2, 1)],
                 ..AllocDraft::default()
@@ -7056,6 +7120,7 @@ mod tests {
                     &[(g(2), dref)],
                     Some(&alloc),
                     2,
+                    &[repl_pending_obj_key("b1", "big")],
                 )
                 .unwrap();
             assert_eq!(n, 1);
@@ -7067,6 +7132,10 @@ mod tests {
             assert!(
                 meta.list_repl_pending(100).unwrap().is_empty(),
                 "pending 引空删键"
+            );
+            assert!(
+                !meta.repl_object_data_pending("b1", "big").unwrap(),
+                "对象级标记同事务摘除"
             );
             let recs = meta.list_alloc_records(0).unwrap();
             assert_eq!(recs.len(), 1);
@@ -7082,8 +7151,65 @@ mod tests {
                 vec![local_seg.clone()]
             );
             assert!(meta.list_repl_pending(100).unwrap().is_empty());
+            assert!(!meta.repl_object_data_pending("b1", "big").unwrap());
             assert_eq!(meta.list_alloc_records(0).unwrap().len(), 1);
         }
+    }
+
+    /// M21 C4:repl_object_entries 范围 = base 键 + 该 key 全部版本键;
+    /// 前缀紧邻键("abcd")不得误匹(过滤条件 k == base 或以
+    /// base+0x00 为前缀)。
+    #[test]
+    fn repl_object_entries_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
+        let g = |seq: u64| Gtid { epoch: 1, seq };
+        meta.apply_repl_record(
+            g(1),
+            &ReplRecord::new(
+                1,
+                &[Op::BucketPut {
+                    name: "b1".into(),
+                    meta: bucket_meta("b1"),
+                    location: None,
+                }],
+            ),
+        )
+        .unwrap();
+        let vk = [0x11; 16];
+        meta.apply_repl_record(
+            g(2),
+            &ReplRecord::new(
+                1,
+                &[
+                    Op::ObjectPut {
+                        bucket: "b1".into(),
+                        key: "abc".into(),
+                        meta: object_meta(10),
+                    },
+                    Op::ObjectPutVersion {
+                        bucket: "b1".into(),
+                        key: "abc".into(),
+                        vk,
+                        meta: object_meta(20),
+                    },
+                    Op::ObjectPut {
+                        bucket: "b1".into(),
+                        key: "abcd".into(),
+                        meta: object_meta(30),
+                    },
+                ],
+            ),
+        )
+        .unwrap();
+        let entries = meta.repl_object_entries("b1", "abc").unwrap();
+        let keys: Vec<Vec<u8>> = entries.iter().map(|(k, _)| k.clone()).collect();
+        assert_eq!(entries.len(), 2, "base + 版本键,不得吞 abcd: {keys:?}");
+        assert!(keys.contains(&object_key("b1", "abc")));
+        assert!(keys.contains(&object_version_key("b1", "abc", &vk)));
+        // 邻近前缀键独立可读
+        assert_eq!(meta.repl_object_entries("b1", "abcd").unwrap().len(), 1);
+        assert!(meta.repl_object_entries("b1", "none").unwrap().is_empty());
     }
 
     /// M21 C2(ADR-33 RP2.4/R12;设计稿 §4.3):快照导入落库与收口——

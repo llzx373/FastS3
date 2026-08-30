@@ -1223,6 +1223,13 @@ fn cmd_serve(
                 .map_err(fs3_core::Error::InvalidArgument)?;
             let svc = repl_backfill::BackfillService::spawn(Arc::clone(&engine), meta, bf_cfg)
                 .map_err(fs3_core::Error::InvalidArgument)?;
+            // M21 C4:读路径接线——引擎 pending 探针(get/read_at 命中 →
+            // ReplDataPending)+ S3 层缺数据同步拉取通道(503+Retry-After
+            // 口径在 fs3-s3 repl_ensure_data);primary 无本服务 = None
+            let probe: Arc<dyn fs3_engine::ReplPendingProbe> = svc.clone();
+            engine.write().set_repl_pending_probe(Some(probe));
+            let fetch: Arc<dyn fs3_s3::ReplDataFetch> = svc.clone();
+            service.set_repl_data_fetch(fetch);
             tracing::info!("replication backfill pool started");
             Some(svc)
         }

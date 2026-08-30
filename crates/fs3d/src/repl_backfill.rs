@@ -26,6 +26,13 @@
 //!   按需拉取并发时,后到者在锁内重读 meta,引用已本地化则放弃暂存
 //!   (repl_import_abort 精确逆转账目),同对象段表绝不双写;锁外的
 //!   重复拉取浪费以锁内复查兜底。
+//! - **按需拉取(C4)**:standby 读路径命中 data-pending 标记
+//!   (`s:repl_pdobj`)时经 `fetch_blocking`(unbounded 通道 + 超时等
+//!   应答)触发单对象同步回填:全量 pending 扫描 ∩ 当前段表身份匹配 →
+//!   锁外拉取 → 清算事务(consumed 传空——条目光留给池摘除,已本地化
+//!   的引用池判死引用零拉取收敛;标记同事务摘除,并发 apply 重打标
+//!   必冲突 → ObjectChanged 重组)。失败 = 上游不可达/校验不符,读路径
+//!   映射 503 + Retry-After(语义钉死见 fs3-s3 repl_ensure_data)。
 //! - **可观测**:`data_pending_bytes`(待回填字节 gauge,每轮扫描重算;
 //!   D4 导出接线)与 `extent_data_requests`(上游拉取请求计数)。
 //! - **限速/优先级**:中继流量权重(裁定 4:投递 > 回填 > 按需拉取)
@@ -49,6 +56,8 @@ use crate::repl_worker::{PullConfig, PullError};
 
 /// 回填池缺省并发(设计稿 §3.2「并发回填池(默认 8 并发,可配)」)。
 const DEFAULT_DATA_PULL_CONCURRENCY: usize = 8;
+/// 读路径按需拉取的同步等待缺省超时(秒;C4 fetch_blocking 口径)。
+const DEFAULT_READ_FETCH_TIMEOUT_SECS: u64 = 30;
 /// 队列空转轮询周期(拉取/清算完成即下一轮,此为纯空闲间隔)。
 const POOL_IDLE_MS: u64 = 200;
 /// 单轮扫描的 pending 条目上限(并发收口外的排队边界;GTID 序先进先出)。
@@ -67,10 +76,13 @@ pub struct BackfillConfig {
     pub data_pull_concurrency: usize,
     /// 回填池开关(测试可关:C4 按需拉取用例需 pending 驻留)。
     pub pool_enabled: bool,
+    /// 读路径按需拉取(C4)同步等待上限(默认 30s;超时 → 读路径 503)。
+    pub read_fetch_timeout: Duration,
 }
 
 impl BackfillConfig {
-    /// env 最小配置入口:`FS3D_REPL_DATA_PULL_CONCURRENCY`(缺省 8)。
+    /// env 最小配置入口:`FS3D_REPL_DATA_PULL_CONCURRENCY`(缺省 8)、
+    /// `FS3D_REPL_READ_FETCH_TIMEOUT_SECS`(缺省 30)。
     pub fn from_env(pull: PullConfig) -> Result<BackfillConfig, String> {
         let parse = |k: &str, default: u64| -> Result<u64, String> {
             std::env::var(k)
@@ -86,6 +98,10 @@ impl BackfillConfig {
                 DEFAULT_DATA_PULL_CONCURRENCY as u64,
             )? as usize,
             pool_enabled: true,
+            read_fetch_timeout: Duration::from_secs(parse(
+                "FS3D_REPL_READ_FETCH_TIMEOUT_SECS",
+                DEFAULT_READ_FETCH_TIMEOUT_SECS,
+            )?),
         })
     }
 }
@@ -96,6 +112,14 @@ pub struct BackfillService {
     handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
+/// 读路径按需拉取请求(C4;reply 为一次性应答——成功 = 标记已清,
+/// Err(原因) = 上游不可达/校验失败,读路径 503)。
+struct FetchReq {
+    bucket: String,
+    key: String,
+    reply: std::sync::mpsc::Sender<Result<(), String>>,
+}
+
 struct Inner {
     engine: Arc<RwLock<Engine>>,
     meta: Arc<MetaStore>,
@@ -104,6 +128,9 @@ struct Inner {
     stop: AtomicBool,
     /// 清算互斥(C3/C4 去重;见模块注释「去重/互斥」)。
     localize_mu: tokio::sync::Mutex<()>,
+    /// 按需拉取请求通道(C4;supervisor select! 单臂消费,spawn_local
+    /// 与池任务同 runtime 交错)。
+    fetch_tx: tokio::sync::mpsc::UnboundedSender<FetchReq>,
     /// 待回填字节 gauge(每轮扫描重算;D4 导出接线)。
     data_pending_bytes: AtomicU64,
     /// 上游 extent-data 请求计数(观测 + 内联零往返断言)。
@@ -126,6 +153,7 @@ impl BackfillService {
             }
         }
         let tls = crate::repl_worker::build_client_tls(&cfg.pull)?;
+        let (fetch_tx, fetch_rx) = tokio::sync::mpsc::unbounded_channel();
         let inner = Arc::new(Inner {
             engine,
             meta,
@@ -133,6 +161,7 @@ impl BackfillService {
             cfg,
             stop: AtomicBool::new(false),
             localize_mu: tokio::sync::Mutex::new(()),
+            fetch_tx,
             data_pending_bytes: AtomicU64::new(0),
             extent_data_requests: AtomicU64::new(0),
         });
@@ -149,7 +178,7 @@ impl BackfillService {
                 // sink,!Send 不可跨线程):并发 = 网络拉取交错,引擎写锁
                 // 本就串行化落盘 feed(分配器单写者),与多线程等价
                 let local = tokio::task::LocalSet::new();
-                local.block_on(&rt, supervisor(inner2));
+                local.block_on(&rt, supervisor(inner2, fetch_rx));
             })
             .map_err(|e| format!("spawn repl backfill pool: {e}"))?;
         Ok(Arc::new(BackfillService {
@@ -176,15 +205,61 @@ impl BackfillService {
             let _ = h.join();
         }
     }
+
+    /// 读路径按需拉取(C4):投递单对象回填请求并同步等待应答(超时
+    /// = read_fetch_timeout)。**调用方不得持引擎读锁**(清算需写锁)。
+    fn fetch_object_blocking(&self, bucket: &str, key: &str) -> Result<(), String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.inner
+            .fetch_tx
+            .send(FetchReq {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                reply: tx,
+            })
+            .map_err(|_| "repl backfill service stopped".to_string())?;
+        rx.recv_timeout(self.inner.cfg.read_fetch_timeout)
+            .map_err(|e| format!("read fetch wait: {e}"))?
+    }
+}
+
+/// M21 C4:standby 引擎读路径探针(点读 s:repl_pdobj 标记;meta 读
+/// 失败 fail-closed 按 pending 处理——宁可 503 不吐上游悬空引用)。
+impl fs3_engine::ReplPendingProbe for BackfillService {
+    fn object_data_pending(&self, bucket: &str, key: &str) -> bool {
+        match self.inner.meta.repl_object_data_pending(bucket, key) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("repl pending probe {bucket}/{key}: {e}");
+                true
+            }
+        }
+    }
+}
+
+/// M21 C4:S3 读路径缺数据拉取通道(语义同探针;fetch 走按需回填)。
+impl fs3_s3::ReplDataFetch for BackfillService {
+    fn object_data_pending(&self, bucket: &str, key: &str) -> bool {
+        fs3_engine::ReplPendingProbe::object_data_pending(self, bucket, key)
+    }
+
+    fn fetch_blocking(&self, bucket: &str, key: &str) -> Result<(), String> {
+        self.fetch_object_blocking(bucket, key)
+    }
 }
 
 /// 监督循环:周期扫 pending 队列 → 并发拉取 + 清算任务(信号量收口);
-/// 停止标志置位即退出(JoinSet 弃置,任务在取消点让出)。
-async fn supervisor(inner: Arc<Inner>) {
+/// select! 单臂消费 C4 按需拉取请求(与池任务同 runtime spawn_local
+/// 交错,pool_enabled=false 时照常服务);停止标志置位即退出。
+async fn supervisor(
+    inner: Arc<Inner>,
+    mut fetch_rx: tokio::sync::mpsc::UnboundedReceiver<FetchReq>,
+) {
     let sem = Arc::new(tokio::sync::Semaphore::new(
         inner.cfg.data_pull_concurrency.max(1),
     ));
     let mut tasks = tokio::task::JoinSet::new();
+    let mut fetch_tasks = tokio::task::JoinSet::new();
     let mut inflight: HashSet<Gtid> = HashSet::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(POOL_IDLE_MS));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -199,6 +274,19 @@ async fn supervisor(inner: Arc<Inner>) {
                 if let Some(Ok(gtid)) = done {
                     inflight.remove(&gtid);
                 }
+            }
+            _ = fetch_tasks.join_next(), if !fetch_tasks.is_empty() => {}
+            req = fetch_rx.recv() => {
+                let Some(req) = req else {
+                    // 全部发送方析构 = 服务关停
+                    return;
+                };
+                let inner2 = inner.clone();
+                fetch_tasks.spawn_local(async move {
+                    let r = fetch_object(&inner2, &req.bucket, &req.key).await;
+                    // 应答方已超时离开 = 丢弃,不告警(读路径已 503)
+                    let _ = req.reply.send(r);
+                });
             }
         }
         if !inner.cfg.pool_enabled {
@@ -353,7 +441,7 @@ async fn process_record(inner: &Arc<Inner>, gtid: Gtid, refs: Vec<DataRef>) {
     let consumed: Vec<(Gtid, DataRef)> = refs.iter().map(|r| (gtid, *r)).collect();
     if let Err(e) = inner
         .meta
-        .repl_localize_segments(&[], &consumed, None, gtid.seq)
+        .repl_localize_segments(&[], &consumed, None, gtid.seq, &[])
     {
         tracing::warn!("repl backfill {gtid:?} pending cleanup: {e}; will retry");
     }
@@ -410,7 +498,7 @@ async fn localize_target(
             let _g = inner.localize_mu.lock().await;
             inner
                 .meta
-                .repl_localize_segments(&[], &consumed, None, gtid.seq)
+                .repl_localize_segments(&[], &consumed, None, gtid.seq, &[])
                 .map_err(|e| format!("consume dead refs: {e}"))?;
             return Ok(());
         }
@@ -450,6 +538,7 @@ async fn localize_target(
                 &consumed,
                 (!alloc.is_empty()).then_some(&alloc),
                 gtid.seq,
+                &[],
             )
         };
         match res {
@@ -476,6 +565,149 @@ async fn localize_target(
         }
     }
     Err("localize recompute rounds exhausted".into())
+}
+
+/// 单对象按需回填(M21 C4;读路径触发,语义见模块注释「按需拉取」):
+/// 当前对象全条目(base + 版本键)× 全量 pending 队列身份匹配 →
+/// 锁外拉取 → `localize_mu` 内清算(consumed 传空、标记同事务摘除;
+/// ObjectChanged → 放弃暂存重组,≤ LOCALIZE_MAX_ROUNDS 轮)。
+/// 匹配为空 = 池已先到/对象已改写:仅清标记返回 Ok。
+async fn fetch_object(inner: &Arc<Inner>, bucket: &str, key: &str) -> Result<(), String> {
+    let marker = fs3_meta::keys::repl_pending_obj_key(bucket, key);
+    for _ in 0..LOCALIZE_MAX_ROUNDS {
+        // 当前段表(o: 全形态;含 restore_state.restored_extents)
+        let entries = inner
+            .meta
+            .repl_object_entries(bucket, key)
+            .map_err(|e| format!("read object entries: {e}"))?;
+        let mut entry_segs: Vec<(Vec<u8>, Vec<fs3_core::Segment>)> =
+            Vec::with_capacity(entries.len());
+        for (k, v) in entries {
+            let m = fs3_core::ObjectMeta::decode_value(&v)
+                .map_err(|e| format!("decode object meta: {e}"))?;
+            let mut s = m.extents.clone();
+            if let Some(st) = &m.restore_state {
+                s.extend(st.restored_extents.iter().cloned());
+            }
+            entry_segs.push((k, s));
+        }
+        // 全量 pending 扫描 ∩ 当前段表身份匹配(引用在队列 = 仍未回填)
+        let pending = inner
+            .meta
+            .list_repl_pending(usize::MAX)
+            .map_err(|e| format!("scan repl pending: {e}"))?;
+        let mut matched: Vec<(Gtid, DataRef)> = Vec::new();
+        for (g, refs) in pending {
+            for r in refs {
+                if entry_segs.iter().any(|(_, segs)| {
+                    segs.iter().any(|s| {
+                        s.extent_id == r.extent_id && s.offset == r.offset && s.len == r.len
+                    })
+                }) {
+                    matched.push((g, r));
+                }
+            }
+        }
+        if matched.is_empty() {
+            // 池已清算/对象被并发改写:零拉取清标记收工(get 锚定读集,
+            // 并发 apply 重打标必冲突 → ObjectChanged 下轮重组)
+            let res = {
+                let _g = inner.localize_mu.lock().await;
+                inner
+                    .meta
+                    .repl_localize_segments(&[], &[], None, 0, std::slice::from_ref(&marker))
+            };
+            match res {
+                Ok(_) => return Ok(()),
+                Err(fs3_core::Error::ObjectChanged(m)) => {
+                    tracing::debug!("repl read-fetch marker clear recompute: {m}");
+                    continue;
+                }
+                Err(e) => return Err(format!("clear pending marker: {e}")),
+            }
+        }
+        // 去重(COW 跨条目/跨版本共享同一上游段):按身份只拉一次
+        let mut uniq: Vec<DataRef> = Vec::new();
+        for (_, r) in &matched {
+            if !uniq
+                .iter()
+                .any(|u| u.extent_id == r.extent_id && u.offset == r.offset && u.len == r.len)
+            {
+                uniq.push(*r);
+            }
+        }
+        // 锁外拉取(失败:已取暂存精确逆转账目)
+        let mut staged: Vec<(DataRef, ReplImportStaged)> = Vec::with_capacity(uniq.len());
+        for r in &uniq {
+            match fetch_data_ref(inner, r).await {
+                Ok(st) => staged.push((*r, st)),
+                Err(e) => {
+                    for (_, st) in staged {
+                        inner.engine.write().repl_import_abort(st);
+                    }
+                    return Err(format!("fetch segment {r:?}: {e}"));
+                }
+            }
+        }
+        // 按条目组替换表(同一暂存段可被多条目/版本引用,各引一份)
+        let mut items: Vec<ReplLocalizeItem> = Vec::new();
+        for (k, segs) in &entry_segs {
+            let subs: Vec<(DataRef, Vec<fs3_core::Segment>)> = staged
+                .iter()
+                .filter(|(r, _)| {
+                    segs.iter().any(|s| {
+                        s.extent_id == r.extent_id && s.offset == r.offset && s.len == r.len
+                    })
+                })
+                .map(|(r, st)| (*r, st.segments.clone()))
+                .collect();
+            if !subs.is_empty() {
+                items.push(ReplLocalizeItem {
+                    key: k.clone(),
+                    subs,
+                });
+            }
+        }
+        let alloc = staged
+            .iter()
+            .fold(fs3_core::AllocDraft::default(), |acc, (_, s)| {
+                acc.merge(s.alloc.clone())
+            });
+        // 分配记录挂命中条目的最大 seq(同池路径 gtid.seq 口径)
+        let alloc_seq = matched.iter().map(|(g, _)| g.seq).max().unwrap_or(0);
+        let res = {
+            let _g = inner.localize_mu.lock().await;
+            inner.meta.repl_localize_segments(
+                &items,
+                &[], // consumed 传空:条目光留给池摘除(死引用零拉取收敛)
+                (!alloc.is_empty()).then_some(&alloc),
+                alloc_seq,
+                std::slice::from_ref(&marker),
+            )
+        };
+        match res {
+            Ok(_) => {
+                for (_, st) in staged {
+                    inner.engine.write().repl_import_committed(st);
+                }
+                return Ok(());
+            }
+            Err(fs3_core::Error::ObjectChanged(m)) => {
+                tracing::debug!("repl read-fetch localize recompute: {m}");
+                for (_, st) in staged {
+                    inner.engine.write().repl_import_abort(st);
+                }
+                continue;
+            }
+            Err(e) => {
+                for (_, st) in staged {
+                    inner.engine.write().repl_import_abort(st);
+                }
+                return Err(format!("localize txn: {e}"));
+            }
+        }
+    }
+    Err("read-fetch recompute rounds exhausted".into())
 }
 
 /// 单上游段的字节拉取 + 本地落盘(C2 import_segments 同口径:

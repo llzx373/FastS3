@@ -3244,6 +3244,45 @@ mod tests {
         }
     }
 
+    /// SigV4 签名 GET 请求夹具(M21 C4 用例;test/secret123,照
+    /// fs3-s3 service_integration 先例)。
+    fn signed_get(path: &str) -> fs3_s3::S3Request {
+        use fs3_s3::auth::{now_amz, sign_request, PayloadHash};
+        use sha2::Digest;
+        let amz_date = now_amz();
+        let hash = hex::encode(sha2::Sha256::digest(b""));
+        let mut headers: Vec<(String, String)> = vec![
+            ("host".into(), "s3.example.com".into()),
+            ("x-amz-date".into(), amz_date.clone()),
+            ("x-amz-content-sha256".into(), hash.clone()),
+        ];
+        let cred = fs3_s3::auth::Credentials {
+            access_key: "test".into(),
+            secret_key: "secret123".into(),
+        };
+        let auth_hdr = sign_request(
+            &cred,
+            "us-east-1",
+            "GET",
+            path,
+            &[],
+            &headers,
+            &amz_date,
+            &PayloadHash::HexSha256(hash),
+        )
+        .unwrap();
+        headers.push(("authorization".into(), auth_hdr));
+        fs3_s3::S3Request {
+            method: "GET".into(),
+            raw_path: path.into(),
+            decoded_path: path.into(),
+            host: "s3.example.com".into(),
+            query: vec![],
+            headers,
+            body: vec![],
+        }
+    }
+
     /// M21 C2(设计稿 §4.3;ADR-33 RP2.4;TODO M21/C2 具名用例):
     /// **空库备端从快照引导并追平**——
     /// ① 上游(binlog 开)1 桶 + 段对象 + 内联对象(seq 1..=3);下游空库
@@ -3510,6 +3549,7 @@ mod tests {
                 pull: cfg,
                 data_pull_concurrency: 4,
                 pool_enabled: true,
+                read_fetch_timeout: std::time::Duration::from_secs(30),
             },
         )
         .unwrap();
@@ -3584,6 +3624,7 @@ mod tests {
                 pull: cfg.clone(),
                 data_pull_concurrency: 4,
                 pool_enabled: true,
+                read_fetch_timeout: std::time::Duration::from_secs(30),
             },
         )
         .unwrap();
@@ -3626,5 +3667,238 @@ mod tests {
         assert_eq!(bf.extent_data_requests(), 0, "内联对象零 extent-data 往返");
         w.shutdown();
         bf.shutdown();
+    }
+
+    /// M21 C4(ADR-33 RP4.2;设计稿 §4.2;TODO M21/C4 具名用例):
+    /// **读路径缺数据 → 同步拉取后放行**——
+    /// ① 增量段对象 apply 后 pending 驻留(回填池关)+ 对象级标记在;
+    /// ② 签名 GET:repl_ensure_data 经按需通道同步回填(逐段
+    ///    extent-data,CRC 校验同池口径)→ 200,流式逐块读取字节一致;
+    /// ③ 计数 = 上游段数;标记已清;段表已本地化(≠ 上游引用)。
+    #[test]
+    fn read_pending_object_blocks_then_serves() {
+        use crate::repl_backfill::{BackfillConfig, BackfillService};
+        use crate::repl_worker::PullWorker;
+        let dir = tempfile::tempdir().unwrap();
+        let up_engine = test_engine_opts(&dir.path().join("up"), 4 * 1024 * 1024, true);
+        {
+            let mut e = up_engine.write();
+            e.create_bucket_with_quota("b0", None).unwrap();
+        }
+        let up_meta = up_engine.read().meta_arc();
+        let fx = start_server_on(up_engine.clone(), up_meta.clone());
+
+        let down_engine = test_engine(&dir.path().join("down"));
+        let down = down_engine.read().meta_arc();
+        down.set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
+        let cfg = pull_cfg(dir.path(), &fx, "s1", "node-b");
+        let w = PullWorker::spawn(down_engine.clone(), down.clone(), cfg.clone()).unwrap();
+        // 空库引导(bucket 经快照;不产 pending)
+        wait_repl_cursor(
+            &down,
+            Gtid {
+                epoch: 1,
+                seq: up_meta.last_seq().unwrap(),
+            },
+        );
+
+        // ① 增量:5MiB 段对象经 binlog apply → pending + 标记驻留
+        let payload: Vec<u8> = (0..5 * 1024 * 1024usize).map(|i| (i % 233) as u8).collect();
+        up_engine.write().put("b0", "k", &mut &payload[..]).unwrap();
+        wait_repl_cursor(
+            &down,
+            Gtid {
+                epoch: 1,
+                seq: up_meta.last_seq().unwrap(),
+            },
+        );
+        assert!(
+            down.repl_object_data_pending("b0", "k").unwrap(),
+            "带引用 ObjectPut apply 同事务打标"
+        );
+        let up_segs = up_meta
+            .get_object("b0", "k")
+            .unwrap()
+            .unwrap()
+            .extents
+            .len();
+        assert!(up_segs >= 2, "夹具:多段对象(实测 {up_segs} 段)");
+
+        // C4 装配:回填池关(pending 驻留),按需拉取通道 + 引擎探针
+        let svc = BackfillService::spawn(
+            down_engine.clone(),
+            down.clone(),
+            BackfillConfig {
+                pull: cfg,
+                data_pull_concurrency: 4,
+                pool_enabled: false,
+                read_fetch_timeout: std::time::Duration::from_secs(30),
+            },
+        )
+        .unwrap();
+        let probe: Arc<dyn fs3_engine::ReplPendingProbe> = svc.clone();
+        down_engine.write().set_repl_pending_probe(Some(probe));
+        let s3 = fs3_s3::S3Service::new(
+            down_engine.clone(),
+            vec![fs3_s3::auth::Credentials {
+                access_key: "test".into(),
+                secret_key: "secret123".into(),
+            }],
+            "us-east-1".into(),
+            false,
+        );
+        let fetch: Arc<dyn fs3_s3::ReplDataFetch> = svc.clone();
+        s3.set_repl_data_fetch(fetch);
+
+        // ② 签名 GET:同步拉取后 200;流式逐块读取(同 fs3-http 口径)
+        let req = signed_get("/b0/k");
+        let resp = s3.handle(&req).unwrap();
+        assert_eq!(resp.status, 200, "缺数据 GET 同步拉取后放行");
+        let fs3_s3::ResponseBody::ObjectStream {
+            bucket,
+            key,
+            version,
+            offset,
+            length,
+            versioning,
+            ..
+        } = resp.body
+        else {
+            panic!("expect object stream, got {:?}", resp.body);
+        };
+        let mut out = Vec::new();
+        let mut pos = 0u64;
+        let mut buf = vec![0u8; 1024 * 1024];
+        loop {
+            let n = s3
+                .read_stream_chunk(
+                    &bucket,
+                    &key,
+                    version.as_ref(),
+                    versioning,
+                    offset,
+                    length,
+                    &mut pos,
+                    &mut buf,
+                    None,
+                )
+                .unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(out, payload, "按需拉取后逐字节一致");
+
+        // ③ 计数/标记/段表终局
+        assert_eq!(
+            svc.extent_data_requests() as usize,
+            up_segs,
+            "逐段一次 extent-data 拉取(CRC 逐块校验同池口径)"
+        );
+        assert!(
+            !down.repl_object_data_pending("b0", "k").unwrap(),
+            "清算事务同事务摘除标记"
+        );
+        let down_obj = down.get_object("b0", "k").unwrap().unwrap();
+        assert_ne!(
+            down_obj.extents,
+            up_meta.get_object("b0", "k").unwrap().unwrap().extents,
+            "段引用必须改写为本地段(布局独立 §4.3)"
+        );
+        w.shutdown();
+        svc.shutdown();
+    }
+
+    /// M21 C4(TODO M21/C4 具名用例):**上游不可达 → 503 +
+    /// Retry-After**——pending 驻留对象 GET,按需拉取连死端口失败 →
+    /// 503 ServiceUnavailable + Retry-After 头(不无限阻塞读路径);
+    /// 标记保留(下轮重试语义),拉取已有真实请求动作(非提前短路)。
+    #[test]
+    fn read_pending_upstream_down_503() {
+        use crate::repl_backfill::{BackfillConfig, BackfillService};
+        use crate::repl_worker::PullWorker;
+        let dir = tempfile::tempdir().unwrap();
+        let up_engine = test_engine_opts(&dir.path().join("up"), 4 * 1024 * 1024, true);
+        {
+            let mut e = up_engine.write();
+            e.create_bucket_with_quota("b0", None).unwrap();
+        }
+        let up_meta = up_engine.read().meta_arc();
+        let fx = start_server_on(up_engine.clone(), up_meta.clone());
+
+        let down_engine = test_engine(&dir.path().join("down"));
+        let down = down_engine.read().meta_arc();
+        down.set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
+        let cfg = pull_cfg(dir.path(), &fx, "s1", "node-b");
+        let w = PullWorker::spawn(down_engine.clone(), down.clone(), cfg.clone()).unwrap();
+        wait_repl_cursor(
+            &down,
+            Gtid {
+                epoch: 1,
+                seq: up_meta.last_seq().unwrap(),
+            },
+        );
+        // 增量段对象 apply → pending 驻留
+        let payload: Vec<u8> = (0..1024 * 1024usize).map(|i| (i % 229) as u8).collect();
+        up_engine.write().put("b0", "k", &mut &payload[..]).unwrap();
+        wait_repl_cursor(
+            &down,
+            Gtid {
+                epoch: 1,
+                seq: up_meta.last_seq().unwrap(),
+            },
+        );
+        assert!(down.repl_object_data_pending("b0", "k").unwrap());
+
+        // 回填服务指死端口(bind 取闲端口后 drop = connection refused)
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let mut dead_pull = cfg;
+        dead_pull.primary_url = format!("https://127.0.0.1:{dead_port}");
+        let svc = BackfillService::spawn(
+            down_engine.clone(),
+            down.clone(),
+            BackfillConfig {
+                pull: dead_pull,
+                data_pull_concurrency: 4,
+                pool_enabled: false,
+                read_fetch_timeout: std::time::Duration::from_secs(30),
+            },
+        )
+        .unwrap();
+        let s3 = fs3_s3::S3Service::new(
+            down_engine.clone(),
+            vec![fs3_s3::auth::Credentials {
+                access_key: "test".into(),
+                secret_key: "secret123".into(),
+            }],
+            "us-east-1".into(),
+            false,
+        );
+        let fetch: Arc<dyn fs3_s3::ReplDataFetch> = svc.clone();
+        s3.set_repl_data_fetch(fetch);
+
+        let req = signed_get("/b0/k");
+        let err = s3.handle(&req).unwrap_err();
+        assert_eq!(err.status(), 503, "上游不可达 → 503: {err:?}");
+        assert!(
+            err.resp_headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("retry-after") && v == "5"),
+            "503 必带 Retry-After: {:?}",
+            err.resp_headers
+        );
+        assert!(
+            down.repl_object_data_pending("b0", "k").unwrap(),
+            "拉取失败标记保留(下轮重试语义)"
+        );
+        assert!(
+            svc.extent_data_requests() >= 1,
+            "确有真实拉取动作(非标记短路)"
+        );
+        w.shutdown();
+        svc.shutdown();
     }
 }

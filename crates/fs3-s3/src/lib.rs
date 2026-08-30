@@ -19,4 +19,6 @@ pub mod xml;
 
 pub use error::{S3Error, S3ErrorCode};
 pub use router::{Operation, Router, VersionIdArg};
-pub use service::{ResponseBody, S3Request, S3Service, ServiceResponse, BUFFERED_PUT_LIMIT};
+pub use service::{
+    ReplDataFetch, ResponseBody, S3Request, S3Service, ServiceResponse, BUFFERED_PUT_LIMIT,
+};

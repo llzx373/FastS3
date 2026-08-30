@@ -419,6 +419,17 @@ pub struct Engine {
     trusted_clock_divergence: std::sync::atomic::AtomicU64,
     /// 回拨事件计数(divergence 从 0→正 的边沿;admin 渲染 counter)。
     trusted_clock_divergence_events: std::sync::atomic::AtomicU64,
+    /// M21 C4:standby 读路径 data-pending 探针(None = primary/未装配,
+    /// 热路径单次分支零开销;由 fs3d 回填服务装配)。
+    repl_probe: Option<Arc<dyn ReplPendingProbe>>,
+}
+
+/// M21 C4(ADR-33 RP4.2):standby 读路径的 data-pending 探针——对象
+/// 元数据已随 binlog apply,但段数据尚未回填(仍指向上游 extent)。
+/// 实现 = fs3d BackfillService(点读 s:repl_pdobj 旁路标记)。
+pub trait ReplPendingProbe: Send + Sync {
+    /// 该对象当前是否有待回填段数据。
+    fn object_data_pending(&self, bucket: &str, key: &str) -> bool;
 }
 
 /// M21 A5 开发态开关(风格仿 fs3-agent `FS3_SYNC_MC_WORKERS` env 先例):
@@ -892,6 +903,7 @@ impl Engine {
             }),
             trusted_clock_divergence: std::sync::atomic::AtomicU64::new(0),
             trusted_clock_divergence_events: std::sync::atomic::AtomicU64::new(0),
+            repl_probe: None,
         };
         e.note_clock_divergence(wall, clock_state.last_wall);
         Ok(e)
@@ -899,6 +911,25 @@ impl Engine {
 
     pub fn superblock(&self) -> &fs3_core::SuperBlock {
         &self.main_sb
+    }
+
+    /// M21 C4:装配 standby data-pending 探针(fs3d 回填服务;primary
+    /// 不装配 = None,读路径零开销)。
+    pub fn set_repl_pending_probe(&mut self, probe: Option<Arc<dyn ReplPendingProbe>>) {
+        self.repl_probe = probe;
+    }
+
+    /// M21 C4:standby 读路径 pending 判定(resolve_object 之后调用;
+    /// 命中 → ReplDataPending,协议层同步拉取或 503+Retry-After)。
+    fn check_repl_data_pending(&self, bucket: &str, key: &str) -> Result<()> {
+        if let Some(p) = &self.repl_probe {
+            if p.object_data_pending(bucket, key) {
+                return Err(Error::ReplDataPending(format!(
+                    "{bucket}/{key} segment data not yet backfilled"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// 池设备表(只读;内部测试用)。
@@ -3084,6 +3115,7 @@ impl Engine {
         out: &mut dyn Write,
     ) -> Result<u64> {
         let meta = self.resolve_object(bucket, key, version, None)?;
+        self.check_repl_data_pending(bucket, key)?;
         self.get_to_meta(&meta, range, out, None)
     }
 
@@ -3535,6 +3567,7 @@ impl Engine {
         sse_key: Option<&fs3_core::SseCKey>,
     ) -> Result<usize> {
         let meta = self.resolve_object(bucket, key, version, Some(versioning))?;
+        self.check_repl_data_pending(bucket, key)?;
         self.read_at_meta(&meta, offset, buf, sse_key)
     }
 

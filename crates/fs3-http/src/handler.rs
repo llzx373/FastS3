@@ -346,8 +346,14 @@ fn error_response(e: &S3Error, host_id: &str, request_id: &str) -> Response<Resp
     for (k, v) in &e.resp_headers {
         builder = builder.header(k.as_str(), v.as_str());
     }
-    // AWS 节流语义(准入/限速):503 恒带 Retry-After
-    if status == StatusCode::SERVICE_UNAVAILABLE {
+    // AWS 节流语义(准入/限速):503 恒带 Retry-After——服务层
+    // with_resp_header 已注入的(M21 C4 回填 503)不重复追加
+    if status == StatusCode::SERVICE_UNAVAILABLE
+        && !e
+            .resp_headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("retry-after"))
+    {
         builder = builder.header("retry-after", "5");
     }
     builder.body(bytes_body(xml.into_bytes())).unwrap()

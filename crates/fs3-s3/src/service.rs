@@ -199,6 +199,20 @@ pub struct S3Service {
     /// put_tenant/delete_tenant 双写即时生效。缺席(未知租户)→ 按
     /// default 租户 canonical 处理(compat 钉死)。
     tenants: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// M21 C4(ADR-33 RP4.2):standby 读路径缺数据同步拉取通道(OnceLock
+    /// 一次性装配;None = primary/未装配,热路径一次原子读判空)。
+    repl_data_fetch: std::sync::OnceLock<Arc<dyn ReplDataFetch>>,
+}
+
+/// M21 C4(ADR-33 RP4.2):standby 读路径的缺数据拉取通道——实现 =
+/// fs3d BackfillService。`object_data_pending` 判定标记;
+/// `fetch_blocking` 同步触发按需回填(上游拉取 + 本地落盘 + 清算),
+/// 返回 Err(原因) = 上游不可达/校验失败 → 协议层 503 + Retry-After。
+pub trait ReplDataFetch: Send + Sync {
+    /// 该对象当前是否有待回填段数据(s:repl_pdobj 标记口径)。
+    fn object_data_pending(&self, bucket: &str, key: &str) -> bool;
+    /// 同步拉取该对象的待回填段(阻塞;成功返回后标记已清)。
+    fn fetch_blocking(&self, bucket: &str, key: &str) -> Result<(), String>;
 }
 
 /// M18 U2:IAM 用户内存视图(U1 仅 enabled;U2 起含策略/组,身份层
@@ -353,7 +367,42 @@ impl S3Service {
             key_owners: std::sync::Mutex::new(std::collections::HashMap::new()),
             tenants: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_clock_secs: std::sync::atomic::AtomicI64::new(unix_now() as i64),
+            repl_data_fetch: std::sync::OnceLock::new(),
         }
+    }
+
+    /// M21 C4:装配 standby 缺数据拉取通道(fs3d 回填服务;OnceLock
+    /// 一次性装配,重复调用告警忽略)。
+    pub fn set_repl_data_fetch(&self, fetch: Arc<dyn ReplDataFetch>) {
+        if self.repl_data_fetch.set(fetch).is_err() {
+            tracing::warn!("repl_data_fetch already installed; ignoring");
+        }
+    }
+
+    /// M21 C4(ADR-33 RP4.2):standby 读路径缺数据确保——标记在则同步
+    /// 拉取(≤8 轮,拉取与并发 apply 竞态由轮询兜底);拉取失败/轮次
+    /// 耗尽 → 503 ServiceUnavailable + Retry-After。**调用方不得持有
+    /// engine 读锁**(fetch 清算需写锁,持读锁调用死锁)。
+    fn repl_ensure_data(&self, bucket: &str, key: &str) -> Result<(), S3Error> {
+        let Some(fetch) = self.repl_data_fetch.get() else {
+            return Ok(());
+        };
+        for _ in 0..8 {
+            if !fetch.object_data_pending(bucket, key) {
+                return Ok(());
+            }
+            fetch.fetch_blocking(bucket, key).map_err(|e| {
+                S3Error::new(S3ErrorCode::ServiceUnavailable)
+                    .with_message(format!("replication backfill in progress: {e}"))
+                    .with_resp_header("Retry-After", "5")
+            })?;
+        }
+        if fetch.object_data_pending(bucket, key) {
+            return Err(S3Error::new(S3ErrorCode::ServiceUnavailable)
+                .with_message("replication backfill did not converge")
+                .with_resp_header("Retry-After", "5"));
+        }
+        Ok(())
     }
 
     /// M14 H1-2:装配热对象缓存(默认关;开关在 fs3_core::cache::CacheConfig)。
@@ -3669,20 +3718,44 @@ impl S3Service {
         let want = ((length - *pos) as usize).min(buf.len());
         // 读路径:读锁(读并发;write 锁会让流式 GET 互相串行)
         let engine = self.engine.read();
-        engine
-            .read_at_version_for(
-                bucket,
-                key,
-                version,
-                offset + *pos,
-                &mut buf[..want],
-                versioning,
-                sse_key,
-            )
-            .inspect(|&n| {
-                *pos += n as u64;
-            })
-            .map_err(|e| map_engine_error(e, bucket, key))
+        let res = engine.read_at_version_for(
+            bucket,
+            key,
+            version,
+            offset + *pos,
+            &mut buf[..want],
+            versioning,
+            sse_key,
+        );
+        // M21 C4:ensure 后并发 apply 重新打标的竞态——先放读锁(fetch
+        // 清算需写锁,持读锁调用死锁),同步拉取后重试一次
+        let res = match res {
+            Err(CoreError::ReplDataPending(_)) => {
+                drop(engine);
+                self.repl_ensure_data(bucket, key)?;
+                self.engine
+                    .read()
+                    .read_at_version_for(
+                        bucket,
+                        key,
+                        version,
+                        offset + *pos,
+                        &mut buf[..want],
+                        versioning,
+                        sse_key,
+                    )
+                    .inspect(|&n| {
+                        *pos += n as u64;
+                    })
+                    .map_err(|e| map_engine_error(e, bucket, key))
+            }
+            other => other
+                .inspect(|&n| {
+                    *pos += n as u64;
+                })
+                .map_err(|e| map_engine_error(e, bucket, key)),
+        };
+        res
     }
 
     /// 对象大小(流头部计算 Content-Length 用;当前版本,D1a 裁决)。
@@ -5751,6 +5824,11 @@ impl S3Service {
         head_only: bool,
         version_id: Option<VersionIdArg>,
     ) -> Result<ServiceResponse, S3Error> {
+        // M21 C4:standby 缺数据同步拉取——必须在取 engine 读锁**之前**
+        // (fetch 清算需引擎写锁,持读锁调用死锁);HEAD 只读元数据不触发
+        if !head_only {
+            self.repl_ensure_data(bucket, key)?;
+        }
         let engine = self.engine.read();
         let bkt = engine
             .meta()
@@ -7096,6 +7174,9 @@ impl S3Service {
         key: &str,
         part_number: u32,
     ) -> Result<ServiceResponse, S3Error> {
+        // M21 C4:standby 缺数据同步拉取(取 engine 读锁之前,同
+        // op_get_object 口径;partNumber GET 读数据,恒触发)
+        self.repl_ensure_data(bucket, key)?;
         let engine = self.engine.read();
         let bkt = engine
             .meta()
@@ -8653,6 +8734,11 @@ fn map_engine_error(e: CoreError, bucket: &str, key: &str) -> S3Error {
             S3Error::new(S3ErrorCode::InvalidObjectState).with_message(m)
         }
         CoreError::AccessDenied(m) => S3Error::new(S3ErrorCode::AccessDenied).with_message(m),
+        // M21 C4:standby 读路径 pending 竞态兜底(ensure 后仍命中)→
+        // 503 + Retry-After(正常路径在 repl_ensure_data 已被同步拉取吸收)
+        CoreError::ReplDataPending(m) => S3Error::new(S3ErrorCode::ServiceUnavailable)
+            .with_message(m)
+            .with_resp_header("Retry-After", "5"),
         // M20 D3(ADR-29 KR6.3):引擎读/写路径 KMS 故障 → AWS 风格 XML
         CoreError::Kms { fault, detail } => {
             use fs3_core::KmsFault;

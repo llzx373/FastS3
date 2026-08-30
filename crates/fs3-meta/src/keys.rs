@@ -215,6 +215,15 @@ pub const SYS_REPL_CURSOR: &[u8] = b"s:repl_cursor";
 /// `o:`/`p:` 段引用键,队列值内 DataRef 是上游回填引用而非本地 extent
 /// 持有,天然安全(同 PREFIX_BINLOG 登记口径)。
 pub const PREFIX_REPL_PENDING: &[u8] = b"s:repl_pending\x00";
+/// 对象级 data-pending 旁路索引(M21 C4;ADR-33 RP4.2;设计稿 §4.2):
+/// `s:repl_pdobj\0{bucket}\0{esc(key)}` → 空值标记。apply_repl_record
+/// 事务内对带段引用的 ObjectPut/ObjectPutVersion/ObjectMigrate 打标
+/// (p: 分片不打标——备端写 501,分片永不直接读),standby 读路径点读
+/// 该标记判定「元数据已 apply 但段数据未回填」→ 503/同步拉取(C4);
+/// 回填清算(repl_localize_segments clear_markers)同事务摘除。不改
+/// ObjectMeta 值格式(同 PREFIX_REPL_PENDING 的旁路口径);meta-export
+/// 显式不导出、check 扫描不相交(瞬态复制状态,同 `s:repl_pending`)。
+pub const PREFIX_REPL_PENDING_OBJ: &[u8] = b"s:repl_pdobj\x00";
 /// 池清单(M13 M1-1,ADR-15 DM1/DM1';值 = postcard(fs3_core::pool::PoolManifest),
 /// 设备序 = 数组序,仅尾部增删)。s: 既有前缀下的新系统键,不新增前缀,
 /// 故 meta-export DTO 与 check 可达性扫描无需联动(同
@@ -735,6 +744,18 @@ pub fn parse_repl_pending_key(raw: &[u8]) -> Result<fs3_core::Gtid> {
         epoch: u64::from_be_bytes(body[..8].try_into().unwrap()),
         seq: u64::from_be_bytes(body[8..].try_into().unwrap()),
     })
+}
+
+/// 对象级 data-pending 标记键:`s:repl_pdobj\0{bucket}\0{esc(key)}`
+/// (M21 C4;esc(key) 不含裸 0x00,键间边界唯一可辨;空值标记)。
+pub fn repl_pending_obj_key(bucket: &str, key: &str) -> Vec<u8> {
+    let mut k =
+        Vec::with_capacity(PREFIX_REPL_PENDING_OBJ.len() + bucket.len() + 1 + key.len() + 4);
+    k.extend_from_slice(PREFIX_REPL_PENDING_OBJ);
+    k.extend_from_slice(bucket.as_bytes());
+    k.push(0x00);
+    k.extend_from_slice(&escape(key.as_bytes()));
+    k
 }
 
 /// 分片键:`p:{uploadId}\0{part_no be32}`。
