@@ -57,6 +57,24 @@ pub use crate::restore::{
 };
 pub use fs3_alloc::ReadPin;
 
+/// M21 C2:复制快照导入写上下文(见 Engine::repl_import_begin 小节注释)。
+/// 每导入对象一个;SSE/压缩臂关闭,导出字节(存储流)原样落本地分配器。
+pub struct ReplImportWriter {
+    writer: ExtentWriter,
+    draft: Staged,
+}
+
+/// M21 C2:导入暂存(finish 产物)= 本地段表(调用方改写 o:/p: 段引用
+/// 用)+ 提交期收口的 AllocDraft(a:{import_seq} 记录素材)+ 分配草稿
+/// 本体(提交失败经 repl_import_abort 精确逆转)。私有 draft 不出本 crate。
+pub struct ReplImportStaged {
+    /// 本地段表(按 feed 字节序;段 CRC 网格随段落盘)。
+    pub segments: Vec<Segment>,
+    /// 本地分配草稿(提交期收口后;MetaStore::import_repl_batch 的 alloc 入参)。
+    pub alloc: fs3_core::AllocDraft,
+    draft: Staged,
+}
+
 #[derive(Clone)]
 pub struct EngineConfig {
     /// 数据设备路径列表(裸设备或镜像文件;M13 M1-2 起支持多设备池;
@@ -103,6 +121,10 @@ pub struct EngineConfig {
     /// 引擎只持客户端句柄(mint/unwrap 逐次在线调用)。
     #[doc(hidden)]
     pub kms: Option<std::sync::Arc<dyn fs3_kms::RootKms>>,
+    /// M21 C2:复制 binlog 记录开关(等价 env `FS3D_REPL_BINLOG`;进程级
+    /// env 在并行测试间有竞态,配置字段供测试/装配显式按实例开启)。
+    #[doc(hidden)]
+    pub repl_binlog: bool,
 }
 
 impl Default for EngineConfig {
@@ -126,6 +148,7 @@ impl Default for EngineConfig {
             clock_offset_secs: 0,
             // M20 E(ADR-29):SSE-KMS 客户端默认未配置(显式装配)
             kms: None,
+            repl_binlog: false,
         }
     }
 }
@@ -430,7 +453,7 @@ impl Engine {
             // 记录(apply_ops 同事务写 `bl:{seq}`)。仅用于 M21 期性能验证/
             // 演练(perf-m21-binlog-compare.sh);正式引擎/[replication]
             // 配置接线属后续 B/F 组任务,届时本 env 入口由配置取代。
-            repl_binlog: repl_binlog_env_enabled(),
+            repl_binlog: cfg.repl_binlog || repl_binlog_env_enabled(),
             ..Default::default()
         };
         if meta_cfg.repl_binlog {
@@ -7072,6 +7095,72 @@ impl Engine {
     /// 跳过 pinned,compaction.rs 既有口径)。
     pub fn pin_extent_ids(&self, ids: Vec<u64>) -> ReadPin {
         ReadPin::new(Arc::clone(&self.alloc), ids)
+    }
+
+    // —— 复制快照导入(M21 C2;ADR-33 RP2.4;设计稿 §4.3) ——
+    //
+    // 语义钉死:导入写 = 导出字节(存储流原样:上游 SSE 密文/压缩流不解
+    // 不转)经**本地分配器**落盘(布局独立 §4.3),SSE/压缩臂关闭(不重
+    // 加密不重压缩;压缩档 0 = 关,ExtentWriter 口径)。元数据事务由调用
+    // 方经 MetaStore::import_repl_batch 提交(a: 记录挂 import_seq);提交
+    // 失败必须 repl_import_abort 精确逆转分配账目(同 put 路径 abort_draft
+    // 先例)。
+
+    /// 打开一个导入写上下文(每对象一个;SSE/压缩关闭,etag 走 crc32c
+    /// 臂零 MD5 开销——上游 etag 随元数据原样保留,写侧摘要用不到)。
+    pub fn repl_import_begin(&mut self) -> Result<ReplImportWriter> {
+        if self.read_only {
+            return Err(Error::Unsupported(
+                "engine is read-only (degraded pool or tool mode); repl import rejected".into(),
+            ));
+        }
+        Ok(ReplImportWriter {
+            writer: ExtentWriter::new(self.chunk_size, fs3_core::EtagMode::Crc32c, None, None, 0)?,
+            draft: Staged::default(),
+        })
+    }
+
+    /// 灌入导出字节(上游段数据,按对象字节序顺次 feed;存储流原样)。
+    pub fn repl_import_feed(&mut self, w: &mut ReplImportWriter, data: &[u8]) -> Result<()> {
+        w.writer.feed(self, &mut w.draft, data)
+    }
+
+    /// 收尾:flush 尾批 + 段即时入账收口 + add_object/to_alloc_draft(同
+    /// put 路径提交前口径)。返回导入暂存(本地段表 + AllocDraft);元数据
+    /// 提交成败分别走 repl_import_committed / repl_import_abort。
+    pub fn repl_import_finish(&mut self, w: ReplImportWriter) -> Result<ReplImportStaged> {
+        let ReplImportWriter { writer, mut draft } = w;
+        let out = match writer.finish(self, &mut draft) {
+            Ok(o) => o,
+            Err(e) => {
+                self.abort_draft(&draft);
+                return Err(e);
+            }
+        };
+        self.alloc.add_object(&mut draft, &out.segments);
+        let alloc = self.alloc.to_alloc_draft(&draft);
+        Ok(ReplImportStaged {
+            segments: out.segments,
+            alloc,
+            draft,
+        })
+    }
+
+    /// 元数据提交成功:记录开放 extent 已提交水位(同 put 路径),
+    /// 暂存草稿丢弃(内存位图/账目已是最终状态)。
+    pub fn repl_import_committed(&mut self, _staged: ReplImportStaged) {
+        self.mark_open_committed();
+    }
+
+    /// feed/finish 中途失败(写错误)或元数据提交失败:精确逆转分配账目
+    /// (abort_draft 口径;已落盘字节为孤儿区,由恢复按活段 max_end 覆盖)。
+    pub fn repl_import_abort(&mut self, staged: ReplImportStaged) {
+        self.abort_draft(&staged.draft);
+    }
+
+    /// feed 中途失败的回滚(finish 未走完,草稿未经 to_alloc_draft 收口)。
+    pub fn repl_import_abort_writer(&mut self, w: ReplImportWriter) {
+        self.abort_draft(&w.draft);
     }
 
     /// 对象数据段(设备偏移 + 长度),裁剪到 [offset, offset+length) 响应区间;

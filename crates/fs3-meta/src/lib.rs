@@ -1547,6 +1547,17 @@ fn decode_alloc(v: &[u8]) -> Result<AllocRecord> {
     decode(v).map_err(|e| Error::Corrupt(format!("alloc record: {e}")))
 }
 
+/// M21 C2:快照导入的分片值解码/编码(段引用改写用;p: 值 = postcard
+/// 直编码无版本字节,解码带四层旧格式回退,同写路径 decode_part)。
+pub fn decode_part_meta(v: &[u8]) -> Result<PartMeta> {
+    decode_part(v)
+}
+
+/// 同 decode_part_meta(改写后重编码;postcard 直编码)。
+pub fn encode_part_meta(p: &PartMeta) -> Result<Vec<u8>> {
+    encode(p)
+}
+
 /// 前缀扫描(惰性迭代;调用方 break 即停止)。
 fn scan_prefix<'a>(
     db: &'a OptimisticTransactionDB,
@@ -2883,6 +2894,133 @@ impl MetaStore {
                         let _ = self.truncate_events(self.event_queue_max);
                     }
                     return Ok(ReplApplyOutcome::Applied);
+                }
+                Err(e) if e.kind() == ErrorKind::Busy || e.kind() == ErrorKind::TryAgain => {
+                    retries += 1;
+                    if retries > MAX_TXN_RETRIES {
+                        return Err(Error::Meta(format!(
+                            "rocksdb txn retries exhausted after {MAX_TXN_RETRIES}: {e}"
+                        )));
+                    }
+                    continue;
+                }
+                Err(e) => return Err(rocks_err(e)),
+            }
+        }
+    }
+
+    // —— 快照导入(M21 C2;ADR-33 RP2.4/R12;设计稿 §4.3) ——
+    //
+    // 语义钉死:
+    // - **导入 ≠ apply**:快照条目是 P 位点的权威历史,不经 binlog——
+    //   import_repl_batch **不增 s:seq、不写 bl:**(seq 水位与游标由
+    //   finalize_repl_import 收口时一并裁决);
+    // - **导入段的分配记录挂 import_seq(= P.seq)**:a:/t: 多批 RMW 合并
+    //   (同一位点键碰撞时 alloc/ref_inc/ref_dec 直拼,与 AllocDraft::merge
+    //   同口径),启动恢复重放等价;
+    // - **finalize 重置而非累加**(R12):s:repl_cursor = P、s:repl_executed
+    //   = {P.epoch:[1..=P.seq]}、s:repl_epoch = max(本地, P.epoch)、s:seq =
+    //   max(本地, P.seq)(防 promote 转正后 seq 回退与既有 bl: 键碰撞,
+    //   同 apply_repl_record 口径)。
+
+    /// 快照导入批量落库(单个乐观事务,同 commit 重试口径)。entries 为
+    /// (原始键, 段引用已改写为本地段的值);同键已存在 = 快照权威覆盖
+    /// (空库引导路径不应发生)。`alloc` = 本批导入段的本地分配草稿
+    /// (None = 纯元数据批)。**不触碰 s:seq / bl: / 游标**。
+    pub fn import_repl_batch(
+        &self,
+        entries: &[(Vec<u8>, Vec<u8>)],
+        alloc: Option<&AllocDraft>,
+        import_seq: u64,
+    ) -> Result<()> {
+        const MAX_TXN_RETRIES: u32 = 10_000;
+        let mut retries = 0u32;
+        loop {
+            let tx = self.db.transaction_opt(&self.write_opts, &self.txn_opts);
+            for (k, v) in entries {
+                tx.put(k, v).map_err(rocks_err)?;
+            }
+            if let Some(d) = alloc {
+                if !d.is_empty() {
+                    // RMW 合并:同一位点 P 的多批导入共用 a:{P.seq} 键
+                    let ak = alloc_key(import_seq);
+                    let mut rec = match tx.get(&ak).map_err(rocks_err)? {
+                        Some(v) => decode_alloc(&v)?,
+                        None => AllocRecord {
+                            seq: import_seq,
+                            txn: import_seq,
+                            alloc: Vec::new(),
+                            ref_inc: Vec::new(),
+                            ref_dec: Vec::new(),
+                        },
+                    };
+                    rec.alloc.extend(d.alloc.iter().copied());
+                    rec.ref_inc.extend(d.ref_inc.iter().copied());
+                    rec.ref_dec.extend(d.ref_dec.iter().copied());
+                    tx.put(&ak, encode(&rec)?).map_err(rocks_err)?;
+                    tx.put(txn_key(import_seq), import_seq.to_be_bytes())
+                        .map_err(rocks_err)?;
+                }
+            }
+            match tx.commit() {
+                Ok(()) => {
+                    if self.sync_mode == SyncMode::Full {
+                        self.db.flush_wal(true).map_err(rocks_err)?;
+                    }
+                    return Ok(());
+                }
+                Err(e) if e.kind() == ErrorKind::Busy || e.kind() == ErrorKind::TryAgain => {
+                    retries += 1;
+                    if retries > MAX_TXN_RETRIES {
+                        return Err(Error::Meta(format!(
+                            "rocksdb txn retries exhausted after {MAX_TXN_RETRIES}: {e}"
+                        )));
+                    }
+                    continue;
+                }
+                Err(e) => return Err(rocks_err(e)),
+            }
+        }
+    }
+
+    /// 导入收口(单事务):游标/executed 集/epoch/seq 水位按导出位点 P
+    /// 重置落定(语义见上方小节注释)。调用方保证导入批已全部落库。
+    pub fn finalize_repl_import(&self, point: Gtid) -> Result<()> {
+        const MAX_TXN_RETRIES: u32 = 10_000;
+        let mut retries = 0u32;
+        loop {
+            let tx = self.db.transaction_opt(&self.write_opts, &self.txn_opts);
+            tx.put(SYS_REPL_CURSOR, repl_cursor_value(point))
+                .map_err(rocks_err)?;
+            let mut executed = GtidSet::new();
+            if point.seq >= 1 {
+                executed.insert_range(point.epoch, 1, point.seq);
+            }
+            tx.put(SYS_REPL_EXECUTED, executed.encode()?)
+                .map_err(rocks_err)?;
+            let local_epoch = match tx.get(SYS_REPL_EPOCH).map_err(rocks_err)? {
+                Some(v) => u64::from_be_bytes(
+                    v.as_slice()
+                        .try_into()
+                        .map_err(|_| Error::Corrupt("s:repl_epoch not u64".into()))?,
+                ),
+                None => 0,
+            };
+            tx.put(SYS_REPL_EPOCH, local_epoch.max(point.epoch).to_be_bytes())
+                .map_err(rocks_err)?;
+            let cur_seq = match tx.get(SYS_SEQ).map_err(rocks_err)? {
+                Some(v) => u64::from_be_bytes(
+                    v.as_slice()
+                        .try_into()
+                        .map_err(|_| Error::Corrupt("s:seq not u64".into()))?,
+                ),
+                None => 0,
+            };
+            tx.put(SYS_SEQ, cur_seq.max(point.seq).to_be_bytes())
+                .map_err(rocks_err)?;
+            match tx.commit() {
+                Ok(()) => {
+                    return self.db.flush_wal(true).map_err(rocks_err);
                 }
                 Err(e) if e.kind() == ErrorKind::Busy || e.kind() == ErrorKind::TryAgain => {
                     retries += 1;
@@ -6615,6 +6753,77 @@ mod tests {
         }
     }
 
+    /// M21 C2(ADR-33 RP2.4/R12;设计稿 §4.3):快照导入落库与收口——
+    /// ① import_repl_batch:raw put 原样落键,**不增 s:seq、不写 bl:**;
+    /// ② a:{import_seq}/t:{import_seq} 多批 RMW 合并(两批同位点 →
+    ///    alloc/ref_inc 直拼,一笔记录);
+    /// ③ finalize_repl_import(P):游标 = P、executed = {P.epoch:[1..=P.seq]}
+    ///    **重置不累加**(预置旧历史段被覆盖)、s:seq = max(当前, P.seq);
+    /// ④ 崩溃重放:重开后游标/executed/导入键保持。
+    #[test]
+    fn repl_import_batch_and_finalize() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = Gtid { epoch: 1, seq: 7 };
+        {
+            let meta = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
+            // 预置:本地既有历史(重建前的残留;finalize 必须重置而非累加)
+            meta.commit_bucket_put("stale", &bucket_meta("stale")).unwrap();
+            assert_eq!(meta.last_seq().unwrap(), 1);
+
+            // ① 纯元数据批:不增 s:seq、不写 bl:
+            meta.import_repl_batch(
+                &[(bucket_key("b0"), encode(&bucket_meta("b0")).unwrap())],
+                None,
+                p.seq,
+            )
+            .unwrap();
+            assert_eq!(meta.last_seq().unwrap(), 1, "导入不增 s:seq");
+            assert!(meta.repl_binlog_entries().unwrap().is_empty());
+            assert!(meta.get_bucket("b0").unwrap().is_some());
+
+            // ② 两批同位点的分配记录 RMW 合并
+            let d1 = AllocDraft {
+                alloc: vec![(0, 1)],
+                ref_inc: vec![],
+                ref_dec: vec![],
+            };
+            let d2 = AllocDraft {
+                alloc: vec![(3, 2)],
+                ref_inc: vec![9],
+                ref_dec: vec![],
+            };
+            meta.import_repl_batch(&[], Some(&d1), p.seq).unwrap();
+            meta.import_repl_batch(&[], Some(&d2), p.seq).unwrap();
+            let recs = meta.list_alloc_records(0).unwrap();
+            assert_eq!(recs.len(), 1, "同一位点多批合并为一笔 a: 记录");
+            assert_eq!(recs[0].seq, p.seq);
+            assert_eq!(recs[0].alloc, vec![(0, 1), (3, 2)]);
+            assert_eq!(recs[0].ref_inc, vec![9]);
+
+            // ③ finalize:游标/executed 重置;s:seq = max(1, 7) = 7
+            meta.finalize_repl_import(p).unwrap();
+            assert_eq!(meta.repl_cursor().unwrap(), p);
+            assert_eq!(
+                meta.repl_executed().unwrap().ranges().collect::<Vec<_>>(),
+                vec![(1, 1, 7)],
+                "executed 按 P 重置(R12)"
+            );
+            assert_eq!(meta.last_seq().unwrap(), 7, "s:seq 推进至 P.seq 防回退");
+            meta.flush().unwrap();
+        }
+        // ④ 崩溃重放:重开后保持
+        {
+            let meta = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
+            assert_eq!(meta.repl_cursor().unwrap(), p);
+            assert_eq!(
+                meta.repl_executed().unwrap().ranges().collect::<Vec<_>>(),
+                vec![(1, 1, 7)]
+            );
+            assert!(meta.get_bucket("b0").unwrap().is_some());
+            assert_eq!(meta.list_alloc_records(0).unwrap().len(), 1);
+        }
+    }
+
     /// M21 B4(ADR-33 RP3.2/RP4.2;设计稿 §4.1;TODO M21/B4 具名用例):
     /// **心跳条目推进游标,GTID 集无洞**——桶级槽过滤带过的空 ops 记录
     /// (heartbeat)与纯系统键事务:
@@ -10272,3 +10481,4 @@ mod m21_bench_tests {
         }
     }
 }
+

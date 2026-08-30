@@ -1192,7 +1192,7 @@ fn cmd_serve(
     let mut pull_worker = match repl_worker::PullConfig::from_env() {
         Ok(Some(pull_cfg)) => {
             let meta = engine.read().meta_arc();
-            let worker = repl_worker::PullWorker::spawn(meta, pull_cfg)
+            let worker = repl_worker::PullWorker::spawn(Arc::clone(&engine), meta, pull_cfg)
                 .map_err(fs3_core::Error::InvalidArgument)?;
             tracing::info!("replication pull worker started (role=standby)");
             Some(worker)
@@ -1441,6 +1441,9 @@ pub(crate) fn engine_config_inner_multi(
         rebalance: fs3_engine::RebalanceConfig::default(),
         compression: fs3_core::CompressionConfig::default(),
         clock_offset_secs: 0,
+        // M21:复制 binlog 仍走 env FS3D_REPL_BINLOG 开发态开关
+        // (Engine::open 内或值合并;配置字段接线属 F 组)
+        repl_binlog: false,
     })
 }
 
@@ -1491,6 +1494,9 @@ fn engine_config(
         rebalance: fs3_engine::RebalanceConfig::default(),
         compression: fs3_core::CompressionConfig::default(),
         clock_offset_secs,
+        // M21:复制 binlog 仍走 env FS3D_REPL_BINLOG 开发态开关
+        // (Engine::open 内或值合并;配置字段接线属 F 组)
+        repl_binlog: false,
     })
 }
 

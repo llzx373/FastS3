@@ -553,6 +553,35 @@ impl ReplServer {
             },
             None => 0,
         };
+        // C2 断档检查(设计稿 §3.4;hello ③同口径,拉取路径兜底——截断可能
+        // 发生在握手之后):下一 wanted GTID 低于 binlog 可用下界 = 中间已被
+        // 截断 → 410 ErrBinlogGone(空库下游 after=0-0 的 genesis wanted =
+        // {floor.epoch, 1};下游 worker 据此走快照 bootstrap,非空库 = 显式
+        // 重建)。binlog 空(无条目)= 无下界,不查。
+        match self.binlog_floor() {
+            Ok(Some(floor)) => {
+                let next_wanted = if (after.epoch, after.seq) == (0, 0) {
+                    Gtid {
+                        epoch: floor.epoch,
+                        seq: 1,
+                    }
+                } else {
+                    Gtid {
+                        epoch: after.epoch,
+                        seq: after.seq + 1,
+                    }
+                };
+                if floor > next_wanted {
+                    return json_err(
+                        StatusCode::GONE,
+                        "ErrBinlogGone",
+                        "resume point below binlog floor (truncated); bootstrap from snapshot",
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(e) => return internal_err("binlog floor", &e),
+        }
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
         loop {
             let watermark = match self.high_watermark() {
@@ -1625,15 +1654,24 @@ mod tests {
     }
 
     fn test_engine(dir: &Path) -> Arc<RwLock<Engine>> {
+        test_engine_opts(dir, 4 * 1024 * 1024, false)
+    }
+
+    /// 参数化引擎夹具(C2:extent_size 错配/binlog 开关按用例显式给;
+    /// binlog 走 EngineConfig 字段而非 env——并行测试间 env 是进程级
+    /// 竞态)。
+    fn test_engine_opts(dir: &Path, extent_size: u64, repl_binlog: bool) -> Arc<RwLock<Engine>> {
+        std::fs::create_dir_all(dir).unwrap();
         let img = dir.join("disk.img");
         std::fs::File::create(&img)
             .unwrap()
             .set_len(128 * 1024 * 1024)
             .unwrap();
-        fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
+        fs3_device::init_device(&img, extent_size, 0, false).unwrap();
         let cfg = fs3_engine::EngineConfig {
             devices: vec![img],
             meta_dir: dir.join("meta"),
+            repl_binlog,
             ..Default::default()
         };
         Arc::new(RwLock::new(Engine::open(&cfg).unwrap()))
@@ -3019,13 +3057,15 @@ mod tests {
     }
 
     /// ① 上游 4 条事务(含 Stats 增量事务,双记账探针)+ 下游 pull worker
-    ///    (真实 mTLS 复制口 + 独立 MetaStore)追平游标 1-4;
+    ///    (真实 mTLS 复制口 + 独立引擎)经空库快照 bootstrap 追平游标 1-4;
     /// ② 杀 pull worker(优雅停 = 断线等价物);上游再写 2 条;
     /// ③ 重启 worker:重握手(hello 带 executed 集)→ 从游标 1-4 续传
     ///    1-5/1-6,**不重拉**(b0 统计不重双记)不丢(b3/b4 落盘);
     /// ④ ack 回执:上游槽 confirmed_gtid 随游标推进到 1-6;
-    /// ⑤ 不重编号:下游 bl: 6 条与上游同 seq 同内容(原样 ReplRecord);
-    /// ⑥ 下游 executed 集 = 连续 [1,6] 无洞;s:seq = 6(防回退)。
+    /// ⑤ 不重编号:下游 bl: 只有流式追赶的 2 条(快照不含 bl:),与上游
+    ///    尾部同 seq 同内容(原样 ReplRecord);
+    /// ⑥ 下游 executed 集 = 连续 [1,6] 无洞(bootstrap finalize 重置
+    ///    [1,4] + 流式并入);s:seq = 6(防回退)。
     #[test]
     fn repl_reconnect_resumes_from_cursor() {
         use crate::repl_worker::{PullConfig, PullWorker};
@@ -3043,14 +3083,10 @@ mod tests {
         .unwrap();
         let fx = start_repl_server(Some(up.clone()));
 
-        // 下游:独立 MetaStore,role=standby(pull worker 硬校验)
-        let down = Arc::new(
-            MetaStore::open(
-                &dir.path().join("down-meta"),
-                &fs3_meta::MetaConfig::default(),
-            )
-            .unwrap(),
-        );
+        // 下游:独立引擎 + MetaStore(C2 起 worker 导入需引擎),role=standby
+        // (pull worker 硬校验);空库 → 首轮经快照 bootstrap 到 1-4
+        let down_engine = test_engine(&dir.path().join("down"));
+        let down = down_engine.read().meta_arc();
         down.set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
 
         let (cert, key) = fx.client_cert(Some("node-b"));
@@ -3080,8 +3116,9 @@ mod tests {
             }
         };
 
-        // ① 追平 1-4(长轮询覆盖空闲期)
-        let w1 = PullWorker::spawn(down.clone(), cfg.clone()).unwrap();
+        // ① 追平 1-4(C2:空库首轮 = 快照 bootstrap 导入至 P=1-4;
+        // 长轮询覆盖空闲期)
+        let w1 = PullWorker::spawn(down_engine.clone(), down.clone(), cfg.clone()).unwrap();
         wait_cursor(&down, g(4));
         // ② 杀 pull worker(断线);上游再写 2 条(seq 5,6)
         w1.shutdown();
@@ -3120,7 +3157,7 @@ mod tests {
         .unwrap();
 
         // ③ 重启 worker:重握手 → 从游标续传 1-5/1-6
-        let w2 = PullWorker::spawn(down.clone(), cfg).unwrap();
+        let w2 = PullWorker::spawn(down_engine.clone(), down.clone(), cfg).unwrap();
         wait_cursor(&down, g(6));
         w2.shutdown();
 
@@ -3144,15 +3181,24 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "ack 未推进: {slot:?}");
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        // ⑤ 不重编号:下游 bl: = 上游同 seq 同内容(原样记录,级联预备)
+        // ⑤ 不重编号:下游 bl: 只有 bootstrap 后流式的条目(快照不含
+        // bl:,C1 导出排除键族),seq 5/6 与上游尾部同 seq 同内容(原样
+        // 记录,级联预备)
         let up_entries = up.repl_binlog_entries().unwrap();
         let down_entries = down.repl_binlog_entries().unwrap();
-        assert_eq!(down_entries.len(), 6);
-        for (i, ((useq, urec), (dseq, drec))) in
-            up_entries.iter().zip(down_entries.iter()).enumerate()
+        assert_eq!(
+            down_entries.len(),
+            2,
+            "快照导入不写 bl:;仅流式追赶段落 binlog"
+        );
+        for (i, ((useq, urec), (dseq, drec))) in up_entries
+            .iter()
+            .skip(4)
+            .zip(down_entries.iter())
+            .enumerate()
         {
-            assert_eq!(useq, dseq, "第 {} 条 seq 一致(不重编号)", i + 1);
-            assert_eq!(urec, drec, "第 {} 条记录原样", i + 1);
+            assert_eq!(useq, dseq, "第 {} 条 seq 一致(不重编号)", i + 5);
+            assert_eq!(urec, drec, "第 {} 条记录原样", i + 5);
         }
         // ⑥ executed 连续无洞;s:seq 推进至原水位
         assert_eq!(
@@ -3160,6 +3206,201 @@ mod tests {
             vec![(1, 1, 6)]
         );
         assert_eq!(down.last_seq().unwrap(), 6, "s:seq 推进至原 seq 防回退");
+    }
+
+    /// pull worker 配置夹具(C2 两具名用例共用;mTLS 材料落盘)。
+    fn pull_cfg(
+        dir: &Path,
+        fx: &Fixture,
+        slot: &str,
+        node: &str,
+    ) -> crate::repl_worker::PullConfig {
+        let (cert, key) = fx.client_cert(Some(node));
+        crate::repl_worker::PullConfig {
+            primary_url: format!("https://localhost:{}", fx.addr.port()),
+            slot_name: slot.into(),
+            node_id: node.into(),
+            ca_cert: write_pem(dir, "ca.pem", &fx.ca_pem),
+            client_cert: write_pem(dir, "node.pem", &cert),
+            client_key: write_pem(dir, "node.key", &key),
+            long_poll_ms: 200,
+            retry_ms: 50,
+        }
+    }
+
+    /// 等待下游游标到位(20s 上限,20ms 轮询;同 B4 用例口径)。
+    fn wait_repl_cursor(meta: &MetaStore, want: Gtid) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let cur = meta.repl_cursor().unwrap();
+            if cur >= want {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timeout waiting cursor {want:?}, now {cur:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// M21 C2(设计稿 §4.3;ADR-33 RP2.4;TODO M21/C2 具名用例):
+    /// **空库备端从快照引导并追平**——
+    /// ① 上游(binlog 开)1 桶 + 段对象 + 内联对象(seq 1..=3);下游空库
+    ///    pull worker → 游标 {0,0} → 快照 bootstrap:meta 分页导入,o: 段
+    ///    经 extent-data 拉字节、本地分配器落盘、段引用改写为本地段;
+    /// ② finalize:游标 = P=1-3、executed = [1,3] 重置、s:seq = 3;
+    /// ③ 对象逐字节可读(段数据真到位,非仅元数据);导入分配随收尾
+    ///    checkpoint 落定(a:/t: 记录此后按常规 GC,恢复语义不变);
+    /// ④ P 后上游再写内联对象(追赶段:C3 回填未做,增量只覆盖字节随
+    ///    Op 直达的内联对象)→ worker 续流 apply → 下游可读;bl: 只有
+    ///    追赶条目(快照不写 bl:)。
+    #[test]
+    fn standby_bootstrap_from_empty_catches_up() {
+        use crate::repl_worker::PullWorker;
+        let dir = tempfile::tempdir().unwrap();
+        // 上游:binlog 经 EngineConfig 字段开(不用 env,并行测试进程级竞态)
+        let up_engine = test_engine_opts(&dir.path().join("up"), 4 * 1024 * 1024, true);
+        let big: Vec<u8> = (0..1024 * 1024usize).map(|i| (i % 251) as u8).collect();
+        let inline1 = b"inline-payload-1".to_vec();
+        {
+            let mut e = up_engine.write();
+            e.create_bucket_with_quota("b0", None).unwrap();
+            e.put("b0", "big", &mut &big[..]).unwrap();
+            e.put("b0", "inline1", &mut &inline1[..]).unwrap();
+        }
+        let up_meta = up_engine.read().meta_arc();
+        let p_seq = up_meta.last_seq().unwrap();
+        assert_eq!(p_seq, 3, "桶 + 两对象 = 3 条事务");
+        let fx = start_server_on(up_engine.clone(), up_meta.clone());
+
+        // 下游:空引擎,role=standby
+        let down_engine = test_engine(&dir.path().join("down"));
+        let down = down_engine.read().meta_arc();
+        down.set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
+        let cfg = pull_cfg(dir.path(), &fx, "s1", "node-b");
+
+        // ①② 空库 → bootstrap → 游标 = P
+        let w = PullWorker::spawn(down_engine.clone(), down.clone(), cfg).unwrap();
+        wait_repl_cursor(
+            &down,
+            Gtid {
+                epoch: 1,
+                seq: p_seq,
+            },
+        );
+        assert_eq!(
+            down.repl_executed().unwrap().ranges().collect::<Vec<_>>(),
+            vec![(1, 1, p_seq)],
+            "executed 按 P 重置(R12)"
+        );
+        assert_eq!(down.last_seq().unwrap(), p_seq, "s:seq 推进至 P.seq");
+
+        // ③ 段对象/内联对象逐字节可读(段引用已改写为本地段);导入分配
+        // 随 bootstrap 收尾的 checkpoint 落定设备检查点(a: 记录随即被
+        // truncate_alloc_records 常规 GC——恢复语义同普通写路径;a:/t:
+        // RMW 合并与 finalize 重置的单测在 fs3-meta)
+        let mut out = Vec::new();
+        down_engine
+            .read()
+            .get_to("b0", "big", 0..u64::MAX, &mut out)
+            .unwrap();
+        assert_eq!(out, big, "bootstrap 后段对象逐字节一致");
+        out.clear();
+        down_engine
+            .read()
+            .get_to("b0", "inline1", 0..u64::MAX, &mut out)
+            .unwrap();
+        assert_eq!(out, inline1);
+
+        // ④ 追赶:P 后上游写内联对象(字节随 Op 直达),worker 续流 apply
+        let inline2 = b"inline-payload-2".to_vec();
+        up_engine
+            .write()
+            .put("b0", "inline2", &mut &inline2[..])
+            .unwrap();
+        wait_repl_cursor(
+            &down,
+            Gtid {
+                epoch: 1,
+                seq: p_seq + 1,
+            },
+        );
+        w.shutdown();
+        out.clear();
+        down_engine
+            .read()
+            .get_to("b0", "inline2", 0..u64::MAX, &mut out)
+            .unwrap();
+        assert_eq!(out, inline2, "P 后增量经 binlog 追平");
+        let down_entries = down.repl_binlog_entries().unwrap();
+        assert_eq!(
+            down_entries.len(),
+            1,
+            "下游 bl: 只有追赶条目(快照不写 binlog)"
+        );
+        assert_eq!(down_entries[0].0, p_seq + 1, "不重编号:原 seq 落盘");
+    }
+
+    /// M21 C2(TODO M21/C2 具名用例):**上下游 extent_size 错配的引导**
+    /// ——上游 4MiB extent(3MiB 对象 = 单个打包段),下游 1MiB extent
+    /// (同对象 = 3 段跨 extent):导入段经**本地**分配器重新布局(§4.3
+    /// 布局独立),段引用改写为本地段表,对象逐字节一致;游标/executed
+    /// 按 P 落定。
+    #[test]
+    fn bootstrap_on_different_extent_size() {
+        use crate::repl_worker::PullWorker;
+        let dir = tempfile::tempdir().unwrap();
+        let up_engine = test_engine_opts(&dir.path().join("up"), 4 * 1024 * 1024, true);
+        let payload: Vec<u8> = (0..3 * 1024 * 1024usize).map(|i| (i % 239) as u8).collect();
+        {
+            let mut e = up_engine.write();
+            e.create_bucket_with_quota("b0", None).unwrap();
+            e.put("b0", "big3m", &mut &payload[..]).unwrap();
+        }
+        let up_meta = up_engine.read().meta_arc();
+        let p_seq = up_meta.last_seq().unwrap();
+        let up_obj = up_meta.get_object("b0", "big3m").unwrap().unwrap();
+        assert_eq!(up_obj.extents.len(), 1, "上游 4MiB extent:3MiB 对象单段");
+        let fx = start_server_on(up_engine.clone(), up_meta.clone());
+
+        // 下游:1MiB extent(错配)
+        let down_engine = test_engine_opts(&dir.path().join("down"), 1024 * 1024, false);
+        let down = down_engine.read().meta_arc();
+        down.set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
+        let cfg = pull_cfg(dir.path(), &fx, "s1", "node-b");
+
+        let w = PullWorker::spawn(down_engine.clone(), down.clone(), cfg).unwrap();
+        wait_repl_cursor(
+            &down,
+            Gtid {
+                epoch: 1,
+                seq: p_seq,
+            },
+        );
+        w.shutdown();
+
+        // 本地重布局:同一对象在 1MiB extent 池 = 多段;逐字节一致
+        let down_obj = down.get_object("b0", "big3m").unwrap().unwrap();
+        assert!(
+            down_obj.extents.len() >= 3,
+            "下游 1MiB extent:3MiB 对象跨多段(本地分配器重布局): {:?}",
+            down_obj.extents
+        );
+        assert_ne!(
+            down_obj.extents, up_obj.extents,
+            "段引用必须改写为本地段(布局独立 §4.3)"
+        );
+        let mut out = Vec::new();
+        down_engine
+            .read()
+            .get_to("b0", "big3m", 0..u64::MAX, &mut out)
+            .unwrap();
+        assert_eq!(out, payload, "extent_size 错配导入后逐字节一致");
+        assert_eq!(
+            down.repl_executed().unwrap().ranges().collect::<Vec<_>>(),
+            vec![(1, 1, p_seq)]
+        );
     }
 
     /// subject CN 提取:rcgen 证书正/反向 + 垃圾输入不 panic。
