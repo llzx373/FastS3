@@ -163,10 +163,10 @@
 
 ### E. 级联与切换(≈2.5 pw;设计 §3.5/§3.6/§5;ADR-33)
 
-- [ ] E1 中继服务:备端开复制口对下服务,GTID 原样转发不重编号;**发送水位 ≤ 本地数据
+- [x] E1 中继服务:备端开复制口对下服务,GTID 原样转发不重编号;**发送水位 ≤ 本地数据
   水位**(data_pending 条目暂存);槽协议复用 B3
   - 用例:`relay_ships_only_materialized_gtids`;`three_tier_chain_catches_up`
-- [ ] E2 流量优先级:令牌桶权重 投递 > 回填 > 按需拉取(`traffic_weights` 可配),
+- [x] E2 流量优先级:令牌桶权重 投递 > 回填 > 按需拉取(`traffic_weights` 可配),
   饥饿测试:下游读流量打满时回填/投递仍前进
   - 用例:`relay_priority_prevents_read_starvation`
 - [ ] E3 promote(dry-run 前置):`POST /v1/admin/replication/promote?dry_run=true` 返回
