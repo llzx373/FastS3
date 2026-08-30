@@ -221,8 +221,10 @@ pub struct CompressionInfo {
 
 /// 分配草稿(ADR-9 §4.5 / ADR-15 DM3):随事务写入 `a:` 记录的形态;
 /// 自 M13 起由 fs3-alloc 提交收口(engine 侧)生成,三方(meta/engine/
-/// alloc)共享类型。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// alloc)共享类型。M21 A1 起随 Op 进 ReplRecord 落 binlog(`bl:`):
+/// serde 形状自此成为持久化兼容面,演进只允许尾部追加字段(同值格式
+/// 纪律,DESIGN-FUTURE §2)。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AllocDraft {
     pub alloc: Vec<(u64, u64)>,
     pub ref_inc: Vec<u64>,

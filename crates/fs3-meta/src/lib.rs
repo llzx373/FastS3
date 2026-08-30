@@ -27,7 +27,11 @@ pub mod keys;
 /// M11 L3-1(ADR-12 DL5):`s:audit` 审计持久化环形。
 pub mod audit;
 
+/// M21 A1(ADR-33 RP1/RP2):复制 binlog 记录(`bl:` 前缀值格式与提取)。
+pub mod repl;
+
 pub use audit::AuditStore;
+pub use repl::{BucketScope, DataRef, ReplRecord, REPL_RECORD_VERSION};
 
 /// 元数据同步模式(DESIGN §4.4 / E2)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -49,6 +53,10 @@ pub struct MetaConfig {
     pub cache_capacity: Option<u64>,
     /// 事件队列环形上限(F5-3:worker 关闭时入队路径仍截断 `e:`;默认 10 万)。
     pub event_queue_max: usize,
+    /// 复制 binlog 开关(M21 A1;ADR-33 RP1):开启后每个提交事务同批写
+    /// `bl:{seq}` ReplRecord;默认关,未启用时零开销(apply_ops 一次分支)。
+    /// 引擎/[replication] 配置接线在后续任务(B/F 组)。
+    pub repl_binlog: bool,
 }
 
 impl Default for MetaConfig {
@@ -58,6 +66,7 @@ impl Default for MetaConfig {
             sync_mode: SyncMode::Group,
             cache_capacity: None,
             event_queue_max: 100_000,
+            repl_binlog: false,
         }
     }
 }
@@ -68,7 +77,9 @@ impl Default for MetaConfig {
 pub use fs3_core::AllocDraft;
 
 /// 桶统计增量。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// M21 A1 起随 Op 进 ReplRecord 落 binlog:serde 形状成为持久化兼容面,
+/// 演进只允许尾部追加字段(同 Op 注释口径)。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatsDelta {
     pub objects: i64,
     pub bytes: i64,
@@ -300,7 +311,9 @@ impl PartMeta {
 /// BucketMeta 值(配置文档可达数 KB,避免桶记录膨胀;M8 `l:` location 先例)。
 /// 值 = 协议层校验后的规范化文档(S3 桶策略为原始 JSON 文本;其余为规范化
 /// XML);删桶时与同事务清理。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// M21 A1 起随 Op 进 ReplRecord 落 binlog:变体只允许尾部追加(serde
+/// 形状 = 持久化兼容面,同 Op 注释口径)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BucketConf {
     /// CORS 配置(S2;键 `bc:{bucket}`)。
     Cors,
@@ -339,13 +352,18 @@ impl BucketConf {
 }
 
 /// 元数据操作(单事务应用,顺序执行)。
-#[derive(Debug, Clone)]
+///
+/// **兼容面登记(M21 A1)**:开启复制 binlog 后 Op 随 ReplRecord 持久化
+/// (`bl:{seq}`),serde 形状自此成为 binlog 兼容面——只允许尾部追加新
+/// 变体、变体字段只允许尾部追加(postcard 变体序 = 编码序),演进纪律同
+/// 值格式(DESIGN-FUTURE §2);不得重排/改名既有变体与字段。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Op {
     BucketPut {
         name: String,
         meta: BucketMeta,
         /// 创建时 LocationConstraint(M8 回显语义;None/"" = us-east-1 默认)。
-        /// Op 不落盘(瞬态事务指令),扩字段无版本兼容问题。
+        /// M21 A1 起随 ReplRecord 落 binlog,扩字段走尾部追加(见 Op 注释)。
         location: Option<String>,
     },
     BucketDelete {
@@ -807,6 +825,8 @@ pub struct MetaStore {
     notification_cache: Mutex<HashMap<String, Vec<fs3_core::NotificationRule>>>,
     /// 事件队列环形上限(F5-3;入队路径截断,不依赖投递 worker)。
     event_queue_max: usize,
+    /// 复制 binlog 开关(M21 A1;MetaConfig.repl_binlog 快照)。
+    repl_binlog: bool,
 }
 
 /// rocksdb 错误 → fs3 Error。
@@ -1585,6 +1605,7 @@ impl MetaStore {
             lifecycle_cache: Mutex::new(HashMap::new()),
             notification_cache: Mutex::new(HashMap::new()),
             event_queue_max: cfg.event_queue_max.max(1),
+            repl_binlog: cfg.repl_binlog,
         };
         // M18 I1(ADR-28 DI1.3)升级迁移:存量部署隐式落入租户 default
         // (canonical_id 钉死 "fasts3");幂等,首次打开即落地。
@@ -2390,7 +2411,7 @@ impl MetaStore {
         let mut retries = 0u32;
         loop {
             let tx = self.db.transaction_opt(&self.write_opts, &self.txn_opts);
-            let seq = match apply_ops(&tx, ops) {
+            let seq = match apply_ops(&tx, ops, self.repl_binlog) {
                 Ok(seq) => seq,
                 Err(e) => {
                     tx.rollback().map_err(rocks_err)?;
@@ -2854,6 +2875,33 @@ impl MetaStore {
             s.insert(parse_event_seq(&k)?);
         }
         Ok(s)
+    }
+
+    // —— 复制 binlog(M21 A1;ADR-33 RP1/RP2;键 `bl:{seq be64}`) ——
+
+    /// 读单条 binlog 记录(缺席 → None)。
+    pub fn repl_record(&self, seq: u64) -> Result<Option<ReplRecord>> {
+        match self.db.get(binlog_key(seq)).map_err(rocks_err)? {
+            Some(v) => ReplRecord::decode_value(&v).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// 全量扫描 binlog(seq 升序;A1 原子性用例/诊断用。复制口的增量
+    /// 拉取与 A3 水位截断在 B1/A3 落各自的带界迭代)。
+    pub fn repl_binlog_entries(&self) -> Result<Vec<(u64, ReplRecord)>> {
+        let mut out = Vec::new();
+        for item in self
+            .db
+            .iterator(IteratorMode::From(PREFIX_BINLOG, Direction::Forward))
+        {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(PREFIX_BINLOG) {
+                break;
+            }
+            out.push((parse_binlog_seq(&k)?, ReplRecord::decode_value(&v)?));
+        }
+        Ok(out)
     }
 
     /// 归档恢复作业队列读取(M16 A2,ADR-19 DA2.3):从 `after_seq` 之后
@@ -4279,7 +4327,7 @@ impl MetaStore {
     }
 }
 
-fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u64> {
+fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op], repl_binlog: bool) -> Result<u64> {
     // rocksdb 事务闭包内操作失败 → 整体 Err → 回滚(调用方 commit 不执行)。
     fn tget(tx: &Transaction<OptimisticTransactionDB>, key: &[u8]) -> Result<Option<Vec<u8>>> {
         tx.get(key).map_err(rocks_err)
@@ -5091,6 +5139,19 @@ fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op]) -> Result<u6
         }
     }
 
+    // M21 A1(ADR-33 RP1/RP2;设计稿 §3.2):binlog 开关开启时,把整事务
+    // ops 以 ReplRecord 写入 `bl:{seq}`(seq = 本事务 s:seq 序号)——与
+    // 元数据变更同批同 WAL(照 EventEnqueue 臂口径),崩溃零漂移且**不增
+    // 组提交 fsync 次数**;事务失败整体回滚,bl: 零残留。开关默认关,
+    // 未启用时零开销(此分支不进入)。
+    if repl_binlog {
+        let epoch = tget(tx, SYS_REPL_EPOCH)?
+            .map(|v| u64::from_be_bytes(v.as_slice().try_into().unwrap()))
+            .unwrap_or(REPL_INITIAL_EPOCH);
+        let rec = ReplRecord::new(epoch, ops);
+        tinsert(tx, binlog_key(seq), rec.encode_value()?)?;
+    }
+
     tinsert(tx, SYS_SEQ.to_vec(), seq.to_be_bytes().to_vec())?;
     Ok(seq)
 }
@@ -5642,6 +5703,162 @@ mod tests {
         // after_seq 断点续投(N3 worker 游标)
         let tail = meta.pending_events(100, Some(head)).unwrap();
         assert_eq!(tail[0].key, "bulk4");
+    }
+
+    /// M21 A1(ADR-33 RP1/RP2;设计稿 §3.2):binlog 与元数据同事务——
+    /// ① 开关开启后每条已提交事务恰一条 `bl:{seq}` 记录,键 seq = 事务
+    ///   seq,记录内 ops 原样、epoch = 当前复制代(缺省初始代 1);
+    /// ② data_refs 只含段引用(内联小对象随 Op 值直达,不产生引用),
+    ///   bucket_scope 从事务 ops 提取;
+    /// ③ 失败事务整体回滚:seq 不消耗、bl: 零残留;
+    /// ④ 开关关闭(默认)时零 bl: 写入;
+    /// ⑤ 重开 MetaStore(模拟崩溃重放):binlog 与元数据零漂移,续写
+    ///   seq/binlog 键继续单调无洞。
+    #[test]
+    fn repl_binlog_committed_atomically_with_meta() {
+        // ④ 开关默认关:零开销零写入
+        {
+            let (_dir, meta) = open_tmp();
+            meta.commit_bucket_put("b0", &bucket_meta("b0")).unwrap();
+            assert!(
+                meta.repl_binlog_entries().unwrap().is_empty(),
+                "binlog 未启用时不得有 bl: 写入"
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MetaConfig {
+            repl_binlog: true,
+            ..MetaConfig::default()
+        };
+        let seg = Segment {
+            extent_id: 7,
+            offset: 0,
+            len: 8192,
+            crcs: vec![0xAAAA],
+        };
+        let (s1, ops1, s2, ops2, s3, ops3);
+        {
+            let meta = MetaStore::open(dir.path(), &cfg).unwrap();
+            // ① 事务 1:建桶(纯桶域 ops,无 unscoped)
+            ops1 = vec![Op::BucketPut {
+                name: "b1".into(),
+                meta: bucket_meta("b1"),
+                location: None,
+            }];
+            s1 = meta.commit(&ops1).unwrap();
+            // 事务 2:大对象(段引用)+ 内联小对象(无引用)+ 统计
+            let mut big = object_meta(8192);
+            big.extents = vec![seg.clone()];
+            let mut small = object_meta(3);
+            small.inline = Some(vec![1, 2, 3]);
+            ops2 = vec![
+                Op::ObjectPut {
+                    bucket: "b1".into(),
+                    key: "big".into(),
+                    meta: big,
+                },
+                Op::ObjectPut {
+                    bucket: "b1".into(),
+                    key: "small".into(),
+                    meta: small,
+                },
+                Op::Stats {
+                    bucket: "b1".into(),
+                    delta: StatsDelta {
+                        objects: 2,
+                        bytes: 8195,
+                        by_class: Vec::new(),
+                    },
+                },
+            ];
+            s2 = meta.commit(&ops2).unwrap();
+            assert_eq!(s2, s1 + 1);
+            // ③ 失败事务(目标桶不存在):整体回滚,bl: 零残留
+            let err = meta.commit(&[Op::ObjectPut {
+                bucket: "ghost".into(),
+                key: "k".into(),
+                meta: object_meta(1),
+            }]);
+            assert!(err.is_err());
+            assert!(meta.repl_record(s2 + 1).unwrap().is_none());
+            // 事务 3:删内联对象 + 负向统计(失败事务不消耗 seq)
+            ops3 = vec![
+                Op::ObjectDelete {
+                    bucket: "b1".into(),
+                    key: "small".into(),
+                },
+                Op::Stats {
+                    bucket: "b1".into(),
+                    delta: StatsDelta {
+                        objects: -1,
+                        bytes: -3,
+                        by_class: Vec::new(),
+                    },
+                },
+            ];
+            s3 = meta.commit(&ops3).unwrap();
+            assert_eq!(s3, s2 + 1, "失败事务回滚后 seq 复用,无洞");
+            // 无桶上下文 Op(事件清理走 s: 族口径)→ has_unscoped
+            let s4 = meta.commit(&[Op::EventDelete { seq: s1 }]).unwrap();
+            assert_eq!(s4, s3 + 1);
+
+            // ① 每条已提交事务恰一条 bl: 记录,键序 = 事务序
+            let entries = meta.repl_binlog_entries().unwrap();
+            assert_eq!(entries.len(), 4);
+            assert_eq!(
+                entries.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
+                vec![s1, s2, s3, s4]
+            );
+            // 记录内容:epoch = 初始代;ops 原样往返
+            for (_, rec) in &entries {
+                assert_eq!(rec.epoch, REPL_INITIAL_EPOCH);
+            }
+            assert_eq!(entries[0].1.ops, ops1);
+            assert_eq!(entries[1].1.ops, ops2);
+            assert_eq!(entries[2].1.ops, ops3);
+            assert_eq!(entries[3].1.ops, vec![Op::EventDelete { seq: s1 }]);
+            // ② data_refs:big 段在内;small 内联直达不产生引用
+            assert_eq!(entries[0].1.data_refs, Vec::new());
+            assert_eq!(
+                entries[1].1.data_refs,
+                vec![DataRef {
+                    extent_id: 7,
+                    offset: 0,
+                    len: 8192,
+                    crc32c: None,
+                }]
+            );
+            assert_eq!(entries[2].1.data_refs, Vec::new());
+            // ② bucket_scope:桶域 ops 提取桶名;无桶 Op → has_unscoped
+            assert_eq!(entries[0].1.bucket_scope.buckets, vec!["b1".to_string()]);
+            assert!(!entries[0].1.bucket_scope.has_unscoped);
+            assert_eq!(entries[1].1.bucket_scope.buckets, vec!["b1".to_string()]);
+            assert!(!entries[1].1.bucket_scope.has_unscoped);
+            assert!(entries[3].1.bucket_scope.buckets.is_empty());
+            assert!(entries[3].1.bucket_scope.has_unscoped);
+            // 点读路径
+            assert_eq!(meta.repl_record(s2).unwrap().unwrap().ops, ops2);
+            meta.flush().unwrap();
+        }
+        // ⑤ 崩溃重放(重开):binlog 与元数据零漂移
+        {
+            let meta = MetaStore::open(dir.path(), &cfg).unwrap();
+            let entries = meta.repl_binlog_entries().unwrap();
+            assert_eq!(entries.len(), 4, "重启后 binlog 完整重放");
+            assert_eq!(entries[1].0, s2);
+            assert_eq!(entries[1].1.ops, ops2);
+            // 元数据侧同事务状态:big 在、small 已删、ghost 桶/对象零残留
+            assert!(meta.get_object("b1", "big").unwrap().is_some());
+            assert!(meta.get_object("b1", "small").unwrap().is_none());
+            assert!(meta.get_bucket("ghost").unwrap().is_none());
+            // 续写:seq 与 binlog 键继续单调,无洞无重
+            let s5 = meta.commit_bucket_put("b2", &bucket_meta("b2")).unwrap();
+            assert_eq!(s5, s3 + 2);
+            let entries = meta.repl_binlog_entries().unwrap();
+            assert_eq!(entries.len(), 5);
+            assert_eq!(entries[4].0, s5);
+        }
     }
 
     /// F5-3:worker 关闭时入队路径仍按 event_queue_max 截断,e: 不无界堆积。

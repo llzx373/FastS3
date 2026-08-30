@@ -21,6 +21,9 @@
 //! - `e:{seq be64}` 事件队列条目(M15 N2;ADR-18 D-E1;值 = postcard
 //!   EventRecord;be64 字典序 = 写入序;有界环形批量截断;入队与数据
 //!   操作同事务——崩溃零漂移)
+//! - `bl:{seq be64}` 复制 binlog 记录(M21 A1;ADR-33 RP1/RP2;值 =
+//!   [版本字节 u8] + postcard ReplRecord;be64 字典序 = 事务序;与事务
+//!   同批写入,崩溃零漂移)
 //! - `tn:{tenant_id}` IAM 租户(M18 I1;ADR-28 DI1)
 //! - `iu:{tenant}\0{user}` / `ig:{tenant}\0{group}` / `ip:{tenant}\0{name}` /
 //!   `ir:{tenant}\0{role}` IAM 用户/组/策略/角色(M18 I1;ADR-28 DI2;
@@ -30,7 +33,9 @@
 //! `s:value_rewrite_v3_done`(M10 V5-3 值格式重写完成标记)、
 //! `s:sse_kek_seed` / `s:sse_kek_gen`(M11 K1-1 SSE-S3 KEK 体系)、
 //! `s:audit\0{seq be64}` 审计环形条目(M11 L3-1;ADR-12 DL5)、
-//! `s:trusted_clock`(M12 W1-1;ADR-13 DL6 可信时钟 wall+mono 对)。
+//! `s:trusted_clock`(M12 W1-1;ADR-13 DL6 可信时钟 wall+mono 对)、
+//! `s:repl_role` / `s:repl_epoch` / `s:repl_executed`(M21 A1/A2;
+//! ADR-33 RP2 复制角色/epoch/executed GTID 集)。
 //!
 //! 转义规则:0x00 → 0xFF 0x00;0xFF → 0xFF 0xFF;其余原样。
 //! 保证 `o:{bucket}\0` 前缀扫描恰好覆盖该桶全部对象。
@@ -126,6 +131,14 @@ pub const PREFIX_INGEST_JOB: &[u8] = b"ij:";
 /// 前缀表(本处)、meta-export/import DTO(显式不导出,运维瞬态)、
 /// check 可达性扫描(任务值不含 extent 引用,天然安全,登记于注释)。
 pub const PREFIX_BATCH_JOB: &[u8] = b"jb:";
+/// 复制 binlog 记录(M21 A1;ADR-33 RP1/RP2;设计稿 §3.2:`bl:{seq be64}`
+/// → [版本字节 u8] + postcard ReplRecord)。be64 字典序 = 数值序 = 事务序
+/// (seq 复用 `s:seq`,GTID 零额外分配成本);与触发它的事务**同批同 WAL**
+/// 写入(照 `e:` 事件队列先例,不增组提交 fsync 次数),崩溃零漂移。
+/// 新一级前缀:三处同步——keys.rs 前缀表(本处);meta-export/import DTO
+/// 与 check 可达性扫描属 **TODO M21/A4 待办**(本任务只落前缀表;check
+/// 扫描只读 `o:`/`p:` 段引用键,对 `bl:` 天然安全,登记于注释)。
+pub const PREFIX_BINLOG: &[u8] = b"bl:";
 
 /// 系统单调计数器(每个事务 +1,单点序列化;ADR-5)。
 pub const SYS_SEQ: &[u8] = b"s:seq";
@@ -154,6 +167,14 @@ pub const SYS_SSE_KEK_GEN: &[u8] = b"s:sse_kek_gen";
 /// 故 meta-export DTO 与 check 可达性扫描无需联动(同
 /// SYS_KEY_VALUE_REWRITE_V3_DONE 注释口径)。
 pub const SYS_TRUSTED_CLOCK: &[u8] = b"s:trusted_clock";
+/// 复制 epoch(M21 A1;ADR-33 RP2:promote +1,promote 崩溃不得产生半
+/// 状态;值 = be64 u64;键缺席 = 初始代 REPL_INITIAL_EPOCH,惰性不落盘)。
+/// s: 既有前缀下的新系统键,不新增前缀,meta-export DTO 与 check 可达性
+/// 扫描无需联动(同 SYS_KEY_VALUE_REWRITE_V3_DONE 注释口径)。
+pub const SYS_REPL_EPOCH: &[u8] = b"s:repl_epoch";
+/// 初始复制 epoch(键缺席时的读默认值;promote 自当前 +1,新 epoch 的
+/// GTID 从 seq=1 重计而全局字典序仍单调,ADR-33 RP2)。
+pub const REPL_INITIAL_EPOCH: u64 = 1;
 /// 池清单(M13 M1-1,ADR-15 DM1/DM1';值 = postcard(fs3_core::pool::PoolManifest),
 /// 设备序 = 数组序,仅尾部增删)。s: 既有前缀下的新系统键,不新增前缀,
 /// 故 meta-export DTO 与 check 可达性扫描无需联动(同
@@ -569,6 +590,26 @@ pub fn parse_event_seq(raw: &[u8]) -> Result<u64> {
         .ok_or_else(|| Error::Corrupt("event key missing prefix".into()))?;
     if body.len() != 8 {
         return Err(Error::Corrupt("event key malformed".into()));
+    }
+    Ok(u64::from_be_bytes(body.try_into().unwrap()))
+}
+
+/// 复制 binlog 键:`bl:{seq be64}`(M21 A1;be64 字典序 = 事务序)。
+pub fn binlog_key(seq: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(PREFIX_BINLOG.len() + 8);
+    k.extend_from_slice(PREFIX_BINLOG);
+    k.extend_from_slice(&seq.to_be_bytes());
+    k
+}
+
+/// 解析 `bl:` 键中的 seq(截断/扫描边界用;A3 水位截断与 B1 增量拉取
+/// 的游标解析入口)。
+pub fn parse_binlog_seq(raw: &[u8]) -> Result<u64> {
+    let body = raw
+        .strip_prefix(PREFIX_BINLOG)
+        .ok_or_else(|| Error::Corrupt("binlog key missing prefix".into()))?;
+    if body.len() != 8 {
+        return Err(Error::Corrupt("binlog key malformed".into()));
     }
     Ok(u64::from_be_bytes(body.try_into().unwrap()))
 }
