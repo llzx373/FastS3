@@ -194,7 +194,7 @@
   rebuild}`;审计 who 归属沿 M19 J3 先例;console 拓扑/延迟/位点页(照 Kms.tsx 样板,
   api.ts + i18n + web/server 代理 + iam-authz 映射)
   - 用例:`repl_admin_roundtrip`;`repl_console_topology_page`
-- [ ] F3 配置段:`[replication]` 全字段(设计 §6.1 toml)照 `[batch]` 样板;
+- [x] F3 配置段:`[replication]` 全字段(设计 §6.1 toml)照 `[batch]` 样板;
   `fasts3.example.toml` + wizard.rs 问询;settings 页 restart_required 标注
   - 用例:`repl_config_settings_patch_restart_required`
 - [ ] F4 文档收口:DESIGN.md §1 非目标注解(ADR-33 链接)+ ADR-20 旁注;
