@@ -119,7 +119,7 @@
 - [x] B3 复制槽生命周期:握手自动登记 / admin 预登记(带 BucketFilter)/ drop;
   `s:repl_slot\0{name}` 持久化;`confirmed_gtid` 回执更新;`max_slots` 硬限制
   - 用例:`slot_register_confirm_drop_roundtrip`;`slot_17th_rejected`
-- [ ] B4 下游 pull worker:apply 单流严格按 GTID 序;游标与 apply 事务同盘;长轮询空挂;
+- [x] B4 下游 pull worker:apply 单流严格按 GTID 序;游标与 apply 事务同盘;长轮询空挂;
   心跳条目推进游标(被过滤 seq 不留洞);崩溃重放幂等(`seq <= cursor` 丢弃)
   - 用例:`repl_apply_idempotent_on_replay`;`repl_cursor_advances_over_filtered_gaps`;
     `repl_reconnect_resumes_from_cursor`(杀进程断点续传,照 m16 断线用例样板)
