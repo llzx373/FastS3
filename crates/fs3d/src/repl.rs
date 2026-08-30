@@ -24,7 +24,9 @@
 //! - `GET  /v1/repl/v1/extent-data?extent_id=&offset=&len=`
 //! - `GET  /v1/repl/v1/slots`
 //! - `POST /v1/repl/v1/hello` —— B2 握手(三件套校验 + 环检测,见下)。
-//! - `POST /v1/repl/v1/snapshot` —— 501 占位(C1 实现)。
+//! - `POST /v1/repl/v1/snapshot` —— C1 在线快照导出会话(见下)。
+//! - `GET /v1/repl/v1/snapshot/{id}/meta` / `…/segments` + `DELETE
+//!   /v1/repl/v1/snapshot/{id}` —— C1 分页续拉 / 活段清单 / 释放。
 //!
 //! 线格式(B1 自定,注释钉死):
 //! - binlog/slots 响应为 JSON;binlog `entries[i].record` =
@@ -70,10 +72,39 @@
 //!   seq=1 重计」落地属 E3 promote,届时复核跨 epoch 续流边界(本任务不对
 //!   现有 bl: 存储做 epoch 重编号)。
 //!
-//! 本任务边界(后续任务接线,勿在此抢跑):槽过滤/心跳(D2,本任务全量
-//! 不过滤)、snapshot 导出(C1)、lag 计算(D1,slots 先给原始字段)、
-//! 委派凭证(D3)。长轮询空挂已落地(B4;`wait={ms}` 参数,见
-//! handle_binlog)。//!
+//! 本任务边界(后续任务接线,勿在此抢跑):槽过滤/心跳(D2,binlog 拉取
+//! 全量不过滤;快照导出的过滤器参数已带,见下)、lag 计算(D1,slots 先给
+//! 原始字段)、委派凭证(D3)。长轮询空挂已落地(B4;`wait={ms}` 参数,见
+//! handle_binlog)。
+//!
+//! 快照导出会话线格式(C1;设计稿 §3.1;ADR-33 RP8.3):
+//! - `POST /v1/repl/v1/snapshot`:`{slot_name?, filters?}`(filters =
+//!   BucketFilter serde 形,缺省;slot_name 给出且槽已登记时采用槽过滤器,
+//!   显式 filters 优先;全量 = All)。服务端顺序:`flush_wal(true)` →
+//!   强制分配器检查点(`Engine::checkpoint`)→ rocksdb MVCC 快照(会话
+//!   持有,fs3-meta ReplExportSession 读线程形态,键族取舍见其模块注释)
+//!   → 记录导出位点 P = (s:repl_epoch, s:seq 水位)→ 活段清单内全部
+//!   extent 持 ReadPin(会话期;防导出期间 compaction 迁移,ADR-22)。
+//!   成功 200:`{snapshot_id, point, filters, segments, expires_at}`。
+//!   并发会话上限 MAX_SNAPSHOT_SESSIONS,超限 429 `ErrSnapshotLimit`。
+//! - `GET /v1/repl/v1/snapshot/{id}/meta?after={cursor}&limit=N`:一页
+//!   原始键值 `[{key, value}]`(标准 base64;值含版本字节;内联小对象
+//!   载荷随值直达)。`after` = 上页 `next`(URL-safe base64 无填充的
+//!   原始键;缺省 = 从头);页字节上限 MAX_SNAPSHOT_PAGE_BYTES。
+//!   响应 `{point, entries, next, done}`。断点续 = 带游标重拉(同键
+//!   幂等覆盖);暂停 = 停止拉取(空闲 TTL SNAPSHOT_SESSION_TTL 后服务端
+//!   回收,再拉 = 410 `ErrSnapshotGone`,须重开会话)。
+//! - `GET /v1/repl/v1/snapshot/{id}/segments?after={index}&limit=N`:
+//!   活段清单分页 `[{extent_id, offset, len, crc32c}]`(crc32c = null
+//!   预留,端到端校验走 extent-data 响应头);段数据本体走既有
+//!   extent-data 端点拉取。
+//! - `DELETE /v1/repl/v1/snapshot/{id}`:释放会话(MVCC 快照 + ReadPin;
+//!   幂等,未知/已过期 = 410 ErrSnapshotGone)。
+//! - 限速(R5/RP8.3):导出会话共享服务级令牌桶(复用 fs3-engine
+//!   worker::Throttle,ADR-12 DL2 共享桶先例;速率
+//!   `FS3D_REPL_EXPORT_RATE` 字节/秒,默认 64 MiB/s),meta 页与
+//!   extent-data 响应字节记账,透支即挂起等回充。
+//!
 //! 复制槽生命周期线格式(B3;设计稿 §3.3;ADR-33 RP3/RP8):
 //! - `POST /v1/repl/v1/slots`(预登记,消费方部署前由持受信证书的运维面
 //!   调用):`{name, consumer_node_id?, filters?, confirmed_gtid?}`;
@@ -100,21 +131,23 @@
 //! `FS3D_REPL_SERVER_CERT`/`FS3D_REPL_SERVER_KEY` 必须同设(缺任一项 =
 //! 启动显式报错,不静默降级);`FS3D_REPL_LISTEN` 覆盖监听地址。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use bytes::Bytes;
 use fs3_core::{Gtid, GtidSet};
 use fs3_engine::Engine;
-use fs3_meta::{BucketFilter, MetaStore, Slot};
+use fs3_engine::worker::Throttle;
+use fs3_meta::{BucketFilter, MetaStore, ReplExportSession, Slot};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::Deserialize;
 use tokio_rustls::TlsAcceptor;
 
@@ -135,6 +168,25 @@ const MAX_HELLO_BODY: usize = 64 * 1024;
 const MAX_CHAIN_HOPS: usize = 8;
 /// 复制槽扇出硬上限默认值(ADR-33 RP3.1/裁定 2)。
 pub const DEFAULT_MAX_SLOTS: usize = 16;
+/// 快照导出令牌桶默认速率(64 MiB/s,对齐 ADR-12 DL2 后台共享桶缺省;
+/// C1,R5/RP8.3)。
+const DEFAULT_EXPORT_RATE: u64 = 64 << 20;
+/// 导出令牌桶速率下限(0 速率 = 永不回充死锁,钳到 1 MiB/s)。
+const MIN_EXPORT_RATE: u64 = 1 << 20;
+/// 快照元数据单页字节上限(键+值合计;防巨型页缓冲)。
+const MAX_SNAPSHOT_PAGE_BYTES: usize = 4 << 20;
+/// 快照元数据分页默认/上限条数。
+const DEFAULT_SNAPSHOT_PAGE_LIMIT: usize = 512;
+const MAX_SNAPSHOT_PAGE_LIMIT: usize = 4096;
+/// 活段清单分页默认/上限条数。
+const DEFAULT_MANIFEST_LIMIT: usize = 4096;
+const MAX_MANIFEST_LIMIT: usize = 65536;
+/// 导出会话空闲 TTL(可暂停/断点续窗口;超时回收释放 MVCC 快照与
+/// ReadPin,再拉 = 410 ErrSnapshotGone)。
+const SNAPSHOT_SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+/// 并发导出会话上限(每会话 = 一个读线程 + 一份 MVCC 快照 + 一组
+/// ReadPin;快照会话是主端读压来源,R5)。
+const MAX_SNAPSHOT_SESSIONS: usize = 4;
 
 /// 复制口配置(F3 前的 env 最小面;装配校验在 from_env/ServerTls::build)。
 #[derive(Debug, Clone)]
@@ -146,6 +198,8 @@ pub struct ReplConfig {
     pub server_key: PathBuf,
     /// 复制槽扇出硬上限(ADR-33 RP3.1/裁定 2,默认 16)。
     pub max_slots: usize,
+    /// 快照导出限速(字节/秒;C1;服务级令牌桶速率,默认 64 MiB/s)。
+    pub export_rate: u64,
 }
 
 impl ReplConfig {
@@ -177,12 +231,22 @@ impl ReplConfig {
             })
             .transpose()?
             .unwrap_or(DEFAULT_MAX_SLOTS);
+        let export_rate = std::env::var("FS3D_REPL_EXPORT_RATE")
+            .ok()
+            .map(|s| {
+                s.parse()
+                    .map_err(|e| format!("bad FS3D_REPL_EXPORT_RATE: {e}"))
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_EXPORT_RATE)
+            .max(MIN_EXPORT_RATE);
         Ok(Some(ReplConfig {
             listen,
             ca_cert: PathBuf::from(ca_cert),
             server_cert: PathBuf::from(server_cert),
             server_key: PathBuf::from(server_key),
             max_slots,
+            export_rate,
         }))
     }
 }
@@ -248,6 +312,25 @@ pub struct ReplServer {
     node_id: Option<String>,
     /// 复制槽扇出硬上限(B3;握手自动登记与预登记共用同一闸)。
     max_slots: usize,
+    /// 导出会话共享令牌桶(C1,R5/RP8.3;meta 页与 extent-data 字节记账)。
+    throttle: Arc<Throttle>,
+    /// 在线快照导出会话注册表(C1;snapshot_id → 会话;空闲 TTL 回收)。
+    snapshots: Mutex<HashMap<u64, Arc<SnapshotSession>>>,
+    /// 会话 id 分配(进程内单调;1 起)。
+    next_snapshot_id: AtomicU64,
+}
+
+/// 在线快照导出会话(C1;设计稿 §3.1):MVCC 快照(fs3-meta 会话读
+/// 线程持有)+ 活段清单 extent 的 ReadPin(导出期防 compaction 迁移,
+/// ADR-22 (c))+ 空闲计时(TTL 回收输入)。
+struct SnapshotSession {
+    /// 导出位点 P(开启时定;分页响应回显)。
+    point: Gtid,
+    export: ReplExportSession,
+    /// 会话级 ReadPin:清单内全部活段 extent;随会话 Drop 释放。
+    _pins: fs3_engine::ReadPin,
+    /// 最近一次访问(每请求刷新;TTL 回收)。
+    touched: Mutex<std::time::Instant>,
 }
 
 /// 运行句柄(bind 成功后回传实际监听地址;测试用 ephemeral 端口)。
@@ -270,6 +353,9 @@ impl ReplServer {
             listen: cfg.listen,
             node_id,
             max_slots: cfg.max_slots,
+            throttle: Throttle::new(cfg.export_rate),
+            snapshots: Mutex::new(HashMap::new()),
+            next_snapshot_id: AtomicU64::new(1),
         })
     }
 
@@ -375,16 +461,17 @@ impl ReplServer {
         let method = req.method().clone();
         match (&method, path.as_str()) {
             (&Method::GET, "/v1/repl/v1/binlog") => self.handle_binlog(&req).await,
-            (&Method::GET, "/v1/repl/v1/extent-data") => self.handle_extent_data(&req),
+            (&Method::GET, "/v1/repl/v1/extent-data") => self.handle_extent_data(&req).await,
             (&Method::GET, "/v1/repl/v1/slots") => self.handle_slots(),
             (&Method::POST, "/v1/repl/v1/hello") => self.handle_hello(req, cn).await,
             (&Method::POST, "/v1/repl/v1/slots") => self.handle_slot_create(req, cn).await,
-            (&Method::POST, "/v1/repl/v1/snapshot") => json_err(
-                StatusCode::NOT_IMPLEMENTED,
-                "not_implemented",
-                "snapshot export is TODO M21/C1",
-            ),
+            (&Method::POST, "/v1/repl/v1/snapshot") => self.handle_snapshot(req).await,
             _ => {
+                // 快照会话子路径(C1):GET snapshot/{id}/meta、
+                // GET snapshot/{id}/segments、DELETE snapshot/{id}
+                if let Some(rest) = path.strip_prefix("/v1/repl/v1/snapshot/") {
+                    return self.route_snapshot_sub(&method, rest, &req).await;
+                }
                 // 槽子路径:DELETE /slots/{name}(drop)、POST /slots/{name}/ack
                 // (回执;B3 线格式见模块注释)
                 if let Some(rest) = path.strip_prefix("/v1/repl/v1/slots/") {
@@ -514,8 +601,9 @@ impl ReplServer {
 
     /// `GET /v1/repl/v1/extent-data?extent_id=&offset=&len=`(DataRef 三件套,
     /// §3.2):Range 读 + ReadPin(引擎 read_extent_range 内钉扎)+ 整段
-    /// CRC32C 响应头(线格式见模块注释)。
-    fn handle_extent_data(&self, req: &Request<Incoming>) -> Response<Full<Bytes>> {
+    /// CRC32C 响应头(线格式见模块注释)。C1 起经共享令牌桶限速(R11:
+    /// extent-data 走只读路径 + 令牌桶)。
+    async fn handle_extent_data(&self, req: &Request<Incoming>) -> Response<Full<Bytes>> {
         let query = req.uri().query().unwrap_or("");
         let parse = |name: &str| query_param(query, name).and_then(|s| s.parse::<u64>().ok());
         let (Some(extent_id), Some(offset), Some(len)) =
@@ -537,6 +625,7 @@ impl ReplServer {
                 "len must be in (0, 64MiB]; backfill chunks large segments",
             );
         }
+        self.throttle_wait().await;
         let bytes = match self.engine.read().read_extent_range(extent_id, offset, len) {
             Ok(b) => b,
             Err(fs3_core::Error::NotFound(_)) => {
@@ -551,6 +640,7 @@ impl ReplServer {
             }
             Err(e) => return internal_err("extent read", &e),
         };
+        self.throttle.consume(bytes.len() as u64);
         let crc = fs3_core::crc32c::crc32c(&bytes, 0);
         Response::builder()
             .status(StatusCode::OK)
@@ -932,6 +1022,280 @@ impl ReplServer {
             seq: self.meta.last_seq()?,
         })
     }
+
+    // ─────────────────── C1 在线快照导出(设计稿 §3.1;ADR-33 RP8.3) ───────────────────
+
+    /// 令牌桶等待(透支即挂起等回充;25ms 滴答)。导出/meta 页/extent-data
+    /// 共用(R5/RP8.3;worker 共享令牌桶先例 = fs3-engine worker::Throttle)。
+    async fn throttle_wait(&self) {
+        while self.throttle.overdrawn() {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    /// 空闲会话回收(每次快照相关请求顺手扫;TTL 见常量注释)。
+    fn sweep_snapshots(&self) {
+        self.snapshots
+            .lock()
+            .retain(|_, s| s.touched.lock().elapsed() < SNAPSHOT_SESSION_TTL);
+    }
+
+    /// 会话查找(404/410 合一:未知或已过期 = ErrSnapshotGone,下游重开
+    /// 会话即可,语义同一)。
+    fn snapshot_session(&self, id: u64) -> Option<Arc<SnapshotSession>> {
+        self.sweep_snapshots();
+        let s = self.snapshots.lock().get(&id).cloned()?;
+        *s.touched.lock() = std::time::Instant::now();
+        Some(s)
+    }
+
+    /// `POST /v1/repl/v1/snapshot`(C1;线格式见模块注释)。开启导出会话:
+    /// flush + 强制检查点 → MVCC 快照 + 位点 P → 活段清单 ReadPin。
+    /// 低频管理面路径:flush/checkpoint/快照扫描为阻塞调用,直接在复制口
+    /// current_thread runtime 上执行(会话开启非热路径,注释钉死)。
+    async fn handle_snapshot(&self, req: Request<Incoming>) -> Response<Full<Bytes>> {
+        let body = match read_json_body::<SnapshotRequest>(req, MAX_HELLO_BODY).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        if let Some(name) = &body.slot_name {
+            if !valid_slot_name(name) {
+                return bad_slot_name();
+            }
+        }
+        // 过滤器裁决:显式 filters 优先;否则槽已登记 → 槽过滤器(D2 联动:
+        // 桶级槽位只导出命中桶);皆无 = All(全量)。
+        let filters = match (body.filters, &body.slot_name) {
+            (Some(f), _) => f,
+            (None, Some(name)) => match self.meta.repl_slot(name) {
+                Ok(Some(s)) => s.filters,
+                Ok(None) => BucketFilter::All,
+                Err(e) => return internal_err("slot lookup", &e),
+            },
+            (None, None) => BucketFilter::All,
+        };
+        self.sweep_snapshots();
+        if self.snapshots.lock().len() >= MAX_SNAPSHOT_SESSIONS {
+            return json_err(
+                StatusCode::TOO_MANY_REQUESTS,
+                "ErrSnapshotLimit",
+                "concurrent snapshot export sessions capped (R5); retry after TTL or release",
+            );
+        }
+        // ① 确定性刷盘 + 强制分配器检查点(§3.1 步骤 1)
+        if let Err(e) = self.meta.flush() {
+            return internal_err("flush wal", &e);
+        }
+        if let Err(e) = self.engine.write().checkpoint() {
+            return internal_err("allocator checkpoint", &e);
+        }
+        // ② MVCC 快照 + 位点 P + 活段清单(fs3-meta 会话读线程)
+        let export = match self.meta.repl_export_open(filters.clone()) {
+            Ok(s) => s,
+            Err(e) => return internal_err("snapshot open", &e),
+        };
+        // ③ ReadPin 清单内全部活段 extent(会话期;去重后一次钉扎)
+        let mut ids: Vec<u64> = export
+            .manifest()
+            .iter()
+            .map(|s| u64::from(s.extent_id))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let pins = self.engine.read().pin_extent_ids(ids);
+        let id = self
+            .next_snapshot_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let point = export.point();
+        let segments = export.manifest().len();
+        let session = Arc::new(SnapshotSession {
+            point,
+            export,
+            _pins: pins,
+            touched: Mutex::new(std::time::Instant::now()),
+        });
+        let expires_at = now_unix_secs() + SNAPSHOT_SESSION_TTL.as_secs() as i64;
+        self.snapshots.lock().insert(id, session);
+        json_ok(serde_json::json!({
+            "snapshot_id": id,
+            "point": fmt_gtid(point),
+            "filters": filters,
+            "segments": segments,
+            "expires_at": expires_at,
+        }))
+    }
+
+    /// 快照会话子路径路由:snapshot/{id}/meta、snapshot/{id}/segments(GET)、
+    /// snapshot/{id}(DELETE)。
+    async fn route_snapshot_sub(
+        &self,
+        method: &Method,
+        rest: &str,
+        req: &Request<Incoming>,
+    ) -> Response<Full<Bytes>> {
+        let (id_str, sub) = match rest.split_once('/') {
+            Some((i, s)) => (i, Some(s)),
+            None => (rest, None),
+        };
+        let Ok(id) = id_str.parse::<u64>() else {
+            return json_err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "snapshot id must be u64",
+            );
+        };
+        match (method, sub) {
+            (&Method::GET, Some("meta")) => self.handle_snapshot_meta(req, id).await,
+            (&Method::GET, Some("segments")) => self.handle_snapshot_segments(req, id),
+            (&Method::DELETE, None) => self.handle_snapshot_drop(id),
+            _ => json_err(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method_not_allowed",
+                "snapshot/{id}: GET meta|segments, DELETE to release",
+            ),
+        }
+    }
+
+    /// `GET /v1/repl/v1/snapshot/{id}/meta?after={b64url}&limit=N`(C1
+    /// 分页续拉;线格式见模块注释)。令牌桶限速按页字节记账。
+    async fn handle_snapshot_meta(
+        &self,
+        req: &Request<Incoming>,
+        id: u64,
+    ) -> Response<Full<Bytes>> {
+        let query = req.uri().query().unwrap_or("");
+        let after = match query_param(query, "after") {
+            Some(s) => {
+                use base64::Engine as _;
+                match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s) {
+                    Ok(k) => Some(k),
+                    Err(_) => {
+                        return json_err(
+                            StatusCode::BAD_REQUEST,
+                            "bad_cursor",
+                            "after must be URL-safe base64 (no pad) of the raw key",
+                        );
+                    }
+                }
+            }
+            None => None,
+        };
+        let limit = match query_param(query, "limit") {
+            Some(s) => match s.parse::<usize>() {
+                Ok(n) => n.clamp(1, MAX_SNAPSHOT_PAGE_LIMIT),
+                Err(_) => {
+                    return json_err(StatusCode::BAD_REQUEST, "bad_limit", "limit must be int");
+                }
+            },
+            None => DEFAULT_SNAPSHOT_PAGE_LIMIT,
+        };
+        let Some(session) = self.snapshot_session(id) else {
+            return json_err(
+                StatusCode::GONE,
+                "ErrSnapshotGone",
+                "snapshot session unknown or expired (idle TTL); open a new one",
+            );
+        };
+        self.throttle_wait().await;
+        let page = match session
+            .export
+            .meta_page(after, limit, MAX_SNAPSHOT_PAGE_BYTES)
+        {
+            Ok(p) => p,
+            Err(e) => return internal_err("snapshot page", &e),
+        };
+        let bytes: u64 = page
+            .entries
+            .iter()
+            .map(|(k, v)| (k.len() + v.len()) as u64)
+            .sum();
+        self.throttle.consume(bytes);
+        use base64::Engine as _;
+        let entries: Vec<serde_json::Value> = page
+            .entries
+            .iter()
+            .map(|(k, v)| {
+                serde_json::json!({
+                    "key": base64::engine::general_purpose::STANDARD.encode(k),
+                    "value": base64::engine::general_purpose::STANDARD.encode(v),
+                })
+            })
+            .collect();
+        json_ok(serde_json::json!({
+            "point": fmt_gtid(session.point),
+            "entries": entries,
+            "next": page.next.map(|k| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(k)),
+            "done": page.done,
+        }))
+    }
+
+    /// `GET /v1/repl/v1/snapshot/{id}/segments?after={index}&limit=N`(活段
+    /// 清单分页;段数据本体走 extent-data 端点)。
+    fn handle_snapshot_segments(&self, req: &Request<Incoming>, id: u64) -> Response<Full<Bytes>> {
+        let query = req.uri().query().unwrap_or("");
+        let after = match query_param(query, "after") {
+            Some(s) => match s.parse::<usize>() {
+                Ok(n) => n,
+                Err(_) => {
+                    return json_err(StatusCode::BAD_REQUEST, "bad_cursor", "after must be int");
+                }
+            },
+            None => 0,
+        };
+        let limit = match query_param(query, "limit") {
+            Some(s) => match s.parse::<usize>() {
+                Ok(n) => n.clamp(1, MAX_MANIFEST_LIMIT),
+                Err(_) => {
+                    return json_err(StatusCode::BAD_REQUEST, "bad_limit", "limit must be int");
+                }
+            },
+            None => DEFAULT_MANIFEST_LIMIT,
+        };
+        let Some(session) = self.snapshot_session(id) else {
+            return json_err(
+                StatusCode::GONE,
+                "ErrSnapshotGone",
+                "snapshot session unknown or expired (idle TTL); open a new one",
+            );
+        };
+        let manifest = session.export.manifest();
+        let page: Vec<serde_json::Value> = manifest
+            .iter()
+            .skip(after)
+            .take(limit)
+            .map(|s| {
+                serde_json::json!({
+                    "extent_id": s.extent_id,
+                    "offset": s.offset,
+                    "len": s.len,
+                    "crc32c": s.crc32c,
+                })
+            })
+            .collect();
+        let next_idx = after + page.len();
+        let done = next_idx >= manifest.len();
+        json_ok(serde_json::json!({
+            "point": fmt_gtid(session.point),
+            "segments": page,
+            "next": if done { serde_json::Value::Null } else { serde_json::json!(next_idx) },
+            "done": done,
+        }))
+    }
+
+    /// `DELETE /v1/repl/v1/snapshot/{id}`:释放会话(MVCC 快照 + ReadPin;
+    /// 未知/已过期 = 410 ErrSnapshotGone,语义同拉取侧)。
+    fn handle_snapshot_drop(&self, id: u64) -> Response<Full<Bytes>> {
+        self.sweep_snapshots();
+        match self.snapshots.lock().remove(&id) {
+            // 移出即 Drop:读线程关闭(快照释放)+ unpin
+            Some(_) => json_ok(serde_json::json!({ "released": id })),
+            None => json_err(
+                StatusCode::GONE,
+                "ErrSnapshotGone",
+                "snapshot session unknown or expired",
+            ),
+        }
+    }
 }
 
 // ─────────────────────────── 协议小件 ───────────────────────────
@@ -971,6 +1335,16 @@ struct SlotCreateRequest {
 #[derive(Debug, Deserialize)]
 struct SlotAckRequest {
     confirmed_gtid: String,
+}
+
+/// 快照导出会话请求体(C1;线格式见模块注释)。两字段皆可缺省(全量 =
+/// 空过滤器)。
+#[derive(Debug, Deserialize)]
+struct SnapshotRequest {
+    #[serde(default)]
+    slot_name: Option<String>,
+    #[serde(default)]
+    filters: Option<BucketFilter>,
 }
 
 /// 槽的 JSON 投影(slots 观测端点与 hello 成功响应共用同一形状)。
@@ -1290,6 +1664,7 @@ mod tests {
             server_cert: write_pem(dir.path(), "server.pem", &cert_pem),
             server_key: write_pem(dir.path(), "server.key", &key_pem),
             max_slots: DEFAULT_MAX_SLOTS,
+            export_rate: DEFAULT_EXPORT_RATE,
         };
         let server = ReplServer::new(engine.clone(), meta, cfg).unwrap();
         let handle = server.spawn().unwrap();
@@ -1582,6 +1957,7 @@ mod tests {
             server_cert: write_pem(dir.path(), "server.pem", &srv_cert),
             server_key: write_pem(dir.path(), "server.key", &srv_key),
             max_slots: DEFAULT_MAX_SLOTS,
+            export_rate: DEFAULT_EXPORT_RATE,
         };
         let addr = ReplServer::new(engine.clone(), meta, cfg)
             .unwrap()
@@ -1681,11 +2057,11 @@ mod tests {
             0
         );
 
-        // POST snapshot 占位 501 / hello 空体 400(B2 已实现)/ 未知路径 404 /
-        // 错误动词 405
+        // POST snapshot 空体 400(C1 已实现,体须为 JSON)/ hello 空体 400
+        // (B2)/ 未知路径 404 / 错误动词 405
         let req = "POST /v1/repl/v1/snapshot HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
         let (st, _, body) = mtls_request(addr, &ca_pem, cli, req).await.unwrap();
-        assert_eq!(st, 501, "snapshot: {}", String::from_utf8_lossy(&body));
+        assert_eq!(st, 400, "snapshot: {}", String::from_utf8_lossy(&body));
         let req = "POST /v1/repl/v1/hello HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
         let (st, _, body) = mtls_request(addr, &ca_pem, cli, req).await.unwrap();
         assert_eq!(
@@ -2323,8 +2699,325 @@ mod tests {
         );
     }
 
-    /// M21 B4(ADR-33 RP4.2;设计稿 §4.1;TODO M21/B4 具名用例,照 m16
-    /// 断线样板精神的进程内双实例形态):**断线重连从游标续传**——
+    /// 在既有引擎/元数据上起复制口(C1/C2 测试:对象预写入引擎自带
+    /// meta,服务端与数据同源)。
+    fn start_server_on(engine: Arc<RwLock<Engine>>, meta: Arc<MetaStore>) -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let (ca, ca_key) = make_ca("M21 Test CA");
+        let (cert_pem, key_pem) =
+            make_leaf(&ca, &ca_key, Some("repl-server"), vec!["localhost".into()]);
+        let cfg = ReplConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            ca_cert: write_pem(dir.path(), "ca.pem", &ca.pem()),
+            server_cert: write_pem(dir.path(), "server.pem", &cert_pem),
+            server_key: write_pem(dir.path(), "server.key", &key_pem),
+            max_slots: DEFAULT_MAX_SLOTS,
+            export_rate: DEFAULT_EXPORT_RATE,
+        };
+        let server = ReplServer::new(engine.clone(), meta, cfg).unwrap();
+        let handle = server.spawn().unwrap();
+        Fixture {
+            _dir: dir,
+            engine,
+            addr: handle.local_addr,
+            ca_pem: ca.pem(),
+            ca,
+            ca_key,
+        }
+    }
+
+    /// 拉完一个快照会话的全部元数据页(小页强制多页 + 游标续拉)。
+    /// 返回 (point 文本, [(raw_key, raw_value)]);逐页断言 point 一致。
+    async fn pull_all_meta_pages(
+        addr: SocketAddr,
+        ca_pem: &str,
+        cli: (&str, &str),
+        id: u64,
+    ) -> (String, Vec<(Vec<u8>, Vec<u8>)>) {
+        use base64::Engine as _;
+        let mut after: Option<String> = None;
+        let mut point = String::new();
+        let mut out = Vec::new();
+        loop {
+            let path = format!(
+                "/v1/repl/v1/snapshot/{id}/meta?limit=2{}",
+                after.map(|a| format!("&after={a}")).unwrap_or_default()
+            );
+            let (st, _, body) = mtls_request(addr, ca_pem, Some(cli), &get_req(&path))
+                .await
+                .unwrap();
+            assert_eq!(st, 200, "{}", String::from_utf8_lossy(&body));
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let p = v["point"].as_str().unwrap().to_string();
+            if point.is_empty() {
+                point = p;
+            } else {
+                assert_eq!(point, p, "每页位点必须一致(同一 MVCC 快照)");
+            }
+            for e in v["entries"].as_array().unwrap() {
+                let k = base64::engine::general_purpose::STANDARD
+                    .decode(e["key"].as_str().unwrap())
+                    .unwrap();
+                let val = base64::engine::general_purpose::STANDARD
+                    .decode(e["value"].as_str().unwrap())
+                    .unwrap();
+                out.push((k, val));
+            }
+            if v["done"].as_bool().unwrap() {
+                break;
+            }
+            after = Some(
+                v["next"]
+                    .as_str()
+                    .expect("done=false 必须给续拉游标")
+                    .to_string(),
+            );
+        }
+        (point, out)
+    }
+
+    /// M21 C1(设计稿 §3.1;ADR-33 RP8.3;TODO M21/C1 具名用例):
+    /// **快照内容严格 = 位点 P 时刻状态**——导出期间并发写入(新增/覆盖/
+    /// 删除)不进快照;位点 P = 快照时刻 (s:repl_epoch, s:seq) 水位;
+    /// s:/bl:/a: 等排除键族不导出;内联小对象载荷随 o: 值直达;桶级
+    /// 过滤器参数生效(D2 联动)。
+    #[tokio::test]
+    async fn snapshot_export_consistent_at_gtid_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        let small_old = b"inline-payload-v1".to_vec();
+        let small_new = b"inline-payload-v2".to_vec();
+        let big_payload: Vec<u8> = (0..2 * 1024 * 1024usize).map(|i| (i % 251) as u8).collect();
+        {
+            let mut e = engine.write();
+            e.create_bucket_with_quota("snap", None).unwrap();
+            e.put("snap", "inline1", &mut &small_old[..]).unwrap();
+            e.put("snap", "big1", &mut &big_payload[..]).unwrap();
+        }
+        let meta = engine.read().meta_arc();
+        let seq_at_p = meta.last_seq().unwrap();
+        let fx = start_server_on(engine.clone(), meta.clone());
+        let (cert, key) = fx.client_cert(Some("node-b"));
+        let cli = (cert, key);
+
+        // ① 开快照会话:位点 P = 当前水位
+        let (st, _, raw) = mtls_request(
+            fx.addr,
+            &fx.ca_pem,
+            Some((&cli.0, &cli.1)),
+            &post_json_req("/v1/repl/v1/snapshot", "{}"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(st, 200, "{}", String::from_utf8_lossy(&raw));
+        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        let id = v["snapshot_id"].as_u64().unwrap();
+        let point = v["point"].as_str().unwrap().to_string();
+        assert_eq!(point, format!("1-{seq_at_p}"), "位点 P = 快照时刻水位");
+
+        // ② 导出期间并发写入:新增 big2 / 覆盖 inline1 / 删除 big1
+        {
+            let mut e = engine.write();
+            e.put("snap", "big2", &mut &big_payload[..]).unwrap();
+            e.put("snap", "inline1", &mut &small_new[..]).unwrap();
+            e.delete("snap", "big1").unwrap();
+        }
+        assert!(meta.last_seq().unwrap() > seq_at_p, "并发写推进了水位");
+
+        // ③ 全量拉页:内容必须严格 = P 时刻
+        let (page_point, entries) =
+            pull_all_meta_pages(fx.addr, &fx.ca_pem, (&cli.0, &cli.1), id).await;
+        assert_eq!(page_point, point);
+        assert!(!entries.is_empty());
+        // 排除键族:s: 系统键 / bl: binlog / a: 分配记录一律不导出
+        for (k, _) in &entries {
+            assert!(
+                !k.starts_with(b"s:") && !k.starts_with(b"bl:") && !k.starts_with(b"a:"),
+                "排除键族泄漏: {}",
+                String::from_utf8_lossy(k)
+            );
+        }
+        // 桶记录导出
+        assert!(entries.iter().any(|(k, _)| k.as_slice() == b"b:snap"));
+        // o: 条目解码:big1 在(P 时刻未删)、inline1 = 旧值、big2 缺席
+        let mut seen_big1 = false;
+        let mut seen_inline1_old = false;
+        for (k, val) in &entries {
+            if !k.starts_with(b"o:") {
+                continue;
+            }
+            let m = fs3_core::ObjectMeta::decode_value(val).unwrap();
+            if k.starts_with(b"o:snap\0big1") {
+                seen_big1 = true;
+                assert!(!m.extents.is_empty(), "big1 是段对象");
+            }
+            if k.starts_with(b"o:snap\0inline1") {
+                assert_eq!(
+                    m.inline.as_deref(),
+                    Some(small_old.as_slice()),
+                    "快照必须是 P 时刻旧值(覆盖写不进快照)"
+                );
+                seen_inline1_old = true;
+            }
+            assert!(!k.starts_with(b"o:snap\0big2"), "P 之后的新对象不得进快照");
+        }
+        assert!(seen_big1 && seen_inline1_old);
+
+        // ④ 桶级过滤器参数:include 未命中桶 → 只剩不可归属桶的随同键
+        let (st, _, raw) = mtls_request(
+            fx.addr,
+            &fx.ca_pem,
+            Some((&cli.0, &cli.1)),
+            &post_json_req(
+                "/v1/repl/v1/snapshot",
+                &serde_json::json!({"filters": {"Include": ["other-bucket"]}}).to_string(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(st, 200, "{}", String::from_utf8_lossy(&raw));
+        let fid = serde_json::from_slice::<serde_json::Value>(&raw).unwrap()["snapshot_id"]
+            .as_u64()
+            .unwrap();
+        let (_, filtered) = pull_all_meta_pages(fx.addr, &fx.ca_pem, (&cli.0, &cli.1), fid).await;
+        assert!(
+            filtered
+                .iter()
+                .all(|(k, _)| !k.starts_with(b"o:snap\0") && k.as_slice() != b"b:snap"),
+            "过滤器未命中的桶不得导出"
+        );
+
+        // ⑤ 释放会话;重复释放 = 410
+        let req = format!(
+            "DELETE /v1/repl/v1/snapshot/{id} HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n"
+        );
+        let (st, _, _) = mtls_request(fx.addr, &fx.ca_pem, Some((&cli.0, &cli.1)), &req)
+            .await
+            .unwrap();
+        assert_eq!(st, 200);
+        let (st, _, body) = mtls_request(fx.addr, &fx.ca_pem, Some((&cli.0, &cli.1)), &req)
+            .await
+            .unwrap();
+        assert_eq!(st, 410, "{}", String::from_utf8_lossy(&body));
+        let req = format!(
+            "DELETE /v1/repl/v1/snapshot/{fid} HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n"
+        );
+        let (st, _, _) = mtls_request(fx.addr, &fx.ca_pem, Some((&cli.0, &cli.1)), &req)
+            .await
+            .unwrap();
+        assert_eq!(st, 200);
+    }
+
+    /// M21 C1(ADR-22 (c);TODO M21/C1 具名用例):**导出期间触发
+    /// compaction,导出数据不破**——会话级 ReadPin 钉住活段清单内全部
+    /// extent,压缩候选跳过 pinned;清单段经 extent-data 拉取字节与
+    /// CRC32C 头端到端校验;释放会话后同一压缩即可迁移(反证钉扎生效)。
+    #[tokio::test]
+    async fn snapshot_export_survives_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        let data: Vec<u8> = (0..1024 * 1024usize).map(|i| (i % 253) as u8).collect();
+        {
+            let mut e = engine.write();
+            e.create_bucket_with_quota("cb", None).unwrap();
+            for i in 0..3 {
+                e.put("cb", &format!("k{i}"), &mut &data[..]).unwrap();
+            }
+            // extent 0 碎化:k0/k1 删除,k2 活段留存(压缩候选形态)
+            e.delete("cb", "k0").unwrap();
+            e.delete("cb", "k1").unwrap();
+        }
+        let meta = engine.read().meta_arc();
+        let fx = start_server_on(engine.clone(), meta.clone());
+        let (cert, key) = fx.client_cert(Some("node-b"));
+        let cli = (cert, key);
+
+        // 开快照会话(活段 = k2 的段,会话级 ReadPin)
+        let (st, _, raw) = mtls_request(
+            fx.addr,
+            &fx.ca_pem,
+            Some((&cli.0, &cli.1)),
+            &post_json_req("/v1/repl/v1/snapshot", "{}"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(st, 200, "{}", String::from_utf8_lossy(&raw));
+        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        let id = v["snapshot_id"].as_u64().unwrap();
+        assert!(v["segments"].as_u64().unwrap() >= 1);
+
+        // ① 导出期间触发压缩:pinned extent 不进候选,零迁移
+        let r = engine.write().compact_once().unwrap();
+        assert_eq!(r.candidates, 0, "导出期 pinned extent 不得成为压缩候选");
+        assert_eq!(r.migrated_objects, 0);
+
+        // ② 活段清单 + 段数据拉取:字节 == 原载荷,CRC32C 头端到端校验
+        let (st, _, raw) = mtls_request(
+            fx.addr,
+            &fx.ca_pem,
+            Some((&cli.0, &cli.1)),
+            &get_req(&format!("/v1/repl/v1/snapshot/{id}/segments")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(st, 200, "{}", String::from_utf8_lossy(&raw));
+        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        let segs = v["segments"].as_array().unwrap();
+        assert_eq!(segs.len(), 1, "k2 单段;k0/k1 已删不在快照清单");
+        let seg = &segs[0];
+        assert_eq!(seg["crc32c"], serde_json::Value::Null, "crc32c 为预留位");
+        let path = format!(
+            "/v1/repl/v1/extent-data?extent_id={}&offset={}&len={}",
+            seg["extent_id"].as_u64().unwrap(),
+            seg["offset"].as_u64().unwrap(),
+            seg["len"].as_u64().unwrap()
+        );
+        let (st, headers, body) =
+            mtls_request(fx.addr, &fx.ca_pem, Some((&cli.0, &cli.1)), &get_req(&path))
+                .await
+                .unwrap();
+        assert_eq!(st, 200, "compaction 后段数据必须仍可读");
+        let crc_hdr = headers
+            .iter()
+            .find(|(k, _)| k == "x-fasts3-repl-crc32c")
+            .map(|(_, v)| v.clone())
+            .expect("crc header");
+        assert_eq!(
+            crc_hdr.parse::<u32>().unwrap(),
+            fs3_core::crc32c::crc32c(&body, 0),
+            "CRC32C 头端到端校验"
+        );
+        assert_eq!(body, data, "导出期间压缩不得破坏段数据(ReadPin)");
+
+        // ③ 元数据页:k2 对象引用完好
+        let (_, entries) = pull_all_meta_pages(fx.addr, &fx.ca_pem, (&cli.0, &cli.1), id).await;
+        let k2 = entries
+            .iter()
+            .find(|(k, _)| k.starts_with(b"o:cb\0k2"))
+            .expect("k2 在快照内");
+        let m = fs3_core::ObjectMeta::decode_value(&k2.1).unwrap();
+        assert_eq!(m.extents.len(), 1);
+        assert_eq!(m.extents[0].len as usize, data.len());
+
+        // ④ 释放会话 → ReadPin 解除 → 同一压缩现在可以迁移(反证钉扎生效)
+        let req = format!(
+            "DELETE /v1/repl/v1/snapshot/{id} HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n"
+        );
+        let (st, _, _) = mtls_request(fx.addr, &fx.ca_pem, Some((&cli.0, &cli.1)), &req)
+            .await
+            .unwrap();
+        assert_eq!(st, 200);
+        let r2 = engine.write().compact_once().unwrap();
+        assert_eq!(r2.candidates, 1, "释放钉扎后 extent 0 成为候选");
+        assert_eq!(r2.migrated_objects, 1, "k2 被迁移");
+        let mut out = Vec::new();
+        engine
+            .read()
+            .get_to("cb", "k2", 0..u64::MAX, &mut out)
+            .unwrap();
+        assert_eq!(out, data, "迁移后对象仍逐字节可读");
+    }
+
     /// ① 上游 4 条事务(含 Stats 增量事务,双记账探针)+ 下游 pull worker
     ///    (真实 mTLS 复制口 + 独立 MetaStore)追平游标 1-4;
     /// ② 杀 pull worker(优雅停 = 断线等价物);上游再写 2 条;

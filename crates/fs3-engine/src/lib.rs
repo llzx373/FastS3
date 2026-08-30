@@ -7066,6 +7066,14 @@ impl Engine {
         ReadPin::new(Arc::clone(&self.alloc), ids)
     }
 
+    /// M21 C1(ADR-22 (c);设计稿 §3.1):快照导出会话的批量钉扎——按
+    /// extent id 清单钉扎(清单来自导出会话的活段清单),ReadPin 生命周期
+    /// = 导出会话期,导出期间 compaction 不得迁移这些 extent(候选筛选
+    /// 跳过 pinned,compaction.rs 既有口径)。
+    pub fn pin_extent_ids(&self, ids: Vec<u64>) -> ReadPin {
+        ReadPin::new(Arc::clone(&self.alloc), ids)
+    }
+
     /// 对象数据段(设备偏移 + 长度),裁剪到 [offset, offset+length) 响应区间;
     /// 内联/空对象返回 Some(vec![])。零拷贝读路径用(B3/D2;ADR-9 段级拼接)。
     pub fn object_segments(

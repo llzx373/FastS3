@@ -365,6 +365,376 @@ fn data_refs_of(ops: &[Op]) -> Vec<DataRef> {
     out
 }
 
+// ───────────────────── C1 在线快照导出会话 ─────────────────────
+//
+// (M21 C1;ADR-33 RP8.3;docs/replication-design.md §3.1):rocksdb MVCC
+// 快照持有期 = 导出会话期,导出面 = 位点 P 时刻的一致性视图。
+//
+// 形态决策:rust-rocksdb 0.25 的 Snapshot 生命周期绑定 &DB 借用,无法
+// 以 'static 句柄跨请求寄存;故每会话一个**专用导出读线程**——快照在
+// 线程栈上创建并持有,分页请求经 mpsc 通道进入,线程在同一快照上迭代
+// 作答;会话 Drop(通道关闭)即释放快照。零 unsafe,快照一致性由
+// rocksdb MVCC 保证(导出期间并发写不进快照)。
+//
+// 导出口径(键族取舍钉死,改动须走 ADR):
+// - **排除**:`s:`(系统键族:sse_kek_seed 红线不导出,repl_*/session/
+//   audit/pool 为本机状态)、`a:`/`t:`(上游分配记录,下游布局独立
+//   §4.3)、`bl:`(binlog 本体,增量从 P 经 binlog 端点续拉)、
+//   `e:`/`x:`/`ij:`/`jb:`(事件/恢复/迁入/批作业 = 运维瞬态队列,
+//   同 meta-export DTO 不导出口径);
+// - **导出**:其余全部键族原始键值直出(桶/对象/分段/桶配置/IAM/会话;
+//   值字节原样,含对象值版本字节与内联小对象载荷;SSE-KMS wrapped_dek
+//   为密文随对象值自然携带,RP7.1);
+// - **桶级过滤**(D2 联动):能解析出桶名的键族按过滤器判定;无法归属
+// 桶的键(`p:`/`u:`/IAM 等)保守随同(同 BucketScope.has_unscoped
+//   口径,§3.2)。
+//
+// 活段清单:会话开启时从同一快照扫描 `o:`/`p:` 段引用(含恢复副本段),
+// 排序去重;`crc32c` 恒 None(**预留位**——整段 CRC32C 无存量索引,
+// 导出期逐段计算 = 全量读盘,违背在线流式口径;段字节端到端校验在
+// extent-data 拉取路径的响应头,§3.2)。清单全量驻留会话内存(段引用
+// 定长小记录;元数据值走分页,全量值不进内存)。
+
+/// 活段清单条目(设计稿 §3.1 `[extent_id, offset, len, crc32c]`)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ReplSegmentRef {
+    pub extent_id: u32,
+    pub offset: u32,
+    pub len: u32,
+    /// 预留位,恒 None(见模块注释;端到端校验走 extent-data 响应头)。
+    pub crc32c: Option<u32>,
+}
+
+/// 一页导出元数据(原始键值对 + 续拉游标)。
+#[derive(Debug, Default)]
+pub struct ReplExportPage {
+    /// 原始键值(值含版本字节;序 = 键字典序)。
+    pub entries: Vec<(Vec<u8>, Vec<u8>)>,
+    /// 续拉游标 = 本页最后一条原始键(下游带回 `after`);`done` 时无意义。
+    pub next: Option<Vec<u8>>,
+    /// 是否已到快照尾。
+    pub done: bool,
+}
+
+/// 导出会话(rocksdb MVCC 快照 + 专用读线程;位点 P 与活段清单在开启
+/// 时一次性确定)。线程安全:分页方法内部经通道串行化,多调用方并发
+/// 安全(复制口按 snapshot_id 单下游续拉,正常为顺序调用)。
+pub struct ReplExportSession {
+    /// 导出位点 P = 快照时刻的 (s:repl_epoch, s:seq 水位)。
+    point: fs3_core::Gtid,
+    /// 快照内活段清单(排序去重;ReadPin 钉扎在复制口侧,会话只管清单)。
+    manifest: Vec<ReplSegmentRef>,
+    /// 页请求通道(Drop = 关通道 → 读线程退出 → 快照释放)。
+    req: std::sync::mpsc::Sender<ExportReq>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+enum ExportReq {
+    MetaPage {
+        after: Option<Vec<u8>>,
+        limit: usize,
+        byte_cap: usize,
+        reply: std::sync::mpsc::Sender<Result<ReplExportPage>>,
+    },
+}
+
+impl ReplExportSession {
+    /// 开启会话:取 MVCC 快照,读位点 P,构建活段清单,起读线程。
+    /// `db` 为 MetaStore 持有的 Arc(线程持有克隆,快照寿命不依赖
+    /// 调用方借用)。
+    pub(crate) fn open(
+        db: std::sync::Arc<rocksdb::OptimisticTransactionDB>,
+        filters: BucketFilter,
+    ) -> Result<Self> {
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<ExportReq>();
+        let (ready_tx, ready_rx) =
+            std::sync::mpsc::channel::<Result<(fs3_core::Gtid, Vec<ReplSegmentRef>)>>();
+        let join = std::thread::Builder::new()
+            .name("fs3-repl-export".into())
+            .spawn(move || export_thread(db, filters, req_rx, ready_tx))
+            .map_err(|e| Error::Meta(format!("spawn repl export thread: {e}")))?;
+        let (point, manifest) = ready_rx
+            .recv()
+            .map_err(|_| Error::Meta("repl export thread exited before ready".into()))??;
+        Ok(ReplExportSession {
+            point,
+            manifest,
+            req: req_tx,
+            join: Some(join),
+        })
+    }
+
+    /// 导出位点 P(开启时自快照读定)。
+    pub fn point(&self) -> fs3_core::Gtid {
+        self.point
+    }
+
+    /// 活段清单(复制口钉扎/分页服务用)。
+    pub fn manifest(&self) -> &[ReplSegmentRef] {
+        &self.manifest
+    }
+
+    /// 拉一页元数据:`after` = 上页游标(严格大于,None = 从头);
+    /// `limit` 条数上限,`byte_cap` 页字节上限(键+值)。
+    pub fn meta_page(
+        &self,
+        after: Option<Vec<u8>>,
+        limit: usize,
+        byte_cap: usize,
+    ) -> Result<ReplExportPage> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.req
+            .send(ExportReq::MetaPage {
+                after,
+                limit,
+                byte_cap,
+                reply: reply_tx,
+            })
+            .map_err(|_| Error::Meta("repl export session closed".into()))?;
+        reply_rx
+            .recv()
+            .map_err(|_| Error::Meta("repl export thread exited".into()))?
+    }
+}
+
+impl Drop for ReplExportSession {
+    fn drop(&mut self) {
+        // 先释放 sender(通道关闭 → 读线程 recv 出错退出 → 快照随之
+        // 释放),再 join 回收线程;顺序不可颠倒(join 时 sender 仍存活
+        // 则线程不退出,自死锁)。
+        drop(std::mem::replace(
+            &mut self.req,
+            std::sync::mpsc::channel().0,
+        ));
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
+}
+
+/// 导出读线程:快照在栈上创建并持有至通道关闭;分页请求在同一快照上
+/// 续扫(游标不匹配 = 断点续拉,重建迭代器从 after 起)。
+fn export_thread(
+    db: std::sync::Arc<rocksdb::OptimisticTransactionDB>,
+    filters: BucketFilter,
+    rx: std::sync::mpsc::Receiver<ExportReq>,
+    ready: std::sync::mpsc::Sender<Result<(fs3_core::Gtid, Vec<ReplSegmentRef>)>>,
+) {
+    use rocksdb::{Direction, IteratorMode};
+    let snap = db.snapshot();
+    let point = (|| -> Result<fs3_core::Gtid> {
+        let seq = snap
+            .get(crate::keys::SYS_SEQ)
+            .map_err(crate::rocks_err)?
+            .map(|v| u64::from_be_bytes(v.as_slice().try_into().unwrap()))
+            .unwrap_or(0);
+        let epoch = match snap
+            .get(crate::keys::SYS_REPL_EPOCH)
+            .map_err(crate::rocks_err)?
+        {
+            Some(v) => {
+                let b: [u8; 8] = v
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| Error::Corrupt("s:repl_epoch malformed".into()))?;
+                u64::from_be_bytes(b)
+            }
+            None => crate::keys::REPL_INITIAL_EPOCH,
+        };
+        Ok(fs3_core::Gtid { epoch, seq })
+    })();
+    let point = match point {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = ready.send(Err(e));
+            return;
+        }
+    };
+    let manifest = match build_manifest(&snap, &filters) {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = ready.send(Err(e));
+            return;
+        }
+    };
+    if ready.send(Ok((point, manifest))).is_err() {
+        return;
+    }
+
+    // 分页服务:持久迭代器顺序续扫;after ≠ 上次游标(断点续拉/重拉)
+    // 时重建迭代器(From(after) 含等于位,跳过相等键)。
+    let mut iter = snap.iterator(IteratorMode::Start);
+    let mut last: Option<Vec<u8>> = None;
+    while let Ok(req) = rx.recv() {
+        match req {
+            ExportReq::MetaPage {
+                after,
+                limit,
+                byte_cap,
+                reply,
+            } => {
+                let page = (|| -> Result<ReplExportPage> {
+                    if after != last {
+                        iter = match &after {
+                            Some(a) => snap.iterator(IteratorMode::From(a, Direction::Forward)),
+                            None => snap.iterator(IteratorMode::Start),
+                        };
+                        last = None;
+                    }
+                    let mut page = ReplExportPage::default();
+                    let mut bytes = 0usize;
+                    for item in &mut iter {
+                        let (k, v) = item.map_err(crate::rocks_err)?;
+                        // 跳过游标键本身:正常续扫(after == last,迭代器
+                        // 已在下一位)无需跳;重建迭代器(断点续拉/重拉)
+                        // From(after) 含等于位,须跳过相等键
+                        let is_cursor =
+                            last.is_none() && after.as_deref().is_some_and(|a| k.as_ref() == a);
+                        if is_cursor {
+                            continue;
+                        }
+                        if !export_key_included(&k, &filters) {
+                            continue;
+                        }
+                        let k = k.to_vec();
+                        let v = v.to_vec();
+                        bytes += k.len() + v.len();
+                        page.entries.push((k, v));
+                        if page.entries.len() >= limit || bytes >= byte_cap {
+                            page.next = page.entries.last().map(|(k, _)| k.clone());
+                            last = page.next.clone();
+                            return Ok(page);
+                        }
+                    }
+                    page.done = true;
+                    page.next = page.entries.last().map(|(k, _)| k.clone());
+                    last = page.next.clone();
+                    Ok(page)
+                })();
+                if reply.send(page).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// 从快照扫描 `o:`/`p:` 段引用构建活段清单(排序去重;含对象恢复
+/// 副本段;桶级过滤器只裁剪可归属桶的 `o:` 条目,`p:` 保守随同)。
+fn build_manifest(
+    snap: &rocksdb::SnapshotWithThreadMode<rocksdb::OptimisticTransactionDB>,
+    filters: &BucketFilter,
+) -> Result<Vec<ReplSegmentRef>> {
+    use rocksdb::{Direction, IteratorMode};
+    let mut set = std::collections::BTreeSet::new();
+    for item in snap.iterator(IteratorMode::From(
+        crate::keys::PREFIX_OBJECT,
+        Direction::Forward,
+    )) {
+        let (k, v) = item.map_err(crate::rocks_err)?;
+        if !k.starts_with(crate::keys::PREFIX_OBJECT) {
+            break;
+        }
+        if !export_key_included(&k, filters) {
+            continue;
+        }
+        let meta = crate::decode_object(&v)?;
+        for s in &meta.extents {
+            set.insert((s.extent_id, s.offset, s.len));
+        }
+        if let Some(st) = &meta.restore_state {
+            for s in &st.restored_extents {
+                set.insert((s.extent_id, s.offset, s.len));
+            }
+        }
+    }
+    for item in snap.iterator(IteratorMode::From(
+        crate::keys::PREFIX_PART,
+        Direction::Forward,
+    )) {
+        let (k, v) = item.map_err(crate::rocks_err)?;
+        if !k.starts_with(crate::keys::PREFIX_PART) {
+            break;
+        }
+        let part = crate::decode_part(&v)?;
+        for s in &part.extents {
+            set.insert((s.extent_id, s.offset, s.len));
+        }
+    }
+    Ok(set
+        .into_iter()
+        .map(|(extent_id, offset, len)| ReplSegmentRef {
+            extent_id,
+            offset,
+            len,
+            crc32c: None,
+        })
+        .collect())
+}
+
+/// 导出键族排除表(模块注释钉死):`s:`/`a:`/`t:`/`bl:` 为本机/上游
+/// 状态,`e:`/`x:`/`ij:`/`jb:` 为运维瞬态队列。
+fn export_key_excluded(key: &[u8]) -> bool {
+    key.starts_with(crate::keys::PREFIX_SYS)
+        || key.starts_with(crate::keys::PREFIX_ALLOC)
+        || key.starts_with(crate::keys::PREFIX_TXN)
+        || key.starts_with(crate::keys::PREFIX_BINLOG)
+        || key.starts_with(crate::keys::PREFIX_EVENT)
+        || key.starts_with(crate::keys::PREFIX_RESTORE_JOB)
+        || key.starts_with(crate::keys::PREFIX_INGEST_JOB)
+        || key.starts_with(crate::keys::PREFIX_BATCH_JOB)
+}
+
+/// 解析键的归属桶(能归属的键族);不可归属 → None(保守随同)。
+fn export_key_bucket(key: &[u8]) -> Option<&str> {
+    // 整余串即桶名的键族(桶名无 \0;conf 单段键 = 前缀 + 桶名)
+    for p in [
+        crate::keys::PREFIX_BUCKET as &[u8],
+        crate::keys::PREFIX_BUCKET_LOC,
+        crate::keys::PREFIX_BUCKET_CORS,
+        crate::keys::PREFIX_BUCKET_TAGGING,
+        crate::keys::PREFIX_BUCKET_OWNERSHIP,
+        crate::keys::PREFIX_BUCKET_BPA,
+        crate::keys::PREFIX_BUCKET_POLICY,
+    ] {
+        if let Some(rest) = key.strip_prefix(p) {
+            return std::str::from_utf8(rest).ok();
+        }
+    }
+    // 桶名到首个 \0 的两段式键族
+    for p in [
+        crate::keys::PREFIX_OBJECT as &[u8],
+        crate::keys::PREFIX_LIFECYCLE_RULE,
+        crate::keys::PREFIX_NOTIFICATION,
+        crate::keys::PREFIX_INVENTORY,
+        crate::keys::PREFIX_UPLOAD_INDEX,
+    ] {
+        if let Some(rest) = key.strip_prefix(p) {
+            let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+            return std::str::from_utf8(&rest[..end]).ok();
+        }
+    }
+    None
+}
+
+/// 导出条目判定:排除表优先;桶级过滤(All 全放;Include 只放命中桶,
+/// Exclude 放未命中桶;不可归属桶的键两态都放——保守随同,§3.2
+/// has_unscoped 口径)。
+fn export_key_included(key: &[u8], filters: &BucketFilter) -> bool {
+    if export_key_excluded(key) {
+        return false;
+    }
+    match filters {
+        BucketFilter::All => true,
+        BucketFilter::Include(list) => {
+            export_key_bucket(key).is_none_or(|b| list.iter().any(|x| x == b))
+        }
+        BucketFilter::Exclude(list) => {
+            export_key_bucket(key).is_none_or(|b| !list.iter().any(|x| x == b))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

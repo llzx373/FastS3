@@ -29,11 +29,15 @@ pub mod keys;
 /// M11 L3-1(ADR-12 DL5):`s:audit` 审计持久化环形。
 pub mod audit;
 
-/// M21 A1(ADR-33 RP1/RP2):复制 binlog 记录(`bl:` 前缀值格式与提取)。
+/// M21 A1(ADR-33 RP1/RP2):复制 binlog 记录(`bl:` 前缀值格式与提取);
+/// C1 在线快照导出会话(`ReplExportSession`)同模块。
 pub mod repl;
 
 pub use audit::AuditStore;
-pub use repl::{BucketFilter, BucketScope, DataRef, ReplRecord, Slot, REPL_RECORD_VERSION};
+pub use repl::{
+    BucketFilter, BucketScope, DataRef, ReplExportPage, ReplExportSession, ReplRecord,
+    ReplSegmentRef, Slot, REPL_RECORD_VERSION,
+};
 
 /// 元数据同步模式(DESIGN §4.4 / E2)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1704,6 +1708,16 @@ impl MetaStore {
     /// 显式落盘:WAL write + fsync(组提交窗口外的确定性刷盘)。
     pub fn flush(&self) -> Result<()> {
         self.db.flush_wal(true).map_err(rocks_err)
+    }
+
+    /// M21 C1(ADR-33 RP8.3;设计稿 §3.1):开启在线快照导出会话——
+    /// rocksdb MVCC 快照持有期 = 会话期,位点 P = 快照时刻的
+    /// (s:repl_epoch, s:seq 水位);元数据分页流式导出 + 活段清单
+    /// (口径/排除键族/桶级过滤见 repl.rs 模块注释)。调用方(复制口)
+    /// 须在开启前 `flush()` + 强制分配器检查点,并对清单内 extent
+    /// 持 ReadPin 至会话结束。
+    pub fn repl_export_open(self: &Arc<Self>, filters: BucketFilter) -> Result<ReplExportSession> {
+        ReplExportSession::open(Arc::clone(&self.db), filters)
     }
 
     pub fn sync_mode(&self) -> SyncMode {
