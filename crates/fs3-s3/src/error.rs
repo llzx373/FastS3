@@ -407,10 +407,14 @@ impl S3Error {
 
     /// AWS 错误码字符串(Code 字段)。
     pub fn code_name(&self) -> String {
-        let name = format!("{:?}", self.code);
-        // CamelCase → AWS 命名:InvalidRange / NoSuchKey 等与 Rust 变体名一致,
-        // 仅 InternalError 等保持一致即可;无需要改写。
-        name
+        // M20 D3(ADR-29 KR6.3):KMS 故障码带 `KMS.` 前缀(AWS 风格)
+        match self.code {
+            S3ErrorCode::KmsNotFoundException => "KMS.NotFoundException".into(),
+            S3ErrorCode::KmsDisabledException => "KMS.DisabledException".into(),
+            S3ErrorCode::KmsUnavailableException => "KMS.UnavailableException".into(),
+            S3ErrorCode::KmsAccessDeniedException => "KMS.AccessDeniedException".into(),
+            other => format!("{other:?}"),
+        }
     }
 }
 

@@ -367,6 +367,15 @@ pub struct SseS3SessionDto {
     pub wrapped_dek_hex: String,
 }
 
+/// SSE-KMS 会话导出 DTO(M20 D3;wrapped_dek = transit 密文属密文可导出)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SseKmsSessionDto {
+    pub key_name: String,
+    pub wrapped_dek: String,
+    pub context_suffix: String,
+    pub bucket_key_enabled: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadDto {
     pub upload_id: String,
@@ -395,6 +404,10 @@ pub struct UploadDto {
     /// 是元数据迁移通道,不是加密数据备份通道(备份走卷快照)。
     #[serde(default)]
     pub sse_s3: Option<SseS3SessionDto>,
+    /// SSE-KMS 会话绑定(M20 D3,ADR-29:transit 密文 + 绑定标签;密文
+    /// 可导出;**导入侧无同源 KMS 时恢复的会话不可解**——与 SSE-S3 同口径)。
+    #[serde(default)]
+    pub sse_kms: Option<SseKmsSessionDto>,
     /// M15 C1(ADR-18 D-E3):Create 时请求的存储类(随会话导出/导入;
     /// 旧导出无此字段 → None)。
     #[serde(default)]
@@ -426,6 +439,12 @@ impl UploadDto {
             sse_s3: s.sse_s3.as_ref().map(|s3| SseS3SessionDto {
                 kek_id: s3.kek_id,
                 wrapped_dek_hex: hex::encode(&s3.wrapped_dek),
+            }),
+            sse_kms: s.sse_kms.as_ref().map(|k| SseKmsSessionDto {
+                key_name: k.key_name.clone(),
+                wrapped_dek: k.wrapped_dek.clone(),
+                context_suffix: k.context_suffix.clone(),
+                bucket_key_enabled: k.bucket_key_enabled,
             }),
             created: s.created,
             completed: s.completed,
@@ -1086,6 +1105,12 @@ pub fn run_meta_import(
                 }),
                 None => None,
             },
+            sse_kms: u.sse_kms.as_ref().map(|k| fs3_meta::SessionSseKms {
+                key_name: k.key_name.clone(),
+                wrapped_dek: k.wrapped_dek.clone(),
+                context_suffix: k.context_suffix.clone(),
+                bucket_key_enabled: k.bucket_key_enabled,
+            }),
             retention: None,
             legal_hold: None,
             requested_storage_class: u.requested_storage_class.clone(),

@@ -157,17 +157,17 @@
   (xml.rs:1932,当前 AES256-only);`BucketMeta.default_encryption` 扩 Kms;
   意愿裁决三分支 = 显式头 > 桶默认 > 无(sse.rs:75-86);Get/DeleteBucketEncryption 往返
   - 用例:`ssekms_bucket_default_enforces_kms`(无头 PUT 落 aws:kms;HEAD 回显)
-- [ ] D3 全 op 接线与错误映射:PUT / CopyObject / UploadPartCopy / CreateMultipartUpload /
+- [x] D3 全 op 接线与错误映射:PUT / CopyObject / UploadPartCopy / CreateMultipartUpload /
   UploadPart / CompleteMultipartUpload / GET / HEAD;Vault 故障 → AWS 风格 XML 错误
   (ADR-29 (f));Copy 加密源 → 解密后按目标 key 重加密(DESIGN.md DE3 既有裁决)
   - 用例:`ssekms_vault_down_maps_to_kms_unavailable`;copy/multipart 用例见 E
 
 ### E. 引擎接线(≈1 pw;ADR-29)
 
-- [ ] E1 写路径:`ExtentWriter` 收 Kms 写密钥(lib.rs:7820 构造点);inline 小对象臂与
+- [x] E1 写路径:`ExtentWriter` 收 Kms 写密钥(lib.rs:7820 构造点);inline 小对象臂与
   extent 臂同一密钥语义
   - 用例:inline(<64KiB)与 extent(≥64KiB)对象 roundtrip 对账
-- [ ] E2 读路径:`sse_read_data_key` 加 Kms 分支(lib.rs:3676);ingest 通道默认加密分派
+- [x] E2 读路径:`sse_read_data_key` 加 Kms 分支(lib.rs:3676);ingest 通道默认加密分派
   (lib.rs:2143);Complete 一次解密+重加密用点(lib.rs:6500)
   - 用例:`ssekms_multipart_complete_reencrypt`;`ssekms_copy_reencrypt_under_new_key`;
     `ssekms_upload_part_copy_keeps_sse`;`ssekms_ingest_channel_default_encryption`

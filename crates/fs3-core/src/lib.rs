@@ -21,11 +21,11 @@ pub mod util;
 pub use checksum::{checksum_one_shot, ChecksumHasher};
 pub use clock::{retention_expired, TrustedClockState};
 pub use consts::*;
-pub use error::{Error, Result};
+pub use error::{Error, KmsFault, Result};
 pub use ssec::{
     derive_part_nonce_base, derive_sse_s3_kek, hkdf_sha256, mint_sse_s3_write_key,
     rewrap_sse_s3_dek, sse_s3_unwrap_dek, sse_s3_wrap_dek, unwrap_sse_s3_dek, ChunkedGcm, SseCKey,
-    SseError, SseS3WriteKey, SseWriteKey, SSE_CHUNK_SIZE, SSE_S3_WRAPPED_DEK_LEN,
+    SseError, SseKmsWriteKey, SseS3WriteKey, SseWriteKey, SSE_CHUNK_SIZE, SSE_S3_WRAPPED_DEK_LEN,
 };
 pub use types::*;
 pub use util::{new_version_vk, random_bytes, vk_time_us};

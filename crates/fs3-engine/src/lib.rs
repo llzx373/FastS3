@@ -98,6 +98,11 @@ pub struct EngineConfig {
     /// 次轮清偏移模拟系统时钟回拨,断言 COMPLIANCE 保留不可缩短。
     #[doc(hidden)]
     pub clock_offset_secs: i64,
+    /// M20 E(ADR-29):SSE-KMS 根密钥服务(Vault/OpenBao transit 客户端;
+    /// None = 未配置,读路径遇 KMS 对象显式报错)。KEK 永不出 KMS 进程,
+    /// 引擎只持客户端句柄(mint/unwrap 逐次在线调用)。
+    #[doc(hidden)]
+    pub kms: Option<std::sync::Arc<dyn fs3_kms::RootKms>>,
 }
 
 impl Default for EngineConfig {
@@ -119,6 +124,8 @@ impl Default for EngineConfig {
             compression: fs3_core::CompressionConfig::default(),
             debug_io: None,
             clock_offset_secs: 0,
+            // M20 E(ADR-29):SSE-KMS 客户端默认未配置(显式装配)
+            kms: None,
         }
     }
 }
@@ -381,6 +388,8 @@ pub struct Engine {
     /// SSE-S3 重包裹进度(M11 K1-1;admin rotate/status 与工作线程共享;
     /// 内存态——重启后经 meta 的 rewrap_done_gen 持久标记判定待办)。
     sse_s3_rewrap: Arc<std::sync::Mutex<SseS3RewrapProgress>>,
+    /// M20 E(ADR-29):SSE-KMS 根密钥服务(Option;None = 未配置)。
+    kms: Option<std::sync::Arc<dyn fs3_kms::RootKms>>,
     /// 可信时钟(M12 W1-1,ADR-13 DL6;启动加载 + 检查点刷新)。
     trusted_clock: std::sync::Mutex<TrustedClockRt>,
     /// 墙钟落后单调推导的秒数(M12 W1-2;0 = 无回拨;admin 渲染 gauge)。
@@ -834,6 +843,7 @@ impl Engine {
             degraded: degraded.clone(),
             sse_decrypt_bytes: std::sync::atomic::AtomicU64::new(0),
             sse_s3_rewrap: Arc::new(std::sync::Mutex::new(SseS3RewrapProgress::default())),
+            kms: cfg.kms.clone(),
             trusted_clock: std::sync::Mutex::new(TrustedClockRt {
                 state: clock_state,
                 inject: None,
@@ -2146,12 +2156,10 @@ impl Engine {
                 Some(fs3_core::SseAlgorithm::Aes256) => {
                     Some(fs3_core::SseWriteKey::SseS3(&self.sse_s3_mint_write_key()?))
                 }
-                // M20 E2(ADR-29):ingest 通道 KMS 默认加密分派;接线前显式拒绝
-                Some(fs3_core::SseAlgorithm::Kms) => {
-                    return Err(Error::Unsupported(
-                        "SSE-KMS ingest not wired yet (M20 E2)".into(),
-                    ))
-                }
+                // M20 E2(ADR-29):ingest 通道 KMS 默认加密分派(后端默认 key)
+                Some(fs3_core::SseAlgorithm::Kms) => Some(fs3_core::SseWriteKey::SseKms(
+                    self.kms_mint_write_key(bucket, key, None, None)?,
+                )),
                 None => None,
             }
         };
@@ -3695,11 +3703,74 @@ impl Engine {
                 })?
                 .data_key()),
             fs3_core::SseKind::SseS3 => self.sse_s3_unwrap(sse.kek_id, &sse.wrapped_dek),
-            // M20 E2(ADR-29):RootKms 逐次在线 unwrap;接线前的显式错误不静默
-            fs3_core::SseKind::SseKms => Err(Error::Unsupported(
-                "SSE-KMS unwrap not wired yet (M20 E2)".into(),
-            )),
+            // M20 E2(ADR-29 KR3.4):RootKms 逐次在线 unwrap——KMS 停机 =
+            // 解密失败(不降级);上下文 = SseInfo V2 载荷的绑定标签
+            // (transit AAD 校验为篡改检测权威)
+            fs3_core::SseKind::SseKms => {
+                let kms = self.kms.as_ref().ok_or_else(|| {
+                    Error::Unsupported(
+                        "object is SSE-KMS encrypted but no KMS backend is configured".into(),
+                    )
+                })?;
+                let parts = sse
+                    .kms_parts()
+                    .map_err(|e| Error::Corrupt(format!("kms payload: {e}")))?;
+                let ctx = fs3_kms::KmsContext::from_stored(&parts.context_binding);
+                let dk = kms
+                    .unwrap_dek(&parts.key_name, &parts.ciphertext, &ctx)
+                    .map_err(|e| e.to_core())?;
+                Ok(*dk.expose())
+            }
         }
+    }
+
+    /// M20 E1(ADR-29 KR3):SSE-KMS 写密钥签发——本地随机 DEK → transit
+    /// encrypt(key_name, associated_data = canonical(bucket,key,algo) ⊕
+    /// 客户端 context 透传)。明文 DEK 仅内存持有(Drop zeroize)。
+    /// KMS 未配置 → Unsupported(调用方映射 501);KMS 故障按分类映射
+    /// Error::Kms(协议层 → KMS.* XML)。
+    pub fn kms_mint_write_key(
+        &self,
+        bucket: &str,
+        key: &str,
+        key_name: Option<&str>,
+        extra_ctx: Option<&str>,
+    ) -> Result<fs3_core::SseKmsWriteKey> {
+        let kms = self.kms.as_ref().ok_or_else(|| {
+            Error::Unsupported(
+                "KMS backend is not configured (server-side-encryption aws:kms)".into(),
+            )
+        })?;
+        let ctx = fs3_kms::KmsContext::object(bucket, key).with_suffix(extra_ctx.unwrap_or(""));
+        let out = kms.mint(key_name, &ctx).map_err(|e| e.to_core())?;
+        Ok(fs3_core::SseKmsWriteKey::new(
+            out.key_name,
+            out.wrapped_dek,
+            ctx.as_str().to_string(),
+            *out.data_key.expose(),
+        ))
+    }
+
+    /// M20 E2(ADR-29 KR3.4):SSE-KMS 会话/存储 DEK 在线解包(mint 的逆;
+    /// 用于 Complete 分片解密与 UploadPart 会话密钥现解现用)。
+    pub fn kms_unwrap_dek(
+        &self,
+        key_name: &str,
+        wrapped_dek: &str,
+        ctx: &fs3_kms::KmsContext,
+    ) -> Result<fs3_kms::DataKey> {
+        let kms = self.kms.as_ref().ok_or_else(|| {
+            Error::Unsupported(
+                "KMS backend is not configured (server-side-encryption aws:kms)".into(),
+            )
+        })?;
+        kms.unwrap_dek(key_name, wrapped_dek, ctx)
+            .map_err(|e| e.to_core())
+    }
+
+    /// KMS 后端句柄(S3Service mint 直连用;None = 未配置)。
+    pub fn kms_client(&self) -> Option<std::sync::Arc<dyn fs3_kms::RootKms>> {
+        self.kms.clone()
     }
 
     /// KEK 代状态(admin 状态端点数据源;只含代数/时间戳,零密钥材料)。
@@ -4379,6 +4450,7 @@ impl Engine {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -4395,6 +4467,7 @@ impl Engine {
         checksum_alg: Option<ChecksumAlgorithm>,
         sse_key_md5: Option<String>,
         sse_s3: Option<fs3_meta::SessionSseS3>,
+        sse_kms: Option<fs3_meta::SessionSseKms>,
         retention: Option<fs3_core::Retention>,
         legal_hold: Option<bool>,
         requested_storage_class: Option<String>,
@@ -4403,13 +4476,15 @@ impl Engine {
             return Err(Error::NotFound(format!("bucket {bucket}")));
         }
         debug_assert!(
-            !(sse_key_md5.is_some() && sse_s3.is_some()),
-            "SSE-C 与 SSE-S3 会话互斥(协议层二选一)"
+            !(sse_key_md5.is_some() && sse_s3.is_some())
+                && !(sse_key_md5.is_some() && sse_kms.is_some())
+                && !(sse_s3.is_some() && sse_kms.is_some()),
+            "SSE-C/SSE-S3/SSE-KMS 会话互斥(协议层二选一)"
         );
         // M16 A1(ADR-19 DA1.5):SSE + 归档 + multipart 组合显式拒绝
         // (分片独立帧 × SSE 重加密组合面不开放;协议层 Create 先行,
         // 此处防御纵深)
-        if (sse_key_md5.is_some() || sse_s3.is_some())
+        if (sse_key_md5.is_some() || sse_s3.is_some() || sse_kms.is_some())
             && requested_storage_class
                 .as_deref()
                 .is_some_and(fs3_core::is_archive_class)
@@ -4431,6 +4506,7 @@ impl Engine {
             checksum_alg,
             sse_key_md5,
             sse_s3,
+            sse_kms,
             requested_storage_class,
         )
         .with_object_lock(retention, legal_hold);
@@ -4453,6 +4529,37 @@ impl Engine {
                     s3.kek_id,
                     s3.wrapped_dek.clone(),
                 )))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// M20 E2(ADR-29 KR3):SSE-KMS 会话写密钥现解(unwrap 会话级 DEK;
+    /// 上下文 = canonical(bucket,key) ⊕ 会话后缀——与 Create mint 时一致)。
+    fn session_kms_write_key(
+        &self,
+        session: &MultipartSession,
+    ) -> Result<Option<fs3_core::SseKmsWriteKey>> {
+        match &session.sse_kms {
+            Some(k) => {
+                let dk = self.kms_unwrap_dek(
+                    &k.key_name,
+                    &k.wrapped_dek,
+                    &fs3_kms::KmsContext::object(&session.bucket, &session.key)
+                        .with_suffix(&k.context_suffix),
+                )?;
+                Ok(Some(
+                    fs3_core::SseKmsWriteKey::new(
+                        k.key_name.clone(),
+                        k.wrapped_dek.clone(),
+                        fs3_kms::KmsContext::object(&session.bucket, &session.key)
+                            .with_suffix(&k.context_suffix)
+                            .as_str()
+                            .to_string(),
+                        *dk.expose(),
+                    )
+                    .with_bucket_key_enabled(k.bucket_key_enabled),
+                ))
             }
             None => Ok(None),
         }
@@ -4499,7 +4606,11 @@ impl Engine {
         let archive_session = session_class
             .as_deref()
             .is_some_and(fs3_core::is_archive_class);
-        if archive_session && (session.sse_key_md5.is_some() || session.sse_s3.is_some()) {
+        if archive_session
+            && (session.sse_key_md5.is_some()
+                || session.sse_s3.is_some()
+                || session.sse_kms.is_some())
+        {
             return Err(Error::InvalidRequest(
                 "SSE combined with archive storage classes is not supported for multipart uploads (ADR-19 DA1); use single-object PUT or a plaintext session".into(),
             ));
@@ -4528,11 +4639,13 @@ impl Engine {
         }
         // K1-1:有效写密钥(SSE-C 请求密钥 / SSE-S3 会话 DEK 现解)
         let s3_key = self.session_s3_write_key(&session)?;
-        let write_key = match (sse_key, &s3_key) {
-            (Some(c), None) => Some(fs3_core::SseWriteKey::SseC(c)),
-            (None, Some(s)) => Some(fs3_core::SseWriteKey::SseS3(s)),
-            (None, None) => None,
-            (Some(_), Some(_)) => unreachable!("SSE-C/SSE-S3 会话互斥已在上方判定"),
+        let kms_key = self.session_kms_write_key(&session)?;
+        let write_key = match (sse_key, &s3_key, &kms_key) {
+            (Some(c), None, None) => Some(fs3_core::SseWriteKey::SseC(c)),
+            (None, Some(s), None) => Some(fs3_core::SseWriteKey::SseS3(s)),
+            (None, None, Some(k)) => Some(fs3_core::SseWriteKey::SseKms(k.clone())),
+            (None, None, None) => None,
+            _ => unreachable!("SSE-C/SSE-S3/SSE-KMS 会话互斥已在上方判定"),
         };
         let old_part = self.meta.get_part(upload_id, part_no)?;
         // D-E6:分片 nonce_base 确定性派生(仅加密会话;明文分片为 None)
@@ -4758,7 +4871,11 @@ impl Engine {
         let archive_session = session_class
             .as_deref()
             .is_some_and(fs3_core::is_archive_class);
-        if archive_session && (session.sse_key_md5.is_some() || session.sse_s3.is_some()) {
+        if archive_session
+            && (session.sse_key_md5.is_some()
+                || session.sse_s3.is_some()
+                || session.sse_kms.is_some())
+        {
             return Err(Error::InvalidRequest(
                 "SSE combined with archive storage classes is not supported for multipart uploads (ADR-19 DA1)".into(),
             ));
@@ -4792,7 +4909,8 @@ impl Engine {
             }
         }
         // DE3/DS3:源加密 + 目标(会话)未加密 → 显式拒绝(防静默解密落盘)
-        let dst_encrypted = dst_sse_key.is_some() || session.sse_s3.is_some();
+        let dst_encrypted =
+            dst_sse_key.is_some() || session.sse_s3.is_some() || session.sse_kms.is_some();
         if src.sse.is_some() && !dst_encrypted {
             return Err(Error::InvalidRequest(
                 "copy source is SSE-C encrypted; the destination of the copy must specify SSE-C encryption".into(),
@@ -4820,11 +4938,13 @@ impl Engine {
             // None = 明文直通)直灌 ExtentWriter;分片 nonce_base = D-E6
             // 确定性派生(与 upload_part 同一规则,同 part 重传 ⇒ ETag 稳定)
             let s3_key = self.session_s3_write_key(&session)?;
-            let write_key = match (dst_sse_key, &s3_key) {
-                (Some(c), None) => Some(fs3_core::SseWriteKey::SseC(c)),
-                (None, Some(s)) => Some(fs3_core::SseWriteKey::SseS3(s)),
-                (None, None) => None,
-                (Some(_), Some(_)) => unreachable!("SSE-C/SSE-S3 会话互斥已在上方判定"),
+            let kms_key = self.session_kms_write_key(&session)?;
+            let write_key = match (dst_sse_key, &s3_key, &kms_key) {
+                (Some(c), None, None) => Some(fs3_core::SseWriteKey::SseC(c)),
+                (None, Some(s), None) => Some(fs3_core::SseWriteKey::SseS3(s)),
+                (None, None, Some(k)) => Some(fs3_core::SseWriteKey::SseKms(k.clone())),
+                (None, None, None) => None,
+                _ => unreachable!("SSE-C/SSE-S3/SSE-KMS 会话互斥已在上方判定"),
             };
             let part_nonce_base = write_key
                 .as_ref()
@@ -4986,7 +5106,11 @@ impl Engine {
         let archive_session = session_class
             .as_deref()
             .is_some_and(fs3_core::is_archive_class);
-        if archive_session && (session.sse_key_md5.is_some() || session.sse_s3.is_some()) {
+        if archive_session
+            && (session.sse_key_md5.is_some()
+                || session.sse_s3.is_some()
+                || session.sse_kms.is_some())
+        {
             return Err(Error::InvalidRequest(
                 "SSE combined with archive storage classes is not supported for multipart uploads (ADR-19 DA1)".into(),
             ));
@@ -5000,11 +5124,13 @@ impl Engine {
         // K1-1:part 解密密钥统一视图——SSE-C 会话 = 请求客户密钥;
         // SSE-S3 会话 = 会话级 DEK 现解(内存持有,臂末擦除)
         let s3_part_key = self.session_s3_write_key(&session)?;
-        let part_data_key: Option<[u8; 32]> = match (sse_key, &s3_part_key) {
-            (Some(c), None) => Some(c.data_key()),
-            (None, Some(s)) => Some(s.data_key()),
-            (None, None) => None,
-            (Some(_), Some(_)) => unreachable!("SSE-C/SSE-S3 会话互斥已在上方判定"),
+        let kms_part_key = self.session_kms_write_key(&session)?;
+        let part_data_key: Option<[u8; 32]> = match (sse_key, &s3_part_key, &kms_part_key) {
+            (Some(c), None, None) => Some(c.data_key()),
+            (None, Some(s), None) => Some(s.data_key()),
+            (None, None, Some(k)) => Some(k.data_key()),
+            (None, None, None) => None,
+            _ => unreachable!("SSE-C/SSE-S3/SSE-KMS 会话互斥已在上方判定"),
         };
         if client_parts.is_empty() {
             return Err(Error::InvalidArgument("empty parts list".into()));
@@ -5356,11 +5482,23 @@ impl Engine {
                 Some(_) => Some(self.sse_s3_mint_write_key()?),
                 None => None,
             };
-            let obj_write_key = match (sse_key, &s3_obj_key) {
-                (Some(c), None) => Some(fs3_core::SseWriteKey::SseC(c)),
-                (None, Some(s)) => Some(fs3_core::SseWriteKey::SseS3(s)),
-                (None, None) => None,
-                (Some(_), Some(_)) => unreachable!("SSE-C/SSE-S3 会话互斥已在上方判定"),
+            // M20 E2(ADR-29 KR6.4):KMS 会话 = 重签对象级 DEK(同一上下文:
+            // canonical(bucket,key) ⊕ 会话后缀;wrapped 不同,绑定不变)
+            let kms_obj_key = match &session.sse_kms {
+                Some(k) => Some(self.kms_mint_write_key(
+                    &session.bucket,
+                    &session.key,
+                    Some(&k.key_name),
+                    Some(&k.context_suffix),
+                )?),
+                None => None,
+            };
+            let obj_write_key = match (sse_key, &s3_obj_key, &kms_obj_key) {
+                (Some(c), None, None) => Some(fs3_core::SseWriteKey::SseC(c)),
+                (None, Some(s), None) => Some(fs3_core::SseWriteKey::SseS3(s)),
+                (None, None, Some(k)) => Some(fs3_core::SseWriteKey::SseKms(k.clone())),
+                (None, None, None) => None,
+                _ => unreachable!("SSE-C/SSE-S3/SSE-KMS 会话互斥已在上方判定"),
             };
             let meta = if let Some(m) = archive_meta {
                 m
@@ -6379,13 +6517,9 @@ impl Engine {
                         true
                     }
                     (fs3_core::SseKind::SseS3, fs3_core::SseWriteKey::SseC(_)) => true,
-                    // M20 E2(ADR-29):KMS 源/目标 = 解密后按目标 key 重加密;
-                    // 接线前显式拒绝不静默
-                    (fs3_core::SseKind::SseKms, _) | (_, fs3_core::SseWriteKey::SseKms(_)) => {
-                        return Err(Error::Unsupported(
-                            "SSE-KMS copy re-encrypt not wired yet (M20 E2)".into(),
-                        ))
-                    }
+                    // M20 E2(ADR-29 KR6.4):KMS 参与 = 恒数据路径——上下文
+                    // 绑定到 (bucket,key),copy 目标键必然不同 → 解密重加密
+                    (fs3_core::SseKind::SseKms, _) | (_, fs3_core::SseWriteKey::SseKms(_)) => true,
                 },
             }
         } || force_data_path;
@@ -7870,11 +8004,20 @@ impl ExtentWriter {
                         w.kek_id(),
                         w.wrapped_dek().to_vec(),
                     ),
-                    fs3_core::SseWriteKey::SseKms(w) => (
-                        fs3_core::SseKind::SseKms,
-                        0,
-                        w.wrapped_dek().as_bytes().to_vec(),
-                    ),
+                    fs3_core::SseWriteKey::SseKms(w) => {
+                        // V2 载荷一次性编进 wrapped_dek(与 SseInfo::sse_kms
+                        // 同形状);finish 原样落盘,读路径 kms_parts 可解
+                        let encoded = fs3_core::SseInfo::sse_kms(
+                            w.key_name(),
+                            w.wrapped_dek(),
+                            [0u8; 12],
+                            Vec::new(),
+                            w.context_binding(),
+                            w.bucket_key_enabled(),
+                        )
+                        .wrapped_dek;
+                        (fs3_core::SseKind::SseKms, 0, encoded)
+                    }
                 };
                 Some(SseWriteState {
                     cipher: fs3_core::ChunkedGcm::new(k.data_key(), nonce_base),

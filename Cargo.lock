@@ -716,6 +716,7 @@ dependencies = [
  "fs3-alloc",
  "fs3-core",
  "fs3-device",
+ "fs3-kms",
  "fs3-meta",
  "hex",
  "io-uring",
@@ -773,6 +774,7 @@ name = "fs3-kms"
 version = "2.5.0"
 dependencies = [
  "base64",
+ "fs3-core",
  "libc",
  "reqwest",
  "serde",
@@ -805,6 +807,7 @@ dependencies = [
  "fs3-core",
  "fs3-device",
  "fs3-engine",
+ "fs3-kms",
  "fs3-meta",
  "hex",
  "hmac",

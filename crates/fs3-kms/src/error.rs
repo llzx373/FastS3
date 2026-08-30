@@ -36,6 +36,22 @@ pub enum KmsError {
 }
 
 impl KmsError {
+    /// 映射为 fs3-core 统一错误(引擎读路径错误保全分类;E2)。
+    pub fn to_core(&self) -> fs3_core::Error {
+        use fs3_core::KmsFault;
+        let (fault, detail) = match self {
+            KmsError::KeyNotFound(d) => (KmsFault::KeyNotFound, d.clone()),
+            KmsError::KeyDisabled(d) => (KmsFault::KeyDisabled, d.clone()),
+            KmsError::Unavailable(d) => (KmsFault::Unavailable, d.clone()),
+            KmsError::AccessDenied(d) => (KmsFault::AccessDenied, d.clone()),
+            KmsError::InvalidCiphertext => (KmsFault::InvalidCiphertext, String::new()),
+            KmsError::Config(d) => (KmsFault::Backend, format!("config: {d}")),
+            KmsError::Backend(d) => (KmsFault::Backend, d.clone()),
+            KmsError::Io(e) => (KmsFault::Backend, format!("io: {e}")),
+        };
+        fs3_core::Error::Kms { fault, detail }
+    }
+
     /// vaultrs APIError{code, errors} → KmsError(B1 用例 kms_error_map_404_403_503)。
     pub fn from_api(code: u16, errors: Vec<String>) -> Self {
         let joined = errors.join("; ");

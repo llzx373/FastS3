@@ -136,6 +136,23 @@ pub struct SessionSseS3 {
     pub wrapped_dek: Vec<u8>,
 }
 
+/// SSE-KMS 会话绑定(M20 D3,ADR-29 KR3/KR6):Create 的 SSE-KMS 意愿
+/// 落本字段;与 sse_key_md5/sse_s3 互斥。Complete 时解包会话 DEK 解密
+/// 分片 + 重签对象级 DEK(KR6.4)。**只存 transit 密文与绑定标签**,
+/// 明文 DEK 零落盘(KR3 红线)。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionSseKms {
+    /// transit key 名(裸名;None = 后端默认 key 时的解析名,从 mint 返回)。
+    pub key_name: String,
+    /// transit 密文(`vault:v1:…` ASCII)。
+    pub wrapped_dek: String,
+    /// 上下文后缀(客户端 -encryption-context 透传;unwrap/mint 时与
+    /// canonical(bucket,key) 重组)。
+    pub context_suffix: String,
+    /// 桶键头落盘值(D1:接受 + 回显 + 落 meta;优化不做)。
+    pub bucket_key_enabled: Option<bool>,
+}
+
 /// 分片上传会话(DESIGN §4.7;键 `u:{uploadId}`,桶索引 `m:{bucket}\0{uploadId}`)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MultipartSession {
@@ -184,6 +201,9 @@ pub struct MultipartSession {
     /// 矩阵 8 值 → 统一落 STANDARD;Complete 时随对象元数据记录请求类)。
     /// 序列化尾部追加,decode_session 八读回退,存量会话按 None。
     pub requested_storage_class: Option<String>,
+    /// SSE-KMS 会话绑定(M20 D3,ADR-29):Create 的 SSE-KMS 意愿;**必须
+    /// 尾部追加**(postcard 双读:存量无此字段走九读回退,不插中间)。
+    pub sse_kms: Option<SessionSseKms>,
 }
 
 /// 当前 Unix 秒(会话时间戳用)。
@@ -206,6 +226,7 @@ impl MultipartSession {
         checksum_alg: Option<fs3_core::ChecksumAlgorithm>,
         sse_key_md5: Option<String>,
         sse_s3: Option<SessionSseS3>,
+        sse_kms: Option<SessionSseKms>,
         requested_storage_class: Option<String>,
     ) -> Self {
         MultipartSession {
@@ -226,6 +247,7 @@ impl MultipartSession {
             retention: None,
             legal_hold: None,
             requested_storage_class,
+            sse_kms,
         }
     }
 
@@ -1108,6 +1130,7 @@ fn decode_session(v: &[u8]) -> Result<MultipartSession> {
             retention: None,
             legal_hold: None,
             requested_storage_class: None,
+            sse_kms: None,
         }
     }
     /// M12 前会话格式(含 sse_s3,无 object lock;W2-3 回退用)。
@@ -1128,9 +1151,52 @@ fn decode_session(v: &[u8]) -> Result<MultipartSession> {
         sse_key_md5: Option<String>,
         sse_s3: Option<SessionSseS3>,
     }
+    /// M20 前会话格式(含 object lock + storage class,无 sse_kms;
+    /// D3 九读回退:尾部追加纪律,存量会话 sse_kms = None)。
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct SessionV19 {
+        bucket: String,
+        key: String,
+        content_type: String,
+        user_meta: Vec<(String, String)>,
+        resp_headers: Vec<(String, String)>,
+        created: i64,
+        completed: bool,
+        final_etag: [u8; 16],
+        final_size: u64,
+        final_mtime: i64,
+        tags: Vec<(String, String)>,
+        checksum_alg: Option<fs3_core::ChecksumAlgorithm>,
+        sse_key_md5: Option<String>,
+        sse_s3: Option<SessionSseS3>,
+        retention: Option<fs3_core::Retention>,
+        legal_hold: Option<bool>,
+        requested_storage_class: Option<String>,
+    }
     match postcard::from_bytes::<MultipartSession>(v) {
         Ok(s) => Ok(s),
-        Err(_) => match postcard::from_bytes::<SessionV12d>(v) {
+        Err(_) => match postcard::from_bytes::<SessionV19>(v) {
+            Ok(s) => Ok(MultipartSession {
+                bucket: s.bucket,
+                key: s.key,
+                content_type: s.content_type,
+                user_meta: s.user_meta,
+                resp_headers: s.resp_headers,
+                created: s.created,
+                completed: s.completed,
+                final_etag: s.final_etag,
+                final_size: s.final_size,
+                final_mtime: s.final_mtime,
+                tags: s.tags,
+                checksum_alg: s.checksum_alg,
+                sse_key_md5: s.sse_key_md5,
+                sse_s3: s.sse_s3,
+                retention: s.retention,
+                legal_hold: s.legal_hold,
+                requested_storage_class: s.requested_storage_class,
+                sse_kms: None,
+            }),
+            Err(_) => match postcard::from_bytes::<SessionV12d>(v) {
             Ok(s) => Ok(MultipartSession {
                 bucket: s.bucket,
                 key: s.key,
@@ -1149,6 +1215,7 @@ fn decode_session(v: &[u8]) -> Result<MultipartSession> {
                 retention: None,
                 legal_hold: None,
                 requested_storage_class: None,
+                sse_kms: None,
             }),
             Err(_) => match postcard::from_bytes::<SessionV12c>(v) {
                 Ok(s) => Ok(into_session(
@@ -1239,6 +1306,7 @@ fn decode_session(v: &[u8]) -> Result<MultipartSession> {
                     },
                 },
             },
+        },
         },
     }
 }
@@ -6820,6 +6888,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             ),
         )
         .unwrap();
@@ -6865,6 +6934,7 @@ mod tests {
                 vec![],
                 vec![],
                 vec![],
+                None,
                 None,
                 None,
                 None,
@@ -6942,6 +7012,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             ),
         )
         .unwrap();
@@ -7005,6 +7076,7 @@ mod tests {
             vec![],
             None,
             Some("1B2M2Y8AsgTpgAmY7PhCfg==".to_string()),
+            None,
             None,
             None,
         );
@@ -7575,6 +7647,7 @@ mod tests {
                 vec![],
                 vec![],
                 vec![],
+                None,
                 None,
                 None,
                 None,
@@ -8199,6 +8272,7 @@ mod tests {
                     vec![],
                     vec![],
                     vec![],
+                    None,
                     None,
                     None,
                     None,

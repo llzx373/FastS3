@@ -568,6 +568,88 @@ impl fs3_engine::lifecycle::EngineAccess for SharedEngine {
 /// M6 / K4 优雅停机:SIGTERM/SIGINT → 停止接受连接 → 排空(≤ drain)→
 /// 引擎收尾(最终检查点 + 元数据关闭)→ 退出(升级流程的前置条件)。
 #[allow(clippy::too_many_arguments)]
+/// M20 E(ADR-29):装配 KMS 托管子进程(可选)+ VaultKms 客户端。
+/// 托管在场但拉起失败 = 启动失败(不静默降级)。token 自 token_file
+/// 读取,不进日志。G1 补 external 后端(addr + token_file 无 deploy)。
+fn assemble_kms(
+    cfg: &config::RootConfig,
+) -> fs3_core::Result<(
+    Option<Arc<fs3_kms::KmsServiceManager>>,
+    Option<Arc<fs3_kms::VaultKms>>,
+)> {
+    let manager: Option<Arc<fs3_kms::KmsServiceManager>> = match &cfg.kms.deploy {
+        Some(d) => {
+            let shares = d.init_key_shares.unwrap_or(5);
+            let mc = fs3_kms::ManagedConfig {
+                flavor: fs3_kms::Flavor::parse(&d.flavor)
+                    .map_err(|e| fs3_core::Error::InvalidArgument(e.to_string()))?,
+                binary: d.binary.clone().map(std::path::PathBuf::from),
+                port: d.port.unwrap_or(8200),
+                data_dir: std::path::PathBuf::from(&d.data_dir),
+                init_key_shares: shares,
+                init_key_threshold: shares.min(3),
+                auto_unseal: d.auto_unseal.unwrap_or(false),
+                key_file: d.key_file.clone().map(std::path::PathBuf::from),
+                timeout_ms: 3000,
+            };
+            let mgr = Arc::new(
+                fs3_kms::KmsServiceManager::new(mc)
+                    .map_err(|e| fs3_core::Error::InvalidArgument(e.to_string()))?,
+            );
+            let report = mgr
+                .deploy()
+                .map_err(|e| fs3_core::Error::InvalidArgument(e.to_string()))?;
+            tracing::info!(
+                "kms managed service ready: flavor={} addr={} initialized_now={}",
+                report.flavor,
+                report.addr,
+                report.initialized_now
+            );
+            if report.initialized_now {
+                tracing::warn!(
+                    "kms managed service: init/unseal keys 已一次性生成,请经控制台向导或 {} 获取并离线保管(不会再次显示)",
+                    mgr.config().data_dir.join("init-keys.json").display()
+                );
+            }
+            if let Ok(st) = mgr.status() {
+                tracing::info!(
+                    "kms managed status: running={} healthy={} sealed={:?} restarts={}",
+                    st.running,
+                    st.healthy,
+                    st.sealed,
+                    st.restarts
+                );
+            }
+            Some(mgr)
+        }
+        None => None,
+    };
+    let client = if let Some(mgr) = &manager {
+        let token = std::fs::read_to_string(mgr.config().token_file()).map_err(|e| {
+            fs3_core::Error::InvalidArgument(format!(
+                "kms token_file {}: {e}",
+                mgr.config().token_file().display()
+            ))
+        })?;
+        let token = token.trim().to_string();
+        if token.is_empty() {
+            return Err(fs3_core::Error::InvalidArgument(
+                "kms token_file empty after deploy".into(),
+            ));
+        }
+        let v = fs3_kms::VaultKms::new(fs3_kms::VaultKmsConfig {
+            addr: mgr.addr(),
+            token,
+            ..Default::default()
+        })
+        .map_err(|e| fs3_core::Error::InvalidArgument(e.to_string()))?;
+        Some(Arc::new(v))
+    } else {
+        None
+    };
+    Ok((manager, client))
+}
+
 fn cmd_serve(
     config_path: Option<PathBuf>,
     engine_cfg: &EngineConfig,
@@ -591,6 +673,20 @@ fn cmd_serve(
     // 此前 CLI 硬编码仅引擎层可配)
     if let Some(sol) = cfg.storage.small_object_limit {
         engine_cfg.small_object_limit = sol;
+    }
+    // M6 / K4:优雅停机标志提前创建(KMS token 续期 / admin / agent 共用)。
+    let shutdown = Arc::new(AtomicBool::new(false));
+    // M20 E(ADR-29):KMS 客户端必须在 Engine::open 之前装配(读路径 unwrap
+    // 走引擎持有的 RootKms;托管子进程与 token_file 同源)。
+    let (kms_manager, vault_kms) = assemble_kms(cfg)?;
+    if let Some(v) = &vault_kms {
+        engine_cfg.kms = Some(v.clone() as Arc<dyn fs3_kms::RootKms>);
+        v.spawn_token_renewer(
+            shutdown.clone(),
+            Duration::from_secs(30),
+            Duration::from_secs(120),
+        );
+        tracing::info!("kms client attached (token renewer spawned)");
     }
     let engine = Arc::new(parking_lot::RwLock::new(Engine::open(&engine_cfg)?));
     // M11 K1-1(ADR-12 DS1):SSE-S3 重包裹待办续跑——重启后 gen >
@@ -696,7 +792,8 @@ fn cmd_serve(
         metrics,
         // M11 L2-2:生命周期执行器共用同一 AuditRing(who=system:lifecycle)
         audit.clone(),
-    );
+    )
+    .with_kms(engine_cfg.kms.clone());
     // M14 H1-2(§4.12):热对象缓存(默认关;内存额度与 ≤256MiB 基线冲突的
     // 明示 —— 开启即主动扩大内存预算)
     if cfg.cache.enabled.unwrap_or(false) {
@@ -892,62 +989,8 @@ fn cmd_serve(
         None
     };
 
-    // M6 / K4:优雅停机标志(SIGTERM/SIGINT → 排空 → 引擎收尾)。
-    // 提前创建供 admin/agent 等后台模块注入(agent 循环每周期观测)。
-    let shutdown = Arc::new(AtomicBool::new(false));
-
-    // M20 A2(ADR-29 KR5):[kms.deploy] 托管 KMS 服务——生成配置 + 子进程
-    // 监督 + 首启引导(init/unseal key 只向操作者一次性交付,不进日志)。
-    // 显式 opt-in:配置在场但拉起失败 = 启动失败(不静默降级)。
-    let kms_manager: Option<Arc<fs3_kms::KmsServiceManager>> = match &cfg.kms.deploy {
-        Some(d) => {
-            let shares = d.init_key_shares.unwrap_or(5);
-            let mc = fs3_kms::ManagedConfig {
-                flavor: fs3_kms::Flavor::parse(&d.flavor)
-                    .map_err(|e| fs3_core::Error::InvalidArgument(e.to_string()))?,
-                binary: d.binary.clone().map(std::path::PathBuf::from),
-                port: d.port.unwrap_or(8200),
-                data_dir: std::path::PathBuf::from(&d.data_dir),
-                init_key_shares: shares,
-                init_key_threshold: shares.min(3),
-                auto_unseal: d.auto_unseal.unwrap_or(false),
-                key_file: d.key_file.clone().map(std::path::PathBuf::from),
-                timeout_ms: 3000,
-            };
-            let mgr = Arc::new(
-                fs3_kms::KmsServiceManager::new(mc)
-                    .map_err(|e| fs3_core::Error::InvalidArgument(e.to_string()))?,
-            );
-            let report = mgr
-                .deploy()
-                .map_err(|e| fs3_core::Error::InvalidArgument(e.to_string()))?;
-            tracing::info!(
-                "kms managed service ready: flavor={} addr={} initialized_now={}",
-                report.flavor,
-                report.addr,
-                report.initialized_now
-            );
-            if report.initialized_now {
-                tracing::warn!(
-                    "kms managed service: init/unseal keys 已一次性生成,请经控制台向导或                      {} 获取并离线保管(不会再次显示)",
-                    mgr.config().data_dir.join("init-keys.json").display()
-                );
-            }
-            // A3 将把 mgr 注入 admin(/v1/admin/kms/service/*);此处先保留
-            // Arc 至 cmd_serve 结束(Drop = 优雅终止子进程 + 停监督线程)
-            if let Ok(st) = mgr.status() {
-                tracing::info!(
-                    "kms managed status: running={} healthy={} sealed={:?} restarts={}",
-                    st.running,
-                    st.healthy,
-                    st.sealed,
-                    st.restarts
-                );
-            }
-            Some(mgr)
-        }
-        None => None,
-    };
+    // M20 A3:kms_manager 已在 Engine::open 前由 assemble_kms 拉起;
+    // 此处只注入 admin 控制面(未配置 = None → 501)。
 
     // 管理 API(H1;可选)
     let admin_listen = cli_admin_listen.or_else(|| cfg.admin.listen.clone());
@@ -1268,6 +1311,8 @@ pub(crate) fn engine_config_inner_multi(
         devices: devices.to_vec(),
         meta_dir: meta_dir.to_path_buf(),
         debug_io: None,
+        // M20 E(ADR-29):KMS 客户端由 cmd_serve 按配置装配(check 工具等 = None)
+        kms: None,
         sync_mode: fs3_meta::SyncMode::Group,
         group_commit_ms: fs3_core::DEFAULT_GROUP_COMMIT_MS,
         checkpoint_interval_secs: fs3_core::DEFAULT_CHECKPOINT_INTERVAL_SECS,
@@ -1314,6 +1359,8 @@ fn engine_config(
         devices,
         meta_dir,
         debug_io: None,
+        // M20 E(ADR-29):KMS 客户端由 cmd_serve 按配置装配(CLI 命令 = None)
+        kms: None,
         sync_mode,
         group_commit_ms: group_commit_ms.unwrap_or(fs3_core::DEFAULT_GROUP_COMMIT_MS),
         checkpoint_interval_secs: checkpoint_interval

@@ -152,6 +152,9 @@ pub struct S3Service {
     /// 密钥策略缓存(J4:access → Policy;None = 无策略 = 放行)。
     /// 与 meta 中 KeyRecord.policy 保持同步(启动恢复/写入时更新)。
     policies: std::sync::Mutex<std::collections::HashMap<String, Option<crate::policy::Policy>>>,
+    /// M20 D3(ADR-29):SSE-KMS 根密钥客户端(与 Engine.kms 同一实例;
+    /// None = 未配置,KMS 意图 → 501 NotImplemented)。
+    kms: Option<std::sync::Arc<dyn fs3_kms::RootKms>>,
     /// SA 嵌入策略缓存(M18 S1;ADR-28 DI2.4:access → 解析后 Policy;
     /// None = 该密钥无嵌入策略 = 本层 no-op)。与 meta 中
     /// KeyRecord.embedded_policy 同步:add_key_owned/restore 写入,
@@ -252,6 +255,69 @@ impl S3Service {
         )
     }
 
+    /// 注入 SSE-KMS 根密钥客户端(M20 D3;与 Engine.kms 同一实例;
+    /// None = 未配置)。fs3d 装配:engine cfg.kms 与 service kms 同源。
+    pub fn with_kms(mut self, kms: Option<std::sync::Arc<dyn fs3_kms::RootKms>>) -> Self {
+        self.kms = kms;
+        self
+    }
+
+    /// M20 D3(ADR-29 KR6.3):KmsError → AWS 风格 XML 错误。
+    fn map_kms_error(e: fs3_kms::KmsError) -> S3Error {
+        match e {
+            fs3_kms::KmsError::KeyNotFound(d) => {
+                S3Error::new(S3ErrorCode::KmsNotFoundException).with_message(d)
+            }
+            fs3_kms::KmsError::KeyDisabled(d) => {
+                S3Error::new(S3ErrorCode::KmsDisabledException).with_message(d)
+            }
+            fs3_kms::KmsError::Unavailable(d) => {
+                S3Error::new(S3ErrorCode::KmsUnavailableException).with_message(d)
+            }
+            fs3_kms::KmsError::AccessDenied(d) => {
+                S3Error::new(S3ErrorCode::KmsAccessDeniedException).with_message(d)
+            }
+            fs3_kms::KmsError::InvalidCiphertext => S3Error::new(S3ErrorCode::InvalidRequest)
+                .with_message(
+                    "The object was stored with a different server-side encryption context.",
+                ),
+            fs3_kms::KmsError::Config(d) => {
+                S3Error::new(S3ErrorCode::NotImplemented).with_message(d)
+            }
+            fs3_kms::KmsError::Backend(d) => {
+                S3Error::new(S3ErrorCode::InternalError).with_message(format!("kms: {d}"))
+            }
+            fs3_kms::KmsError::Io(e) => S3Error::new(S3ErrorCode::KmsUnavailableException)
+                .with_message(format!("kms io: {e}")),
+        }
+    }
+
+    /// M20 D3(ADR-29 KR3):KMS 写密钥 mint(写锁之外执行;KMS RTT 不占
+    /// 引擎写锁)。KMS 未配置 → 501 NotImplemented(显式,不静默)。
+    fn mint_kms_write_key(
+        &self,
+        bucket: &str,
+        key: &str,
+        h: &crate::sse::SseKmsHeaders,
+    ) -> Result<fs3_core::SseKmsWriteKey, S3Error> {
+        let kms = self.kms.as_ref().ok_or_else(|| {
+            S3Error::new(S3ErrorCode::NotImplemented)
+                .with_message("SSE-KMS requested but no KMS backend is configured.")
+        })?;
+        let ctx = fs3_kms::KmsContext::object(bucket, key)
+            .with_suffix(h.context.as_deref().unwrap_or(""));
+        let out = kms
+            .mint(h.key_id.as_deref(), &ctx)
+            .map_err(Self::map_kms_error)?;
+        Ok(fs3_core::SseKmsWriteKey::new(
+            out.key_name,
+            out.wrapped_dek,
+            ctx.as_str().to_string(),
+            *out.data_key.expose(),
+        )
+        .with_bucket_key_enabled(h.bucket_key_enabled))
+    }
+
     /// 带指标/审计的构造(admin API 共享同一注册表)。
     pub fn with_observability(
         engine: Arc<parking_lot::RwLock<Engine>>,
@@ -277,6 +343,7 @@ impl S3Service {
             limiter: Arc::new(crate::ratelimit::KeyLimiter::new()),
             cache: None,
             policies: std::sync::Mutex::new(std::collections::HashMap::new()),
+            kms: None,
             embedded_policies: std::sync::Mutex::new(std::collections::HashMap::new()),
             bucket_policies: std::sync::Mutex::new(std::collections::HashMap::new()),
             iam_users: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -3205,11 +3272,19 @@ impl S3Service {
                 crate::sse::SseWriteIntent::None
             }
         };
-        // M20 D3/E:SSE-KMS 写密钥经 RootKms mint;接线前显式 501 不静默
-        if matches!(intent, crate::sse::SseWriteIntent::SseKms(_)) {
-            return Err(S3Error::new(S3ErrorCode::NotImplemented)
-                .with_message("SSE-KMS write path is not wired on this call site (M20 D3)."));
-        }
+        // M20 D3(ADR-29):KMS 写密钥 mint(写锁之外;RTT 不占引擎写锁)
+        // M20 D3:目标对象 (bucket,key) — StreamTarget::Object 臂才有 KMS
+        // 意愿(Part 臂已在意愿裁决显式拒绝携带 KMS 头)
+        let (kms_tgt_bucket, kms_tgt_key) = match &target {
+            StreamTarget::Object { bucket, key } => (bucket.as_str(), key.as_str()),
+            StreamTarget::Part { .. } => ("", ""),
+        };
+        let kms_key = match &intent {
+            crate::sse::SseWriteIntent::SseKms(h) => {
+                Some(self.mint_kms_write_key(kms_tgt_bucket, kms_tgt_key, h)?)
+            }
+            _ => None,
+        };
         let use_s3 = matches!(intent, crate::sse::SseWriteIntent::SseS3);
 
         // 载荷哈希处理(M9/D3:与缓冲 PUT 同一认证语义——header 认证
@@ -3245,6 +3320,7 @@ impl S3Service {
         // K1-2:SSE-S3 会话标记(响应回显用;part 请求零头,引擎内部以
         // 会话 DEK 加密)
         let mut sess_sse_s3 = false;
+        let mut sess_sse_kms: Option<fs3_meta::SessionSseKms> = None;
         if let StreamTarget::Part {
             bucket, upload_id, ..
         } = &target
@@ -3256,6 +3332,7 @@ impl S3Service {
             if let Some(sess) = &sess {
                 crate::sse::check_session_sse(sess.sse_key_md5.as_deref(), ssec.as_ref())?;
                 sess_sse_s3 = sess.sse_s3.is_some();
+                sess_sse_kms = sess.sse_kms.clone();
             }
         }
         // 统一收口:执行写入(对象或分片),返回 (etag, 对象版本视图——版本化
@@ -3288,13 +3365,12 @@ impl S3Service {
                     } else {
                         None
                     };
-                    let write_key = match (&ssec, &s3_key) {
-                        (Some(s), None) => Some(fs3_core::SseWriteKey::SseC(&s.key)),
-                        (None, Some(w)) => Some(fs3_core::SseWriteKey::SseS3(w)),
-                        (None, None) => None,
-                        (Some(_), Some(_)) => {
-                            unreachable!("SSE-C/SSE-S3 互斥已在意愿裁决判定")
-                        }
+                    let write_key = match (&ssec, &s3_key, &kms_key) {
+                        (Some(s), None, None) => Some(fs3_core::SseWriteKey::SseC(&s.key)),
+                        (None, Some(w), None) => Some(fs3_core::SseWriteKey::SseS3(w)),
+                        (None, None, Some(k)) => Some(fs3_core::SseWriteKey::SseKms(k.clone())),
+                        (None, None, None) => None,
+                        _ => unreachable!("SSE-C/SSE-S3/SSE-KMS 互斥已在意愿裁决判定"),
                     };
                     let lock = crate::object_lock::resolve_write(
                         &req.headers,
@@ -3533,6 +3609,18 @@ impl S3Service {
         // 为 SSE-S3 时回显,AWS 口径)
         if use_s3 || sess_sse_s3 {
             headers.push(crate::sse::sse_s3_response_header());
+        }
+        // M20 D3:SSE-KMS 回显(Object = mint 写密钥;Part = 会话绑定)
+        if let Some(k) = &kms_key {
+            headers.extend(crate::sse::kms_read_response_headers(
+                k.key_name(),
+                k.bucket_key_enabled(),
+            ));
+        } else if let Some(k) = &sess_sse_kms {
+            headers.extend(crate::sse::kms_read_response_headers(
+                &k.key_name,
+                k.bucket_key_enabled,
+            ));
         }
         // V3-5 + V4:x-amz-version-id(Enabled = hex(vk);Suspended = "null";
         // Off 不回)
@@ -5531,10 +5619,13 @@ impl S3Service {
         // (SSE-C 头优先;两者同现显式拒绝;x-amz-server-side-encryption 非
         // AES256 值已在本调用内显式拒绝,K1-4)
         let intent = crate::sse::sse_write_intent(req, ssec.as_ref(), bkt.default_encryption)?;
-        if matches!(intent, crate::sse::SseWriteIntent::SseKms(_)) {
-            return Err(S3Error::new(S3ErrorCode::NotImplemented)
-                .with_message("SSE-KMS write path is not wired on this call site (M20 D3)."));
-        }
+        // M20 D3(ADR-29):KMS 写密钥 mint(写锁之外;RTT 不占引擎写锁)
+        let kms_key = match &intent {
+            crate::sse::SseWriteIntent::SseKms(h) => {
+                Some(self.mint_kms_write_key(&bucket, &key, h)?)
+            }
+            _ => None,
+        };
         let use_s3 = matches!(intent, crate::sse::SseWriteIntent::SseS3);
 
         // M9/A1 配套:ACL 家族头显式校验(接受但不生效,单账号私有默认语义;
@@ -5559,11 +5650,12 @@ impl S3Service {
         } else {
             None
         };
-        let write_key = match (&ssec, &s3_key) {
-            (Some(s), None) => Some(fs3_core::SseWriteKey::SseC(&s.key)),
-            (None, Some(w)) => Some(fs3_core::SseWriteKey::SseS3(w)),
-            (None, None) => None,
-            (Some(_), Some(_)) => unreachable!("SSE-C/SSE-S3 互斥已在意愿裁决判定"),
+        let write_key = match (&ssec, &s3_key, &kms_key) {
+            (Some(s), None, None) => Some(fs3_core::SseWriteKey::SseC(&s.key)),
+            (None, Some(w), None) => Some(fs3_core::SseWriteKey::SseS3(w)),
+            (None, None, Some(k)) => Some(fs3_core::SseWriteKey::SseKms(k.clone())),
+            (None, None, None) => None,
+            _ => unreachable!("SSE-C/SSE-S3/SSE-KMS 互斥已在意愿裁决判定"),
         };
         let lock = crate::object_lock::resolve_write(
             &req.headers,
@@ -5627,6 +5719,13 @@ impl S3Service {
         // M11 K1-2:SSE-S3 回显(显式头或桶默认生效,恒 AES256)
         if use_s3 {
             headers.push(crate::sse::sse_s3_response_header());
+        }
+        // M20 D3:SSE-KMS 回显(aws:kms + key 名 + 桶键值)
+        if let Some(k) = &kms_key {
+            headers.extend(crate::sse::kms_read_response_headers(
+                k.key_name(),
+                k.bucket_key_enabled(),
+            ));
         }
         // V3-5 + V4:x-amz-version-id(Enabled = hex;Suspended = "null";Off 不回)
         if let Some(v) = write_version_id_header(bucket_versioning, &meta) {
@@ -5704,18 +5803,24 @@ impl S3Service {
             }
         }
 
-        // M11 E1-2/E1-3 + D-E5(SSE-C)/ K1-2(SSE-S3):按 SseInfo.kind 分派——
+        // M11 E1-2/E1-3 + D-E5(SSE-C)/ K1-2(SSE-S3)/ M20 D3(SSE-KMS):
+        // 按 SseInfo.kind 分派——
         // · SSE-C 对象缺三头 → 400 InvalidRequest(AWS 口径:"The object was
         //   stored using a form of Server Side Encryption...");带三头 → E1-2
         //   校验 + D-E5 校验子比对(错 key 400;HEAD 不读数据同能发现);
-        // · SSE-S3 对象零客户头(服务端 KEK 体系自持解密);携带 SSE-C 头 →
-        //   显式 InvalidRequest(不静默拿客户密钥解 SSE-S3 对象,红线);
+        // · SSE-S3/SSE-KMS 对象零客户头(服务端/KMS 自持解密);携带 SSE-C
+        //   头 → 显式 InvalidRequest(不静默拿客户密钥解,红线);
         // · 未加密对象带三头 → 按 AWS 语义忽略(§4.2.1 明文裁决;正常返回)
         let ssec = match &meta.sse {
-            Some(sse) if sse.kind == fs3_core::SseKind::SseS3 => {
+            Some(sse)
+                if matches!(
+                    sse.kind,
+                    fs3_core::SseKind::SseS3 | fs3_core::SseKind::SseKms
+                ) =>
+            {
                 if crate::sse::has_customer_headers(req) {
                     return Err(S3Error::new(S3ErrorCode::InvalidRequest).with_message(
-                        "The object is SSE-S3 encrypted; SSE-C customer headers are not applicable.",
+                        "The object is server-side encrypted; SSE-C customer headers are not applicable.",
                     ));
                 }
                 None
@@ -5850,6 +5955,17 @@ impl S3Service {
                 if matches!(&meta.sse, Some(s) if s.kind == fs3_core::SseKind::SseS3) {
                     headers.push(crate::sse::sse_s3_response_header());
                 }
+                // M20 D3:SSE-KMS 对象回显(key 名/桶键值从 V2 载荷还原)
+                if matches!(&meta.sse, Some(s) if s.kind == fs3_core::SseKind::SseKms) {
+                    if let Some(s) = &meta.sse {
+                        if let Ok(parts) = s.kms_parts() {
+                            headers.extend(crate::sse::kms_read_response_headers(
+                                &parts.key_name,
+                                parts.bucket_key_enabled,
+                            ));
+                        }
+                    }
+                }
                 let total = meta.size;
                 let len = multipart_byte_length(&boundary, &meta.content_type, parts, total);
                 for (k, v) in headers.iter_mut() {
@@ -5968,6 +6084,17 @@ impl S3Service {
         // M11 K1-2:SSE-S3 对象恒回显 AES256(无客户头要求)
         if matches!(&meta.sse, Some(s) if s.kind == fs3_core::SseKind::SseS3) {
             headers.push(crate::sse::sse_s3_response_header());
+        }
+        // M20 D3:SSE-KMS 对象回显(key 名/桶键值从 V2 载荷还原)
+        if matches!(&meta.sse, Some(s) if s.kind == fs3_core::SseKind::SseKms) {
+            if let Some(s) = &meta.sse {
+                if let Ok(parts) = s.kms_parts() {
+                    headers.extend(crate::sse::kms_read_response_headers(
+                        &parts.key_name,
+                        parts.bucket_key_enabled,
+                    ));
+                }
+            }
         }
         if is_range {
             // S3 Content-Range 为闭区间:start-(end-1)/size
@@ -6149,18 +6276,20 @@ impl S3Service {
             Err(e) => return Err(map_engine_error(e, bucket, key)),
         };
         let resp_version_id = version_id_response_header(bkt.versioning, &meta);
-        // M11 E1-2/E1-3 + D-E5(SSE-C)/ K1-2(SSE-S3):与 op_get_object
-        // 同口径按 kind 分派——SSE-C 对象缺三头 → 400(AWS:attributes 属
-        // 对象读操作族,test_get_sse_c_encrypted_object_attributes);错 key →
-        // D-E5 校验子比对 400;SSE-S3 对象零客户头(带 SSE-C 头显式拒绝);
-        // AWS 模型中 attributes 响应无 SSE-S3 头,故 SSE-S3 不回显(与
-        // GET/HEAD 恒回显的口径差异写死——AWS GetObjectAttributes 响应
-        // 模型无 x-amz-server-side-encryption 字段)。
+        // M11 E1-2/E1-3 + D-E5(SSE-C)/ K1-2(SSE-S3)/ M20 D3(SSE-KMS):
+        // 与 op_get_object 同口径按 kind 分派——SSE-C 对象缺三头 → 400;
+        // SSE-S3/KMS 对象零客户头(带 SSE-C 头显式拒绝);AWS attributes
+        // 响应无 SSE 头,故不回显。
         let ssec = match &meta.sse {
-            Some(sse) if sse.kind == fs3_core::SseKind::SseS3 => {
+            Some(sse)
+                if matches!(
+                    sse.kind,
+                    fs3_core::SseKind::SseS3 | fs3_core::SseKind::SseKms
+                ) =>
+            {
                 if crate::sse::has_customer_headers(req) {
                     return Err(S3Error::new(S3ErrorCode::InvalidRequest).with_message(
-                        "The object is SSE-S3 encrypted; SSE-C customer headers are not applicable.",
+                        "The object is server-side encrypted; SSE-C customer headers are not applicable.",
                     ));
                 }
                 None
@@ -6319,10 +6448,14 @@ impl S3Service {
         // M11 K1-2/K1-3(DS2/DS3):SSE-S3 意愿 = 显式 AES256 头 > 桶默认
         // (SSE-C 优先,同现显式互斥 400)
         let intent = crate::sse::sse_write_intent(req, ssec.as_ref(), bkt.default_encryption)?;
-        if matches!(intent, crate::sse::SseWriteIntent::SseKms(_)) {
-            return Err(S3Error::new(S3ErrorCode::NotImplemented)
-                .with_message("SSE-KMS write path is not wired on this call site (M20 D3)."));
-        }
+        // M20 D3(ADR-29):KMS 写密钥 mint(写锁之外;RTT 不占引擎写锁;
+        // 会话绑定复用本次 mint,不二次往返)
+        let kms_key = match &intent {
+            crate::sse::SseWriteIntent::SseKms(h) => {
+                Some(self.mint_kms_write_key(&bucket, &key, h)?)
+            }
+            _ => None,
+        };
         let use_s3 = matches!(intent, crate::sse::SseWriteIntent::SseS3);
         // M11 K1-1:签发会话级 DEK(当前代 KEK 包裹;只存包裹值,DEK 明文
         // 零落盘——part 请求时按 kek_id 派生 KEK 现解现用)
@@ -6336,6 +6469,17 @@ impl S3Service {
             })
         } else {
             None
+        };
+        // M20 D3(ADR-29):SSE-KMS 会话绑定——复用上方 mint(transit 包裹;
+        // 只存密文 + 绑定后缀,明文零落盘)。part 请求时按会话现解现用(E2)。
+        let sess_kms = match (&intent, &kms_key) {
+            (crate::sse::SseWriteIntent::SseKms(h), Some(wk)) => Some(fs3_meta::SessionSseKms {
+                key_name: wk.key_name().to_string(),
+                wrapped_dek: wk.wrapped_dek().to_string(),
+                context_suffix: h.context.clone().unwrap_or_default(),
+                bucket_key_enabled: h.bucket_key_enabled,
+            }),
+            _ => None,
         };
         let (lock_ret, lock_hold) = crate::object_lock::parse_write_headers(&req.headers)?;
         if lock_ret.is_some() || lock_hold.is_some() {
@@ -6361,6 +6505,8 @@ impl S3Service {
                 ssec.as_ref().map(|s| s.key_md5_b64.clone()),
                 // M11 K1-1:SSE-S3 会话 DEK 包裹值绑定会话
                 sess_s3,
+                // M20 D3:SSE-KMS 会话绑定
+                sess_kms.clone(),
                 lock_ret,
                 lock_hold,
                 self.requested_storage_class(req),
@@ -6384,6 +6530,13 @@ impl S3Service {
         // M11 K1-2:SSE-S3 会话回显(显式头/桶默认生效,恒 AES256)
         if use_s3 {
             headers.push(crate::sse::sse_s3_response_header());
+        }
+        // M20 D3:SSE-KMS 会话回显(Create;mint 一次,密文落会话)
+        if let Some(k) = &sess_kms {
+            headers.extend(crate::sse::kms_read_response_headers(
+                &k.key_name,
+                k.bucket_key_enabled,
+            ));
         }
         Ok(ServiceResponse {
             status: 200,
@@ -6440,6 +6593,7 @@ impl S3Service {
         // K1-2:SSE-S3 会话标记(响应回显用;part 请求零头,引擎内部以
         // 会话 DEK 加密)
         let mut sess_sse_s3 = false;
+        let mut sess_sse_kms: Option<fs3_meta::SessionSseKms> = None;
         let sess = engine
             .meta()
             .get_multipart(upload_id)
@@ -6447,6 +6601,7 @@ impl S3Service {
         if let Some(sess) = &sess {
             crate::sse::check_session_sse(sess.sse_key_md5.as_deref(), ssec.as_ref())?;
             sess_sse_s3 = sess.sse_s3.is_some();
+            sess_sse_kms = sess.sse_kms.clone();
         }
         let part = engine
             .upload_part(
@@ -6472,6 +6627,13 @@ impl S3Service {
         // M11 K1-2:SSE-S3 会话回显(AWS:加密会话的 UploadPart 响应回显)
         if sess_sse_s3 {
             headers.push(crate::sse::sse_s3_response_header());
+        }
+        // M20 D3:SSE-KMS 会话回显(UploadPart;AWS 加密会话同口径)
+        if let Some(k) = &sess_sse_kms {
+            headers.extend(crate::sse::kms_read_response_headers(
+                &k.key_name,
+                k.bucket_key_enabled,
+            ));
         }
         Ok(ServiceResponse {
             status: 200,
@@ -6557,6 +6719,7 @@ impl S3Service {
         // key-MD5 与 Create 绑定值逐值比对);会话不存在时跳过,由引擎报
         // NoSuchUpload
         let mut sess_sse_s3 = false;
+        let mut sess_sse_kms: Option<fs3_meta::SessionSseKms> = None;
         let sess = engine
             .meta()
             .get_multipart(upload_id)
@@ -6564,12 +6727,13 @@ impl S3Service {
         if let Some(sess) = &sess {
             crate::sse::check_session_sse(sess.sse_key_md5.as_deref(), dst_ssec.as_ref())?;
             sess_sse_s3 = sess.sse_s3.is_some();
+            sess_sse_kms = sess.sse_kms.clone();
         }
         // DE3/DS3 显式错误(不静默):源加密而目标(会话)未加密 →
         // InvalidRequest(防静默解密落盘);源 SSE-C 而 copy-source 侧未给
         // 密钥 → InvalidRequest(源 SSE-S3 由服务端自持解包,无客户头语义;
         // 对 SSE-S3 源携带 SSE-C 头 → 显式拒绝混用)。引擎侧另有兜底
-        let dst_encrypted = dst_ssec.is_some() || sess_sse_s3;
+        let dst_encrypted = dst_ssec.is_some() || sess_sse_s3 || sess_sse_kms.is_some();
         if src_meta.sse.is_some() && !dst_encrypted {
             return Err(S3Error::new(S3ErrorCode::InvalidRequest).with_message(
                 "The copy source is SSE-C encrypted; the destination of the copy must specify SSE-C encryption.",
@@ -6582,11 +6746,13 @@ impl S3Service {
                 "The copy source is SSE-C encrypted; x-amz-copy-source-server-side-encryption-customer-* headers are required.",
             ));
         }
-        if matches!(&src_meta.sse, Some(s) if s.kind == fs3_core::SseKind::SseS3)
-            && cs_ssec.is_some()
+        if matches!(
+            &src_meta.sse,
+            Some(s) if matches!(s.kind, fs3_core::SseKind::SseS3 | fs3_core::SseKind::SseKms)
+        ) && cs_ssec.is_some()
         {
             return Err(S3Error::new(S3ErrorCode::InvalidRequest).with_message(
-                "The copy source is SSE-S3 encrypted; copy-source SSE-C headers are not applicable.",
+                "The copy source is server-side encrypted; copy-source SSE-C headers are not applicable.",
             ));
         }
         // M11 H1-1(D-E5 对齐到 copy 源侧):copy-source 错 key 早判——请求
@@ -6631,6 +6797,13 @@ impl S3Service {
         if sess_sse_s3 {
             headers.push(crate::sse::sse_s3_response_header());
         }
+        // M20 D3:UploadPartCopy 目标 = 会话(会话 KMS 绑定回显)
+        if let Some(k) = &sess_sse_kms {
+            headers.extend(crate::sse::kms_read_response_headers(
+                &k.key_name,
+                k.bucket_key_enabled,
+            ));
+        }
         Ok(ServiceResponse {
             status: 200,
             headers,
@@ -6674,6 +6847,7 @@ impl S3Service {
         // NoSuchUpload。K1-2:SSE-S3 会话标记(响应回显;Complete 零头,
         // 引擎内部以会话 DEK 解密、新签发对象级 DEK 重加密)
         let mut sess_sse_s3 = false;
+        let mut sess_sse_kms: Option<fs3_meta::SessionSseKms> = None;
         let sess = engine
             .meta()
             .get_multipart(upload_id)
@@ -6681,6 +6855,7 @@ impl S3Service {
         if let Some(sess) = &sess {
             crate::sse::check_session_sse(sess.sse_key_md5.as_deref(), ssec.as_ref())?;
             sess_sse_s3 = sess.sse_s3.is_some();
+            sess_sse_kms = sess.sse_kms.clone();
         }
         // 条件写(ADR-11 D6;AWS 语义:Complete 携带 If-Match/If-None-Match
         // 时对新对象的当前版本判定;引擎写锁内执行,check-then-act 原子)
@@ -6744,6 +6919,13 @@ impl S3Service {
         // M11 K1-2:SSE-S3 会话回显(AWS:Complete 响应回显会话加密算法)
         if sess_sse_s3 {
             headers.push(crate::sse::sse_s3_response_header());
+        }
+        // M20 D3:SSE-KMS 会话回显(Complete;重签对象级 DEK 后回显)
+        if let Some(k) = &sess_sse_kms {
+            headers.extend(crate::sse::kms_read_response_headers(
+                &k.key_name,
+                k.bucket_key_enabled,
+            ));
         }
         // V3-5 + V4:x-amz-version-id(Enabled = hex;Suspended = "null";
         // Off 不回)
@@ -6947,14 +7129,19 @@ impl S3Service {
             let before: u64 = meta.parts[..part_number as usize - 1].iter().sum();
             (before, meta.parts[part_number as usize - 1])
         };
-        // M11 E1-2/E1-3 + D-E5(SSE-C)/ K1-2(SSE-S3):与 op_get_object
-        // 同口径按 kind 分派(partNumber GET/HEAD 属同一读路径:SSE-C 对象
-        // 缺头 400、错 key 400;SSE-S3 对象零客户头、恒回显 AES256)
+        // M11 E1-2/E1-3 + D-E5(SSE-C)/ K1-2(SSE-S3)/ M20 D3(SSE-KMS):
+        // 与 op_get_object 同口径按 kind 分派(partNumber GET/HEAD:
+        // SSE-C 缺头 400;SSE-S3/KMS 零客户头、恒回显算法头)
         let ssec = match &meta.sse {
-            Some(sse) if sse.kind == fs3_core::SseKind::SseS3 => {
+            Some(sse)
+                if matches!(
+                    sse.kind,
+                    fs3_core::SseKind::SseS3 | fs3_core::SseKind::SseKms
+                ) =>
+            {
                 if crate::sse::has_customer_headers(req) {
                     return Err(S3Error::new(S3ErrorCode::InvalidRequest).with_message(
-                        "The object is SSE-S3 encrypted; SSE-C customer headers are not applicable.",
+                        "The object is server-side encrypted; SSE-C customer headers are not applicable.",
                     ));
                 }
                 None
@@ -7129,10 +7316,13 @@ impl S3Service {
         // 解析内显式拒绝,K1-4)
         let dst_intent =
             crate::sse::sse_write_intent(req, dst_ssec.as_ref(), dst_bkt.default_encryption)?;
-        if matches!(dst_intent, crate::sse::SseWriteIntent::SseKms(_)) {
-            return Err(S3Error::new(S3ErrorCode::NotImplemented)
-                .with_message("SSE-KMS write path is not wired on this call site (M20 D3)."));
-        }
+        // M20 D3(ADR-29 KR6.4):copy 目标 KMS 写密钥(上下文绑定目标对象)
+        let dst_kms_key = match &dst_intent {
+            crate::sse::SseWriteIntent::SseKms(h) => {
+                Some(self.mint_kms_write_key(&bucket, &key, h)?)
+            }
+            _ => None,
+        };
         let dst_use_s3 = matches!(dst_intent, crate::sse::SseWriteIntent::SseS3);
         if engine
             .meta()
@@ -7206,7 +7396,7 @@ impl S3Service {
         // 体系自持解包,无客户头语义,携带 SSE-C 源侧头 → 显式拒绝混用)。
         // 同密钥 COW 直灌、异密钥/跨算法解密重加密、明文源加密写由引擎按
         // 矩阵执行(见 copy_object_version_for)
-        let dst_encrypted = dst_ssec.is_some() || dst_use_s3;
+        let dst_encrypted = dst_ssec.is_some() || dst_use_s3 || dst_kms_key.is_some();
         if src_meta.sse.is_some() && !dst_encrypted {
             return Err(S3Error::new(S3ErrorCode::InvalidRequest).with_message(
                 "The copy source is SSE-C encrypted; the destination of the copy must specify SSE-C encryption.",
@@ -7219,11 +7409,13 @@ impl S3Service {
                 "The copy source is SSE-C encrypted; x-amz-copy-source-server-side-encryption-customer-* headers are required.",
             ));
         }
-        if matches!(&src_meta.sse, Some(s) if s.kind == fs3_core::SseKind::SseS3)
-            && cs_ssec.is_some()
+        if matches!(
+            &src_meta.sse,
+            Some(s) if matches!(s.kind, fs3_core::SseKind::SseS3 | fs3_core::SseKind::SseKms)
+        ) && cs_ssec.is_some()
         {
             return Err(S3Error::new(S3ErrorCode::InvalidRequest).with_message(
-                "The copy source is SSE-S3 encrypted; copy-source SSE-C headers are not applicable.",
+                "The copy source is server-side encrypted; copy-source SSE-C headers are not applicable.",
             ));
         }
         // M11 H1-1(D-E5 对齐到 copy 源侧):copy-source 错 key 早判——请求
@@ -7288,11 +7480,12 @@ impl S3Service {
         } else {
             None
         };
-        let dst_wk = match (&dst_ssec, &s3_key) {
-            (Some(s), None) => Some(fs3_core::SseWriteKey::SseC(&s.key)),
-            (None, Some(w)) => Some(fs3_core::SseWriteKey::SseS3(w)),
-            (None, None) => None,
-            (Some(_), Some(_)) => unreachable!("SSE-C/SSE-S3 互斥已在意愿裁决判定"),
+        let dst_wk = match (&dst_ssec, &s3_key, &dst_kms_key) {
+            (Some(s), None, None) => Some(fs3_core::SseWriteKey::SseC(&s.key)),
+            (None, Some(w), None) => Some(fs3_core::SseWriteKey::SseS3(w)),
+            (None, None, Some(k)) => Some(fs3_core::SseWriteKey::SseKms(k.clone())),
+            (None, None, None) => None,
+            _ => unreachable!("SSE-C/SSE-S3/SSE-KMS 互斥已在意愿裁决判定"),
         };
         let lock = crate::object_lock::resolve_write(
             &req.headers,
@@ -7351,6 +7544,13 @@ impl S3Service {
         // M11 K1-2:目标侧 SSE-S3 回显(显式头/目标桶默认生效,恒 AES256)
         if dst_use_s3 {
             headers.push(crate::sse::sse_s3_response_header());
+        }
+        // M20 D3:目标 KMS 回显(copy 重加密后的对象)
+        if let Some(k) = &dst_kms_key {
+            headers.extend(crate::sse::kms_read_response_headers(
+                k.key_name(),
+                k.bucket_key_enabled(),
+            ));
         }
         Ok(ServiceResponse {
             status: 200,
@@ -8453,6 +8653,26 @@ fn map_engine_error(e: CoreError, bucket: &str, key: &str) -> S3Error {
             S3Error::new(S3ErrorCode::InvalidObjectState).with_message(m)
         }
         CoreError::AccessDenied(m) => S3Error::new(S3ErrorCode::AccessDenied).with_message(m),
+        // M20 D3(ADR-29 KR6.3):引擎读/写路径 KMS 故障 → AWS 风格 XML
+        CoreError::Kms { fault, detail } => {
+            use fs3_core::KmsFault;
+            let mut err = match fault {
+                KmsFault::KeyNotFound => S3Error::new(S3ErrorCode::KmsNotFoundException),
+                KmsFault::KeyDisabled => S3Error::new(S3ErrorCode::KmsDisabledException),
+                KmsFault::Unavailable => S3Error::new(S3ErrorCode::KmsUnavailableException),
+                KmsFault::AccessDenied => S3Error::new(S3ErrorCode::KmsAccessDeniedException),
+                KmsFault::InvalidCiphertext => S3Error::new(S3ErrorCode::InvalidRequest)
+                    .with_message(
+                        "The object was stored with a different server-side encryption context.",
+                    ),
+                KmsFault::Backend => S3Error::new(S3ErrorCode::InternalError),
+            };
+            if !detail.is_empty() && fault != KmsFault::InvalidCiphertext {
+                err = err.with_message(detail);
+            }
+            err
+        }
+        CoreError::Unsupported(m) => S3Error::new(S3ErrorCode::NotImplemented).with_message(m),
         // 删除标记命中(未走显式判定的兜底路径;§3.4.3:无 versionId = 404)
         CoreError::DeleteMarker(_) => S3Error::new(S3ErrorCode::NoSuchKey)
             .with_extra("Key", key)

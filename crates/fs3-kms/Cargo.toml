@@ -6,6 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# M20 E:KmsError → fs3-core::Error::Kms 映射(引擎读路径错误保全分类)
+fs3-core.workspace = true
 # M20/B1(ADR-29 KR2):vaultrs(transit 客户端)+ reqwest(rustls,健康检查/mTLS
 # Identity 保留)。对 AGENT §9.3 依赖最小化的例外与理由见 ADR-29。
 vaultrs = "0.8"

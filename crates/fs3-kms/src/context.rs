@@ -36,6 +36,22 @@ impl KmsContext {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// 从存储的绑定标签构造(SseInfo V2 载荷的 context_binding 原样回放;
+    /// transit 侧 AAD 校验 = 篡改检测权威)。
+    pub fn from_stored(raw: &str) -> Self {
+        KmsContext(raw.to_string())
+    }
+
+    /// 在 canonical 上下文后追加补充绑定(M20 D1:客户端
+    /// x-amz-server-side-encryption-context 透传进 associated_data)。
+    pub fn with_suffix(&self, suffix: &str) -> Self {
+        if suffix.is_empty() {
+            self.clone()
+        } else {
+            KmsContext(format!("{}\u{1f}{}", self.0, suffix))
+        }
+    }
 }
 
 #[cfg(test)]

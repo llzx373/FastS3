@@ -460,6 +460,7 @@ pub struct SseKmsWriteKey {
     key_name: String,
     wrapped_dek: String,
     context_binding: String,
+    bucket_key_enabled: Option<bool>,
     data_key: [u8; 32],
 }
 
@@ -474,8 +475,19 @@ impl SseKmsWriteKey {
             key_name,
             wrapped_dek,
             context_binding,
+            bucket_key_enabled: None,
             data_key,
         }
+    }
+
+    /// 桶键头落盘值(D1:接受 + 回显 + 落 meta;优化不做)。
+    pub fn with_bucket_key_enabled(mut self, enabled: Option<bool>) -> Self {
+        self.bucket_key_enabled = enabled;
+        self
+    }
+
+    pub fn bucket_key_enabled(&self) -> Option<bool> {
+        self.bucket_key_enabled
     }
 
     pub fn key_name(&self) -> &str {
@@ -567,6 +579,7 @@ impl SseWriteKey<'_> {
                 nonce_base,
                 chunk_tags,
                 w.context_binding(),
+                w.bucket_key_enabled(),
             ),
         }
     }

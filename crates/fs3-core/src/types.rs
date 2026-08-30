@@ -274,6 +274,8 @@ pub struct KmsDekV2 {
     pub ciphertext: String,
     /// 上下文绑定标签(mint 时随 associated_data 送 KMS)。
     pub context_binding: String,
+    /// 桶键头落盘值(D1:接受 + 回显 + 落 meta;优化不做)。
+    pub bucket_key_enabled: Option<bool>,
 }
 
 /// 服务端加密信息(v1.2 填充,ADR-11 D0;§4.3 DS1 两级密钥 KEK/DEK)。
@@ -356,11 +358,13 @@ impl SseInfo {
         nonce_base: [u8; 12],
         chunk_tags: Vec<[u8; 16]>,
         context_binding: &str,
+        bucket_key_enabled: Option<bool>,
     ) -> Self {
         let payload = KmsDekV2 {
             key_name: key_name.to_string(),
             ciphertext: wrapped_dek.to_string(),
             context_binding: context_binding.to_string(),
+            bucket_key_enabled,
         };
         let mut buf = vec![SSE_KMS_DEK_VERSION];
         buf.extend(postcard::to_allocvec(&payload).expect("KmsDekV2 postcard encode infallible"));
@@ -389,8 +393,22 @@ impl SseInfo {
                 "kms wrapped_dek version {ver} unsupported (expected {SSE_KMS_DEK_VERSION})"
             )));
         }
-        postcard::from_bytes::<KmsDekV2>(rest)
-            .map_err(|e| Error::Corrupt(format!("kms wrapped_dek decode: {e}")))
+        postcard::from_bytes::<KmsDekV2>(rest).or_else(|_| {
+            // C1 已发布的三字段载荷(无 bucket_key_enabled)双读
+            #[derive(Deserialize)]
+            struct KmsDekV2Legacy {
+                key_name: String,
+                ciphertext: String,
+                context_binding: String,
+            }
+            postcard::from_bytes::<KmsDekV2Legacy>(rest).map(|l| KmsDekV2 {
+                key_name: l.key_name,
+                ciphertext: l.ciphertext,
+                context_binding: l.context_binding,
+                bucket_key_enabled: None,
+            })
+        })
+        .map_err(|e| Error::Corrupt(format!("kms wrapped_dek decode: {e}")))
     }
 }
 
@@ -2613,6 +2631,7 @@ mod tests {
             [0x09; 12],
             vec![[0x0A; 16]],
             "fasts3-ssekms-v1\u{1f}b\u{1f}k\u{1f}aws:kms",
+            None,
         );
         let bytes2 = postcard::to_allocvec(&v2).unwrap();
         let back2: SseInfo = postcard::from_bytes(&bytes2).unwrap();

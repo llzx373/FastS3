@@ -8105,6 +8105,7 @@ fn storage_class_requested_recorded() -> Result<()> {
         None,
         None,
         None,
+        None,
         Some("ONEZONE_IA".into()),
     )?;
     e.upload_part(
@@ -8227,6 +8228,7 @@ fn class_stats_accounting_five_paths() -> Result<()> {
             None,
             None,
             None,
+            None,
             Some("DEEP_ARCHIVE".into()),
         )
         .unwrap();
@@ -8323,4 +8325,237 @@ fn class_stats_accounting_five_paths() -> Result<()> {
     assert_eq!(s.class_sum(), (s.objects, s.bytes));
     e.abort();
     Ok(())
+}
+
+/// M20 E1/E2:MemoryKms 桩上 inline 与 extent SSE-KMS 写读往返;
+/// 读侧零客户头;KMS 停机 → Unavailable(不降级)。
+#[test]
+fn ssekms_inline_and_extent_roundtrip() {
+    let kms = std::sync::Arc::new(fs3_kms::MemoryKms::new());
+    let (_d, mut cfg) = setup();
+    cfg.kms = Some(kms.clone());
+    let mut e = open_engine(&cfg);
+
+    let small = rnd(1_000, 71);
+    let wk = e.kms_mint_write_key("b1", "kms-small", None, None).unwrap();
+    let wk_ref = fs3_core::SseWriteKey::SseKms(wk);
+    let m = e
+        .put_with_meta(
+            "b1",
+            "kms-small",
+            &mut Cursor::new(small.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            Some(&wk_ref),
+        )
+        .unwrap();
+    drop(wk_ref);
+    let sse = m.sse.as_ref().expect("kms sse");
+    assert_eq!(sse.kind, fs3_core::SseKind::SseKms);
+    assert!(sse.kms_parts().is_ok());
+    assert!(m.inline.is_some(), "1KiB 走内联");
+    let mut buf = vec![0u8; small.len()];
+    let n = e
+        .read_at_version_for(
+            "b1",
+            "kms-small",
+            None,
+            0,
+            &mut buf,
+            VersioningState::Off,
+            None,
+        )
+        .unwrap();
+    assert_eq!(&buf[..n], small.as_slice());
+
+    let large = rnd(80_000, 72);
+    let wk = e.kms_mint_write_key("b1", "kms-large", None, None).unwrap();
+    let wk_ref = fs3_core::SseWriteKey::SseKms(wk);
+    let m = e
+        .put_with_meta(
+            "b1",
+            "kms-large",
+            &mut Cursor::new(large.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            Some(&wk_ref),
+        )
+        .unwrap();
+    drop(wk_ref);
+    assert!(m.inline.is_none(), "80KiB 走 extent");
+    let mut out = Vec::new();
+    e.get_to_meta(&m, 0..u64::MAX, &mut out, None).unwrap();
+    assert_eq!(out, large);
+
+    kms.set_unavailable(true);
+    let err = e
+        .read_at_version_for(
+            "b1",
+            "kms-small",
+            None,
+            0,
+            &mut buf,
+            VersioningState::Off,
+            None,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::Kms {
+                fault: fs3_core::KmsFault::Unavailable,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    kms.set_unavailable(false);
+    e.close().unwrap();
+}
+
+/// M20 E2:copy 加密源 → 解密后按目标 key 重加密。
+#[test]
+fn ssekms_copy_reencrypt_under_new_key() {
+    let kms = std::sync::Arc::new(fs3_kms::MemoryKms::new());
+    let (_d, mut cfg) = setup();
+    cfg.kms = Some(kms);
+    let mut e = open_engine(&cfg);
+    let data = rnd(4_000, 73);
+    let wk = e.kms_mint_write_key("b1", "src", None, None).unwrap();
+    let r = fs3_core::SseWriteKey::SseKms(wk);
+    e.put_with_meta(
+        "b1",
+        "src",
+        &mut Cursor::new(data.clone()),
+        None,
+        vec![],
+        vec![],
+        vec![],
+        None,
+        None,
+        Some(&r),
+    )
+    .unwrap();
+    drop(r);
+    let dst_wk = e.kms_mint_write_key("b1", "dst", None, None).unwrap();
+    let dr = fs3_core::SseWriteKey::SseKms(dst_wk);
+    let m = e
+        .copy_object_version_for(
+            "b1",
+            "src",
+            None,
+            "b1",
+            "dst",
+            None,
+            None,
+            None,
+            None,
+            VersioningState::Off,
+            None,
+            Some(&dr),
+        )
+        .unwrap();
+    drop(dr);
+    assert_eq!(m.sse.as_ref().unwrap().kind, fs3_core::SseKind::SseKms);
+    let mut out = Vec::new();
+    e.get_to_meta(&m, 0..u64::MAX, &mut out, None).unwrap();
+    assert_eq!(out, data);
+    e.close().unwrap();
+}
+
+/// M20 E2:Complete 一次解密+重加密(会话 DEK 解分片,对象级新 DEK)。
+#[test]
+fn ssekms_multipart_complete_reencrypt() {
+    let kms = std::sync::Arc::new(fs3_kms::MemoryKms::new());
+    let (_d, mut cfg) = setup();
+    cfg.kms = Some(kms);
+    let mut e = open_engine(&cfg);
+    let wk = e.kms_mint_write_key("b1", "kms-mp", None, None).unwrap();
+    let uid = e
+        .create_multipart_lock(
+            "b1",
+            "kms-mp",
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            Some(fs3_meta::SessionSseKms {
+                key_name: wk.key_name().to_string(),
+                wrapped_dek: wk.wrapped_dek().to_string(),
+                context_suffix: String::new(),
+                bucket_key_enabled: None,
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    drop(wk);
+    let p1d = rnd(5 * 1024 * 1024 + 100, 74);
+    let p2d = rnd(1000, 75);
+    let p1 = e
+        .upload_part(&uid, 1, &mut Cursor::new(p1d.clone()), None, None)
+        .unwrap();
+    let p2 = e
+        .upload_part(&uid, 2, &mut Cursor::new(p2d.clone()), None, None)
+        .unwrap();
+    let m = e
+        .complete_multipart(
+            "b1",
+            "kms-mp",
+            &uid,
+            &[cp(1, p1.etag_hex()), cp(2, p2.etag_hex())],
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(m.sse.as_ref().unwrap().kind, fs3_core::SseKind::SseKms);
+    let mut expect = p1d.clone();
+    expect.extend_from_slice(&p2d);
+    let mut out = Vec::new();
+    e.get_to_meta(&m, 0..u64::MAX, &mut out, None).unwrap();
+    assert_eq!(out, expect);
+    e.close().unwrap();
+}
+
+/// M20 E2:ingest 通道按桶默认 aws:kms 现铸写密钥。
+#[test]
+fn ssekms_ingest_channel_default_encryption() {
+    let kms = std::sync::Arc::new(fs3_kms::MemoryKms::new());
+    let (_d, mut cfg) = setup();
+    cfg.kms = Some(kms);
+    let mut e = open_engine(&cfg);
+    let mut b = e.meta().get_bucket("b1").unwrap().unwrap();
+    b.default_encryption = Some(fs3_core::SseAlgorithm::Kms);
+    e.meta().commit_bucket_put("b1", &b).unwrap();
+
+    let body = b"ingest-kms-body".to_vec();
+    let m = e
+        .ingest_put_object(
+            "b1",
+            "ing-k",
+            &mut Cursor::new(body.clone()),
+            Some("text/plain"),
+            vec![],
+            vec![],
+            None,
+            1_700_000_001,
+        )
+        .unwrap();
+    assert_eq!(m.sse.as_ref().unwrap().kind, fs3_core::SseKind::SseKms);
+    let mut out = Vec::new();
+    e.get_to_meta(&m, 0..u64::MAX, &mut out, None).unwrap();
+    assert_eq!(out, body);
+    e.close().unwrap();
 }

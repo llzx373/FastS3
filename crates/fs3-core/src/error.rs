@@ -2,6 +2,34 @@
 
 use std::io;
 
+/// SSE-KMS 故障分类(M20,ADR-29 KR6.3;协议层映射:
+/// KeyNotFound → KMS.NotFoundException / KeyDisabled → KMS.DisabledException /
+/// Unavailable → KMS.UnavailableException / AccessDenied → KMS.AccessDeniedException /
+/// InvalidCiphertext → InvalidRequest)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KmsFault {
+    KeyNotFound,
+    KeyDisabled,
+    Unavailable,
+    AccessDenied,
+    InvalidCiphertext,
+    Backend,
+}
+
+impl std::fmt::Display for KmsFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            KmsFault::KeyNotFound => "KeyNotFound",
+            KmsFault::KeyDisabled => "KeyDisabled",
+            KmsFault::Unavailable => "Unavailable",
+            KmsFault::AccessDenied => "AccessDenied",
+            KmsFault::InvalidCiphertext => "InvalidCiphertext",
+            KmsFault::Backend => "Backend",
+        };
+        f.write_str(name)
+    }
+}
+
 /// FastS3 统一错误。
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -77,6 +105,14 @@ pub enum Error {
     /// 引擎写锁内对当前版本元数据判定;S3 层映射 412 PreconditionFailed)。
     #[error("precondition failed: {0}")]
     PreconditionFailed(String),
+
+    /// SSE-KMS 故障(M20,ADR-29 KR6.3;分类与 fs3-kms::KmsError 对齐,
+    /// 协议层映射 AWS 风格 KMS.* XML;detail 不含任何密钥材料)。
+    #[error("kms error: {fault} {detail}")]
+    Kms {
+        fault: crate::error::KmsFault,
+        detail: String,
+    },
 
     /// checksum 值不符(M11 C1-4,ADR-12:UploadPart/Complete 的分片或复合
     /// checksum 与客户端声明值不匹配;S3 层映射 400 BadDigest)。

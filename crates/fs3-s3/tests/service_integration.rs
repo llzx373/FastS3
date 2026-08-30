@@ -13602,3 +13602,217 @@ fn get_session_token_no_elevation_after_r1() {
     assert_eq!(rec.tenant_id, None);
     assert_eq!(rec.inline_policy, None);
 }
+
+/// M20 D3/E:MemoryKms 桩装配引擎+服务。
+fn setup_kms() -> (
+    tempfile::TempDir,
+    S3Service,
+    Arc<fs3_kms::MemoryKms>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("disk.img");
+    std::fs::File::create(&img)
+        .unwrap()
+        .set_len(128 * 1024 * 1024)
+        .unwrap();
+    fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
+    let kms = Arc::new(fs3_kms::MemoryKms::new());
+    let cfg = fs3_engine::EngineConfig {
+        devices: vec![img],
+        meta_dir: dir.path().join("meta"),
+        compaction: fs3_engine::CompactionConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        kms: Some(kms.clone()),
+        ..Default::default()
+    };
+    let engine = Arc::new(parking_lot::RwLock::new(Engine::open(&cfg).unwrap()));
+    let svc = S3Service::new(
+        engine,
+        vec![Credentials {
+            access_key: "test".into(),
+            secret_key: "secret123".into(),
+        }],
+        "us-east-1".into(),
+        false,
+    )
+    .with_kms(Some(kms.clone()));
+    (dir, svc, kms)
+}
+
+fn kms_req(method: &str, path: &str, query: &[(&str, &str)], body: Vec<u8>) -> S3Request {
+    ssec_req_q(
+        method,
+        path,
+        query,
+        &[(SSE_S3_HDR, "aws:kms")],
+        body,
+    )
+}
+
+/// M20 D3:PUT/GET/HEAD aws:kms 往返 + 停机映射 KMS.UnavailableException。
+#[test]
+fn ssekms_put_get_head_roundtrip_and_vault_down() {
+    let (_d, svc, kms) = setup_kms();
+    assert_eq!(status(&svc.handle(&req("PUT", "/kmsbkt", vec![]))), 200);
+    let body = b"hello-kms".to_vec();
+    let r = svc.handle(&kms_req("PUT", "/kmsbkt/o", &[], body.clone()));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let put = r.unwrap();
+    assert_eq!(
+        hdr(&put, "x-amz-server-side-encryption").as_deref(),
+        Some("aws:kms")
+    );
+
+    let head = svc.handle(&req("HEAD", "/kmsbkt/o", vec![])).unwrap();
+    assert_eq!(
+        hdr(&head, "x-amz-server-side-encryption").as_deref(),
+        Some("aws:kms")
+    );
+    let get = svc.handle(&req("GET", "/kmsbkt/o", vec![])).unwrap();
+    assert_eq!(
+        hdr(&get, "x-amz-server-side-encryption").as_deref(),
+        Some("aws:kms")
+    );
+    read_body(&svc, &get, &body);
+
+    // MemoryKms 自动建 key,停机映射 KMS.UnavailableException(503)
+    kms.set_unavailable(true);
+    let r = svc.handle(&kms_req("PUT", "/kmsbkt/down", &[], b"x".to_vec()));
+    assert_eq!(err_code(&r), "KmsUnavailableException", "{r:?}");
+    assert_eq!(status(&r), 503);
+    let r = svc.handle(&req("GET", "/kmsbkt/o", vec![]));
+    assert_eq!(err_code(&r), "KmsUnavailableException", "{r:?}");
+    kms.set_unavailable(false);
+    let get = svc.handle(&req("GET", "/kmsbkt/o", vec![])).unwrap();
+    read_body(&svc, &get, &body);
+}
+
+/// M20 D3:CopyObject 加密源按目标 key 重加密;multipart 会话往返。
+#[test]
+fn ssekms_copy_and_multipart_roundtrip() {
+    let (_d, svc, _kms) = setup_kms();
+    assert_eq!(status(&svc.handle(&req("PUT", "/kmsbkt", vec![]))), 200);
+    let plain = b"copy-src".to_vec();
+    assert_eq!(
+        status(&svc.handle(&kms_req("PUT", "/kmsbkt/src", &[], plain.clone()))),
+        200
+    );
+    let r = svc.handle(&ssec_req_q(
+        "PUT",
+        "/kmsbkt/dst",
+        &[],
+        &[
+            ("x-amz-copy-source", "/kmsbkt/src"),
+            (SSE_S3_HDR, "aws:kms"),
+        ],
+        vec![],
+    ));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let get = svc.handle(&req("GET", "/kmsbkt/dst", vec![])).unwrap();
+    read_body(&svc, &get, &plain);
+
+    let init = svc
+        .handle(&kms_req(
+            "POST",
+            "/kmsbkt/mp.bin",
+            &[("uploads", "")],
+            vec![],
+        ))
+        .unwrap();
+    assert_eq!(
+        hdr(&init, "x-amz-server-side-encryption").as_deref(),
+        Some("aws:kms")
+    );
+    let xml = body_str(&init);
+    let upload_id = extract(&xml, "UploadId");
+    let p1 = vec![0x41u8; 5 * 1024 * 1024];
+    let p2 = b"tail".to_vec();
+    let r1 = svc
+        .handle(&req_q(
+            "PUT",
+            "/kmsbkt/mp.bin",
+            &[("partNumber", "1"), ("uploadId", &upload_id)],
+            p1.clone(),
+        ))
+        .unwrap();
+    let r2 = svc
+        .handle(&req_q(
+            "PUT",
+            "/kmsbkt/mp.bin",
+            &[("partNumber", "2"), ("uploadId", &upload_id)],
+            p2.clone(),
+        ))
+        .unwrap();
+    let et1 = etag_of(&r1);
+    let et2 = etag_of(&r2);
+    let et1 = et1.trim_matches('"');
+    let et2 = et2.trim_matches('"');
+    let complete = format!(
+        r#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>&quot;{et1}&quot;</ETag></Part><Part><PartNumber>2</PartNumber><ETag>&quot;{et2}&quot;</ETag></Part></CompleteMultipartUpload>"#
+    );
+    let r = svc.handle(&req_q(
+        "POST",
+        "/kmsbkt/mp.bin",
+        &[("uploadId", &upload_id)],
+        complete.into_bytes(),
+    ));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let get = svc.handle(&req("GET", "/kmsbkt/mp.bin", vec![])).unwrap();
+    let mut expect = p1;
+    expect.extend_from_slice(&p2);
+    read_body(&svc, &get, &expect);
+}
+
+/// M20 E2:UploadPartCopy 加密源灌入 aws:kms 会话,目标保持 SSE-KMS。
+#[test]
+fn ssekms_upload_part_copy_keeps_sse() {
+    let (_d, svc, _kms) = setup_kms();
+    assert_eq!(status(&svc.handle(&req("PUT", "/kmsbkt", vec![]))), 200);
+    let src = b"part-copy-kms".to_vec();
+    assert_eq!(
+        status(&svc.handle(&kms_req("PUT", "/kmsbkt/src", &[], src.clone()))),
+        200
+    );
+    let init = svc
+        .handle(&kms_req(
+            "POST",
+            "/kmsbkt/upc",
+            &[("uploads", "")],
+            vec![],
+        ))
+        .unwrap();
+    let uid = extract(&body_str(&init), "UploadId");
+    let r = svc.handle(&ssec_req_q(
+        "PUT",
+        "/kmsbkt/upc",
+        &[("partNumber", "1"), ("uploadId", &uid)],
+        &[("x-amz-copy-source", "/kmsbkt/src")],
+        vec![],
+    ));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let et = extract(&body_str(&r.unwrap()), "ETag");
+    let et = et.trim_matches('"');
+    let complete = format!(
+        r#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>&quot;{et}&quot;</ETag></Part></CompleteMultipartUpload>"#
+    );
+    let r = svc.handle(&req_q(
+        "POST",
+        "/kmsbkt/upc",
+        &[("uploadId", &uid)],
+        complete.into_bytes(),
+    ));
+    assert_eq!(status(&r), 200, "{r:?}");
+    let done = r.unwrap();
+    assert_eq!(
+        hdr(&done, "x-amz-server-side-encryption").as_deref(),
+        Some("aws:kms")
+    );
+    let get = svc.handle(&req("GET", "/kmsbkt/upc", vec![])).unwrap();
+    read_body(&svc, &get, &src);
+    assert_eq!(
+        hdr(&get, "x-amz-server-side-encryption").as_deref(),
+        Some("aws:kms")
+    );
+}
