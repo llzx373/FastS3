@@ -3773,6 +3773,14 @@ impl Engine {
         self.kms.clone()
     }
 
+    /// M20 F1:KMS Prometheus 文本(未配置 = 空串,admin /metrics 不渲染组)。
+    pub fn kms_metrics_text(&self) -> String {
+        self.kms
+            .as_ref()
+            .map(|k| k.render_metrics())
+            .unwrap_or_default()
+    }
+
     /// KEK 代状态(admin 状态端点数据源;只含代数/时间戳,零密钥材料)。
     pub fn sse_s3_kek_state(&self) -> Result<fs3_meta::SseKekGenState> {
         self.meta.sse_kek_gen_state()

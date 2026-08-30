@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use fs3_admin::{AdminConfig, AdminServer};
 use fs3_engine::{Engine, EngineConfig};
+use fs3_kms::RootKms;
 use fs3_s3::auth::Credentials;
 use fs3_s3::S3Service;
 use parking_lot::RwLock;
@@ -203,7 +204,46 @@ fn admin_status_metrics_and_auth() {
         !body.contains("fasts3_lifecycle_cycles_total"),
         "metrics body: {body}"
     );
+    // M20 F1:未配置 KMS 时指标组缺席
+    assert!(
+        !body.contains("fasts3_kms_mint_total"),
+        "metrics body: {body}"
+    );
 
+    let _ = handle;
+}
+
+/// M20 F1:装配 MemoryKms 后 admin /metrics 可见 fasts3_kms_* 分账。
+#[test]
+fn kms_metrics_ops_attribution() {
+    let (_d, img) = setup();
+    let kms = std::sync::Arc::new(fs3_kms::MemoryKms::new());
+    let cfg = EngineConfig {
+        devices: vec![img.clone()],
+        meta_dir: img.parent().unwrap().join("meta"),
+        kms: Some(kms.clone()),
+        ..Default::default()
+    };
+    let ctx = fs3_kms::KmsContext::object("b", "k");
+    let _ = kms.mint(None, &ctx).unwrap();
+    let _ = kms.mint(None, &ctx).unwrap();
+    kms.set_unavailable(true);
+    let _ = kms.mint(None, &ctx);
+    kms.set_unavailable(false);
+    let (sock, handle) = start_admin(&cfg, "sekret");
+    let sock = sock.trim_start_matches("unix://");
+    let (code, body) = http_unix(sock, "GET", "/v1/admin/metrics", None, "sekret");
+    assert_eq!(code, 200);
+    assert!(
+        body.contains("fasts3_kms_mint_total{result=\"ok\"} 2"),
+        "metrics body: {body}"
+    );
+    assert!(
+        body.contains("fasts3_kms_mint_total{result=\"error\"} 1"),
+        "metrics body: {body}"
+    );
+    assert!(body.contains("fasts3_kms_error_total 1"), "{body}");
+    assert!(!body.contains("key_id"), "key_id 不得进标签: {body}");
     let _ = handle;
 }
 

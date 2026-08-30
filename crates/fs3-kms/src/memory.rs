@@ -15,6 +15,7 @@ use zeroize::Zeroize;
 use crate::context::KmsContext;
 use crate::error::KmsError;
 use crate::kms::{DataKey, KeyMetadata, KmsStatus, MintedKey, RootKms};
+use crate::metrics::KmsMetrics;
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 const PREFIX: &str = "mem:v1:";
@@ -24,6 +25,7 @@ pub struct MemoryKms {
     default_key: String,
     keys: Mutex<HashMap<String, KeyMetadata>>,
     down: AtomicBool,
+    metrics: KmsMetrics,
 }
 
 impl Default for MemoryKms {
@@ -41,6 +43,7 @@ impl MemoryKms {
             default_key: name,
             keys: Mutex::new(keys),
             down: AtomicBool::new(false),
+            metrics: KmsMetrics::default(),
         }
     }
 
@@ -104,19 +107,25 @@ fn unwrap_raw(wrapped: &str, ctx: &KmsContext) -> Result<[u8; 32], KmsError> {
 
 impl RootKms for MemoryKms {
     fn mint(&self, key_name: Option<&str>, ctx: &KmsContext) -> Result<MintedKey, KmsError> {
-        self.ensure_up()?;
-        let name = key_name.unwrap_or(&self.default_key).to_string();
-        {
-            let mut g = self.keys.lock().expect("memory kms keys");
-            g.entry(name.clone()).or_insert_with(|| meta(&name, 1));
-        }
-        let dk = DataKey::generate()?;
-        let wrapped = wrap(dk.expose(), ctx);
-        Ok(MintedKey {
-            key_name: name,
-            wrapped_dek: wrapped,
-            data_key: dk,
-        })
+        let t0 = std::time::Instant::now();
+        let r = (|| {
+            self.ensure_up()?;
+            let name = key_name.unwrap_or(&self.default_key).to_string();
+            {
+                let mut g = self.keys.lock().expect("memory kms keys");
+                g.entry(name.clone()).or_insert_with(|| meta(&name, 1));
+            }
+            let dk = DataKey::generate()?;
+            let wrapped = wrap(dk.expose(), ctx);
+            Ok(MintedKey {
+                key_name: name,
+                wrapped_dek: wrapped,
+                data_key: dk,
+            })
+        })();
+        self.metrics
+            .record_mint(r.is_ok(), t0.elapsed().as_micros() as u64);
+        r
     }
 
     fn unwrap_dek(
@@ -125,11 +134,17 @@ impl RootKms for MemoryKms {
         wrapped_dek: &str,
         ctx: &KmsContext,
     ) -> Result<DataKey, KmsError> {
-        self.ensure_up()?;
-        let mut raw = unwrap_raw(wrapped_dek, ctx)?;
-        let dk = DataKey::new(raw);
-        raw.zeroize();
-        Ok(dk)
+        let t0 = std::time::Instant::now();
+        let r = (|| {
+            self.ensure_up()?;
+            let mut raw = unwrap_raw(wrapped_dek, ctx)?;
+            let dk = DataKey::new(raw);
+            raw.zeroize();
+            Ok(dk)
+        })();
+        self.metrics
+            .record_unwrap(r.is_ok(), t0.elapsed().as_micros() as u64);
+        r
     }
 
     fn create_key(&self, name: &str) -> Result<KeyMetadata, KmsError> {
@@ -192,6 +207,10 @@ impl RootKms for MemoryKms {
                 detail: "memory".into(),
             }
         }
+    }
+
+    fn render_metrics(&self) -> String {
+        self.metrics.render()
     }
 }
 

@@ -174,7 +174,7 @@
 
 ### F. 横切:指标/审计/通知/admin(≈1 pw)
 
-- [ ] F1 指标:`fasts3_kms_{mint,unwrap,error}_total` + 延迟(裸 AtomicU64 先例
+- [x] F1 指标:`fasts3_kms_{mint,unwrap,error}_total` + 延迟(裸 AtomicU64 先例
   engine lib.rs:379);分账按 op+result,key_id 不进标签(防高基数)
   - 用例:`kms_metrics_ops_attribution`;admin `/metrics` 可见
 - [ ] F2 审计与通知:对象请求照旧 `audit_record`;密钥材料零落盘/零日志/不进审计(红线);

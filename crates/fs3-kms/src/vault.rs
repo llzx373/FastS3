@@ -553,4 +553,8 @@ impl RootKms for VaultKms {
             },
         }
     }
+
+    fn render_metrics(&self) -> String {
+        self.metrics.render()
+    }
 }

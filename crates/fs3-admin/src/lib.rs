@@ -1527,6 +1527,11 @@ impl AdminServer {
             "fasts3_sse_decrypt_bytes_total {}\n",
             engine.sse_decrypt_bytes()
         ));
+        // M20 F1(ADR-29):KMS mint/unwrap 分账(key_id 不进标签;未配置 = 组缺席)
+        let kms_m = engine.kms_metrics_text();
+        if !kms_m.is_empty() {
+            text.push_str(&kms_m);
+        }
         // M12 W1-2(ADR-13 DL6):可信时钟与墙钟的偏差;升级 clock_jumps
         // (后者仍计 SigV4 路径回拨)。gauge=当前落后秒数,counter=边沿次数。
         text.push_str("# HELP fasts3_trusted_clock_divergence_seconds Wall clock lag behind trusted monotonic high-water (Object Lock)\n");
