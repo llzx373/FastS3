@@ -2860,6 +2860,30 @@ impl MetaStore {
         self.db.flush_wal(true).map_err(rocks_err)
     }
 
+    /// 读桶级备端标记(M21 D2;设计稿 §5.4;键缺席 = false,实例级全量
+    /// 备默认)。
+    pub fn repl_bucket_scoped(&self) -> Result<bool> {
+        Ok(self
+            .db
+            .get(SYS_REPL_BUCKET_SCOPED)
+            .map_err(rocks_err)?
+            .is_some())
+    }
+
+    /// 写/覆写桶级备端标记(直写 + fsync,照 set_repl_role 先例)。
+    /// false = 删键回到缺席默认态(语义同一;pull worker 每次 hello 按
+    /// 上游槽实况覆写,drop + 重建为全量槽后标记随之复位)。
+    pub fn set_repl_bucket_scoped(&self, scoped: bool) -> Result<()> {
+        if scoped {
+            self.db
+                .put(SYS_REPL_BUCKET_SCOPED, b"1")
+                .map_err(rocks_err)?;
+        } else {
+            self.db.delete(SYS_REPL_BUCKET_SCOPED).map_err(rocks_err)?;
+        }
+        self.db.flush_wal(true).map_err(rocks_err)
+    }
+
     /// 待回填队列扫描(GTID 升序;C3 回填池消费入口;B4 测试断言用)。
     pub fn list_repl_pending(&self, limit: usize) -> Result<Vec<(Gtid, Vec<repl::DataRef>)>> {
         let mut out = Vec::new();
@@ -3368,6 +3392,8 @@ impl MetaStore {
         batch.delete(SYS_REPL_CURSOR);
         batch.delete(SYS_REPL_EXECUTED);
         batch.delete(SYS_REPL_EPOCH);
+        // 桶级备端标记(D2)一并复位:重建后 hello 按新槽实况重落
+        batch.delete(SYS_REPL_BUCKET_SCOPED);
         self.db
             .write_opt(batch, &self.write_opts)
             .map_err(rocks_err)?;

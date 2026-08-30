@@ -38,6 +38,8 @@
 //!   缺省 = 纯主/不中继);
 //! - `FS3D_REPL_SLOT_NAME`(缺省 = 客户端证书 CN,设计稿 §6.1
 //!   「slot_name 缺省 = node_id」);
+//! - `FS3D_REPL_SLOT_FILTERS`(D2 桶级槽;BucketFilter serde JSON 形,
+//!   缺省 `"All"`;变更 = 上游 drop + 重建槽,禁原地改);
 //! - TLS 三件套:`FS3D_REPL_CA_CERT`(与服务端共用根)+
 //!   `FS3D_REPL_CLIENT_CERT`/`FS3D_REPL_CLIENT_KEY`(CN = 本节点
 //!   node_id;三件套缺任一项 = 启动显式报错,mTLS 红线不降级);
@@ -75,6 +77,10 @@ pub struct PullConfig {
     pub slot_name: String,
     /// 本节点 node_id = 客户端证书 CN(hello 自报;服务端 B2 比对)。
     pub node_id: String,
+    /// 槽桶级过滤器(D2;hello 自报 want_filters——首次握手以此登记
+    /// 桶级槽;与已登记槽不一致 = ErrFilterMismatch,须 drop + 重建槽,
+    /// 禁原地改)。缺省 All(实例级全量备)。
+    pub filters: BucketFilter,
     /// 根信任(同时校验上游服务端证书)。
     pub ca_cert: PathBuf,
     pub client_cert: PathBuf,
@@ -127,6 +133,14 @@ impl PullConfig {
             })?
         };
         let slot_name = std::env::var("FS3D_REPL_SLOT_NAME").unwrap_or_else(|_| node_id.clone());
+        // 槽桶级过滤器(D2):BucketFilter 的 serde JSON 形
+        // (`"All"` / `{"Include":[...]}` / `{"Exclude":[...]}`,同 B2
+        // hello 线格式——下游同为 Rust 端,不引入第二套语法);缺省 All
+        let filters: BucketFilter = match std::env::var("FS3D_REPL_SLOT_FILTERS") {
+            Ok(s) => serde_json::from_str(&s)
+                .map_err(|e| format!("bad FS3D_REPL_SLOT_FILTERS (BucketFilter json): {e}"))?,
+            Err(_) => BucketFilter::All,
+        };
         let parse_ms = |k: &str, default: u64| -> Result<u64, String> {
             std::env::var(k)
                 .ok()
@@ -138,6 +152,7 @@ impl PullConfig {
             primary_url: primary_url.trim_end_matches('/').to_string(),
             slot_name,
             node_id,
+            filters,
             ca_cert,
             client_cert,
             client_key,
@@ -421,8 +436,12 @@ fn executed_is_empty(meta: &MetaStore) -> bool {
 }
 
 /// hello 握手:自报 executed 集(B2 线格式区间表)+ node_id + 槽过滤器
-/// (B4 恒 All;桶级槽位 D2 接线)+ chain = [](直连上游;级联链路上溯
-/// 属 E1)。成功:上游 epoch 推进本地 s:repl_epoch(fencing 锚点,§2.3)。
+/// (D2:cfg.filters——桶级槽以此登记/比对,不一致 = ErrFilterMismatch
+/// 须 drop + 重建)+ chain = [](直连上游;级联链路上溯属 E1)。成功:
+/// ① 上游 epoch 推进本地 s:repl_epoch(fencing 锚点,§2.3);② 桶级
+/// 备端打标落本地 `s:repl_bscoped`(D2/§5.4:filters != All 的槽其
+/// 下游 GTID 集有洞,**不可 promote**——E3 校验输入;每次握手按上游
+/// 槽实况覆写,drop + 重建为全量槽后标记随之复位)。
 async fn hello(
     meta: &MetaStore,
     cfg: &PullConfig,
@@ -438,7 +457,7 @@ async fn hello(
         "node_id": cfg.node_id,
         "slot_name": cfg.slot_name,
         "executed_gtid_set": executed,
-        "want_filters": BucketFilter::All,
+        "want_filters": cfg.filters,
         "chain": Vec::<String>::new(),
     });
     let (status, json) = call(cfg, tls, "POST", "/v1/repl/v1/hello", Some(&body)).await?;
@@ -455,6 +474,10 @@ async fn hello(
         meta.set_repl_epoch(epoch)
             .map_err(|e| PullError::Transient(format!("set repl epoch: {e}")))?;
     }
+    // 桶级备端打标(D2):响应缺席字段按 false(全量)落,保守不置位
+    let scoped = json["slot"]["bucket_scoped"].as_bool() == Some(true);
+    meta.set_repl_bucket_scoped(scoped)
+        .map_err(|e| PullError::Transient(format!("set bucket_scoped marker: {e}")))?;
     Ok(())
 }
 

@@ -204,6 +204,15 @@ pub const SYS_REPL_EXECUTED: &[u8] = b"s:repl_executed";
 /// Stats 类增量重复记账,必须与 executed 同进退);check 扫描无需联动
 /// (同 SYS_REPL_ROLE 口径)。
 pub const SYS_REPL_CURSOR: &[u8] = b"s:repl_cursor";
+/// 桶级备端标记(M21 D2;ADR-33 RP4.5;设计稿 §5.4):值 = 单字节
+/// `b"1"`;键缺席 = false(实例级全量备,默认)。pull worker 每次 hello
+/// 成功按上游槽 `filters != All` 覆写本键(**桶级备端数据不全,GTID 集
+/// 有洞,不可 promote 为实例主**——E3 promote 校验读此标记拒绝;转正
+/// 唯一路径 = 显式重建为全量备再 promote);重建清空
+/// (clear_for_rebuild)复位到缺席态。s: 既有前缀下的新系统键,不新增
+/// 前缀;meta-export 不导出(s: 系统键不入导出)、check 可达性扫描不
+/// 相交(同 SYS_REPL_ROLE 口径)。
+pub const SYS_REPL_BUCKET_SCOPED: &[u8] = b"s:repl_bscoped";
 /// 待回填队列(M21 B4;ADR-33 RP4.2;设计稿 §4.2/§4.3 布局独立):
 /// `s:repl_pending\0{epoch be64}{seq be64}` → postcard `Vec<DataRef>`。
 /// 上游 Op 的段引用指向**上游 extent**,备端本地分配器不认识——apply

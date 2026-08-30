@@ -72,12 +72,15 @@
 //!   seq=1 重计」落地属 E3 promote,届时复核跨 epoch 续流边界(本任务不对
 //!   现有 bl: 存储做 epoch 重编号)。
 //!
-//! 本任务边界(后续任务接线,勿在此抢跑):槽过滤/心跳(D2,binlog 拉取
-//! 全量不过滤;快照导出的过滤器参数已带,见下)、委派凭证(D3)。D1 已落
-//! 地:slots 端点 lag 三件套(lag_seq/lag_bytes/lag_seconds,口径见
+//! 本任务边界(后续任务接线,勿在此抢跑):委派凭证(D3)。D1 已落地:
+//! slots 端点 lag 三件套(lag_seq/lag_bytes/lag_seconds,口径见
 //! handle_slots 注释);多槽位点独立 = binlog 端点按 after 参数无状态
-//! 服务(B1 形态),截断下限 = min(活跃槽 confirmed)(A3)。长轮询空挂
-//! 已落地(B4;`wait={ms}` 参数,见 handle_binlog)。
+//! 服务(B1 形态),截断下限 = min(活跃槽 confirmed)(A3)。D2 已落
+//! 地:binlog 按槽 BucketFilter 上游侧过滤 + 心跳带过(handle_binlog/
+//! record_in_scope/heartbeat_of),过滤器变更 = drop + 重建槽(B2
+//! ErrFilterMismatch + B3 ErrSlotExists 双向把守,禁原地改),桶级槽
+//! 打标 `bucket_scoped`(slot_json;下游本地记录见 repl_worker hello)。
+//! 长轮询空挂已落地(B4;`wait={ms}` 参数,见 handle_binlog)。
 //!
 //! 快照导出会话线格式(C1;设计稿 §3.1;ADR-33 RP8.3):
 //! - `POST /v1/repl/v1/snapshot`:`{slot_name?, filters?}`(filters =
@@ -143,7 +146,7 @@ use bytes::Bytes;
 use fs3_core::{Gtid, GtidSet};
 use fs3_engine::worker::Throttle;
 use fs3_engine::Engine;
-use fs3_meta::{BucketFilter, MetaStore, ReplExportSession, Slot};
+use fs3_meta::{BucketFilter, BucketScope, MetaStore, ReplExportSession, ReplRecord, Slot};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -516,12 +519,18 @@ impl ReplServer {
     }
 
     /// `GET /v1/repl/v1/binlog?slot={name}&after={epoch}-{seq}&limit=N&wait={ms}`:
-    /// after 之后的记录批(seq 升序 = GTID 序)+ 上游当前水位。本任务
-    /// 全量不过滤(槽过滤/心跳 D2);slot 参数接受但不消费(B3 登记/
-    /// 校验接线点)。**长轮询空挂(B4)**:`wait>0` 且批为空时挂起重扫,
-    /// 直到出现新条目或挂满 wait(上限 MAX_BINLOG_WAIT_MS=30s)返回
-    /// 空批——下游 pull worker 以单次请求覆盖空闲期,断开/超时由客户端
-    /// 重连兜底。
+    /// after 之后的记录批(seq 升序 = GTID 序)+ 上游当前水位。**槽参数
+    /// 必填(D2)**:binlog 按槽过滤器服务(§3.2/§3.3;槽 = 过滤/保留/
+    /// 观测的唯一载体,无槽拉流会绕过桶级边界)——未知槽 404
+    /// `ErrSlotUnknown`(同 ack 口径),stale 槽 410 `ErrBinlogGone`
+    /// (唯一出路 = 显式重建,同 hello ⑤ 口径)。**上游侧过滤(D2)**:
+    /// 不命中槽过滤器的记录整条不下发,以**心跳条目**带过(空 ops/空
+    /// data_refs,epoch/ts 保留,见 heartbeat_of)——下游游标连续推进、
+    /// GTID 集无洞;`has_unscoped` 记录(系统键族/无法归属桶)恒放行
+    /// (§6.2 s: 族强制随同)。**长轮询空挂(B4)**:`wait>0` 且批为空
+    /// 时挂起重扫,直到出现新条目或挂满 wait(上限 MAX_BINLOG_WAIT_MS=
+    /// 30s)返回空批——下游 pull worker 以单次请求覆盖空闲期,断开/
+    /// 超时由客户端重连兜底。
     async fn handle_binlog(&self, req: &Request<Incoming>) -> Response<Full<Bytes>> {
         let query = req.uri().query().unwrap_or("");
         let after = match query_param(query, "after") {
@@ -554,6 +563,40 @@ impl ReplServer {
                 }
             },
             None => 0,
+        };
+        // D2:槽解析(语义见函数注释)——过滤器随槽走;stale 槽 = 断档
+        // 已判死,先于截断下限检查给出同口径 410
+        let filters = match query_param(query, "slot") {
+            Some(name) => {
+                if !valid_slot_name(name) {
+                    return bad_slot_name();
+                }
+                match self.meta.repl_slot(name) {
+                    Ok(Some(s)) if s.stale => {
+                        return json_err(
+                            StatusCode::GONE,
+                            "ErrBinlogGone",
+                            "slot marked stale; explicit rebuild required (ADR-33 RP8)",
+                        )
+                    }
+                    Ok(Some(s)) => s.filters,
+                    Ok(None) => {
+                        return json_err(
+                            StatusCode::NOT_FOUND,
+                            "ErrSlotUnknown",
+                            "no such slot; register via hello or POST /v1/repl/v1/slots first",
+                        )
+                    }
+                    Err(e) => return internal_err("slot lookup", &e),
+                }
+            }
+            None => {
+                return json_err(
+                    StatusCode::BAD_REQUEST,
+                    "bad_request",
+                    "slot is required (binlog is served per-slot, D2; replication-design §3.2)",
+                )
+            }
         };
         // C2 断档检查(设计稿 §3.4;hello ③同口径,拉取路径兜底——截断可能
         // 发生在握手之后):下一 wanted GTID 低于 binlog 可用下界 = 中间已被
@@ -600,6 +643,15 @@ impl ReplServer {
                     Ok(v) => v
                         .into_iter()
                         .filter(|(seq, rec)| (rec.epoch, *seq) > (after.epoch, after.seq))
+                        // D2 上游侧过滤:不命中槽过滤器的记录以心跳带过
+                        // (seq 原位保留,游标连续、GTID 无洞)
+                        .map(|(seq, rec)| {
+                            if record_in_scope(&rec, &filters) {
+                                (seq, rec)
+                            } else {
+                                (seq, heartbeat_of(&rec))
+                            }
+                        })
                         .collect::<Vec<_>>(),
                     Err(e) => return internal_err("binlog scan", &e),
                 }
@@ -1441,16 +1493,60 @@ struct SnapshotRequest {
 }
 
 /// 槽的 JSON 投影(slots 观测端点与 hello 成功响应共用同一形状)。
+/// `bucket_scoped` = 桶级备端打标(D2;设计稿 §5.4「桶级备端不可
+/// promote」——filters != All 的槽其下游 GTID 集有洞;hello 响应携带
+/// 本标记,下游 pull worker 落本地 `s:repl_bscoped`,E3 promote 校验
+/// 读取)。
 fn slot_json(s: &Slot) -> serde_json::Value {
     serde_json::json!({
         "name": s.name,
         "consumer_node_id": s.consumer_node_id,
         "confirmed_gtid": fmt_gtid(s.confirmed_gtid),
         "filters": s.filters,
+        "bucket_scoped": s.filters != BucketFilter::All,
         "created_at": s.created_at,
         "last_ack_at": s.last_ack_at,
         "stale": s.stale,
     })
+}
+
+/// 记录级桶过滤判定(M21 D2;设计稿 §3.2/§3.3;ADR-33 RP3.2):
+/// - `has_unscoped` 恒放行(§6.2 s: 族强制随同口径,fs3-meta A1
+///   BucketScope 注释;系统键族/无法归属桶的记录对桶级槽也复制);
+/// - Include = 任一涉及桶命中名单即整条下发;Exclude = 任一涉及桶在
+///   名单外即整条下发(跨桶事务在 Exclude 下保守随同——精度损失口径
+///   同 has_unscoped,下游 apply 幂等兜底 §4.1);
+/// - 空桶集且 scoped 的记录(上游中继转发来的心跳)两态都不命中 →
+///   再过滤仍是心跳(级联幂等,E1)。
+fn record_in_scope(rec: &ReplRecord, filters: &BucketFilter) -> bool {
+    if rec.bucket_scope.has_unscoped {
+        return true;
+    }
+    match filters {
+        BucketFilter::All => true,
+        BucketFilter::Include(list) => rec.bucket_scope.buckets.iter().any(|b| list.contains(b)),
+        BucketFilter::Exclude(list) => rec.bucket_scope.buckets.iter().any(|b| !list.contains(b)),
+    }
+}
+
+/// 心跳条目形态(M21 D2;设计稿 §3.2「被过滤的 seq 以 heartbeat 条目
+/// 带过」):同 seq 原位的空 ops/空 data_refs/空 bucket_scope 记录。
+/// epoch/ts 保留——epoch 供下游 fencing 一致性校验(apply 断言
+/// gtid.epoch == rec.epoch),ts 供 D1 lag 估算「首条未消费记录」口径
+/// 在过滤流上仍可读。下游 B4 apply:零元数据变更、bl: 原样落盘、游标
+/// 推进、executed 并入——GTID 集无洞(fs3-meta apply_repl_record 注释
+/// 口径)。
+fn heartbeat_of(rec: &ReplRecord) -> ReplRecord {
+    ReplRecord {
+        epoch: rec.epoch,
+        ops: Vec::new(),
+        data_refs: Vec::new(),
+        bucket_scope: BucketScope {
+            buckets: Vec::new(),
+            has_unscoped: false,
+        },
+        ts: rec.ts,
+    }
 }
 
 /// 读 JSON 请求体(有界;超限/IO/解析失败 = 400)。
@@ -2037,6 +2133,17 @@ mod tests {
             },
         )
         .unwrap();
+        // D2 起 binlog 按槽服务(slot 必填且已登记):smoke 槽预登记
+        meta.put_repl_slot(&Slot {
+            name: "s1".into(),
+            consumer_node_id: "node-b".into(),
+            confirmed_gtid: Gtid { epoch: 0, seq: 0 },
+            filters: BucketFilter::All,
+            created_at: 1,
+            last_ack_at: 1,
+            stale: false,
+        })
+        .unwrap();
 
         // 引擎侧:真对象(> small_object_limit 走段;逐段对照载荷窗口)
         let payload: Vec<u8> = (0..2 * 1024 * 1024usize).map(|i| (i % 251) as u8).collect();
@@ -2084,19 +2191,39 @@ mod tests {
         assert_eq!(v["high_watermark"], "1-1");
         assert_eq!(v["entries"][0]["gtid"], "1-1");
         assert!(v["entries"][0]["record"].as_str().unwrap().len() > 8);
-        let (st, _, body) =
-            mtls_request(addr, &ca_pem, cli, &get_req("/v1/repl/v1/binlog?after=1-1"))
-                .await
-                .unwrap();
+        let (st, _, body) = mtls_request(
+            addr,
+            &ca_pem,
+            cli,
+            &get_req("/v1/repl/v1/binlog?slot=s1&after=1-1"),
+        )
+        .await
+        .unwrap();
         assert_eq!(st, 200);
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["high_watermark"], "1-1");
         assert_eq!(v["entries"].as_array().unwrap().len(), 0);
+        // D2:slot 必填且已登记——缺席 400;未知槽 404 ErrSlotUnknown
+        let (st, _, body) =
+            mtls_request(addr, &ca_pem, cli, &get_req("/v1/repl/v1/binlog?after=1-1"))
+                .await
+                .unwrap();
+        assert_eq!(st, 400, "slot 必填: {}", String::from_utf8_lossy(&body));
+        let (st, _, body) = mtls_request(
+            addr,
+            &ca_pem,
+            cli,
+            &get_req("/v1/repl/v1/binlog?slot=ghost&after=0-0"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(st, 404, "{}", String::from_utf8_lossy(&body));
+        assert!(String::from_utf8_lossy(&body).contains("ErrSlotUnknown"));
         let (st, _, _) = mtls_request(
             addr,
             &ca_pem,
             cli,
-            &get_req("/v1/repl/v1/binlog?after=oops"),
+            &get_req("/v1/repl/v1/binlog?slot=s1&after=oops"),
         )
         .await
         .unwrap();
@@ -2146,18 +2273,16 @@ mod tests {
         .unwrap();
         assert_eq!(st, 400);
 
-        // slots(本用例未登记槽 → 空;字段面在 fs3-meta A3 用例覆盖)
+        // slots(本用例登记了 smoke 槽 s1 → 单列;D1 lag 字段口径在
+        // slots_endpoint_reports_lag 覆盖)
         let (st, _, body) = mtls_request(addr, &ca_pem, cli, &get_req("/v1/repl/v1/slots"))
             .await
             .unwrap();
         assert_eq!(st, 200);
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["slots"]
-                .as_array()
-                .unwrap()
-                .len(),
-            0
-        );
+        let v = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        let slots = v["slots"].as_array().unwrap();
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0]["name"], "s1");
 
         // POST snapshot 空体 400(C1 已实现,体须为 JSON)/ hello 空体 400
         // (B2)/ 未知路径 404 / 错误动词 405
@@ -2962,6 +3087,355 @@ mod tests {
         assert_eq!(s2["lag_seconds"], 0, "追平槽 lag 全零");
     }
 
+    /// GET binlog 并解码记录(D2 用例:心跳形态断言需要记录本体)。
+    async fn binlog_pull_records(
+        fx: &Fixture,
+        cli: (&str, &str),
+        slot: &str,
+        after: &str,
+    ) -> Vec<(String, ReplRecord)> {
+        use base64::Engine as _;
+        let (st, _, body) = mtls_request(
+            fx.addr,
+            &fx.ca_pem,
+            Some(cli),
+            &get_req(&format!(
+                "/v1/repl/v1/binlog?slot={slot}&after={after}&limit=16"
+            )),
+        )
+        .await
+        .unwrap();
+        assert_eq!(st, 200, "{}", String::from_utf8_lossy(&body));
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                let gtid = e["gtid"].as_str().unwrap().to_string();
+                let raw = base64::engine::general_purpose::STANDARD
+                    .decode(e["record"].as_str().unwrap())
+                    .unwrap();
+                let rec = ReplRecord::decode_value(&raw).unwrap();
+                (gtid, rec)
+            })
+            .collect()
+    }
+
+    /// M21 D2(ADR-33 RP3.2;设计稿 §3.2/§3.3/§4.1/§6.2;TODO M21/D2 具名
+    /// 用例):**桶级过滤——过滤桶外零数据下发,心跳带过游标连续**——
+    /// ① 上游 5 条事务:b1 命中桶(seq 1/3)、b2 过滤桶(seq 2/4)、
+    ///    无桶系统事务(seq 5,Op::EventDelete → has_unscoped);
+    /// ② 槽 s1 = Include([b1]) 拉流:b1 记录原样下发;b2 两条 = 心跳
+    ///    (空 ops/空 data_refs/空 bucket_scope,epoch/ts 保留原位);
+    ///    has_unscoped 记录恒放行(§6.2 随同口径);条目 seq 1..=5 连续
+    ///    无洞;流尾续拉 = 空批(游标可越过心跳推进到底);
+    /// ③ 快照联动(核对 C1 接线):slot_name 开会话 → filters 回显 = 槽
+    ///    过滤器,导出只含命中桶键(b:b1 在、b:b2 缺席);
+    /// ④ E2E:桶级 pull worker(filters=Include[b1])空库引导 → 下游
+    ///    b2 桶缺席、b1 落盘、executed 集连续无洞(心跳并入)、
+    ///    `s:repl_bscoped` 标记落盘(E3 promote 校验输入)、上游槽
+    ///    confirmed 随 ack 推进。
+    #[tokio::test]
+    async fn bucket_filter_ships_only_scoped_buckets() {
+        let dir = tempfile::tempdir().unwrap();
+        // 上游:交替两桶 + 一条无桶系统事务(seq 1..=5)
+        let meta = repl_meta_with_entries(dir.path(), 0);
+        for b in ["b1", "b2", "b1", "b2"] {
+            meta.commit_bucket_put(
+                b,
+                &fs3_core::BucketMeta {
+                    created: 1,
+                    owner: "t".into(),
+                    stats: Default::default(),
+                    quota: None,
+                    created_with_acl: false,
+                    versioning: Default::default(),
+                    default_encryption: None,
+                    object_lock: false,
+                    default_retention: None,
+                    default_kms_key: None,
+                },
+            )
+            .unwrap();
+        }
+        meta.commit(&[fs3_meta::Op::EventDelete { seq: 7 }])
+            .unwrap();
+        assert_eq!(meta.last_seq().unwrap(), 5);
+        let fx = start_repl_server(Some(meta.clone()));
+        let (cert, key) = fx.client_cert(Some("node-ops"));
+        let cli = (cert, key);
+        let cli_ref = (cli.0.as_str(), cli.1.as_str());
+
+        // ② 槽 s1 = Include([b1])(hello 自动登记带过滤器)
+        let (st, v) = hello_call(
+            &fx,
+            "node-b",
+            &hello_json(
+                "node-b",
+                "s1",
+                &[],
+                serde_json::json!({"Include": ["b1"]}),
+                &[],
+            ),
+        )
+        .await;
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(v["slot"]["filters"], serde_json::json!({"Include": ["b1"]}));
+        assert_eq!(v["slot"]["bucket_scoped"], true, "桶级槽打标");
+
+        let entries = binlog_pull_records(&fx, cli_ref, "s1", "0-0").await;
+        let gtids: Vec<&str> = entries.iter().map(|(g, _)| g.as_str()).collect();
+        assert_eq!(
+            gtids,
+            ["1-1", "1-2", "1-3", "1-4", "1-5"],
+            "心跳原位带过:seq 连续无洞"
+        );
+        for (gtid, rec) in &entries {
+            match gtid.as_str() {
+                // 命中桶:原样下发
+                "1-1" | "1-3" => {
+                    assert!(!rec.ops.is_empty(), "{gtid} 命中桶必须原样下发");
+                    assert_eq!(rec.bucket_scope.buckets, vec!["b1".to_string()]);
+                    assert!(!rec.bucket_scope.has_unscoped);
+                }
+                // 过滤桶:心跳(零数据下发)
+                "1-2" | "1-4" => {
+                    assert!(rec.ops.is_empty(), "{gtid} 过滤桶不得下发 ops");
+                    assert!(rec.data_refs.is_empty(), "{gtid} 心跳不带段引用");
+                    assert!(rec.bucket_scope.buckets.is_empty() && !rec.bucket_scope.has_unscoped);
+                    assert_eq!(rec.epoch, 1);
+                    let seq: u64 = gtid[2..].parse().unwrap();
+                    assert_eq!(
+                        rec.ts,
+                        meta.repl_record(seq).unwrap().unwrap().ts,
+                        "{gtid} 心跳保留原提交 ts(D1 lag 口径可读)"
+                    );
+                }
+                // 无桶系统事务:恒放行(§6.2)
+                "1-5" => {
+                    assert!(!rec.ops.is_empty(), "has_unscoped 恒放行");
+                    assert!(rec.bucket_scope.has_unscoped);
+                }
+                other => panic!("unexpected gtid {other}"),
+            }
+        }
+        // 流尾续拉 = 空批(游标越过心跳到达流尾)
+        assert!(binlog_pull_records(&fx, cli_ref, "s1", "1-5")
+            .await
+            .is_empty());
+
+        // ③ 快照联动:桶级槽位只导命中桶
+        let (st, _, raw) = mtls_request(
+            fx.addr,
+            &fx.ca_pem,
+            Some(cli_ref),
+            &post_json_req(
+                "/v1/repl/v1/snapshot",
+                &serde_json::json!({"slot_name": "s1"}).to_string(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(st, 200, "{}", String::from_utf8_lossy(&raw));
+        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(
+            v["filters"],
+            serde_json::json!({"Include": ["b1"]}),
+            "快照采用槽过滤器"
+        );
+        let id = v["snapshot_id"].as_u64().unwrap();
+        let (_, exported) = pull_all_meta_pages(fx.addr, &fx.ca_pem, cli_ref, id).await;
+        assert!(exported.iter().any(|(k, _)| k.as_slice() == b"b:b1"));
+        assert!(
+            exported.iter().all(|(k, _)| k.as_slice() != b"b:b2"),
+            "过滤桶不得进快照导出"
+        );
+        let req = format!(
+            "DELETE /v1/repl/v1/snapshot/{id} HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n"
+        );
+        let (st, _, _) = mtls_request(fx.addr, &fx.ca_pem, Some(cli_ref), &req)
+            .await
+            .unwrap();
+        assert_eq!(st, 200);
+
+        // ④ E2E:桶级 pull worker 空库引导
+        let down_engine = test_engine(&dir.path().join("down"));
+        let down = down_engine.read().meta_arc();
+        down.set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
+        let cfg = crate::repl_worker::PullConfig {
+            filters: BucketFilter::Include(vec!["b1".into()]),
+            ..pull_cfg(dir.path(), &fx, "s2", "node-b")
+        };
+        let w =
+            crate::repl_worker::PullWorker::spawn(down_engine.clone(), down.clone(), cfg).unwrap();
+        wait_repl_cursor(&down, Gtid { epoch: 1, seq: 5 });
+        // 增量:命中桶事务(seq 6,下发)+ 过滤桶事务(seq 7,心跳)——
+        // 流式段同样过滤,且驱动 ack 推进 confirmed
+        meta.commit(&[fs3_meta::Op::Stats {
+            bucket: "b1".into(),
+            delta: fs3_meta::StatsDelta {
+                objects: 1,
+                bytes: 10,
+                by_class: Vec::new(),
+            },
+        }])
+        .unwrap();
+        meta.commit_bucket_put(
+            "b2new",
+            &fs3_core::BucketMeta {
+                created: 1,
+                owner: "t".into(),
+                stats: Default::default(),
+                quota: None,
+                created_with_acl: false,
+                versioning: Default::default(),
+                default_encryption: None,
+                object_lock: false,
+                default_retention: None,
+                default_kms_key: None,
+            },
+        )
+        .unwrap();
+        wait_repl_cursor(&down, Gtid { epoch: 1, seq: 7 });
+        w.shutdown();
+        assert!(down.get_bucket("b1").unwrap().is_some(), "命中桶落盘");
+        assert!(
+            down.get_bucket("b2").unwrap().is_none() && down.get_bucket("b2new").unwrap().is_none(),
+            "过滤桶缺席(零数据下发)"
+        );
+        assert_eq!(
+            down.repl_executed().unwrap().ranges().collect::<Vec<_>>(),
+            vec![(1, 1, 7)],
+            "心跳并入:executed 集连续无洞"
+        );
+        assert!(
+            down.repl_bucket_scoped().unwrap(),
+            "桶级备端标记落本地(§5.4,E3 promote 校验输入)"
+        );
+        // 上游槽 confirmed 随 ack 推进到流尾
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let slot = meta.repl_slot("s2").unwrap().expect("s2 registered");
+            if slot.confirmed_gtid >= (Gtid { epoch: 1, seq: 7 }) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "ack 未推进: {slot:?}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            meta.repl_slot("s2").unwrap().unwrap().filters,
+            BucketFilter::Include(vec!["b1".into()])
+        );
+    }
+
+    /// M21 D2(ADR-33 RP3.2/R9;设计稿 §3.3;TODO M21/D2 具名用例):
+    /// **过滤器变更 = drop + 重建槽,禁原地改**——
+    /// ① 槽 s1 = Include([b1]) 登记生效,binlog 按登记过滤器服务;
+    /// ② 原地改双向被拒:hello want_filters 不一致 → 409
+    ///    ErrFilterMismatch(B2 把守);预登记重名 → 409 ErrSlotExists
+    ///    (B3 把守);被拒期间 binlog 仍按旧过滤器服务(语义不变);
+    /// ③ drop + 重建:DELETE 释放 → hello 以新过滤器重登记 → binlog
+    ///    立即按新过滤器服务(b1 变心跳、b2 原样下发)——闭环生效。
+    #[tokio::test]
+    async fn filter_change_requires_slot_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = repl_meta_with_entries(dir.path(), 2); // b0(seq1)/ b1(seq2)
+        let fx = start_repl_server(Some(meta.clone()));
+        let (cert, key) = fx.client_cert(Some("node-ops"));
+        let cli = (cert, key);
+        let cli_ref = (cli.0.as_str(), cli.1.as_str());
+
+        // ① 登记 s1 = Include([b0])
+        let (st, v) = hello_call(
+            &fx,
+            "node-b",
+            &hello_json(
+                "node-b",
+                "s1",
+                &[],
+                serde_json::json!({"Include": ["b0"]}),
+                &[],
+            ),
+        )
+        .await;
+        assert_eq!(st, 200, "{v}");
+        let entries = binlog_pull_records(&fx, cli_ref, "s1", "0-0").await;
+        assert!(!entries[0].1.ops.is_empty(), "b0 命中,原样下发");
+        assert!(entries[1].1.ops.is_empty(), "b1 过滤,心跳带过");
+
+        // ② 原地改被拒(两个入口都把守)
+        let (st, v) = hello_call(
+            &fx,
+            "node-b",
+            &hello_json(
+                "node-b",
+                "s1",
+                &[],
+                serde_json::json!({"Include": ["b1"]}),
+                &[],
+            ),
+        )
+        .await;
+        assert_eq!(st, 409, "{v}");
+        assert_eq!(v["error"], "ErrFilterMismatch");
+        let (st, _, raw) = mtls_request(
+            fx.addr,
+            &fx.ca_pem,
+            Some(cli_ref),
+            &post_json_req(
+                "/v1/repl/v1/slots",
+                &serde_json::json!({"name": "s1", "filters": {"Include": ["b1"]}}).to_string(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(st, 409, "{}", String::from_utf8_lossy(&raw));
+        assert!(String::from_utf8_lossy(&raw).contains("ErrSlotExists"));
+        // 被拒期间过滤器不变
+        assert_eq!(
+            meta.repl_slot("s1").unwrap().unwrap().filters,
+            BucketFilter::Include(vec!["b0".into()])
+        );
+        let entries = binlog_pull_records(&fx, cli_ref, "s1", "0-0").await;
+        assert!(entries[1].1.ops.is_empty(), "原地改被拒:仍按旧过滤器服务");
+
+        // ③ drop + 重建 → 新过滤器生效
+        let req =
+            "DELETE /v1/repl/v1/slots/s1 HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n";
+        let (st, _, _) = mtls_request(fx.addr, &fx.ca_pem, Some(cli_ref), req)
+            .await
+            .unwrap();
+        assert_eq!(st, 200);
+        let (st, v) = hello_call(
+            &fx,
+            "node-b",
+            &hello_json(
+                "node-b",
+                "s1",
+                &[],
+                serde_json::json!({"Include": ["b1"]}),
+                &[],
+            ),
+        )
+        .await;
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(v["slot"]["filters"], serde_json::json!({"Include": ["b1"]}));
+        let entries = binlog_pull_records(&fx, cli_ref, "s1", "0-0").await;
+        assert!(entries[0].1.ops.is_empty(), "重建后 b0 变心跳");
+        assert!(!entries[1].1.ops.is_empty(), "重建后 b1 原样下发");
+
+        // 全量槽对照:bucket_scoped = false
+        let (st, v) = hello_call(
+            &fx,
+            "node-c",
+            &hello_json("node-c", "sfull", &[], serde_json::json!("All"), &[]),
+        )
+        .await;
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(v["slot"]["bucket_scoped"], false);
+    }
+
     /// M21 B4(设计稿 §3.2;ADR-33 RP6.3):binlog 长轮询空挂——
     /// ① wait>0 且无新条目:请求挂起,上游提交后**提前**返回新条目
     ///    (不挂满 wait);
@@ -2972,6 +3446,17 @@ mod tests {
     async fn repl_binlog_long_poll() {
         let dir = tempfile::tempdir().unwrap();
         let meta = repl_meta_with_entries(dir.path(), 1); // seq 1,水位 1-1
+                                                          // D2 起 binlog 按槽服务:登记 s1(过滤器 All = 不过滤)
+        meta.put_repl_slot(&Slot {
+            name: "s1".into(),
+            consumer_node_id: "node-b".into(),
+            confirmed_gtid: Gtid { epoch: 0, seq: 0 },
+            filters: BucketFilter::All,
+            created_at: 1,
+            last_ack_at: 1,
+            stale: false,
+        })
+        .unwrap();
         let fx = start_repl_server(Some(meta.clone()));
         let (cert, key) = fx.client_cert(Some("node-b"));
         let cli = (cert, key);
@@ -3052,7 +3537,7 @@ mod tests {
             fx.addr,
             &fx.ca_pem,
             Some((&cli.0, &cli.1)),
-            &get_req("/v1/repl/v1/binlog?after=1-2"),
+            &get_req("/v1/repl/v1/binlog?slot=s1&after=1-2"),
         )
         .await
         .unwrap();
@@ -3421,6 +3906,7 @@ mod tests {
             primary_url: format!("https://localhost:{}", fx.addr.port()),
             slot_name: "s1".into(),
             node_id: "node-b".into(),
+            filters: BucketFilter::All,
             ca_cert: write_pem(dir.path(), "ca.pem", &fx.ca_pem),
             client_cert: write_pem(dir.path(), "node-b.pem", &cert),
             client_key: write_pem(dir.path(), "node-b.key", &key),
@@ -3547,6 +4033,7 @@ mod tests {
             primary_url: format!("https://localhost:{}", fx.addr.port()),
             slot_name: slot.into(),
             node_id: node.into(),
+            filters: BucketFilter::All,
             ca_cert: write_pem(dir, "ca.pem", &fx.ca_pem),
             client_cert: write_pem(dir, "node.pem", &cert),
             client_key: write_pem(dir, "node.key", &key),
