@@ -186,7 +186,7 @@
 
 ### F. KMS/center/文档(≈1.5 pw;设计 §6/§7;ADR-33)
 
-- [ ] F1 SSE-KMS 共享保全:主备指向同一 Vault/OpenBao,`SseInfo` 随 binlog 原样落盘可解;
+- [x] F1 SSE-KMS 共享保全:主备指向同一 Vault/OpenBao,`SseInfo` 随 binlog 原样落盘可解;
   SSE-S3 KEK/种子(`s:` 族)对桶级槽强制随同;部署文档写明共享 KMS 前置
   - 用例:`ssekms_objects_decryptable_on_standby`(真 Vault 车道,H 组纪律);
     `ssekms_promoted_standby_decrypts_after_takeover`
