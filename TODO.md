@@ -101,7 +101,7 @@
 - [x] A4 演进三处同步:`keys.rs` 前缀表 + meta-export/import DTO + check 可达性扫描覆盖
   `bl:`/`s:repl_*`;layout_version 不变(纯键前缀新增,升级框架内声明)
   - 用例:`meta_export_import_carries_repl_state`;`check_scans_repl_prefixes`
-- [ ] A5 perf 验证:binlog 写放大量化(组提交路径 p99 增量 <5% 为及格线),结论落
+- [x] A5 perf 验证:binlog 写放大量化(组提交路径 p99 增量 <5% 为及格线;ADR-33 补记修订为端到端口径),结论落
   `docs/perf-M21.md`(仿 perf-M* 样板)
   - 用例:`perf-M21` 文档 + warp 混载对照记录
 

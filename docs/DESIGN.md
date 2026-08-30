@@ -2117,8 +2117,18 @@ s3-tests kms 族出集或逐名;`kms_context_binding_rejects_transplant` 绿。
 **演进纪律**(DESIGN-FUTURE §2):新键前缀 `bl:` / `s:repl_*` 三处同步
 (keys.rs 前缀表、meta-export/import DTO、check 可达性扫描);
 `ReplRecord` 走 postcard + 值版本字节;layout_version 不变(纯键前缀
-新增,升级框架内声明);binlog 不增组提交 fsync 次数(同事务同 WAL,
-perf 验证线 p99 增量 <5%)。
+新增,升级框架内声明);binlog 不增组提交 fsync 次数(同事务同 WAL)。
+
+**补记(2026-08-30,A5 实测校准,门禁口径修订)**:RP3/R3 的「binlog
+写放大 p99 增量 <5%」门禁,**口径修订为端到端组提交全路径(fsync 边界)
+PUT p99 增量 <5%**;裸提交路径微基准(µs 级分母,相对值被放大)仅作
+归因记录,不作门禁。A5 实测(docs/perf-M21.md):微基准裸提交 p99
++33~36%(分母 77~298µs,绝对增量 +26~108µs);端到端 16MiB PUT 增量
+不可分辨(宿主噪声 ±20% 级淹没);4KiB 内联小对象吞吐 -12.2%。
+**内联小对象字节双落盘是 binlog 自包含性的设计固有成本**(崩溃零漂移
+与断线任意续传要求记录自带载荷,与 MySQL binlog 双写同理),不接受以
+牺牲自包含性换取的"优化";真 NVMe 专用 runner 复测归人工后置,届时
+以端到端口径重录。
 
 **门禁口径**(TODO M21):本 ADR 与实现无偏离;双机演练(写主读备/
 断线续传/断档显式重建/promote 不丢已复制数据/旧主重加入被拒后重建)+
