@@ -126,12 +126,12 @@
 
 ### C. 全量同步与数据回填(≈2 pw;设计 §3.1/§3.2/§4.2;ADR-33)
 
-- [ ] C1 在线快照导出:`flush_wal` + 强制分配器检查点 + rocksdb MVCC 快照,记录导出位点
+- [x] C1 在线快照导出:`flush_wal` + 强制分配器检查点 + rocksdb MVCC 快照,记录导出位点
   GTID `P`;流式导出元数据 + 活段 `[extent,offset,len,crc32c]` 清单;ReadPin 防 compaction
   迁移;令牌桶限速,可暂停/断点续
   - 用例:`snapshot_export_consistent_at_gtid_point`;
     `snapshot_export_survives_compaction`(导出期间触发压缩,数据不破)
-- [ ] C2 下游导入:逻辑段拷贝(非块镜像),本地分配器重建布局(设备异构可,容量 ≥ 用量);
+- [x] C2 下游导入:逻辑段拷贝(非块镜像),本地分配器重建布局(设备异构可,容量 ≥ 用量);
   CRC 端到端校验;导入完成从 `P` 转增量追赶
   - 用例:`standby_bootstrap_from_empty_catches_up`;`bootstrap_on_different_extent_size`
 - [ ] C3 段回填池:`data_pending` 标记 + 并发回填(`data_pull_concurrency` 默认 8);
