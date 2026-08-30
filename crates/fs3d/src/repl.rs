@@ -39,6 +39,9 @@
 //!   整段 CRC32C 置于响应头 `x-fasts3-repl-crc32c`(十进制 u32),下游端到端
 //!   校验(§3.2「Range 读 + CRC32C + ReadPin」);单请求 len 上限
 //!   `MAX_EXTENT_DATA_LEN`(下游回填池分块拉取,超大对象不产生巨型缓冲)。
+//!   坐标系(E1 级联):缺省 = 服务端本地池坐标(快照/引导路径);
+//!   `space=stream` = binlog 流坐标(原始生产端坐标系),经 `s:repl_rmap`
+//!   翻译到本地段后供数,未命中回退本地直读(handle_extent_data 注释)。
 //! - query 参数不做百分号解码:slot 名/GTID/数值均为 URL 安全字符(B3 若
 //!   放开槽名字符集再补解码)。
 //!
@@ -90,6 +93,15 @@
 //! (delegated_for_hello,delivered 标记);吊销 = 删槽同删凭证记录
 //! (handle_slot_drop)+ 备端重握手收讫轮换凭证覆盖(验签即败)。
 //! 长轮询空挂已落地(B4;`wait={ms}` 参数,见 handle_binlog)。
+//!
+//! E1 已落地(设计稿 §3.5;ADR-33 RP3.3;级联中继):备端开复制口对下
+//! 服务即中继(装配零新增——role=standby 与本服务并存 = 中继);GTID
+//! 原样转发不重编号(B4 本地 bl: 原样口径直接复用);**发送水位 ≤ 本地
+//! 数据水位**(handle_binlog:带 data_refs 且 pending 未摘除的条目暂存
+//! 不投递、不可跳发);extent-data `space=stream` 流坐标翻译
+//! (`s:repl_rmap`,fs3-meta repl_localize_segments 同事务落盘);快照
+//! 导出 pending 护栏(handle_snapshot)。槽/hello/环检测协议对下游完全
+//! 复用 B2/B3(中继对下游同样是"上游")。
 //!
 //! 快照导出会话线格式(C1;设计稿 §3.1;ADR-33 RP8.3):
 //! - `POST /v1/repl/v1/snapshot`:`{slot_name?, filters?}`(filters =
@@ -665,6 +677,31 @@ impl ReplServer {
                     Err(e) => return internal_err("binlog scan", &e),
                 }
             };
+            // E1 发送水位 ≤ 本地数据水位(设计稿 §3.5;ADR-33 RP3.3):
+            // 带 data_refs 且 `s:repl_pending` 仍有该 GTID 条目的记录 =
+            // 段字节未在本地齐备,**暂存不投递**;GTID 严格序**不可跳发**
+            // ——批截断于首个未齐备条目(水位 = 连续已齐备前缀),其后
+            // 条目(含无引用条目)一律随之一批停发。心跳/无引用条目
+            // (data_refs 空)天然通过、不受阻。被暂存的条目待回填完成
+            // (清算事务摘除 pending)后随下一批/长轮询重扫发出——下游
+            // 的段拉取因此永远落在数据确实存在的节点上,链条无悬空引用。
+            // 主端与已追平的节点 pending 恒空:每带引用条目一次点读,
+            // 零行为变化。
+            let mut ship = Vec::with_capacity(entries.len());
+            for (seq, rec) in entries {
+                if !rec.data_refs.is_empty() {
+                    match self.meta.repl_pending_exists(Gtid {
+                        epoch: rec.epoch,
+                        seq,
+                    }) {
+                        Ok(true) => break,
+                        Ok(false) => {}
+                        Err(e) => return internal_err("repl pending probe", &e),
+                    }
+                }
+                ship.push((seq, rec));
+            }
+            let entries = ship;
             // 长轮询:空批且 wait 未挂满 → 挂起重扫(秒级以下粒度即可,
             // 写路径经 rocksdb 组提交,无通知通道)
             if !entries.is_empty() || wait_ms == 0 || tokio::time::Instant::now() >= deadline {
@@ -694,7 +731,8 @@ impl ReplServer {
     /// `GET /v1/repl/v1/extent-data?extent_id=&offset=&len=`(DataRef 三件套,
     /// §3.2):Range 读 + ReadPin(引擎 read_extent_range 内钉扎)+ 整段
     /// CRC32C 响应头(线格式见模块注释)。C1 起经共享令牌桶限速(R11:
-    /// extent-data 走只读路径 + 令牌桶)。
+    /// extent-data 走只读路径 + 令牌桶)。`space=stream`(E1 级联):
+    /// 坐标按 binlog 流坐标系经 `s:repl_rmap` 翻译到本地段(口径见下)。
     async fn handle_extent_data(&self, req: &Request<Incoming>) -> Response<Full<Bytes>> {
         let query = req.uri().query().unwrap_or("");
         let parse = |name: &str| query_param(query, name).and_then(|s| s.parse::<u64>().ok());
@@ -717,20 +755,44 @@ impl ReplServer {
                 "len must be in (0, 64MiB]; backfill chunks large segments",
             );
         }
-        self.throttle_wait().await;
-        let bytes = match self.engine.read().read_extent_range(extent_id, offset, len) {
-            Ok(b) => b,
-            Err(fs3_core::Error::NotFound(_)) => {
+        let stream = match query_param(query, "space") {
+            None => false,
+            Some("stream") => true,
+            Some(_) => {
                 return json_err(
-                    StatusCode::NOT_FOUND,
-                    "extent_not_found",
-                    "extent not in pool",
+                    StatusCode::BAD_REQUEST,
+                    "bad_param",
+                    "space must be \"stream\" when present",
                 )
             }
-            Err(fs3_core::Error::InvalidArgument(_)) => {
-                return json_err(StatusCode::BAD_REQUEST, "bad_range", "range out of extent")
+        };
+        self.throttle_wait().await;
+        // E1 级联翻译(§3.5/RP3.3):`space=stream` = 请求坐标是 binlog
+        // 流坐标(原始生产端坐标系——记录沿链原样转发,中下游的回填/
+        // 按需拉取以此坐标落到本节点)。命中 `s:repl_rmap`(本节点回填
+        // 清算时落盘的「流坐标 → 本地段表」映射)→ 按本地段拼读切片
+        // 返回;未命中 → 回退本地池直读(直连主端:主端无 rmap,流坐标
+        // 即其本地坐标;promote 后本端自写记录的坐标同理)。水位规则
+        // (handle_binlog)保证中下游只会在映射已存在后发起流坐标拉取。
+        // 快照/引导路径(本节点本地坐标)不带 space 参数,恒走本地直读,
+        // 两坐标系不相混。
+        let bytes = if stream {
+            match self.meta.repl_rmap_lookup(extent_id, offset, len) {
+                Ok(Some((dref, local))) => match self.read_translated(&dref, &local, offset, len) {
+                    Ok(b) => b,
+                    Err(e) => return internal_err("translated extent read", &e),
+                },
+                Ok(None) => match self.read_native_extent(extent_id, offset, len) {
+                    Ok(b) => b,
+                    Err(e) => return extent_read_err(&e),
+                },
+                Err(e) => return internal_err("repl rmap lookup", &e),
             }
-            Err(e) => return internal_err("extent read", &e),
+        } else {
+            match self.read_native_extent(extent_id, offset, len) {
+                Ok(b) => b,
+                Err(e) => return extent_read_err(&e),
+            }
         };
         self.throttle.consume(bytes.len() as u64);
         let crc = fs3_core::crc32c::crc32c(&bytes, 0);
@@ -740,6 +802,56 @@ impl ReplServer {
             .header("x-fasts3-repl-crc32c", crc.to_string())
             .body(Full::new(Bytes::from(bytes)))
             .expect("static response")
+    }
+
+    /// 本地池直读(native 坐标;原 handle_extent_data 读取路径,错误
+    /// 映射在 extent_read_err)。
+    fn read_native_extent(
+        &self,
+        extent_id: u32,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>, fs3_core::Error> {
+        self.engine.read().read_extent_range(extent_id, offset, len)
+    }
+
+    /// 流坐标翻译读(M21 E1):本地段表按序覆盖上游段
+    /// [dref.offset, dref.offset+dref.len),切出 [offset, offset+len)
+    /// 子区间(只读覆盖子区间的本地段,不把整段读进内存)。本地段由
+    /// 回填清算同事务与映射一起落盘(覆盖全长),读不到覆盖全长 =
+    /// 本地状态异常,显式 Corrupt 不静默。
+    fn read_translated(
+        &self,
+        dref: &fs3_meta::repl::DataRef,
+        local: &[fs3_core::Segment],
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>, fs3_core::Error> {
+        let want_lo = offset - u64::from(dref.offset);
+        let want_hi = want_lo + len;
+        let engine = self.engine.read();
+        let mut pos = 0u64;
+        let mut out = Vec::with_capacity(len as usize);
+        for s in local {
+            let (seg_lo, seg_hi) = (pos, pos + u64::from(s.len));
+            let (lo, hi) = (want_lo.max(seg_lo), want_hi.min(seg_hi));
+            if lo < hi {
+                let b = engine.read_extent_range(
+                    s.extent_id,
+                    u64::from(s.offset) + (lo - seg_lo),
+                    hi - lo,
+                )?;
+                out.extend_from_slice(&b);
+            }
+            pos = seg_hi;
+        }
+        if out.len() as u64 != len {
+            return Err(fs3_core::Error::Corrupt(format!(
+                "repl rmap local segments cover {} bytes, want {len} (ref {dref:?})",
+                out.len()
+            )));
+        }
+        Ok(out)
     }
 
     /// `GET /v1/repl/v1/slots`:槽位观测(D1 升级;设计稿 §3.3;ADR-33
@@ -1256,6 +1368,22 @@ impl ReplServer {
             },
             (None, None) => BucketFilter::All,
         };
+        // E1 水位护栏(§3.5 同一不变量的快照面):本节点有 data_pending
+        // 段(中继回填中)时,o:/p: 条目的段引用可能仍是**流坐标**——
+        // 活段清单内这些段本节点供不出字节,导出 = 给下游开悬空引用。
+        // 拒开新会话(503;下游 bootstrap 的 Transient 重试路径在回填
+        // 排空后天然收敛)。主端/已排空节点 pending 恒空,零行为变化。
+        match self.meta.list_repl_pending(1) {
+            Ok(p) if !p.is_empty() => {
+                return json_err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ErrDataPending",
+                    "relay has unmaterialized segments (data_pending); retry after backfill drains",
+                )
+            }
+            Ok(_) => {}
+            Err(e) => return internal_err("pending probe", &e),
+        }
         self.sweep_snapshots();
         if self.snapshots.lock().len() >= MAX_SNAPSHOT_SESSIONS {
             return json_err(
@@ -1748,6 +1876,22 @@ fn internal_err(what: &str, e: &fs3_core::Error) -> Response<Full<Bytes>> {
         "internal",
         &format!("{what}: {e}"),
     )
+}
+
+/// extent-data 本地直读的错误 → 响应映射(原 handle_extent_data 内联
+/// 口径;E1 抽出供 native/流坐标回退两路复用)。
+fn extent_read_err(e: &fs3_core::Error) -> Response<Full<Bytes>> {
+    match e {
+        fs3_core::Error::NotFound(_) => json_err(
+            StatusCode::NOT_FOUND,
+            "extent_not_found",
+            "extent not in pool",
+        ),
+        fs3_core::Error::InvalidArgument(_) => {
+            json_err(StatusCode::BAD_REQUEST, "bad_range", "range out of extent")
+        }
+        other => internal_err("extent read", other),
+    }
 }
 
 fn json_resp(status: StatusCode, v: serde_json::Value) -> Response<Full<Bytes>> {
@@ -4782,6 +4926,204 @@ mod tests {
             .get_to("b0", "big", 0..u64::MAX, &mut out)
             .unwrap();
         assert_eq!(out, big, "幂等重入后数据仍一致");
+    }
+
+    /// M21 E1(设计稿 §3.5;ADR-33 RP3.3;TODO M21/E1 具名用例):**中继只
+    /// 投递本地数据已齐备的 GTID(发送水位 ≤ 本地数据水位)**——
+    /// ① 中继(standby apply 原样落 bl: + pending 待回填)对下服务
+    ///    binlog:带 data_refs 且 pending 未摘除的条目**暂存不投递**;
+    /// ② GTID 严格序**不可跳发**:被暂存条目之后、本地已齐备的条目
+    ///    也不随批发出(水位 = 连续已齐备前缀);
+    /// ③ 回填完成(清算事务摘除 pending)后,被暂存条目随下一批到达。
+    #[tokio::test]
+    async fn relay_ships_only_materialized_gtids() {
+        let dir = tempfile::tempdir().unwrap();
+        // 上游产生 4 条真实记录:建桶(无引用)+ 三个段对象(带引用)
+        let up_engine = test_engine_opts(&dir.path().join("up"), 4 * 1024 * 1024, true);
+        let (p1, p2, p3) = (
+            vec![7u8; 1024 * 1024],
+            vec![8u8; 1024 * 1024],
+            vec![9u8; 1024 * 1024],
+        );
+        {
+            let mut e = up_engine.write();
+            e.create_bucket_with_quota("b0", None).unwrap();
+            e.put("b0", "o1", &mut &p1[..]).unwrap();
+            e.put("b0", "o2", &mut &p2[..]).unwrap();
+            e.put("b0", "o3", &mut &p3[..]).unwrap();
+        }
+        let up_meta = up_engine.read().meta_arc();
+        let records = up_meta.repl_binlog_scan(0, 100).unwrap();
+        assert_eq!(records.len(), 4, "桶 + 三对象 = 4 条 binlog");
+
+        // 中继:standby 原样 apply(B4 路径)——bl: 原样落盘、三条 put
+        // 记录入 pending(段字节未回填 = 本地数据未齐备)
+        let relay_engine = test_engine(&dir.path().join("relay"));
+        let relay = relay_engine.read().meta_arc();
+        relay.set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
+        for (seq, rec) in &records {
+            let gtid = Gtid {
+                epoch: rec.epoch,
+                seq: *seq,
+            };
+            relay.apply_repl_record(gtid, rec).unwrap();
+        }
+        assert_eq!(relay.list_repl_pending(100).unwrap().len(), 3);
+        let fx = start_server_on(relay_engine.clone(), relay.clone());
+        let cli = fx.client_cert(Some("node-c"));
+        // 预登记槽(binlog 端点按槽服务,D2 口径)
+        let (st, _, raw) = mtls_request(
+            fx.addr,
+            &fx.ca_pem,
+            Some((&cli.0, &cli.1)),
+            &post_json_req(
+                "/v1/repl/v1/slots",
+                &serde_json::json!({"name": "s1"}).to_string(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(st, 200, "{}", String::from_utf8_lossy(&raw));
+
+        // ① 三条 put 全部 pending:只有建桶记录(无引用)可投递
+        let got = binlog_get(&fx, (&cli.0, &cli.1), "s1", "0-0").await;
+        assert_eq!(got, vec!["1-1"], "pending 段条目暂存不投递");
+
+        // 清算摘除指定 seq 的 pending 条目(回填完成的死引用收尾口径,
+        // 同回填池 process_record 的 consume 调用)
+        let consume = |seq: u64| {
+            let pend = relay.list_repl_pending(100).unwrap();
+            let (g, refs) = pend.iter().find(|(g, _)| g.seq == seq).unwrap();
+            let consumed: Vec<(Gtid, fs3_meta::repl::DataRef)> =
+                refs.iter().map(|r| (*g, *r)).collect();
+            relay
+                .repl_localize_segments(&[], &consumed, None, seq, &[])
+                .unwrap();
+        };
+
+        // ③ o1 回填完成 → 1-2 随下一批到达;1-3 仍 pending 阻住批尾
+        consume(2);
+        let got = binlog_get(&fx, (&cli.0, &cli.1), "s1", "1-1").await;
+        assert_eq!(got, vec!["1-2"], "回填完成的条目随下一批到达");
+
+        // ② 不可跳发:o3(1-4)已齐备但 o2(1-3)仍 pending → 空批
+        consume(4);
+        let got = binlog_get(&fx, (&cli.0, &cli.1), "s1", "1-2").await;
+        assert!(
+            got.is_empty(),
+            "1-3 未齐备阻住 1-4(严格序不可跳发): {got:?}"
+        );
+        consume(3);
+        let got = binlog_get(&fx, (&cli.0, &cli.1), "s1", "1-2").await;
+        assert_eq!(got, vec!["1-3", "1-4"], "全部回填完成后续流放行");
+    }
+
+    /// M21 E1(设计稿 §3.5/§3.6;TODO M21/E1 具名用例):**三级链路
+    /// A→B→C 追平**——A 写 → B(中继 = pull A + 回填池 + 对下复制口)
+    /// → C(pull B + 回填池);水位约束下 C 只在 B 数据齐备后收到对应
+    /// GTID;终局 B/C 对象逐字节一致(段经各跳本地分配器重布局,流坐标
+    /// 经 `s:repl_rmap` 逐跳翻译)。
+    #[test]
+    fn three_tier_chain_catches_up() {
+        use crate::repl_backfill::{BackfillConfig, BackfillService};
+        use crate::repl_worker::PullWorker;
+        let dir = tempfile::tempdir().unwrap();
+        let bf_cfg = |pull: crate::repl_worker::PullConfig| BackfillConfig {
+            pull,
+            data_pull_concurrency: 4,
+            pool_enabled: true,
+            read_fetch_timeout: std::time::Duration::from_secs(30),
+        };
+        // A:主,binlog 开
+        let a_engine = test_engine_opts(&dir.path().join("a"), 4 * 1024 * 1024, true);
+        {
+            let mut e = a_engine.write();
+            e.create_bucket_with_quota("b0", None).unwrap();
+        }
+        let a_meta = a_engine.read().meta_arc();
+        let fa = start_server_on(a_engine.clone(), a_meta.clone());
+
+        // B:中继(standby + pull + 回填池 + 对下复制口)
+        let b_engine = test_engine(&dir.path().join("b"));
+        let b_meta = b_engine.read().meta_arc();
+        b_meta.set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
+        let b_tls = dir.path().join("b_tls");
+        std::fs::create_dir_all(&b_tls).unwrap();
+        let cfg_b = pull_cfg(&b_tls, &fa, "s-b", "node-b");
+        let wb = PullWorker::spawn(b_engine.clone(), b_meta.clone(), cfg_b.clone()).unwrap();
+        wait_repl_cursor(&b_meta, Gtid { epoch: 1, seq: 1 });
+        let bfb = BackfillService::spawn(b_engine.clone(), b_meta.clone(), bf_cfg(cfg_b)).unwrap();
+        let fb = start_server_on(b_engine.clone(), b_meta.clone());
+
+        // C:末端备(pull B + 回填池)
+        let c_engine = test_engine(&dir.path().join("c"));
+        let c_meta = c_engine.read().meta_arc();
+        c_meta.set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
+        let c_tls = dir.path().join("c_tls");
+        std::fs::create_dir_all(&c_tls).unwrap();
+        let cfg_c = pull_cfg(&c_tls, &fb, "s-c", "node-c");
+        let wc = PullWorker::spawn(c_engine.clone(), c_meta.clone(), cfg_c.clone()).unwrap();
+        wait_repl_cursor(&c_meta, Gtid { epoch: 1, seq: 1 });
+        let bfc = BackfillService::spawn(c_engine.clone(), c_meta.clone(), bf_cfg(cfg_c)).unwrap();
+
+        // A 写:两个段对象 + 一个内联对象(seq 2..=4)
+        let big1: Vec<u8> = (0..1024 * 1024usize).map(|i| (i % 251) as u8).collect();
+        let big2: Vec<u8> = (0..3 * 1024 * 1024usize).map(|i| (i % 239) as u8).collect();
+        let inl = b"inline-via-binlog".to_vec();
+        {
+            let mut e = a_engine.write();
+            e.put("b0", "big1", &mut &big1[..]).unwrap();
+            e.put("b0", "big2", &mut &big2[..]).unwrap();
+            e.put("b0", "inl", &mut &inl[..]).unwrap();
+        }
+        let tip = a_meta.last_seq().unwrap();
+        assert_eq!(tip, 4);
+
+        // 链路追平:游标到顶 + 两端 pending 排空(回填完成)
+        wait_repl_cursor(&b_meta, Gtid { epoch: 1, seq: tip });
+        wait_repl_cursor(&c_meta, Gtid { epoch: 1, seq: tip });
+        let wait_drained = |meta: &MetaStore| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let pend = meta.list_repl_pending(100).unwrap();
+                if pend.is_empty() {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "pending 未在限时内排空: {pend:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        wait_drained(&b_meta);
+        wait_drained(&c_meta);
+        wb.shutdown();
+        wc.shutdown();
+        bfb.shutdown();
+        bfc.shutdown();
+
+        // 终局:三端逐字节一致;C 段表 = 本地段(布局独立 §4.3)
+        for (k, p) in [("big1", &big1), ("big2", &big2), ("inl", &inl)] {
+            let mut out = Vec::new();
+            b_engine
+                .read()
+                .get_to("b0", k, 0..u64::MAX, &mut out)
+                .unwrap();
+            assert_eq!(&out, p, "B: {k} 逐字节一致");
+            out.clear();
+            c_engine
+                .read()
+                .get_to("b0", k, 0..u64::MAX, &mut out)
+                .unwrap();
+            assert_eq!(&out, p, "C: {k} 逐字节一致(级联两跳)");
+        }
+        let a_obj = a_meta.get_object("b0", "big1").unwrap().unwrap();
+        let c_obj = c_meta.get_object("b0", "big1").unwrap().unwrap();
+        assert_ne!(
+            c_obj.extents, a_obj.extents,
+            "C: 段引用必须逐跳改写为本地段"
+        );
     }
 
     /// subject CN 提取:rcgen 证书正/反向 + 垃圾输入不 panic。

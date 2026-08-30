@@ -101,6 +101,8 @@ pub struct RebuildClearStats {
     pub pending_deleted: u64,
     /// `s:repl_pdobj` 对象级 pending 标记删除数。
     pub pending_obj_deleted: u64,
+    /// `s:repl_rmap` 中继段映射删除数(M21 E1)。
+    pub rmap_deleted: u64,
     /// 本地复制槽删除数。
     pub slots_deleted: u64,
     /// 委派凭证记录删除数(M21 D3;`s:repl_dcred_out` + `s:repl_dcred_in`
@@ -186,6 +188,9 @@ pub struct BinlogTruncateStats {
     pub soft_capped: bool,
     /// 硬上限强截时被标记 stale 的槽数。
     pub stale_marked: u64,
+    /// 同批回收的 `s:repl_rmap` 中继段映射条目数(M21 E1;口径见
+    /// truncate_binlog 注释)。
+    pub rmap_deleted: u64,
 }
 
 /// 分配器变更草稿(随事务写入 a:/t: 记录;M13 起类型本体移至 fs3_core,
@@ -2900,6 +2905,49 @@ impl MetaStore {
         Ok(out)
     }
 
+    /// 待回填条目点读(M21 E1 中继发送水位:binlog 投递路径逐带引用
+    /// 条目判「本地数据是否已齐备」,单次 RocksDB 点读;条目在 = 该
+    /// GTID 的段字节未齐备)。
+    pub fn repl_pending_exists(&self, g: Gtid) -> Result<bool> {
+        Ok(self
+            .db
+            .get(repl_pending_key(g))
+            .map_err(rocks_err)?
+            .is_some())
+    }
+
+    /// 中继段映射查询(M21 E1;设计稿 §3.5;键族语义见 keys.rs
+    /// PREFIX_REPL_RMAP):在 `s:repl_rmap\0{extent_id}` 前缀内找**包含**
+    /// 请求区间 [offset, offset+len) 的流坐标引用,命中返回
+    /// (流坐标 DataRef, 本地段表);未命中 = None(调用方回退本地池
+    /// 直读——直连主端/promote 后本端自写记录的坐标即本地坐标)。
+    pub fn repl_rmap_lookup(
+        &self,
+        extent_id: u32,
+        offset: u64,
+        len: u64,
+    ) -> Result<Option<(repl::DataRef, Vec<fs3_core::Segment>)>> {
+        for item in scan_prefix(&self.db, &repl_rmap_extent_prefix(extent_id)) {
+            let (k, v) = item?;
+            let (eid, roff, rlen) = parse_repl_rmap_key(&k)?;
+            debug_assert_eq!(eid, extent_id);
+            let (start, end) = (u64::from(roff), u64::from(roff) + u64::from(rlen));
+            if start <= offset && offset + len <= end {
+                let local: Vec<fs3_core::Segment> = decode(&v)?;
+                return Ok(Some((
+                    repl::DataRef {
+                        extent_id,
+                        offset: roff,
+                        len: rlen,
+                        crc32c: None,
+                    },
+                    local,
+                )));
+            }
+        }
+        Ok(None)
+    }
+
     /// 原始键点读(C3 回填池的段匹配输入:o:/p: 全形态;值含版本字节)。
     pub fn repl_raw_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.db.get(key).map_err(rocks_err)
@@ -2943,6 +2991,10 @@ impl MetaStore {
     //   apply 覆盖了对象 → 旧引用不再出现 → 乐观事务读集冲突,提交
     //   失败显式返回 ObjectChanged 交调用方重取状态重组——绝不把本地
     //   段写进已不属于它的段表槽位;
+    // - **中继段映射同事务(M21 E1,§3.5)**:全匹配替换成功的每个
+    //   上游引用 → `s:repl_rmap` 写「流坐标 → 本地段表」,与段表替换
+    //   同批落盘(中继对下 extent-data 翻译的供数底座;回收/清空口径
+    //   见 keys.rs PREFIX_REPL_RMAP 与 truncate_binlog 注释);
     // - **pending 清算按记录粒度**:`consumed` 从所属条目摘除引用
     //   (extent_id/offset/len 匹配),条目引空即删键;失去引用的
     //   「死引用」(对象被并发覆盖/删除)以零替换 consumed 摘除,
@@ -3055,6 +3107,19 @@ impl MetaStore {
                     "repl localize target key ({} bytes) not o:/p: family",
                     item.key.len()
                 )));
+            }
+            // E1 级联中继(§3.5/RP3.3):「流坐标 → 本地段表」映射与段表
+            // 替换同事务落盘(s:repl_rmap,零漂移)——中继对下服务
+            // extent-data 的翻译底座;仅在全匹配替换成功的同一条件下写
+            // (部分匹配 = 上行已 rollback 返回,不可达)。
+            if matched.iter().all(|m| *m) && !item.subs.is_empty() {
+                for (dref, local) in &item.subs {
+                    tx.put(
+                        repl_rmap_key(dref.extent_id, dref.offset, dref.len),
+                        encode(local)?,
+                    )
+                    .map_err(rocks_err)?;
+                }
             }
         }
         // pending 清算:按记录条目摘除已处理引用(幂等:条目缺席/引用
@@ -3418,6 +3483,7 @@ impl MetaStore {
             binlog_deleted: self.delete_prefix_chunked(PREFIX_BINLOG)?,
             pending_deleted: self.delete_prefix_chunked(PREFIX_REPL_PENDING)?,
             pending_obj_deleted: self.delete_prefix_chunked(PREFIX_REPL_PENDING_OBJ)?,
+            rmap_deleted: self.delete_prefix_chunked(PREFIX_REPL_RMAP)?,
             slots_deleted: self.delete_prefix_chunked(PREFIX_REPL_SLOT)?,
             dcred_deleted: self.delete_prefix_chunked(PREFIX_REPL_DCRED_OUT)?
                 + self.delete_prefix_chunked(PREFIX_REPL_DCRED_IN)?,
@@ -3652,6 +3718,9 @@ impl MetaStore {
             bytes: u64,
             /// 提交墙钟(A1 存量记录 None = 年龄未知,时限判定保守保数据)。
             ts: Option<i64>,
+            /// 段引用(E1:s:repl_rmap 回收输入;中继映射条目的生命期 =
+            /// 引用它的 bl: 记录保留期,见下方删除批注释)。
+            refs: Vec<repl::DataRef>,
         }
         let mut entries: Vec<Entry> = Vec::new();
         for item in scan_prefix(&self.db, PREFIX_BINLOG) {
@@ -3664,6 +3733,7 @@ impl MetaStore {
                 },
                 bytes: v.len() as u64,
                 ts: rec.ts,
+                refs: rec.data_refs,
             });
         }
         if entries.is_empty() {
@@ -3729,6 +3799,28 @@ impl MetaStore {
         let mut batch = WriteBatchWithTransaction::<true>::default();
         for e in &entries[..cut] {
             batch.delete(binlog_key(e.gtid.seq));
+        }
+        // E1 中继段映射(s:repl_rmap)同批回收:映射条目只服务「引用它
+        // 的 bl: 记录仍可被下游续拉」的窗口——记录被截断(全部活跃槽已
+        // 确认越过;强截 = 槽 stale 唯一出路重建)后映射失效。COW 共享
+        // 段(同一上游引用出现于多条记录)只删「不被任何 retained 记录
+        // 引用」的条目,防截断早记录误删晚记录仍在用的映射。
+        {
+            let id_of = |r: &repl::DataRef| (r.extent_id, r.offset, r.len);
+            let retained: std::collections::HashSet<(u32, u32, u32)> = entries[cut..]
+                .iter()
+                .flat_map(|e| e.refs.iter().map(id_of))
+                .collect();
+            let mut dropped = std::collections::HashSet::new();
+            for e in &entries[..cut] {
+                for r in &e.refs {
+                    let id = id_of(r);
+                    if !retained.contains(&id) && dropped.insert(id) {
+                        batch.delete(repl_rmap_key(r.extent_id, r.offset, r.len));
+                        stats.rmap_deleted += 1;
+                    }
+                }
+            }
         }
         if forced {
             for s in &slots {
@@ -7733,7 +7825,7 @@ mod tests {
     /// M21 C5(ADR-33 RP2.3/RP5.4;TODO M21/C5):clear_for_rebuild 清空范围
     /// 与崩溃续清——
     /// ① 清空:复制面元数据族(b:/o:/iv: 等 C1 快照导出面)+ bl: +
-    ///    s:repl_pending/s:repl_pdobj + 本地槽全删;s:repl_cursor /
+    ///    s:repl_pending/s:repl_pdobj/s:repl_rmap + 本地槽全删;s:repl_cursor /
     ///    s:repl_executed / s:repl_epoch 复位到读默认;role → standby;
     /// ② 保留:本机状态不动(s:seq 水位、s:audit、e: 瞬态队列、a:/t:
     ///    分配记录);
@@ -7776,6 +7868,7 @@ mod tests {
         meta.db.put(b"iv:probe", b"v").unwrap();
         meta.db.put(b"s:repl_pending\x00p", b"v").unwrap();
         meta.db.put(b"s:repl_pdobj\x00p", b"").unwrap();
+        meta.db.put(b"s:repl_rmap\x00p", b"v").unwrap();
         meta.db.put(b"e:\0\0\0\0\0\0\0\x01", b"v").unwrap();
         meta.db.put(b"a:\0\0\0\0\0\0\0\x63", b"v").unwrap();
         meta.flush().unwrap();
@@ -7785,6 +7878,7 @@ mod tests {
         assert_eq!(stats.binlog_deleted, 2, "桶 + 对象各一条 bl:");
         assert_eq!(stats.pending_deleted, 1);
         assert_eq!(stats.pending_obj_deleted, 1);
+        assert_eq!(stats.rmap_deleted, 1, "s:repl_rmap 中继映射同清(E1)");
         assert_eq!(stats.slots_deleted, 1);
         // b:/o:/iv: + open 期 ensure 的 tn:default/iu:bootstrap 同清
         assert!(stats.replicated_meta_deleted >= 3, "{stats:?}");
@@ -7792,6 +7886,7 @@ mod tests {
         assert!(meta.db.get(b"iv:probe").unwrap().is_none());
         assert!(meta.db.get(b"s:repl_pending\x00p").unwrap().is_none());
         assert!(meta.db.get(b"s:repl_pdobj\x00p").unwrap().is_none());
+        assert!(meta.db.get(b"s:repl_rmap\x00p").unwrap().is_none());
         assert!(meta.list_repl_slots().unwrap().is_empty());
         assert_eq!(meta.repl_cursor().unwrap(), Gtid { epoch: 0, seq: 0 });
         assert!(meta.repl_executed().unwrap().is_empty());

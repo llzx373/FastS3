@@ -210,6 +210,7 @@ impl RebuildService {
                 "binlog": stats.binlog_deleted,
                 "pending": stats.pending_deleted,
                 "pending_obj": stats.pending_obj_deleted,
+                "rmap": stats.rmap_deleted,
                 "slots": stats.slots_deleted,
             },
             "note": "pull worker restarted; C1/C2 snapshot bootstrap + catch-up from P in progress (async)",

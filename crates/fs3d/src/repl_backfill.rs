@@ -725,8 +725,10 @@ async fn fetch_data_ref(inner: &Arc<Inner>, dref: &DataRef) -> Result<ReplImport
     let mut crc_acc: Option<u32> = dref.crc32c.map(|_| 0);
     while remaining > 0 {
         let chunk = remaining.min(crate::repl_worker::EXTENT_DATA_CHUNK);
+        // space=stream(E1):DataRef 是 binlog 流坐标(原始生产端坐标系);
+        // 上游是中继时经其 s:repl_rmap 翻译供数,是主端时回退本地直读
         let path = format!(
-            "/v1/repl/v1/extent-data?extent_id={}&offset={off}&len={chunk}",
+            "/v1/repl/v1/extent-data?extent_id={}&offset={off}&len={chunk}&space=stream",
             dref.extent_id
         );
         inner.extent_data_requests.fetch_add(1, Ordering::Relaxed);
