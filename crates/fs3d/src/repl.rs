@@ -126,10 +126,12 @@
 //!   extent-data 端点拉取。
 //! - `DELETE /v1/repl/v1/snapshot/{id}`:释放会话(MVCC 快照 + ReadPin;
 //!   幂等,未知/已过期 = 410 ErrSnapshotGone)。
-//! - 限速(R5/RP8.3):导出会话共享服务级令牌桶(复用 fs3-engine
-//!   worker::Throttle,ADR-12 DL2 共享桶先例;速率
-//!   `FS3D_REPL_EXPORT_RATE` 字节/秒,默认 64 MiB/s),meta 页与
-//!   extent-data 响应字节记账,透支即挂起等回充。
+//! - 限速(R5/RP8.3;E2 起经 `ReplTraffic` 旁路桶,不动 fs3-engine
+//!   worker::Throttle):复制口 serve 字节(extent-data 响应、快照
+//!   meta 页)记账进中继流量共享桶,速率 `FS3D_REPL_EXPORT_RATE`
+//!   字节/秒(默认 64 MiB/s),透支即挂起等回充;三类流量权重
+//!   `FS3D_REPL_TRAFFIC_WEIGHTS`(默认 serve=100,backfill=50,
+//!   on_demand=10;共享桶 + 每类保底信用,语义见 repl_traffic.rs)。
 //!
 //! 复制槽生命周期线格式(B3;设计稿 §3.3;ADR-33 RP3/RP8):
 //! - `POST /v1/repl/v1/slots`(预登记,消费方部署前由持受信证书的运维面
@@ -165,7 +167,6 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use fs3_core::{Gtid, GtidSet};
-use fs3_engine::worker::Throttle;
 use fs3_engine::Engine;
 use fs3_meta::{BucketFilter, BucketScope, MetaStore, ReplExportSession, ReplRecord, Slot};
 use http_body_util::{BodyExt, Full};
@@ -176,6 +177,8 @@ use hyper_util::rt::TokioIo;
 use parking_lot::{Mutex, RwLock};
 use serde::Deserialize;
 use tokio_rustls::TlsAcceptor;
+
+use crate::repl_traffic::{ReplTraffic, TrafficClass, TrafficWeights};
 
 /// extent-data 单请求 len 上限(64 MiB;下游回填池分块,见模块注释)。
 const MAX_EXTENT_DATA_LEN: u64 = 64 * 1024 * 1024;
@@ -195,8 +198,8 @@ const MAX_CHAIN_HOPS: usize = 8;
 /// 复制槽扇出硬上限默认值(ADR-33 RP3.1/裁定 2)。
 pub const DEFAULT_MAX_SLOTS: usize = 16;
 /// 快照导出令牌桶默认速率(64 MiB/s,对齐 ADR-12 DL2 后台共享桶缺省;
-/// C1,R5/RP8.3)。
-const DEFAULT_EXPORT_RATE: u64 = 64 << 20;
+/// C1,R5/RP8.3)。E2 起兼作中继流量共享桶(ReplTraffic)的默认总速率。
+pub(crate) const DEFAULT_EXPORT_RATE: u64 = 64 << 20;
 /// 导出令牌桶速率下限(0 速率 = 永不回充死锁,钳到 1 MiB/s)。
 const MIN_EXPORT_RATE: u64 = 1 << 20;
 /// 快照元数据单页字节上限(键+值合计;防巨型页缓冲)。
@@ -226,6 +229,14 @@ pub struct ReplConfig {
     pub max_slots: usize,
     /// 快照导出限速(字节/秒;C1;服务级令牌桶速率,默认 64 MiB/s)。
     pub export_rate: u64,
+    /// 中继流量权重(M21 E2;裁定 4;env `FS3D_REPL_TRAFFIC_WEIGHTS`,
+    /// 缺省 serve=100/backfill=50/on_demand=10)。
+    pub traffic_weights: TrafficWeights,
+    /// 装配注入的中继流量共享桶(E2;main.rs cmd_serve 在复制口或
+    /// pull/backfill 任一启用时建桶并注入,serve/backfill/on_demand
+    /// 三类共持同一 Arc)。None = 按 export_rate/traffic_weights 自建
+    /// 独立桶(单角色节点/测试)。
+    pub traffic: Option<Arc<ReplTraffic>>,
 }
 
 impl ReplConfig {
@@ -273,6 +284,8 @@ impl ReplConfig {
             server_key: PathBuf::from(server_key),
             max_slots,
             export_rate,
+            traffic_weights: TrafficWeights::from_env()?,
+            traffic: None,
         }))
     }
 }
@@ -338,8 +351,10 @@ pub struct ReplServer {
     node_id: Option<String>,
     /// 复制槽扇出硬上限(B3;握手自动登记与预登记共用同一闸)。
     max_slots: usize,
-    /// 导出会话共享令牌桶(C1,R5/RP8.3;meta 页与 extent-data 字节记账)。
-    throttle: Arc<Throttle>,
+    /// 中继流量共享桶(E2,裁定 4):extent-data/快照页字节按
+    /// TrafficClass::Serve 记账(投递下游类;与回填/按需拉取按权重
+    /// 共享同一预算,实现形态见 repl_traffic.rs 模块注释)。
+    traffic: Arc<ReplTraffic>,
     /// 在线快照导出会话注册表(C1;snapshot_id → 会话;空闲 TTL 回收)。
     snapshots: Mutex<HashMap<u64, Arc<SnapshotSession>>>,
     /// 会话 id 分配(进程内单调;1 起)。
@@ -379,7 +394,9 @@ impl ReplServer {
             listen: cfg.listen,
             node_id,
             max_slots: cfg.max_slots,
-            throttle: Throttle::new(cfg.export_rate),
+            traffic: cfg
+                .traffic
+                .unwrap_or_else(|| ReplTraffic::new(cfg.export_rate, cfg.traffic_weights)),
             snapshots: Mutex::new(HashMap::new()),
             next_snapshot_id: AtomicU64::new(1),
         })
@@ -794,7 +811,8 @@ impl ReplServer {
                 Err(e) => return extent_read_err(&e),
             }
         };
-        self.throttle.consume(bytes.len() as u64);
+        self.traffic
+            .consume(TrafficClass::Serve, bytes.len() as u64);
         let crc = fs3_core::crc32c::crc32c(&bytes, 0);
         Response::builder()
             .status(StatusCode::OK)
@@ -1319,10 +1337,11 @@ impl ReplServer {
 
     // ─────────────────── C1 在线快照导出(设计稿 §3.1;ADR-33 RP8.3) ───────────────────
 
-    /// 令牌桶等待(透支即挂起等回充;25ms 滴答)。导出/meta 页/extent-data
-    /// 共用(R5/RP8.3;worker 共享令牌桶先例 = fs3-engine worker::Throttle)。
+    /// 令牌桶等待(Serve 类透支即挂起等回充;25ms 滴答)。导出/meta 页/
+    /// extent-data 共用(R5/RP8.3;E2 起 = 中继流量共享桶 repl_traffic,
+    /// 原 fs3-engine worker::Throttle 无类别语义不敷优先级所需)。
     async fn throttle_wait(&self) {
-        while self.throttle.overdrawn() {
+        while self.traffic.overdrawn(TrafficClass::Serve) {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
     }
@@ -1519,7 +1538,7 @@ impl ReplServer {
             .iter()
             .map(|(k, v)| (k.len() + v.len()) as u64)
             .sum();
-        self.throttle.consume(bytes);
+        self.traffic.consume(TrafficClass::Serve, bytes);
         use base64::Engine as _;
         let entries: Vec<serde_json::Value> = page
             .entries
@@ -2120,6 +2139,8 @@ mod tests {
             server_key: write_pem(dir.path(), "server.key", &key_pem),
             max_slots: DEFAULT_MAX_SLOTS,
             export_rate: DEFAULT_EXPORT_RATE,
+            traffic_weights: TrafficWeights::default(),
+            traffic: None,
         };
         let server = ReplServer::new(engine.clone(), meta, cfg).unwrap();
         let handle = server.spawn().unwrap();
@@ -2424,6 +2445,8 @@ mod tests {
             server_key: write_pem(dir.path(), "server.key", &srv_key),
             max_slots: DEFAULT_MAX_SLOTS,
             export_rate: DEFAULT_EXPORT_RATE,
+            traffic_weights: TrafficWeights::default(),
+            traffic: None,
         };
         let addr = ReplServer::new(engine.clone(), meta, cfg)
             .unwrap()
@@ -3820,6 +3843,8 @@ mod tests {
             server_key: write_pem(dir.path(), "server.key", &key_pem),
             max_slots: DEFAULT_MAX_SLOTS,
             export_rate: DEFAULT_EXPORT_RATE,
+            traffic_weights: TrafficWeights::default(),
+            traffic: None,
         };
         let server = ReplServer::new(engine.clone(), meta, cfg).unwrap();
         let handle = server.spawn().unwrap();
@@ -4879,7 +4904,8 @@ mod tests {
             "us-east-1".into(),
             false,
         ));
-        let rebuild = RebuildService::new(down_engine.clone(), svc, down.clone(), cfg.clone());
+        let rebuild =
+            RebuildService::new(down_engine.clone(), svc, down.clone(), cfg.clone(), None);
         let v = rebuild.rebuild(Some(&cfg.primary_url), None).unwrap();
         assert_eq!(v["status"], serde_json::json!("rebuilding"), "{v}");
         assert!(
@@ -5033,6 +5059,7 @@ mod tests {
             data_pull_concurrency: 4,
             pool_enabled: true,
             read_fetch_timeout: std::time::Duration::from_secs(30),
+            traffic: None,
         };
         // A:主,binlog 开
         let a_engine = test_engine_opts(&dir.path().join("a"), 4 * 1024 * 1024, true);
@@ -5234,6 +5261,7 @@ mod tests {
                 data_pull_concurrency: 4,
                 pool_enabled: true,
                 read_fetch_timeout: std::time::Duration::from_secs(30),
+                traffic: None,
             },
         )
         .unwrap();
@@ -5309,6 +5337,7 @@ mod tests {
                 data_pull_concurrency: 4,
                 pool_enabled: true,
                 read_fetch_timeout: std::time::Duration::from_secs(30),
+                traffic: None,
             },
         )
         .unwrap();
@@ -5417,6 +5446,7 @@ mod tests {
                 data_pull_concurrency: 4,
                 pool_enabled: false,
                 read_fetch_timeout: std::time::Duration::from_secs(30),
+                traffic: None,
             },
         )
         .unwrap();
@@ -5549,6 +5579,7 @@ mod tests {
                 data_pull_concurrency: 4,
                 pool_enabled: false,
                 read_fetch_timeout: std::time::Duration::from_secs(30),
+                traffic: None,
             },
         )
         .unwrap();

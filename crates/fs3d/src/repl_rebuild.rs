@@ -40,6 +40,7 @@ use fs3_meta::MetaStore;
 use parking_lot::{Mutex, RwLock};
 
 use crate::repl_backfill::{BackfillConfig, BackfillService};
+use crate::repl_traffic::ReplTraffic;
 use crate::repl_worker::{PullConfig, PullWorker};
 
 /// 重建编排服务(admin trait 注入面 + CLI 动作的实际执行体)。
@@ -47,6 +48,9 @@ pub struct RebuildService {
     engine: Arc<RwLock<Engine>>,
     service: Arc<fs3_s3::S3Service>,
     meta: Arc<MetaStore>,
+    /// 中继流量共享桶(E2;重建后重起的回填池注入同一预算;None =
+    /// 回填池独立无限桶)。
+    traffic: Option<Arc<ReplTraffic>>,
     inner: Mutex<Inner>,
 }
 
@@ -69,11 +73,13 @@ impl RebuildService {
         service: Arc<fs3_s3::S3Service>,
         meta: Arc<MetaStore>,
         pull_cfg: PullConfig,
+        traffic: Option<Arc<ReplTraffic>>,
     ) -> RebuildService {
         RebuildService {
             engine,
             service,
             meta,
+            traffic,
             inner: Mutex::new(Inner {
                 pull: None,
                 backfill: None,
@@ -231,7 +237,8 @@ impl RebuildService {
             cfg.clone(),
         )
         .map_err(|e| RebuildError::Failed(format!("restart pull worker: {e}")))?;
-        let bf_cfg = BackfillConfig::from_env(cfg.clone()).map_err(RebuildError::Failed)?;
+        let mut bf_cfg = BackfillConfig::from_env(cfg.clone()).map_err(RebuildError::Failed)?;
+        bf_cfg.traffic = self.traffic.clone();
         let backfill =
             BackfillService::spawn(Arc::clone(&self.engine), Arc::clone(&self.meta), bf_cfg)
                 .map_err(|e| RebuildError::Failed(format!("restart backfill pool: {e}")))?;

@@ -35,9 +35,11 @@
 //!   映射 503 + Retry-After(语义钉死见 fs3-s3 repl_ensure_data)。
 //! - **可观测**:`data_pending_bytes`(待回填字节 gauge,每轮扫描重算;
 //!   D4 导出接线)与 `extent_data_requests`(上游拉取请求计数)。
-//! - **限速/优先级**:中继流量权重(裁定 4:投递 > 回填 > 按需拉取)
-//!   属 E1 接线;本池规模由并发数收口,快照导出/回填共用 worker 令牌桶
-//!   的挂点留待 E1。
+//! - **限速/优先级(E2 落地)**:本池拉取(backfill)与读路径按需拉取
+//!   (on_demand)按块记账进 `ReplTraffic` 共享桶(`ReplTraffic` 由装配处
+//!   注入,与复制口 serve 同一流量预算;裁定 4 权重 投递 > 回填 >
+//!   按需拉取,语义见 repl_traffic.rs);未注入 = 独立无限桶(单角色
+//!   节点保持 E2 前无节流行为)。本池规模另由并发数收口。
 //! - **生命周期**:role=standby 硬校验(同 PullWorker);`shutdown()`
 //!   置停止标志 + join(拉取中任务在当前块完成后退出)。
 
@@ -52,6 +54,7 @@ use fs3_meta::keys::{object_key, object_version_key, part_key};
 use fs3_meta::{repl::DataRef, MetaStore, Op, ReplLocalizeItem};
 use parking_lot::RwLock;
 
+use crate::repl_traffic::{ReplTraffic, TrafficClass};
 use crate::repl_worker::{PullConfig, PullError};
 
 /// 回填池缺省并发(设计稿 §3.2「并发回填池(默认 8 并发,可配)」)。
@@ -78,6 +81,8 @@ pub struct BackfillConfig {
     pub pool_enabled: bool,
     /// 读路径按需拉取(C4)同步等待上限(默认 30s;超时 → 读路径 503)。
     pub read_fetch_timeout: Duration,
+    /// 中继流量共享桶(E2;None = 独立无限桶,单角色节点/测试用)。
+    pub traffic: Option<Arc<ReplTraffic>>,
 }
 
 impl BackfillConfig {
@@ -102,6 +107,7 @@ impl BackfillConfig {
                 "FS3D_REPL_READ_FETCH_TIMEOUT_SECS",
                 DEFAULT_READ_FETCH_TIMEOUT_SECS,
             )?),
+            traffic: None,
         })
     }
 }
@@ -135,6 +141,8 @@ struct Inner {
     data_pending_bytes: AtomicU64,
     /// 上游 extent-data 请求计数(观测 + 内联零往返断言)。
     extent_data_requests: AtomicU64,
+    /// 中继流量桶(E2;backfill/on_demand 两类按块申领/记账)。
+    traffic: Arc<ReplTraffic>,
 }
 
 impl BackfillService {
@@ -153,6 +161,7 @@ impl BackfillService {
             }
         }
         let tls = crate::repl_worker::build_client_tls(&cfg.pull)?;
+        let traffic = cfg.traffic.clone().unwrap_or_else(ReplTraffic::unlimited);
         let (fetch_tx, fetch_rx) = tokio::sync::mpsc::unbounded_channel();
         let inner = Arc::new(Inner {
             engine,
@@ -164,6 +173,7 @@ impl BackfillService {
             fetch_tx,
             data_pending_bytes: AtomicU64::new(0),
             extent_data_requests: AtomicU64::new(0),
+            traffic,
         });
         let inner2 = inner.clone();
         let handle = std::thread::Builder::new()
@@ -505,7 +515,7 @@ async fn localize_target(
         // 拉取(锁外并发;重复拉取浪费由清算锁内复查兜底)
         let mut staged: Vec<(DataRef, ReplImportStaged)> = Vec::with_capacity(matched.len());
         for r in &matched {
-            match fetch_data_ref(inner, r).await {
+            match fetch_data_ref(inner, r, TrafficClass::Backfill).await {
                 Ok(st) => staged.push((*r, st)),
                 Err(e) => {
                     // 已取到的暂存精确逆转账目
@@ -639,7 +649,7 @@ async fn fetch_object(inner: &Arc<Inner>, bucket: &str, key: &str) -> Result<(),
         // 锁外拉取(失败:已取暂存精确逆转账目)
         let mut staged: Vec<(DataRef, ReplImportStaged)> = Vec::with_capacity(uniq.len());
         for r in &uniq {
-            match fetch_data_ref(inner, r).await {
+            match fetch_data_ref(inner, r, TrafficClass::OnDemand).await {
                 Ok(st) => staged.push((*r, st)),
                 Err(e) => {
                     for (_, st) in staged {
@@ -714,7 +724,11 @@ async fn fetch_object(inner: &Arc<Inner>, bucket: &str, key: &str) -> Result<(),
 /// 64MiB 分块,extent-data 响应头 CRC32C 逐块端到端校验;DataRef.
 /// crc32c 预留位非空时追加整段校验)。ReadPin 上游侧已管(服务端
 /// extent-data 端点口径)。
-async fn fetch_data_ref(inner: &Arc<Inner>, dref: &DataRef) -> Result<ReplImportStaged, PullError> {
+async fn fetch_data_ref(
+    inner: &Arc<Inner>,
+    dref: &DataRef,
+    class: TrafficClass,
+) -> Result<ReplImportStaged, PullError> {
     let mut w = inner
         .engine
         .write()
@@ -724,6 +738,15 @@ async fn fetch_data_ref(inner: &Arc<Inner>, dref: &DataRef) -> Result<ReplImport
     let mut remaining = u64::from(dref.len);
     let mut crc_acc: Option<u32> = dref.crc32c.map(|_| 0);
     while remaining > 0 {
+        // E2 流量门:开下一块前查桶,透支即制动等回充(块原子口径:
+        // 块内不受限,记账允许透支;语义见 repl_traffic.rs)
+        while inner.traffic.overdrawn(class) {
+            if inner.stop.load(Ordering::Relaxed) {
+                inner.engine.write().repl_import_abort_writer(w);
+                return Err(PullError::Transient("repl backfill stopped".into()));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
         let chunk = remaining.min(crate::repl_worker::EXTENT_DATA_CHUNK);
         // space=stream(E1):DataRef 是 binlog 流坐标(原始生产端坐标系);
         // 上游是中继时经其 s:repl_rmap 翻译供数,是主端时回退本地直读
@@ -769,6 +792,7 @@ async fn fetch_data_ref(inner: &Arc<Inner>, dref: &DataRef) -> Result<ReplImport
             inner.engine.write().repl_import_abort_writer(w);
             return Err(PullError::Transient(format!("repl import feed: {e}")));
         }
+        inner.traffic.consume(class, bytes.len() as u64);
         off += chunk;
         remaining -= chunk;
     }

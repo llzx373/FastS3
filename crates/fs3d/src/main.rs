@@ -24,6 +24,7 @@ mod repl;
 mod repl_backfill;
 mod repl_metrics;
 mod repl_rebuild;
+mod repl_traffic;
 mod repl_worker;
 mod rewrite;
 mod settings;
@@ -1091,6 +1092,21 @@ fn cmd_serve(
         Ok(v) => v,
         Err(e) => return Err(fs3_core::Error::InvalidArgument(e)),
     };
+    // M21 E2(ADR-33 裁定 4):中继流量共享桶(任一复制配置在 = 建桶;
+    // serve/backfill/on_demand 三类共用同一预算,权重
+    // FS3D_REPL_TRAFFIC_WEIGHTS,速率 = 复制口限速 FS3D_REPL_EXPORT_RATE)
+    let repl_traffic: Option<Arc<repl_traffic::ReplTraffic>> =
+        if repl_cfg_env.is_some() || pull_cfg_env.is_some() {
+            let weights = repl_traffic::TrafficWeights::from_env()
+                .map_err(fs3_core::Error::InvalidArgument)?;
+            let rate = repl_cfg_env
+                .as_ref()
+                .map(|c| c.export_rate)
+                .unwrap_or(repl::DEFAULT_EXPORT_RATE);
+            Some(repl_traffic::ReplTraffic::new(rate, weights))
+        } else {
+            None
+        };
     // M21 C5(ADR-33 RP2.3/RP5.4):断档显式重建编排(pull 配置在 = 可
     // 重建;纯主无上游 = 不注入,admin rebuild 端点 501)
     let rebuild_svc: Option<Arc<repl_rebuild::RebuildService>> = pull_cfg_env.as_ref().map(|pc| {
@@ -1099,6 +1115,7 @@ fn cmd_serve(
             service.clone(),
             engine.read().meta_arc(),
             pc.clone(),
+            repl_traffic.clone(),
         ))
     });
 
@@ -1164,7 +1181,7 @@ fn cmd_serve(
                     )
                 } else {
                     None
-                });
+            });
         // M6 / J5:设置页供应器(admin GET/PATCH /v1/admin/config)
         let provider = Arc::new(settings::SettingsProvider::new(
             config_path.clone(),
@@ -1226,7 +1243,8 @@ fn cmd_serve(
     // 强制)。配置走 env 最小入口(FS3D_REPL_*;[replication] 完整配置段
     // 属 F3 收口)。TLS 材料装配期装载,坏材料 = 启动显式失败(不静默降级
     // 为无 mTLS,红线 RP6.2)。
-    if let Some(repl_cfg) = repl_cfg_env {
+    if let Some(mut repl_cfg) = repl_cfg_env {
+        repl_cfg.traffic = repl_traffic.clone();
         let meta = engine.read().meta_arc();
         let handle = repl::ReplServer::new(engine.clone(), meta, repl_cfg)
             .map_err(fs3_core::Error::InvalidArgument)?
@@ -1270,8 +1288,9 @@ fn cmd_serve(
     let mut backfill = match pull_worker.as_ref() {
         Some((_, pull_cfg)) => {
             let meta = engine.read().meta_arc();
-            let bf_cfg = repl_backfill::BackfillConfig::from_env(pull_cfg.clone())
+            let mut bf_cfg = repl_backfill::BackfillConfig::from_env(pull_cfg.clone())
                 .map_err(fs3_core::Error::InvalidArgument)?;
+            bf_cfg.traffic = repl_traffic.clone();
             let svc = repl_backfill::BackfillService::spawn(Arc::clone(&engine), meta, bf_cfg)
                 .map_err(fs3_core::Error::InvalidArgument)?;
             // M21 C4:读路径接线——引擎 pending 探针(get/read_at 命中 →
