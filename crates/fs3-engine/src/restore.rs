@@ -128,6 +128,7 @@ impl Engine {
             version_id: meta.version_id.map(|v| crate::version_id_display(Some(&v))),
             delete_marker: false,
             dead: false,
+            sse: fs3_core::EventRecord::sse_label(meta.sse.as_ref()),
         }
     }
 

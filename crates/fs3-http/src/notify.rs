@@ -583,6 +583,9 @@ pub fn build_payload(
     if rec.delete_marker {
         object["deleteMarker"] = serde_json::json!(true);
     }
+    if let Some(sse) = &rec.sse {
+        object["sse"] = serde_json::json!(sse);
+    }
     let payload = serde_json::json!({
         "Records": [{
             "eventVersion": "2.1",
@@ -659,6 +662,7 @@ mod tests {
             version_id: None,
             delete_marker: false,
             dead: false,
+            sse: None,
         };
         let rule = fs3_core::NotificationRule {
             id: "rule-1".into(),
@@ -681,6 +685,44 @@ mod tests {
         assert_eq!(
             r["s3"]["object"]["eTag"],
             "d41d8cd98f00b204e9800998ecf8427e"
+        );
+    }
+
+    /// M20 F2:通知载荷携带 sse 算法字段,不含密钥材料(Webhook/Kafka 同载荷)。
+    #[test]
+    fn kafka_payload_carries_sse_fields() {
+        let rec = EventRecord {
+            seq: 7,
+            ts: 1_700_000_000,
+            bucket: "bkt".into(),
+            key: "enc/o".into(),
+            event: "s3:ObjectCreated:Put".into(),
+            etag: Some("abc".into()),
+            size: Some(9),
+            version_id: None,
+            delete_marker: false,
+            dead: false,
+            sse: Some("aws:kms".into()),
+        };
+        let rule = fs3_core::NotificationRule {
+            id: "k".into(),
+            events: vec!["s3:ObjectCreated:*".into()],
+            kind: fs3_core::NotificationTargetKind::Queue,
+            url: "kafka://broker/topic".into(),
+            hmac_key: None,
+            enabled: true,
+            filter: fs3_core::NotificationKeyFilter::default(),
+        };
+        let body = build_payload(&rec, &rule, "us-east-1");
+        let text = String::from_utf8(body.clone()).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["Records"][0]["s3"]["object"]["sse"], "aws:kms");
+        assert!(
+            !text.contains("vault:v1:")
+                && !text.contains("mem:v1:")
+                && !text.contains("wrapped_dek")
+                && !text.to_ascii_lowercase().contains("data_key"),
+            "payload must not carry key material: {text}"
         );
     }
 
@@ -722,6 +764,7 @@ mod tests {
             version_id: None,
             delete_marker: false,
             dead: false,
+            sse: None,
         }
     }
 

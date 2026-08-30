@@ -1389,6 +1389,21 @@ pub struct EventRecord {
     /// 绝不影响数据面)。#[serde(default)] 保证初版值可读。
     #[serde(default)]
     pub dead: bool,
+    /// M20 F2:对象加密算法回显(`AES256` / `aws:kms`);None = 明文。
+    /// 尾部追加,不含密钥材料(红线)。存量事件双读补 None。
+    #[serde(default)]
+    pub sse: Option<String>,
+}
+
+impl EventRecord {
+    /// 通知/事件载荷用算法标签(零密钥材料;KMS key 名不进事件)。
+    pub fn sse_label(sse: Option<&SseInfo>) -> Option<String> {
+        match sse.map(|s| s.kind) {
+            Some(SseKind::SseKms) => Some("aws:kms".into()),
+            Some(SseKind::SseS3 | SseKind::SseC) => Some("AES256".into()),
+            None => None,
+        }
+    }
 }
 
 /// 事件入队草案(M15 N2;ADR-18 D-E1)。服务层在触发数据原语**前**置入

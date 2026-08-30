@@ -13816,3 +13816,26 @@ fn ssekms_upload_part_copy_keeps_sse() {
         Some("aws:kms")
     );
 }
+
+/// M20 F2:对象请求审计照旧;密钥材料(wrapped_dek/mem:v1/vault:v1)零进审计。
+#[test]
+fn kms_audit_no_key_material() {
+    let (_d, svc, _kms) = setup_kms();
+    assert_eq!(status(&svc.handle(&req("PUT", "/kmsbkt", vec![]))), 200);
+    assert_eq!(
+        status(&svc.handle(&kms_req("PUT", "/kmsbkt/secret.bin", &[], b"payload".to_vec()))),
+        200
+    );
+    let entries = svc.audit().recent(50);
+    assert!(
+        entries.iter().any(|e| e.op == "PutObject" && e.key == "secret.bin" && e.status == 200),
+        "PutObject 必须进审计: {entries:?}"
+    );
+    let dump = serde_json::to_string(&entries).expect("audit json");
+    for needle in ["mem:v1:", "vault:v1:", "wrapped_dek", "data_key", "unseal"] {
+        assert!(
+            !dump.contains(needle),
+            "audit must not contain {needle}: {dump}"
+        );
+    }
+}

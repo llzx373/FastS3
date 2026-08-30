@@ -1864,6 +1864,7 @@ impl Engine {
                 version_id: meta.version_id.map(|v| crate::version_id_display(Some(&v))),
                 delete_marker: false,
                 dead: false,
+                sse: fs3_core::EventRecord::sse_label(meta.sse.as_ref()),
             }
         });
         match target.version_key() {
@@ -4022,6 +4023,7 @@ impl Engine {
             version_id: meta.version_id.map(|v| crate::version_id_display(Some(&v))),
             delete_marker: marker_created || meta.is_delete_marker,
             dead: false,
+            sse: fs3_core::EventRecord::sse_label(meta.sse.as_ref()),
         })
     }
 
@@ -4318,6 +4320,7 @@ impl Engine {
             version_id: meta.version_id.map(|v| crate::version_id_display(Some(&v))),
             delete_marker: false,
             dead: false,
+            sse: fs3_core::EventRecord::sse_label(meta.sse.as_ref()),
         };
         // 新段记账 + 旧段释放(同事务;ADR-9 §5.4 覆盖语义:新段记账先于
         // 旧段释放——开放 extent 原地覆盖时位图不被误清;崩溃 = 事务未
@@ -5830,6 +5833,7 @@ impl Engine {
                         version_id: meta.version_id.map(|v| crate::version_id_display(Some(&v))),
                         delete_marker: false,
                         dead: false,
+                        sse: fs3_core::EventRecord::sse_label(meta.sse.as_ref()),
                     }
                 }),
             )?;
@@ -6767,6 +6771,7 @@ impl Engine {
                             .map(|v| crate::version_id_display(Some(&v))),
                         delete_marker: true,
                         dead: false,
+                        sse: None,
                     }
                 }),
             )

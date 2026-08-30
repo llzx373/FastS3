@@ -974,9 +974,38 @@ fn decode_event_record(v: &[u8]) -> Result<fs3_core::EventRecord> {
         version_id: Option<String>,
         delete_marker: bool,
     }
+    /// M15 N3..M19 形状(有 dead,无 sse;M20 F2 双读回退)。
+    #[derive(serde::Deserialize)]
+    struct EventVDead {
+        seq: u64,
+        ts: u64,
+        bucket: String,
+        key: String,
+        event: String,
+        etag: Option<String>,
+        size: Option<u64>,
+        version_id: Option<String>,
+        delete_marker: bool,
+        dead: bool,
+    }
     match postcard::from_bytes::<fs3_core::EventRecord>(v) {
         Ok(r) => Ok(r),
         Err(_) => {
+            if let Ok(old) = postcard::from_bytes::<EventVDead>(v) {
+                return Ok(fs3_core::EventRecord {
+                    seq: old.seq,
+                    ts: old.ts,
+                    bucket: old.bucket,
+                    key: old.key,
+                    event: old.event,
+                    etag: old.etag,
+                    size: old.size,
+                    version_id: old.version_id,
+                    delete_marker: old.delete_marker,
+                    dead: old.dead,
+                    sse: None,
+                });
+            }
             let old: EventV1 = postcard::from_bytes(v)
                 .map_err(|e| Error::Corrupt(format!("postcard decode event record: {e}")))?;
             Ok(fs3_core::EventRecord {
@@ -990,6 +1019,7 @@ fn decode_event_record(v: &[u8]) -> Result<fs3_core::EventRecord> {
                 version_id: old.version_id,
                 delete_marker: old.delete_marker,
                 dead: false,
+                sse: None,
             })
         }
     }
@@ -5501,6 +5531,7 @@ mod tests {
             version_id: None,
             delete_marker: false,
             dead: false,
+            sse: None,
         };
         {
             let meta = Arc::new(MetaStore::open(dir.path(), &MetaConfig::default()).unwrap());
@@ -5635,6 +5666,7 @@ mod tests {
                 version_id: None,
                 delete_marker: false,
                 dead: false,
+                sse: None,
             };
             meta.commit_with_event(&[], &rec).unwrap();
         }
