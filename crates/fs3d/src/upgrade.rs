@@ -76,6 +76,11 @@ pub type MigrationEntry = (u32, u32, MigrationFn);
 /// v2 → v3(M13 M3-3,ADR-15):零数据搬迁——仅重写超块
 /// (version=3、metadata 字段清零、features |= MULTI_DEVICE;
 /// checkpoints/位图/数据区不动)。回滚 = 框架备份恢复(实测见测试)。
+///
+/// 无迁移声明:M21 A3/A4(ADR-33)`bl:` binlog 与 `s:repl_slot` 复制槽
+/// 为**纯元数据键前缀新增**——超级块/extent 划分/检查点区逐字节不变,
+/// layout_version 维持 3,注册表不增条目(rocksdb 键空间演进不走布局
+/// 迁移,同 `e:`/`iv:`/`ij:` 等前缀新增先例)。
 pub static MIGRATIONS: &[MigrationEntry] = &[(2, 3, migrate_2_to_3)];
 
 /// M13 M3-3:v2 → v3 迁移(零数据搬迁;只写超级块扇区,备份覆盖区内)。

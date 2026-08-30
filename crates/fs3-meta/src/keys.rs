@@ -137,8 +137,11 @@ pub const PREFIX_BATCH_JOB: &[u8] = b"jb:";
 /// (seq 复用 `s:seq`,GTID 零额外分配成本);与触发它的事务**同批同 WAL**
 /// 写入(照 `e:` 事件队列先例,不增组提交 fsync 次数),崩溃零漂移。
 /// 新一级前缀:三处同步——keys.rs 前缀表(本处);meta-export/import DTO
-/// 与 check 可达性扫描属 **TODO M21/A4 待办**(本任务只落前缀表;check
-/// 扫描只读 `o:`/`p:` 段引用键,对 `bl:` 天然安全,登记于注释)。
+/// (M21/A4:**显式不导出**,瞬态复制日志,同 `e:`/`x:`/`ij:` 口径,声明
+/// 见 fs3d/meta.rs MetaExportFile.objects 注释);check 可达性扫描只读
+/// `o:`/`p:` 段引用键,`bl:` 值内 data_refs 是下游回填引用而非 extent
+/// 持有,对 `bl:` 天然安全(M21/A4 登记,见 fs3-engine
+/// collect_reachable_extents 注释)。
 pub const PREFIX_BINLOG: &[u8] = b"bl:";
 
 /// 系统单调计数器(每个事务 +1,单点序列化;ADR-5)。
@@ -170,22 +173,24 @@ pub const SYS_SSE_KEK_GEN: &[u8] = b"s:sse_kek_gen";
 pub const SYS_TRUSTED_CLOCK: &[u8] = b"s:trusted_clock";
 /// 复制 epoch(M21 A1;ADR-33 RP2:promote +1,promote 崩溃不得产生半
 /// 状态;值 = be64 u64;键缺席 = 初始代 REPL_INITIAL_EPOCH,惰性不落盘)。
-/// s: 既有前缀下的新系统键,不新增前缀,meta-export DTO 与 check 可达性
-/// 扫描无需联动(同 SYS_KEY_VALUE_REWRITE_V3_DONE 注释口径)。
+/// s: 既有前缀下的新系统键,不新增前缀;check 可达性扫描无需联动(同
+/// SYS_KEY_VALUE_REWRITE_V3_DONE 口径)。meta-export:M21/A4 起随导出
+/// (MetaExportFile.repl 字段;`s:repl_*` 复制状态导出口径)。
 pub const SYS_REPL_EPOCH: &[u8] = b"s:repl_epoch";
 /// 初始复制 epoch(键缺席时的读默认值;promote 自当前 +1,新 epoch 的
 /// GTID 从 seq=1 重计而全局字典序仍单调,ADR-33 RP2)。
 pub const REPL_INITIAL_EPOCH: u64 = 1;
 /// 复制角色(M21 A2;ADR-33 RP2:值 = UTF-8 小写串 "primary"|"standby";
 /// 键缺席 = primary——单写者默认,同配置 §6.1 缺省口径)。s: 既有前缀下
-/// 的新系统键,不新增前缀,meta-export DTO 与 check 可达性扫描无需联动
-/// (同 SYS_KEY_VALUE_REWRITE_V3_DONE 注释口径)。
+/// 的新系统键,不新增前缀;meta-export 随 M21/A4 导出(MetaExportFile.
+/// repl),check 可达性扫描无需联动(同 SYS_KEY_VALUE_REWRITE_V3_DONE
+/// 注释口径)。
 pub const SYS_REPL_ROLE: &[u8] = b"s:repl_role";
 /// 本节点 executed GTID 区间集(M21 A2;ADR-33 RP2/R12:值 = postcard
 /// fs3_core::GtidSet;与下游 apply 事务同库同事务更新;快照重建后按导出
 /// 位点 P 对应集合**整体重置,不累加**——累加会残留本地旧历史段,对上游
-/// 形成假分歧)。s: 既有前缀下的新系统键,不新增前缀,三处无需联动
-/// (同 SYS_KEY_VALUE_REWRITE_V3_DONE 注释口径)。
+/// 形成假分歧)。s: 既有前缀下的新系统键,不新增前缀;meta-export 随
+/// M21/A4 导出(MetaExportFile.repl),check 扫描无需联动(同上口径)。
 pub const SYS_REPL_EXECUTED: &[u8] = b"s:repl_executed";
 /// 池清单(M13 M1-1,ADR-15 DM1/DM1';值 = postcard(fs3_core::pool::PoolManifest),
 /// 设备序 = 数组序,仅尾部增删)。s: 既有前缀下的新系统键,不新增前缀,
@@ -209,8 +214,10 @@ pub const PREFIX_SESSION: &[u8] = b"s:session\x00";
 /// 复制槽(M21 A3;ADR-33 RP3/RP8;设计稿 §3.3:`s:repl_slot\0{name}` →
 /// postcard fs3_meta::Slot;每下游一键,confirmed_gtid 随回执更新)。
 /// s: 既有前缀下的系统键族(同 PREFIX_AUDIT 口径:不新增一级前缀);
-/// 演进三处同步中 meta-export/import DTO 与 check 可达性扫描登记在
-/// TODO M21/A4 落。
+/// 演进三处同步——keys.rs 前缀表(本处);meta-export/import DTO(M21/A4:
+/// 随 MetaExportFile.repl.slots 导出,槽位位点随库迁移);check 可达性
+/// 扫描只读 `o:`/`p:` 段引用键,槽值不含 extent 引用,天然安全(M21/A4
+/// 登记,见 fs3-engine collect_reachable_extents 注释)。
 pub const PREFIX_REPL_SLOT: &[u8] = b"s:repl_slot\x00";
 
 /// 转义:S3 对象键可含任意字节,0x00/0xFF 需转义以保持键内无分隔符。

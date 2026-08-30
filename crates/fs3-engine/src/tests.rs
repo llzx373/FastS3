@@ -3218,6 +3218,109 @@ fn check_report_counts_all_object_versions() {
     e.close().unwrap();
 }
 
+/// M21 A4(ADR-33;`bl:`/`s:repl_*` 键前缀三处同步之三):带复制键的库
+/// 跑 check 零误报泄漏——collect_reachable_extents 只读 o:/p: 段引用键,
+/// ReplRecord.data_refs 是下游回填引用而非 extent 持有,天然安全(登记
+/// 见 keys.rs PREFIX_BINLOG/PREFIX_REPL_SLOT 与本函数注释)。另断言
+/// keys.rs 前缀表覆盖声明:复制前缀与既有前缀域两两不相交(无前缀完备
+/// 性测试先例,按 audit/event 两两不相交样板挂入本用例)。
+#[test]
+fn check_scans_repl_prefixes() {
+    let (_d, cfg) = setup();
+    {
+        let mut e = open_engine(&cfg);
+        e.put("b1", "o", &mut Cursor::new(rnd(64 * 1024, 9)))
+            .unwrap();
+        e.close().unwrap();
+    }
+    // 独立打开 MetaStore 写入复制键(bl: 写入需 repl_binlog 开关,引擎
+    // 配置接线在 B/F 组;此处直接以 MetaStore 层构造前缀覆盖场景)
+    {
+        let m = MetaStore::open(
+            &cfg.meta_dir,
+            &MetaConfig {
+                repl_binlog: true,
+                ..MetaConfig::default()
+            },
+        )
+        .unwrap();
+        // bl: 条目(对象标签改写事务,段引用为空也无妨——前缀覆盖是主题)
+        m.commit(&[Op::ObjectSetTags {
+            bucket: "b1".into(),
+            key: "o".into(),
+            vk: None,
+            tags: vec![("repl".into(), "1".into())],
+        }])
+        .unwrap();
+        assert_eq!(m.repl_binlog_entries().unwrap().len(), 1);
+        // s:repl_* 状态 + 复制槽
+        m.set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
+        m.set_repl_epoch(3).unwrap();
+        let mut executed = fs3_core::GtidSet::new();
+        executed.insert(fs3_core::Gtid { epoch: 1, seq: 1 });
+        m.set_repl_executed(&executed).unwrap();
+        m.put_repl_slot(&fs3_meta::Slot {
+            name: "stb-1".into(),
+            consumer_node_id: "node-b".into(),
+            confirmed_gtid: fs3_core::Gtid { epoch: 1, seq: 1 },
+            filters: fs3_meta::BucketFilter::Exclude(vec!["b9".into()]),
+            created_at: 1_700_000_000,
+            last_ack_at: 1_700_000_100,
+            stale: false,
+        })
+        .unwrap();
+        m.flush().unwrap();
+    }
+    // check(重开 = 可达性扫描重建路径):零误报泄漏
+    let e2 = Engine::open(&cfg).unwrap();
+    let r = e2.check_report().unwrap();
+    assert!(
+        r.leaks.is_empty(),
+        "复制前缀不得引入误报泄漏: {:?}",
+        r.leaks
+    );
+    assert!(e2.leaks().unwrap().is_empty());
+    e2.abort();
+
+    // keys.rs 前缀表覆盖声明:复制前缀 vs 既有前缀域两两不相交
+    use fs3_meta::keys;
+    let repl_keys: Vec<Vec<u8>> = vec![
+        keys::binlog_key(1),
+        keys::repl_slot_key("s1").unwrap(),
+        keys::SYS_REPL_ROLE.to_vec(),
+        keys::SYS_REPL_EPOCH.to_vec(),
+        keys::SYS_REPL_EXECUTED.to_vec(),
+    ];
+    let olds: Vec<Vec<u8>> = vec![
+        keys::object_key("b", "k"),
+        keys::part_key("u1", 1),
+        keys::alloc_key(1),
+        keys::txn_key(1),
+        keys::event_key(1),
+        keys::restore_job_key(1),
+        keys::audit_entry_key(1),
+        keys::sts_session_key("s1"),
+        keys::bucket_key("b"),
+        keys::key_key("ak"),
+        keys::SYS_SEQ.to_vec(),
+        keys::SYS_SSE_KEK_SEED.to_vec(),
+    ];
+    for n in &repl_keys {
+        for o in &olds {
+            assert!(!n.starts_with(o.as_slice()), "{n:?} vs {o:?}");
+            assert!(!o.starts_with(n.as_slice()), "{o:?} vs {n:?}");
+        }
+    }
+    // 复制前缀两两不相交(bl: 独立一级;s:repl_slot\0 与 s:repl_role 等
+    // 单键以 \0 分隔不相交)
+    for (i, a) in repl_keys.iter().enumerate() {
+        for b in repl_keys.iter().skip(i + 1) {
+            assert!(!a.starts_with(b.as_slice()), "{a:?} vs {b:?}");
+            assert!(!b.starts_with(a.as_slice()), "{b:?} vs {a:?}");
+        }
+    }
+}
+
 // ─────────────────────────── M4 D4 故障注入 ───────────────────────────
 
 /// 故障注入 I/O 引擎:前 `budget` 次写 submit 成功,其后写操作失败(errno)。

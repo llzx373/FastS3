@@ -39,6 +39,9 @@ use serde::{Deserialize, Serialize};
 
 pub const META_EXPORT_FORMAT: &str = "fasts3-meta-export";
 /// 当前导出格式版本:v2 = M10 V5-1(版本条目/null 槽/桶版本化字段)。
+/// 其后新增字段均为 `#[serde(default)]` 尾部追加(M18 IAM、M20 KMS、
+/// M21 A4 复制状态),serde 双读兼容 v1/v2 导出,版本号不 bump——bump
+/// 只用于不兼容形状变更(本文件尚无先例)。
 pub const META_EXPORT_VERSION: u32 = 2;
 /// 可导入的最低格式版本(v1 = v1.0.x 导出,无版本化字段,serde 默认双读)。
 pub const META_EXPORT_VERSION_MIN: u32 = 1;
@@ -468,6 +471,20 @@ pub struct LayoutInfoDto {
     pub layout_version: u32,
 }
 
+/// 复制状态 DTO(M21 A4;ADR-33 RP2/RP3):`s:repl_*` 系统键的导出形态。
+/// GtidSet/Slot 直接内嵌(serde 形状已是持久化兼容面,同 IAM 记录内嵌
+/// 先例;GtidSet JSON 形状 = 内部 interval 表,紧凑且带不变量校验);
+/// role 用 UTF-8 串("primary"|"standby",s:repl_role 原值口径)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplStateDto {
+    pub role: String,
+    pub epoch: u64,
+    /// 本节点 executed GTID 区间集(s:repl_executed)。
+    pub executed: fs3_core::GtidSet,
+    /// 复制槽(s:repl_slot\0{name} 记录)。
+    pub slots: Vec<fs3_meta::Slot>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BucketDto {
     pub name: String,
@@ -586,11 +603,26 @@ pub struct MetaExportFile {
     /// (无此字段)→ 空表。
     #[serde(default)]
     pub roles: Vec<fs3_core::IamRole>,
+    /// 复制状态(M21 A4;ADR-33 RP2/RP3 + 键前缀三处同步之二:`s:repl_*`
+    /// 系统键登记于 fs3-meta keys.rs(一处);本字段承载 role/epoch/
+    /// executed GTID 集/复制槽(二处)——迁移/灾备恢复后位点连续,主备
+    /// 身份随库走;check 可达性扫描只读 `o:`/`p:` 段引用键,对
+    /// `s:repl_*` 天然安全(三处))。旧导出(无此字段)→ None,导入
+    /// 侧跳过不写(键缺席 = 默认 primary/初始代 1/空集)。
+    /// **红线不变:`s:sse_kek_seed` 永不导出,不在本字段范围。**
+    #[serde(default)]
+    pub repl: Option<ReplStateDto>,
     /// M19 迁入任务(ADR-24 DR6):`ij:` 键前缀三处同步之二——本 DTO
     /// **显式不导出**(任务为运维瞬态且含源凭证,secret 明文不进导出物,
     /// 同 `e:`/`x:` 不导出口径;迁移后由管理员经向导重建任务)。
     /// check 可达性扫描只读 `o:`/`p:` 段引用键,对 `ij:` 天然安全
     /// (三处,keys.rs 注释登记)。(无字段承载 = 不导出的显式声明。)
+    ///
+    /// M21 A4(ADR-33 RP1):`bl:` 复制 binlog 同样**显式不导出**(瞬态
+    /// 复制日志;meta-import 的位点语义 = 导入库从 last_seq 续写,增量
+    /// 复制由复制槽/快照位点承载,见 repl 字段)。check 可达性扫描只读
+    /// `o:`/`p:` 段引用键,`bl:` 值内 data_refs 是下游回填引用而非
+    /// extent 持有,天然安全(三处,keys.rs 前缀表注释登记)。
     pub objects: Vec<ObjectEntryDto>,
     pub uploads: Vec<UploadDto>,
 }
@@ -725,6 +757,20 @@ pub fn run_meta_export(
     // M18 R1:IAM 角色(策略文档无秘密材料,随导出)
     let roles = store.list_iam_roles()?;
 
+    // M21 A4(ADR-33 RP2/RP3):复制状态 `s:repl_*` 原样随导出(role/
+    // epoch/executed GTID 集/复制槽;`bl:` binlog 为瞬态复制日志,显式
+    // 不导出——见 MetaExportFile.objects 字段注释)
+    let repl = ReplStateDto {
+        role: match store.repl_role()? {
+            fs3_meta::ReplRole::Primary => "primary",
+            fs3_meta::ReplRole::Standby => "standby",
+        }
+        .into(),
+        epoch: store.repl_epoch()?,
+        executed: store.repl_executed()?,
+        slots: store.list_repl_slots()?,
+    };
+
     // M10 V5-1:版本化桶逐版本条目导出(含删除标记与 null 槽),vk 不丢 ——
     // 键形态经 ObjectDto.version_id 承载(None/"null"/hex 三态)。
     let objects: Vec<ObjectEntryDto> = store
@@ -769,6 +815,7 @@ pub fn run_meta_export(
         groups,
         policies,
         roles,
+        repl: Some(repl),
         objects,
         uploads,
     };
@@ -797,6 +844,14 @@ pub fn run_meta_export(
         file.layout.layout_version,
         file.last_seq
     );
+    if let Some(repl) = &file.repl {
+        println!(
+            "  replication: role={} epoch={} slots={}",
+            repl.role,
+            repl.epoch,
+            repl.slots.len()
+        );
+    }
     Ok(())
 }
 
@@ -994,6 +1049,29 @@ pub fn run_meta_import(
     // 字段)→ 空表。
     for r in &file.roles {
         store.commit_iam_role_put(r)?;
+    }
+
+    // 5g) 复制状态(M21 A4;ADR-33 RP2/RP3):role/epoch/executed GTID 集/
+    // 复制槽原样恢复(覆盖语义;槽位 confirmed 位点随库走,迁移后下游
+    // 重握手按 §2.2 包含性校验续流或显式重建)。旧导出(无 repl 字段)
+    // → None,跳过不写(键缺席 = 默认 primary/初始代/空集)。
+    // `bl:` binlog 不随导出,导入库自 last_seq 续写新日志。
+    if let Some(repl) = &file.repl {
+        let role = match repl.role.as_str() {
+            "primary" => fs3_meta::ReplRole::Primary,
+            "standby" => fs3_meta::ReplRole::Standby,
+            other => {
+                return Err(fs3_core::Error::InvalidArgument(format!(
+                    "repl role {other:?} unknown (expect primary|standby)"
+                )))
+            }
+        };
+        store.set_repl_role(role)?;
+        store.set_repl_epoch(repl.epoch)?;
+        store.set_repl_executed(&repl.executed)?;
+        for s in &repl.slots {
+            store.put_repl_slot(s)?;
+        }
     }
 
     // 6) 对象:段校验(布局边界/对齐)+ 分配草稿 + 零统计增量
@@ -2163,6 +2241,161 @@ mod tests {
             err.to_string().contains("stats mismatch"),
             "expected D5 stats mismatch, got: {err}"
         );
+    }
+
+    /// M21 A4(ADR-33 RP2/RP3;`s:repl_*` 键前缀三处同步之二):复制状态
+    /// 随 meta-export/import 迁移——
+    /// ① role/epoch/executed GTID 集/复制槽(含 BucketFilter/stale)逐项
+    ///    导出 → 导入新库一致;
+    /// ② `bl:` binlog 记录**不在导出内**(瞬态复制日志;标记串只存在于
+    ///    bl: 记录,导出文件不得包含);
+    /// ③ 导入后引擎 check 零泄漏(复制键不含 extent 所有权引用)。
+    #[test]
+    fn meta_export_import_carries_repl_state() {
+        let (dir, img1, img2) = tmp_devices();
+        let meta1 = dir.path().join("meta1");
+        let meta2 = dir.path().join("meta2");
+
+        let slot_a = fs3_meta::Slot {
+            name: "stb-a".into(),
+            consumer_node_id: "node-a".into(),
+            confirmed_gtid: fs3_core::Gtid { epoch: 1, seq: 4 },
+            filters: fs3_meta::BucketFilter::Include(vec!["b1".into()]),
+            created_at: 1_700_000_000,
+            last_ack_at: 1_700_000_100,
+            stale: false,
+        };
+        let slot_b = fs3_meta::Slot {
+            name: "stb-b".into(),
+            consumer_node_id: "node-b".into(),
+            confirmed_gtid: fs3_core::Gtid { epoch: 2, seq: 9 },
+            filters: fs3_meta::BucketFilter::All,
+            created_at: 1_700_000_010,
+            last_ack_at: 1_700_000_110,
+            stale: true,
+        };
+        let mut executed = fs3_core::GtidSet::new();
+        for seq in 1..=5 {
+            executed.insert(fs3_core::Gtid { epoch: 1, seq });
+        }
+        for seq in 1..=9 {
+            executed.insert(fs3_core::Gtid { epoch: 2, seq });
+        }
+
+        // 夹具:真实对象(导出载荷)+ 复制状态 + binlog 标记条目
+        {
+            let mut e = fs3_engine::Engine::open(&engine_cfg(&img1, &meta1)).unwrap();
+            e.ensure_bucket("b1").unwrap();
+            e.put("b1", "o", &mut Cursor::new(rnd(10_000, 12))).unwrap();
+            e.close().unwrap();
+        }
+        {
+            // binlog 写入需 repl_binlog 开关;引擎已关,独立打开 MetaStore
+            let m = MetaStore::open(
+                &meta1,
+                &MetaConfig {
+                    repl_binlog: true,
+                    ..MetaConfig::default()
+                },
+            )
+            .unwrap();
+            m.set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
+            m.set_repl_epoch(3).unwrap();
+            m.set_repl_executed(&executed).unwrap();
+            m.put_repl_slot(&slot_a).unwrap();
+            m.put_repl_slot(&slot_b).unwrap();
+            // 标记条目:put+delete 同一 key——元数据零残留,标记串仅存于
+            // bl: 记录(桶统计不经 Stats op,保持 D5 重算一致)
+            let marker = ObjectMeta {
+                size: 0,
+                etag: [0u8; 16],
+                mtime: 1,
+                extents: vec![],
+                content_type: "application/octet-stream".into(),
+                user_meta: vec![],
+                inline: None,
+                parts: vec![],
+                resp_headers: vec![],
+                version_id: None,
+                is_delete_marker: false,
+                tags: vec![],
+                sse: None,
+                checksum: None,
+                retention: None,
+                legal_hold: false,
+                part_checksums: Vec::new(),
+                compressed: None,
+                requested_storage_class: None,
+                storage_class: None,
+                restore_state: None,
+            };
+            m.commit(&[fs3_meta::Op::ObjectPut {
+                bucket: "b1".into(),
+                key: "bl-only-marker-9f3c".into(),
+                meta: marker,
+            }])
+            .unwrap();
+            m.commit(&[fs3_meta::Op::ObjectDelete {
+                bucket: "b1".into(),
+                key: "bl-only-marker-9f3c".into(),
+            }])
+            .unwrap();
+            assert_eq!(m.repl_binlog_entries().unwrap().len(), 2);
+            m.flush().unwrap();
+        }
+
+        // —— 导出 ——
+        let export = dir.path().join("export.json");
+        run_meta_export(
+            &img1,
+            &meta1,
+            &MetaExportArgs {
+                output: export.clone(),
+            },
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&export).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        // ① 复制状态在导出内
+        assert_eq!(json["repl"]["role"], "standby");
+        assert_eq!(json["repl"]["epoch"], 3);
+        assert_eq!(json["repl"]["slots"].as_array().unwrap().len(), 2);
+        assert!(!json["repl"]["executed"]["ranges"].is_null());
+        // ② bl: 不在导出内:无 binlog 字段,标记串不出现
+        assert!(json.get("binlog").is_none());
+        assert!(
+            !text.contains("bl-only-marker-9f3c"),
+            "binlog 记录(瞬态复制日志)不得进导出物"
+        );
+
+        // —— 导入(同布局新设备;设备文件整拷 = 底层卷快照)——
+        std::fs::copy(&img1, &img2).unwrap();
+        run_meta_import(
+            &img2,
+            &meta2,
+            &MetaImportArgs {
+                input: export.clone(),
+                force: false,
+            },
+        )
+        .unwrap();
+
+        // —— 逐项断言一致(经引擎侧 meta 句柄,避免重复开库)——
+        let e2 = fs3_engine::Engine::open(&engine_cfg(&img2, &meta2)).unwrap();
+        let m2 = e2.meta();
+        assert_eq!(m2.repl_role().unwrap(), fs3_meta::ReplRole::Standby);
+        assert_eq!(m2.repl_epoch().unwrap(), 3);
+        assert_eq!(m2.repl_executed().unwrap(), executed);
+        assert_eq!(
+            m2.list_repl_slots().unwrap(),
+            vec![slot_a, slot_b],
+            "槽位(名序)全字段一致,含 stale 标记"
+        );
+        // ③ 导入库无 binlog(自 last_seq 续写新日志)
+        assert!(m2.repl_binlog_entries().unwrap().is_empty());
+        // 引擎侧零泄漏(run_meta_import 内部 check 已断言,此处复验)
+        assert!(e2.check_report().unwrap().leaks.is_empty());
+        e2.abort();
     }
 
     #[test]

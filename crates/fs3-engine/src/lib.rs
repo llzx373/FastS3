@@ -7333,6 +7333,11 @@ impl Engine {
 }
 
 /// o: 当前/历史版本段 + restore 副本 + p: 分片段(F7-1 mark 集)。
+/// M21 A4 登记(ADR-33):`bl:` binlog 与 `s:repl_*` 复制状态**不含
+/// extent 所有权引用**——ReplRecord.data_refs 是下游回填的段引用而非
+/// 持有(extent 所有权恒由 o:/p: 表达),Slot/role/epoch/executed 为纯
+/// 状态值;本扫描只读 o:/p:,对复制前缀天然安全,零误报(keys.rs
+/// PREFIX_BINLOG/PREFIX_REPL_SLOT 注释互引)。
 fn collect_reachable_extents(meta: &MetaStore) -> Result<HashSet<u64>> {
     let mut out = HashSet::new();
     for (_, _, _, m) in meta.snapshot_all_objects()? {
