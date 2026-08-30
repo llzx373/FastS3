@@ -190,7 +190,7 @@
   SSE-S3 KEK/种子(`s:` 族)对桶级槽强制随同;部署文档写明共享 KMS 前置
   - 用例:`ssekms_objects_decryptable_on_standby`(真 Vault 车道,H 组纪律);
     `ssekms_promoted_standby_decrypts_after_takeover`
-- [ ] F2 admin API 面:`/v1/admin/replication/{status,slots,pause,resume,promote,demote,
+- [x] F2 admin API 面:`/v1/admin/replication/{status,slots,pause,resume,promote,demote,
   rebuild}`;审计 who 归属沿 M19 J3 先例;console 拓扑/延迟/位点页(照 Kms.tsx 样板,
   api.ts + i18n + web/server 代理 + iam-authz 映射)
   - 用例:`repl_admin_roundtrip`;`repl_console_topology_page`
