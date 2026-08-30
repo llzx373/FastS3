@@ -1153,34 +1153,33 @@ fn cmd_serve(
             });
             f
         });
-        let admin =
-            fs3_admin::AdminServer::new(engine.clone(), service.clone(), admin_cfg)
-                .with_reload(reload)
-                .with_lifecycle_stats(lifecycle_stats)
-                .with_notification_stats(notification_stats.clone())
-                .with_inventory_stats(inventory_stats.clone())
-                .with_restore_stats(restore_stats.clone())
-                // M20 A3(ADR-29 KR5):KMS 托管服务控制面(未配置 = None → 501)
-                .with_kms_service(kms_manager.clone().map(|m| {
+        let admin = fs3_admin::AdminServer::new(engine.clone(), service.clone(), admin_cfg)
+            .with_reload(reload)
+            .with_lifecycle_stats(lifecycle_stats)
+            .with_notification_stats(notification_stats.clone())
+            .with_inventory_stats(inventory_stats.clone())
+            .with_restore_stats(restore_stats.clone())
+            // M20 A3(ADR-29 KR5):KMS 托管服务控制面(未配置 = None → 501)
+            .with_kms_service(
+                kms_manager.clone().map(|m| {
                     Arc::new(KmsServiceAdapter(m)) as Arc<dyn fs3_admin::KmsServiceControl>
-                }))
-                // M21 C5(ADR-33 RP5.4):断档显式重建控制面(未配置 pull =
-                // None → 501;CLI/本端点 = 重建唯一入口,不自动触发红线)
-                .with_replication_control(
-                    rebuild_svc
-                        .clone()
-                        .map(|s| s as Arc<dyn fs3_admin::ReplicationControl>),
-                )
-                // M21 D4(ADR-33 RP8.3):逐槽复制指标(任一复制配置在 =
-                // 注入;纯非复制节点 = None → fasts3_repl_* 组缺席)
-                .with_repl_metrics(if pull_cfg_env.is_some() || repl_cfg_env.is_some() {
-                    Some(
-                        Arc::new(repl_metrics::ReplMetricsProvider::new(
-                            engine.read().meta_arc(),
-                        )) as Arc<dyn fs3_admin::ReplMetricsSource>,
-                    )
-                } else {
-                    None
+                }),
+            )
+            // M21 C5(ADR-33 RP5.4):断档显式重建控制面(未配置 pull =
+            // None → 501;CLI/本端点 = 重建唯一入口,不自动触发红线)
+            .with_replication_control(
+                rebuild_svc
+                    .clone()
+                    .map(|s| s as Arc<dyn fs3_admin::ReplicationControl>),
+            )
+            // M21 D4(ADR-33 RP8.3):逐槽复制指标(任一复制配置在 =
+            // 注入;纯非复制节点 = None → fasts3_repl_* 组缺席)
+            .with_repl_metrics(if pull_cfg_env.is_some() || repl_cfg_env.is_some() {
+                Some(Arc::new(repl_metrics::ReplMetricsProvider::new(
+                    engine.read().meta_arc(),
+                )) as Arc<dyn fs3_admin::ReplMetricsSource>)
+            } else {
+                None
             });
         // M6 / J5:设置页供应器(admin GET/PATCH /v1/admin/config)
         let provider = Arc::new(settings::SettingsProvider::new(
@@ -1270,6 +1269,9 @@ fn cmd_serve(
             }
         };
         engine.read().meta().set_repl_role(role)?;
+        // M21 E5:S3 层角色缓存同步(env 应用在 service 装配之后,
+        // with_observability 的启动初始化读不到本次翻转)
+        service.set_repl_role(role);
     }
     let mut pull_worker = match pull_cfg_env {
         Some(pull_cfg) => {

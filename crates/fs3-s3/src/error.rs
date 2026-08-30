@@ -115,6 +115,9 @@ pub enum S3ErrorCode {
     NoSuchUpload,
     NoSuchVersion,
     NotImplemented,
+    /// M21 E5(ADR-33 RP4.1):备端写动词统一拒绝(复制只读面;
+    /// 不做 307——S3 客户端重定向支持参差)。
+    ReplicationStandby,
     NotModified,
     /// M20 D3(ADR-29 KR6.3):KMS key 不存在(transit 404)。
     KmsNotFoundException,
@@ -245,6 +248,9 @@ impl S3ErrorCode {
             NoSuchUpload => "The specified multipart upload does not exist. The upload ID might be invalid, or the multipart upload might have been aborted or completed.",
             NoSuchVersion => "The version ID specified in the request does not match an existing version.",
             NotImplemented => "A header you provided implies functionality that is not implemented.",
+            ReplicationStandby => {
+                "This node is a replication standby; writes are served by the primary."
+            }
             KmsNotFoundException => "The specified KMS key does not exist.",
             KmsDisabledException => "The specified KMS key is not usable for decryption.",
             KmsUnavailableException => "The KMS backend is unavailable; decryption is blocked until it recovers.",
@@ -327,6 +333,7 @@ impl S3ErrorCode {
             InternalError => 500,
             ServiceUnavailable | SlowDown => 503,
             NotImplemented => 501,
+            ReplicationStandby => 501,
             KmsNotFoundException | KmsDisabledException | KmsAccessDeniedException => 400,
             KmsUnavailableException => 503,
             RequestTimeout => 400,

@@ -13604,11 +13604,7 @@ fn get_session_token_no_elevation_after_r1() {
 }
 
 /// M20 D3/E:MemoryKms 桩装配引擎+服务。
-fn setup_kms() -> (
-    tempfile::TempDir,
-    S3Service,
-    Arc<fs3_kms::MemoryKms>,
-) {
+fn setup_kms() -> (tempfile::TempDir, S3Service, Arc<fs3_kms::MemoryKms>) {
     let dir = tempfile::tempdir().unwrap();
     let img = dir.path().join("disk.img");
     std::fs::File::create(&img)
@@ -13642,13 +13638,7 @@ fn setup_kms() -> (
 }
 
 fn kms_req(method: &str, path: &str, query: &[(&str, &str)], body: Vec<u8>) -> S3Request {
-    ssec_req_q(
-        method,
-        path,
-        query,
-        &[(SSE_S3_HDR, "aws:kms")],
-        body,
-    )
+    ssec_req_q(method, path, query, &[(SSE_S3_HDR, "aws:kms")], body)
 }
 
 /// M20 D3:PUT/GET/HEAD aws:kms 往返 + 停机映射 KMS.UnavailableException。
@@ -13776,12 +13766,7 @@ fn ssekms_upload_part_copy_keeps_sse() {
         200
     );
     let init = svc
-        .handle(&kms_req(
-            "POST",
-            "/kmsbkt/upc",
-            &[("uploads", "")],
-            vec![],
-        ))
+        .handle(&kms_req("POST", "/kmsbkt/upc", &[("uploads", "")], vec![]))
         .unwrap();
     let uid = extract(&body_str(&init), "UploadId");
     let r = svc.handle(&ssec_req_q(
@@ -13823,12 +13808,19 @@ fn kms_audit_no_key_material() {
     let (_d, svc, _kms) = setup_kms();
     assert_eq!(status(&svc.handle(&req("PUT", "/kmsbkt", vec![]))), 200);
     assert_eq!(
-        status(&svc.handle(&kms_req("PUT", "/kmsbkt/secret.bin", &[], b"payload".to_vec()))),
+        status(&svc.handle(&kms_req(
+            "PUT",
+            "/kmsbkt/secret.bin",
+            &[],
+            b"payload".to_vec()
+        ))),
         200
     );
     let entries = svc.audit().recent(50);
     assert!(
-        entries.iter().any(|e| e.op == "PutObject" && e.key == "secret.bin" && e.status == 200),
+        entries
+            .iter()
+            .any(|e| e.op == "PutObject" && e.key == "secret.bin" && e.status == 200),
         "PutObject 必须进审计: {entries:?}"
     );
     let dump = serde_json::to_string(&entries).expect("audit json");
@@ -13838,4 +13830,155 @@ fn kms_audit_no_key_material() {
             "audit must not contain {needle}: {dump}"
         );
     }
+}
+
+/// M21 E5(ADR-33 RP4.1;replication-design §4.1;TODO M21/E5 具名用例):
+/// **备端只读面——写动词统一 501 ReplicationStandby**。
+/// ① PUT(CreateBucket/PutObject/CopyObject)/DELETE(DeleteObject/
+///    DeleteObjects/DeleteBucket)/POST(CreateMultipartUpload)全部 501
+///    且错误码 = ReplicationStandby;
+/// ② GET/HEAD/List 读动词放行(陈旧读是设计语义),响应头携带
+///    `X-FastS3-Repl-Applied-Gtid: {epoch}-{seq}` apply 水位;
+/// ③ 回归:复制 apply 通道不经 S3 层——standby 下 meta.apply_repl_record
+///    直放成功,同一桶名的 S3 写仍 501(拦截只挂在 S3 写路径)。
+#[test]
+fn standby_rejects_all_write_verbs() {
+    let (_dir, svc) = setup();
+    // 主端先建桶写对象(standby 化之前的存量读材料)
+    svc.handle(&req("PUT", "/bkt1", vec![])).unwrap();
+    svc.handle(&req("PUT", "/bkt1/k1", b"v1".to_vec())).unwrap();
+
+    // standby 化(meta 落盘 + S3 层缓存,两侧同步 = fs3d 装配/重建口径)
+    svc.engine()
+        .read()
+        .meta()
+        .set_repl_role(fs3_meta::ReplRole::Standby)
+        .unwrap();
+    svc.set_repl_role(fs3_meta::ReplRole::Standby);
+
+    // ① 写动词全灭
+    let copy = req_h(
+        "PUT",
+        "/bkt1/k4",
+        &[("x-amz-copy-source", "/bkt1/k1")],
+        vec![],
+    );
+    let del_multi = req_q(
+        "POST",
+        "/bkt1",
+        &[("delete", "")],
+        b"<Delete><Object><Key>k1</Key></Object></Delete>".to_vec(),
+    );
+    let cases: Vec<(&str, S3Request)> = vec![
+        ("CreateBucket", req("PUT", "/bkt2", vec![])),
+        ("PutObject", req("PUT", "/bkt1/k2", b"v2".to_vec())),
+        ("DeleteObject", req("DELETE", "/bkt1/k1", vec![])),
+        (
+            "CreateMultipartUpload",
+            req_q("POST", "/bkt1/k3", &[("uploads", "")], vec![]),
+        ),
+        ("CopyObject", copy),
+        ("DeleteObjects", del_multi),
+        ("DeleteBucket", req("DELETE", "/bkt1", vec![])),
+    ];
+    for (m, r) in cases {
+        let e = svc.handle(&r).unwrap_err();
+        assert_eq!(
+            e.code,
+            fs3_s3::S3ErrorCode::ReplicationStandby,
+            "{m} 必须 501 ReplicationStandby: {e:?}"
+        );
+        assert_eq!(e.status(), 501, "{m}");
+    }
+
+    // ② 读动词放行 + 水位头
+    svc.handle(&req("GET", "/bkt1/k1", vec![])).unwrap();
+    svc.handle(&req("HEAD", "/bkt1/k1", vec![])).unwrap();
+    svc.handle(&req("GET", "/bkt1", vec![])).unwrap(); // ListObjects
+    svc.handle(&req("GET", "/", vec![])).unwrap(); // ListBuckets
+    let resp = svc.handle(&req("GET", "/bkt1/k1", vec![])).unwrap();
+    let h = resp
+        .headers
+        .iter()
+        .find(|(k, _)| k == "X-FastS3-Repl-Applied-Gtid")
+        .expect("standby 读响应必须带 apply 水位头");
+    assert!(
+        h.1.split_once('-')
+            .is_some_and(|(e, s)| e.parse::<u64>().is_ok() && s.parse::<u64>().is_ok()),
+        "水位头形 = {{epoch}}-{{seq}}: {:?}",
+        h.1
+    );
+    // 错误读响应同样带头(404 NoSuchKey)
+    let e = svc.handle(&req("GET", "/bkt1/nope", vec![])).unwrap_err();
+    assert!(
+        e.resp_headers
+            .iter()
+            .any(|(k, _)| k == "X-FastS3-Repl-Applied-Gtid"),
+        "standby 错误读响应也带水位头"
+    );
+
+    // ③ apply 通道不经 S3 层(复制流直放;同键名 S3 写仍拒)
+    let rec = fs3_meta::ReplRecord::new(
+        1,
+        &[fs3_meta::Op::BucketPut {
+            name: "bkt3".into(),
+            meta: fs3_core::BucketMeta {
+                created: 1,
+                owner: "o".into(),
+                stats: fs3_core::BucketStats::default(),
+                quota: None,
+                created_with_acl: false,
+                versioning: fs3_core::VersioningState::Off,
+                default_encryption: None,
+                object_lock: false,
+                default_retention: None,
+                default_kms_key: None,
+            },
+            location: None,
+        }],
+    );
+    let out = svc
+        .engine()
+        .read()
+        .meta()
+        .apply_repl_record(fs3_core::Gtid { epoch: 1, seq: 1 }, &rec)
+        .unwrap();
+    assert_eq!(out, fs3_meta::ReplApplyOutcome::Applied);
+    let e = svc
+        .handle(&req("PUT", "/bkt3/k", b"v".to_vec()))
+        .unwrap_err();
+    assert_eq!(e.code, fs3_s3::S3ErrorCode::ReplicationStandby);
+}
+
+/// M21 E5(ADR-33 RP5;TODO M21/E5 具名用例):**promote 后备端恢复写
+/// 服务**——standby 拒写 → meta promote(epoch+1)→ S3 层缓存翻转 →
+/// PUT/GET 正常;读响应不再携带 standby 水位头(本端已是主,单调读
+/// 陈旧度语义消失)。
+#[test]
+fn promoted_standby_serves_writes() {
+    let (_dir, svc) = setup();
+    let meta = svc.engine().read().meta_arc();
+    meta.set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
+    svc.set_repl_role(fs3_meta::ReplRole::Standby);
+    let e = svc.handle(&req("PUT", "/bkt1", vec![])).unwrap_err();
+    assert_eq!(e.code, fs3_s3::S3ErrorCode::ReplicationStandby);
+
+    // promote(meta 层裁决;无 pending、全量角色 → 直接成功)
+    let out = meta.promote(false).unwrap();
+    assert_eq!(out.epoch, 2);
+    svc.set_repl_role(fs3_meta::ReplRole::Primary);
+
+    // 写读恢复
+    svc.handle(&req("PUT", "/bkt1", vec![])).unwrap();
+    svc.handle(&req("PUT", "/bkt1/k1", b"after-promote".to_vec()))
+        .unwrap();
+    let resp = svc.handle(&req("GET", "/bkt1/k1", vec![])).unwrap();
+    read_body(&svc, &resp, b"after-promote"); // promote 后写读一致
+    assert!(
+        !resp
+            .headers
+            .iter()
+            .any(|(k, _)| k == "X-FastS3-Repl-Applied-Gtid"),
+        "转主后读响应不再带 standby 水位头"
+    );
 }

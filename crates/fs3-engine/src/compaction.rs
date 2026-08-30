@@ -245,6 +245,15 @@ impl Compactor {
     /// 口径不变(rate × 100ms 突发 + rate 匀速回充);前台 compact_once
     /// 与后台 worker 走同一桶,与生命周期执行器等后续实例共享。
     pub fn compact_batch(&self, budget: &Throttle) -> Result<CompactionReport> {
+        // M21 E5(ADR-33 RP4.4):复制备端禁本地 compaction 新分配——迁移
+        // 活段 = 本地 commit 新 extent,会污染复制不变量(段布局与
+        // `s:repl_rmap` 翻译表漂移;备端分配只许发生在 apply/回填通道)。
+        // promote 后 role 翻转,本门控自动恢复;Compaction/Rebalance 双
+        // 模式与前台 compact_once/后台 worker 同走此口。meta 读失败按
+        // 非备端放行(fail-open,不阻塞主端维护)。
+        if matches!(self.meta.repl_role(), Ok(fs3_meta::ReplRole::Standby)) {
+            return Ok(CompactionReport::default());
+        }
         let _guard = match self.running.try_lock() {
             Ok(g) => g,
             Err(_) => return Ok(CompactionReport::default()), // 已有批次在跑
@@ -694,6 +703,60 @@ mod tests {
         assert_eq!(m.extents.len(), 1);
         assert_ne!(m.extents[0].extent_id, 0);
         assert!(m.extents[0].offset < cap as u32);
+        e.close().unwrap();
+    }
+
+    /// M21 E5(ADR-33 RP4.4):复制备端禁本地 compaction 新分配——standby
+    /// 时 compact_once 零候选零迁移(门控在 compact_batch 入口,前台/
+    /// 后台同口);翻回 primary(= promote 后)同一批候选恢复执行。
+    #[test]
+    fn compaction_standby_gated_primary_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("disk.img");
+        std::fs::File::create(&img)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
+        let cfg = crate::EngineConfig {
+            devices: vec![img],
+            meta_dir: dir.path().join("meta"),
+            compaction: CompactionConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut e = crate::Engine::open(&cfg).unwrap();
+        e.ensure_bucket("b1").unwrap();
+        // 同 compaction_reclaims_hole_extents 的候选形态:3×1MiB 删 2
+        let data = vec![0x11u8; 1024 * 1024];
+        for i in 0..3 {
+            e.put("b1", &format!("k{i}"), &mut Cursor::new(data.clone()))
+                .unwrap();
+        }
+        e.delete("b1", "k0").unwrap();
+        e.delete("b1", "k1").unwrap();
+
+        // standby:零迁移零分配(复制不变量保护)
+        e.meta().set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
+        let r = e.compact_once().unwrap();
+        assert_eq!(r.candidates, 0, "standby:候选发现即短路");
+        assert_eq!(r.migrated_objects, 0);
+        assert_eq!(r.freed_extents, 0);
+        assert!(
+            e.allocator().test_bit(0),
+            "standby:extent 0 原样保留(迁移未发生)"
+        );
+
+        // primary(promote 后):同一形态恢复压缩,数据完好
+        e.meta().set_repl_role(fs3_meta::ReplRole::Primary).unwrap();
+        let r = e.compact_once().unwrap();
+        assert_eq!(r.migrated_objects, 1);
+        assert_eq!(r.freed_extents, 1);
+        let mut out = Vec::new();
+        e.get_to("b1", "k2", 0..u64::MAX, &mut out).unwrap();
+        assert_eq!(out, data);
         e.close().unwrap();
     }
 
@@ -1499,7 +1562,10 @@ mod tests {
             .and_then(|s| s.split("\n## ").next())
             .expect("CHANGELOG v2.6.0");
         assert!(v26.contains("本版本不打 tag"), "v2.6.0 须声明不打 tag");
-        assert!(v26.contains("ADR-29") && v26.contains("SSE-KMS"), "v2.6.0 须引用 ADR-29");
+        assert!(
+            v26.contains("ADR-29") && v26.contains("SSE-KMS"),
+            "v2.6.0 须引用 ADR-29"
+        );
         let rel = include_str!("../../../RELEASES.md");
         assert!(rel.contains("## v2.6.0 — M20"));
         assert!(rel.contains("本版本不打 tag"));

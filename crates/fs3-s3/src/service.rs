@@ -203,6 +203,11 @@ pub struct S3Service {
     /// primary/未装配,热路径一次读判空)。**C5 起可替换**(RwLock):
     /// 断档重建重启回填池后旧通道随旧池关停失效,必须换绑新池。
     repl_data_fetch: std::sync::RwLock<Option<Arc<dyn ReplDataFetch>>>,
+    /// M21 E5(ADR-33 RP4.1):复制角色缓存(true = standby,写动词统一
+    /// 501 ReplicationStandby)。启动时随 meta `s:repl_role` 初始化,
+    /// promote/rebuild 经 `set_repl_role` 热翻转(不重启进程);meta 读
+    /// 失败回退 false + warn(fail-open 主端口径,不静默禁写)。
+    repl_standby: std::sync::atomic::AtomicBool,
 }
 
 /// M21 C4(ADR-33 RP4.2):standby 读路径的缺数据拉取通道——实现 =
@@ -343,6 +348,15 @@ impl S3Service {
         audit: Arc<fs3_core::audit::AuditRing>,
     ) -> Self {
         let host_id = format!("{:x}", rand_hex());
+        // M21 E5:启动时一次性读 meta 角色落缓存;读失败 fail-open(false
+        // = 主端口径),promote/rebuild 翻转走 set_repl_role 显式同步
+        let repl_standby = match engine.read().meta().repl_role() {
+            Ok(r) => r == fs3_meta::ReplRole::Standby,
+            Err(e) => {
+                tracing::warn!("repl role read failed at startup, assuming primary: {e}");
+                false
+            }
+        };
         S3Service {
             engine,
             auth: Authenticator::new(keys, region.clone(), std::time::SystemTime::now()),
@@ -369,7 +383,16 @@ impl S3Service {
             tenants: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_clock_secs: std::sync::atomic::AtomicI64::new(unix_now() as i64),
             repl_data_fetch: std::sync::RwLock::new(None),
+            repl_standby: std::sync::atomic::AtomicBool::new(repl_standby),
         }
+    }
+
+    /// M21 E5:复制角色翻转热同步(promote → Primary 恢复写;rebuild →
+    /// Standby 恢复只读)。只写缓存,meta 的 `s:repl_role` 由 fs3-meta 层
+    /// 事务落盘,两侧时序由调用方(RebuildService/装配)保证。
+    pub fn set_repl_role(&self, role: fs3_meta::ReplRole) {
+        self.repl_standby
+            .store(role == fs3_meta::ReplRole::Standby, Ordering::Relaxed);
     }
 
     /// M21 C4:装配 standby 缺数据拉取通道(fs3d 回填服务)。**M21 C5 起
@@ -1194,6 +1217,16 @@ impl S3Service {
     /// 读(GetObject/HeadObject/List*)不受影响。
     fn check_writable(&self, req: &S3Request) -> Result<(), S3Error> {
         let is_write = matches!(req.method.as_str(), "PUT" | "POST" | "DELETE");
+        // M21 E5(ADR-33 RP4.1):复制备端写动词统一 501 ReplicationStandby
+        // ——在 degraded 检查之前(角色是更先决的语义:备端写永远拒,
+        // 与设备健康无关)。层次口径(同 handle() D3 注释钉死):D3 委派
+        // 只读凭证的写动词在鉴权层已 403 先行,此处是普通认证的统一拦截;
+        // POST 覆盖 SelectObjectContent/RestoreObject 等读向 op 是按动词
+        // 拦截的已知取舍(同下方 degraded 检查先例——备端数据面唯一写
+        // 入是 apply 通道,不经 S3 层)。
+        if is_write && self.repl_standby.load(Ordering::Relaxed) {
+            return Err(S3Error::new(S3ErrorCode::ReplicationStandby));
+        }
         if is_write && self.engine.read().degraded() {
             return Err(S3Error::new(S3ErrorCode::ServiceUnavailable).with_message(
                 "Storage device is degraded; writes are temporarily disabled (read-only mode).",
@@ -2165,7 +2198,28 @@ impl S3Service {
         }
         // M4 D4 掉盘只读降级:写方法在降级期拒绝(读不受影响)
         self.check_writable(req)?;
-        let result = self.handle_inner(req);
+        let mut result = self.handle_inner(req);
+        // M21 E5(ADR-33 RP4.1):备端读响应携带 apply 水位头
+        // `X-FastS3-Repl-Applied-Gtid: {epoch}-{seq}`(客户端判断单调读
+        // 陈旧度;读写一致性只在主端成立)。成功/错误响应都带;游标读
+        // 失败 fail-open(读路径不因观测头失败而失败)。
+        if self.repl_standby.load(Ordering::Relaxed)
+            && matches!(req.method.as_str(), "GET" | "HEAD")
+        {
+            match self.engine.read().meta().repl_cursor() {
+                Ok(g) => {
+                    let h = (
+                        "X-FastS3-Repl-Applied-Gtid".to_string(),
+                        format!("{}-{}", g.epoch, g.seq),
+                    );
+                    match &mut result {
+                        Ok(resp) => resp.headers.push(h),
+                        Err(e) => e.resp_headers.push(h),
+                    }
+                }
+                Err(e) => tracing::warn!("repl cursor read failed, skip applied-gtid header: {e}"),
+            }
+        }
         let status = match &result {
             Ok(r) => r.status,
             Err(e) => {
@@ -5777,9 +5831,7 @@ impl S3Service {
         let intent = crate::sse::sse_write_intent(req, ssec.as_ref(), bkt.default_encryption)?;
         // M20 D3(ADR-29):KMS 写密钥 mint(写锁之外;RTT 不占引擎写锁)
         let kms_key = match &intent {
-            crate::sse::SseWriteIntent::SseKms(h) => {
-                Some(self.mint_kms_write_key(bucket, key, h)?)
-            }
+            crate::sse::SseWriteIntent::SseKms(h) => Some(self.mint_kms_write_key(bucket, key, h)?),
             _ => None,
         };
         let use_s3 = matches!(intent, crate::sse::SseWriteIntent::SseS3);
@@ -6612,9 +6664,7 @@ impl S3Service {
         // M20 D3(ADR-29):KMS 写密钥 mint(写锁之外;RTT 不占引擎写锁;
         // 会话绑定复用本次 mint,不二次往返)
         let kms_key = match &intent {
-            crate::sse::SseWriteIntent::SseKms(h) => {
-                Some(self.mint_kms_write_key(bucket, key, h)?)
-            }
+            crate::sse::SseWriteIntent::SseKms(h) => Some(self.mint_kms_write_key(bucket, key, h)?),
             _ => None,
         };
         let use_s3 = matches!(intent, crate::sse::SseWriteIntent::SseS3);
@@ -7482,9 +7532,7 @@ impl S3Service {
             crate::sse::sse_write_intent(req, dst_ssec.as_ref(), dst_bkt.default_encryption)?;
         // M20 D3(ADR-29 KR6.4):copy 目标 KMS 写密钥(上下文绑定目标对象)
         let dst_kms_key = match &dst_intent {
-            crate::sse::SseWriteIntent::SseKms(h) => {
-                Some(self.mint_kms_write_key(bucket, key, h)?)
-            }
+            crate::sse::SseWriteIntent::SseKms(h) => Some(self.mint_kms_write_key(bucket, key, h)?),
             _ => None,
         };
         let dst_use_s3 = matches!(dst_intent, crate::sse::SseWriteIntent::SseS3);

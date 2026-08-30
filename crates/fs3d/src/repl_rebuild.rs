@@ -202,6 +202,9 @@ impl RebuildService {
             .meta
             .clear_for_rebuild()
             .map_err(|e| RebuildError::Failed(format!("clear local state: {e}")))?;
+        // M21 E5:clear 已置 role=standby(meta 层),S3 层缓存同步——
+        // 重建后本端是备,写动词恢复 501 拦截(覆盖「旧主重建归队」形态)
+        self.service.set_repl_role(fs3_meta::ReplRole::Standby);
         tracing::warn!(
             ?stats,
             from = %cfg.primary_url,
@@ -319,6 +322,9 @@ impl RebuildService {
         self.service.clear_repl_data_fetch();
         match self.meta.promote(force) {
             Ok(out) => {
+                // M21 E5:S3 层角色缓存热翻转(promote 成功 = 本端转主,
+                // 写路径 501 拦截解除;失败路径不动缓存——角色未变)
+                self.service.set_repl_role(fs3_meta::ReplRole::Primary);
                 tracing::warn!(
                     epoch = out.epoch,
                     barrier = %crate::repl::fmt_gtid(out.barrier),
