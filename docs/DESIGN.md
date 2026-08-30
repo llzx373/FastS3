@@ -67,13 +67,17 @@
 > LDAP/OIDC → ADR-21(v2.2);IAM 多租户(用户/组/策略/服务账号)→ ADR-28(v2.4);
 > 在线扩容 → ADR-15(v1.4);
 > 纠删码/跨节点复制仍非目标;站点级容灾走 ADR-20 策略化同步(不内置 ?replication)。
+> **实例级/桶级主备异步复制(单写者 + 手动 promote)→ ADR-33(v2.7)**;
+> AWS `?replication` 配置语义维持 501 排除不变。
 > Public Access Block → ADR-23(v2.3);迁入保真 → ADR-24、Kafka 通知 → ADR-25、
 > S3 Batch → ADR-26、Condition 时间/变量 → ADR-27(v2.5);S3 Select 停售排除。
 > 完整现行范围见
 > [compat.md](./site/docs/reference/compat.md) 与 ADR-5/9/14/22/23/28。
 
-- 多节点 / 分布式部署(单机内多设备条带化除外);
-- 纠删码、跨节点复制、站点级容灾(交给底层存储);
+- 多节点 / 分布式部署(单机内多设备条带化除外;主备异步复制为
+  双机/级联部署形态,非分布式一致性,见 ADR-33);
+- 纠删码、跨节点多副本复制、站点级容灾(交给底层存储;主备复制
+  见 ADR-33);
 - S3 Select、生命周期管理、对象锁、版本控制(列入路线图,V1 不做);
 - SSE-KMS、IAM 联邦、AD/LDAP 集成;
 - 动态缩扩容(扩设备为离线运维操作)。
@@ -1308,6 +1312,12 @@ s3-tests 出排除集且 100%(transition/restore/storage-class);崩溃 ≥500
    联动;S3-GAP Top20 对照同步更新(「跨桶复制」行标注策略化
    落地)。
 
+> **旁注(2026-08-30,ADR-33)**:「故障转移」一项已由 **ADR-33(M21)**
+> 立项为数据面实例级主备复制(仅异步 + 手动 promote + dry-run,无
+> quorum 不自动切换);双向同步/复制事件/复制删除标记/版本化复制维持
+> 后置,AWS `?replication` 501 口径不变。`sync.run` 占位方案由内置
+> 复制替代为中心编排视图(二期,见 m14-center-contract §6)。
+
 **门禁口径同步**(TODO M16 门禁):ADR-20 与实现无偏离;R 组
 s3-tests 无新增 API(无 ?replication,501 显式);drill 实测双节点
 互备(mc/rclone 恰同步一次、断线重连幂等、拔中心安全停止/继续);
@@ -1982,6 +1992,140 @@ s3-tests batch 族无上游用例(逐名记账,不虚称出集);审计可检索 
 **门禁口径**(TODO M20):`kms_wizard_console_flow` 走通 OpenBao 与 Vault;
 H1/H2 安全断言全绿(落盘密文抽样、Vault 停机阻断解密、崩溃 ≥200 轮可解);
 s3-tests kms 族出集或逐名;`kms_context_binding_rejects_transplant` 绿。
+
+#### ADR-33(M21 立项决策):主备复制——仅异步语义 / GTID+epoch / 拓扑 / 备端语义 / 切换 / 信道 / 加密 / 资源纪律
+
+> 背景:用户诉求(类 MySQL 主备:**读写分离 + 高可用切换**,加密走 KMS、
+> 信道走 SSL)。设计稿 [docs/replication-design.md](./replication-design.md)
+> v1→v3 两轮评审(2026-08-30):v2 并入范围五点(仅异步;一主多备/桶级/复制槽/
+> 级联/GTID;缺数据等待;显式重建;独立端口),v3 并入裁定 1-4(上游委派凭证;
+> 扇出上限一期/配额二期;promote dry-run;中继流量优先级可配),开放问题清零。
+> 本 ADR **正面修订 ADR-20 DR5 与 §1.3 非目标清单**:实例级/桶级主备复制立项为
+> 数据面能力(v2.7.0,M21);**AWS `?replication` 配置语义(bucket replication
+> XML、复制事件、删除标记传播)维持 501 排除不变**——运维面实例复制 ≠ AWS 桶
+> 复制语义,两者不混淆。设计权威 = replication-design.md v3;实现偏离必须走
+> ADR,不得静默偏离(AGENT §5)。多主/双向复制、自动脑裂仲裁仍排除(持有组
+> H11/H12)。以下八件事钉死(**RP1~RP8**):
+
+**RP1(语义 = 仅异步单写者复制)**:
+
+1. 仅异步复制,RPO = 复制延迟(`fasts3_repl_slot_lag_seconds` 可观测);
+   **不做半同步/同步复制**——GTID ack 位点字段预留不占实现,零 RPO 硬诉求
+   回持有组 H11 单独立项;
+2. 拉取模型(下游主动 pull),与 agent/center「节点不暴露入站管理口」哲学
+   一致;主端热路径零侵入——binlog 与元数据同事务落盘,主端不感知下游
+   数量与在线状态;
+3. 单写者假设不变:多主/双向复制/自动冲突合并/自动回退不做(排除清单)。
+
+**RP2(标识 = GTID `{epoch, seq}`)**:
+
+1. `seq` 直接复用 `s:seq` 全局事务序号——binlog 天然全序,GTID 零额外
+   分配成本;`epoch` 持久化 `s:repl_epoch`,**每次 promote +1**,promote
+   时写 `EpochBarrier` binlog 条目(与 epoch 变更同事务落盘,promote 崩溃
+   不得产生半状态,R12);新 epoch 从 seq=1 重计,GTID 全局字典序仍单调;
+2. 每节点持久化 executed GTID 区间集(`s:repl_executed`,与 apply 事务
+   同库同事务更新)与角色(`s:repl_role`);
+3. 握手做 GTID 集**包含性校验**:起始位点不可用 → `ErrBinlogGone`;
+   executed 集 ⊄ 上游 → `ErrDiverged`;两者唯一出路 = **显式重建**,
+   无自动修复;
+4. **R12 陷阱钉死**:快照重建后 executed 集必须以导出位点 `P` 为准
+   **重置**(不是累加),否则假分歧。
+
+**RP3(拓扑 = 一主多备 + 桶级槽位 + 级联)**:
+
+1. 一主多备 = 多个命名复制槽(`s:repl_slot\0{name}`),fan-out 上限
+   `max_slots` 默认 16(**一期硬限制**;单槽带宽配额二期,R11);
+2. 桶级槽位过滤器(include/exclude)在**上游侧**过滤,被过滤 seq 以
+   heartbeat 条目带过(下游游标连续、GTID 集无空洞);过滤器变更 =
+   drop + 重建槽,禁原地改(R9);
+3. 级联 = 备端同时是上游,GTID 原样转发不重编号;**中继发送水位 ≤
+   本地数据水位**(data_pending 条目暂存);链路 ≤8 跳,握手比对链路
+   node_id 列表,成环即拒;GTID 分歧检测为最后兜底。
+
+**RP4(备端语义 = 严格只读 + 缺数据等待)**:
+
+1. 备端 S3 层写动词统一 **501 `ReplicationStandby`**(不做 307,S3 客户端
+   支持参差);读为单调读、可能陈旧,响应头
+   `X-FastS3-Repl-Applied-Gtid` 供客户端判断;写后读一致性只在主端成立;
+2. apply 单流严格按 GTID 序,`seq <= cursor` 幂等丢弃;游标与 apply
+   事务同盘,崩溃重放天然幂等;先提交元数据、段标记 `data_pending`,
+   后台回填池并发拉取(默认 8);
+3. **缺数据等待**:读命中 `data_pending` 段 → 同步向上游即时拉取、落盘
+   校验 CRC 后服务(单请求超时 `read_fetch_timeout_secs` 默认 30s 可配);
+   上游不可达且数据未到 → 503 + `Retry-After`;不做干等后台池;
+4. 备端不复制上游 extent 布局:段数据经本地分配器重建(设备异构可,
+   容量 ≥ 用量);备端禁分配器写/禁本地 compaction 新分配,promote 后恢复;
+5. **桶级备端不可 promote**(GTID 有洞);转正 = 先显式重建为全量备再
+   promote(§5.4 文档明示防误用)。
+
+**RP5(切换 = 手动 promote + epoch fencing)**:
+
+1. **dry-run 前置必带丢弃清单**:`promote?dry_run=true` 返回将丢弃对象
+   清单 + 影响桶 + GTID 范围 + 受影响下游分支,零状态变更;运维确认后才
+   执行真实 promote(裁定 3);
+2. 真实 promote = 停 apply → 校验无 `data_pending`(或 `--force`,清单与
+   dry-run 一致)→ epoch+1 → EpochBarrier 同事务落盘 → role=primary →
+   开写路径;
+3. **无 quorum 不做自动故障转移,promote 永远人工确认**(红线;自动切换
+   回持有组 H12);旧 epoch 的一切写入全网络拒收(fencing);
+4. **旧主重加入 = 显式 rebuild 唯一路径**:握手必中 `ErrDiverged`,运维
+   执行 `replication rebuild --as-standby --from <new_primary>`,清空本地
+   复制状态后走全量流程;不做尾事务抢救;
+5. 级联 promote 后下游自动重握手续流(executed 含旧 epoch 段,新主 GTID
+   集继承包含);仅 `--force` 丢弃过数据时受影响分支需对应桶重建(R10)。
+
+**RP6(信道 = 独立复制口,mTLS 强制)**:
+
+1. 复制口**独立监听(默认 9445)**,不复用 S3 数据面/center 9443——职责
+   分离,主端即使不纳管也能被复制;
+2. 栈复用 fs3-agent rustls(TLS 1.2/1.3,根信任 + 客户端证书)与 center
+   验证逻辑;**mTLS 强制,客户端证书 CN = node_id**;**复制口无 mTLS
+   不合入**(红线);
+3. 协议:手写 HTTP/1.1 复用 agent http1.rs 样板;
+   `GET /v1/repl/v1/{binlog,extent-data,slots}`(binlog 长轮询、段数据
+   Range 读 + CRC32C + ReadPin、槽位观测)+
+   `POST /v1/repl/v1/{snapshot,hello}`。
+
+**RP7(加密 = 一期方案 A 共享 KMS)**:
+
+1. **主备指向同一 Vault/OpenBao**:wrapped DEK 绑定 canonical(bucket,key)
+   AAD,桶键名不变,`SseInfo` 随 binlog 原样落盘即可解;零重加密,
+   明文 DEK 永不出 KMS;KMS 停机 = 主备同败(现状红线不变);
+2. 方案 B(异构 KMS 重加密)= **显式开关二期**(H13);启用时复制链路
+   明文 DEK 用毕 zeroize(红线);
+3. SSE-S3 KEK/种子(`s:` 族系统键)纳入 binlog,**对桶级槽强制随同**;
+   SSE-C 密钥客户端持有,密文直接搬;IAM 密钥随实例级 binlog 复制,
+   promote 后客户端凭据不变;
+4. **桶级备端读鉴权 = 上游委派只读凭证**(裁定 1):上游 admin 为槽位
+   签发绑定 `{slot_name, bucket_scope}` 的只读 HMAC 凭证(权限恒等于
+   范围内桶 GET/HEAD/List),mTLS 握手一次性下发,备端验签放行;
+   **删槽即吊销**;不在备端本地手工配密钥。
+
+**RP8(资源纪律 = binlog 两级水位 + 中继流量优先级)**:
+
+1. binlog 截断下限 = `min(各槽 confirmed_gtid)`;软上限
+   `repl_retain_hours`(默认 24h)/`repl_retain_bytes`(默认 8GiB)超限
+   → **停截断 + 告警保槽**(R7);硬上限 `repl_retain_bytes_hard`
+   (默认 32GiB)→ 强制截断 + 槽标记 stale(下次握手 ErrBinlogGone →
+   显式重建);保数据还是保磁盘由硬上限裁决,行为确定;
+2. 中继流量优先级 **投递 > 回填 > 按需拉取**,经 worker 共享令牌桶按
+   权重分配(`traffic_weights = {serve=100, backfill=50, on_demand=10}`
+   量级,缺省即此序),防下游读流量饿死回填与投递(裁定 4);
+3. 快照导出:flush_wal + 强制分配器检查点 + rocksdb MVCC 快照 + ReadPin
+   防 compaction 迁移(ADR-22),令牌桶限速,可暂停/断点续(R5)。
+
+**演进纪律**(DESIGN-FUTURE §2):新键前缀 `bl:` / `s:repl_*` 三处同步
+(keys.rs 前缀表、meta-export/import DTO、check 可达性扫描);
+`ReplRecord` 走 postcard + 值版本字节;layout_version 不变(纯键前缀
+新增,升级框架内声明);binlog 不增组提交 fsync 次数(同事务同 WAL,
+perf 验证线 p99 增量 <5%)。
+
+**门禁口径**(TODO M21):本 ADR 与实现无偏离;双机演练(写主读备/
+断线续传/断档显式重建/promote 不丢已复制数据/旧主重加入被拒后重建)+
+三级级联 + 桶级(过滤零泄漏/委派凭证越界 403/桶级备 promote 被拒)+
+SSE-KMS 真 Vault 车道(备端可解/promote 后可解/KMS 停机双侧失败);
+崩溃注入 ≥200 轮混载(binlog 与元数据零漂移、apply 幂等、promote
+无半状态);perf-M21 达标;不打 tag/不公网 Release。
 
 ---
 

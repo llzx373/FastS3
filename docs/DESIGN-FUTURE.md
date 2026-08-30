@@ -919,6 +919,7 @@ v1.0 基线 <256MiB 空载。远期特性开启态的常驻增量:多设备位�
 | DL2 | NEXT-ROUND §5.6 | LDAP 客户端 | 内置最小 LDAPv3(BER)BIND/SEARCH,零外部依赖;ldap/ldaps;mock LDAP 集成测试 | ADR-21(M16) |
 | DL3 | NEXT-ROUND §5.6 | OIDC 控制台 SSO | implicit flow id_token → 本地会话 JWT;角色映射配置化;issuer 不可达回退本地登录;会话不依赖 issuer 在线 | ADR-21(M16) |
 | DL4 | NEXT-ROUND §5.6 | 身份审计与范围 | 身份事件环形缓冲可检索 + 状态端点;LDAP 密码登录/数据面组鉴权/code+PKCE/SCIM 后置 | ADR-21(M16) |
+| RP1~RP8 | replication-design v3 | 主备复制立项(正面修订 ADR-20 DR5 与 §1.3) | 仅异步单写者 + GTID{epoch,seq} + 复制槽;一主多备/桶级/级联;备端只读 + 缺数据等待;手动 promote(dry-run)+ 显式重建;独立复制口 mTLS 强制;共享 KMS 保全 SSE-KMS;binlog 两级水位 + 中继流量优先级 | ADR-33(M21) |
 
 ---
 
