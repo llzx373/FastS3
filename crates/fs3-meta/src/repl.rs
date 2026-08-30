@@ -93,6 +93,80 @@ pub enum BucketFilter {
     Exclude(Vec<String>),
 }
 
+/// 委派只读凭证(M21 D3;ADR-33 RP7.4 裁定 1;docs/replication-design.md
+/// §6.3):上游为**桶级槽**签发绑定 `{slot_name, bucket_scope}` 的只读
+/// HMAC 凭证,权限恒等于「范围内桶 GET/HEAD/List」。实例级槽(All)不签发
+/// (IAM 随 binlog 复制,§6.3)。
+///
+/// 持久化形态:上游侧 `s:repl_dcred_out\0{slot}`(签发/待下发记录),
+/// 备端侧 `s:repl_dcred_in\0{slot}`(hello 一次性下发后落本地,重启后
+/// 验签用)。**密钥材料零日志/零 API 面**:secret 明文只存这两个 rocksdb
+/// 键;slot_json/slots 观测端点/admin 均不含本记录;hello 响应仅在
+/// 「未投递」状态携带一次(delivered 标记,复用 center secrets 一次性
+/// 投递精神)。serde 形状自此成为持久化兼容面(尾部追加演进纪律同 Slot)。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegatedCred {
+    /// access key(`REPL-{slot}`,DELEGATED_ACCESS_PREFIX;槽名回指 =
+    /// 备端点读的键解析来源)。
+    pub access_key: String,
+    /// secret(上游侧 = HMAC-SHA256(issuer_seed, …) 派生的 hex;备端
+    /// 原样落收。验签用后即弃,不进日志)。
+    pub secret_key: String,
+    /// 绑定的桶范围 = 签发时刻槽过滤器快照(过滤器变更 = drop + 重建槽,
+    /// R9,故不存在原地漂移;范围强制在备端 S3 鉴权层,越界/写动词 = 403)。
+    pub filters: BucketFilter,
+    /// 一次性下发标记(仅上游侧有意义):true = 已随某次成功握手下发,
+    /// 后续 hello 不再携带。备端侧恒 true(收讫语义)。
+    pub delivered: bool,
+    /// 签发墙钟 Unix 秒。
+    pub issued_at: i64,
+}
+
+/// 委派凭证 access key 前缀(M21 D3):`REPL-{slot}`。备端 S3 鉴权以此前缀
+/// 快速分流(常驻密钥热路径零 meta 读);前缀命中才点读 `s:repl_dcred_in`。
+/// 命名碰撞口径:常驻密钥/admin 密钥若恰好以此前缀命名,在持有同名槽
+/// 委派记录的备端上被委派路径遮蔽(异态部署才可见,注释钉死)。
+pub const DELEGATED_ACCESS_PREFIX: &str = "REPL-";
+
+impl DelegatedCred {
+    /// 持久化编码:postcard(同 Slot 口径;演进 = 尾部追加 + 解码侧双读
+    /// 回退,零迁移)。
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        postcard::to_allocvec(self)
+            .map_err(|e| Error::Meta(format!("postcard encode repl dcred: {e}")))
+    }
+
+    /// 解码;损坏 → Corrupt(不静默接受)。
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        postcard::from_bytes(buf).map_err(|e| Error::Corrupt(format!("repl dcred: {e}")))
+    }
+}
+
+impl std::fmt::Debug for DelegatedCred {
+    /// 密钥材料零日志(红线):Debug 输出遮蔽 secret。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DelegatedCred")
+            .field("access_key", &self.access_key)
+            .field("secret_key", &"<redacted>")
+            .field("filters", &self.filters)
+            .field("delivered", &self.delivered)
+            .field("issued_at", &self.issued_at)
+            .finish()
+    }
+}
+
+impl BucketFilter {
+    /// 桶名是否命中过滤器(M21 D3:委派凭证范围强制的判定原语;All 恒
+    /// 命中——委派凭证只对桶级槽签发,All 分支为防御性兜底)。
+    pub fn allows_bucket(&self, bucket: &str) -> bool {
+        match self {
+            BucketFilter::All => true,
+            BucketFilter::Include(list) => list.iter().any(|b| b == bucket),
+            BucketFilter::Exclude(list) => !list.iter().any(|b| b == bucket),
+        }
+    }
+}
+
 /// 复制槽持久化记录(M21 A3;ADR-33 RP3/RP8;设计稿 §3.3;键
 /// `s:repl_slot\0{name}` → postcard Slot,每下游一键)。
 /// 本任务只落存储层;握手自动登记/admin 预登记/drop/max_slots 属 B3。
@@ -834,5 +908,33 @@ mod tests {
             assert_eq!(Slot::decode(&s.encode().unwrap()).unwrap().filters, f);
         }
         assert_eq!(BucketFilter::default(), BucketFilter::All);
+    }
+
+    /// M21 D3(ADR-33 RP7.4 裁定 1;设计稿 §6.3):DelegatedCred 持久化
+    /// 编码往返 + 损坏拒绝;allows_bucket 三态判定;Debug 遮蔽 secret
+    /// (密钥材料零日志红线)。
+    #[test]
+    fn repl_dcred_codec_roundtrip() {
+        let cred = DelegatedCred {
+            access_key: "REPL-s1".into(),
+            secret_key: "deadbeef".into(),
+            filters: BucketFilter::Include(vec!["b1".into()]),
+            delivered: true,
+            issued_at: 1_700_000_000,
+        };
+        let buf = cred.encode().unwrap();
+        assert_eq!(DelegatedCred::decode(&buf).unwrap(), cred);
+        assert!(DelegatedCred::decode(&[]).is_err());
+        assert!(DelegatedCred::decode(&buf[..buf.len() - 1]).is_err());
+        // 密钥材料零日志:Debug 不含 secret 本体
+        let dbg = format!("{cred:?}");
+        assert!(!dbg.contains("deadbeef"), "{dbg}");
+        assert!(dbg.contains("<redacted>"));
+        // allows_bucket 三态
+        assert!(BucketFilter::All.allows_bucket("any"));
+        assert!(cred.filters.allows_bucket("b1"));
+        assert!(!cred.filters.allows_bucket("b2"));
+        assert!(BucketFilter::Exclude(vec!["b2".into()]).allows_bucket("b1"));
+        assert!(!BucketFilter::Exclude(vec!["b2".into()]).allows_bucket("b2"));
     }
 }

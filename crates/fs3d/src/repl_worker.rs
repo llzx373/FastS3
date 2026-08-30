@@ -26,6 +26,10 @@
 //!   永不自调);is_alive() 可观测。
 //! - **epoch fencing**(§2.3):hello 成功响应的上游 epoch 推进本地
 //!   `s:repl_epoch`(取大),apply 层拒绝低于本地 epoch 的流。
+//! - **委派凭证(D3;裁定 1/§6.3)**:桶级槽的只读凭证随 hello 一次性
+//!   下发,落本地 `s:repl_dcred_in`(持久化供重启后验签;覆盖写 = 上游
+//!   删槽重签发后的吊销生效点;槽转全量 = 删键本地吊销)。备端 S3 层
+//!   验签/范围强制在 fs3-s3(service.rs 委派分支)。
 //! - **生命周期**:`role=standby` 才启动(spawn 硬校验,非备显式报错);
 //!   `shutdown()` 置停止标志 + join(长轮询请求有界,退出延迟 ≤
 //!   long_poll_ms + retry 退避);暂停/恢复(pause/resume)语义属 F2,
@@ -441,8 +445,10 @@ fn executed_is_empty(meta: &MetaStore) -> bool {
 /// ① 上游 epoch 推进本地 s:repl_epoch(fencing 锚点,§2.3);② 桶级
 /// 备端打标落本地 `s:repl_bscoped`(D2/§5.4:filters != All 的槽其
 /// 下游 GTID 集有洞,**不可 promote**——E3 校验输入;每次握手按上游
-/// 槽实况覆写,drop + 重建为全量槽后标记随之复位)。
-async fn hello(
+/// 槽实况覆写,drop + 重建为全量槽后标记随之复位);③ D3 委派只读
+/// 凭证落本地 `s:repl_dcred_in`(裁定 1/§6.3,见函数内注释)。
+/// pub(crate):D3 具名用例直接驱动本函数(repl.rs 测试模块)。
+pub(crate) async fn hello(
     meta: &MetaStore,
     cfg: &PullConfig,
     tls: &Arc<rustls::ClientConfig>,
@@ -478,6 +484,50 @@ async fn hello(
     let scoped = json["slot"]["bucket_scoped"].as_bool() == Some(true);
     meta.set_repl_bucket_scoped(scoped)
         .map_err(|e| PullError::Transient(format!("set bucket_scoped marker: {e}")))?;
+    // D3(ADR-33 RP7.4 裁定 1;设计稿 §6.3):委派只读凭证——
+    // - 响应携带(对象形态)= 一次性下发:原样落本地 `s:repl_dcred_in`
+    //   (内存验签 = S3 层点读;持久化副本供重启后验签)。**覆盖写 =
+    //   吊销生效点**:上游删槽后本握手自动重登记 + 重签发,新 secret
+    //   覆盖旧记录,旧凭证自此验签失败(403);
+    // - null(已投递过的常态重连)= 保留本地副本;
+    // - 槽非桶级(scoped=false)= 本地吊销(删键;drop + 重建为全量槽
+    //   后旧委派凭证不再存续)。密钥材料零日志:不落任何 tracing。
+    match &json["delegated_credential"] {
+        v if v.is_object() => {
+            let get_str = |f: &str| {
+                v[f].as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| PullError::Fatal(format!("hello dcred missing {f}")))
+            };
+            let filters: BucketFilter = serde_json::from_value(v["bucket_scope"].clone())
+                .map_err(|e| PullError::Fatal(format!("hello dcred bad bucket_scope: {e}")))?;
+            let cred = fs3_meta::DelegatedCred {
+                access_key: get_str("access_key")?,
+                secret_key: get_str("secret_key")?,
+                filters,
+                delivered: true, // 备端侧恒 true(收讫语义)
+                issued_at: 0,    // 下发时刻以响应为准,本地不重演签发时钟
+            };
+            // 完整性:下发的 access_key 必须回指本槽(REPL-{slot}),
+            // 串槽/串响应 = 上游实现缺陷,显式拒绝而非落错凭证
+            let want = format!("{}{}", fs3_meta::DELEGATED_ACCESS_PREFIX, cfg.slot_name);
+            if cred.access_key != want {
+                return Err(PullError::Fatal(format!(
+                    "hello dcred access_key mismatch (slot {})",
+                    cfg.slot_name
+                )));
+            }
+            meta.put_repl_dcred_in(&cred)
+                .map_err(|e| PullError::Transient(format!("store delegated credential: {e}")))?;
+        }
+        _ => {
+            if !scoped {
+                meta.delete_repl_dcred_in(&cfg.slot_name).map_err(|e| {
+                    PullError::Transient(format!("revoke delegated credential: {e}"))
+                })?;
+            }
+        }
+    }
     Ok(())
 }
 

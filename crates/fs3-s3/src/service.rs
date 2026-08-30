@@ -379,6 +379,38 @@ impl S3Service {
         *self.repl_data_fetch.write().unwrap() = Some(fetch);
     }
 
+    /// M21 D3(ADR-33 RP7.4 裁定 1;replication-design §6.3):上游委派
+    /// 只读凭证的本地查找(**桶级备端**专属——桶级槽不含 IAM 键,备端读
+    /// 鉴权无法走 IAM,由上游签发的委派凭证承载)。access_key 形
+    /// `REPL-{slot}`(fs3_meta::DELEGATED_ACCESS_PREFIX):前缀不命中 =
+    /// 零成本退回(常驻密钥热路径无 meta 读);命中才点读
+    /// `s:repl_dcred_in\0{slot}`(桶级备端至多一条上游槽记录,rocksdb
+    /// 点读,非主端热路径)。缺席 = 未签发/已吊销 → 回退常驻密钥表
+    /// (实例级备的密钥随 binlog 复制,§6.3),委派前缀键若不在常驻表
+    /// 则 InvalidAccessKeyId(403)。
+    fn delegated_cred(&self, access_key: &str) -> Option<fs3_meta::DelegatedCred> {
+        let slot = access_key.strip_prefix(fs3_meta::DELEGATED_ACCESS_PREFIX)?;
+        // 槽名字符集守卫(同复制口 valid_slot_name;防任意串打点读)
+        if slot.is_empty()
+            || !slot
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        {
+            return None;
+        }
+        let engine = self.engine.read();
+        match engine.meta().repl_dcred_in(slot) {
+            Ok(Some(cred)) if cred.access_key == access_key => Some(cred),
+            Ok(_) => None,
+            Err(e) => {
+                // 读失败 fail-closed:按无记录回退(常驻表必不含 → 403),
+                // 绝不因本地故障静默放行
+                tracing::warn!("repl delegated credential lookup: {e}");
+                None
+            }
+        }
+    }
+
     /// M21 C4(ADR-33 RP4.2):standby 读路径缺数据确保——标记在则同步
     /// 拉取(≤8 轮,拉取与并发 apply 竞态由轮询兜底);拉取失败/轮次
     /// 耗尽 → 503 ServiceUnavailable + Retry-After。**调用方不得持有
@@ -2096,11 +2128,31 @@ impl S3Service {
                     .with_message("Rate limit exceeded for this access key."));
             }
         }
-        // J4 密钥策略 × M10 S3 桶策略双层求交(Deny 优先;同账号 Allow 并集)。
-        // M15 T2:会话请求另加会话策略求交(见 authorize)。
-        // PostObject 除外:键在表单体内,授权(含匿名桶策略放行)由
-        // op_post_object 解析后按真实键执行。
-        if name != "PostObject" {
+        // M21 D3(ADR-33 RP7.4 裁定 1;replication-design §6.3):委派只读
+        // 凭证的范围强制——命中委派凭证的身份其权限**恒等于**「范围内桶的
+        // GET/HEAD/List」,不走密钥策略/IAM/桶策略层(桶级备端无 IAM 数据,
+        // §6.3;委派语义由签发时绑定的 bucket_scope 自足承载)。越界桶 /
+        // 写动词 / 服务级列举(空桶 = ListBuckets 会泄范围外桶名)→ 403
+        // AccessDenied。**403 vs 501 层次口径(注释钉死)**:委派凭证的写
+        // 动词在此鉴权层即 403(语义 = 凭证无权,同 AWS AccessDenied);
+        // E5 备端写隔离 501 是更靠后的写路径拦截,普通认证(非委派)的写
+        // 仍走到那一层报 501——两层互不替代。
+        let delegated = match access {
+            Some(ak) => self.delegated_cred(ak),
+            None => None,
+        };
+        if let Some(cred) = &delegated {
+            let read_verb = matches!(req.method.as_str(), "GET" | "HEAD");
+            if !read_verb || bucket.is_empty() || !cred.filters.allows_bucket(&bucket) {
+                return Err(S3Error::new(S3ErrorCode::AccessDenied).with_message(
+                    "delegated replication credential allows only GET/HEAD/List on in-scope buckets",
+                ));
+            }
+        } else if name != "PostObject" {
+            // J4 密钥策略 × M10 S3 桶策略双层求交(Deny 优先;同账号 Allow 并集)。
+            // M15 T2:会话请求另加会话策略求交(见 authorize)。
+            // PostObject 除外:键在表单体内,授权(含匿名桶策略放行)由
+            // op_post_object 解析后按真实键执行。
             self.authorize(auth.as_ref(), &name, &bucket, &key, req)?;
             self.authorize_bypass_if_requested(auth.as_ref(), &name, &bucket, &key, req)?;
         }
@@ -2415,6 +2467,29 @@ impl S3Service {
                 }
             }
             None => {
+                // M21 D3(裁定 1;§6.3):委派凭证分支——access_key 命中本地
+                // 委派记录(桶级备端)时用记录内 secret 验签(同会话路径的
+                // 「调用方给 secret」形态 verify_header_auth_sessions;常驻
+                // 密钥表不含此键)。缺席/已吊销 → 回退常驻密钥表路径。
+                // 预签名 query 不支持委派凭证(验签入口只此一处,注释钉死)。
+                if let Some(ak) = self.auth.peek_access_key(&req.headers) {
+                    if let Some(cred) = self.delegated_cred(&ak) {
+                        let outcome = self.auth.verify_header_auth_sessions(
+                            &req.method,
+                            &req.raw_path,
+                            &req.query,
+                            &req.headers,
+                            Some(&cred.secret_key),
+                        )?;
+                        return Ok(match outcome {
+                            AuthOutcome::Authenticated { .. } => Some(AuthIdentity {
+                                who: ak,
+                                session: None,
+                            }),
+                            AuthOutcome::Anonymous => None,
+                        });
+                    }
+                }
                 // 常驻密钥路径(与 authenticate 逐字节等价)
                 let outcome = self.auth.verify_header_auth(
                     &req.method,

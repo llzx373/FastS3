@@ -51,8 +51,12 @@
 //!   下游同为 Rust 端,直用持久化枚举的 serde 面,不引入第二套语法);
 //!   `chain` = 上游链路 node_id 列表(本端为直连上游时含本端之后逐跳上溯,
 //!   缺省 [])。请求体上限 `MAX_HELLO_BODY`。
-//! - 成功 200:`{slot, high_watermark, epoch}`——slot = 登记结果(首次握手
-//!   自动登记,设计稿 §3.3;confirmed_gtid 初值 = 下游 executed 集最大值)。
+//! - 成功 200:`{slot, high_watermark, epoch, delegated_credential}`——slot
+//!   = 登记结果(首次握手自动登记,设计稿 §3.3;confirmed_gtid 初值 = 下游
+//!   executed 集最大值);delegated_credential = D3 委派只读凭证,桶级槽
+//!   一次性下发(未投递才携带 `{access_key, secret_key, bucket_scope}`,
+//!   已投递/实例级槽 = null;备端落 `s:repl_dcred_in` 供重启后验签,
+//!   见 delegated_for_hello 注释与 repl_worker hello 落盘逻辑)。
 //! - 失败:统一 JSON `{error, detail}`,`error` 为机器可判错误码:
 //!   `ErrNodeIdMismatch`(403,mTLS peer CN ≠ 自报 node_id)、
 //!   `ErrTopologyLoop`(403,chain 含本节点/有重复/超 8 跳,§3.6 成环即拒)、
@@ -72,7 +76,7 @@
 //!   seq=1 重计」落地属 E3 promote,届时复核跨 epoch 续流边界(本任务不对
 //!   现有 bl: 存储做 epoch 重编号)。
 //!
-//! 本任务边界(后续任务接线,勿在此抢跑):委派凭证(D3)。D1 已落地:
+//! 本任务边界(后续任务接线,勿在此抢跑):逐槽指标导出属 D4。D1 已落地:
 //! slots 端点 lag 三件套(lag_seq/lag_bytes/lag_seconds,口径见
 //! handle_slots 注释);多槽位点独立 = binlog 端点按 after 参数无状态
 //! 服务(B1 形态),截断下限 = min(活跃槽 confirmed)(A3)。D2 已落
@@ -80,6 +84,11 @@
 //! record_in_scope/heartbeat_of),过滤器变更 = drop + 重建槽(B2
 //! ErrFilterMismatch + B3 ErrSlotExists 双向把守,禁原地改),桶级槽
 //! 打标 `bucket_scoped`(slot_json;下游本地记录见 repl_worker hello)。
+//! D3 已落地(ADR-33 RP7.4 裁定 1;设计稿 §6.3):桶级槽委派只读凭证——
+//! 签发 = 槽预登记/首次握手(issue_delegated_cred,HMAC 派生 + 持久化
+//! `s:repl_dcred_out`,密钥材料零日志);下发 = hello 响应一次性携带
+//! (delegated_for_hello,delivered 标记);吊销 = 删槽同删凭证记录
+//! (handle_slot_drop)+ 备端重握手收讫轮换凭证覆盖(验签即败)。
 //! 长轮询空挂已落地(B4;`wait={ms}` 参数,见 handle_binlog)。
 //!
 //! 快照导出会话线格式(C1;设计稿 §3.1;ADR-33 RP8.3):
@@ -980,6 +989,42 @@ impl ReplServer {
             "slot": slot_json(&slot),
             "high_watermark": fmt_gtid(watermark),
             "epoch": watermark.epoch,
+            // D3(裁定 1;§6.3):桶级槽委派只读凭证,一次性下发(未投递
+            // 才携带;此后握手为 null,备端靠本地持久化副本验签)。实例级
+            // 槽(All)恒 null(IAM 随 binlog 复制,无需委派)。
+            "delegated_credential": match self.delegated_for_hello(&slot) {
+                Ok(v) => v,
+                Err(e) => return internal_err("delegated credential", &e),
+            },
+        }))
+    }
+
+    /// D3 hello 下发裁决(ADR-33 RP7.4 裁定 1;设计稿 §6.3「随槽位握手
+    /// 经 mTLS 信道一次性下发,复用 center secrets 一次性投递模式」):
+    /// - 实例级槽(All)→ None(不签发;IAM 随 binlog 复制);
+    /// - 记录缺席(库迁移后重握手/签发写失败自愈)→ 现场重签发并投递;
+    /// - `delivered=false`(预登记已签发待投递 / 重签发)→ 随本次响应
+    ///   下发并落 delivered=true;
+    /// - `delivered=true` → None(**一次性**:此后握手不再携带;响应
+    ///   发出前落标,备端收丢 = 凭证遗失,恢复路径 = drop + 重建槽——
+    ///   同 center secrets 一次性投递的遗失裁决);
+    ///   密钥材料零日志:本函数不 tracing 任何凭证字段。
+    fn delegated_for_hello(&self, slot: &Slot) -> Result<serde_json::Value, fs3_core::Error> {
+        if slot.filters == BucketFilter::All {
+            return Ok(serde_json::Value::Null);
+        }
+        let cred = match self.meta.repl_dcred_out(&slot.name)? {
+            Some(c) if c.delivered => return Ok(serde_json::Value::Null),
+            Some(c) => c,
+            None => issue_delegated_cred(&self.meta, slot)?,
+        };
+        let mut stored = cred.clone();
+        stored.delivered = true;
+        self.meta.put_repl_dcred_out(&stored)?;
+        Ok(serde_json::json!({
+            "access_key": cred.access_key,
+            "secret_key": cred.secret_key,
+            "bucket_scope": cred.filters,
         }))
     }
 
@@ -1057,11 +1102,27 @@ impl ReplServer {
         if let Err(e) = self.meta.put_repl_slot(&slot) {
             return internal_err("slot register", &e);
         }
+        // D3:桶级槽预登记同步签发委派凭证(delivered=false,待该槽首次
+        // 成功握手下发,见 delegated_for_hello)。签发失败 = 槽已登记但
+        // 无凭证记录——下次握手按「记录缺席 → 重签发并投递」自愈。
+        if slot.filters != BucketFilter::All {
+            match issue_delegated_cred(&self.meta, &slot) {
+                Ok(cred) => {
+                    if let Err(e) = self.meta.put_repl_dcred_out(&cred) {
+                        return internal_err("delegated credential issue", &e);
+                    }
+                }
+                Err(e) => return internal_err("delegated credential issue", &e),
+            }
+        }
         json_ok(serde_json::json!({ "slot": slot_json(&slot) }))
     }
 
     /// `DELETE /v1/repl/v1/slots/{name}`(B3 drop;释放保留约束——截断下限
-    /// = min(活跃槽 confirmed),drop 即不再参与,§3.3/§3.4)。
+    /// = min(活跃槽 confirmed),drop 即不再参与,§3.3/§3.4)。D3 吊销的
+    /// 上游侧一半:委派凭证记录随槽同删(先证后槽——半途失败时槽在证失
+    /// 可由下次握手「记录缺席 → 重签发」自愈,反向则残留待投递旧证)。
+    /// 备端侧一半 = 重握手收讫轮换凭证覆盖本地记录(repl_worker)。
     fn handle_slot_drop(&self, name: &str) -> Response<Full<Bytes>> {
         if !valid_slot_name(name) {
             return bad_slot_name();
@@ -1070,6 +1131,9 @@ impl ReplServer {
             Ok(Some(_)) => {}
             Ok(None) => return json_err(StatusCode::NOT_FOUND, "ErrSlotUnknown", "no such slot"),
             Err(e) => return internal_err("slot lookup", &e),
+        }
+        if let Err(e) = self.meta.delete_repl_dcred_out(name) {
+            return internal_err("delegated credential drop", &e);
         }
         match self.meta.delete_repl_slot(name) {
             Ok(()) => json_ok(serde_json::json!({ "dropped": name })),
@@ -1598,6 +1662,39 @@ fn now_unix_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// D3 签发(ADR-33 RP7.4 裁定 1;设计稿 §6.3):为桶级槽生成委派只读凭证。
+/// - access_key = `REPL-{slot}`(fs3_meta::DELEGATED_ACCESS_PREFIX;槽名
+///   回指,备端按槽名点读本地记录);
+/// - secret = hex(HMAC-SHA256(issuer_seed, "fasts3-repl-delegated" ‖ slot ‖
+///   nonce)):issuer_seed = 持久化随机 32B(`s:repl_credseed` 懒初始化),
+///   nonce = 每次签发随机 16B——**同槽重签发(drop + 重建 / 库迁移后记录
+///   缺席)必得新 secret,旧凭证验签即败 = 吊销语义的密码学载体**;
+/// - 派生结果随记录持久化(`s:repl_dcred_out\0{slot}`,delivered 由调用方
+///   标记),重启后可验;密钥材料零日志(本函数不 tracing 凭证字段)。
+fn issue_delegated_cred(
+    meta: &MetaStore,
+    slot: &Slot,
+) -> Result<fs3_meta::DelegatedCred, fs3_core::Error> {
+    use hmac::Mac as _;
+    let seed = meta.repl_cred_seed_or_init()?;
+    let mut nonce = [0u8; 16];
+    fs3_core::random_bytes(&mut nonce)?;
+    let mut mac =
+        hmac::Hmac::<sha2::Sha256>::new_from_slice(&seed).expect("hmac accepts any key length");
+    mac.update(b"fasts3-repl-delegated\0");
+    mac.update(slot.name.as_bytes());
+    mac.update(b"\0");
+    mac.update(&nonce);
+    let secret = hex::encode(mac.finalize().into_bytes());
+    Ok(fs3_meta::DelegatedCred {
+        access_key: format!("{}{}", fs3_meta::DELEGATED_ACCESS_PREFIX, slot.name),
+        secret_key: secret,
+        filters: slot.filters.clone(),
+        delivered: false,
+        issued_at: now_unix_secs(),
+    })
 }
 
 /// GTID 文本形 `{epoch}-{seq}`(模块注释的线格式)。
@@ -4095,6 +4192,264 @@ mod tests {
             headers,
             body: vec![],
         }
+    }
+
+    /// SigV4 签名请求夹具(M21 D3 用例;任意凭证/方法/路径,空载荷,
+    /// 照 signed_get 先例)。
+    fn signed_req(cred: &fs3_s3::auth::Credentials, method: &str, path: &str) -> fs3_s3::S3Request {
+        use fs3_s3::auth::{now_amz, sign_request, PayloadHash};
+        use sha2::Digest;
+        let amz_date = now_amz();
+        let hash = hex::encode(sha2::Sha256::digest(b""));
+        let mut headers: Vec<(String, String)> = vec![
+            ("host".into(), "s3.example.com".into()),
+            ("x-amz-date".into(), amz_date.clone()),
+            ("x-amz-content-sha256".into(), hash.clone()),
+        ];
+        let auth_hdr = sign_request(
+            cred,
+            "us-east-1",
+            method,
+            path,
+            &[],
+            &headers,
+            &amz_date,
+            &PayloadHash::HexSha256(hash),
+        )
+        .unwrap();
+        headers.push(("authorization".into(), auth_hdr));
+        fs3_s3::S3Request {
+            method: method.into(),
+            raw_path: path.into(),
+            decoded_path: path.into(),
+            host: "s3.example.com".into(),
+            query: vec![],
+            headers,
+            body: vec![],
+        }
+    }
+
+    /// M21 D3(ADR-33 RP7.4 裁定 1;设计稿 §6.3;TODO M21/D3 具名用例):
+    /// **委派凭证范围强制**——
+    /// ① 签发/下发:桶级槽(Include([b1]))hello 一次性携带凭证
+    ///    (access_key = REPL-s1 + secret + bucket_scope),备端落本地
+    ///    `s:repl_dcred_in`;二次握手不再携带(一次性投递);slots 观测
+    ///    端点不泄漏 secret(密钥材料零 API 面);
+    /// ② 备端 S3 层本地验签放行:范围内 GET/HEAD/List = 200(备端无
+    ///    IAM 数据,委派凭证自足);
+    /// ③ 越界即 403:越界桶 GET、写动词(PUT/DELETE)、服务级
+    ///    ListBuckets、错 secret 签名 —— 全部 403 AccessDenied(写动词
+    ///    拦在鉴权层 403,非 E5 备端写隔离的 501,层次口径见 fs3-s3
+    ///    handle() 注释)。
+    #[tokio::test]
+    async fn delegated_credential_scope_enforced() {
+        let dir = tempfile::tempdir().unwrap();
+        // 上游:两桶各一内联对象(binlog 开)
+        let up_engine = test_engine_opts(&dir.path().join("up"), 4 * 1024 * 1024, true);
+        {
+            let mut e = up_engine.write();
+            e.create_bucket_with_quota("b1", None).unwrap();
+            e.put("b1", "obj", &mut b"v1".as_slice()).unwrap();
+            e.create_bucket_with_quota("b2", None).unwrap();
+            e.put("b2", "obj", &mut b"v2".as_slice()).unwrap();
+        }
+        let up_meta = up_engine.read().meta_arc();
+        let fx = start_server_on(up_engine.clone(), up_meta.clone());
+
+        // 下游 standby:本地直接造同形数据(本用例验鉴权层,不跑复制流)
+        let down_engine = test_engine(&dir.path().join("down"));
+        {
+            let mut e = down_engine.write();
+            e.create_bucket_with_quota("b1", None).unwrap();
+            e.put("b1", "obj", &mut b"v1".as_slice()).unwrap();
+            e.create_bucket_with_quota("b2", None).unwrap();
+            e.put("b2", "obj", &mut b"v2".as_slice()).unwrap();
+        }
+        let down = down_engine.read().meta_arc();
+        down.set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
+
+        // ① hello:桶级槽 s1 = Include([b1]) → 委派凭证一次性下发落本地
+        let cfg = crate::repl_worker::PullConfig {
+            filters: BucketFilter::Include(vec!["b1".into()]),
+            ..pull_cfg(dir.path(), &fx, "s1", "node-b")
+        };
+        let tls = crate::repl_worker::build_client_tls(&cfg).unwrap();
+        crate::repl_worker::hello(&down, &cfg, &tls).await.unwrap();
+        let cred = down
+            .repl_dcred_in("s1")
+            .unwrap()
+            .expect("委派凭证随 hello 落本地(持久化供重启后验签)");
+        assert_eq!(cred.access_key, "REPL-s1");
+        assert_eq!(cred.filters, BucketFilter::Include(vec!["b1".into()]));
+        assert!(cred.delivered);
+        assert_eq!(cred.secret_key.len(), 64, "HMAC-SHA256 hex");
+
+        // 一次性:二次握手 delegated_credential = null;签发记录在上游持久化
+        let (st, v) = hello_call(
+            &fx,
+            "node-b",
+            &hello_json(
+                "node-b",
+                "s1",
+                &[],
+                serde_json::json!({"Include": ["b1"]}),
+                &[],
+            ),
+        )
+        .await;
+        assert_eq!(st, 200, "{v}");
+        assert!(
+            v["delegated_credential"].is_null(),
+            "一次性下发:已投递槽的握手不再携带凭证: {v}"
+        );
+        let issued = up_meta
+            .repl_dcred_out("s1")
+            .unwrap()
+            .expect("签发记录持久化");
+        assert!(issued.delivered && issued.secret_key == cred.secret_key);
+        // 密钥材料零 API 面:slots 观测端点不得含 secret
+        let (ocert, okey) = fx.client_cert(Some("node-ops"));
+        let (st, _, raw) = mtls_request(
+            fx.addr,
+            &fx.ca_pem,
+            Some((&ocert, &okey)),
+            &get_req("/v1/repl/v1/slots"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(st, 200);
+        assert!(
+            !String::from_utf8_lossy(&raw).contains(&cred.secret_key),
+            "slots 观测面不得含密钥材料"
+        );
+
+        // ② 备端 S3 层:范围内 GET/HEAD/List 放行(常驻密钥表为空,
+        //    验签完全走委派记录)
+        let svc = fs3_s3::S3Service::new(down_engine.clone(), vec![], "us-east-1".into(), false);
+        let pair = fs3_s3::auth::Credentials {
+            access_key: cred.access_key.clone(),
+            secret_key: cred.secret_key.clone(),
+        };
+        let r = svc.handle(&signed_req(&pair, "GET", "/b1/obj")).unwrap();
+        assert_eq!(r.status, 200, "范围内 GET 放行");
+        let r = svc.handle(&signed_req(&pair, "HEAD", "/b1/obj")).unwrap();
+        assert_eq!(r.status, 200, "范围内 HEAD 放行");
+        let r = svc.handle(&signed_req(&pair, "GET", "/b1")).unwrap();
+        assert_eq!(r.status, 200, "范围内 List(ListObjects)放行");
+
+        // ③ 越界即 403(鉴权层口径)
+        let assert_403 = |method: &str, path: &str, what: &str| {
+            let err = svc
+                .handle(&signed_req(&pair, method, path))
+                .expect_err(what);
+            assert_eq!(err.status(), 403, "{what}");
+            assert_eq!(err.code, fs3_s3::error::S3ErrorCode::AccessDenied, "{what}");
+        };
+        assert_403("GET", "/b2/obj", "越界桶 GET → 403");
+        assert_403("PUT", "/b1/x", "写动词 PUT → 403(鉴权层,非 E5 的 501)");
+        assert_403("DELETE", "/b1/obj", "写动词 DELETE → 403");
+        assert_403("GET", "/", "服务级 ListBuckets → 403(泄范围外桶名)");
+        // 错 secret → 验签失败 403
+        let bad = fs3_s3::auth::Credentials {
+            access_key: cred.access_key.clone(),
+            secret_key: "wrong-secret".into(),
+        };
+        let err = svc
+            .handle(&signed_req(&bad, "GET", "/b1/obj"))
+            .expect_err("错 secret 必须验签失败");
+        assert_eq!(err.status(), 403);
+        assert_eq!(err.code, fs3_s3::error::S3ErrorCode::SignatureDoesNotMatch);
+    }
+
+    /// M21 D3(ADR-33 RP7.4 裁定 1;设计稿 §6.3;TODO M21/D3 具名用例):
+    /// **删槽即吊销**——
+    /// ① 桶级槽签发下发,备端凭证可用(GET 200);
+    /// ② 上游 DELETE 槽:委派凭证记录随槽同删(吊销的上游侧一半);
+    /// ③ 备端重连重握手(worker 断线重连必经 hello):槽自动重登记 +
+    ///    重签发(同 access_key、新 secret —— nonce 使重签发必换钥),
+    ///    随响应覆盖本地记录(吊销的备端侧一半);**旧凭证 GET → 403**
+    ///    (验签失败),新凭证 → 200。
+    #[tokio::test]
+    async fn drop_slot_revokes_delegated_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let up_engine = test_engine_opts(&dir.path().join("up"), 4 * 1024 * 1024, true);
+        {
+            let mut e = up_engine.write();
+            e.create_bucket_with_quota("b1", None).unwrap();
+            e.put("b1", "obj", &mut b"v1".as_slice()).unwrap();
+        }
+        let up_meta = up_engine.read().meta_arc();
+        let fx = start_server_on(up_engine.clone(), up_meta.clone());
+        let down_engine = test_engine(&dir.path().join("down"));
+        {
+            let mut e = down_engine.write();
+            e.create_bucket_with_quota("b1", None).unwrap();
+            e.put("b1", "obj", &mut b"v1".as_slice()).unwrap();
+        }
+        let down = down_engine.read().meta_arc();
+        down.set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
+        let cfg = crate::repl_worker::PullConfig {
+            filters: BucketFilter::Include(vec!["b1".into()]),
+            ..pull_cfg(dir.path(), &fx, "s1", "node-b")
+        };
+        let tls = crate::repl_worker::build_client_tls(&cfg).unwrap();
+
+        // ① 签发 + 下发 + 可用
+        crate::repl_worker::hello(&down, &cfg, &tls).await.unwrap();
+        let cred1 = down.repl_dcred_in("s1").unwrap().unwrap();
+        let svc = fs3_s3::S3Service::new(down_engine.clone(), vec![], "us-east-1".into(), false);
+        let pair1 = fs3_s3::auth::Credentials {
+            access_key: cred1.access_key.clone(),
+            secret_key: cred1.secret_key.clone(),
+        };
+        assert_eq!(
+            svc.handle(&signed_req(&pair1, "GET", "/b1/obj"))
+                .unwrap()
+                .status,
+            200,
+            "下发后凭证可用"
+        );
+
+        // ② 上游 drop 槽:凭证记录随槽同删
+        let (ocert, okey) = fx.client_cert(Some("node-ops"));
+        let (st, _, raw) = mtls_request(
+            fx.addr,
+            &fx.ca_pem,
+            Some((&ocert, &okey)),
+            "DELETE /v1/repl/v1/slots/s1 HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(st, 200, "{}", String::from_utf8_lossy(&raw));
+        assert!(up_meta.repl_slot("s1").unwrap().is_none());
+        assert!(
+            up_meta.repl_dcred_out("s1").unwrap().is_none(),
+            "删槽即删签发记录(吊销的上游侧一半)"
+        );
+
+        // ③ 重连重握手:自动重登记 + 重签发,覆盖本地记录;旧凭证 403
+        crate::repl_worker::hello(&down, &cfg, &tls).await.unwrap();
+        let cred2 = down.repl_dcred_in("s1").unwrap().unwrap();
+        assert_eq!(cred2.access_key, cred1.access_key, "access_key 回指同槽");
+        assert_ne!(
+            cred2.secret_key, cred1.secret_key,
+            "重签发必换 secret(per-issuance nonce)= 吊销的密码学载体"
+        );
+        let err = svc
+            .handle(&signed_req(&pair1, "GET", "/b1/obj"))
+            .expect_err("drop 后原凭证必须失效");
+        assert_eq!(err.status(), 403, "drop 后原凭证 403");
+        let pair2 = fs3_s3::auth::Credentials {
+            access_key: cred2.access_key.clone(),
+            secret_key: cred2.secret_key.clone(),
+        };
+        assert_eq!(
+            svc.handle(&signed_req(&pair2, "GET", "/b1/obj"))
+                .unwrap()
+                .status,
+            200,
+            "轮换后新凭证可用"
+        );
     }
 
     /// M21 C2(设计稿 §4.3;ADR-33 RP2.4;TODO M21/C2 具名用例):

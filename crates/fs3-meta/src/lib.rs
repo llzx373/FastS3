@@ -35,8 +35,8 @@ pub mod repl;
 
 pub use audit::AuditStore;
 pub use repl::{
-    BucketFilter, BucketScope, DataRef, ReplExportPage, ReplExportSession, ReplRecord,
-    ReplSegmentRef, Slot, REPL_RECORD_VERSION,
+    BucketFilter, BucketScope, DataRef, DelegatedCred, ReplExportPage, ReplExportSession,
+    ReplRecord, ReplSegmentRef, Slot, DELEGATED_ACCESS_PREFIX, REPL_RECORD_VERSION,
 };
 
 /// 元数据同步模式(DESIGN §4.4 / E2)。
@@ -103,6 +103,9 @@ pub struct RebuildClearStats {
     pub pending_obj_deleted: u64,
     /// 本地复制槽删除数。
     pub slots_deleted: u64,
+    /// 委派凭证记录删除数(M21 D3;`s:repl_dcred_out` + `s:repl_dcred_in`
+    /// 两族合计——重建 = 全新复制关系,旧签发/收讫凭证全部失效)。
+    pub dcred_deleted: u64,
 }
 
 /// 段回填清算的单键替换项(M21 C3;MetaStore::repl_localize_segments
@@ -3364,7 +3367,10 @@ impl MetaStore {
     // - **复制状态**:`s:repl_cursor` / `s:repl_executed` / `s:repl_epoch`
     //   删键(= 读默认 {0,0}/空集/初始代;快照 finalize 按导出位点 P
     //   重新落定,RP2.4)、`s:repl_role` → standby、`s:repl_pending*` /
-    //   `s:repl_pdobj*` / `s:repl_slot\0*`(本地槽)全清;
+    //   `s:repl_pdobj*` / `s:repl_slot\0*`(本地槽)全清;D3 起
+    //   `s:repl_dcred_out*` / `s:repl_dcred_in*`(委派凭证)同清——
+    //   重建 = 全新复制关系,旧凭证全失效(签发种子 `s:repl_credseed`
+    //   保留:只服务未来签发,无陈旧语义);
     // - **复制面元数据 = C1 快照导出面全族**(repl.rs 模块注释钉死的
     //   口径):b:/l:/bc:/bt:/bo:/ba:/bp:/o:/u:/m:/p:/k:/r:/n:/iv:/
     //   tn:/iu:/ig:/ip:/ir: ——清空后由快照导入整体重建,杜绝「上游
@@ -3413,6 +3419,8 @@ impl MetaStore {
             pending_deleted: self.delete_prefix_chunked(PREFIX_REPL_PENDING)?,
             pending_obj_deleted: self.delete_prefix_chunked(PREFIX_REPL_PENDING_OBJ)?,
             slots_deleted: self.delete_prefix_chunked(PREFIX_REPL_SLOT)?,
+            dcred_deleted: self.delete_prefix_chunked(PREFIX_REPL_DCRED_OUT)?
+                + self.delete_prefix_chunked(PREFIX_REPL_DCRED_IN)?,
             ..RebuildClearStats::default()
         };
         // 复制面元数据 = C1 快照导出面(排除族 = 本机状态,见上方注释)
@@ -3510,6 +3518,98 @@ impl MetaStore {
     pub fn delete_repl_slot(&self, name: &str) -> Result<()> {
         self.db.delete(repl_slot_key(name)?).map_err(rocks_err)?;
         self.db.flush_wal(true).map_err(rocks_err)
+    }
+
+    // —— 委派只读凭证(M21 D3;ADR-33 RP7.4 裁定 1;设计稿 §6.3) ——
+    // 本层只做存取;签发/一次性下发/吊销编排在 fs3d 复制口(repl.rs)与
+    // pull worker(repl_worker.rs)。两侧分键:上游签发记录 =
+    // `s:repl_dcred_out\0{slot}`,备端收讫记录 = `s:repl_dcred_in\0{slot}`
+    // (级联中继两身份并存时互不遮蔽)。
+
+    /// 上游签发侧:写入/覆盖(直写 + fsync,同 put_repl_slot 口径)。
+    pub fn put_repl_dcred_out(&self, cred: &DelegatedCred) -> Result<()> {
+        let slot = cred
+            .access_key
+            .strip_prefix(DELEGATED_ACCESS_PREFIX)
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "delegated access key {:?} missing REPL- prefix",
+                    cred.access_key
+                ))
+            })?;
+        self.db
+            .put(repl_dcred_out_key(slot)?, cred.encode()?)
+            .map_err(rocks_err)?;
+        self.db.flush_wal(true).map_err(rocks_err)
+    }
+
+    /// 上游签发侧:按槽名读(缺席 → None)。
+    pub fn repl_dcred_out(&self, slot: &str) -> Result<Option<DelegatedCred>> {
+        match self.db.get(repl_dcred_out_key(slot)?).map_err(rocks_err)? {
+            Some(v) => DelegatedCred::decode(&v).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// 上游签发侧:删除(删槽即吊销的上游侧一半;幂等)。
+    pub fn delete_repl_dcred_out(&self, slot: &str) -> Result<()> {
+        self.db
+            .delete(repl_dcred_out_key(slot)?)
+            .map_err(rocks_err)?;
+        self.db.flush_wal(true).map_err(rocks_err)
+    }
+
+    /// 备端收讫侧:写入/覆盖(hello 一次性下发落本地;覆盖写 = 上游删槽
+    /// 重登记后的轮换生效点,旧 secret 自此验签失败)。
+    pub fn put_repl_dcred_in(&self, cred: &DelegatedCred) -> Result<()> {
+        let slot = cred
+            .access_key
+            .strip_prefix(DELEGATED_ACCESS_PREFIX)
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "delegated access key {:?} missing REPL- prefix",
+                    cred.access_key
+                ))
+            })?;
+        self.db
+            .put(repl_dcred_in_key(slot)?, cred.encode()?)
+            .map_err(rocks_err)?;
+        self.db.flush_wal(true).map_err(rocks_err)
+    }
+
+    /// 备端收讫侧:按槽名读(备端 S3 鉴权点读路径;缺席 → None = 未签发
+    /// 或已吊销,回退常驻密钥表)。
+    pub fn repl_dcred_in(&self, slot: &str) -> Result<Option<DelegatedCred>> {
+        match self.db.get(repl_dcred_in_key(slot)?).map_err(rocks_err)? {
+            Some(v) => DelegatedCred::decode(&v).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// 备端收讫侧:删除(槽转实例级 All = 本地吊销;幂等)。
+    pub fn delete_repl_dcred_in(&self, slot: &str) -> Result<()> {
+        self.db
+            .delete(repl_dcred_in_key(slot)?)
+            .map_err(rocks_err)?;
+        self.db.flush_wal(true).map_err(rocks_err)
+    }
+
+    /// 委派凭证签发种子懒初始化(键缺席 = 生成随机 32B 落盘)。并发双写
+    /// 后写胜出,无害:已签发记录的验签材料 = 记录内 secret 本体,不依赖
+    /// seed 存续(seed 只服务未来签发的域分离)。
+    pub fn repl_cred_seed_or_init(&self) -> Result<[u8; 32]> {
+        if let Some(v) = self.db.get(SYS_REPL_CRED_SEED).map_err(rocks_err)? {
+            let b: [u8; 32] = v
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::Corrupt("s:repl_credseed malformed".into()))?;
+            return Ok(b);
+        }
+        let mut seed = [0u8; 32];
+        fs3_core::random_bytes(&mut seed)?;
+        self.db.put(SYS_REPL_CRED_SEED, seed).map_err(rocks_err)?;
+        self.db.flush_wal(true).map_err(rocks_err)?;
+        Ok(seed)
     }
 
     /// binlog 软上限保槽告警计数(M21 A3;指标导出在 TODO M21/D4 接线)。

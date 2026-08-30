@@ -262,6 +262,30 @@ pub const PREFIX_SESSION: &[u8] = b"s:session\x00";
 /// 登记,见 fs3-engine collect_reachable_extents 注释)。
 pub const PREFIX_REPL_SLOT: &[u8] = b"s:repl_slot\x00";
 
+/// 上游签发的委派只读凭证(M21 D3;ADR-33 RP7.4 裁定 1;设计稿 §6.3):
+/// `s:repl_dcred_out\0{slot}` → postcard fs3_meta::DelegatedCred,每桶级槽
+/// 一键(实例级槽不签发——IAM 随 binlog 复制,委派凭证无意义)。签发入口
+/// = 槽预登记/首次握手(repl.rs issue_delegated_cred),删槽即删凭证
+/// (吊销的上游侧一半;备端侧一半 = 重握手收到轮换凭证覆盖本地)。
+/// s: 既有前缀下的系统键族(同 PREFIX_REPL_SLOT 口径,不新增一级前缀);
+/// 演进三处同步——keys.rs 前缀表(本处);meta-export **不导出**(s: 系统
+/// 键不入导出;库迁移后下游重握手,槽在而凭证记录缺席 → 重签发重下发,
+/// 自愈);check 可达性扫描不相交(值无 extent 引用);clear_for_rebuild
+/// 全清(重建 = 全新复制关系,旧签发全部失效)。
+pub const PREFIX_REPL_DCRED_OUT: &[u8] = b"s:repl_dcred_out\x00";
+/// 备端收讫的委派只读凭证(M21 D3;同上裁定):`s:repl_dcred_in\0{slot}` →
+/// postcard DelegatedCred。hello 一次性下发后落本地(内存验签 = rocksdb
+/// 点读;持久化副本供重启后验签);上游删槽重登记 → 新 secret 随重握手
+/// 覆盖写(吊销生效点);槽转实例级(All)= 删键本地吊销。三处同步口径
+/// 同 PREFIX_REPL_DCRED_OUT。
+pub const PREFIX_REPL_DCRED_IN: &[u8] = b"s:repl_dcred_in\x00";
+/// 委派凭证签发种子(M21 D3):值 = 随机 32 字节,懒初始化(首次签发时
+/// 生成落盘)。secret = HMAC-SHA256(seed, "fasts3-repl-delegated" ‖ slot ‖
+/// nonce) 派生;派生结果随 DelegatedCred 记录持久化,seed 本身只服务
+/// 未来签发(丢失/轮换不影响已签发凭证的验签——验签材料 = 记录内
+/// secret)。s: 系统键,不导出/不随复制。
+pub const SYS_REPL_CRED_SEED: &[u8] = b"s:repl_credseed";
+
 /// 断档重建中断续清标记(M21 C5;ADR-33 RP5.4;`MetaStore::clear_for_rebuild`):
 /// 重建清空分块提交,首块先落本键(fsync)再清各族,末块摘除;open() 见
 /// 标记 = 上轮 rebuild 清空未走完 → 补清完成后才服务(半清空 + 旧游标续流
@@ -524,6 +548,30 @@ pub fn parse_repl_slot_name(raw: &[u8]) -> Result<String> {
                 Ok(s)
             }
         })
+}
+
+/// 委派凭证键(M21 D3):`{prefix}\0{slot}` —— prefix = PREFIX_REPL_DCRED_OUT
+/// (上游签发)/ PREFIX_REPL_DCRED_IN(备端收讫)。槽名校验同 repl_slot_key。
+fn repl_dcred_key(prefix: &[u8], slot: &str) -> Result<Vec<u8>> {
+    if slot.is_empty() || slot.as_bytes().contains(&0x00) {
+        return Err(Error::InvalidArgument(format!(
+            "repl dcred slot name {slot:?} invalid (empty or contains NUL)"
+        )));
+    }
+    let mut k = Vec::with_capacity(prefix.len() + slot.len());
+    k.extend_from_slice(prefix);
+    k.extend_from_slice(slot.as_bytes());
+    Ok(k)
+}
+
+/// 上游签发侧委派凭证键:`s:repl_dcred_out\0{slot}`。
+pub fn repl_dcred_out_key(slot: &str) -> Result<Vec<u8>> {
+    repl_dcred_key(PREFIX_REPL_DCRED_OUT, slot)
+}
+
+/// 备端收讫侧委派凭证键:`s:repl_dcred_in\0{slot}`。
+pub fn repl_dcred_in_key(slot: &str) -> Result<Vec<u8>> {
+    repl_dcred_key(PREFIX_REPL_DCRED_IN, slot)
 }
 
 /// 会话主键:`u:{uploadId}`。
