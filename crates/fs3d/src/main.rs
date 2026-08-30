@@ -22,6 +22,7 @@ mod meta;
 mod pool_cmds;
 mod repl;
 mod repl_backfill;
+mod repl_metrics;
 mod repl_rebuild;
 mod repl_worker;
 mod rewrite;
@@ -1084,6 +1085,12 @@ fn cmd_serve(
         Ok(v) => v,
         Err(e) => return Err(fs3_core::Error::InvalidArgument(e)),
     };
+    // M21 D4:复制口配置同样提前解析(纯 env/证书路径读取;原位置在
+    // admin 装配之后)——D4 逐槽指标源按「任一复制配置在」判定注入。
+    let repl_cfg_env: Option<repl::ReplConfig> = match repl::ReplConfig::from_env() {
+        Ok(v) => v,
+        Err(e) => return Err(fs3_core::Error::InvalidArgument(e)),
+    };
     // M21 C5(ADR-33 RP2.3/RP5.4):断档显式重建编排(pull 配置在 = 可
     // 重建;纯主无上游 = 不注入,admin rebuild 端点 501)
     let rebuild_svc: Option<Arc<repl_rebuild::RebuildService>> = pull_cfg_env.as_ref().map(|pc| {
@@ -1146,7 +1153,18 @@ fn cmd_serve(
                     rebuild_svc
                         .clone()
                         .map(|s| s as Arc<dyn fs3_admin::ReplicationControl>),
-                );
+                )
+                // M21 D4(ADR-33 RP8.3):逐槽复制指标(任一复制配置在 =
+                // 注入;纯非复制节点 = None → fasts3_repl_* 组缺席)
+                .with_repl_metrics(if pull_cfg_env.is_some() || repl_cfg_env.is_some() {
+                    Some(
+                        Arc::new(repl_metrics::ReplMetricsProvider::new(
+                            engine.read().meta_arc(),
+                        )) as Arc<dyn fs3_admin::ReplMetricsSource>,
+                    )
+                } else {
+                    None
+                });
         // M6 / J5:设置页供应器(admin GET/PATCH /v1/admin/config)
         let provider = Arc::new(settings::SettingsProvider::new(
             config_path.clone(),
@@ -1208,17 +1226,13 @@ fn cmd_serve(
     // 强制)。配置走 env 最小入口(FS3D_REPL_*;[replication] 完整配置段
     // 属 F3 收口)。TLS 材料装配期装载,坏材料 = 启动显式失败(不静默降级
     // 为无 mTLS,红线 RP6.2)。
-    match repl::ReplConfig::from_env() {
-        Ok(Some(repl_cfg)) => {
-            let meta = engine.read().meta_arc();
-            let handle = repl::ReplServer::new(engine.clone(), meta, repl_cfg)
-                .map_err(fs3_core::Error::InvalidArgument)?
-                .spawn()
-                .map_err(fs3_core::Error::Io)?;
-            tracing::info!("replication port bound on {}", handle.local_addr);
-        }
-        Ok(None) => {}
-        Err(e) => return Err(fs3_core::Error::InvalidArgument(e)),
+    if let Some(repl_cfg) = repl_cfg_env {
+        let meta = engine.read().meta_arc();
+        let handle = repl::ReplServer::new(engine.clone(), meta, repl_cfg)
+            .map_err(fs3_core::Error::InvalidArgument)?
+            .spawn()
+            .map_err(fs3_core::Error::Io)?;
+        tracing::info!("replication port bound on {}", handle.local_addr);
     }
 
     // M21 B4(ADR-33 RP4.2;设计稿 §4.1):下游 pull worker。role 的 env

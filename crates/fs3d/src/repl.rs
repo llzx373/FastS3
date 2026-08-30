@@ -785,34 +785,7 @@ impl ReplServer {
         s: &Slot,
         watermark: Gtid,
     ) -> Result<serde_json::Value, fs3_core::Error> {
-        let lag_seq = if s.confirmed_gtid.epoch == watermark.epoch {
-            watermark.seq.saturating_sub(s.confirmed_gtid.seq)
-        } else {
-            // 跨 epoch(仅在 promote 后出现):旧代尾部不可由减法表达,
-            // 新代水位 seq 为下界
-            watermark.seq
-        };
-        let lag_bytes = if s.confirmed_gtid.epoch <= watermark.epoch {
-            self.meta.repl_binlog_bytes_after(s.confirmed_gtid.seq)?
-        } else {
-            0
-        };
-        let lag_seconds = if lag_seq == 0 {
-            0
-        } else {
-            // 主口径:首条未消费 retained 记录的提交 ts 至今的等待时长
-            let waited = self
-                .meta
-                .repl_record(s.confirmed_gtid.seq.saturating_add(1))?
-                .and_then(|rec| rec.ts)
-                .map(|ts| now_unix_secs().saturating_sub(ts))
-                .filter(|d| *d >= 0);
-            match waited {
-                Some(d) => d,
-                // 回退:回执陈旧度(stale/截断/ts 缺失时唯一可读口径)
-                None => now_unix_secs().saturating_sub(s.last_ack_at).max(0),
-            }
-        };
+        let (lag_seq, lag_bytes, lag_seconds) = slot_lag_parts(&self.meta, s, watermark)?;
         let mut item = slot_json(s);
         let obj = item.as_object_mut().expect("slot json is object");
         obj.insert("lag_seq".into(), serde_json::json!(lag_seq));
@@ -1572,6 +1545,49 @@ fn slot_json(s: &Slot) -> serde_json::Value {
         "last_ack_at": s.last_ack_at,
         "stale": s.stale,
     })
+}
+
+/// 单槽 lag 三件套计算(D1 口径钉死,见 handle_slots 注释;slots 观测端点
+/// 与 D4 逐槽指标抓取共用同一实现,防两份口径漂移):
+/// 返回 (lag_seq, lag_bytes, lag_seconds)。
+/// - `lag_seq` = 水位 seq − confirmed seq(同 epoch 精确;跨 epoch 取新代
+///   水位 seq 为下界);
+/// - `lag_bytes` = retained binlog 内 seq > confirmed 的编码值字节合计;
+/// - `lag_seconds` = now − 首条未消费 retained 记录提交 ts(主口径);
+///   截断/ts 缺失回退 = now − last_ack_at;`lag_seq == 0` → 0。
+pub(crate) fn slot_lag_parts(
+    meta: &MetaStore,
+    s: &Slot,
+    watermark: Gtid,
+) -> Result<(u64, u64, i64), fs3_core::Error> {
+    let lag_seq = if s.confirmed_gtid.epoch == watermark.epoch {
+        watermark.seq.saturating_sub(s.confirmed_gtid.seq)
+    } else {
+        // 跨 epoch(仅在 promote 后出现):旧代尾部不可由减法表达,
+        // 新代水位 seq 为下界
+        watermark.seq
+    };
+    let lag_bytes = if s.confirmed_gtid.epoch <= watermark.epoch {
+        meta.repl_binlog_bytes_after(s.confirmed_gtid.seq)?
+    } else {
+        0
+    };
+    let lag_seconds = if lag_seq == 0 {
+        0
+    } else {
+        // 主口径:首条未消费 retained 记录的提交 ts 至今的等待时长
+        let waited = meta
+            .repl_record(s.confirmed_gtid.seq.saturating_add(1))?
+            .and_then(|rec| rec.ts)
+            .map(|ts| now_unix_secs().saturating_sub(ts))
+            .filter(|d| *d >= 0);
+        match waited {
+            Some(d) => d,
+            // 回退:回执陈旧度(stale/截断/ts 缺失时唯一可读口径)
+            None => now_unix_secs().saturating_sub(s.last_ack_at).max(0),
+        }
+    };
+    Ok((lag_seq, lag_bytes, lag_seconds))
 }
 
 /// 记录级桶过滤判定(M21 D2;设计稿 §3.2/§3.3;ADR-33 RP3.2):
@@ -5226,5 +5242,153 @@ mod tests {
         );
         w.shutdown();
         svc.shutdown();
+    }
+
+    /// M21 D4(ADR-33 RP8.3;设计稿 §7;TODO M21/D4 具名用例):
+    /// **逐槽复制指标导出**——
+    /// ① 上游侧:`fasts3_repl_slot_lag_seconds/bytes{slot=...}` 按槽标签
+    ///    分账(与 D1 slots 观测端点同源 slot_lag_parts;快槽追平水位 =
+    ///    全 0;慢槽 bytes = repl_binlog_bytes_after(0) 现算精确值,
+    ///    seconds 范围断言防秒界 flake);
+    /// ② 下游侧(standby):`fasts3_repl_applied_gtid` = 复制游标 seq、
+    ///    `fasts3_repl_data_pending_bytes` = 待回填段字节合计(C3 gauge
+    ///    同式 list_repl_pending 现算,不依赖 BackfillService 句柄);
+    /// ③ 经 AdminServer::with_repl_metrics 注入,/v1/admin/metrics 尾部
+    ///    追加(unix socket + Bearer,照 fs3-admin tests/admin_api.rs
+    ///    先例)。
+    #[test]
+    fn repl_metrics_per_slot_attribution() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine_opts(&dir.path().join("n"), 4 * 1024 * 1024, true);
+        {
+            let mut e = engine.write();
+            e.create_bucket_with_quota("b1", None).unwrap();
+            e.put("b1", "obj", &mut b"v1".as_slice()).unwrap();
+        }
+        let meta = engine.read().meta_arc();
+        // standby 身份 + 游标/待回填:apply 一条带 4KiB 段引用的记录
+        // (gtid 1-3;Replay 把 s:seq 推进至 3、bl:3 原样落盘,水位随之
+        // 到 3——上游侧 lag 断言的基准)
+        meta.set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
+        meta.apply_repl_record(
+            Gtid { epoch: 1, seq: 3 },
+            &ReplRecord {
+                epoch: 1,
+                ops: vec![],
+                data_refs: vec![fs3_meta::DataRef {
+                    extent_id: 1,
+                    offset: 0,
+                    len: 4096,
+                    crc32c: None,
+                }],
+                bucket_scope: BucketScope {
+                    buckets: vec![],
+                    has_unscoped: false,
+                },
+                ts: Some(now_unix_secs()),
+            },
+        )
+        .unwrap();
+        assert_eq!(meta.repl_cursor().unwrap(), Gtid { epoch: 1, seq: 3 });
+        assert_eq!(meta.last_seq().unwrap(), 3, "Replay 推进 s:seq 防回退");
+
+        // 两槽:s-fast 追平水位(lag 全 0);s-slow 停在 0(全量未消费)
+        let now = now_unix_secs();
+        let mk_slot = |name: &str, seq: u64| Slot {
+            name: name.into(),
+            consumer_node_id: "node-b".into(),
+            confirmed_gtid: Gtid { epoch: 1, seq },
+            filters: BucketFilter::All,
+            created_at: now,
+            last_ack_at: now,
+            stale: false,
+        };
+        meta.put_repl_slot(&mk_slot("s-fast", 3)).unwrap();
+        meta.put_repl_slot(&mk_slot("s-slow", 0)).unwrap();
+        let want_slow_bytes = meta.repl_binlog_bytes_after(0).unwrap();
+        assert!(want_slow_bytes > 0, "慢槽滞后字节非零才有断言意义");
+
+        // admin 装配 + 真 provider 注入
+        let svc = fs3_s3::S3Service::new(engine.clone(), vec![], "us-east-1".into(), false);
+        let sock = dir.path().join("admin.sock");
+        let admin = fs3_admin::AdminServer::new(
+            engine.clone(),
+            Arc::new(svc),
+            fs3_admin::AdminConfig {
+                listen: format!("unix://{}", sock.display()),
+                token: "t".into(),
+            },
+        )
+        .with_repl_metrics(Some(
+            Arc::new(crate::repl_metrics::ReplMetricsProvider::new(meta.clone()))
+                as Arc<dyn fs3_admin::ReplMetricsSource>,
+        ));
+        std::thread::spawn(move || {
+            let _ = admin.serve();
+        });
+        for _ in 0..100 {
+            if sock.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let out = std::process::Command::new("curl")
+            .arg("-s")
+            .arg("-w")
+            .arg("\n%{http_code}")
+            .arg("--unix-socket")
+            .arg(&sock)
+            .arg("-H")
+            .arg("Authorization: Bearer t")
+            .arg("http://localhost/v1/admin/metrics")
+            .output()
+            .expect("curl");
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let (body, code) = text.rsplit_once('\n').expect("curl -w 尾行");
+        assert_eq!(code.trim(), "200", "metrics 200: {body}");
+
+        // ① 上游侧逐槽分账(HELP/TYPE 齐 + 精确值)
+        for m in [
+            "fasts3_repl_slot_lag_seconds",
+            "fasts3_repl_slot_lag_bytes",
+            "fasts3_repl_applied_gtid",
+            "fasts3_repl_data_pending_bytes",
+        ] {
+            assert!(
+                body.contains(&format!("# TYPE {m} gauge")),
+                "{m} TYPE 在: {body}"
+            );
+        }
+        assert!(
+            body.contains("fasts3_repl_slot_lag_seconds{slot=\"s-fast\"} 0\n"),
+            "快槽 seconds = 0: {body}"
+        );
+        assert!(
+            body.contains("fasts3_repl_slot_lag_bytes{slot=\"s-fast\"} 0\n"),
+            "快槽 bytes = 0: {body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "fasts3_repl_slot_lag_bytes{{slot=\"s-slow\"}} {want_slow_bytes}\n"
+            )),
+            "慢槽 bytes = 现算精确值: {body}"
+        );
+        // 慢槽 seconds 范围断言(提交 ts ≈ now,防秒界 flake)
+        let line = body
+            .lines()
+            .find(|l| l.starts_with("fasts3_repl_slot_lag_seconds{slot=\"s-slow\"} "))
+            .expect("慢槽 seconds 行在");
+        let secs: i64 = line.rsplit(' ').next().unwrap().parse().unwrap();
+        assert!((0..=5).contains(&secs), "慢槽 seconds ∈ [0,5]: {secs}");
+
+        // ② 下游侧 standby 指标
+        assert!(
+            body.contains("fasts3_repl_applied_gtid 3\n"),
+            "applied = 游标 seq: {body}"
+        );
+        assert!(
+            body.contains("fasts3_repl_data_pending_bytes 4096\n"),
+            "待回填字节 = 段引用合计: {body}"
+        );
     }
 }

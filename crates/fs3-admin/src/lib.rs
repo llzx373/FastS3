@@ -147,6 +147,10 @@ pub struct AdminServer {
     /// None = 未配置 pull(FS3D_REPL_* 缺席),replication/rebuild 返回
     /// 501)。
     replication: Option<Arc<dyn ReplicationControl>>,
+    /// M21 D4(ADR-33 RP8.3):逐槽复制指标源(fs3d ReplMetricsProvider
+    /// 注入;None = 未配置任何复制(FS3D_REPL_* 全缺席),/metrics 相应
+    /// 指标组缺席)。
+    repl_metrics: Option<Arc<dyn ReplMetricsSource>>,
 }
 
 /// M20 A3:KMS 托管服务控制抽象(fs3d 以 KmsServiceManager 适配实现;
@@ -177,6 +181,14 @@ pub struct RebuildRequest {
     pub from: Option<String>,
     /// 复制槽名(缺省 = 节点现配置)。
     pub slot: Option<String>,
+}
+
+/// M21 D4(ADR-33 RP8.3;设计稿 §7):逐槽复制指标源抽象(fs3d 以
+/// ReplMetricsProvider 适配实现;放 trait 照 KmsServiceControl 先例,
+/// 避免 fs3-admin → fs3d 依赖)。render 返回 Prometheus 文本片段
+/// (含 HELP/TYPE;空串 = 指标组缺席,handle_metrics 不追加)。
+pub trait ReplMetricsSource: Send + Sync {
+    fn render(&self) -> String;
 }
 
 /// rebuild 失败分类(HTTP 映射:Busy → 409,Failed → 500)。
@@ -213,6 +225,7 @@ impl AdminServer {
             restore_stats: None,
             kms_service: None,
             replication: None,
+            repl_metrics: None,
         }
     }
 
@@ -226,6 +239,13 @@ impl AdminServer {
     /// /v1/admin/replication/rebuild 返回 501)。
     pub fn with_replication_control(mut self, ctrl: Option<Arc<dyn ReplicationControl>>) -> Self {
         self.replication = ctrl;
+        self
+    }
+
+    /// 注入逐槽复制指标源(M21 D4;fs3d 配置任一 FS3D_REPL_* 时调用;
+    /// None → /metrics 的 fasts3_repl_* 组缺席)。
+    pub fn with_repl_metrics(mut self, src: Option<Arc<dyn ReplMetricsSource>>) -> Self {
+        self.repl_metrics = src;
         self
     }
 
@@ -359,6 +379,7 @@ impl AdminServer {
             restore_stats: self.restore_stats.clone(),
             kms_service: self.kms_service.clone(),
             replication: self.replication.clone(),
+            repl_metrics: self.repl_metrics.clone(),
         })
     }
 
@@ -2002,6 +2023,14 @@ impl AdminServer {
                 "fasts3_restore_last_completed_timestamp {}\n",
                 s.last_completed_at
             ));
+        }
+        // M21 D4(ADR-33 RP8.3):逐槽复制指标组(未配置复制 = 缺席;
+        // 抓取时现算,口径见 fs3d repl_metrics 模块注释)
+        if let Some(m) = &self.repl_metrics {
+            let t = m.render();
+            if !t.is_empty() {
+                text.push_str(&t);
+            }
         }
         Response::builder()
             .status(StatusCode::OK)
