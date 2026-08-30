@@ -395,22 +395,23 @@ impl SseInfo {
                 "kms wrapped_dek version {ver} unsupported (expected {SSE_KMS_DEK_VERSION})"
             )));
         }
-        postcard::from_bytes::<KmsDekV2>(rest).or_else(|_| {
-            // C1 已发布的三字段载荷(无 bucket_key_enabled)双读
-            #[derive(Deserialize)]
-            struct KmsDekV2Legacy {
-                key_name: String,
-                ciphertext: String,
-                context_binding: String,
-            }
-            postcard::from_bytes::<KmsDekV2Legacy>(rest).map(|l| KmsDekV2 {
-                key_name: l.key_name,
-                ciphertext: l.ciphertext,
-                context_binding: l.context_binding,
-                bucket_key_enabled: None,
+        postcard::from_bytes::<KmsDekV2>(rest)
+            .or_else(|_| {
+                // C1 已发布的三字段载荷(无 bucket_key_enabled)双读
+                #[derive(Deserialize)]
+                struct KmsDekV2Legacy {
+                    key_name: String,
+                    ciphertext: String,
+                    context_binding: String,
+                }
+                postcard::from_bytes::<KmsDekV2Legacy>(rest).map(|l| KmsDekV2 {
+                    key_name: l.key_name,
+                    ciphertext: l.ciphertext,
+                    context_binding: l.context_binding,
+                    bucket_key_enabled: None,
+                })
             })
-        })
-        .map_err(|e| Error::Corrupt(format!("kms wrapped_dek decode: {e}")))
+            .map_err(|e| Error::Corrupt(format!("kms wrapped_dek decode: {e}")))
     }
 }
 

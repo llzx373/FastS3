@@ -11,6 +11,7 @@ pub mod crc32;
 pub mod crc32c;
 pub mod crc64nvme;
 pub mod error;
+pub mod gtid;
 pub mod md5x4;
 pub mod metrics;
 pub mod pool;
@@ -22,6 +23,7 @@ pub use checksum::{checksum_one_shot, ChecksumHasher};
 pub use clock::{retention_expired, TrustedClockState};
 pub use consts::*;
 pub use error::{Error, KmsFault, Result};
+pub use gtid::{Gtid, GtidSet};
 pub use ssec::{
     derive_part_nonce_base, derive_sse_s3_kek, hkdf_sha256, mint_sse_s3_write_key,
     rewrap_sse_s3_dek, sse_s3_unwrap_dek, sse_s3_wrap_dek, unwrap_sse_s3_dek, ChunkedGcm, SseCKey,

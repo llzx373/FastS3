@@ -175,6 +175,17 @@ pub const SYS_REPL_EPOCH: &[u8] = b"s:repl_epoch";
 /// 初始复制 epoch(键缺席时的读默认值;promote 自当前 +1,新 epoch 的
 /// GTID 从 seq=1 重计而全局字典序仍单调,ADR-33 RP2)。
 pub const REPL_INITIAL_EPOCH: u64 = 1;
+/// 复制角色(M21 A2;ADR-33 RP2:值 = UTF-8 小写串 "primary"|"standby";
+/// 键缺席 = primary——单写者默认,同配置 §6.1 缺省口径)。s: 既有前缀下
+/// 的新系统键,不新增前缀,meta-export DTO 与 check 可达性扫描无需联动
+/// (同 SYS_KEY_VALUE_REWRITE_V3_DONE 注释口径)。
+pub const SYS_REPL_ROLE: &[u8] = b"s:repl_role";
+/// 本节点 executed GTID 区间集(M21 A2;ADR-33 RP2/R12:值 = postcard
+/// fs3_core::GtidSet;与下游 apply 事务同库同事务更新;快照重建后按导出
+/// 位点 P 对应集合**整体重置,不累加**——累加会残留本地旧历史段,对上游
+/// 形成假分歧)。s: 既有前缀下的新系统键,不新增前缀,三处无需联动
+/// (同 SYS_KEY_VALUE_REWRITE_V3_DONE 注释口径)。
+pub const SYS_REPL_EXECUTED: &[u8] = b"s:repl_executed";
 /// 池清单(M13 M1-1,ADR-15 DM1/DM1';值 = postcard(fs3_core::pool::PoolManifest),
 /// 设备序 = 数组序,仅尾部增删)。s: 既有前缀下的新系统键,不新增前缀,
 /// 故 meta-export DTO 与 check 可达性扫描无需联动(同

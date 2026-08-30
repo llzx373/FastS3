@@ -12,7 +12,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use fs3_core::{AllocRecord, BucketMeta, Error, ObjectMeta, Result, Segment, MAX_OBJECT_SIZE};
+use fs3_core::{
+    AllocRecord, BucketMeta, Error, GtidSet, ObjectMeta, Result, Segment, MAX_OBJECT_SIZE,
+};
 use rocksdb::{
     BlockBasedOptions, Cache, DBCompressionType, Direction, Error as RocksError, ErrorKind,
     IteratorMode, OptimisticTransactionDB, OptimisticTransactionOptions, Options, Transaction,
@@ -43,6 +45,35 @@ pub enum SyncMode {
     Full,
     /// 不主动落盘(用户声明 HA 层可容忍单机丢失,如纯缓存集群)。
     None,
+}
+
+/// 复制角色(M21 A2;ADR-33 RP2;`s:repl_role` 值 = UTF-8 小写串,
+/// 编码自定:单键两种状态无需 postcard)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplRole {
+    /// 单写者主(键缺席即本值;配置 §6.1 缺省 primary 口径)。
+    Primary,
+    /// 只读备(S3 写动词 501 ReplicationStandby,E5 接线)。
+    Standby,
+}
+
+impl ReplRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            ReplRole::Primary => "primary",
+            ReplRole::Standby => "standby",
+        }
+    }
+
+    fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "primary" => Ok(ReplRole::Primary),
+            "standby" => Ok(ReplRole::Standby),
+            other => Err(Error::Corrupt(format!(
+                "s:repl_role unknown role {other:?}"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1247,43 +1278,27 @@ fn decode_session(v: &[u8]) -> Result<MultipartSession> {
                 sse_kms: None,
             }),
             Err(_) => match postcard::from_bytes::<SessionV12d>(v) {
-            Ok(s) => Ok(MultipartSession {
-                bucket: s.bucket,
-                key: s.key,
-                content_type: s.content_type,
-                user_meta: s.user_meta,
-                resp_headers: s.resp_headers,
-                created: s.created,
-                completed: s.completed,
-                final_etag: s.final_etag,
-                final_size: s.final_size,
-                final_mtime: s.final_mtime,
-                tags: s.tags,
-                checksum_alg: s.checksum_alg,
-                sse_key_md5: s.sse_key_md5,
-                sse_s3: s.sse_s3,
-                retention: None,
-                legal_hold: None,
-                requested_storage_class: None,
-                sse_kms: None,
-            }),
-            Err(_) => match postcard::from_bytes::<SessionV12c>(v) {
-                Ok(s) => Ok(into_session(
-                    s.bucket,
-                    s.key,
-                    s.content_type,
-                    s.user_meta,
-                    s.resp_headers,
-                    s.created,
-                    s.completed,
-                    s.final_etag,
-                    s.final_size,
-                    s.final_mtime,
-                    s.tags,
-                    s.checksum_alg,
-                    s.sse_key_md5,
-                )),
-                Err(_) => match postcard::from_bytes::<SessionV12b>(v) {
+                Ok(s) => Ok(MultipartSession {
+                    bucket: s.bucket,
+                    key: s.key,
+                    content_type: s.content_type,
+                    user_meta: s.user_meta,
+                    resp_headers: s.resp_headers,
+                    created: s.created,
+                    completed: s.completed,
+                    final_etag: s.final_etag,
+                    final_size: s.final_size,
+                    final_mtime: s.final_mtime,
+                    tags: s.tags,
+                    checksum_alg: s.checksum_alg,
+                    sse_key_md5: s.sse_key_md5,
+                    sse_s3: s.sse_s3,
+                    retention: None,
+                    legal_hold: None,
+                    requested_storage_class: None,
+                    sse_kms: None,
+                }),
+                Err(_) => match postcard::from_bytes::<SessionV12c>(v) {
                     Ok(s) => Ok(into_session(
                         s.bucket,
                         s.key,
@@ -1297,9 +1312,9 @@ fn decode_session(v: &[u8]) -> Result<MultipartSession> {
                         s.final_mtime,
                         s.tags,
                         s.checksum_alg,
-                        None,
+                        s.sse_key_md5,
                     )),
-                    Err(_) => match postcard::from_bytes::<SessionV12>(v) {
+                    Err(_) => match postcard::from_bytes::<SessionV12b>(v) {
                         Ok(s) => Ok(into_session(
                             s.bucket,
                             s.key,
@@ -1312,10 +1327,10 @@ fn decode_session(v: &[u8]) -> Result<MultipartSession> {
                             s.final_size,
                             s.final_mtime,
                             s.tags,
-                            None,
+                            s.checksum_alg,
                             None,
                         )),
-                        Err(_) => match postcard::from_bytes::<SessionV11>(v) {
+                        Err(_) => match postcard::from_bytes::<SessionV12>(v) {
                             Ok(s) => Ok(into_session(
                                 s.bucket,
                                 s.key,
@@ -1327,36 +1342,52 @@ fn decode_session(v: &[u8]) -> Result<MultipartSession> {
                                 s.final_etag,
                                 s.final_size,
                                 s.final_mtime,
-                                Vec::new(),
+                                s.tags,
                                 None,
                                 None,
                             )),
-                            Err(_) => {
-                                let legacy: LegacySession =
-                                    postcard::from_bytes(v).map_err(|e| {
-                                        Error::Corrupt(format!("postcard decode session: {e}"))
-                                    })?;
-                                Ok(into_session(
-                                    legacy.bucket,
-                                    legacy.key,
-                                    legacy.content_type,
-                                    legacy.user_meta,
-                                    Vec::new(),
-                                    legacy.created,
-                                    legacy.completed,
-                                    legacy.final_etag,
-                                    legacy.final_size,
-                                    legacy.final_mtime,
+                            Err(_) => match postcard::from_bytes::<SessionV11>(v) {
+                                Ok(s) => Ok(into_session(
+                                    s.bucket,
+                                    s.key,
+                                    s.content_type,
+                                    s.user_meta,
+                                    s.resp_headers,
+                                    s.created,
+                                    s.completed,
+                                    s.final_etag,
+                                    s.final_size,
+                                    s.final_mtime,
                                     Vec::new(),
                                     None,
                                     None,
-                                ))
-                            }
+                                )),
+                                Err(_) => {
+                                    let legacy: LegacySession =
+                                        postcard::from_bytes(v).map_err(|e| {
+                                            Error::Corrupt(format!("postcard decode session: {e}"))
+                                        })?;
+                                    Ok(into_session(
+                                        legacy.bucket,
+                                        legacy.key,
+                                        legacy.content_type,
+                                        legacy.user_meta,
+                                        Vec::new(),
+                                        legacy.created,
+                                        legacy.completed,
+                                        legacy.final_etag,
+                                        legacy.final_size,
+                                        legacy.final_mtime,
+                                        Vec::new(),
+                                        None,
+                                        None,
+                                    ))
+                                }
+                            },
                         },
                     },
                 },
             },
-        },
         },
     }
 }
@@ -2582,6 +2613,67 @@ impl MetaStore {
     pub fn put_trusted_clock(&self, st: &fs3_core::TrustedClockState) -> Result<()> {
         self.db
             .put(SYS_TRUSTED_CLOCK, encode(st)?)
+            .map_err(rocks_err)?;
+        self.db.flush_wal(true).map_err(rocks_err)
+    }
+
+    // —— 复制状态(M21 A2;ADR-33 RP2;`s:repl_*` 系统键) ——
+
+    /// 本节点复制角色(键缺席 = Primary,配置 §6.1 缺省 primary 口径)。
+    pub fn repl_role(&self) -> Result<ReplRole> {
+        match self.db.get(SYS_REPL_ROLE).map_err(rocks_err)? {
+            Some(v) => ReplRole::parse(&String::from_utf8_lossy(&v)),
+            None => Ok(ReplRole::Primary),
+        }
+    }
+
+    /// 写复制角色(直写 + fsync,照 trusted_clock 先例;promote/demote
+    /// 为本地裁决动作,E3 接线,调用方持单点)。
+    pub fn set_repl_role(&self, role: ReplRole) -> Result<()> {
+        self.db
+            .put(SYS_REPL_ROLE, role.as_str().as_bytes())
+            .map_err(rocks_err)?;
+        self.db.flush_wal(true).map_err(rocks_err)
+    }
+
+    /// 当前复制 epoch(键缺席 = 初始代 REPL_INITIAL_EPOCH,惰性不落盘)。
+    pub fn repl_epoch(&self) -> Result<u64> {
+        match self.db.get(SYS_REPL_EPOCH).map_err(rocks_err)? {
+            Some(v) => {
+                let b: [u8; 8] = v
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| Error::Corrupt("s:repl_epoch malformed".into()))?;
+                Ok(u64::from_be_bytes(b))
+            }
+            None => Ok(REPL_INITIAL_EPOCH),
+        }
+    }
+
+    /// 写复制 epoch(直写 + fsync;promote 路径与 EpochBarrier 同事务的
+    /// 形态在 E3 落,此处为独立便捷写法)。
+    pub fn set_repl_epoch(&self, epoch: u64) -> Result<()> {
+        self.db
+            .put(SYS_REPL_EPOCH, epoch.to_be_bytes())
+            .map_err(rocks_err)?;
+        self.db.flush_wal(true).map_err(rocks_err)
+    }
+
+    /// 读 executed GTID 集(键缺席 = 空集,全新节点)。
+    pub fn repl_executed(&self) -> Result<GtidSet> {
+        match self.db.get(SYS_REPL_EXECUTED).map_err(rocks_err)? {
+            Some(v) => GtidSet::decode(&v),
+            None => Ok(GtidSet::new()),
+        }
+    }
+
+    /// 整体重置 executed 集(直写 + fsync,照 trusted_clock 先例)。
+    /// R12(ADR-33 RP2.4):快照重建后按导出位点 P 对应集合**重置替换,
+    /// 不累加**——累加会残留本地旧历史段,对上游形成假分歧。下游 apply
+    /// 的增量更新走 put_repl_executed_in_tx(与 apply 事务同批)。
+    pub fn set_repl_executed(&self, set: &GtidSet) -> Result<()> {
+        self.db
+            .put(SYS_REPL_EXECUTED, set.encode()?)
             .map_err(rocks_err)?;
         self.db.flush_wal(true).map_err(rocks_err)
     }
@@ -4327,7 +4419,21 @@ impl MetaStore {
     }
 }
 
-fn apply_ops(tx: &Transaction<OptimisticTransactionDB>, ops: &[Op], repl_binlog: bool) -> Result<u64> {
+/// executed GTID 集的事务内写入(M21 A2;ADR-33 RP2:与下游 apply 事务
+/// 同库同事务——集合更新与元数据变更同批,崩溃零漂移,设计稿 §2.1/§4.1)。
+/// 独立便捷写法 = MetaStore::set_repl_executed(整体重置,重建路径)。
+pub fn put_repl_executed_in_tx(
+    tx: &Transaction<OptimisticTransactionDB>,
+    set: &GtidSet,
+) -> Result<()> {
+    tx.put(SYS_REPL_EXECUTED, set.encode()?).map_err(rocks_err)
+}
+
+fn apply_ops(
+    tx: &Transaction<OptimisticTransactionDB>,
+    ops: &[Op],
+    repl_binlog: bool,
+) -> Result<u64> {
     // rocksdb 事务闭包内操作失败 → 整体 Err → 回滚(调用方 commit 不执行)。
     fn tget(tx: &Transaction<OptimisticTransactionDB>, key: &[u8]) -> Result<Option<Vec<u8>>> {
         tx.get(key).map_err(rocks_err)
@@ -5859,6 +5965,89 @@ mod tests {
             assert_eq!(entries.len(), 5);
             assert_eq!(entries[4].0, s5);
         }
+    }
+
+    /// M21 A2(ADR-33 RP2/R12;设计稿 §2.1/§3.1):executed GTID 集持久化——
+    /// ① role/epoch/executed 三键读写往返,键缺席 = 默认(Primary/初始
+    ///   代 1/空集);
+    /// ② 事务内写法 put_repl_executed_in_tx:apply 事务同批更新形态;
+    /// ③ R12:快照重建后 executed 集按导出位点 P 对应集合**整体重置
+    ///   (不累加)**——旧历史段(含未复制尾事务)重置后不存在,对上游
+    ///   不发生假分歧;
+    /// ④ 重开(崩溃重放)后集合保持。
+    #[test]
+    fn executed_set_reset_to_snapshot_point() {
+        let gtid = |epoch, seq| fs3_core::Gtid { epoch, seq };
+        let range = |s: &mut GtidSet, epoch, lo, hi| {
+            for seq in lo..=hi {
+                s.insert(gtid(epoch, seq));
+            }
+        };
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let meta = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
+            // ① 缺席默认
+            assert_eq!(meta.repl_role().unwrap(), ReplRole::Primary);
+            assert_eq!(meta.repl_epoch().unwrap(), REPL_INITIAL_EPOCH);
+            assert!(meta.repl_executed().unwrap().is_empty());
+            // ① 读写往返
+            meta.set_repl_role(ReplRole::Standby).unwrap();
+            meta.set_repl_epoch(2).unwrap();
+            assert_eq!(meta.repl_role().unwrap(), ReplRole::Standby);
+            assert_eq!(meta.repl_epoch().unwrap(), 2);
+            // 旧历史:{1:[1,500], 2:[1,120]}
+            let mut old = GtidSet::new();
+            range(&mut old, 1, 1, 500);
+            range(&mut old, 2, 1, 120);
+            meta.set_repl_executed(&old).unwrap();
+            assert_eq!(meta.repl_executed().unwrap(), old);
+            // ② 事务内写法(下游 apply 同批形态):推进 2:[121,131]
+            // (后段 122..=131 扮演旧主未复制的尾事务,对新主 = 分歧段)
+            {
+                let mut applied = old.clone();
+                range(&mut applied, 2, 121, 131);
+                let tx = meta.db.transaction_opt(&meta.write_opts, &meta.txn_opts);
+                put_repl_executed_in_tx(&tx, &applied).unwrap();
+                tx.commit().map_err(rocks_err).unwrap();
+                let got = meta.repl_executed().unwrap();
+                assert!(got.contains(gtid(2, 121)) && got.contains(gtid(2, 131)));
+                assert_eq!(ranges(&got), vec![(1, 1, 500), (2, 1, 131)]);
+            }
+            // ③ R12:快照重建,导出位点 P = {3:80};上游在 P 点的 GTID 集
+            // = {1:[1,500], 2:[1,120], 3:[1,80]}。重置 = 整体替换
+            let mut snap = GtidSet::new();
+            range(&mut snap, 1, 1, 500);
+            range(&mut snap, 2, 1, 120);
+            range(&mut snap, 3, 1, 80);
+            meta.set_repl_executed(&snap).unwrap();
+            let got = meta.repl_executed().unwrap();
+            assert_eq!(got, snap, "重置 = 替换,不累加旧历史");
+            assert!(
+                !got.contains(gtid(2, 121)) && !got.contains(gtid(2, 131)),
+                "旧主未复制尾事务段已随重置清除"
+            );
+            assert!(got.contains(gtid(3, 80)) && !got.contains(gtid(3, 81)));
+            // 假分歧不发生:重置后 executed ⊆ 上游(P 后已推进)集,
+            // 握手 ②(设计稿 §2.2)通过;若错误累加则会残留 2:[121,131]
+            // 而被判 ErrDiverged
+            let mut upstream = snap.clone();
+            range(&mut upstream, 3, 81, 90);
+            assert!(got.is_subset(&upstream));
+            assert!(!upstream.is_subset(&got));
+            meta.flush().unwrap();
+        }
+        // ④ 崩溃重放:重置结果持久
+        let meta = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
+        let got = meta.repl_executed().unwrap();
+        assert!(!got.contains(gtid(2, 121)), "重启后旧历史段不得复活");
+        assert!(got.contains(gtid(3, 80)));
+        assert_eq!(meta.repl_role().unwrap(), ReplRole::Standby);
+        assert_eq!(meta.repl_epoch().unwrap(), 2);
+    }
+
+    /// ranges 辅助:GTID 集 → (epoch, start, end) 升序表(测试断言用)。
+    fn ranges(s: &GtidSet) -> Vec<(u64, u64, u64)> {
+        s.ranges().collect()
     }
 
     /// F5-3:worker 关闭时入队路径仍按 event_queue_max 截断,e: 不无界堆积。
