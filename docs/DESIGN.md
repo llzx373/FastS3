@@ -2031,6 +2031,16 @@ s3-tests kms 族出集或逐名;`kms_context_binding_rejects_transplant` 绿。
 4. **R12 陷阱钉死**:快照重建后 executed 集必须以导出位点 `P` 为准
    **重置**(不是累加),否则假分歧。
 
+> **旁注(2026-08-31,M21 E3 落地形态)**:RP2.1 的「新 epoch 从 seq=1
+> 重计」落地为 **bl: 键含 epoch**(`bl:{epoch be64}{seq be64}` = GTID
+> 本体,键序 = GTID 字典序;跨 promote 代际边界续流由键序免费获得),
+> 代内 seq = `s:seq` − `s:repl_ebase`(promote 事务写入的代际基线,值
+> = promote 前一刻 `s:seq`;初始代缺席 = 0,原口径不变)——`s:seq`
+> 自身全局不回退(`a:`/`t:`/`e:` 键内序号以它为锚)。promote 的
+> epoch+1 / EpochBarrier(`bl:{新epoch}{1}`)/ role=primary 单事务
+> 落盘 + 无条件 WAL fsync(R12)。**E4 待办**:replay 侧 `e:`/`x:` 键
+> 内序号以上游原 seq 落键,上游 promote 重计后跨代碰撞的复核归 E4。
+
 **RP3(拓扑 = 一主多备 + 桶级槽位 + 级联)**:
 
 1. 一主多备 = 多个命名复制槽(`s:repl_slot\0{name}`),fan-out 上限

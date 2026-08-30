@@ -9,7 +9,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use fs3_admin::{AdminConfig, AdminServer, RebuildError, RebuildRequest, ReplicationControl};
+use fs3_admin::{
+    AdminConfig, AdminServer, PromoteError, PromoteRequest, RebuildError, RebuildRequest,
+    ReplicationControl,
+};
 use fs3_engine::{Engine, EngineConfig};
 use fs3_s3::auth::Credentials;
 use fs3_s3::S3Service;
@@ -30,6 +33,12 @@ impl ReplicationControl for StubControl {
         }
         *self.last.lock().unwrap() = Some(req);
         Ok(serde_json::json!({"status": "rebuilding"}))
+    }
+
+    fn promote(&self, _req: PromoteRequest) -> Result<serde_json::Value, PromoteError> {
+        Err(PromoteError::Rejected(
+            "stub: promote 用例在 promote_api 测试".into(),
+        ))
     }
 }
 

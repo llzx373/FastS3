@@ -3285,7 +3285,7 @@ fn check_scans_repl_prefixes() {
     // keys.rs 前缀表覆盖声明:复制前缀 vs 既有前缀域两两不相交
     use fs3_meta::keys;
     let repl_keys: Vec<Vec<u8>> = vec![
-        keys::binlog_key(1),
+        keys::binlog_key(1, 1),
         keys::repl_slot_key("s1").unwrap(),
         keys::SYS_REPL_ROLE.to_vec(),
         keys::SYS_REPL_EPOCH.to_vec(),

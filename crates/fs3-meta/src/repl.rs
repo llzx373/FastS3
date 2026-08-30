@@ -1,5 +1,7 @@
 //! 复制 binlog 记录(M21 A1;ADR-33 RP1/RP2;docs/replication-design.md
-//! §3.2):`bl:{seq be64}` → [版本字节 u8] + postcard ReplRecord。
+//! §3.2):`bl:{epoch be64}{seq be64}` → [版本字节 u8] + postcard
+//! ReplRecord(A1 初形 `bl:{seq be64}`;E3 起 epoch 入键,键序 = GTID
+//! 字典序,见 fs3-meta keys.rs binlog_key 注释)。
 //!
 //! 纪律:
 //! - ReplRecord 持久化 `Op`,**Op 的 serde 形状自此成为 binlog 兼容面**
@@ -58,8 +60,9 @@ pub struct BucketScope {
     pub has_unscoped: bool,
 }
 
-/// 一条已提交事务的 binlog 记录(键 `bl:{seq be64}`,seq = 事务自身的
-/// `s:seq` 序号;与元数据变更同事务落盘,崩溃零漂移)。
+/// 一条已提交事务的 binlog 记录(键 `bl:{epoch be64}{seq be64}` =
+/// 事务 GTID;A1 初形键仅 seq——初始代 seq == s:seq 恒等,E3 起 epoch
+/// 入键承载 promote 重计;与元数据变更同事务落盘,崩溃零漂移)。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReplRecord {
     /// 事务所属 epoch(`s:repl_epoch`,promote +1;ADR-33 RP2)。
@@ -77,6 +80,14 @@ pub struct ReplRecord {
     /// 只覆盖 JSON/自描述面)。
     #[serde(default)]
     pub ts: Option<i64>,
+    /// EpochBarrier 标记(M21 E3;ADR-33 RP2.1/RP5.2;设计稿 §5.1):
+    /// promote 事务写的新 epoch 首条 binlog 条目(GTID = {新epoch, 1})
+    /// 置 Some(前一 epoch);常规事务恒 None。promote 崩溃无半状态的
+    /// 判定锚(R12:barrier 在 = promote 完整落盘);下游把它当心跳
+    /// apply(空 ops,游标推进、executed 并入)。尾部追加演进同 ts
+    /// 口径(解码侧双读回退补 None = 常规记录)。
+    #[serde(default)]
+    pub epoch_barrier: Option<u64>,
 }
 
 /// 桶级槽过滤器(M21 A3;ADR-33 RP3;设计稿 §3.3:`include: [...]` /
@@ -217,6 +228,7 @@ impl ReplRecord {
             data_refs: data_refs_of(ops),
             bucket_scope: bucket_scope_of(ops),
             ts: None,
+            epoch_barrier: None,
         }
     }
 
@@ -246,28 +258,50 @@ impl ReplRecord {
         }
     }
 
-    /// v1 解码 + 尾部追加双读回退(M21 A3 追加 `ts`;postcard 非自描述,
-    /// 缺尾字段的旧字节走显式回退分支,照 decode_notification_rule 先例):
-    /// A1 初版四字段记录 → ts=None(年龄未知,时限判定保守保数据)。
+    /// v1 解码 + 尾部追加双读回退(M21 A3 追加 `ts`、E3 追加
+    /// `epoch_barrier`;postcard 非自描述,缺尾字段的旧字节走显式回退
+    /// 分支,照 decode_notification_rule 先例):A1 初版四字段记录 →
+    /// ts=None/barrier=None;A3 五字段 → barrier=None(常规记录)。
     fn decode_v1(buf: &[u8]) -> Result<Self> {
-        postcard::from_bytes(buf).or_else(|_| {
-            /// A1 初版格式(无 ts 尾部;A3 回退用)。
-            #[derive(Deserialize)]
-            struct ReplRecordV1 {
-                epoch: u64,
-                ops: Vec<Op>,
-                data_refs: Vec<DataRef>,
-                bucket_scope: BucketScope,
-            }
-            let old: ReplRecordV1 = postcard::from_bytes(buf)
-                .map_err(|e| Error::Corrupt(format!("postcard decode repl record: {e}")))?;
-            Ok(ReplRecord {
-                epoch: old.epoch,
-                ops: old.ops,
-                data_refs: old.data_refs,
-                bucket_scope: old.bucket_scope,
-                ts: None,
-            })
+        if let Ok(rec) = postcard::from_bytes::<ReplRecord>(buf) {
+            return Ok(rec);
+        }
+        /// A3 五字段格式(无 epoch_barrier 尾部;E3 回退用)。
+        #[derive(Deserialize)]
+        struct ReplRecordV1Ts {
+            epoch: u64,
+            ops: Vec<Op>,
+            data_refs: Vec<DataRef>,
+            bucket_scope: BucketScope,
+            ts: Option<i64>,
+        }
+        if let Ok(with_ts) = postcard::from_bytes::<ReplRecordV1Ts>(buf) {
+            return Ok(ReplRecord {
+                epoch: with_ts.epoch,
+                ops: with_ts.ops,
+                data_refs: with_ts.data_refs,
+                bucket_scope: with_ts.bucket_scope,
+                ts: with_ts.ts,
+                epoch_barrier: None,
+            });
+        }
+        /// A1 初版格式(无 ts/barrier 尾部;A3 回退用)。
+        #[derive(Deserialize)]
+        struct ReplRecordV1 {
+            epoch: u64,
+            ops: Vec<Op>,
+            data_refs: Vec<DataRef>,
+            bucket_scope: BucketScope,
+        }
+        let old: ReplRecordV1 = postcard::from_bytes(buf)
+            .map_err(|e| Error::Corrupt(format!("postcard decode repl record: {e}")))?;
+        Ok(ReplRecord {
+            epoch: old.epoch,
+            ops: old.ops,
+            data_refs: old.data_refs,
+            bucket_scope: old.bucket_scope,
+            ts: None,
+            epoch_barrier: None,
         })
     }
 }
@@ -615,6 +649,25 @@ fn export_thread(
             }
             None => crate::keys::REPL_INITIAL_EPOCH,
         };
+        // M21 E3(ADR-33 RP2.1):位点 P 是 GTID,代内 seq = s:seq − ebase
+        // (promote 后新代从 1 重计;s:seq 全局不回退,见 keys.rs
+        // SYS_REPL_EBASE)
+        let ebase = match snap
+            .get(crate::keys::SYS_REPL_EBASE)
+            .map_err(crate::rocks_err)?
+        {
+            Some(v) => {
+                let b: [u8; 8] = v
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| Error::Corrupt("s:repl_ebase malformed".into()))?;
+                u64::from_be_bytes(b)
+            }
+            None => 0,
+        };
+        let seq = seq
+            .checked_sub(ebase)
+            .ok_or_else(|| Error::Corrupt(format!("s:repl_ebase {ebase} > s:seq {seq}")))?;
         Ok(fs3_core::Gtid { epoch, seq })
     })();
     let point = match point {
@@ -816,6 +869,8 @@ mod tests {
 
     /// M21 A3:ReplRecord 尾部追加 `ts` 双读——A1 初版四字段字节回退
     /// ts=None;新格式往返带 ts;损坏字节两版均拒。
+    /// M21 E3 追加 `epoch_barrier`:A3 五字段字节回退 barrier=None;
+    /// barrier 记录往返;promote 写入形态见 fs3-meta promote 具名用例。
     #[test]
     fn repl_record_ts_tail_dual_read() {
         let ops = vec![Op::EventDelete { seq: 7 }];
@@ -829,6 +884,36 @@ mod tests {
         // 未知版本字节拒绝(截断字节可能恰为合法 V1 负载——varint 尾部
         // 截断的固有歧义,双读口径同 decode_notification_rule 先例)
         assert!(ReplRecord::decode_value(&[0xFF, 0x00]).is_err());
+
+        // E3:EpochBarrier 记录往返(barrier = Some(前一 epoch))
+        let barrier = ReplRecord {
+            epoch_barrier: Some(2),
+            ..rec.clone()
+        };
+        let bbuf = barrier.encode_value().unwrap();
+        assert_eq!(ReplRecord::decode_value(&bbuf).unwrap(), barrier);
+
+        // A3 五字段格式(有 ts、无 barrier 尾部)直读 → barrier = None
+        #[derive(serde::Serialize)]
+        struct ReplRecordV1Ts {
+            epoch: u64,
+            ops: Vec<Op>,
+            data_refs: Vec<DataRef>,
+            bucket_scope: BucketScope,
+            ts: Option<i64>,
+        }
+        let mid = ReplRecordV1Ts {
+            epoch: 3,
+            ops: ops.clone(),
+            data_refs: Vec::new(),
+            bucket_scope: bucket_scope_of(&ops),
+            ts: Some(1_700_000_000),
+        };
+        let mut mid_buf = vec![REPL_RECORD_VERSION];
+        mid_buf.extend_from_slice(&postcard::to_allocvec(&mid).unwrap());
+        let got = ReplRecord::decode_value(&mid_buf).unwrap();
+        assert_eq!(got.ts, Some(1_700_000_000));
+        assert_eq!(got.epoch_barrier, None);
 
         // A1 初版格式(无 ts 尾部)直读 → ts = None
         #[derive(serde::Serialize)]
@@ -848,6 +933,7 @@ mod tests {
         old_buf.extend_from_slice(&postcard::to_allocvec(&old).unwrap());
         let got = ReplRecord::decode_value(&old_buf).unwrap();
         assert_eq!(got.ts, None);
+        assert_eq!(got.epoch_barrier, None);
         assert_eq!(got.ops, ops);
         assert_eq!(got.epoch, 3);
     }

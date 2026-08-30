@@ -379,6 +379,13 @@ impl S3Service {
         *self.repl_data_fetch.write().unwrap() = Some(fetch);
     }
 
+    /// M21 E3:摘除 standby 缺数据拉取通道(promote 停回填池时调用——
+    /// 旧通道随关停失效,promote 后本端是主,读路径不再有「段未回填」
+    /// 态;通道残留只会把按需拉取打到已关停的池)。
+    pub fn clear_repl_data_fetch(&self) {
+        *self.repl_data_fetch.write().unwrap() = None;
+    }
+
     /// M21 D3(ADR-33 RP7.4 裁定 1;replication-design §6.3):上游委派
     /// 只读凭证的本地查找(**桶级备端**专属——桶级槽不含 IAM 键,备端读
     /// 鉴权无法走 IAM,由上游签发的委派凭证承载)。access_key 形

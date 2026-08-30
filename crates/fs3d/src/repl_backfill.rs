@@ -2,7 +2,7 @@
 //! 备端/下游侧)。
 //!
 //! - **消费模型**:扫 `s:repl_pending` 待回填队列(GTID 升序),按条目
-//!   GTID 读本机 `bl:{seq}` 原样记录(apply 同事务落盘,B4)提取目标键
+//!   GTID 读本机 `bl:{epoch}{seq}` 原样记录(apply 同事务落盘,B4)提取目标键
 //!   (o: 当前/版本键、p: 分片键)与其上游段引用;按 DataRef 调上游
 //!   `GET /v1/repl/v1/extent-data`(Range + 响应头 CRC32C 逐块校验,
 //!   与 C2 导入同口径),字节经**本地分配器**落盘(复用 C2
@@ -351,7 +351,9 @@ async fn supervisor(
 /// 单条 pending 条目的回填:读 bl: 原样记录 → 目标键提取 → 逐目标
 /// 拉取 + 清算 → 死引用收尾摘除(条目引空删键在清算事务内)。
 async fn process_record(inner: &Arc<Inner>, gtid: Gtid, refs: Vec<DataRef>) {
-    let rec = match inner.meta.repl_record(gtid.seq) {
+    // E3:bl: 键即 GTID(含 epoch),点读直接以 gtid 定位;epoch 校验臂
+    // 保留(记录 epoch 与键内 epoch 不符 = 库损坏,truncate_binlog 同口径)
+    let rec = match inner.meta.repl_record(gtid) {
         Ok(Some(r)) if r.epoch == gtid.epoch => r,
         Ok(_) => {
             // bl: 与 pending 同事务落盘(B4),缺席/epoch 不符 = 本地

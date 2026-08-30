@@ -1257,7 +1257,8 @@ fn cmd_serve(
     // 最小入口 FS3D_REPL_ROLE(primary|standby;设置即落 s:repl_role,
     // 幂等直写);pull 配置已在 admin 装配前解析(C5 注入用),worker 内
     // role=standby 硬校验(配了上游但角色是主 = 配置矛盾,启动显式失败,
-    // 不静默)。pause/resume 语义属 F2;promote 停 worker 属 E3。
+    // 不静默)。pause/resume 语义属 F2;promote 停 worker 已在 E3 落
+    // (RebuildService::promote,经 admin 面 /v1/admin/replication/promote)。
     if let Ok(role) = std::env::var("FS3D_REPL_ROLE") {
         let role = match role.as_str() {
             "primary" => fs3_meta::ReplRole::Primary,

@@ -28,6 +28,14 @@
 //!   IAM/密钥等 S3 层内存视图与常态 apply 同口径(apply 本就不经 S3
 //!   层,启动时 restore_keys_from_meta 装载)——rebuild 不额外处理。
 //! - **停机**:cmd_serve 收尾经 `shutdown()` 统一停收养的 worker/回填池。
+//! - **手动 promote(M21 E3;ADR-33 RP5;§5.1)**:`POST /v1/admin/
+//!   replication/promote?dry_run=&force=`(同一 trait 注入面;未配置
+//!   pull = 501)。dry-run 纯读丢弃清单(零副作用,不停 worker);真实
+//!   promote = 预检(有 pending 未 force → 409 带清单)→ 停 pull
+//!   worker/回填池 + 摘读路径探针与按需拉取通道 → MetaStore::promote
+//!   单事务落盘(epoch+1/EpochBarrier/role=primary,R12 无半状态)→
+//!   成功后本端为主,pull 栈不再起;失败恢复旧 pull 栈。桶级备显式
+//!   拒绝(§5.4:先 rebuild 为全量备)。
 //!
 //! CLI 侧为 admin 通道最小客户端(unix socket / 回环 TCP + Bearer;手写
 //! HTTP/1.1 阻塞实现,零新增依赖——fs3-agent 是可选 feature 默认关,
@@ -248,6 +256,140 @@ impl RebuildService {
         self.service.set_repl_data_fetch(backfill.clone());
         Ok((worker, backfill))
     }
+
+    /// 手动 promote(M21 E3;ADR-33 RP5;设计稿 §5.1;语义钉死在 fs3-meta
+    /// MetaStore::promote 上方小节注释,本层只做编排):
+    /// - dry_run:纯读 `promote_dry_run` 转 JSON,**零副作用,不停
+    ///   worker**;
+    /// - 真实 promote:先取 dry-run 报告预检(有 pending 且未 force →
+    ///   Rejected/409 带清单,**不动 worker**)→ 与 rebuild 同一互斥 →
+    ///   停 pull worker/回填池、摘除读路径探针与按需拉取通道 →
+    ///   `MetaStore::promote(force)`(单事务落盘,R12)→ 成功 = 本端转
+    ///   主,pull 栈不再起;Store 失败 = 恢复旧 pull 栈后返回 Failed。
+    pub fn promote(
+        &self,
+        dry_run: bool,
+        force: bool,
+    ) -> Result<serde_json::Value, fs3_admin::PromoteError> {
+        use fs3_admin::PromoteError;
+        if dry_run {
+            let report = self.meta.promote_dry_run().map_err(map_promote_err)?;
+            return Ok(serde_json::json!({
+                "status": "dry_run",
+                "discarded": discard_report_json(&report),
+            }));
+        }
+        // 预检(Worker 仍在跑时的快速拒绝;promote 事务内有重扫复核)
+        let report = self.meta.promote_dry_run().map_err(map_promote_err)?;
+        if report.pending_txns > 0 && !force {
+            return Err(PromoteError::Rejected(format!(
+                "data_pending 尾事务存在({} 条),promote 将丢弃;等待回填排空或以 force=true 重试。丢弃清单(dry-run 口径): {}",
+                report.pending_txns,
+                serde_json::to_string(&discard_report_json(&report)).unwrap_or_default()
+            )));
+        }
+        let mut inner = self.inner.lock();
+        if inner.rebuilding {
+            return Err(PromoteError::Rejected(
+                "replication rebuild in progress (promote/rebuild 互斥)".into(),
+            ));
+        }
+        inner.rebuilding = true;
+        let r = self.promote_locked(&mut inner, force);
+        inner.rebuilding = false;
+        r
+    }
+
+    fn promote_locked(
+        &self,
+        inner: &mut Inner,
+        force: bool,
+    ) -> Result<serde_json::Value, fs3_admin::PromoteError> {
+        use fs3_admin::PromoteError;
+        // 停 pull worker 与回填池(promote 事务的「无在途复制流」前提;
+        // 读路径探针/按需拉取通道一并摘除——force 丢弃后不再有可回填态,
+        // 转正后读路径回主端口径)
+        if let Some(w) = inner.pull.take() {
+            w.shutdown();
+        }
+        if let Some(bf) = inner.backfill.take() {
+            bf.shutdown();
+        }
+        self.engine.write().set_repl_pending_probe(None);
+        self.service.clear_repl_data_fetch();
+        match self.meta.promote(force) {
+            Ok(out) => {
+                tracing::warn!(
+                    epoch = out.epoch,
+                    barrier = %crate::repl::fmt_gtid(out.barrier),
+                    discarded_txns = out.discarded.pending_txns,
+                    "replication promote: standby promoted to primary (explicit operator action, ADR-33 RP5)"
+                );
+                Ok(serde_json::json!({
+                    "status": "promoted",
+                    "epoch": out.epoch,
+                    "barrier": crate::repl::fmt_gtid(out.barrier),
+                    "discarded": discard_report_json(&out.discarded),
+                }))
+            }
+            Err(e) => {
+                // 失败恢复:本地状态未变(事务拒绝/回滚),恢复旧 pull 栈
+                // (同 rebuild 中止恢复口径)
+                let cfg = inner.pull_cfg.clone();
+                let note = match self.start_stack(&cfg) {
+                    Ok((w, bf)) => {
+                        inner.pull = Some(w);
+                        inner.backfill = Some(bf);
+                        "pull stack restored"
+                    }
+                    Err(re) => {
+                        tracing::error!("promote abort: failed to restore pull stack: {re}");
+                        "pull stack NOT restored (restart/rebuild to recover)"
+                    }
+                };
+                match e {
+                    fs3_meta::PromoteError::Store(se) => Err(PromoteError::Failed(format!(
+                        "promote store error: {se} ({note})"
+                    ))),
+                    other => Err(PromoteError::Rejected(format!("{other} ({note})"))),
+                }
+            }
+        }
+    }
+}
+
+/// fs3-meta promote 错误 → admin 面分类(E3:前三者 = 前置条件拒绝 409,
+/// Store = 执行失败 500;PendingDiscards 清单随消息带 JSON)。
+fn map_promote_err(e: fs3_meta::PromoteError) -> fs3_admin::PromoteError {
+    use fs3_admin::PromoteError;
+    match e {
+        fs3_meta::PromoteError::PendingDiscards(r) => {
+            let msg = format!(
+                "data_pending 尾事务存在({} 条); 丢弃清单: {}",
+                r.pending_txns,
+                serde_json::to_string(&discard_report_json(&r)).unwrap_or_default()
+            );
+            PromoteError::Rejected(msg)
+        }
+        fs3_meta::PromoteError::Store(se) => PromoteError::Failed(format!("{se}")),
+        other => PromoteError::Rejected(format!("{other}")),
+    }
+}
+
+/// 丢弃清单 JSON 化(dry-run 响应/Rejected 消息/promoted 回显同一形状;
+/// 下游槽用 slot_json 同形状,E3)。
+fn discard_report_json(r: &fs3_meta::PromoteDiscardReport) -> serde_json::Value {
+    serde_json::json!({
+        "pending_txns": r.pending_txns,
+        "gtid_range": r.gtid_range
+            .map(|(lo, hi)| [crate::repl::fmt_gtid(lo), crate::repl::fmt_gtid(hi)]),
+        "objects": r.objects.iter()
+            .map(|(b, k)| serde_json::json!({"bucket": b, "key": k}))
+            .collect::<Vec<_>>(),
+        "buckets": r.buckets,
+        "downstream_slots": r.downstream_slots.iter().map(crate::repl::slot_json)
+            .collect::<Vec<_>>(),
+    })
 }
 
 impl fs3_admin::ReplicationControl for RebuildService {
@@ -257,12 +399,19 @@ impl fs3_admin::ReplicationControl for RebuildService {
     ) -> Result<serde_json::Value, fs3_admin::RebuildError> {
         self.rebuild(req.from.as_deref(), req.slot.as_deref())
     }
+
+    fn promote(
+        &self,
+        req: fs3_admin::PromoteRequest,
+    ) -> Result<serde_json::Value, fs3_admin::PromoteError> {
+        self.promote(req.dry_run, req.force)
+    }
 }
 
 // ─────────────────── CLI(`fasts3d replication rebuild`)───────────────────
 
-/// `fasts3d replication` 子命令面(M21 C5 起;status/slots/pause/resume/
-/// promote/demote 属 F2,不抢跑)。
+/// `fasts3d replication` 子命令面(M21 C5 起;E3 已落 promote 的 admin
+/// 管理面,其 CLI 面与 status/slots/pause/resume/demote 属 F2,不抢跑)。
 #[derive(clap::Args)]
 pub struct ReplicationArgs {
     #[command(subcommand)]

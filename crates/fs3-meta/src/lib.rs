@@ -110,6 +110,85 @@ pub struct RebuildClearStats {
     pub dcred_deleted: u64,
 }
 
+/// promote 丢弃清单(M21 E3;ADR-33 RP5.1 裁定 3;设计稿 §5.1.2):
+/// dry-run 返回/force promote 实际丢弃的同一口径——**force 丢弃清单与
+/// dry-run 输出一致**(编排侧在停 apply 后取清单,promote 事务重扫
+/// 复核;两者必然同源)。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PromoteDiscardReport {
+    /// data_pending 事务数(`s:repl_pending` 队列条目数)。
+    pub pending_txns: usize,
+    /// 待回填 GTID 范围(min..=max;队列空 = None)。队列键
+    /// `{epoch}{seq}` 有序,首/末条目即界。
+    pub gtid_range: Option<(Gtid, Gtid)>,
+    /// 未回填对象清单(`s:repl_pdobj` 标记族解析;(bucket, key) 排序
+    /// 去重,输出确定性)。分片(p:)不入标记族(C4 口径),其引用计入
+    /// pending_txns/gtid_range 但不单列对象。
+    pub objects: Vec<(String, String)>,
+    /// 影响桶(objects 的桶名排序去重)。
+    pub buckets: Vec<String>,
+    /// 受影响下游分支(本机作为中继时其下游槽;force 丢弃过数据时这些
+    /// 分支的对应桶需重建——设计稿 §5.1.4/R10)。
+    pub downstream_slots: Vec<repl::Slot>,
+}
+
+/// promote 失败分类(M21 E3;admin 映射:前三者 → 409,Store → 500)。
+#[derive(Debug)]
+pub enum PromoteError {
+    /// 本节点不是 standby(已是主/角色未配置):promote 是备端动作。
+    NotStandby,
+    /// 桶级备端(`s:repl_bscoped` 置位,上游槽过滤器非 All):GTID 集
+    /// 有洞,不可 promote 为实例主(ADR-33 RP4.5;设计稿 §5.4)——转正
+    /// 唯一路径 = 先显式 rebuild 为全量备。
+    BucketScoped,
+    /// 有 data_pending 未回填尾事务且未带 force:清单随错误返回(与
+    /// dry-run 同口径),等待回填排空或显式 force 重试。
+    PendingDiscards(PromoteDiscardReport),
+    /// 存储层失败。
+    Store(Error),
+}
+
+impl std::fmt::Display for PromoteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PromoteError::NotStandby => f.write_str(
+                "promote requires role=standby (already primary or role unset; ADR-33 RP5)",
+            ),
+            PromoteError::BucketScoped => f.write_str(
+                "bucket-scoped standby cannot promote (GTID 集有洞, §5.4/RP4.5); \
+                 先 rebuild 为全量备(replication rebuild --as-standby)再 promote",
+            ),
+            PromoteError::PendingDiscards(r) => write!(
+                f,
+                "data_pending tail transactions exist ({} txns); wait for backfill or \
+                 retry with force (丢弃清单同 dry-run)",
+                r.pending_txns
+            ),
+            PromoteError::Store(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for PromoteError {}
+
+impl From<Error> for PromoteError {
+    fn from(e: Error) -> Self {
+        PromoteError::Store(e)
+    }
+}
+
+/// promote 成功结果(M21 E3;MetaStore::promote 返回值)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromoteOutcome {
+    /// 新 epoch(= 旧 epoch + 1)。
+    pub epoch: u64,
+    /// EpochBarrier 条目 GTID(恒 {新epoch, 1};R12 崩溃判定锚)。
+    pub barrier: Gtid,
+    /// 实际丢弃清单(force 时 = 事务内重扫口径,与 dry-run 一致;非
+    /// force 且无 pending 时为空报告)。
+    pub discarded: PromoteDiscardReport,
+}
+
 /// 段回填清算的单键替换项(M21 C3;MetaStore::repl_localize_segments
 /// 入参):目标原始键(o: 当前/版本键或 p: 分片键)+ 该键内上游段的
 /// 本地替换表。语义见 repl_localize_segments 上方小节注释。
@@ -133,7 +212,8 @@ pub struct MetaConfig {
     /// 事件队列环形上限(F5-3:worker 关闭时入队路径仍截断 `e:`;默认 10 万)。
     pub event_queue_max: usize,
     /// 复制 binlog 开关(M21 A1;ADR-33 RP1):开启后每个提交事务同批写
-    /// `bl:{seq}` ReplRecord;默认关,未启用时零开销(apply_ops 一次分支)。
+    /// `bl:{epoch}{代内seq}` ReplRecord(E3 起 epoch 入键);默认关,未
+    /// 启用时零开销(apply_ops 一次分支)。
     /// 引擎/[replication] 配置接线在后续任务(B/F 组)。
     pub repl_binlog: bool,
 }
@@ -476,7 +556,8 @@ impl BucketConf {
 /// 元数据操作(单事务应用,顺序执行)。
 ///
 /// **兼容面登记(M21 A1)**:开启复制 binlog 后 Op 随 ReplRecord 持久化
-/// (`bl:{seq}`),serde 形状自此成为 binlog 兼容面——只允许尾部追加新
+/// (`bl:{epoch}{代内seq}`,E3 起 epoch 入键),serde 形状自此成为
+/// binlog 兼容面——只允许尾部追加新
 /// 变体、变体字段只允许尾部追加(postcard 变体序 = 编码序),演进纪律同
 /// 值格式(DESIGN-FUTURE §2);不得重排/改名既有变体与字段。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2805,6 +2886,23 @@ impl MetaStore {
         self.db.flush_wal(true).map_err(rocks_err)
     }
 
+    /// 本代 GTID seq 计数基线(M21 E3;`s:repl_ebase`,promote 事务写入,
+    /// 值 = promote 前一刻 s:seq):代内 GTID seq = s:seq − ebase。键缺席
+    /// = 0(初始代口径,seq == s:seq,A1 不变)。s:seq 自身全局不回退
+    /// (a:/t:/e: 键内序号以它为锚)。
+    pub fn repl_ebase(&self) -> Result<u64> {
+        match self.db.get(SYS_REPL_EBASE).map_err(rocks_err)? {
+            Some(v) => {
+                let b: [u8; 8] = v
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| Error::Corrupt("s:repl_ebase malformed".into()))?;
+                Ok(u64::from_be_bytes(b))
+            }
+            None => Ok(0),
+        }
+    }
+
     /// 读 executed GTID 集(键缺席 = 空集,全新节点)。
     pub fn repl_executed(&self) -> Result<GtidSet> {
         match self.db.get(SYS_REPL_EXECUTED).map_err(rocks_err)? {
@@ -2835,8 +2933,9 @@ impl MetaStore {
     // - **心跳条目**(上游槽过滤带过的空 ops 记录)照常走完整 apply:
     //   ops 为空 = 零元数据变更,但 bl: 原样落盘、游标推进、executed 集
     //   并入——GTID 集无洞(§4.1/RP3.2);
-    // - **不重编号**(级联预备,RP3.3/E1 中继直接受益):`bl:{原 seq}`
-    //   写**原样 ReplRecord**(原 epoch/ops/data_refs/ts),s:seq 推进至
+    // - **不重编号**(级联预备,RP3.3/E1 中继直接受益):
+    //   `bl:{原epoch}{原seq}` 写**原样 ReplRecord**(原 epoch/ops/
+    //   data_refs/ts;E3 起键含 epoch,跨代不碰撞),s:seq 推进至
     //   max(当前, 原 seq)——防本节点 promote 转正后 seq 回退与已重放
     //   的 bl: 键碰撞;promote 后本地写走 A1 原路径(cur+1 自增);
     // - **`Op::Alloc` 跳过不落盘**(§4.3 布局独立):a:/t: 是上游分配器
@@ -3196,8 +3295,8 @@ impl MetaStore {
 
     /// 复制 apply:把上游一条 binlog 记录应用进本库(单个乐观事务,
     /// 原子;冲突自动重试,同 commit 口径)。事务内容 = ops 应用(Alloc
-    /// 跳过)+ `bl:{原 seq}` 原样记录 + s:seq 推进 + executed 集并入 +
-    /// 游标 + 待回填入队——同批同 WAL,崩溃零漂移、重放幂等。
+    /// 跳过)+ `bl:{原epoch}{原seq}` 原样记录 + s:seq 推进 + executed
+    /// 集并入 + 游标 + 待回填入队——同批同 WAL,崩溃零漂移、重放幂等。
     ///
     /// `gtid` = 记录 GTID(键内 seq;调用方 = pull worker,按流序单线程
     /// 调用)。返回 Applied / SkippedDuplicate(`gtid <= 游标`)。
@@ -3463,6 +3562,9 @@ impl MetaStore {
         batch.delete(SYS_REPL_CURSOR);
         batch.delete(SYS_REPL_EXECUTED);
         batch.delete(SYS_REPL_EPOCH);
+        // E3 代内 seq 基线一并复位:重建后新代 ebase 缺席 = 0(seq ==
+        // s:seq;清空范围见上方小节注释)
+        batch.delete(SYS_REPL_EBASE);
         // 桶级备端标记(D2)一并复位:重建后 hello 按新槽实况重落
         batch.delete(SYS_REPL_BUCKET_SCOPED);
         self.db
@@ -3548,6 +3650,260 @@ impl MetaStore {
             }
         }
         Ok(total)
+    }
+
+    // —— 手动 promote(M21 E3;ADR-33 RP2.1/RP5;设计稿 §5.1;R12) ——
+    //
+    // 语义钉死(实现注释 = 唯一事实补充,偏离走 ADR):
+    // - **dry-run 前置**:promote_dry_run 纯读返回丢弃清单(pending 事务
+    //   数/GTID 范围/未回填对象/影响桶/下游槽);admin/CLI 面先 dry-run
+    //   后真实 promote,force 实际丢弃与 dry-run 同口径(同源采集函数 +
+    //   事务内重扫复核);
+    // - **单事务落盘,崩溃无半状态**(R12):epoch+1、s:repl_ebase=旧
+    //   s:seq、s:seq=旧+1(EpochBarrier 消耗一个序号)、barrier 条目
+    //   `bl:{新epoch}{1}`、executed 并入 {新epoch,1}、role=primary 全部
+    //   一个乐观事务;提交后**无条件 flush_wal(true)**(failover 动作,
+    //   确定性落盘优先于组提交窗口,同 clear_for_rebuild 口径);
+    // - **EpochBarrier** = 新代首条 binlog(GTID = {新epoch, 1}):空
+    //   ops、has_unscoped=true(桶级槽强制随同,§6.2)、
+    //   epoch_barrier=Some(旧epoch)、ts=提交墙钟。崩溃判定锚:barrier
+    //   在 = promote 完整落盘;下游当心跳 apply(游标推进、executed
+    //   并入),跨代续流由 bl: 键序免费获得(repl_binlog_scan 注释);
+    // - **代内 seq 重计**:新代 GTID seq 从 1 起(= s:seq − ebase,见
+    //   apply_ops Commit 臂);s:seq 全局不回退(a:/t:/e: 键内序号以它
+    //   为锚)。E4 待办:replay 侧 e:/x: 键内序号在上游 promote 后跨代
+    //   碰撞的复核归 E4(DESIGN.md ADR-33 RP2.1 旁注);
+    // - **桶级备拒绝**:s:repl_bscoped 置位 → BucketScoped(GTID 集有
+    //   洞,§5.4/RP4.5;唯一转正路径 = 先显式 rebuild 为全量备);
+    // - **force 丢弃**:data_pending 尾事务的 pending 条目、pdobj 标记、
+    //   对象 base+全部版本键同批删除(段字节成孤儿,由离线 check --fix
+    //   回收,同 C5 口径;桶统计漂移由 D5 周期重算收敛)。丢弃清单 =
+    //   事务内重扫报告;
+    // - **调用方纪律**(fs3d RebuildService::promote):先停 pull worker/
+    //   回填池再调用;本层不感知 worker,残余并发写由乐观事务冲突挡下
+    //   (角色/纪元锚点 tget 入读集)。
+
+    /// promote dry-run(纯读零副作用;语义见上方小节注释)。
+    pub fn promote_dry_run(&self) -> std::result::Result<PromoteDiscardReport, PromoteError> {
+        if self.repl_role()? != ReplRole::Standby {
+            return Err(PromoteError::NotStandby);
+        }
+        if self.repl_bucket_scoped()? {
+            return Err(PromoteError::BucketScoped);
+        }
+        Ok(self.promote_discard_report()?)
+    }
+
+    /// 丢弃清单采集(promote_dry_run 与 promote 事务内/后复核共用;
+    /// 纯读)。
+    fn promote_discard_report(&self) -> Result<PromoteDiscardReport> {
+        let pending = self.list_repl_pending(usize::MAX)?;
+        let gtid_range = match (pending.first(), pending.last()) {
+            (Some((first, _)), Some((last, _))) => Some((*first, *last)),
+            _ => None,
+        };
+        let mut objects: Vec<(String, String)> = Vec::new();
+        for item in scan_prefix(&self.db, PREFIX_REPL_PENDING_OBJ) {
+            let (k, _v) = item?;
+            objects.push(parse_repl_pending_obj_key(&k)?);
+        }
+        objects.sort();
+        objects.dedup();
+        let mut buckets: Vec<String> = objects.iter().map(|(b, _)| b.clone()).collect();
+        buckets.sort();
+        buckets.dedup();
+        Ok(PromoteDiscardReport {
+            pending_txns: pending.len(),
+            gtid_range,
+            objects,
+            buckets,
+            downstream_slots: self.list_repl_slots()?,
+        })
+    }
+
+    /// 手动 promote(单个乐观事务,原子;冲突自动重试,同 commit 口径;
+    /// 语义见上方小节注释)。`force` = 丢弃 data_pending 尾事务。
+    pub fn promote(&self, force: bool) -> std::result::Result<PromoteOutcome, PromoteError> {
+        // 外预检(快速失败;事务内以 tget 锚定读集复核,并发角色变更 →
+        // 提交冲突重试后再判)
+        if self.repl_role()? != ReplRole::Standby {
+            return Err(PromoteError::NotStandby);
+        }
+        if self.repl_bucket_scoped()? {
+            return Err(PromoteError::BucketScoped);
+        }
+        const MAX_TXN_RETRIES: u32 = 10_000;
+        let mut retries = 0u32;
+        loop {
+            let tx = self.db.transaction_opt(&self.write_opts, &self.txn_opts);
+            // 角色/范围事务内锚定(读集):并发 set_repl_role 等变更 →
+            // 提交冲突检出
+            let role = match tx.get(SYS_REPL_ROLE).map_err(rocks_err)? {
+                Some(v) => ReplRole::parse(&String::from_utf8_lossy(&v))?,
+                None => ReplRole::Primary,
+            };
+            if role != ReplRole::Standby {
+                tx.rollback().map_err(rocks_err)?;
+                return Err(PromoteError::NotStandby);
+            }
+            if tx.get(SYS_REPL_BUCKET_SCOPED).map_err(rocks_err)?.is_some() {
+                tx.rollback().map_err(rocks_err)?;
+                return Err(PromoteError::BucketScoped);
+            }
+            let old_epoch = tx
+                .get(SYS_REPL_EPOCH)
+                .map_err(rocks_err)?
+                .map(|v| u64::from_be_bytes(v.as_slice().try_into().unwrap()))
+                .unwrap_or(REPL_INITIAL_EPOCH);
+            let cur_seq = tx
+                .get(SYS_SEQ)
+                .map_err(rocks_err)?
+                .map(|v| u64::from_be_bytes(v.as_slice().try_into().unwrap()))
+                .unwrap_or(0);
+            // 事务内重扫 pending/pdobj(迭代器读不入冲突集;并发 apply 的
+            // 检出靠角色/纪元锚点 + 调用方停 worker 纪律)
+            let mut pending_keys: Vec<Vec<u8>> = Vec::new();
+            let mut it = tx.iterator(IteratorMode::From(PREFIX_REPL_PENDING, Direction::Forward));
+            for item in &mut it {
+                let (k, _v) = item.map_err(rocks_err)?;
+                if !k.starts_with(PREFIX_REPL_PENDING) {
+                    break;
+                }
+                pending_keys.push(k.to_vec());
+            }
+            drop(it);
+            let mut pdobj_keys: Vec<Vec<u8>> = Vec::new();
+            let mut it = tx.iterator(IteratorMode::From(
+                PREFIX_REPL_PENDING_OBJ,
+                Direction::Forward,
+            ));
+            for item in &mut it {
+                let (k, _v) = item.map_err(rocks_err)?;
+                if !k.starts_with(PREFIX_REPL_PENDING_OBJ) {
+                    break;
+                }
+                pdobj_keys.push(k.to_vec());
+            }
+            drop(it);
+            if !pending_keys.is_empty() && !force {
+                // 拒绝路径:回滚后按 dry-run 同口径重建报告(状态未变,
+                // 两读同源;调用方停 worker 纪律保证期间无并发写)
+                tx.rollback().map_err(rocks_err)?;
+                return Err(PromoteError::PendingDiscards(
+                    self.promote_discard_report()?,
+                ));
+            }
+            let mut report = PromoteDiscardReport::default();
+            if !pending_keys.is_empty() {
+                // force 丢弃:pending 条目/pdobj 标记/对象 base+版本键同批
+                // 删除(对象版本键 = base+0x00 前缀域,同 repl_object_entries
+                // 口径)
+                let mut objects: Vec<(String, String)> = Vec::new();
+                for k in &pdobj_keys {
+                    objects.push(parse_repl_pending_obj_key(k)?);
+                }
+                objects.sort();
+                objects.dedup();
+                for (b, k) in &objects {
+                    let base = object_key(b, k);
+                    tx.delete(&base).map_err(rocks_err)?;
+                    let mut prefix = base;
+                    prefix.push(0x00);
+                    let mut it = tx.iterator(IteratorMode::From(&prefix, Direction::Forward));
+                    let mut version_keys = Vec::new();
+                    for item in &mut it {
+                        let (vk, _v) = item.map_err(rocks_err)?;
+                        if !vk.starts_with(&prefix) {
+                            break;
+                        }
+                        version_keys.push(vk.to_vec());
+                    }
+                    drop(it);
+                    for vk in version_keys {
+                        tx.delete(&vk).map_err(rocks_err)?;
+                    }
+                }
+                for k in &pending_keys {
+                    tx.delete(k).map_err(rocks_err)?;
+                }
+                for k in &pdobj_keys {
+                    tx.delete(k).map_err(rocks_err)?;
+                }
+                let gtid_range = match (pending_keys.first(), pending_keys.last()) {
+                    (Some(f), Some(l)) => {
+                        Some((parse_repl_pending_key(f)?, parse_repl_pending_key(l)?))
+                    }
+                    _ => None,
+                };
+                let mut buckets: Vec<String> = objects.iter().map(|(b, _)| b.clone()).collect();
+                buckets.sort();
+                buckets.dedup();
+                report = PromoteDiscardReport {
+                    pending_txns: pending_keys.len(),
+                    gtid_range,
+                    objects,
+                    buckets,
+                    downstream_slots: self.list_repl_slots()?,
+                };
+            }
+            // 代际推进(同批):epoch+1、ebase=cur、barrier 消耗 s:seq 一个
+            // 序号(此后首个本地 commit 的代内 seq = (cur+2) − cur = 2,
+            // 与 barrier {new,1} 连续)
+            let new_epoch = old_epoch
+                .checked_add(1)
+                .ok_or_else(|| Error::Corrupt("s:repl_epoch overflow on promote".into()))?;
+            tx.put(SYS_REPL_EPOCH, new_epoch.to_be_bytes())
+                .map_err(rocks_err)?;
+            tx.put(SYS_REPL_EBASE, cur_seq.to_be_bytes())
+                .map_err(rocks_err)?;
+            tx.put(SYS_SEQ, (cur_seq + 1).to_be_bytes())
+                .map_err(rocks_err)?;
+            // EpochBarrier 条目(空 ops;has_unscoped=true → 桶级槽强制随同)
+            let mut barrier = ReplRecord::new(new_epoch, &[]);
+            barrier.bucket_scope.has_unscoped = true;
+            barrier.ts = Some(now_ts());
+            barrier.epoch_barrier = Some(old_epoch);
+            tx.put(binlog_key(new_epoch, 1), barrier.encode_value()?)
+                .map_err(rocks_err)?;
+            // executed 并入 {新epoch, 1}(同批;GTID 集无洞)
+            let mut executed = match tx.get(SYS_REPL_EXECUTED).map_err(rocks_err)? {
+                Some(v) => GtidSet::decode(&v)?,
+                None => GtidSet::new(),
+            };
+            executed.insert(Gtid {
+                epoch: new_epoch,
+                seq: 1,
+            });
+            put_repl_executed_in_tx(&tx, &executed)?;
+            // 角色转正(同批)
+            tx.put(SYS_REPL_ROLE, ReplRole::Primary.as_str().as_bytes())
+                .map_err(rocks_err)?;
+            match tx.commit() {
+                Ok(()) => {
+                    // R12:failover 动作无条件 fsync(不依赖 SyncMode::Full)
+                    self.db.flush_wal(true).map_err(rocks_err)?;
+                    return Ok(PromoteOutcome {
+                        epoch: new_epoch,
+                        barrier: Gtid {
+                            epoch: new_epoch,
+                            seq: 1,
+                        },
+                        discarded: report,
+                    });
+                }
+                Err(e) if e.kind() == ErrorKind::Busy || e.kind() == ErrorKind::TryAgain => {
+                    retries += 1;
+                    if retries > MAX_TXN_RETRIES {
+                        return Err(Error::Meta(format!(
+                            "rocksdb txn retries exhausted after {MAX_TXN_RETRIES}: {e}"
+                        ))
+                        .into());
+                    }
+                    continue;
+                }
+                Err(e) => return Err(rocks_err(e).into()),
+            }
+        }
     }
 
     // —— 复制槽(M21 A3;ADR-33 RP3/RP8;设计稿 §3.3;键 `s:repl_slot\0{name}`) ——
@@ -3708,8 +4064,9 @@ impl MetaStore {
             .into_iter()
             .filter(|s| !s.stale)
             .collect();
-        // GTID 字典序 = 发生序(设计稿 §2.1);binlog 键序(seq)与提交序
-        // 一致,epoch 单调不减,故扫描序 = GTID 序。
+        // GTID 字典序 = 发生序(设计稿 §2.1);E3 起 bl: 键含 epoch,
+        // 键序 = GTID 字典序(结构性保证,不再是「epoch 单调不减」假设),
+        // 故扫描序 = GTID 序。
         let floor: Option<Gtid> = slots.iter().map(|s| s.confirmed_gtid).min();
 
         struct Entry {
@@ -3726,11 +4083,15 @@ impl MetaStore {
         for item in scan_prefix(&self.db, PREFIX_BINLOG) {
             let (k, v) = item?;
             let rec = ReplRecord::decode_value(&v)?;
+            let gtid = parse_binlog_gtid(&k)?;
+            if rec.epoch != gtid.epoch {
+                return Err(Error::Corrupt(format!(
+                    "binlog key epoch {} != record epoch {} (bl: 键即 GTID,E3)",
+                    gtid.epoch, rec.epoch
+                )));
+            }
             entries.push(Entry {
-                gtid: Gtid {
-                    epoch: rec.epoch,
-                    seq: parse_binlog_seq(&k)?,
-                },
+                gtid,
                 bytes: v.len() as u64,
                 ts: rec.ts,
                 refs: rec.data_refs,
@@ -3798,7 +4159,7 @@ impl MetaStore {
         let cut_through = entries[cut - 1].gtid;
         let mut batch = WriteBatchWithTransaction::<true>::default();
         for e in &entries[..cut] {
-            batch.delete(binlog_key(e.gtid.seq));
+            batch.delete(binlog_key(e.gtid.epoch, e.gtid.seq));
         }
         // E1 中继段映射(s:repl_rmap)同批回收:映射条目只服务「引用它
         // 的 bl: 记录仍可被下游续拉」的窗口——记录被截断(全部活跃槽已
@@ -4139,19 +4500,20 @@ impl MetaStore {
         Ok(s)
     }
 
-    // —— 复制 binlog(M21 A1;ADR-33 RP1/RP2;键 `bl:{seq be64}`) ——
+    // —— 复制 binlog(M21 A1;ADR-33 RP1/RP2;键 `bl:{epoch be64}{seq be64}`
+    //   = GTID 本体;E3 起 epoch 入键,见 keys.rs binlog_key 注释) ——
 
     /// 读单条 binlog 记录(缺席 → None)。
-    pub fn repl_record(&self, seq: u64) -> Result<Option<ReplRecord>> {
-        match self.db.get(binlog_key(seq)).map_err(rocks_err)? {
+    pub fn repl_record(&self, g: Gtid) -> Result<Option<ReplRecord>> {
+        match self.db.get(binlog_key(g.epoch, g.seq)).map_err(rocks_err)? {
             Some(v) => ReplRecord::decode_value(&v).map(Some),
             None => Ok(None),
         }
     }
 
-    /// 全量扫描 binlog(seq 升序;A1 原子性用例/诊断用。复制口的增量
+    /// 全量扫描 binlog(GTID 升序;A1 原子性用例/诊断用。复制口的增量
     /// 拉取与 A3 水位截断在 B1/A3 落各自的带界迭代)。
-    pub fn repl_binlog_entries(&self) -> Result<Vec<(u64, ReplRecord)>> {
+    pub fn repl_binlog_entries(&self) -> Result<Vec<(Gtid, ReplRecord)>> {
         let mut out = Vec::new();
         for item in self
             .db
@@ -4161,22 +4523,23 @@ impl MetaStore {
             if !k.starts_with(PREFIX_BINLOG) {
                 break;
             }
-            out.push((parse_binlog_seq(&k)?, ReplRecord::decode_value(&v)?));
+            out.push((parse_binlog_gtid(&k)?, ReplRecord::decode_value(&v)?));
         }
         Ok(out)
     }
 
     /// 复制口增量拉取的有界迭代(M21 B1;ADR-33 RP6;A1 注释预留的带界
-    /// 迭代在此落地):从 `after_seq` 之后起取至多 `limit` 条(seq 升序)。
-    /// binlog 键序 = s:seq 提交序且 epoch 单调不减(truncate_binlog 注释
-    /// 口径),扫描序 = GTID 序;after GTID 的 epoch 维字典序过滤由复制口
-    /// 在记录层做(repl.rs)。
-    pub fn repl_binlog_scan(&self, after_seq: u64, limit: usize) -> Result<Vec<(u64, ReplRecord)>> {
+    /// 迭代在此落地):从 `after` 之后起取至多 `limit` 条(GTID 升序)。
+    /// 键序 = GTID 字典序(E3 起 epoch 入键,truncate_binlog 注释口径),
+    /// 扫描序 = GTID 序;after 在旧 epoch 而旧代条目已尽时,扫描自然跨
+    /// 入新一代(`bl:{after.epoch}{after.seq+1}` 之后即
+    /// `bl:{after.epoch+1}{1}`——级联 promote 后续流免费获得,E3/E4)。
+    pub fn repl_binlog_scan(&self, after: Gtid, limit: usize) -> Result<Vec<(Gtid, ReplRecord)>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         let mut out = Vec::with_capacity(limit.min(1024));
-        let start = binlog_key(after_seq.saturating_add(1));
+        let start = binlog_key(after.epoch, after.seq.saturating_add(1));
         for item in self
             .db
             .iterator(IteratorMode::From(&start, Direction::Forward))
@@ -4185,7 +4548,11 @@ impl MetaStore {
             if !k.starts_with(PREFIX_BINLOG) {
                 break;
             }
-            out.push((parse_binlog_seq(&k)?, ReplRecord::decode_value(&v)?));
+            let g = parse_binlog_gtid(&k)?;
+            if g <= after {
+                continue; // 跨代边界防御(From 含等于位,正常不触发)
+            }
+            out.push((g, ReplRecord::decode_value(&v)?));
             if out.len() >= limit {
                 break;
             }
@@ -4193,15 +4560,15 @@ impl MetaStore {
         Ok(out)
     }
 
-    /// retained binlog 内 seq > `after_seq` 的**编码值字节**合计(M21 D1
+    /// retained binlog 内 GTID > `after` 的**编码值字节**合计(M21 D1
     /// lag_bytes 估算输入;ADR-33 RP3.3 槽位观测)。口径:retained 窗口内
     /// 未消费字节——已被截断的部分不可知不计(截断后槽位 lag 以
     /// lag_seq/stale 为准);binlog 键序 = GTID 序(同 repl_binlog_scan
-    /// 口径),跨 epoch 为下界。观测面低频全扫,规模受 RP8 retain 水位
+    /// 口径,跨 epoch 精确)。观测面低频全扫,规模受 RP8 retain 水位
     /// 约束,不进热路径。
-    pub fn repl_binlog_bytes_after(&self, after_seq: u64) -> Result<u64> {
+    pub fn repl_binlog_bytes_after(&self, after: Gtid) -> Result<u64> {
         let mut total = 0u64;
-        let start = binlog_key(after_seq.saturating_add(1));
+        let start = binlog_key(after.epoch, after.seq.saturating_add(1));
         for item in self
             .db
             .iterator(IteratorMode::From(&start, Direction::Forward))
@@ -4209,6 +4576,9 @@ impl MetaStore {
             let (k, v) = item.map_err(rocks_err)?;
             if !k.starts_with(PREFIX_BINLOG) {
                 break;
+            }
+            if parse_binlog_gtid(&k)? <= after {
+                continue;
             }
             total = total.saturating_add(v.len() as u64);
         }
@@ -5659,13 +6029,14 @@ enum ApplyMode<'a> {
     ///   record.seq)一律用**上游原 seq**(gtid.seq),与上游键形逐键一致;
     /// - `s:seq` 推进至 `max(当前, gtid.seq)`(防 promote 转正后 seq
     ///   回退、与已重放 bl: 键碰撞);
-    /// - `bl:{原 seq}` 写**原样 ReplRecord**(原 epoch/ops/data_refs/ts,
-    ///   不从 ops 重建——重建会丢 ts/原 data_refs 形态);
+    /// - `bl:{原epoch}{原seq}` 写**原样 ReplRecord**(原 epoch/ops/
+    ///   data_refs/ts;不从 ops 重建——重建会丢 ts/原 data_refs 形态);
     /// - `Op::Alloc`(a:/t: 上游分配记录)**跳过不落盘**(§4.3 布局独立:
     ///   备端本地分配器不认识上游 extent;段数据到位后由本地分配器重新
     ///   分配,C2/C3 接线);
-    /// - 跨 epoch 续流(epoch barrier / seq 重计)属 E3 promote 边界,
-    ///   本模式假定同 epoch 单调流(worker 握手保证,B4 不做 epoch 重编号)。
+    /// - 跨 epoch 续流(E3 已落:epoch 入 bl: 键 + barrier 条目心跳式
+    ///   apply;seq 重计后 `e:`/`x:` 键内序号的跨代碰撞复核归 E4,
+    ///   DESIGN.md ADR-33 RP2.1 旁注)。
     Replay { gtid: Gtid, record: &'a ReplRecord },
 }
 
@@ -6499,27 +6870,37 @@ fn apply_ops(
     }
 
     // M21 A1(ADR-33 RP1/RP2;设计稿 §3.2):binlog 开关开启时,把整事务
-    // ops 以 ReplRecord 写入 `bl:{seq}`(seq = 本事务 s:seq 序号)——与
-    // 元数据变更同批同 WAL(照 EventEnqueue 臂口径),崩溃零漂移且**不增
-    // 组提交 fsync 次数**;事务失败整体回滚,bl: 零残留。开关默认关,
-    // 未启用时零开销(此分支不进入)。
-    // M21 B4(Replay):重放路径恒写 `bl:{原 seq}` = **原样 ReplRecord**
-    // (不重编号,与 repl_binlog 开关节流无关——备端/中继本地 binlog 是
-    // 级联转发与 promote 后续流的载体,E1/E3 直接消费)。
+    // ops 以 ReplRecord 写入 `bl:{epoch}{代内 seq}`——与元数据变更同批同
+    // WAL(照 EventEnqueue 臂口径),崩溃零漂移且**不增组提交 fsync 次数**;
+    // 事务失败整体回滚,bl: 零残留。开关默认关,未启用时零开销(此分支
+    // 不进入)。
+    // M21 E3(RP2.1):**代内 GTID seq = s:seq − s:repl_ebase**(promote
+    // 后新 epoch 从 seq=1 重计而 s:seq 全局不回退——a:/t:/e: 键内序号以
+    // s:seq 为锚;初始代 ebase 缺席 = 0,seq == s:seq,A1 口径不变);
+    // 键含 epoch(E3),跨 promote 不碰撞。
+    // M21 B4(Replay):重放路径恒写 `bl:{原 epoch}{原 seq}` = **原样
+    // ReplRecord**(不重编号,与 repl_binlog 开关节流无关——备端/中继
+    // 本地 binlog 是级联转发与 promote 后续流的载体,E1/E3 直接消费)。
     match mode {
         ApplyMode::Commit { repl_binlog: true } => {
             let epoch = tget(tx, SYS_REPL_EPOCH)?
                 .map(|v| u64::from_be_bytes(v.as_slice().try_into().unwrap()))
                 .unwrap_or(REPL_INITIAL_EPOCH);
+            let ebase = tget(tx, SYS_REPL_EBASE)?
+                .map(|v| u64::from_be_bytes(v.as_slice().try_into().unwrap()))
+                .unwrap_or(0);
+            let gtid_seq = seq.checked_sub(ebase).ok_or_else(|| {
+                Error::Corrupt(format!("s:repl_ebase {ebase} > commit seq {seq}"))
+            })?;
             let mut rec = ReplRecord::new(epoch, ops);
             // M21 A3:提交墙钟,repl_retain_hours 软上限的年龄输入(截断侧
             // 双读:A1 存量记录 ts=None 保守保数据)。
             rec.ts = Some(now_ts());
-            tinsert(tx, binlog_key(seq), rec.encode_value()?)?;
+            tinsert(tx, binlog_key(epoch, gtid_seq), rec.encode_value()?)?;
         }
         ApplyMode::Commit { repl_binlog: false } => {}
         ApplyMode::Replay { gtid, record } => {
-            tinsert(tx, binlog_key(gtid.seq), record.encode_value()?)?;
+            tinsert(tx, binlog_key(gtid.epoch, gtid.seq), record.encode_value()?)?;
         }
     }
 
@@ -7077,8 +7458,9 @@ mod tests {
     }
 
     /// M21 A1(ADR-33 RP1/RP2;设计稿 §3.2):binlog 与元数据同事务——
-    /// ① 开关开启后每条已提交事务恰一条 `bl:{seq}` 记录,键 seq = 事务
-    ///   seq,记录内 ops 原样、epoch = 当前复制代(缺省初始代 1);
+    /// ① 开关开启后每条已提交事务恰一条 `bl:{epoch}{代内seq}` 记录
+    ///   (E3 起 epoch 入键;初始代代内 seq = 事务 seq),记录内 ops 原
+    ///   样、epoch = 当前复制代(缺省初始代 1);
     /// ② data_refs 只含段引用(内联小对象随 Op 值直达,不产生引用),
     ///   bucket_scope 从事务 ops 提取;
     /// ③ 失败事务整体回滚:seq 不消耗、bl: 零残留;
@@ -7152,7 +7534,13 @@ mod tests {
                 meta: object_meta(1),
             }]);
             assert!(err.is_err());
-            assert!(meta.repl_record(s2 + 1).unwrap().is_none());
+            assert!(meta
+                .repl_record(Gtid {
+                    epoch: REPL_INITIAL_EPOCH,
+                    seq: s2 + 1
+                })
+                .unwrap()
+                .is_none());
             // 事务 3:删内联对象 + 负向统计(失败事务不消耗 seq)
             ops3 = vec![
                 Op::ObjectDelete {
@@ -7178,7 +7566,7 @@ mod tests {
             let entries = meta.repl_binlog_entries().unwrap();
             assert_eq!(entries.len(), 4);
             assert_eq!(
-                entries.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
+                entries.iter().map(|(g, _)| g.seq).collect::<Vec<_>>(),
                 vec![s1, s2, s3, s4]
             );
             // 记录内容:epoch = 初始代;ops 原样往返
@@ -7209,7 +7597,16 @@ mod tests {
             assert!(entries[3].1.bucket_scope.buckets.is_empty());
             assert!(entries[3].1.bucket_scope.has_unscoped);
             // 点读路径
-            assert_eq!(meta.repl_record(s2).unwrap().unwrap().ops, ops2);
+            assert_eq!(
+                meta.repl_record(Gtid {
+                    epoch: REPL_INITIAL_EPOCH,
+                    seq: s2
+                })
+                .unwrap()
+                .unwrap()
+                .ops,
+                ops2
+            );
             meta.flush().unwrap();
         }
         // ⑤ 崩溃重放(重开):binlog 与元数据零漂移
@@ -7217,7 +7614,13 @@ mod tests {
             let meta = MetaStore::open(dir.path(), &cfg).unwrap();
             let entries = meta.repl_binlog_entries().unwrap();
             assert_eq!(entries.len(), 4, "重启后 binlog 完整重放");
-            assert_eq!(entries[1].0, s2);
+            assert_eq!(
+                entries[1].0,
+                Gtid {
+                    epoch: REPL_INITIAL_EPOCH,
+                    seq: s2
+                }
+            );
             assert_eq!(entries[1].1.ops, ops2);
             // 元数据侧同事务状态:big 在、small 已删、ghost 桶/对象零残留
             assert!(meta.get_object("b1", "big").unwrap().is_some());
@@ -7228,7 +7631,13 @@ mod tests {
             assert_eq!(s5, s3 + 2);
             let entries = meta.repl_binlog_entries().unwrap();
             assert_eq!(entries.len(), 5);
-            assert_eq!(entries[4].0, s5);
+            assert_eq!(
+                entries[4].0,
+                Gtid {
+                    epoch: REPL_INITIAL_EPOCH,
+                    seq: s5
+                }
+            );
         }
     }
 
@@ -7249,19 +7658,28 @@ mod tests {
             meta.commit_bucket_put(&format!("b{i}"), &bucket_meta(&format!("b{i}")))
                 .unwrap();
         }
-        let all = meta.repl_binlog_scan(0, 100).unwrap();
+        let z = Gtid { epoch: 0, seq: 0 };
+        let all = meta.repl_binlog_scan(z, 100).unwrap();
         assert_eq!(
-            all.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            all.iter().map(|(g, _)| g.seq).collect::<Vec<_>>(),
             vec![1, 2, 3, 4, 5]
         );
         // 断点续拉 + limit 截断
-        let page = meta.repl_binlog_scan(2, 2).unwrap();
-        assert_eq!(page.iter().map(|(s, _)| *s).collect::<Vec<_>>(), vec![3, 4]);
-        let tail = meta.repl_binlog_scan(4, 100).unwrap();
-        assert_eq!(tail.iter().map(|(s, _)| *s).collect::<Vec<_>>(), vec![5]);
+        let page = meta.repl_binlog_scan(Gtid { epoch: 1, seq: 2 }, 2).unwrap();
+        assert_eq!(
+            page.iter().map(|(g, _)| g.seq).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        let tail = meta
+            .repl_binlog_scan(Gtid { epoch: 1, seq: 4 }, 100)
+            .unwrap();
+        assert_eq!(tail.iter().map(|(g, _)| g.seq).collect::<Vec<_>>(), vec![5]);
         // 边界:尾后空批(长轮询前的现状口径)/ limit=0
-        assert!(meta.repl_binlog_scan(5, 100).unwrap().is_empty());
-        assert!(meta.repl_binlog_scan(0, 0).unwrap().is_empty());
+        assert!(meta
+            .repl_binlog_scan(Gtid { epoch: 1, seq: 5 }, 100)
+            .unwrap()
+            .is_empty());
+        assert!(meta.repl_binlog_scan(z, 0).unwrap().is_empty());
     }
 
     /// M21 B4(ADR-33 RP4.2;设计稿 §4.1;TODO M21/B4 具名用例):
@@ -7271,7 +7689,7 @@ mod tests {
     /// ② `Op::Alloc` 跳过不落盘(a:/t: 零残留,§4.3 布局独立);
     /// ③ 崩溃重放(重开 MetaStore)后再放同一记录仍 SkippedDuplicate,
     ///    游标/executed/bl:/待回填与崩溃前一致(同事务落盘 ⇒ 零漂移);
-    /// ④ 不重编号:bl:{原 seq} 内容 = 原样 ReplRecord;s:seq 推进至原
+    /// ④ 不重编号:bl:{原epoch}{原seq} 内容 = 原样 ReplRecord;s:seq 推进至原
     ///    seq,promote 后本地写从 seq+1 续(防回退);
     /// ⑤ epoch fencing:低于本地 epoch 的记录显式拒绝(§2.3)。
     #[test]
@@ -7337,7 +7755,7 @@ mod tests {
                 ReplApplyOutcome::Applied
             );
             // ④ 不重编号:bl: 键 = 原 seq,值 = 原样记录;s:seq 推进
-            assert_eq!(meta.repl_record(2).unwrap(), Some(rec2.clone()));
+            assert_eq!(meta.repl_record(g(2)).unwrap(), Some(rec2.clone()));
             assert_eq!(meta.last_seq().unwrap(), 2);
             assert_eq!(meta.repl_cursor().unwrap(), g(2));
             let stats = meta.get_bucket("b1").unwrap().unwrap().stats;
@@ -7919,6 +8337,299 @@ mod tests {
         assert!(meta.db.get(b"e:\0\0\0\0\0\0\0\x01").unwrap().is_some());
     }
 
+    /// E3 测试夹具:standby 库,apply 四条上游记录——g(1) 建桶 b1、g(2)
+    /// ObjectPut b1/big 带段(→ pending 条目 + pdobj 标记)、g(3) 建桶
+    /// b2、g(4) ObjectPut b2/obj2 带段。游标 = {1,4},s:seq = 4。
+    fn standby_with_pending(dir: &std::path::Path) -> MetaStore {
+        let meta = MetaStore::open(dir, &MetaConfig::default()).unwrap();
+        meta.set_repl_role(ReplRole::Standby).unwrap();
+        let g = |seq: u64| Gtid { epoch: 1, seq };
+        let seg = Segment {
+            extent_id: 7,
+            offset: 0,
+            len: 8192,
+            crcs: vec![0xAAAA],
+        };
+        let put_bucket = |name: &str| {
+            ReplRecord::new(
+                1,
+                &[Op::BucketPut {
+                    name: name.into(),
+                    meta: bucket_meta(name),
+                    location: None,
+                }],
+            )
+        };
+        let put_obj = |bucket: &str, key: &str| {
+            let mut m = object_meta(8192);
+            m.extents = vec![seg.clone()];
+            ReplRecord::new(
+                1,
+                &[Op::ObjectPut {
+                    bucket: bucket.into(),
+                    key: key.into(),
+                    meta: m,
+                }],
+            )
+        };
+        for (gtid, rec) in [
+            (g(1), put_bucket("b1")),
+            (g(2), put_obj("b1", "big")),
+            (g(3), put_bucket("b2")),
+            (g(4), put_obj("b2", "obj2")),
+        ] {
+            assert_eq!(
+                meta.apply_repl_record(gtid, &rec).unwrap(),
+                ReplApplyOutcome::Applied
+            );
+        }
+        meta
+    }
+
+    /// M21 E3(ADR-33 RP5.1;设计稿 §5.1.2;TODO M21/E3 具名用例):
+    /// **dry-run 列出丢弃清单且零副作用**——
+    /// ① 清单口径:pending_txns / gtid_range(队列首末)/ objects(pdobj
+    ///    标记解析,排序去重)/ buckets / downstream_slots;
+    /// ② dry-run 前后 role/epoch/cursor/executed/pending/pdobj/对象 全
+    ///    不变(纯读);
+    /// ③ 非 force promote 撞 pending → Err(PendingDiscards),清单与
+    ///    dry-run 一致,状态仍不变。
+    #[test]
+    fn promote_dry_run_lists_discards_without_side_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = standby_with_pending(dir.path());
+        meta.put_repl_slot(&Slot {
+            name: "down-1".into(),
+            consumer_node_id: "node-c".into(),
+            confirmed_gtid: Gtid { epoch: 1, seq: 2 },
+            filters: BucketFilter::All,
+            created_at: 1,
+            last_ack_at: 1,
+            stale: false,
+        })
+        .unwrap();
+
+        let report = meta.promote_dry_run().unwrap();
+        assert_eq!(report.pending_txns, 2);
+        assert_eq!(
+            report.gtid_range,
+            Some((Gtid { epoch: 1, seq: 2 }, Gtid { epoch: 1, seq: 4 }))
+        );
+        assert_eq!(
+            report.objects,
+            vec![
+                ("b1".to_string(), "big".to_string()),
+                ("b2".to_string(), "obj2".to_string())
+            ]
+        );
+        assert_eq!(report.buckets, vec!["b1".to_string(), "b2".to_string()]);
+        assert_eq!(report.downstream_slots.len(), 1);
+        assert_eq!(report.downstream_slots[0].name, "down-1");
+
+        // ② 零副作用:状态逐项复核
+        assert_eq!(meta.repl_role().unwrap(), ReplRole::Standby);
+        assert_eq!(meta.repl_epoch().unwrap(), REPL_INITIAL_EPOCH);
+        assert_eq!(meta.repl_cursor().unwrap(), Gtid { epoch: 1, seq: 4 });
+        assert_eq!(
+            meta.repl_executed().unwrap().ranges().collect::<Vec<_>>(),
+            vec![(1, 1, 4)]
+        );
+        assert_eq!(meta.list_repl_pending(usize::MAX).unwrap().len(), 2);
+        assert!(meta.repl_object_data_pending("b1", "big").unwrap());
+        assert!(meta.get_object("b1", "big").unwrap().is_some());
+        assert!(meta.get_object("b2", "obj2").unwrap().is_some());
+        assert_eq!(meta.last_seq().unwrap(), 4);
+        assert_eq!(meta.repl_ebase().unwrap(), 0);
+
+        // ③ 非 force 拒绝,清单与 dry-run 一致,状态不变
+        let err = meta.promote(false).unwrap_err();
+        match err {
+            PromoteError::PendingDiscards(r) => assert_eq!(r, report),
+            other => panic!("expected PendingDiscards, got {other}"),
+        }
+        assert_eq!(meta.repl_role().unwrap(), ReplRole::Standby);
+        assert_eq!(meta.repl_epoch().unwrap(), REPL_INITIAL_EPOCH);
+        assert_eq!(meta.list_repl_pending(usize::MAX).unwrap().len(), 2);
+        assert!(meta.get_object("b1", "big").unwrap().is_some());
+        assert!(meta.repl_binlog_entries().unwrap().len() == 4);
+    }
+
+    /// M21 E3(ADR-33 RP2.1/RP5.2;R12;TODO M21/E3 具名用例):
+    /// **promote 崩溃无半状态**——promote 是单事务(apply 路径无中途可
+    /// 见态),崩溃点采样 = 前/后/拒绝三态:
+    /// ① promote 前 standby 态 drop+重开 → 原样;
+    /// ② promote(false) 成功后立刻 drop+重开(不 flush 之外的额外
+    ///    同步——promote 自身已无条件 flush_wal):epoch+1、role=primary、
+    ///    barrier 在 {新epoch,1} 且 epoch_barrier=Some(旧epoch)、
+    ///    executed 含旧段 + {新epoch:[1,1]}、ebase = 旧 s:seq、游标不变;
+    /// ③ binlog 开启库:promote 后本地 commit 落在 bl:{新epoch}{2}
+    ///    (代内 seq 重计),scan(after={新epoch,1}) 与 scan(after=旧代
+    ///    尾) 的跨代边界都正确;
+    /// ④ 有 pending + force:对象/标记/队列清除,drop+重开状态完整一致。
+    #[test]
+    fn promote_crash_no_half_state() {
+        // ①② 纯 standby 库(无 pending):promote 前/后崩溃采样
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let meta = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
+            meta.set_repl_role(ReplRole::Standby).unwrap();
+            let g = |seq: u64| Gtid { epoch: 1, seq };
+            for seq in 1..=2 {
+                let rec = ReplRecord::new(
+                    1,
+                    &[Op::BucketPut {
+                        name: format!("b{seq}"),
+                        meta: bucket_meta(&format!("b{seq}")),
+                        location: None,
+                    }],
+                );
+                meta.apply_repl_record(g(seq), &rec).unwrap();
+            }
+            meta.flush().unwrap();
+            drop(meta);
+            // ① promote 前重开:standby 态原样
+            let meta = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
+            assert_eq!(meta.repl_role().unwrap(), ReplRole::Standby);
+            assert_eq!(meta.repl_epoch().unwrap(), 1);
+            assert_eq!(meta.repl_cursor().unwrap(), g(2));
+
+            // ② promote 成功(无 pending,非 force)
+            let out = meta.promote(false).unwrap();
+            assert_eq!(out.epoch, 2);
+            assert_eq!(out.barrier, Gtid { epoch: 2, seq: 1 });
+            assert_eq!(out.discarded, PromoteDiscardReport::default());
+            drop(meta);
+            // 重开:无半状态——代际推进五件事(epoch/ebase/s:seq/barrier/
+            // executed/role)要么全在要么全不在;此处全在
+            let meta = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
+            assert_eq!(meta.repl_epoch().unwrap(), 2);
+            assert_eq!(meta.repl_role().unwrap(), ReplRole::Primary);
+            assert_eq!(meta.repl_ebase().unwrap(), 2, "ebase = 旧 s:seq");
+            assert_eq!(meta.last_seq().unwrap(), 3, "barrier 消耗一个 s:seq");
+            let barrier = meta
+                .repl_record(Gtid { epoch: 2, seq: 1 })
+                .unwrap()
+                .unwrap();
+            assert_eq!(barrier.epoch, 2);
+            assert_eq!(barrier.epoch_barrier, Some(1));
+            assert!(barrier.ops.is_empty());
+            assert!(barrier.bucket_scope.has_unscoped);
+            assert!(barrier.ts.is_some());
+            assert_eq!(
+                meta.repl_executed().unwrap().ranges().collect::<Vec<_>>(),
+                vec![(1, 1, 2), (2, 1, 1)]
+            );
+            assert_eq!(meta.repl_cursor().unwrap(), g(2), "游标不动");
+            // 幂等护栏:已转正,再 promote → NotStandby
+            assert!(matches!(
+                meta.promote(false).unwrap_err(),
+                PromoteError::NotStandby
+            ));
+        }
+
+        // ③ binlog 开启库:promote 后本地写走代内 seq 重计 + 跨代扫描
+        let dir3 = tempfile::tempdir().unwrap();
+        let cfg = MetaConfig {
+            repl_binlog: true,
+            ..MetaConfig::default()
+        };
+        let meta = MetaStore::open(dir3.path(), &cfg).unwrap();
+        meta.set_repl_role(ReplRole::Standby).unwrap();
+        let g1 = |seq: u64| Gtid { epoch: 1, seq };
+        for seq in 1..=3 {
+            let rec = ReplRecord::new(
+                1,
+                &[Op::BucketPut {
+                    name: format!("b{seq}"),
+                    meta: bucket_meta(&format!("b{seq}")),
+                    location: None,
+                }],
+            );
+            meta.apply_repl_record(g1(seq), &rec).unwrap();
+        }
+        let out = meta.promote(false).unwrap();
+        assert_eq!(out.epoch, 2);
+        // promote 后本地 commit:s:seq 3→4→5(barrier=4,本事务=5),代内
+        // GTID seq = 5 − ebase(3) = 2 → bl:{2}{2}
+        meta.commit_bucket_put("local", &bucket_meta("local"))
+            .unwrap();
+        let rec = meta
+            .repl_record(Gtid { epoch: 2, seq: 2 })
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.epoch, 2);
+        assert_eq!(rec.epoch_barrier, None);
+        // 跨代边界:旧代尾之后 = barrier + 新代首 commit(键序 = GTID 序)
+        let cross = meta.repl_binlog_scan(g1(3), 10).unwrap();
+        assert_eq!(
+            cross.iter().map(|(g, _)| *g).collect::<Vec<_>>(),
+            vec![Gtid { epoch: 2, seq: 1 }, Gtid { epoch: 2, seq: 2 }]
+        );
+        let after_barrier = meta
+            .repl_binlog_scan(Gtid { epoch: 2, seq: 1 }, 10)
+            .unwrap();
+        assert_eq!(
+            after_barrier.iter().map(|(g, _)| *g).collect::<Vec<_>>(),
+            vec![Gtid { epoch: 2, seq: 2 }]
+        );
+        // 全量:旧代 3 条 + barrier + 新代 1 条
+        assert_eq!(meta.repl_binlog_entries().unwrap().len(), 5);
+
+        // ④ force:pending 对象/标记/队列清除,重开一致
+        let dir4 = tempfile::tempdir().unwrap();
+        {
+            let meta = standby_with_pending(dir4.path());
+            let out = meta.promote(true).unwrap();
+            assert_eq!(out.epoch, 2);
+            assert_eq!(out.discarded.pending_txns, 2);
+            assert_eq!(out.discarded.objects.len(), 2);
+            assert!(meta.list_repl_pending(usize::MAX).unwrap().is_empty());
+            assert!(!meta.repl_object_data_pending("b1", "big").unwrap());
+            assert!(!meta.repl_object_data_pending("b2", "obj2").unwrap());
+            assert!(meta.get_object("b1", "big").unwrap().is_none());
+            assert!(meta.get_object("b2", "obj2").unwrap().is_none());
+            assert!(meta.get_bucket("b1").unwrap().is_some(), "桶本体保留");
+            drop(meta);
+            let meta = MetaStore::open(dir4.path(), &MetaConfig::default()).unwrap();
+            assert_eq!(meta.repl_role().unwrap(), ReplRole::Primary);
+            assert_eq!(meta.repl_epoch().unwrap(), 2);
+            assert!(meta.list_repl_pending(usize::MAX).unwrap().is_empty());
+            assert!(meta.get_object("b1", "big").unwrap().is_none());
+            assert!(meta
+                .repl_record(Gtid { epoch: 2, seq: 1 })
+                .unwrap()
+                .is_some());
+        }
+    }
+
+    /// M21 E3(ADR-33 RP4.5;设计稿 §5.4):桶级备显式拒绝(GTID 集有洞);
+    /// 非 standby 角色拒绝。
+    #[test]
+    fn promote_bucket_scoped_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = standby_with_pending(dir.path());
+        meta.set_repl_bucket_scoped(true).unwrap();
+        assert!(matches!(
+            meta.promote_dry_run().unwrap_err(),
+            PromoteError::BucketScoped
+        ));
+        assert!(matches!(
+            meta.promote(true).unwrap_err(),
+            PromoteError::BucketScoped
+        ));
+        // 复位范围标记但角色非 standby → NotStandby
+        meta.set_repl_bucket_scoped(false).unwrap();
+        meta.set_repl_role(ReplRole::Primary).unwrap();
+        assert!(matches!(
+            meta.promote_dry_run().unwrap_err(),
+            PromoteError::NotStandby
+        ));
+        assert!(matches!(
+            meta.promote(false).unwrap_err(),
+            PromoteError::NotStandby
+        ));
+    }
+
     /// ranges 辅助:GTID 集 → (epoch, start, end) 升序表(测试断言用)。
     fn ranges(s: &GtidSet) -> Vec<(u64, u64, u64)> {
         s.ranges().collect()
@@ -7945,7 +8656,14 @@ mod tests {
         }
         let entries = meta.repl_binlog_entries().unwrap();
         assert_eq!(entries.len(), 11);
-        assert_eq!(entries[0].0, 1, "首事务 seq=1(建桶)");
+        assert_eq!(
+            entries[0].0,
+            Gtid {
+                epoch: REPL_INITIAL_EPOCH,
+                seq: 1
+            },
+            "首事务 seq=1(建桶)"
+        );
         let bytes: Vec<u64> = entries
             .iter()
             .map(|(_, r)| r.encode_value().unwrap().len() as u64)
@@ -8006,11 +8724,22 @@ mod tests {
         // 槽受保护:位点之上(seq>4)的 binlog 一条不丢
         for seq in 5..=11 {
             assert!(
-                meta.repl_record(seq).unwrap().is_some(),
+                meta.repl_record(Gtid {
+                    epoch: REPL_INITIAL_EPOCH,
+                    seq
+                })
+                .unwrap()
+                .is_some(),
                 "滞后槽未消费条目 seq={seq} 必须保留"
             );
         }
-        assert!(meta.repl_record(4).unwrap().is_none());
+        assert!(meta
+            .repl_record(Gtid {
+                epoch: REPL_INITIAL_EPOCH,
+                seq: 4
+            })
+            .unwrap()
+            .is_none());
         assert_eq!(meta.repl_binlog_entries().unwrap().len(), 7);
         // 槽不被标 stale;约束仍生效(再次截断仍停在位点)
         assert!(!meta.repl_slot("slow").unwrap().unwrap().stale);
@@ -8040,8 +8769,20 @@ mod tests {
         assert_eq!(stats.truncated, 8, "硬上限强截 seq 1..=8");
         assert_eq!(stats.stale_marked, 1);
         // 强制截断发生:seq 8 已删,seq 9 起保留
-        assert!(meta.repl_record(8).unwrap().is_none());
-        assert!(meta.repl_record(9).unwrap().is_some());
+        assert!(meta
+            .repl_record(Gtid {
+                epoch: REPL_INITIAL_EPOCH,
+                seq: 8
+            })
+            .unwrap()
+            .is_none());
+        assert!(meta
+            .repl_record(Gtid {
+                epoch: REPL_INITIAL_EPOCH,
+                seq: 9
+            })
+            .unwrap()
+            .is_some());
         assert_eq!(meta.repl_binlog_entries().unwrap().len(), 3);
         // 被越过的 slow 标记 stale(下次握手 ErrBinlogGone → 显式重建,
         // B2 接线);fast 位点在截断点之上,不受影响

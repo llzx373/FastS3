@@ -43,11 +43,19 @@ impl ReplMetricsProvider {
         // ── 上游侧:逐槽 lag ──
         match self.meta.list_repl_slots() {
             Ok(slots) if !slots.is_empty() => {
-                // 水位 = (repl_epoch, last_seq),与 ReplServer::high_watermark 同式
-                let watermark = match (self.meta.repl_epoch(), self.meta.last_seq()) {
-                    (Ok(epoch), Ok(seq)) => fs3_core::Gtid { epoch, seq },
-                    (e1, e2) => {
-                        tracing::warn!("repl metrics watermark: {e1:?} {e2:?}");
+                // 水位 = (repl_epoch, last_seq − repl_ebase)(E3 代内 seq
+                // 重计),与 ReplServer::high_watermark 同式
+                let watermark = match (
+                    self.meta.repl_epoch(),
+                    self.meta.last_seq(),
+                    self.meta.repl_ebase(),
+                ) {
+                    (Ok(epoch), Ok(seq), Ok(ebase)) => fs3_core::Gtid {
+                        epoch,
+                        seq: seq.saturating_sub(ebase),
+                    },
+                    (e1, e2, e3) => {
+                        tracing::warn!("repl metrics watermark: {e1:?} {e2:?} {e3:?}");
                         return out;
                     }
                 };

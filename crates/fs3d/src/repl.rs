@@ -76,8 +76,9 @@
 //!   `[1, 最大 retained seq]` 并入(纯主端 s:repl_executed 为空时由此兜底,
 //!   否则已截断的正常历史会被误判分歧)。
 //! - epoch 语义:握手按 (epoch, seq) 二元组字典序比较;RP2「新 epoch 从
-//!   seq=1 重计」落地属 E3 promote,届时复核跨 epoch 续流边界(本任务不对
-//!   现有 bl: 存储做 epoch 重编号)。
+//!   seq=1 重计」已在 E3 落地——bl: 键含 epoch(键序 = GTID 字典序),
+//!   代内 seq = s:seq − s:repl_ebase;跨 promote 代际边界的续流由键序
+//!   免费获得(repl_binlog_scan/handle_binlog 注释)。
 //!
 //! 本任务边界(后续任务接线,勿在此抢跑):逐槽指标导出属 D4。D1 已落地:
 //! slots 端点 lag 三件套(lag_seq/lag_bytes/lag_seconds,口径见
@@ -671,23 +672,24 @@ impl ReplServer {
                 Ok(g) => g,
                 Err(e) => return internal_err("binlog watermark", &e),
             };
-            // seq 定位:s:seq 全局单调(A1 键序口径),after.seq+1 起迭代;
-            // epoch 维字典序过滤在记录层兜底(after.epoch > 当前代 = 未来代,
-            // 空批——分歧裁决属 B2 握手,不在拉取路径)。
+            // GTID 定位:bl: 键含 epoch(E3),键序 = GTID 字典序,扫描从
+            // after 之后起;after 在旧代而旧代已尽时扫描自然跨入新一代
+            // (级联 promote 后续流免费获得)。after.epoch > 当前代 = 未来
+            // 代,空批——分歧裁决属 B2 握手,不在拉取路径。
             let entries = if after.epoch > watermark.epoch {
                 Vec::new()
             } else {
-                match self.meta.repl_binlog_scan(after.seq, limit) {
+                match self.meta.repl_binlog_scan(after, limit) {
                     Ok(v) => v
                         .into_iter()
-                        .filter(|(seq, rec)| (rec.epoch, *seq) > (after.epoch, after.seq))
+                        .filter(|(gtid, _)| *gtid > after)
                         // D2 上游侧过滤:不命中槽过滤器的记录以心跳带过
-                        // (seq 原位保留,游标连续、GTID 无洞)
-                        .map(|(seq, rec)| {
+                        // (GTID 原位保留,游标连续、GTID 无洞)
+                        .map(|(gtid, rec)| {
                             if record_in_scope(&rec, &filters) {
-                                (seq, rec)
+                                (gtid, rec)
                             } else {
-                                (seq, heartbeat_of(&rec))
+                                (gtid, heartbeat_of(&rec))
                             }
                         })
                         .collect::<Vec<_>>(),
@@ -705,18 +707,15 @@ impl ReplServer {
             // 主端与已追平的节点 pending 恒空:每带引用条目一次点读,
             // 零行为变化。
             let mut ship = Vec::with_capacity(entries.len());
-            for (seq, rec) in entries {
+            for (gtid, rec) in entries {
                 if !rec.data_refs.is_empty() {
-                    match self.meta.repl_pending_exists(Gtid {
-                        epoch: rec.epoch,
-                        seq,
-                    }) {
+                    match self.meta.repl_pending_exists(gtid) {
                         Ok(true) => break,
                         Ok(false) => {}
                         Err(e) => return internal_err("repl pending probe", &e),
                     }
                 }
-                ship.push((seq, rec));
+                ship.push((gtid, rec));
             }
             let entries = ship;
             // 长轮询:空批且 wait 未挂满 → 挂起重扫(秒级以下粒度即可,
@@ -725,9 +724,9 @@ impl ReplServer {
                 use base64::Engine as _;
                 let items: Vec<serde_json::Value> = entries
                     .iter()
-                    .map(|(seq, rec)| {
+                    .map(|(gtid, rec)| {
                         serde_json::json!({
-                            "gtid": fmt_gtid(Gtid { epoch: rec.epoch, seq: *seq }),
+                            "gtid": fmt_gtid(*gtid),
                             "ts": rec.ts,
                             // 线格式:[版本字节]+postcard 的 base64(模块注释)
                             "record": base64::engine::general_purpose::STANDARD
@@ -876,12 +875,13 @@ impl ReplServer {
     /// RP3.1)。每槽在原始字段(B1 形状)上并 lag 三件套,口径钉死:
     /// - `lag_seq` = 水位 seq − confirmed seq(同 epoch 精确;跨 epoch
     ///   ——promote 后新代 seq 自 1 重计——旧代尾部不可由减法表达,取
-    ///   新代水位 seq 为下界;E3 前恒同 epoch);
-    /// - `lag_bytes` = retained binlog 内 seq > confirmed 的编码值字节
-    ///   合计(已被截断部分不可知不计;binlog 关闭/空 = 0);
+    ///   新代水位 seq 为下界);
+    /// - `lag_bytes` = retained binlog 内 GTID > confirmed 的编码值字节
+    ///   合计(E3 起 bl: 键序 = GTID 序,跨 epoch 精确;已被截断部分不
+    ///   可知不计;binlog 关闭/空 = 0);
     /// - `lag_seconds` 估算:主口径 = now − 首条未消费 retained 记录
-    ///   (seq = confirmed+1)的提交 ts——「最老未消费事务已等待时长」,
-    ///   点读 O(1);该记录已截断/A1 存量 ts=None 时回退 =
+    ///   (scan(confirmed,1) 首条,跨代安全)的提交 ts——「最老未消费
+    ///   事务已等待时长」;该记录已截断/A1 存量 ts=None 时回退 =
     ///   now − last_ack_at(回执陈旧度,语义更宽:含下游离线时间,
     ///   stale 槽只剩此口径);`lag_seq == 0` → 0。
     ///
@@ -1135,12 +1135,9 @@ impl ReplServer {
     fn binlog_floor(&self) -> Result<Option<Gtid>, fs3_core::Error> {
         Ok(self
             .meta
-            .repl_binlog_scan(0, 1)?
+            .repl_binlog_scan(Gtid { epoch: 0, seq: 0 }, 1)?
             .first()
-            .map(|(seq, rec)| Gtid {
-                epoch: rec.epoch,
-                seq: *seq,
-            }))
+            .map(|(g, _)| *g))
     }
 
     /// `POST /v1/repl/v1/slots`(B3 预登记;线格式见模块注释)。
@@ -1305,16 +1302,16 @@ impl ReplServer {
     fn upstream_gtid_set(&self) -> Result<GtidSet, fs3_core::Error> {
         let mut set = self.meta.repl_executed()?;
         let mut max_per_epoch: BTreeMap<u64, u64> = BTreeMap::new();
-        let mut after = 0u64;
+        let mut after = Gtid { epoch: 0, seq: 0 };
         loop {
             let page = self.meta.repl_binlog_scan(after, MAX_BINLOG_LIMIT)?;
             if page.is_empty() {
                 break;
             }
-            for (seq, rec) in &page {
-                let m = max_per_epoch.entry(rec.epoch).or_insert(0);
-                *m = (*m).max(*seq);
-                after = *seq;
+            for (gtid, _) in &page {
+                let m = max_per_epoch.entry(gtid.epoch).or_insert(0);
+                *m = (*m).max(gtid.seq);
+                after = *gtid;
             }
             if page.len() < MAX_BINLOG_LIMIT {
                 break;
@@ -1326,12 +1323,16 @@ impl ReplServer {
         Ok(set)
     }
 
-    /// 上游当前水位 = {当前 epoch, 最新事务 seq}(binlog 开启时每事务一条
-    /// bl: 记录,seq = s:seq;关闭时水位仍可读、批恒空)。
+    /// 上游当前水位 = {当前 epoch, 代内最新 GTID seq}(E3 起 = s:seq −
+    /// s:repl_ebase,promote 重计后水位随新代从 1 续;binlog 关闭时水位
+    /// 仍可读、批恒空)。
     fn high_watermark(&self) -> Result<Gtid, fs3_core::Error> {
         Ok(Gtid {
             epoch: self.meta.repl_epoch()?,
-            seq: self.meta.last_seq()?,
+            seq: self
+                .meta
+                .last_seq()?
+                .saturating_sub(self.meta.repl_ebase()?),
         })
     }
 
@@ -1681,7 +1682,7 @@ struct SnapshotRequest {
 /// promote」——filters != All 的槽其下游 GTID 集有洞;hello 响应携带
 /// 本标记,下游 pull worker 落本地 `s:repl_bscoped`,E3 promote 校验
 /// 读取)。
-fn slot_json(s: &Slot) -> serde_json::Value {
+pub(crate) fn slot_json(s: &Slot) -> serde_json::Value {
     serde_json::json!({
         "name": s.name,
         "consumer_node_id": s.consumer_node_id,
@@ -1699,9 +1700,11 @@ fn slot_json(s: &Slot) -> serde_json::Value {
 /// 返回 (lag_seq, lag_bytes, lag_seconds)。
 /// - `lag_seq` = 水位 seq − confirmed seq(同 epoch 精确;跨 epoch 取新代
 ///   水位 seq 为下界);
-/// - `lag_bytes` = retained binlog 内 seq > confirmed 的编码值字节合计;
-/// - `lag_seconds` = now − 首条未消费 retained 记录提交 ts(主口径);
-///   截断/ts 缺失回退 = now − last_ack_at;`lag_seq == 0` → 0。
+/// - `lag_bytes` = retained binlog 内 GTID > confirmed 的编码值字节合计
+///   (E3 起 bl: 键序 = GTID 序,跨 epoch 精确);
+/// - `lag_seconds` = now − 首条未消费 retained 记录提交 ts(主口径;
+///   scan(confirmed,1) 取首条,跨代安全);截断/ts 缺失回退 =
+///   now − last_ack_at;`lag_seq == 0` → 0。
 pub(crate) fn slot_lag_parts(
     meta: &MetaStore,
     s: &Slot,
@@ -1715,7 +1718,7 @@ pub(crate) fn slot_lag_parts(
         watermark.seq
     };
     let lag_bytes = if s.confirmed_gtid.epoch <= watermark.epoch {
-        meta.repl_binlog_bytes_after(s.confirmed_gtid.seq)?
+        meta.repl_binlog_bytes_after(s.confirmed_gtid)?
     } else {
         0
     };
@@ -1723,9 +1726,11 @@ pub(crate) fn slot_lag_parts(
         0
     } else {
         // 主口径:首条未消费 retained 记录的提交 ts 至今的等待时长
+        // (E3:scan 跨代安全——confirmed 在旧代而旧代已尽时取到新代首条)
         let waited = meta
-            .repl_record(s.confirmed_gtid.seq.saturating_add(1))?
-            .and_then(|rec| rec.ts)
+            .repl_binlog_scan(s.confirmed_gtid, 1)?
+            .first()
+            .and_then(|(_, rec)| rec.ts)
             .map(|ts| now_unix_secs().saturating_sub(ts))
             .filter(|d| *d >= 0);
         match waited {
@@ -1773,6 +1778,9 @@ fn heartbeat_of(rec: &ReplRecord) -> ReplRecord {
             has_unscoped: false,
         },
         ts: rec.ts,
+        // EpochBarrier 标记原样透传(barrier 恒 has_unscoped 不会被过滤,
+        // 此路径防御性保留;E3)
+        epoch_barrier: rec.epoch_barrier,
     }
 }
 
@@ -1861,7 +1869,7 @@ fn issue_delegated_cred(
 }
 
 /// GTID 文本形 `{epoch}-{seq}`(模块注释的线格式)。
-fn fmt_gtid(g: Gtid) -> String {
+pub(crate) fn fmt_gtid(g: Gtid) -> String {
     format!("{}-{}", g.epoch, g.seq)
 }
 
@@ -3022,7 +3030,12 @@ mod tests {
             .unwrap();
         assert_eq!(stats.truncated, 3);
         assert!(stats.soft_capped);
-        assert!(meta.repl_record(4).unwrap().is_some(), "未消费条目受槽保护");
+        assert!(
+            meta.repl_record(Gtid { epoch: 1, seq: 4 })
+                .unwrap()
+                .is_some(),
+            "未消费条目受槽保护"
+        );
 
         // ⑤ drop → 保留约束释放:再截断 seq 4 删除;重复 drop → 404
         let req =
@@ -3231,9 +3244,14 @@ mod tests {
             .unwrap();
         assert_eq!(stats.truncated, 2);
         assert!(stats.soft_capped);
-        assert!(meta.repl_record(2).unwrap().is_none());
+        assert!(meta
+            .repl_record(Gtid { epoch: 1, seq: 2 })
+            .unwrap()
+            .is_none());
         assert!(
-            meta.repl_record(3).unwrap().is_some(),
+            meta.repl_record(Gtid { epoch: 1, seq: 3 })
+                .unwrap()
+                .is_some(),
             "sb 未消费的 seq 3 受槽保护"
         );
 
@@ -3244,7 +3262,9 @@ mod tests {
             .unwrap();
         assert_eq!(stats.truncated, 1, "sa 追平后 seq 3 截断");
         assert!(
-            meta.repl_record(4).unwrap().is_some(),
+            meta.repl_record(Gtid { epoch: 1, seq: 4 })
+                .unwrap()
+                .is_some(),
             "sb @1-3 仍钳制 seq 4+"
         );
 
@@ -3304,7 +3324,7 @@ mod tests {
         assert_eq!(s1["confirmed_gtid"], "1-2");
         assert_eq!(s1["lag_seq"], 4, "lag_seq = 6 − 2");
         let want_bytes: u64 = meta
-            .repl_binlog_scan(2, 16)
+            .repl_binlog_scan(Gtid { epoch: 1, seq: 2 }, 16)
             .unwrap()
             .iter()
             .map(|(_, r)| r.encode_value().unwrap().len() as u64)
@@ -3488,7 +3508,10 @@ mod tests {
                     let seq: u64 = gtid[2..].parse().unwrap();
                     assert_eq!(
                         rec.ts,
-                        meta.repl_record(seq).unwrap().unwrap().ts,
+                        meta.repl_record(Gtid { epoch: 1, seq })
+                            .unwrap()
+                            .unwrap()
+                            .ts,
                         "{gtid} 心跳保留原提交 ts(D1 lag 口径可读)"
                     );
                 }
@@ -4732,7 +4755,14 @@ mod tests {
             1,
             "下游 bl: 只有追赶条目(快照不写 binlog)"
         );
-        assert_eq!(down_entries[0].0, p_seq + 1, "不重编号:原 seq 落盘");
+        assert_eq!(
+            down_entries[0].0,
+            Gtid {
+                epoch: 1,
+                seq: p_seq + 1
+            },
+            "不重编号:原 seq 落盘"
+        );
     }
 
     /// M21 C2(TODO M21/C2 具名用例):**上下游 extent_size 错配的引导**
@@ -4979,7 +5009,9 @@ mod tests {
             e.put("b0", "o3", &mut &p3[..]).unwrap();
         }
         let up_meta = up_engine.read().meta_arc();
-        let records = up_meta.repl_binlog_scan(0, 100).unwrap();
+        let records = up_meta
+            .repl_binlog_scan(Gtid { epoch: 0, seq: 0 }, 100)
+            .unwrap();
         assert_eq!(records.len(), 4, "桶 + 三对象 = 4 条 binlog");
 
         // 中继:standby 原样 apply(B4 路径)——bl: 原样落盘、三条 put
@@ -4987,12 +5019,8 @@ mod tests {
         let relay_engine = test_engine(&dir.path().join("relay"));
         let relay = relay_engine.read().meta_arc();
         relay.set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
-        for (seq, rec) in &records {
-            let gtid = Gtid {
-                epoch: rec.epoch,
-                seq: *seq,
-            };
-            relay.apply_repl_record(gtid, rec).unwrap();
+        for (gtid, rec) in &records {
+            relay.apply_repl_record(*gtid, rec).unwrap();
         }
         assert_eq!(relay.list_repl_pending(100).unwrap().len(), 3);
         let fx = start_server_on(relay_engine.clone(), relay.clone());
@@ -5659,6 +5687,7 @@ mod tests {
                     has_unscoped: false,
                 },
                 ts: Some(now_unix_secs()),
+                epoch_barrier: None,
             },
         )
         .unwrap();
@@ -5678,7 +5707,9 @@ mod tests {
         };
         meta.put_repl_slot(&mk_slot("s-fast", 3)).unwrap();
         meta.put_repl_slot(&mk_slot("s-slow", 0)).unwrap();
-        let want_slow_bytes = meta.repl_binlog_bytes_after(0).unwrap();
+        let want_slow_bytes = meta
+            .repl_binlog_bytes_after(Gtid { epoch: 0, seq: 0 })
+            .unwrap();
         assert!(want_slow_bytes > 0, "慢槽滞后字节非零才有断言意义");
 
         // admin 装配 + 真 provider 注入

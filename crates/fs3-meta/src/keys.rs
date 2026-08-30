@@ -21,9 +21,10 @@
 //! - `e:{seq be64}` 事件队列条目(M15 N2;ADR-18 D-E1;值 = postcard
 //!   EventRecord;be64 字典序 = 写入序;有界环形批量截断;入队与数据
 //!   操作同事务——崩溃零漂移)
-//! - `bl:{seq be64}` 复制 binlog 记录(M21 A1;ADR-33 RP1/RP2;值 =
-//!   [版本字节 u8] + postcard ReplRecord;be64 字典序 = 事务序;与事务
-//!   同批写入,崩溃零漂移)
+//! - `bl:{epoch be64}{seq be64}` 复制 binlog 记录(M21 A1 初形
+//!   `bl:{seq be64}`;E3 起 epoch 入键,见 binlog_key 注释;值 =
+//!   [版本字节 u8] + postcard ReplRecord;键序 = GTID 字典序 = 事务序;
+//!   与事务同批写入,崩溃零漂移)
 //! - `tn:{tenant_id}` IAM 租户(M18 I1;ADR-28 DI1)
 //! - `iu:{tenant}\0{user}` / `ig:{tenant}\0{group}` / `ip:{tenant}\0{name}` /
 //!   `ir:{tenant}\0{role}` IAM 用户/组/策略/角色(M18 I1;ADR-28 DI2;
@@ -34,8 +35,8 @@
 //! `s:sse_kek_seed` / `s:sse_kek_gen`(M11 K1-1 SSE-S3 KEK 体系)、
 //! `s:audit\0{seq be64}` 审计环形条目(M11 L3-1;ADR-12 DL5)、
 //! `s:trusted_clock`(M12 W1-1;ADR-13 DL6 可信时钟 wall+mono 对)、
-//! `s:repl_role` / `s:repl_epoch` / `s:repl_executed`(M21 A1/A2;
-//! ADR-33 RP2 复制角色/epoch/executed GTID 集)、
+//! `s:repl_role` / `s:repl_epoch` / `s:repl_ebase` / `s:repl_executed`
+//! (M21 A1/A2/E3;ADR-33 RP2 复制角色/epoch/代内 seq 基值/executed GTID 集)、
 //! `s:repl_slot\0{name}` 复制槽(M21 A3;ADR-33 RP3/RP8)、
 //! `s:rebuild_pending` 断档重建中断续清标记(M21 C5;ADR-33 RP5.4)。
 //!
@@ -133,10 +134,15 @@ pub const PREFIX_INGEST_JOB: &[u8] = b"ij:";
 /// 前缀表(本处)、meta-export/import DTO(显式不导出,运维瞬态)、
 /// check 可达性扫描(任务值不含 extent 引用,天然安全,登记于注释)。
 pub const PREFIX_BATCH_JOB: &[u8] = b"jb:";
-/// 复制 binlog 记录(M21 A1;ADR-33 RP1/RP2;设计稿 §3.2:`bl:{seq be64}`
-/// → [版本字节 u8] + postcard ReplRecord)。be64 字典序 = 数值序 = 事务序
-/// (seq 复用 `s:seq`,GTID 零额外分配成本);与触发它的事务**同批同 WAL**
-/// 写入(照 `e:` 事件队列先例,不增组提交 fsync 次数),崩溃零漂移。
+/// 复制 binlog 记录(M21 A1;ADR-33 RP1/RP2;设计稿 §3.2:`bl:` →
+/// [版本字节 u8] + postcard ReplRecord)。**键形 E3 起 =
+/// `bl:{epoch be64}{seq be64}`(GTID 本体)**:A1 初形 `bl:{seq be64}`
+/// 里 seq 复用 `s:seq`(初始代两者恒等);promote 后新 epoch 的 GTID seq
+/// 从 1 重计(RP2.1)而 `s:seq` 全局不回退(`a:`/`t:`/`e:` 键内序号以
+/// 它为锚,归零即与既有记录碰撞)——epoch 入键使键序 = GTID 字典序 =
+/// 提交序,跨 epoch 续拉/截断/握手覆盖检查共用同一扫描序;代内 seq 折算
+/// 见 SYS_REPL_EBASE。与触发它的事务**同批同 WAL**写入(照 `e:` 事件
+/// 队列先例,不增组提交 fsync 次数),崩溃零漂移。
 /// 新一级前缀:三处同步——keys.rs 前缀表(本处);meta-export/import DTO
 /// (M21/A4:**显式不导出**,瞬态复制日志,同 `e:`/`x:`/`ij:` 口径,声明
 /// 见 fs3d/meta.rs MetaExportFile.objects 注释);check 可达性扫描只读
@@ -178,6 +184,16 @@ pub const SYS_TRUSTED_CLOCK: &[u8] = b"s:trusted_clock";
 /// SYS_KEY_VALUE_REWRITE_V3_DONE 口径)。meta-export:M21/A4 起随导出
 /// (MetaExportFile.repl 字段;`s:repl_*` 复制状态导出口径)。
 pub const SYS_REPL_EPOCH: &[u8] = b"s:repl_epoch";
+/// 当前 epoch 的 `s:seq` 基值(M21 E3;ADR-33 RP2.1;值 = be64 u64,
+/// 键缺席 = 0——初始代起代内 GTID seq == s:seq,A1 口径不变)。promote
+/// 事务把它与 epoch+1/EpochBarrier/role=primary **同事务落盘**(R12),
+/// 值 = promote 前一刻的 s:seq;代内 GTID seq = s:seq − ebase(新 epoch
+/// 从 seq=1 重计,而 s:seq 全局不回退——`a:`/`t:`/`e:` 键内序号以 s:seq
+/// 为锚,归零会与既有记录碰撞)。clear_for_rebuild 删键复位到缺席态;
+/// meta-export 不导出(库迁移后 bl: 为空、自本地 last_seq 续写新日志,
+/// GTID 连续性跨库迁移本就不保证——同 A4 既有口径);check 扫描不相交
+/// (同 SYS_REPL_EPOCH 口径)。
+pub const SYS_REPL_EBASE: &[u8] = b"s:repl_ebase";
 /// 初始复制 epoch(键缺席时的读默认值;promote 自当前 +1,新 epoch 的
 /// GTID 从 seq=1 重计而全局字典序仍单调,ADR-33 RP2)。
 pub const REPL_INITIAL_EPOCH: u64 = 1;
@@ -762,24 +778,32 @@ pub fn parse_event_seq(raw: &[u8]) -> Result<u64> {
     Ok(u64::from_be_bytes(body.try_into().unwrap()))
 }
 
-/// 复制 binlog 键:`bl:{seq be64}`(M21 A1;be64 字典序 = 事务序)。
-pub fn binlog_key(seq: u64) -> Vec<u8> {
-    let mut k = Vec::with_capacity(PREFIX_BINLOG.len() + 8);
+/// 复制 binlog 键:`bl:{epoch be64}{seq be64}`(M21 A1 初形
+/// `bl:{seq be64}`;**E3 起 epoch 入键**——promote 后新 epoch 的 GTID
+/// seq 从 1 重计(ADR-33 RP2.1),`s:seq` 全局不回退;键序 = GTID
+/// 字典序 = 提交序,跨 epoch 续拉/截断扫描共用同一序)。
+pub fn binlog_key(epoch: u64, seq: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(PREFIX_BINLOG.len() + 16);
     k.extend_from_slice(PREFIX_BINLOG);
+    k.extend_from_slice(&epoch.to_be_bytes());
     k.extend_from_slice(&seq.to_be_bytes());
     k
 }
 
-/// 解析 `bl:` 键中的 seq(截断/扫描边界用;A3 水位截断与 B1 增量拉取
-/// 的游标解析入口)。
-pub fn parse_binlog_seq(raw: &[u8]) -> Result<u64> {
+/// 解析 `bl:` 键 → GTID(截断/扫描边界用;A3 水位截断与 B1 增量拉取
+/// 的游标解析入口;E3 起键内即完整 GTID,值内 rec.epoch 应与键内 epoch
+/// 一致——截断路径复核,不符 = Corrupt)。
+pub fn parse_binlog_gtid(raw: &[u8]) -> Result<fs3_core::Gtid> {
     let body = raw
         .strip_prefix(PREFIX_BINLOG)
         .ok_or_else(|| Error::Corrupt("binlog key missing prefix".into()))?;
-    if body.len() != 8 {
+    if body.len() != 16 {
         return Err(Error::Corrupt("binlog key malformed".into()));
     }
-    Ok(u64::from_be_bytes(body.try_into().unwrap()))
+    Ok(fs3_core::Gtid {
+        epoch: u64::from_be_bytes(body[..8].try_into().unwrap()),
+        seq: u64::from_be_bytes(body[8..].try_into().unwrap()),
+    })
 }
 
 /// 下游 apply 游标值编码:`[epoch be64][seq be64]`(M21 B4;
@@ -872,6 +896,22 @@ pub fn repl_pending_obj_key(bucket: &str, key: &str) -> Vec<u8> {
     k.push(0x00);
     k.extend_from_slice(&escape(key.as_bytes()));
     k
+}
+
+/// 解析 `s:repl_pdobj\0` 标记键 → (bucket, key)(M21 E3:promote dry-run
+/// 丢弃清单/force 丢弃的对象枚举入口;桶名到首个裸 0x00,余串 unescape)。
+pub fn parse_repl_pending_obj_key(raw: &[u8]) -> Result<(String, String)> {
+    let body = raw
+        .strip_prefix(PREFIX_REPL_PENDING_OBJ)
+        .ok_or_else(|| Error::Corrupt("repl pending-obj key missing prefix".into()))?;
+    let Some(end) = body.iter().position(|&b| b == 0) else {
+        return Err(Error::Corrupt("repl pending-obj key malformed".into()));
+    };
+    let bucket = String::from_utf8(body[..end].to_vec())
+        .map_err(|_| Error::Corrupt("repl pending-obj bucket not utf8".into()))?;
+    let key = String::from_utf8(unescape(&body[end + 1..])?)
+        .map_err(|_| Error::Corrupt("repl pending-obj key not utf8".into()))?;
+    Ok((bucket, key))
 }
 
 /// 分片键:`p:{uploadId}\0{part_no be32}`。

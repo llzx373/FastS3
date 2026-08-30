@@ -172,7 +172,41 @@ pub trait ReplicationControl: Send + Sync {
     /// 清空本地复制状态并以 standby 从 `from`(缺省 = 现配置上游)全量
     /// 重建(C1/C2 快照导入 + 从 P 追赶);`slot` 缺省 = 现配置槽名。
     fn rebuild(&self, req: RebuildRequest) -> Result<serde_json::Value, RebuildError>;
+    /// 手动 promote(M21 E3;ADR-33 RP5;设计稿 §5.1):dry_run=true = 纯读
+    /// 丢弃清单(零副作用,不停 worker);dry_run=false = 真实转正(停
+    /// pull/回填 → epoch+1/EpochBarrier/role 单事务落盘);force=true =
+    /// 丢弃 data_pending 尾事务。
+    fn promote(&self, req: PromoteRequest) -> Result<serde_json::Value, PromoteError>;
 }
+
+/// promote 请求面(query 的 dry_run/force 字段;E3)。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PromoteRequest {
+    /// true = dry-run(返回丢弃清单,零副作用)。
+    pub dry_run: bool,
+    /// true = 丢弃 data_pending 尾事务(清单同 dry-run 口径)。
+    pub force: bool,
+}
+
+/// promote 失败分类(HTTP 映射:Rejected → 409,Failed → 500;E3)。
+#[derive(Debug)]
+pub enum PromoteError {
+    /// 前置条件拒绝(非 standby/桶级备/有 pending 未带 force;消息含
+    /// 丢弃清单摘要)。
+    Rejected(String),
+    /// 执行失败(存储层/worker 停启失败等)。
+    Failed(String),
+}
+
+impl std::fmt::Display for PromoteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PromoteError::Rejected(m) | PromoteError::Failed(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for PromoteError {}
 
 /// rebuild 请求面(admin body 的 from/slot 字段)。
 #[derive(Debug, Clone, Default)]
@@ -668,8 +702,12 @@ impl AdminServer {
             ("POST", ["kms", "keys", name, "rotate"]) => self.handle_kms_key_rotate(name, body),
             // M21 C5(ADR-33 RP5.4;设计稿 §5.2):断档显式重建——唯一入口
             // (不自动触发红线);未注入 = 501。status/slots/pause/resume/
-            // promote/demote 属 F2,不在本路由
+            // demote 属 F2,不在本路由
             ("POST", ["replication", "rebuild"]) => self.handle_replication_rebuild(body),
+            // M21 E3(ADR-33 RP5;设计稿 §5.1):手动 promote——dry_run 前置
+            // (?dry_run=true 纯读清单),force=true 丢弃 pending 尾事务;
+            // 未注入 = 501
+            ("POST", ["replication", "promote"]) => self.handle_replication_promote(query, body),
             _ => json::err(StatusCode::NOT_FOUND, "not_found", "unknown admin endpoint"),
         }
     }
@@ -760,6 +798,54 @@ impl AdminServer {
             }
             Err(RebuildError::Failed(e)) => {
                 json::err(StatusCode::INTERNAL_SERVER_ERROR, "rebuild_failed", &e)
+            }
+        }
+    }
+
+    /// M21 E3(ADR-33 RP5;设计稿 §5.1):`POST /v1/admin/replication/
+    /// promote?dry_run=true&force=true`,body `{operator?}`。审计:who =
+    /// operator(沿 rebuild 先例);真实 promote 记 ReplicationPromote,
+    /// dry-run 记 ReplicationPromoteDryRun;Rejected → 409,Failed → 500,
+    /// 未注入 → 501。
+    fn handle_replication_promote(
+        &self,
+        query: &[(String, String)],
+        body: &[u8],
+    ) -> Response<String> {
+        let Some(ctrl) = &self.replication else {
+            return json::err(
+                StatusCode::NOT_IMPLEMENTED,
+                "not_implemented",
+                "replication 未配置(FS3D_REPL_* 缺席);promote 入口不可用",
+            );
+        };
+        let req = PromoteRequest {
+            dry_run: query.iter().any(|(k, v)| k == "dry_run" && v == "true"),
+            force: query.iter().any(|(k, v)| k == "force" && v == "true"),
+        };
+        let operator = serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| {
+                v.get("operator")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| "admin".into());
+        match ctrl.promote(req) {
+            Ok(out) => {
+                let op = if req.dry_run {
+                    "ReplicationPromoteDryRun"
+                } else {
+                    "ReplicationPromote"
+                };
+                self.service.audit().push(&operator, op, "", "", 200, "");
+                json::ok(out)
+            }
+            Err(PromoteError::Rejected(e)) => {
+                json::err(StatusCode::CONFLICT, "promote_rejected", &e)
+            }
+            Err(PromoteError::Failed(e)) => {
+                json::err(StatusCode::INTERNAL_SERVER_ERROR, "promote_failed", &e)
             }
         }
     }

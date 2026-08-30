@@ -117,14 +117,17 @@ GTID 集合 = 按 epoch 分段的连续区间集     # 例:{1:[1,500], 2:[1,120]
 
 ### 3.2 增量(binlog 流 + 段数据)
 
-新增前缀 **`bl:{seq be64}` → ReplRecord**(postcard):
+新增前缀 **`bl:{epoch be64}{seq be64}` → ReplRecord**(postcard;键 =
+GTID 本体,键序 = GTID 字典序 = 提交序——M21 E3 起 epoch 入键,承载
+promote 后新代 seq 重计;代内 seq = `s:seq` − `s:repl_ebase`(promote
+事务写入的代际基线,初始代缺席 = 0),`s:seq` 全局不回退):
 
 ```
 ReplRecord { epoch, ops: Vec<Op>, data_refs: Vec<DataRef>, bucket_scope }
 DataRef = { extent_id, offset, len, crc32c }
 ```
 
-- `MetaStore::apply_ops` 同事务写 `bl:{seq}`(与 `e:` 入队同模式,崩溃零漂移);`Op` 已覆盖全部元数据变更,改造成本低。
+- `MetaStore::apply_ops` 同事务写 `bl:{epoch}{代内seq}`(与 `e:` 入队同模式,崩溃零漂移);`Op` 已覆盖全部元数据变更,改造成本低。
 - 下游协议:`GET /v1/repl/v1/binlog?slot={name}&after={gtid}&limit=N`(长轮询)。**桶级过滤器在上游侧按槽过滤**,被过滤的 seq 以 heartbeat 条目带过,保证下游游标连续前进、GTID 集无空洞。
 - 段数据:**binlog 只带引用不带字节**;小对象(≤ `small_object_limit`,内联 rocksdb)随 `Op` 值直达。下游按 `DataRef` 调 `GET /v1/repl/v1/extent-data`(Range 读 + CRC32C + ReadPin),并发回填池(默认 8 并发,可配)。
 
