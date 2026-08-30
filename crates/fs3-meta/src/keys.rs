@@ -192,6 +192,29 @@ pub const SYS_REPL_ROLE: &[u8] = b"s:repl_role";
 /// 形成假分歧)。s: 既有前缀下的新系统键,不新增前缀;meta-export 随
 /// M21/A4 导出(MetaExportFile.repl),check 扫描无需联动(同上口径)。
 pub const SYS_REPL_EXECUTED: &[u8] = b"s:repl_executed";
+/// 下游 apply 游标(M21 B4;ADR-33 RP4.2;设计稿 §4.1「游标与 apply 事务
+/// 同事务落盘」):值 = 16 字节 `[epoch be64][seq be64]`,键缺席 =
+/// {0,0}(全新下游)。**自裁决:独立单键而非「executed 集最大值」**——
+/// ① 单流按序 apply 下两者恒等,但游标语义是「流位点」(级联中继水位
+/// 直接消费),与集合归并形态解耦;② apply 热路径 O(1) 读,不解整个
+/// 区间集;③ 崩溃重放幂等判定(`gtid <= cursor` 丢弃)只读一键。
+/// 与 apply 事务同批写(apply_repl_record);meta-export 随 B4 起导出
+/// (MetaExportFile.repl.cursor——游标丢失会导致已 apply 事务重放、
+/// Stats 类增量重复记账,必须与 executed 同进退);check 扫描无需联动
+/// (同 SYS_REPL_ROLE 口径)。
+pub const SYS_REPL_CURSOR: &[u8] = b"s:repl_cursor";
+/// 待回填队列(M21 B4;ADR-33 RP4.2;设计稿 §4.2/§4.3 布局独立):
+/// `s:repl_pending\0{epoch be64}{seq be64}` → postcard `Vec<DataRef>`。
+/// 上游 Op 的段引用指向**上游 extent**,备端本地分配器不认识——apply
+/// 落元数据时把该事务的 data_refs 原样入队(data_pending 标记形态 =
+/// 旁路队列,不改 ObjectMeta 值格式这条持久化兼容面),C3 回填池消费
+/// (拉取 + 本地分配器重落盘 + 回填后删键);无 data_refs 的记录(心跳/
+/// 纯元数据事务)不入队。s: 既有前缀下的系统键族(不新增一级前缀);
+/// meta-export **显式不导出**(瞬态复制状态,同 `bl:` 口径——备端库
+/// 迁移后待回填集需按新位点重建,C 组接线);check 可达性扫描只读
+/// `o:`/`p:` 段引用键,队列值内 DataRef 是上游回填引用而非本地 extent
+/// 持有,天然安全(同 PREFIX_BINLOG 登记口径)。
+pub const PREFIX_REPL_PENDING: &[u8] = b"s:repl_pending\x00";
 /// 池清单(M13 M1-1,ADR-15 DM1/DM1';值 = postcard(fs3_core::pool::PoolManifest),
 /// 设备序 = 数组序,仅尾部增删)。s: 既有前缀下的新系统键,不新增前缀,
 /// 故 meta-export DTO 与 check 可达性扫描无需联动(同
@@ -668,6 +691,50 @@ pub fn parse_binlog_seq(raw: &[u8]) -> Result<u64> {
         return Err(Error::Corrupt("binlog key malformed".into()));
     }
     Ok(u64::from_be_bytes(body.try_into().unwrap()))
+}
+
+/// 下游 apply 游标值编码:`[epoch be64][seq be64]`(M21 B4;
+/// SYS_REPL_CURSOR 注释钉死形态)。
+pub fn repl_cursor_value(g: fs3_core::Gtid) -> Vec<u8> {
+    let mut v = Vec::with_capacity(16);
+    v.extend_from_slice(&g.epoch.to_be_bytes());
+    v.extend_from_slice(&g.seq.to_be_bytes());
+    v
+}
+
+/// 游标值解码(长度不符 → Corrupt,不静默接受)。
+pub fn parse_repl_cursor_value(raw: &[u8]) -> Result<fs3_core::Gtid> {
+    if raw.len() != 16 {
+        return Err(Error::Corrupt("repl cursor value malformed".into()));
+    }
+    Ok(fs3_core::Gtid {
+        epoch: u64::from_be_bytes(raw[..8].try_into().unwrap()),
+        seq: u64::from_be_bytes(raw[8..].try_into().unwrap()),
+    })
+}
+
+/// 待回填队列键:`s:repl_pending\0{epoch be64}{seq be64}`(M21 B4;
+/// epoch 入键防 promote 后 seq 重计与陈旧待回填项碰撞)。
+pub fn repl_pending_key(g: fs3_core::Gtid) -> Vec<u8> {
+    let mut k = Vec::with_capacity(PREFIX_REPL_PENDING.len() + 16);
+    k.extend_from_slice(PREFIX_REPL_PENDING);
+    k.extend_from_slice(&g.epoch.to_be_bytes());
+    k.extend_from_slice(&g.seq.to_be_bytes());
+    k
+}
+
+/// 解析 `s:repl_pending\0` 键 → GTID(C3 回填池扫描边界用)。
+pub fn parse_repl_pending_key(raw: &[u8]) -> Result<fs3_core::Gtid> {
+    let body = raw
+        .strip_prefix(PREFIX_REPL_PENDING)
+        .ok_or_else(|| Error::Corrupt("repl pending key missing prefix".into()))?;
+    if body.len() != 16 {
+        return Err(Error::Corrupt("repl pending key malformed".into()));
+    }
+    Ok(fs3_core::Gtid {
+        epoch: u64::from_be_bytes(body[..8].try_into().unwrap()),
+        seq: u64::from_be_bytes(body[8..].try_into().unwrap()),
+    })
 }
 
 /// 分片键:`p:{uploadId}\0{part_no be32}`。

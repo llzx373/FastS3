@@ -475,6 +475,10 @@ pub struct LayoutInfoDto {
 /// GtidSet/Slot 直接内嵌(serde 形状已是持久化兼容面,同 IAM 记录内嵌
 /// 先例;GtidSet JSON 形状 = 内部 interval 表,紧凑且带不变量校验);
 /// role 用 UTF-8 串("primary"|"standby",s:repl_role 原值口径)。
+/// M21 B4 追加 `cursor`(s:repl_cursor,下游 apply 游标):游标丢失会
+/// 导致已 apply 事务重放、Stats 类增量重复记账,必须与 executed 同进退;
+/// 尾部追加 + Option(旧导出 → None,导入侧回退 = executed 集最大值,
+/// 单流按序 apply 下两者恒等,见 fs3-meta keys.rs SYS_REPL_CURSOR)。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReplStateDto {
     pub role: String,
@@ -483,6 +487,9 @@ pub struct ReplStateDto {
     pub executed: fs3_core::GtidSet,
     /// 复制槽(s:repl_slot\0{name} 记录)。
     pub slots: Vec<fs3_meta::Slot>,
+    /// 下游 apply 游标(M21 B4;s:repl_cursor)。
+    #[serde(default)]
+    pub cursor: Option<fs3_core::Gtid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -759,7 +766,10 @@ pub fn run_meta_export(
 
     // M21 A4(ADR-33 RP2/RP3):复制状态 `s:repl_*` 原样随导出(role/
     // epoch/executed GTID 集/复制槽;`bl:` binlog 为瞬态复制日志,显式
-    // 不导出——见 MetaExportFile.objects 字段注释)
+    // 不导出——见 MetaExportFile.objects 字段注释)。M21 B4:游标
+    // (s:repl_cursor)随导出(与 executed 同进退,理由见 ReplStateDto);
+    // `s:repl_pending\0` 待回填队列显式不导出(瞬态复制状态,同 `bl:`
+    // 口径,备端库迁移后按新位点重建,C 组接线)。
     let repl = ReplStateDto {
         role: match store.repl_role()? {
             fs3_meta::ReplRole::Primary => "primary",
@@ -769,6 +779,7 @@ pub fn run_meta_export(
         epoch: store.repl_epoch()?,
         executed: store.repl_executed()?,
         slots: store.list_repl_slots()?,
+        cursor: Some(store.repl_cursor()?),
     };
 
     // M10 V5-1:版本化桶逐版本条目导出(含删除标记与 null 槽),vk 不丢 ——
@@ -1071,6 +1082,18 @@ pub fn run_meta_import(
         store.set_repl_executed(&repl.executed)?;
         for s in &repl.slots {
             store.put_repl_slot(s)?;
+        }
+        // M21 B4:游标恢复(与 executed 同进退)。旧导出(无 cursor 字段)
+        // → 回退 = executed 集最大值(单流按序 apply 下两者恒等;不回退
+        // 则已 apply 事务会被重放、Stats 双记——见 ReplStateDto 注释)。
+        let cursor = repl.cursor.or_else(|| {
+            repl.executed
+                .ranges()
+                .map(|(epoch, _s, e)| fs3_core::Gtid { epoch, seq: e })
+                .max()
+        });
+        if let Some(c) = cursor {
+            store.set_repl_cursor(c)?;
         }
     }
 
@@ -2245,8 +2268,8 @@ mod tests {
 
     /// M21 A4(ADR-33 RP2/RP3;`s:repl_*` 键前缀三处同步之二):复制状态
     /// 随 meta-export/import 迁移——
-    /// ① role/epoch/executed GTID 集/复制槽(含 BucketFilter/stale)逐项
-    ///    导出 → 导入新库一致;
+    /// ① role/epoch/executed GTID 集/复制槽(含 BucketFilter/stale)/apply
+    ///    游标(B4)逐项导出 → 导入新库一致;
     /// ② `bl:` binlog 记录**不在导出内**(瞬态复制日志;标记串只存在于
     ///    bl: 记录,导出文件不得包含);
     /// ③ 导入后引擎 check 零泄漏(复制键不含 extent 所有权引用)。
@@ -2302,6 +2325,9 @@ mod tests {
             m.set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
             m.set_repl_epoch(3).unwrap();
             m.set_repl_executed(&executed).unwrap();
+            // M21 B4:下游 apply 游标随导出(与 executed 同进退)
+            m.set_repl_cursor(fs3_core::Gtid { epoch: 2, seq: 9 })
+                .unwrap();
             m.put_repl_slot(&slot_a).unwrap();
             m.put_repl_slot(&slot_b).unwrap();
             // 标记条目:put+delete 同一 key——元数据零残留,标记串仅存于
@@ -2386,6 +2412,11 @@ mod tests {
         assert_eq!(m2.repl_role().unwrap(), fs3_meta::ReplRole::Standby);
         assert_eq!(m2.repl_epoch().unwrap(), 3);
         assert_eq!(m2.repl_executed().unwrap(), executed);
+        assert_eq!(
+            m2.repl_cursor().unwrap(),
+            fs3_core::Gtid { epoch: 2, seq: 9 },
+            "M21 B4:apply 游标随导出/导入"
+        );
         assert_eq!(
             m2.list_repl_slots().unwrap(),
             vec![slot_a, slot_b],

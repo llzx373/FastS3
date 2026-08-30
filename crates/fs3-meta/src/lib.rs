@@ -76,6 +76,15 @@ impl ReplRole {
     }
 }
 
+/// 复制 apply 结果(M21 B4;MetaStore::apply_repl_record 返回值)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplApplyOutcome {
+    /// 已应用(游标/executed/bl:/待回填队列同事务推进)。
+    Applied,
+    /// `gtid <= 游标`,幂等丢弃(崩溃重放/重连重拉的重叠前缀)。
+    SkippedDuplicate,
+}
+
 #[derive(Debug, Clone)]
 pub struct MetaConfig {
     pub flush_every_ms: u64,
@@ -2487,7 +2496,13 @@ impl MetaStore {
         let mut retries = 0u32;
         loop {
             let tx = self.db.transaction_opt(&self.write_opts, &self.txn_opts);
-            let seq = match apply_ops(&tx, ops, self.repl_binlog) {
+            let seq = match apply_ops(
+                &tx,
+                ops,
+                ApplyMode::Commit {
+                    repl_binlog: self.repl_binlog,
+                },
+            ) {
                 Ok(seq) => seq,
                 Err(e) => {
                     tx.rollback().map_err(rocks_err)?;
@@ -2500,19 +2515,7 @@ impl MetaStore {
                         // Full:每事务显式 fsync
                         self.db.flush_wal(true).map_err(rocks_err)?;
                     }
-                    for op in ops {
-                        match op {
-                            Op::LifecycleRulesReplace { bucket, .. }
-                            | Op::LifecycleRulesDelete { bucket } => {
-                                self.lifecycle_cache.lock().unwrap().remove(bucket);
-                            }
-                            Op::NotificationRulesReplace { bucket, .. }
-                            | Op::NotificationRulesDelete { bucket } => {
-                                self.notification_cache.lock().unwrap().remove(bucket);
-                            }
-                            _ => {}
-                        }
-                    }
+                    self.invalidate_conf_caches(ops);
                     if ops.iter().any(|o| matches!(o, Op::EventEnqueue { .. })) {
                         // F5-3:worker 关闭时入队路径仍截断,防 e: 无界堆积
                         let _ = self.truncate_events(self.event_queue_max);
@@ -2529,6 +2532,23 @@ impl MetaStore {
                     continue;
                 }
                 Err(e) => return Err(rocks_err(e)),
+            }
+        }
+    }
+
+    /// 提交后配置缓存失效(commit 与复制 apply 共用,M21 B4 提取;
+    /// 生命周期/通知规则被替换或删除时本地缓存必须同步失效)。
+    fn invalidate_conf_caches(&self, ops: &[Op]) {
+        for op in ops {
+            match op {
+                Op::LifecycleRulesReplace { bucket, .. } | Op::LifecycleRulesDelete { bucket } => {
+                    self.lifecycle_cache.lock().unwrap().remove(bucket);
+                }
+                Op::NotificationRulesReplace { bucket, .. }
+                | Op::NotificationRulesDelete { bucket } => {
+                    self.notification_cache.lock().unwrap().remove(bucket);
+                }
+                _ => {}
             }
         }
     }
@@ -2721,6 +2741,147 @@ impl MetaStore {
             .put(SYS_REPL_EXECUTED, set.encode()?)
             .map_err(rocks_err)?;
         self.db.flush_wal(true).map_err(rocks_err)
+    }
+
+    // —— 下游 apply(M21 B4;ADR-33 RP4.2;设计稿 §4.1/§4.2/§4.3) ——
+    //
+    // 语义钉死(实现注释 = 唯一事实补充,偏离走 ADR):
+    // - **严格按 GTID 序单流 apply**;`gtid <= 游标` 幂等丢弃
+    //   (SkippedDuplicate),崩溃重放天然幂等——游标 `s:repl_cursor` 与
+    //   apply 事务**同批落盘**,要么全进要么全不进;
+    // - **游标形态自裁决 = 独立单键 `s:repl_cursor`**(不取 executed 集
+    //   最大值;裁决理由见 keys.rs SYS_REPL_CURSOR 注释);
+    // - **心跳条目**(上游槽过滤带过的空 ops 记录)照常走完整 apply:
+    //   ops 为空 = 零元数据变更,但 bl: 原样落盘、游标推进、executed 集
+    //   并入——GTID 集无洞(§4.1/RP3.2);
+    // - **不重编号**(级联预备,RP3.3/E1 中继直接受益):`bl:{原 seq}`
+    //   写**原样 ReplRecord**(原 epoch/ops/data_refs/ts),s:seq 推进至
+    //   max(当前, 原 seq)——防本节点 promote 转正后 seq 回退与已重放
+    //   的 bl: 键碰撞;promote 后本地写走 A1 原路径(cur+1 自增);
+    // - **`Op::Alloc` 跳过不落盘**(§4.3 布局独立):a:/t: 是上游分配器
+    //   的恢复记录,备端本地分配器不认识上游 extent;段数据到位后由本地
+    //   分配器重新分配(C2/C3 接线),备端位图不含上游段;
+    // - **data_pending 标记形态 = 旁路队列** `s:repl_pending\0{epoch,seq}`
+    //   → postcard Vec<DataRef>(不改 ObjectMeta 持久化值格式):apply
+    //   同事务入队,C3 回填池消费(拉取/本地重分配/删键);段数据未回填
+    //   前读路径语义属 C2(缺数据等待),本层只保证队列与元数据零漂移;
+    // - **epoch fencing**(§2.3):记录 epoch 低于本地 s:repl_epoch 显式
+    //   拒绝(旧 epoch 的写全网络拒收);本地 epoch 由 pull worker 在握手
+    //   成功时随上游水位推进(B4 repl_worker.rs)。
+
+    /// 读下游 apply 游标(键缺席 = {0,0},全新下游)。
+    pub fn repl_cursor(&self) -> Result<Gtid> {
+        match self.db.get(SYS_REPL_CURSOR).map_err(rocks_err)? {
+            Some(v) => parse_repl_cursor_value(&v),
+            None => Ok(Gtid { epoch: 0, seq: 0 }),
+        }
+    }
+
+    /// 直写游标(直写 + fsync,照 set_repl_executed 先例)。**仅限
+    /// meta-import 迁移路径**(B4 起游标随导出):正常 apply 路径的游标
+    /// 一律走 apply_repl_record 事务内同批写。
+    pub fn set_repl_cursor(&self, cursor: Gtid) -> Result<()> {
+        self.db
+            .put(SYS_REPL_CURSOR, repl_cursor_value(cursor))
+            .map_err(rocks_err)?;
+        self.db.flush_wal(true).map_err(rocks_err)
+    }
+
+    /// 待回填队列扫描(GTID 升序;C3 回填池消费入口;B4 测试断言用)。
+    pub fn list_repl_pending(&self, limit: usize) -> Result<Vec<(Gtid, Vec<repl::DataRef>)>> {
+        let mut out = Vec::new();
+        for item in scan_prefix(&self.db, PREFIX_REPL_PENDING) {
+            let (k, v) = item?;
+            out.push((parse_repl_pending_key(&k)?, decode(&v)?));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// 复制 apply:把上游一条 binlog 记录应用进本库(单个乐观事务,
+    /// 原子;冲突自动重试,同 commit 口径)。事务内容 = ops 应用(Alloc
+    /// 跳过)+ `bl:{原 seq}` 原样记录 + s:seq 推进 + executed 集并入 +
+    /// 游标 + 待回填入队——同批同 WAL,崩溃零漂移、重放幂等。
+    ///
+    /// `gtid` = 记录 GTID(键内 seq;调用方 = pull worker,按流序单线程
+    /// 调用)。返回 Applied / SkippedDuplicate(`gtid <= 游标`)。
+    pub fn apply_repl_record(&self, gtid: Gtid, rec: &ReplRecord) -> Result<ReplApplyOutcome> {
+        if gtid.epoch != rec.epoch {
+            return Err(Error::InvalidArgument(format!(
+                "repl record epoch {} != gtid epoch {} (corrupt stream)",
+                rec.epoch, gtid.epoch
+            )));
+        }
+        // epoch fencing(§2.3):旧 epoch 的流显式拒绝;本地 epoch 由
+        // worker 握手推进,promote(E3)在此基础上 +1
+        let local_epoch = self.repl_epoch()?;
+        if rec.epoch < local_epoch {
+            return Err(Error::InvalidArgument(format!(
+                "repl record epoch {} fenced by local epoch {} (replication-design §2.3)",
+                rec.epoch, local_epoch
+            )));
+        }
+        const MAX_TXN_RETRIES: u32 = 10_000;
+        let mut retries = 0u32;
+        loop {
+            let tx = self.db.transaction_opt(&self.write_opts, &self.txn_opts);
+            // 游标事务内读(与 apply 同批落盘的同一快照上判幂等)
+            let cursor = match tx.get(SYS_REPL_CURSOR).map_err(rocks_err)? {
+                Some(v) => parse_repl_cursor_value(&v)?,
+                None => Gtid { epoch: 0, seq: 0 },
+            };
+            if gtid <= cursor {
+                // 幂等丢弃:崩溃重放/重连重拉的重叠前缀,零副作用
+                tx.rollback().map_err(rocks_err)?;
+                return Ok(ReplApplyOutcome::SkippedDuplicate);
+            }
+            if let Err(e) = apply_ops(&tx, &rec.ops, ApplyMode::Replay { gtid, record: rec }) {
+                tx.rollback().map_err(rocks_err)?;
+                return Err(e);
+            }
+            // executed 集并入(同批;心跳条目也在此——GTID 集无洞)
+            let mut executed = match tx.get(SYS_REPL_EXECUTED).map_err(rocks_err)? {
+                Some(v) => GtidSet::decode(&v)?,
+                None => GtidSet::new(),
+            };
+            executed.insert(gtid);
+            put_repl_executed_in_tx(&tx, &executed)?;
+            // 游标推进(同批)
+            tx.put(SYS_REPL_CURSOR, repl_cursor_value(gtid))
+                .map_err(rocks_err)?;
+            // data_pending:段引用原样入待回填队列(C3 消费;无引用不入队)
+            if !rec.data_refs.is_empty() {
+                tx.put(repl_pending_key(gtid), encode(&rec.data_refs)?)
+                    .map_err(rocks_err)?;
+            }
+            match tx.commit() {
+                Ok(()) => {
+                    if self.sync_mode == SyncMode::Full {
+                        self.db.flush_wal(true).map_err(rocks_err)?;
+                    }
+                    self.invalidate_conf_caches(&rec.ops);
+                    if rec.ops.iter().any(|o| matches!(o, Op::EventEnqueue { .. })) {
+                        // 与主端同确定性的 e: 环形维护(上游 truncate_events
+                        // 的删键不经 binlog——备端必须自行同款截断,队列内容
+                        // 才逐键一致且无界堆积)
+                        let _ = self.truncate_events(self.event_queue_max);
+                    }
+                    return Ok(ReplApplyOutcome::Applied);
+                }
+                Err(e) if e.kind() == ErrorKind::Busy || e.kind() == ErrorKind::TryAgain => {
+                    retries += 1;
+                    if retries > MAX_TXN_RETRIES {
+                        return Err(Error::Meta(format!(
+                            "rocksdb txn retries exhausted after {MAX_TXN_RETRIES}: {e}"
+                        )));
+                    }
+                    continue;
+                }
+                Err(e) => return Err(rocks_err(e)),
+            }
+        }
     }
 
     // —— 复制槽(M21 A3;ADR-33 RP3/RP8;设计稿 §3.3;键 `s:repl_slot\0{name}`) ——
@@ -4681,10 +4842,31 @@ pub fn put_repl_executed_in_tx(
     tx.put(SYS_REPL_EXECUTED, set.encode()?).map_err(rocks_err)
 }
 
+/// apply_ops 运行模式(M21 B4 加 Replay;ADR-33 RP4.2;设计稿 §4.1/§4.3)。
+#[derive(Clone, Copy)]
+enum ApplyMode<'a> {
+    /// 本地单写者提交:seq 自增(cur+1);`repl_binlog` 开 = 同事务把整
+    /// 事务 ops 以 ReplRecord 写 `bl:{新 seq}`(A1)。
+    Commit { repl_binlog: bool },
+    /// 下游复制重放(**不重编号**,RP3.3;级联中继 E1 直接复用本地 bl:):
+    /// - 键内序号(`e:`/`x:`/`bl:` 键与 EventEnqueue/RestoreJobPut 的
+    ///   record.seq)一律用**上游原 seq**(gtid.seq),与上游键形逐键一致;
+    /// - `s:seq` 推进至 `max(当前, gtid.seq)`(防 promote 转正后 seq
+    ///   回退、与已重放 bl: 键碰撞);
+    /// - `bl:{原 seq}` 写**原样 ReplRecord**(原 epoch/ops/data_refs/ts,
+    ///   不从 ops 重建——重建会丢 ts/原 data_refs 形态);
+    /// - `Op::Alloc`(a:/t: 上游分配记录)**跳过不落盘**(§4.3 布局独立:
+    ///   备端本地分配器不认识上游 extent;段数据到位后由本地分配器重新
+    ///   分配,C2/C3 接线);
+    /// - 跨 epoch 续流(epoch barrier / seq 重计)属 E3 promote 边界,
+    ///   本模式假定同 epoch 单调流(worker 握手保证,B4 不做 epoch 重编号)。
+    Replay { gtid: Gtid, record: &'a ReplRecord },
+}
+
 fn apply_ops(
     tx: &Transaction<OptimisticTransactionDB>,
     ops: &[Op],
-    repl_binlog: bool,
+    mode: ApplyMode,
 ) -> Result<u64> {
     // rocksdb 事务闭包内操作失败 → 整体 Err → 回滚(调用方 commit 不执行)。
     fn tget(tx: &Transaction<OptimisticTransactionDB>, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -4774,7 +4956,14 @@ fn apply_ops(
     let cur = tget(tx, SYS_SEQ)?
         .map(|v| u64::from_be_bytes(v.as_slice().try_into().unwrap()))
         .unwrap_or(0);
-    let seq = cur + 1;
+    // M21 B4:键内序号(op_seq)与 s:seq 推进值(new_seq)分离——Commit
+    // 两者同为 cur+1;Replay 键内序号 = 上游原 seq(不重编号,键形与上游
+    // 逐键一致),s:seq 只进不退(max)。
+    let (op_seq, new_seq) = match mode {
+        ApplyMode::Commit { .. } => (cur + 1, cur + 1),
+        ApplyMode::Replay { gtid, .. } => (gtid.seq, cur.max(gtid.seq)),
+    };
+    let seq = op_seq;
 
     for op in ops {
         match op {
@@ -5203,6 +5392,12 @@ fn apply_ops(
                 tinsert(tx, key.clone(), meta.encode_value()?)?;
             }
             Op::Alloc { draft } => {
+                // M21 B4(§4.3 布局独立):复制重放跳过 a:/t: 上游分配
+                // 记录——备端本地分配器不认识上游 extent,段数据到位后由
+                // 本地分配器重新分配(C2/C3 接线);备端位图不含上游段。
+                if matches!(mode, ApplyMode::Replay { .. }) {
+                    continue;
+                }
                 if !draft.is_empty() {
                     let rec = AllocRecord {
                         seq,
@@ -5502,19 +5697,28 @@ fn apply_ops(
     // 元数据变更同批同 WAL(照 EventEnqueue 臂口径),崩溃零漂移且**不增
     // 组提交 fsync 次数**;事务失败整体回滚,bl: 零残留。开关默认关,
     // 未启用时零开销(此分支不进入)。
-    if repl_binlog {
-        let epoch = tget(tx, SYS_REPL_EPOCH)?
-            .map(|v| u64::from_be_bytes(v.as_slice().try_into().unwrap()))
-            .unwrap_or(REPL_INITIAL_EPOCH);
-        let mut rec = ReplRecord::new(epoch, ops);
-        // M21 A3:提交墙钟,repl_retain_hours 软上限的年龄输入(截断侧
-        // 双读:A1 存量记录 ts=None 保守保数据)。
-        rec.ts = Some(now_ts());
-        tinsert(tx, binlog_key(seq), rec.encode_value()?)?;
+    // M21 B4(Replay):重放路径恒写 `bl:{原 seq}` = **原样 ReplRecord**
+    // (不重编号,与 repl_binlog 开关节流无关——备端/中继本地 binlog 是
+    // 级联转发与 promote 后续流的载体,E1/E3 直接消费)。
+    match mode {
+        ApplyMode::Commit { repl_binlog: true } => {
+            let epoch = tget(tx, SYS_REPL_EPOCH)?
+                .map(|v| u64::from_be_bytes(v.as_slice().try_into().unwrap()))
+                .unwrap_or(REPL_INITIAL_EPOCH);
+            let mut rec = ReplRecord::new(epoch, ops);
+            // M21 A3:提交墙钟,repl_retain_hours 软上限的年龄输入(截断侧
+            // 双读:A1 存量记录 ts=None 保守保数据)。
+            rec.ts = Some(now_ts());
+            tinsert(tx, binlog_key(seq), rec.encode_value()?)?;
+        }
+        ApplyMode::Commit { repl_binlog: false } => {}
+        ApplyMode::Replay { gtid, record } => {
+            tinsert(tx, binlog_key(gtid.seq), record.encode_value()?)?;
+        }
     }
 
-    tinsert(tx, SYS_SEQ.to_vec(), seq.to_be_bytes().to_vec())?;
-    Ok(seq)
+    tinsert(tx, SYS_SEQ.to_vec(), new_seq.to_be_bytes().to_vec())?;
+    Ok(new_seq)
 }
 
 #[cfg(test)]
@@ -6252,6 +6456,214 @@ mod tests {
         // 边界:尾后空批(长轮询前的现状口径)/ limit=0
         assert!(meta.repl_binlog_scan(5, 100).unwrap().is_empty());
         assert!(meta.repl_binlog_scan(0, 0).unwrap().is_empty());
+    }
+
+    /// M21 B4(ADR-33 RP4.2;设计稿 §4.1;TODO M21/B4 具名用例):
+    /// **apply 幂等重放**——
+    /// ① 同一 GTID 记录重复 apply:第二次 SkippedDuplicate,零重复副作用
+    ///    (Stats 增量不双记、对象/桶唯一、bl:/executed/游标/待回填不变);
+    /// ② `Op::Alloc` 跳过不落盘(a:/t: 零残留,§4.3 布局独立);
+    /// ③ 崩溃重放(重开 MetaStore)后再放同一记录仍 SkippedDuplicate,
+    ///    游标/executed/bl:/待回填与崩溃前一致(同事务落盘 ⇒ 零漂移);
+    /// ④ 不重编号:bl:{原 seq} 内容 = 原样 ReplRecord;s:seq 推进至原
+    ///    seq,promote 后本地写从 seq+1 续(防回退);
+    /// ⑤ epoch fencing:低于本地 epoch 的记录显式拒绝(§2.3)。
+    #[test]
+    fn repl_apply_idempotent_on_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg = Segment {
+            extent_id: 7,
+            offset: 0,
+            len: 8192,
+            crcs: vec![0xAAAA],
+        };
+        let rec1 = ReplRecord::new(
+            1,
+            &[Op::BucketPut {
+                name: "b1".into(),
+                meta: bucket_meta("b1"),
+                location: None,
+            }],
+        );
+        let mut big = object_meta(8192);
+        big.extents = vec![seg.clone()];
+        let ops2 = vec![
+            Op::ObjectPut {
+                bucket: "b1".into(),
+                key: "big".into(),
+                meta: big,
+            },
+            // 上游分配记录:备端跳过不落盘(②)
+            Op::Alloc {
+                draft: AllocDraft {
+                    alloc: vec![(7, 1)],
+                    ..AllocDraft::default()
+                },
+            },
+            Op::Stats {
+                bucket: "b1".into(),
+                delta: StatsDelta {
+                    objects: 1,
+                    bytes: 8192,
+                    by_class: Vec::new(),
+                },
+            },
+        ];
+        let rec2 = ReplRecord::new(1, &ops2);
+        let g = |seq: u64| Gtid { epoch: 1, seq };
+        {
+            let meta = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
+            // ⑤ fencing:本地 epoch 缺省 1,epoch 0 的记录被拒
+            let mut old = rec1.clone();
+            old.epoch = 0;
+            assert!(meta.apply_repl_record(g(1), &old).is_err());
+            // gtid.epoch 与记录 epoch 不一致 = 流损坏,显式拒绝
+            assert!(meta
+                .apply_repl_record(Gtid { epoch: 9, seq: 1 }, &rec1)
+                .is_err());
+
+            assert_eq!(
+                meta.apply_repl_record(g(1), &rec1).unwrap(),
+                ReplApplyOutcome::Applied
+            );
+            assert_eq!(
+                meta.apply_repl_record(g(2), &rec2).unwrap(),
+                ReplApplyOutcome::Applied
+            );
+            // ④ 不重编号:bl: 键 = 原 seq,值 = 原样记录;s:seq 推进
+            assert_eq!(meta.repl_record(2).unwrap(), Some(rec2.clone()));
+            assert_eq!(meta.last_seq().unwrap(), 2);
+            assert_eq!(meta.repl_cursor().unwrap(), g(2));
+            let stats = meta.get_bucket("b1").unwrap().unwrap().stats;
+            assert_eq!((stats.objects, stats.bytes), (1, 8192));
+            // ② Alloc 跳过:a:/t: 零残留
+            assert!(meta.list_alloc_records(0).unwrap().is_empty());
+            assert_eq!(meta.count_alloc_records().unwrap(), 0);
+            // data_pending:rec2 的段引用入待回填队列(C3 消费)
+            let pending = meta.list_repl_pending(100).unwrap();
+            assert_eq!(
+                pending,
+                vec![(
+                    g(2),
+                    vec![DataRef {
+                        extent_id: 7,
+                        offset: 0,
+                        len: 8192,
+                        crc32c: None,
+                    }]
+                )]
+            );
+
+            // ① 同 GTID 重放(重连重拉重叠前缀):SkippedDuplicate,无副作用
+            assert_eq!(
+                meta.apply_repl_record(g(1), &rec1).unwrap(),
+                ReplApplyOutcome::SkippedDuplicate
+            );
+            assert_eq!(
+                meta.apply_repl_record(g(2), &rec2).unwrap(),
+                ReplApplyOutcome::SkippedDuplicate
+            );
+            let stats = meta.get_bucket("b1").unwrap().unwrap().stats;
+            assert_eq!((stats.objects, stats.bytes), (1, 8192), "Stats 不双记");
+            assert_eq!(meta.repl_binlog_entries().unwrap().len(), 2);
+            assert_eq!(meta.list_repl_pending(100).unwrap().len(), 1);
+            assert_eq!(
+                meta.repl_executed().unwrap().ranges().collect::<Vec<_>>(),
+                vec![(1, 1, 2)]
+            );
+            meta.flush().unwrap();
+        }
+        // ③ 崩溃重放:重开后游标/executed/bl:/待回填保持;再放仍幂等
+        {
+            let meta = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
+            assert_eq!(meta.repl_cursor().unwrap(), g(2));
+            assert_eq!(
+                meta.repl_executed().unwrap().ranges().collect::<Vec<_>>(),
+                vec![(1, 1, 2)]
+            );
+            assert_eq!(meta.repl_binlog_entries().unwrap().len(), 2);
+            assert_eq!(meta.list_repl_pending(100).unwrap().len(), 1);
+            assert_eq!(
+                meta.apply_repl_record(g(2), &rec2).unwrap(),
+                ReplApplyOutcome::SkippedDuplicate
+            );
+            assert_eq!(
+                meta.apply_repl_record(g(1), &rec1).unwrap(),
+                ReplApplyOutcome::SkippedDuplicate
+            );
+            let stats = meta.get_bucket("b1").unwrap().unwrap().stats;
+            assert_eq!((stats.objects, stats.bytes), (1, 8192), "崩溃重放不双记");
+            // ④ promote 后本地写(A1 原路径):seq 从原水位续,不回退
+            let s = meta
+                .commit_bucket_put("local", &bucket_meta("local"))
+                .unwrap();
+            assert_eq!(s, 3, "promote 转正后 seq 自原 seq+1 续,防回退");
+        }
+    }
+
+    /// M21 B4(ADR-33 RP3.2/RP4.2;设计稿 §4.1;TODO M21/B4 具名用例):
+    /// **心跳条目推进游标,GTID 集无洞**——桶级槽过滤带过的空 ops 记录
+    /// (heartbeat)与纯系统键事务:
+    /// ① 空 ops 心跳照常 apply:游标推进、executed 并入、bl: 原样落盘;
+    /// ② executed 集 = 单段连续区间 [1,N](被过滤 seq 不留洞);
+    /// ③ 无 data_refs 的记录不入待回填队列(心跳零回填负担);
+    /// ④ 游标与 apply 同事务:全程 gtid 递增乱序重放仍幂等。
+    #[test]
+    fn repl_cursor_advances_over_filtered_gaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
+        let g = |seq: u64| Gtid { epoch: 1, seq };
+        let put = |name: &str| {
+            ReplRecord::new(
+                1,
+                &[Op::BucketPut {
+                    name: name.into(),
+                    meta: bucket_meta(name),
+                    location: None,
+                }],
+            )
+        };
+
+        // 流:b1(1) 心跳(2,3) b2(4) 心跳(5)
+        let stream = [
+            (g(1), put("b1")),
+            (g(2), ReplRecord::new(1, &[])),
+            (g(3), ReplRecord::new(1, &[])),
+            (g(4), put("b2")),
+            (g(5), ReplRecord::new(1, &[])),
+        ];
+        for (gtid, rec) in &stream {
+            assert_eq!(
+                meta.apply_repl_record(*gtid, rec).unwrap(),
+                ReplApplyOutcome::Applied
+            );
+        }
+        // ① 游标越过心跳推进到流尾
+        assert_eq!(meta.repl_cursor().unwrap(), g(5));
+        assert!(meta.get_bucket("b1").unwrap().is_some());
+        assert!(meta.get_bucket("b2").unwrap().is_some());
+        // ② executed 集无洞:单段连续区间(过滤 seq 由心跳并入)
+        assert_eq!(
+            meta.repl_executed().unwrap().ranges().collect::<Vec<_>>(),
+            vec![(1, 1, 5)]
+        );
+        // 心跳记录原样落盘 bl:(级联中继 E1 直接转发)
+        let entries = meta.repl_binlog_entries().unwrap();
+        assert_eq!(entries.len(), 5);
+        assert!(entries[1].1.ops.is_empty() && entries[4].1.ops.is_empty());
+        // ③ 无 data_refs → 待回填队列空
+        assert!(meta.list_repl_pending(100).unwrap().is_empty());
+        // s:seq 推进至原 seq(防 promote 回退)
+        assert_eq!(meta.last_seq().unwrap(), 5);
+        // ④ 重叠重放幂等(含心跳)
+        for (gtid, rec) in &stream {
+            assert_eq!(
+                meta.apply_repl_record(*gtid, rec).unwrap(),
+                ReplApplyOutcome::SkippedDuplicate
+            );
+        }
+        assert_eq!(meta.repl_cursor().unwrap(), g(5));
+        assert_eq!(meta.repl_binlog_entries().unwrap().len(), 5);
     }
 
     /// M21 A2(ADR-33 RP2/R12;设计稿 §2.1/§3.1):executed GTID 集持久化——

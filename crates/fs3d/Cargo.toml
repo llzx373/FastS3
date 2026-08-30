@@ -35,8 +35,10 @@ fs3-admin.workspace = true
 # 手写 HTTP/1.1,独立线程 current_thread runtime(照 fs3-admin 先例,
 # 数据面热路径零 tokio)。全部已在锁树(fs3-agent/fs3-http/fs3-admin
 # 同版本),零新增包。
+# M21 B4(repl_worker.rs):下游 pull worker 复用同栈;hyper 加 client
+# feature(同 crate 同版本,特性并集,零新增包)。
 tokio = { version = "1.40", features = ["rt", "net", "io-util", "time", "macros"] }
-hyper = { version = "1.5", features = ["http1", "server"] }
+hyper = { version = "1.5", features = ["http1", "server", "client"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"

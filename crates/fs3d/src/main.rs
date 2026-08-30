@@ -21,6 +21,7 @@ mod loadgen;
 mod meta;
 mod pool_cmds;
 mod repl;
+mod repl_worker;
 mod rewrite;
 mod settings;
 mod signal;
@@ -1171,6 +1172,35 @@ fn cmd_serve(
         Err(e) => return Err(fs3_core::Error::InvalidArgument(e)),
     }
 
+    // M21 B4(ADR-33 RP4.2;设计稿 §4.1):下游 pull worker。role 的 env
+    // 最小入口 FS3D_REPL_ROLE(primary|standby;设置即落 s:repl_role,
+    // 幂等直写);pull 配置 FS3D_REPL_PRIMARY_URL 设置即启用,worker 内
+    // role=standby 硬校验(配了上游但角色是主 = 配置矛盾,启动显式失败,
+    // 不静默)。pause/resume 语义属 F2;promote 停 worker 属 E3。
+    if let Ok(role) = std::env::var("FS3D_REPL_ROLE") {
+        let role = match role.as_str() {
+            "primary" => fs3_meta::ReplRole::Primary,
+            "standby" => fs3_meta::ReplRole::Standby,
+            other => {
+                return Err(fs3_core::Error::InvalidArgument(format!(
+                    "bad FS3D_REPL_ROLE {other:?} (expect primary|standby)"
+                )))
+            }
+        };
+        engine.read().meta().set_repl_role(role)?;
+    }
+    let mut pull_worker = match repl_worker::PullConfig::from_env() {
+        Ok(Some(pull_cfg)) => {
+            let meta = engine.read().meta_arc();
+            let worker = repl_worker::PullWorker::spawn(meta, pull_cfg)
+                .map_err(fs3_core::Error::InvalidArgument)?;
+            tracing::info!("replication pull worker started (role=standby)");
+            Some(worker)
+        }
+        Ok(None) => None,
+        Err(e) => return Err(fs3_core::Error::InvalidArgument(e)),
+    };
+
     // 生命周期 worker 启动(创建见 admin 装配前;解耦仅为注入 stats Arc)
     let mut lifecycle_worker = lifecycle_worker.map(|(worker, throttle)| {
         fs3_engine::worker::WorkerHandle::spawn(
@@ -1362,6 +1392,11 @@ fn cmd_serve(
     // M19 J:Batch worker 停止(游标已持久化,重启续跑)
     if let Some(mut h) = batch_worker.take() {
         h.stop();
+    }
+    // M21 B4:复制 pull worker 停止(游标/executed 同事务落盘,重启从
+    // 本地游标续传;先于引擎收尾,避免与 meta 关闭竞写)
+    if let Some(h) = pull_worker.take() {
+        h.shutdown();
     }
     tracing::info!("http workers drained; finalizing engine (checkpoint + meta close)");
     let mut eng = engine.write();

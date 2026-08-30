@@ -3290,6 +3290,9 @@ fn check_scans_repl_prefixes() {
         keys::SYS_REPL_ROLE.to_vec(),
         keys::SYS_REPL_EPOCH.to_vec(),
         keys::SYS_REPL_EXECUTED.to_vec(),
+        // M21 B4:apply 游标单键 + 待回填队列键族(\0 分隔)
+        keys::SYS_REPL_CURSOR.to_vec(),
+        keys::repl_pending_key(fs3_core::Gtid { epoch: 1, seq: 1 }),
     ];
     let olds: Vec<Vec<u8>> = vec![
         keys::object_key("b", "k"),

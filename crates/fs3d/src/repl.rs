@@ -71,9 +71,9 @@
 //!   现有 bl: 存储做 epoch 重编号)。
 //!
 //! 本任务边界(后续任务接线,勿在此抢跑):槽过滤/心跳(D2,本任务全量
-//! 不过滤)、长轮询空挂(B4,空批立即返回)、snapshot 导出(C1)、
-//! lag 计算(D1,slots 先给原始字段)、委派凭证(D3)。
-//!
+//! 不过滤)、snapshot 导出(C1)、lag 计算(D1,slots 先给原始字段)、
+//! 委派凭证(D3)。长轮询空挂已落地(B4;`wait={ms}` 参数,见
+//! handle_binlog)。//!
 //! 复制槽生命周期线格式(B3;设计稿 §3.3;ADR-33 RP3/RP8):
 //! - `POST /v1/repl/v1/slots`(预登记,消费方部署前由持受信证书的运维面
 //!   调用):`{name, consumer_node_id?, filters?, confirmed_gtid?}`;
@@ -120,9 +120,15 @@ use tokio_rustls::TlsAcceptor;
 
 /// extent-data 单请求 len 上限(64 MiB;下游回填池分块,见模块注释)。
 const MAX_EXTENT_DATA_LEN: u64 = 64 * 1024 * 1024;
-/// binlog 单批默认/上限条数(长轮询属 B4,本任务立即返回)。
+/// binlog 单批默认/上限条数。
 const DEFAULT_BINLOG_LIMIT: usize = 256;
 const MAX_BINLOG_LIMIT: usize = 4096;
+/// 长轮询(M21 B4;设计稿 §3.2「binlog 长轮询」;ADR-33 RP6.3):query
+/// `wait={ms}` 无新条目时挂起,上限 30s(可配常量);缺省/0 = 立即返回
+/// 空批(B1 口径保持)。轮询滴答 100ms——binlog 无 in-process 变更通知
+/// 通道(写路径在另一线程的 rocksdb 组提交),低频轮询成本可忽略。
+const MAX_BINLOG_WAIT_MS: u64 = 30_000;
+const LONGPOLL_TICK: std::time::Duration = std::time::Duration::from_millis(100);
 /// hello 请求体上限(64 KiB;executed 区间表/chain 均有界,超限 = 400)。
 const MAX_HELLO_BODY: usize = 64 * 1024;
 /// 拓扑链路上限(设计稿 §3.6:上游链 ≤8 跳,成环即拒)。
@@ -368,7 +374,7 @@ impl ReplServer {
         let path = req.uri().path().to_string();
         let method = req.method().clone();
         match (&method, path.as_str()) {
-            (&Method::GET, "/v1/repl/v1/binlog") => self.handle_binlog(&req),
+            (&Method::GET, "/v1/repl/v1/binlog") => self.handle_binlog(&req).await,
             (&Method::GET, "/v1/repl/v1/extent-data") => self.handle_extent_data(&req),
             (&Method::GET, "/v1/repl/v1/slots") => self.handle_slots(),
             (&Method::POST, "/v1/repl/v1/hello") => self.handle_hello(req, cn).await,
@@ -420,11 +426,14 @@ impl ReplServer {
         }
     }
 
-    /// `GET /v1/repl/v1/binlog?slot={name}&after={epoch}-{seq}&limit=N`:
+    /// `GET /v1/repl/v1/binlog?slot={name}&after={epoch}-{seq}&limit=N&wait={ms}`:
     /// after 之后的记录批(seq 升序 = GTID 序)+ 上游当前水位。本任务
-    /// 全量不过滤(槽过滤/心跳 B3/D2)、空批立即返回(长轮询 B4);slot
-    /// 参数接受但不消费(B3 登记/校验接线点)。
-    fn handle_binlog(&self, req: &Request<Incoming>) -> Response<Full<Bytes>> {
+    /// 全量不过滤(槽过滤/心跳 D2);slot 参数接受但不消费(B3 登记/
+    /// 校验接线点)。**长轮询空挂(B4)**:`wait>0` 且批为空时挂起重扫,
+    /// 直到出现新条目或挂满 wait(上限 MAX_BINLOG_WAIT_MS=30s)返回
+    /// 空批——下游 pull worker 以单次请求覆盖空闲期,断开/超时由客户端
+    /// 重连兜底。
+    async fn handle_binlog(&self, req: &Request<Incoming>) -> Response<Full<Bytes>> {
         let query = req.uri().query().unwrap_or("");
         let after = match query_param(query, "after") {
             Some(s) => match parse_gtid(s) {
@@ -448,41 +457,59 @@ impl ReplServer {
             },
             None => DEFAULT_BINLOG_LIMIT,
         };
-        let watermark = match self.high_watermark() {
-            Ok(g) => g,
-            Err(e) => return internal_err("binlog watermark", &e),
+        let wait_ms = match query_param(query, "wait") {
+            Some(s) => match s.parse::<u64>() {
+                Ok(n) => n.min(MAX_BINLOG_WAIT_MS),
+                Err(_) => {
+                    return json_err(StatusCode::BAD_REQUEST, "bad_wait", "wait must be int (ms)")
+                }
+            },
+            None => 0,
         };
-        // seq 定位:s:seq 全局单调(A1 键序口径),after.seq+1 起迭代;
-        // epoch 维字典序过滤在记录层兜底(after.epoch > 当前代 = 未来代,
-        // 空批——分歧裁决属 B2 握手,不在拉取路径)。
-        let entries = if after.epoch > watermark.epoch {
-            Vec::new()
-        } else {
-            match self.meta.repl_binlog_scan(after.seq, limit) {
-                Ok(v) => v
-                    .into_iter()
-                    .filter(|(seq, rec)| (rec.epoch, *seq) > (after.epoch, after.seq))
-                    .collect::<Vec<_>>(),
-                Err(e) => return internal_err("binlog scan", &e),
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+        loop {
+            let watermark = match self.high_watermark() {
+                Ok(g) => g,
+                Err(e) => return internal_err("binlog watermark", &e),
+            };
+            // seq 定位:s:seq 全局单调(A1 键序口径),after.seq+1 起迭代;
+            // epoch 维字典序过滤在记录层兜底(after.epoch > 当前代 = 未来代,
+            // 空批——分歧裁决属 B2 握手,不在拉取路径)。
+            let entries = if after.epoch > watermark.epoch {
+                Vec::new()
+            } else {
+                match self.meta.repl_binlog_scan(after.seq, limit) {
+                    Ok(v) => v
+                        .into_iter()
+                        .filter(|(seq, rec)| (rec.epoch, *seq) > (after.epoch, after.seq))
+                        .collect::<Vec<_>>(),
+                    Err(e) => return internal_err("binlog scan", &e),
+                }
+            };
+            // 长轮询:空批且 wait 未挂满 → 挂起重扫(秒级以下粒度即可,
+            // 写路径经 rocksdb 组提交,无通知通道)
+            if !entries.is_empty() || wait_ms == 0 || tokio::time::Instant::now() >= deadline {
+                use base64::Engine as _;
+                let items: Vec<serde_json::Value> = entries
+                    .iter()
+                    .map(|(seq, rec)| {
+                        serde_json::json!({
+                            "gtid": fmt_gtid(Gtid { epoch: rec.epoch, seq: *seq }),
+                            "ts": rec.ts,
+                            // 线格式:[版本字节]+postcard 的 base64(模块注释)
+                            "record": base64::engine::general_purpose::STANDARD
+                                .encode(rec.encode_value().unwrap_or_default()),
+                        })
+                    })
+                    .collect();
+                return json_ok(serde_json::json!({
+                    "high_watermark": fmt_gtid(watermark),
+                    "entries": items,
+                }));
             }
-        };
-        use base64::Engine as _;
-        let items: Vec<serde_json::Value> = entries
-            .iter()
-            .map(|(seq, rec)| {
-                serde_json::json!({
-                    "gtid": fmt_gtid(Gtid { epoch: rec.epoch, seq: *seq }),
-                    "ts": rec.ts,
-                    // 线格式:[版本字节]+postcard 的 base64(模块注释)
-                    "record": base64::engine::general_purpose::STANDARD
-                        .encode(rec.encode_value().unwrap_or_default()),
-                })
-            })
-            .collect();
-        json_ok(serde_json::json!({
-            "high_watermark": fmt_gtid(watermark),
-            "entries": items,
-        }))
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            tokio::time::sleep(remaining.min(LONGPOLL_TICK)).await;
+        }
     }
 
     /// `GET /v1/repl/v1/extent-data?extent_id=&offset=&len=`(DataRef 三件套,
@@ -1098,7 +1125,9 @@ fn read_tlv(buf: &[u8], pos: usize) -> Option<(u8, usize, usize, usize)> {
 
 /// 从证书 DER 提取 subject 首个 CN(2.5.4.3)字串;UTF8/Printable/IA5
 /// 直转,BMPString 按 BE u16 解码,其余形态/解析失败 → None。
-fn subject_cn_from_der(der: &[u8]) -> Option<String> {
+/// pub(crate):B4 pull worker 复用(客户端证书 CN = 本节点 node_id,
+/// hello 自报身份 = CN,服务端 B2 比对一致才放行)。
+pub(crate) fn subject_cn_from_der(der: &[u8]) -> Option<String> {
     const SEQ: u8 = 0x30;
     const SET: u8 = 0x31;
     const OID: u8 = 0x06;
@@ -2190,6 +2219,254 @@ mod tests {
         .await;
         assert_eq!(st, 200, "{v}");
         assert_eq!(v["slot"]["name"], "s00");
+    }
+
+    /// M21 B4(设计稿 §3.2;ADR-33 RP6.3):binlog 长轮询空挂——
+    /// ① wait>0 且无新条目:请求挂起,上游提交后**提前**返回新条目
+    ///    (不挂满 wait);
+    /// ② 挂满 wait 仍无新条目:返回空批 + 水位(耗时下界 ≈ wait);
+    /// ③ wait 超上限(30s)被钳制;坏 wait 参数 400;wait=0/缺席 = 立即
+    ///    返回(B1 口径保持)。
+    #[tokio::test]
+    async fn repl_binlog_long_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = repl_meta_with_entries(dir.path(), 1); // seq 1,水位 1-1
+        let fx = start_repl_server(Some(meta.clone()));
+        let (cert, key) = fx.client_cert(Some("node-b"));
+        let cli = (cert, key);
+
+        // ① 挂起中上游提交 → 提前返回新条目
+        let (ca_pem, addr) = (fx.ca_pem.clone(), fx.addr);
+        let (c, k) = (cli.0.clone(), cli.1.clone());
+        let pending = tokio::spawn(async move {
+            mtls_request(
+                addr,
+                &ca_pem,
+                Some((&c, &k)),
+                &get_req("/v1/repl/v1/binlog?slot=s1&after=1-1&wait=1500"),
+            )
+            .await
+            .unwrap()
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        meta.commit_bucket_put(
+            "late",
+            &fs3_core::BucketMeta {
+                created: 1,
+                owner: "t".into(),
+                stats: Default::default(),
+                quota: None,
+                created_with_acl: false,
+                versioning: Default::default(),
+                default_encryption: None,
+                object_lock: false,
+                default_retention: None,
+                default_kms_key: None,
+            },
+        )
+        .unwrap();
+        let (st, _, body) = pending.await.unwrap();
+        assert_eq!(st, 200, "{}", String::from_utf8_lossy(&body));
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["entries"].as_array().unwrap().len(),
+            1,
+            "挂起中被新条目唤醒"
+        );
+        assert_eq!(v["entries"][0]["gtid"], "1-2");
+        assert_eq!(v["high_watermark"], "1-2");
+
+        // ② 挂满 wait 仍空 → 空批;耗时下界 ≈ wait(轮询滴答 100ms)
+        let t0 = std::time::Instant::now();
+        let (st, _, body) = mtls_request(
+            fx.addr,
+            &fx.ca_pem,
+            Some((&cli.0, &cli.1)),
+            &get_req("/v1/repl/v1/binlog?slot=s1&after=1-2&wait=400"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            t0.elapsed().as_millis() >= 350,
+            "长轮询必须挂起: {:?}",
+            t0.elapsed()
+        );
+        assert_eq!(st, 200);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["entries"].as_array().unwrap().len(), 0);
+        assert_eq!(v["high_watermark"], "1-2");
+
+        // ③ 坏参数 400;wait=0 立即返回(不挂起)
+        let (st, _, _) = mtls_request(
+            fx.addr,
+            &fx.ca_pem,
+            Some((&cli.0, &cli.1)),
+            &get_req("/v1/repl/v1/binlog?after=1-2&wait=oops"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(st, 400);
+        let t0 = std::time::Instant::now();
+        let (st, _, _) = mtls_request(
+            fx.addr,
+            &fx.ca_pem,
+            Some((&cli.0, &cli.1)),
+            &get_req("/v1/repl/v1/binlog?after=1-2"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(st, 200);
+        assert!(
+            t0.elapsed().as_millis() < 300,
+            "无 wait = 立即返回: {:?}",
+            t0.elapsed()
+        );
+    }
+
+    /// M21 B4(ADR-33 RP4.2;设计稿 §4.1;TODO M21/B4 具名用例,照 m16
+    /// 断线样板精神的进程内双实例形态):**断线重连从游标续传**——
+    /// ① 上游 4 条事务(含 Stats 增量事务,双记账探针)+ 下游 pull worker
+    ///    (真实 mTLS 复制口 + 独立 MetaStore)追平游标 1-4;
+    /// ② 杀 pull worker(优雅停 = 断线等价物);上游再写 2 条;
+    /// ③ 重启 worker:重握手(hello 带 executed 集)→ 从游标 1-4 续传
+    ///    1-5/1-6,**不重拉**(b0 统计不重双记)不丢(b3/b4 落盘);
+    /// ④ ack 回执:上游槽 confirmed_gtid 随游标推进到 1-6;
+    /// ⑤ 不重编号:下游 bl: 6 条与上游同 seq 同内容(原样 ReplRecord);
+    /// ⑥ 下游 executed 集 = 连续 [1,6] 无洞;s:seq = 6(防回退)。
+    #[test]
+    fn repl_reconnect_resumes_from_cursor() {
+        use crate::repl_worker::{PullConfig, PullWorker};
+        let dir = tempfile::tempdir().unwrap();
+        // 上游:binlog 开,3 桶 + 1 条 Stats 事务(seq 1..=4)
+        let up = repl_meta_with_entries(dir.path(), 3);
+        up.commit(&[fs3_meta::Op::Stats {
+            bucket: "b0".into(),
+            delta: fs3_meta::StatsDelta {
+                objects: 5,
+                bytes: 500,
+                by_class: Vec::new(),
+            },
+        }])
+        .unwrap();
+        let fx = start_repl_server(Some(up.clone()));
+
+        // 下游:独立 MetaStore,role=standby(pull worker 硬校验)
+        let down = Arc::new(
+            MetaStore::open(
+                &dir.path().join("down-meta"),
+                &fs3_meta::MetaConfig::default(),
+            )
+            .unwrap(),
+        );
+        down.set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
+
+        let (cert, key) = fx.client_cert(Some("node-b"));
+        let cfg = PullConfig {
+            primary_url: format!("https://localhost:{}", fx.addr.port()),
+            slot_name: "s1".into(),
+            node_id: "node-b".into(),
+            ca_cert: write_pem(dir.path(), "ca.pem", &fx.ca_pem),
+            client_cert: write_pem(dir.path(), "node-b.pem", &cert),
+            client_key: write_pem(dir.path(), "node-b.key", &key),
+            long_poll_ms: 200,
+            retry_ms: 50,
+        };
+        let g = |seq: u64| Gtid { epoch: 1, seq };
+        let wait_cursor = |down: &MetaStore, want: Gtid| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                let cur = down.repl_cursor().unwrap();
+                if cur >= want {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timeout waiting cursor {want:?}, now {cur:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+
+        // ① 追平 1-4(长轮询覆盖空闲期)
+        let w1 = PullWorker::spawn(down.clone(), cfg.clone()).unwrap();
+        wait_cursor(&down, g(4));
+        // ② 杀 pull worker(断线);上游再写 2 条(seq 5,6)
+        w1.shutdown();
+        assert_eq!(down.repl_cursor().unwrap(), g(4));
+        up.commit_bucket_put(
+            "b3",
+            &fs3_core::BucketMeta {
+                created: 1,
+                owner: "t".into(),
+                stats: Default::default(),
+                quota: None,
+                created_with_acl: false,
+                versioning: Default::default(),
+                default_encryption: None,
+                object_lock: false,
+                default_retention: None,
+                default_kms_key: None,
+            },
+        )
+        .unwrap();
+        up.commit_bucket_put(
+            "b4",
+            &fs3_core::BucketMeta {
+                created: 1,
+                owner: "t".into(),
+                stats: Default::default(),
+                quota: None,
+                created_with_acl: false,
+                versioning: Default::default(),
+                default_encryption: None,
+                object_lock: false,
+                default_retention: None,
+                default_kms_key: None,
+            },
+        )
+        .unwrap();
+
+        // ③ 重启 worker:重握手 → 从游标续传 1-5/1-6
+        let w2 = PullWorker::spawn(down.clone(), cfg).unwrap();
+        wait_cursor(&down, g(6));
+        w2.shutdown();
+
+        // ③ 不重拉不丢:Stats 探针不双记;新事务落盘
+        let stats = down.get_bucket("b0").unwrap().unwrap().stats;
+        assert_eq!(
+            (stats.objects, stats.bytes),
+            (5, 500),
+            "重连不得重放已 apply 事务(Stats 不双记)"
+        );
+        for b in ["b0", "b1", "b2", "b3", "b4"] {
+            assert!(down.get_bucket(b).unwrap().is_some(), "bucket {b} 落盘");
+        }
+        // ④ ack:上游槽 confirmed 推进到流尾
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let slot = up.repl_slot("s1").unwrap().expect("slot registered");
+            if slot.confirmed_gtid >= g(6) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "ack 未推进: {slot:?}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // ⑤ 不重编号:下游 bl: = 上游同 seq 同内容(原样记录,级联预备)
+        let up_entries = up.repl_binlog_entries().unwrap();
+        let down_entries = down.repl_binlog_entries().unwrap();
+        assert_eq!(down_entries.len(), 6);
+        for (i, ((useq, urec), (dseq, drec))) in
+            up_entries.iter().zip(down_entries.iter()).enumerate()
+        {
+            assert_eq!(useq, dseq, "第 {} 条 seq 一致(不重编号)", i + 1);
+            assert_eq!(urec, drec, "第 {} 条记录原样", i + 1);
+        }
+        // ⑥ executed 连续无洞;s:seq 推进至原水位
+        assert_eq!(
+            down.repl_executed().unwrap().ranges().collect::<Vec<_>>(),
+            vec![(1, 1, 6)]
+        );
+        assert_eq!(down.last_seq().unwrap(), 6, "s:seq 推进至原 seq 防回退");
     }
 
     /// subject CN 提取:rcgen 证书正/反向 + 垃圾输入不 panic。
