@@ -1512,7 +1512,7 @@ mod tests {
         let srv = include_str!("../../../web/server/package.json");
         assert!(cons.contains("\"version\": \"2.6.0\""));
         assert!(srv.contains("\"version\": \"2.6.0\""));
-        let todo = include_str!("../../../TODO.md");
+        let todo = include_str!("../../../docs/archive/TODO-v2.6.0.md");
         assert!(
             todo.contains("- [x] A0-1 ADR-29")
                 && todo.contains("- [x] H1 ")
