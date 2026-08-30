@@ -72,8 +72,28 @@
 //!
 //! 本任务边界(后续任务接线,勿在此抢跑):槽过滤/心跳(D2,本任务全量
 //! 不过滤)、长轮询空挂(B4,空批立即返回)、snapshot 导出(C1)、
-//! lag 计算(D1,slots 先给原始字段)、max_slots 硬限制与槽 POST/DELETE/
-//! ack 端点(B3)。
+//! lag 计算(D1,slots 先给原始字段)、委派凭证(D3)。
+//!
+//! 复制槽生命周期线格式(B3;设计稿 §3.3;ADR-33 RP3/RP8):
+//! - `POST /v1/repl/v1/slots`(预登记,消费方部署前由持受信证书的运维面
+//!   调用):`{name, consumer_node_id?, filters?, confirmed_gtid?}`;
+//!   consumer_node_id 缺省 = peer CN;confirmed_gtid 缺省 = **当前水位**
+//!   (预登记自登记时刻起消费;显式 "0-0" = 从零消费,同时把全部现存
+//!   binlog 钉为保留下限——§3.4 语义,运维显式选择);重名 → 409
+//!   `ErrSlotExists`(改过滤器须 drop + 重建,R9,禁原地改)。
+//! - `DELETE /v1/repl/v1/slots/{name}`:drop,释放保留约束(截断下限 =
+//!   min(活跃槽 confirmed),drop 即不再参与);缺席 → 404 `ErrSlotUnknown`。
+//! - `POST /v1/repl/v1/slots/{name}/ack`(confirmed_gtid 回执更新):
+//!   `{confirmed_gtid: "{epoch}-{seq}"}`。选显式 ack 端点而非 binlog 请求
+//!   参数捎带:binlog 端点保持纯读长轮询友好(B4 空挂不带副作用),回执是
+//!   低频写(设计稿 §3.3「回执更新」),独立端点语义单一、可单独拒绝
+//!   (回退/未知槽/stale)。回退 confirmed → 400;stale 槽 → 410
+//!   `ErrBinlogGone`;更新 confirmed_gtid + last_ack_at 落盘。
+//! - `max_slots` 硬限制(默认 16,RP3.1/裁定 2;ReplConfig 字段,env
+//!   `FS3D_REPL_MAX_SLOTS` 覆盖,F3 收口进 [replication] 配置段):
+//!   握手自动登记与预登记共用同一闸;超限 → 403 `ErrSlotLimit`。
+//!   检查-登记非事务(单写者进程内串行度由 meta 层 fsync 写保证持久,
+//!   并发溢出至多超 1 槽,一期可接受,注释钉死)。
 //!
 //! 配置(F3 收口 [replication] 配置段前的最小入口,仿 FS3D_REPL_BINLOG
 //! 开发态开关先例):env `FS3D_REPL_CA_CERT` 设置即启用复制口,
@@ -107,6 +127,8 @@ const MAX_BINLOG_LIMIT: usize = 4096;
 const MAX_HELLO_BODY: usize = 64 * 1024;
 /// 拓扑链路上限(设计稿 §3.6:上游链 ≤8 跳,成环即拒)。
 const MAX_CHAIN_HOPS: usize = 8;
+/// 复制槽扇出硬上限默认值(ADR-33 RP3.1/裁定 2)。
+pub const DEFAULT_MAX_SLOTS: usize = 16;
 
 /// 复制口配置(F3 前的 env 最小面;装配校验在 from_env/ServerTls::build)。
 #[derive(Debug, Clone)]
@@ -116,6 +138,8 @@ pub struct ReplConfig {
     pub ca_cert: PathBuf,
     pub server_cert: PathBuf,
     pub server_key: PathBuf,
+    /// 复制槽扇出硬上限(ADR-33 RP3.1/裁定 2,默认 16)。
+    pub max_slots: usize,
 }
 
 impl ReplConfig {
@@ -139,11 +163,20 @@ impl ReplConfig {
             .unwrap_or_else(|_| "0.0.0.0:9445".into())
             .parse()
             .map_err(|e| format!("bad FS3D_REPL_LISTEN: {e}"))?;
+        let max_slots = std::env::var("FS3D_REPL_MAX_SLOTS")
+            .ok()
+            .map(|s| {
+                s.parse()
+                    .map_err(|e| format!("bad FS3D_REPL_MAX_SLOTS: {e}"))
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_MAX_SLOTS);
         Ok(Some(ReplConfig {
             listen,
             ca_cert: PathBuf::from(ca_cert),
             server_cert: PathBuf::from(server_cert),
             server_key: PathBuf::from(server_key),
+            max_slots,
         }))
     }
 }
@@ -207,6 +240,8 @@ pub struct ReplServer {
     listen: SocketAddr,
     /// 本节点 node_id = 服务端证书 CN(B2 环检测自标识;见 build_server_tls)。
     node_id: Option<String>,
+    /// 复制槽扇出硬上限(B3;握手自动登记与预登记共用同一闸)。
+    max_slots: usize,
 }
 
 /// 运行句柄(bind 成功后回传实际监听地址;测试用 ephemeral 端口)。
@@ -228,6 +263,7 @@ impl ReplServer {
             tls,
             listen: cfg.listen,
             node_id,
+            max_slots: cfg.max_slots,
         })
     }
 
@@ -329,19 +365,36 @@ impl ReplServer {
                 "client certificate must carry CN = node_id (ADR-33 RP6)",
             );
         };
-        let path = req.uri().path();
-        let method = req.method();
-        match (method, path) {
+        let path = req.uri().path().to_string();
+        let method = req.method().clone();
+        match (&method, path.as_str()) {
             (&Method::GET, "/v1/repl/v1/binlog") => self.handle_binlog(&req),
             (&Method::GET, "/v1/repl/v1/extent-data") => self.handle_extent_data(&req),
             (&Method::GET, "/v1/repl/v1/slots") => self.handle_slots(),
             (&Method::POST, "/v1/repl/v1/hello") => self.handle_hello(req, cn).await,
+            (&Method::POST, "/v1/repl/v1/slots") => self.handle_slot_create(req, cn).await,
             (&Method::POST, "/v1/repl/v1/snapshot") => json_err(
                 StatusCode::NOT_IMPLEMENTED,
                 "not_implemented",
                 "snapshot export is TODO M21/C1",
             ),
             _ => {
+                // 槽子路径:DELETE /slots/{name}(drop)、POST /slots/{name}/ack
+                // (回执;B3 线格式见模块注释)
+                if let Some(rest) = path.strip_prefix("/v1/repl/v1/slots/") {
+                    if let Some(name) = rest.strip_suffix("/ack") {
+                        if method == Method::POST {
+                            return self.handle_slot_ack(req, name).await;
+                        }
+                    } else if method == Method::DELETE {
+                        return self.handle_slot_drop(rest);
+                    }
+                    return json_err(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        "slots/{name}: DELETE to drop; slots/{name}/ack: POST to confirm",
+                    );
+                }
                 const KNOWN: [&str; 5] = [
                     "/v1/repl/v1/binlog",
                     "/v1/repl/v1/extent-data",
@@ -349,7 +402,7 @@ impl ReplServer {
                     "/v1/repl/v1/hello",
                     "/v1/repl/v1/snapshot",
                 ];
-                if KNOWN.contains(&path) {
+                if KNOWN.contains(&path.as_str()) {
                     json_err(
                         StatusCode::METHOD_NOT_ALLOWED,
                         "method_not_allowed",
@@ -632,7 +685,19 @@ impl ReplServer {
                 s
             }
             None => {
-                // 首次握手自动登记(设计稿 §3.3;max_slots 硬限制属 B3)
+                // 首次握手自动登记(设计稿 §3.3);max_slots 硬限制(B3,
+                // 与预登记共用同一闸)
+                match self.slot_limit_reached(&hello.slot_name) {
+                    Ok(true) => {
+                        return json_err(
+                            StatusCode::FORBIDDEN,
+                            "ErrSlotLimit",
+                            "max_slots hard cap reached (ADR-33 RP3.1)",
+                        )
+                    }
+                    Ok(false) => {}
+                    Err(e) => return internal_err("slots list", &e),
+                }
                 let now = now_unix_secs();
                 let slot = Slot {
                     name: hello.slot_name.clone(),
@@ -666,6 +731,140 @@ impl ReplServer {
                 epoch: rec.epoch,
                 seq: *seq,
             }))
+    }
+
+    /// `POST /v1/repl/v1/slots`(B3 预登记;线格式见模块注释)。
+    async fn handle_slot_create(&self, req: Request<Incoming>, cn: &str) -> Response<Full<Bytes>> {
+        let body = match read_json_body::<SlotCreateRequest>(req, MAX_HELLO_BODY).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        if !valid_slot_name(&body.name) {
+            return bad_slot_name();
+        }
+        let confirmed = match &body.confirmed_gtid {
+            Some(s) => match parse_gtid(s) {
+                Some(g) => g,
+                None => {
+                    return json_err(
+                        StatusCode::BAD_REQUEST,
+                        "bad_request",
+                        "confirmed_gtid must be \"{epoch}-{seq}\"",
+                    )
+                }
+            },
+            // 缺省 = 当前水位(预登记自登记时刻起消费;从零消费须显式
+            // "0-0",同时钉住全部现存 binlog——模块注释)
+            None => match self.high_watermark() {
+                Ok(g) => g,
+                Err(e) => return internal_err("slot watermark", &e),
+            },
+        };
+        match self.meta.repl_slot(&body.name) {
+            Ok(Some(_)) => {
+                return json_err(
+                    StatusCode::CONFLICT,
+                    "ErrSlotExists",
+                    "slot exists; drop + recreate to change filters/owner (R9)",
+                )
+            }
+            Ok(None) => {}
+            Err(e) => return internal_err("slot lookup", &e),
+        }
+        match self.slot_limit_reached(&body.name) {
+            Ok(true) => {
+                return json_err(
+                    StatusCode::FORBIDDEN,
+                    "ErrSlotLimit",
+                    "max_slots hard cap reached (ADR-33 RP3.1)",
+                )
+            }
+            Ok(false) => {}
+            Err(e) => return internal_err("slots list", &e),
+        }
+        let now = now_unix_secs();
+        let slot = Slot {
+            name: body.name,
+            consumer_node_id: body.consumer_node_id.unwrap_or_else(|| cn.to_string()),
+            confirmed_gtid: confirmed,
+            filters: body.filters,
+            created_at: now,
+            last_ack_at: now,
+            stale: false,
+        };
+        if let Err(e) = self.meta.put_repl_slot(&slot) {
+            return internal_err("slot register", &e);
+        }
+        json_ok(serde_json::json!({ "slot": slot_json(&slot) }))
+    }
+
+    /// `DELETE /v1/repl/v1/slots/{name}`(B3 drop;释放保留约束——截断下限
+    /// = min(活跃槽 confirmed),drop 即不再参与,§3.3/§3.4)。
+    fn handle_slot_drop(&self, name: &str) -> Response<Full<Bytes>> {
+        if !valid_slot_name(name) {
+            return bad_slot_name();
+        }
+        match self.meta.repl_slot(name) {
+            Ok(Some(_)) => {}
+            Ok(None) => return json_err(StatusCode::NOT_FOUND, "ErrSlotUnknown", "no such slot"),
+            Err(e) => return internal_err("slot lookup", &e),
+        }
+        match self.meta.delete_repl_slot(name) {
+            Ok(()) => json_ok(serde_json::json!({ "dropped": name })),
+            Err(e) => internal_err("slot drop", &e),
+        }
+    }
+
+    /// `POST /v1/repl/v1/slots/{name}/ack`(B3 confirmed_gtid 回执更新;
+    /// 选显式端点而非 binlog 参数捎带的取舍见模块注释)。
+    async fn handle_slot_ack(&self, req: Request<Incoming>, name: &str) -> Response<Full<Bytes>> {
+        if !valid_slot_name(name) {
+            return bad_slot_name();
+        }
+        let body = match read_json_body::<SlotAckRequest>(req, MAX_HELLO_BODY).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let Some(confirmed) = parse_gtid(&body.confirmed_gtid) else {
+            return json_err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "confirmed_gtid must be \"{epoch}-{seq}\"",
+            );
+        };
+        let mut slot = match self.meta.repl_slot(name) {
+            Ok(Some(s)) => s,
+            Ok(None) => return json_err(StatusCode::NOT_FOUND, "ErrSlotUnknown", "no such slot"),
+            Err(e) => return internal_err("slot lookup", &e),
+        };
+        if slot.stale {
+            return json_err(
+                StatusCode::GONE,
+                "ErrBinlogGone",
+                "slot marked stale; explicit rebuild required (ADR-33 RP8)",
+            );
+        }
+        // 回执单调:回退 confirmed 会错放截断下限(§3.4),显式拒绝
+        if confirmed < slot.confirmed_gtid {
+            return json_err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "confirmed_gtid must not regress",
+            );
+        }
+        slot.confirmed_gtid = confirmed;
+        slot.last_ack_at = now_unix_secs();
+        if let Err(e) = self.meta.put_repl_slot(&slot) {
+            return internal_err("slot ack", &e);
+        }
+        json_ok(serde_json::json!({ "slot": slot_json(&slot) }))
+    }
+
+    /// max_slots 闸(B3;RP3.1 硬限制):新名登记且已达上限 = true。
+    /// 检查-登记非事务,并发溢出至多超 1 槽(模块注释钉死)。
+    fn slot_limit_reached(&self, new_name: &str) -> Result<bool, fs3_core::Error> {
+        let slots = self.meta.list_repl_slots()?;
+        Ok(slots.len() >= self.max_slots && !slots.iter().any(|s| s.name == new_name))
     }
 
     /// 上游 GTID 集 = 本机 executed ∪ 本机 binlog 覆盖(§2.2 ②口径)。
@@ -727,6 +926,24 @@ struct GtidRangeJson {
     epoch: u64,
     start: u64,
     end: u64,
+}
+
+/// 槽预登记请求体(B3;缺省语义见模块注释)。
+#[derive(Debug, Deserialize)]
+struct SlotCreateRequest {
+    name: String,
+    #[serde(default)]
+    consumer_node_id: Option<String>,
+    #[serde(default)]
+    filters: BucketFilter,
+    #[serde(default)]
+    confirmed_gtid: Option<String>,
+}
+
+/// 槽回执请求体(B3;confirmed_gtid = GTID 文本形)。
+#[derive(Debug, Deserialize)]
+struct SlotAckRequest {
+    confirmed_gtid: String,
 }
 
 /// 槽的 JSON 投影(slots 观测端点与 hello 成功响应共用同一形状)。
@@ -1043,6 +1260,7 @@ mod tests {
             ca_cert: write_pem(dir.path(), "ca.pem", &ca.pem()),
             server_cert: write_pem(dir.path(), "server.pem", &cert_pem),
             server_key: write_pem(dir.path(), "server.key", &key_pem),
+            max_slots: DEFAULT_MAX_SLOTS,
         };
         let server = ReplServer::new(engine.clone(), meta, cfg).unwrap();
         let handle = server.spawn().unwrap();
@@ -1334,6 +1552,7 @@ mod tests {
             ca_cert: write_pem(dir.path(), "ca.pem", &ca.pem()),
             server_cert: write_pem(dir.path(), "server.pem", &srv_cert),
             server_key: write_pem(dir.path(), "server.key", &srv_key),
+            max_slots: DEFAULT_MAX_SLOTS,
         };
         let addr = ReplServer::new(engine.clone(), meta, cfg)
             .unwrap()
@@ -1759,6 +1978,218 @@ mod tests {
         .await;
         assert_eq!(st, 200, "{v}");
         assert_eq!(v["slot"]["name"], "s1");
+    }
+
+    /// M21 B3(ADR-33 RP3/RP8;设计稿 §3.3/§3.4):槽生命周期全程——
+    /// 预登记(带 BucketFilter + 显式位点)→ hello 复用/过滤器不一致拒 →
+    /// ack 回执更新落盘(回退拒/未知槽 404)→ drop → 截断保留约束释放。
+    #[tokio::test]
+    async fn slot_register_confirm_drop_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = repl_meta_with_entries(dir.path(), 4); // seq 1..=4
+        let fx = start_repl_server(Some(meta.clone()));
+        let (cert, key) = fx.client_cert(Some("node-b"));
+        let cli = Some((cert.as_str(), key.as_str()));
+
+        // ① 预登记:filters = Include(b1),confirmed = 1-1
+        let body = serde_json::json!({
+            "name": "s1",
+            "consumer_node_id": "node-b",
+            "filters": {"Include": ["b1"]},
+            "confirmed_gtid": "1-1",
+        })
+        .to_string();
+        let (st, _, raw) = mtls_request(
+            fx.addr,
+            &fx.ca_pem,
+            cli,
+            &post_json_req("/v1/repl/v1/slots", &body),
+        )
+        .await
+        .unwrap();
+        assert_eq!(st, 200, "{}", String::from_utf8_lossy(&raw));
+        let slot = meta.repl_slot("s1").unwrap().unwrap();
+        assert_eq!(slot.filters, BucketFilter::Include(vec!["b1".into()]));
+        assert_eq!(slot.confirmed_gtid, Gtid { epoch: 1, seq: 1 });
+        // 重名预登记 → 409 ErrSlotExists(改过滤器须 drop + 重建,R9)
+        let (st, _, raw) = mtls_request(
+            fx.addr,
+            &fx.ca_pem,
+            cli,
+            &post_json_req("/v1/repl/v1/slots", &body),
+        )
+        .await
+        .unwrap();
+        assert_eq!(st, 409, "{}", String::from_utf8_lossy(&raw));
+        assert!(String::from_utf8_lossy(&raw).contains("ErrSlotExists"));
+
+        // ② hello 复用已登记槽(过滤器一致)→ 200;过滤器不一致 →
+        // 409 ErrFilterMismatch(B2/B3 联动:禁原地改)
+        let (st, v) = hello_call(
+            &fx,
+            "node-b",
+            &hello_json(
+                "node-b",
+                "s1",
+                &[(1, 1, 1)],
+                serde_json::json!({"Include": ["b1"]}),
+                &[],
+            ),
+        )
+        .await;
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(v["slot"]["confirmed_gtid"], "1-1");
+        let (st, v) = hello_call(
+            &fx,
+            "node-b",
+            &hello_json(
+                "node-b",
+                "s1",
+                &[(1, 1, 1)],
+                serde_json::json!({"Include": ["b2"]}),
+                &[],
+            ),
+        )
+        .await;
+        assert_eq!(st, 409, "{v}");
+        assert_eq!(v["error"], "ErrFilterMismatch");
+
+        // ③ ack 回执:1-1 → 1-3 落盘;回退 1-2 → 400;未知槽 → 404
+        let (st, _, raw) = mtls_request(
+            fx.addr,
+            &fx.ca_pem,
+            cli,
+            &post_json_req(
+                "/v1/repl/v1/slots/s1/ack",
+                &serde_json::json!({"confirmed_gtid": "1-3"}).to_string(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(st, 200, "{}", String::from_utf8_lossy(&raw));
+        let slot = meta.repl_slot("s1").unwrap().unwrap();
+        assert_eq!(slot.confirmed_gtid, Gtid { epoch: 1, seq: 3 });
+        assert!(slot.last_ack_at >= slot.created_at);
+        let (st, _, _) = mtls_request(
+            fx.addr,
+            &fx.ca_pem,
+            cli,
+            &post_json_req(
+                "/v1/repl/v1/slots/s1/ack",
+                &serde_json::json!({"confirmed_gtid": "1-2"}).to_string(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(st, 400, "回执回退必须拒绝");
+        let (st, _, raw) = mtls_request(
+            fx.addr,
+            &fx.ca_pem,
+            cli,
+            &post_json_req(
+                "/v1/repl/v1/slots/ghost/ack",
+                &serde_json::json!({"confirmed_gtid": "1-1"}).to_string(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(st, 404, "{}", String::from_utf8_lossy(&raw));
+        assert!(String::from_utf8_lossy(&raw).contains("ErrSlotUnknown"));
+
+        // ④ 保留约束:软上限(1B)期望全截,槽 s1 @ 1-3 钳回 → 只删
+        // seq 1..=3,seq 4 保槽留存
+        let stats = meta
+            .truncate_binlog(
+                now_unix_secs(),
+                &fs3_meta::ReplRetainConfig {
+                    retain_hours: 24,
+                    retain_bytes: 1,
+                    retain_bytes_hard: u64::MAX,
+                },
+            )
+            .unwrap();
+        assert_eq!(stats.truncated, 3);
+        assert!(stats.soft_capped);
+        assert!(meta.repl_record(4).unwrap().is_some(), "未消费条目受槽保护");
+
+        // ⑤ drop → 保留约束释放:再截断 seq 4 删除;重复 drop → 404
+        let req =
+            "DELETE /v1/repl/v1/slots/s1 HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n";
+        let (st, _, _) = mtls_request(fx.addr, &fx.ca_pem, cli, req).await.unwrap();
+        assert_eq!(st, 200);
+        assert!(meta.repl_slot("s1").unwrap().is_none());
+        let (st, _, raw) = mtls_request(fx.addr, &fx.ca_pem, cli, req).await.unwrap();
+        assert_eq!(st, 404, "{}", String::from_utf8_lossy(&raw));
+        let stats = meta
+            .truncate_binlog(
+                now_unix_secs(),
+                &fs3_meta::ReplRetainConfig {
+                    retain_hours: 24,
+                    retain_bytes: 1,
+                    retain_bytes_hard: u64::MAX,
+                },
+            )
+            .unwrap();
+        assert_eq!(stats.truncated, 1, "drop 后无槽约束,seq 4 可截");
+        assert!(!stats.soft_capped);
+        assert!(meta.repl_binlog_entries().unwrap().is_empty());
+    }
+
+    /// M21 B3(ADR-33 RP3.1/裁定 2;设计稿 §8 M-d「第 17 槽被拒」):
+    /// max_slots 硬限制(默认 16)——预登记与握手自动登记共用同一闸,
+    /// 第 17 槽均 403 ErrSlotLimit;存量槽的握手不受限(200 对照)。
+    #[tokio::test]
+    async fn slot_17th_rejected() {
+        let fx = start_repl_server(None);
+        let (cert, key) = fx.client_cert(Some("node-b"));
+        let cli = Some((cert.as_str(), key.as_str()));
+
+        // 预登记 16 槽(s00..s15)全部成功
+        for i in 0..DEFAULT_MAX_SLOTS {
+            let body = serde_json::json!({ "name": format!("s{i:02}") }).to_string();
+            let (st, _, raw) = mtls_request(
+                fx.addr,
+                &fx.ca_pem,
+                cli,
+                &post_json_req("/v1/repl/v1/slots", &body),
+            )
+            .await
+            .unwrap();
+            assert_eq!(st, 200, "slot s{i:02}: {}", String::from_utf8_lossy(&raw));
+        }
+
+        // 第 17 槽:预登记 → 403 ErrSlotLimit
+        let body = serde_json::json!({ "name": "s16" }).to_string();
+        let (st, _, raw) = mtls_request(
+            fx.addr,
+            &fx.ca_pem,
+            cli,
+            &post_json_req("/v1/repl/v1/slots", &body),
+        )
+        .await
+        .unwrap();
+        assert_eq!(st, 403, "{}", String::from_utf8_lossy(&raw));
+        assert!(String::from_utf8_lossy(&raw).contains("ErrSlotLimit"));
+
+        // 第 17 槽:握手自动登记同样被拒(共用同一闸)
+        let (st, v) = hello_call(
+            &fx,
+            "node-c",
+            &hello_json("node-c", "s16", &[], serde_json::json!("All"), &[]),
+        )
+        .await;
+        assert_eq!(st, 403, "{v}");
+        assert_eq!(v["error"], "ErrSlotLimit");
+
+        // 存量槽握手不受限(登记闸只拦新名)
+        let (st, v) = hello_call(
+            &fx,
+            "node-b",
+            &hello_json("node-b", "s00", &[], serde_json::json!("All"), &[]),
+        )
+        .await;
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(v["slot"]["name"], "s00");
     }
 
     /// subject CN 提取:rcgen 证书正/反向 + 垃圾输入不 panic。
