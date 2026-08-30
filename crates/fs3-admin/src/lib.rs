@@ -54,6 +54,13 @@
 //! - `POST /v1/admin/sse/rotate`                SSE-S3 KEK 轮换 + 后台重包裹(M11 K1-1)
 //! - `GET  /v1/admin/sse/status`                KEK 代数/轮换时间/重包裹进度(零密钥材料)
 //! - `POST /v1/admin/config/reload`             热重载配置(H3;fs3d 提供回调)
+//! - `GET  /v1/admin/replication/status`        复制状态(M21 F2):role/epoch/cursor/high_watermark/pending/上下游摘要
+//! - `GET  /v1/admin/replication/slots`         槽位观测透传(M21 F2;同 D1 /v1/repl/v1/slots 口径)
+//! - `POST /v1/admin/replication/pause`         暂停 pull worker 与回填池(M21 F2;幂等)
+//! - `POST /v1/admin/replication/resume`        恢复 pull worker 与回填池(M21 F2;幂等)
+//! - `POST /v1/admin/replication/promote?dry_run=&force=` 手动 promote(M21 E3)
+//! - `POST /v1/admin/replication/demote`        主→备只读(M21 F2;再接上游须 rebuild)
+//! - `POST /v1/admin/replication/rebuild`       断档显式重建(M21 C5;唯一入口)
 //! - `WS   /v1/admin/ws?token=`                 实时推送(H3):snapshot 5s/audit 尾随/health/ping
 //!
 //! 认证:除 `/healthz` 外全部要求 `Authorization: Bearer <token>`(WS 亦接受 query token)。
@@ -151,6 +158,13 @@ pub struct AdminServer {
     /// 注入;None = 未配置任何复制([replication] 段与 env 测试钩子均
     /// 缺席),/metrics 相应指标组缺席)。
     repl_metrics: Option<Arc<dyn ReplMetricsSource>>,
+    /// M21 F2(ADR-33;设计稿 §5.3):复制拓扑观测 + demote 控制面(fs3d
+    /// ReplAdminService 注入;None = 未配置任何复制([replication] 段与
+    /// env 测试钩子均缺席),replication/status|slots|demote 返回 501)。
+    /// 与 `replication` 分列:纯主(无 pull)也有下游槽可观/可 demote,
+    /// 而 pause/resume/promote/rebuild 是 pull 栈动作,仍由
+    /// `replication` 承载(未配 pull = 501)。
+    repl_admin: Option<Arc<dyn ReplAdminControl>>,
 }
 
 /// M20 A3:KMS 托管服务控制抽象(fs3d 以 KmsServiceManager 适配实现;
@@ -177,7 +191,52 @@ pub trait ReplicationControl: Send + Sync {
     /// pull/回填 → epoch+1/EpochBarrier/role 单事务落盘);force=true =
     /// 丢弃 data_pending 尾事务。
     fn promote(&self, req: PromoteRequest) -> Result<serde_json::Value, PromoteError>;
+    /// 暂停 pull worker 与回填池(M21 F2;幂等——已暂停 = 200)。
+    /// 只停复制流入,role 不动;暂停窗内读路径缺数据口径同 rebuild
+    /// 窗口(503+Retry-After,C4)。
+    fn pause(&self) -> Result<serde_json::Value, ReplActionError>;
+    /// 恢复 pull worker 与回填池(M21 F2;幂等——运行中 = 200)。
+    /// 断档/分歧 Fatal 退出的恢复不走本动作(显式 rebuild 红线,C5)。
+    fn resume(&self) -> Result<serde_json::Value, ReplActionError>;
 }
+
+/// M21 F2(ADR-33;设计稿 §5.3):复制拓扑观测 + demote 控制抽象(fs3d 以
+/// ReplAdminService 适配实现;与 ReplicationControl 分列的注入口径见
+/// AdminServer.repl_admin 字段注释)。status/slots 纯读不审计;demote
+/// 记审计(who = operator,沿 M19 J3 先例)。
+pub trait ReplAdminControl: Send + Sync {
+    /// 本端复制状态:role/epoch/cursor/high_watermark/data_pending 字节/
+    /// 上游(pull 配置与 worker 活性)/下游槽摘要。
+    fn status(&self) -> Result<serde_json::Value, String>;
+    /// 槽位观测透传(与复制口 D1 `GET /v1/repl/v1/slots` 同形状同口径:
+    /// 原始字段 + lag 三件套)。
+    fn slots(&self) -> Result<serde_json::Value, String>;
+    /// demote 主→备(M21 F2;设计稿 §5 本地裁决动作):role=standby +
+    /// 停写(S3 层写动词恢复 501)。**最简单合法形态**:binlog/槽位
+    /// 不动(下游续拉至最后位点;promote 新主后下游重握手按 §2.2 分歧
+    /// 裁决),本端若要以备接上游须显式 rebuild(C5 唯一入口)。已在
+    /// standby → Rejected(409)。
+    fn demote(&self) -> Result<serde_json::Value, ReplActionError>;
+}
+
+/// pause/resume/demote 失败分类(HTTP 映射:Rejected → 409,Failed → 500)。
+#[derive(Debug)]
+pub enum ReplActionError {
+    /// 前置条件拒绝(已是 standby/已暂停互斥/纯主无 pull 栈等)。
+    Rejected(String),
+    /// 执行失败(存储层/worker 停启失败等)。
+    Failed(String),
+}
+
+impl std::fmt::Display for ReplActionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReplActionError::Rejected(m) | ReplActionError::Failed(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for ReplActionError {}
 
 /// promote 请求面(query 的 dry_run/force 字段;E3)。
 #[derive(Debug, Clone, Copy, Default)]
@@ -260,6 +319,7 @@ impl AdminServer {
             kms_service: None,
             replication: None,
             repl_metrics: None,
+            repl_admin: None,
         }
     }
 
@@ -280,6 +340,14 @@ impl AdminServer {
     /// 测试钩子时调用;None → /metrics 的 fasts3_repl_* 组缺席)。
     pub fn with_repl_metrics(mut self, src: Option<Arc<dyn ReplMetricsSource>>) -> Self {
         self.repl_metrics = src;
+        self
+    }
+
+    /// 注入复制拓扑观测 + demote 控制面(M21 F2;fs3d 配置任一复制
+    /// 字段/env 测试钩子时调用;None → replication/status|slots|demote
+    /// 返回 501)。
+    pub fn with_repl_admin_control(mut self, ctrl: Option<Arc<dyn ReplAdminControl>>) -> Self {
+        self.repl_admin = ctrl;
         self
     }
 
@@ -414,6 +482,7 @@ impl AdminServer {
             kms_service: self.kms_service.clone(),
             replication: self.replication.clone(),
             repl_metrics: self.repl_metrics.clone(),
+            repl_admin: self.repl_admin.clone(),
         })
     }
 
@@ -701,13 +770,27 @@ impl AdminServer {
             ("GET", ["kms", "keys", name]) => self.handle_kms_key_get(name),
             ("POST", ["kms", "keys", name, "rotate"]) => self.handle_kms_key_rotate(name, body),
             // M21 C5(ADR-33 RP5.4;设计稿 §5.2):断档显式重建——唯一入口
-            // (不自动触发红线);未注入 = 501。status/slots/pause/resume/
-            // demote 属 F2,不在本路由
+            // (不自动触发红线);未注入 = 501
             ("POST", ["replication", "rebuild"]) => self.handle_replication_rebuild(body),
             // M21 E3(ADR-33 RP5;设计稿 §5.1):手动 promote——dry_run 前置
             // (?dry_run=true 纯读清单),force=true 丢弃 pending 尾事务;
             // 未注入 = 501
             ("POST", ["replication", "promote"]) => self.handle_replication_promote(query, body),
+            // M21 F2(ADR-33;设计稿 §5.3):拓扑观测(纯读不审计;未注入
+            // = 501)
+            ("GET", ["replication", "status"]) => self.handle_replication_status(),
+            ("GET", ["replication", "slots"]) => self.handle_replication_slots(),
+            // M21 F2:demote 主→备(审计 ReplicationDemote;未注入 = 501)
+            ("POST", ["replication", "demote"]) => self.handle_replication_demote(body),
+            // M21 F2:暂停/恢复 pull worker 与回填池(pull 栈动作,走
+            // ReplicationControl;审计 ReplicationPause/ReplicationResume;
+            // 未配 pull = 501)
+            ("POST", ["replication", "pause"]) => {
+                self.handle_replication_pause_resume("pause", body)
+            }
+            ("POST", ["replication", "resume"]) => {
+                self.handle_replication_pause_resume("resume", body)
+            }
             _ => json::err(StatusCode::NOT_FOUND, "not_found", "unknown admin endpoint"),
         }
     }
@@ -847,6 +930,110 @@ impl AdminServer {
             Err(PromoteError::Failed(e)) => {
                 json::err(StatusCode::INTERNAL_SERVER_ERROR, "promote_failed", &e)
             }
+        }
+    }
+
+    /// M21 F2:`GET /v1/admin/replication/status`(纯读,不审计;未注入
+    /// → 501,执行失败 → 500)。
+    fn handle_replication_status(&self) -> Response<String> {
+        let Some(ctrl) = &self.repl_admin else {
+            return json::err(
+                StatusCode::NOT_IMPLEMENTED,
+                "not_implemented",
+                "replication 未配置([replication] 段缺席);status 观测不可用",
+            );
+        };
+        match ctrl.status() {
+            Ok(v) => json::ok(v),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "replication_status_error",
+                &e,
+            ),
+        }
+    }
+
+    /// M21 F2:`GET /v1/admin/replication/slots`(纯读,不审计;同 D1
+    /// 槽位观测口径;未注入 → 501)。
+    fn handle_replication_slots(&self) -> Response<String> {
+        let Some(ctrl) = &self.repl_admin else {
+            return json::err(
+                StatusCode::NOT_IMPLEMENTED,
+                "not_implemented",
+                "replication 未配置([replication] 段缺席);slots 观测不可用",
+            );
+        };
+        match ctrl.slots() {
+            Ok(v) => json::ok(v),
+            Err(e) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "replication_slots_error",
+                &e,
+            ),
+        }
+    }
+
+    /// M21 F2:`POST /v1/admin/replication/demote`,body `{operator?}`。
+    /// 审计:who = operator(沿 rebuild/promote 先例),op =
+    /// ReplicationDemote;Rejected → 409,Failed → 500,未注入 → 501。
+    fn handle_replication_demote(&self, body: &[u8]) -> Response<String> {
+        let Some(ctrl) = &self.repl_admin else {
+            return json::err(
+                StatusCode::NOT_IMPLEMENTED,
+                "not_implemented",
+                "replication 未配置([replication] 段缺席);demote 入口不可用",
+            );
+        };
+        let operator = Self::kms_operator(body);
+        match ctrl.demote() {
+            Ok(out) => {
+                self.service
+                    .audit()
+                    .push(&operator, "ReplicationDemote", "", "", 200, "");
+                json::ok(out)
+            }
+            Err(ReplActionError::Rejected(e)) => {
+                json::err(StatusCode::CONFLICT, "demote_rejected", &e)
+            }
+            Err(ReplActionError::Failed(e)) => {
+                json::err(StatusCode::INTERNAL_SERVER_ERROR, "demote_failed", &e)
+            }
+        }
+    }
+
+    /// M21 F2:`POST /v1/admin/replication/{pause,resume}`,body
+    /// `{operator?}`。审计:who = operator,op = ReplicationPause/
+    /// ReplicationResume;Rejected → 409,Failed → 500,未配 pull → 501。
+    fn handle_replication_pause_resume(&self, action: &str, body: &[u8]) -> Response<String> {
+        let Some(ctrl) = &self.replication else {
+            return json::err(
+                StatusCode::NOT_IMPLEMENTED,
+                "not_implemented",
+                "replication 未配置 pull([replication].primary_url 缺席);pause/resume 入口不可用",
+            );
+        };
+        let operator = Self::kms_operator(body);
+        let result = match action {
+            "pause" => ctrl.pause(),
+            "resume" => ctrl.resume(),
+            _ => unreachable!("route 已收敛 action"),
+        };
+        match result {
+            Ok(out) => {
+                let op = format!("Replication{}", action[..1].to_uppercase() + &action[1..]);
+                self.service.audit().push(&operator, &op, "", "", 200, "");
+                json::ok(out)
+            }
+            Err(ReplActionError::Rejected(e)) => json::err(
+                StatusCode::CONFLICT,
+                &format!("replication_{action}_rejected"),
+                &e,
+            ),
+            Err(ReplActionError::Failed(e)) => json::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("replication_{action}_failed"),
+                &e,
+            ),
         }
     }
 

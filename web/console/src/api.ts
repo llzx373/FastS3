@@ -391,6 +391,8 @@ export interface IamCapabilities {
   can_batch?: boolean;
   /** M20 G2:SSE-KMS 页(consoleAdmin 域;unseal key 不对 diagnostics 开放) */
   can_kms?: boolean;
+  /** M21 F2:复制拓扑页(consoleAdmin 域;同 KMS 口径) */
+  can_replication?: boolean;
 }
 
 /** M19 J1(ADR-26):Batch 任务。 */
@@ -494,6 +496,42 @@ export interface ServiceAccount {
   policy: string | null;
   embedded_policy: string | null;
   note: string | null;
+}
+
+/** M21 F2:复制状态(GET /api/replication/status;字段随 Rust 侧,消费方容错)。 */
+export interface ReplStatus {
+  role?: "primary" | "standby";
+  epoch?: number;
+  cursor?: string;
+  high_watermark?: string;
+  data_pending_bytes?: number;
+  bucket_scoped?: boolean;
+  upstream?: {
+    primary_url?: string;
+    slot_name?: string;
+    pull_running?: boolean;
+    paused?: boolean;
+  } | null;
+  downstream?: { slots?: number; stale_slots?: number };
+}
+
+/** M21 F2:槽位观测(GET /api/replication/slots;D1 口径 + lag 三件套)。 */
+export interface ReplSlot {
+  name: string;
+  consumer_node_id?: string | null;
+  confirmed_gtid?: string;
+  bucket_scoped?: boolean;
+  created_at?: number;
+  last_ack_at?: number;
+  stale?: boolean;
+  lag_seq?: number;
+  lag_bytes?: number;
+  lag_seconds?: number;
+}
+
+export interface ReplSlots {
+  high_watermark?: string;
+  slots: ReplSlot[];
 }
 
 const TOKEN_KEY = "fasts3_token";
@@ -897,6 +935,22 @@ export const api = {
   kmsServiceDeploy: () => request<Record<string, unknown>>("POST", "/api/kms/service/deploy"),
   kmsServiceStart: () => request<Record<string, unknown>>("POST", "/api/kms/service/start"),
   kmsServiceStop: () => request<Record<string, unknown>>("POST", "/api/kms/service/stop"),
+
+  // ── M21 F2:主备复制(代理 admin /v1/admin/replication/*;ADR-33) ──
+  replStatus: () => request<ReplStatus>("GET", "/api/replication/status"),
+  replSlots: () => request<ReplSlots>("GET", "/api/replication/slots"),
+  replPause: () => request<Record<string, unknown>>("POST", "/api/replication/pause"),
+  replResume: () => request<Record<string, unknown>>("POST", "/api/replication/resume"),
+  replDemote: () => request<Record<string, unknown>>("POST", "/api/replication/demote"),
+  replPromote: (opts: { dryRun?: boolean; force?: boolean } = {}) => {
+    const q = new URLSearchParams();
+    if (opts.dryRun) q.set("dry_run", "true");
+    if (opts.force) q.set("force", "true");
+    const qs = q.toString();
+    return request<Record<string, unknown>>("POST", `/api/replication/promote${qs ? `?${qs}` : ""}`);
+  },
+  replRebuild: (body: { from?: string; slot?: string }) =>
+    request<Record<string, unknown>>("POST", "/api/replication/rebuild", body),
 
   ldapStatus: () => request<LdapStatus>("GET", "/api/ldap/status"),
   identityEvents: (limit = 100) =>

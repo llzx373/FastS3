@@ -20,6 +20,7 @@ import Tenants from "./pages/Tenants";
 import Ingest from "./pages/Ingest";
 import Batches from "./pages/Batches";
 import Kms from "./pages/Kms";
+import Replication from "./pages/Replication";
 import CenterApp from "./center/CenterApp";
 import { FIRST_RUN_DISMISS_KEY } from "./pages/FirstRun";
 import { hashRoutePath } from "./hash-route";
@@ -59,6 +60,7 @@ const NAV: NavItem[] = [
   { path: "/ingest", labelZh: "迁入", labelEn: "Ingest", show: (c) => !!c.can_ingest },
   { path: "/batches", labelZh: "批量任务", labelEn: "Batch Ops", show: (c) => !!c.can_batch },
   { path: "/kms", labelZh: "KMS", labelEn: "KMS", show: (c) => !!c.can_kms },
+  { path: "/replication", labelZh: "复制", labelEn: "Replication", show: (c) => !!c.can_replication },
   { path: "/settings", labelZh: "设置", labelEn: "Settings", show: (c) => c.is_console_admin },
 ];
 
@@ -177,6 +179,9 @@ export default function App() {
       break;
     case "/kms":
       page = eff.can_kms ? <Kms /> : denied;
+      break;
+    case "/replication":
+      page = eff.can_replication ? <Replication /> : denied;
       break;
     case "/settings":
       page = eff.is_console_admin ? <Settings /> : denied;

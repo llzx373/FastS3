@@ -170,6 +170,56 @@ class FakeAdmin implements AdminApi {
   async deviceAdd(): Promise<never> {
     throw new Error("not used");
   }
+  // M20 G2 / M21 F2:KMS 与复制管理面(本测试未走这些路由;接口占位,
+  // 否则 TS2420 —— AdminApi 全量实现要求)
+  async kmsStatus(): Promise<never> {
+    throw new Error("not used");
+  }
+  async kmsKeys(): Promise<never> {
+    throw new Error("not used");
+  }
+  async kmsCreateKey(): Promise<never> {
+    throw new Error("not used");
+  }
+  async kmsDescribeKey(): Promise<never> {
+    throw new Error("not used");
+  }
+  async kmsRotateKey(): Promise<never> {
+    throw new Error("not used");
+  }
+  async kmsServiceStatus(): Promise<never> {
+    throw new Error("not used");
+  }
+  async kmsServiceDeploy(): Promise<never> {
+    throw new Error("not used");
+  }
+  async kmsServiceStart(): Promise<never> {
+    throw new Error("not used");
+  }
+  async kmsServiceStop(): Promise<never> {
+    throw new Error("not used");
+  }
+  async replStatus(): Promise<never> {
+    throw new Error("not used");
+  }
+  async replSlots(): Promise<never> {
+    throw new Error("not used");
+  }
+  async replPause(): Promise<never> {
+    throw new Error("not used");
+  }
+  async replResume(): Promise<never> {
+    throw new Error("not used");
+  }
+  async replDemote(): Promise<never> {
+    throw new Error("not used");
+  }
+  async replPromote(): Promise<never> {
+    throw new Error("not used");
+  }
+  async replRebuild(): Promise<never> {
+    throw new Error("not used");
+  }
   // M18 C1:IAM 授权求值(配置 admin 用户 = consoleAdmin,升级同步完成态;
   // 授权路由经 iamUser + iamAuthorize,见 iam-authz.ts)
   private iamApi = consoleAdminIam();

@@ -21,6 +21,7 @@ mod loadgen;
 mod meta;
 mod pool_cmds;
 mod repl;
+mod repl_admin;
 mod repl_backfill;
 mod repl_metrics;
 mod repl_rebuild;
@@ -1138,6 +1139,20 @@ fn cmd_serve(
             cfg.replication.clone(),
         ))
     });
+    // M21 F2(ADR-33;设计稿 §5.3):拓扑观测(status/slots)+ demote
+    // 控制面——任一复制配置在 = 注入(同 D4 口径);**纯主无 pull 也有
+    // 下游槽可观、可 demote**(§5.1 fence 入口),故与 pull 栈动作
+    // (pause/resume/promote/rebuild,ReplicationControl)分列注入。
+    let repl_admin_svc: Option<Arc<repl_admin::ReplAdminService>> =
+        if pull_cfg_env.is_some() || repl_cfg_env.is_some() {
+            Some(Arc::new(repl_admin::ReplAdminService::new(
+                service.clone(),
+                engine.read().meta_arc(),
+                rebuild_svc.clone(),
+            )))
+        } else {
+            None
+        };
 
     // 管理 API(H1;可选)
     let admin_listen = cli_admin_listen.or_else(|| cfg.admin.listen.clone());
@@ -1200,7 +1215,12 @@ fn cmd_serve(
                 )) as Arc<dyn fs3_admin::ReplMetricsSource>)
             } else {
                 None
-            });
+            })
+            // M21 F2(ADR-33;设计稿 §5.3):拓扑观测 + demote(任一复制
+            // 配置在 = 注入;纯非复制节点 = None → status/slots/demote 501)
+            .with_repl_admin_control(
+                repl_admin_svc.map(|s| s as Arc<dyn fs3_admin::ReplAdminControl>),
+            );
         // M6 / J5:设置页供应器(admin GET/PATCH /v1/admin/config)
         let provider = Arc::new(settings::SettingsProvider::new(
             config_path.clone(),

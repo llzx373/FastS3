@@ -352,14 +352,23 @@ export default function Settings() {
             </p>
           )}
 
-          <OpsPanels />
+          <OpsPanels draft={draft} set={set} />
         </>
       )}
     </div>
   );
 }
 
-function OpsPanels() {
+function OpsPanels({
+  draft,
+  set,
+}: {
+  /** KMS 卡编辑的是外层 Settings 的配置草稿(F3 起 [replication] 段
+   *  同走该草稿;修复:draft/set 原为外层闭包变量,OpsPanels 拆出后
+   *  需显式 props 传入,否则 tsc TS2304/2552)。 */
+  draft: Draft;
+  set: <K extends keyof Draft>(k: K, v: Draft[K]) => void;
+}) {
   const [sse, setSse] = useState<Record<string, unknown> | null>(null);
   const [sseErr, setSseErr] = useState<string | null>(null);
   const [devicePath, setDevicePath] = useState("");

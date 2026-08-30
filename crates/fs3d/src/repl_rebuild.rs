@@ -36,6 +36,12 @@
 //!   单事务落盘(epoch+1/EpochBarrier/role=primary,R12 无半状态)→
 //!   成功后本端为主,pull 栈不再起;失败恢复旧 pull 栈。桶级备显式
 //!   拒绝(§5.4:先 rebuild 为全量备)。
+//! - **暂停/恢复(M21 F2;§5.3)**:`POST /v1/admin/replication/
+//!   {pause,resume}`(同一 trait 注入面;pause/resume 方法)。pause =
+//!   停 pull worker + 回填池(role 不动,读路径缺数据口径同 rebuild
+//!   窗口);resume = 按现配置重启整栈(游标续流)。皆幂等,与
+//!   rebuild/promote 同一互斥。拓扑观测(status/slots)与 demote 在
+//!   repl_admin.rs(纯主也可观/可 demote,不依赖 pull 栈)。
 //!
 //! CLI 侧为 admin 通道最小客户端(unix socket / 回环 TCP + Bearer;手写
 //! HTTP/1.1 阻塞实现,零新增依赖——fs3-agent 是可选 feature 默认关,
@@ -66,14 +72,17 @@ pub struct RebuildService {
 }
 
 struct Inner {
-    /// 运行中的 pull worker(重建期/Fatal 退出后 = None)。
+    /// 运行中的 pull worker(重建期/Fatal 退出/暂停后 = None)。
     pull: Option<PullWorker>,
     /// 运行中的回填池(C4 读路径探针/按需拉取通道随其换绑)。
     backfill: Option<Arc<BackfillService>>,
     /// 当前生效的上游配置(rebuild 的 from/slot 覆盖后更新)。
     pull_cfg: PullConfig,
-    /// 重建互斥(并发 rebuild → Busy/409;幂等重入护栏)。
+    /// 重建互斥(并发 rebuild → Busy/409;幂等重入护栏;F2 起
+    /// pause/resume 同互斥——停启编排不叠加)。
     rebuilding: bool,
+    /// F2 暂停标记(pause 停栈后置位;resume/重建/promote 成功后清除)。
+    paused: bool,
 }
 
 impl RebuildService {
@@ -98,6 +107,7 @@ impl RebuildService {
                 backfill: None,
                 pull_cfg,
                 rebuilding: false,
+                paused: false,
             }),
         }
     }
@@ -223,6 +233,8 @@ impl RebuildService {
         inner.pull = Some(worker);
         inner.backfill = Some(backfill);
         inner.pull_cfg = cfg.clone();
+        // 重建重启整栈 = 暂停态随栈换新清除(F2)
+        inner.paused = false;
         Ok(serde_json::json!({
             "status": "rebuilding",
             "from": cfg.primary_url,
@@ -264,6 +276,95 @@ impl RebuildService {
             .set_repl_pending_probe(Some(backfill.clone()));
         self.service.set_repl_data_fetch(backfill.clone());
         Ok((worker, backfill))
+    }
+
+    /// F2:上游(pull)摘要——ReplAdminService status 端点的 `upstream`
+    /// 字段数据源(纯读;无 pull 配置的节点不装配本服务,字段缺席)。
+    pub fn upstream_summary(&self) -> serde_json::Value {
+        let inner = self.inner.lock();
+        serde_json::json!({
+            "primary_url": inner.pull_cfg.primary_url,
+            "slot_name": inner.pull_cfg.slot_name,
+            "pull_running": inner.pull.as_ref().is_some_and(|w| w.is_alive()),
+            "paused": inner.paused,
+        })
+    }
+
+    /// 暂停 pull worker 与回填池(M21 F2;ADR-33;设计稿 §5.3)。语义:
+    /// 只停复制流入(apply 停、回填停),**role 不动、本地数据照读**;
+    /// 读路径探针与按需拉取通道随池摘除——暂停窗内缺数据读 =
+    /// 503+Retry-After(口径同 rebuild 清空窗口,C4)。幂等:已暂停 =
+    /// 200。与 rebuild/promote 同一互斥(停启编排不叠加)。
+    pub fn pause(&self) -> Result<serde_json::Value, fs3_admin::ReplActionError> {
+        use fs3_admin::ReplActionError;
+        let mut inner = self.inner.lock();
+        if inner.rebuilding {
+            return Err(ReplActionError::Rejected(
+                "replication rebuild/promote in progress (pause 互斥)".into(),
+            ));
+        }
+        if inner.paused {
+            return Ok(serde_json::json!({
+                "status": "paused",
+                "note": "already paused (idempotent)",
+            }));
+        }
+        if let Some(w) = inner.pull.take() {
+            w.shutdown();
+        }
+        if let Some(bf) = inner.backfill.take() {
+            bf.shutdown();
+        }
+        self.engine.write().set_repl_pending_probe(None);
+        self.service.clear_repl_data_fetch();
+        inner.paused = true;
+        tracing::warn!(
+            slot = %inner.pull_cfg.slot_name,
+            "replication pull paused (explicit operator action, M21 F2)"
+        );
+        Ok(serde_json::json!({
+            "status": "paused",
+            "slot": inner.pull_cfg.slot_name,
+            "note": "pull worker 与回填池已停;role 不变;缺数据读 = 503+Retry-After 直至 resume",
+        }))
+    }
+
+    /// 恢复 pull worker 与回填池(M21 F2):按当前生效上游配置重启整栈
+    /// (游标续流,hello 重握手照常跑分歧/位点校验)。幂等:未暂停 =
+    /// 200(附 pull_running 观测)。**断档/分歧 Fatal 的恢复不走本动作**
+    /// ——那是显式 rebuild 红线(C5);resume 只覆盖「运维暂停后继续」。
+    pub fn resume(&self) -> Result<serde_json::Value, fs3_admin::ReplActionError> {
+        use fs3_admin::ReplActionError;
+        let mut inner = self.inner.lock();
+        if inner.rebuilding {
+            return Err(ReplActionError::Rejected(
+                "replication rebuild/promote in progress (resume 互斥)".into(),
+            ));
+        }
+        if !inner.paused {
+            return Ok(serde_json::json!({
+                "status": "running",
+                "pull_running": inner.pull.as_ref().is_some_and(|w| w.is_alive()),
+                "note": "not paused (idempotent)",
+            }));
+        }
+        let cfg = inner.pull_cfg.clone();
+        let (worker, backfill) = self.start_stack(&cfg).map_err(|e| match e {
+            fs3_admin::RebuildError::Busy(m) => ReplActionError::Rejected(m),
+            fs3_admin::RebuildError::Failed(m) => ReplActionError::Failed(m),
+        })?;
+        inner.pull = Some(worker);
+        inner.backfill = Some(backfill);
+        inner.paused = false;
+        tracing::warn!(
+            slot = %cfg.slot_name,
+            "replication pull resumed (explicit operator action, M21 F2)"
+        );
+        Ok(serde_json::json!({
+            "status": "running",
+            "slot": cfg.slot_name,
+            "note": "pull worker restarted; catch-up from local cursor in progress",
+        }))
     }
 
     /// 手动 promote(M21 E3;ADR-33 RP5;设计稿 §5.1;语义钉死在 fs3-meta
@@ -331,6 +432,8 @@ impl RebuildService {
                 // M21 E5:S3 层角色缓存热翻转(promote 成功 = 本端转主,
                 // 写路径 501 拦截解除;失败路径不动缓存——角色未变)
                 self.service.set_repl_role(fs3_meta::ReplRole::Primary);
+                // 转正后 pull 栈不再起:暂停态一并清除(F2)
+                inner.paused = false;
                 tracing::warn!(
                     epoch = out.epoch,
                     barrier = %crate::repl::fmt_gtid(out.barrier),
@@ -418,12 +521,21 @@ impl fs3_admin::ReplicationControl for RebuildService {
     ) -> Result<serde_json::Value, fs3_admin::PromoteError> {
         self.promote(req.dry_run, req.force)
     }
+
+    fn pause(&self) -> Result<serde_json::Value, fs3_admin::ReplActionError> {
+        self.pause()
+    }
+
+    fn resume(&self) -> Result<serde_json::Value, fs3_admin::ReplActionError> {
+        self.resume()
+    }
 }
 
 // ─────────────────── CLI(`fasts3d replication rebuild`)───────────────────
 
-/// `fasts3d replication` 子命令面(M21 C5 起;E3 已落 promote 的 admin
-/// 管理面,其 CLI 面与 status/slots/pause/resume/demote 属 F2,不抢跑)。
+/// `fasts3d replication` 子命令面(M21 C5 起;F2 已落 status/slots/
+/// pause/resume/demote 的 admin 管理面,其 CLI 面暂不加——console 与
+/// curl 已覆盖,需要时按 rebuild 先例补)。
 #[derive(clap::Args)]
 pub struct ReplicationArgs {
     #[command(subcommand)]

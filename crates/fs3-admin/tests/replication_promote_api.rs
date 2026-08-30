@@ -51,6 +51,18 @@ impl ReplicationControl for StubControl {
             StubOutcome::Failed => Err(PromoteError::Failed("store error".into())),
         }
     }
+
+    fn pause(&self) -> Result<serde_json::Value, fs3_admin::ReplActionError> {
+        Err(fs3_admin::ReplActionError::Rejected(
+            "stub: pause 用例在 admin_api(F2)测试".into(),
+        ))
+    }
+
+    fn resume(&self) -> Result<serde_json::Value, fs3_admin::ReplActionError> {
+        Err(fs3_admin::ReplActionError::Rejected(
+            "stub: resume 用例在 admin_api(F2)测试".into(),
+        ))
+    }
 }
 
 fn http_unix(

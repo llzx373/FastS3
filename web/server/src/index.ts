@@ -1632,6 +1632,95 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     },
   );
 
+  // ── M21 F2:主备复制(代理 admin /v1/admin/replication/*;ADR-33;设计稿 §5.3)──
+  // consoleAdmin 域(admin:ListTenants;照 KMS 先例——复制面是实例级运维动作,
+  // 不开 diagnostics)。status/slots 纯读;pause/resume/promote/demote/rebuild
+  // 审计 who = operator(此处注入 JWT sub,admin 侧落审计)。
+  const replAllow = "admin:ListTenants";
+  const replProxyErr = (e: unknown, reply: FastifyReply) => {
+    const msg = (e as Error).message;
+    const m = /HTTP (\d{3})/.exec(msg);
+    const status = m && ["400", "404", "409", "501"].includes(m[1]) ? Number(m[1]) : 502;
+    return reply.code(status).send({ error: { code: "replication_proxy_error", message: msg } });
+  };
+  app.get("/api/replication/status", { preHandler: requireIamAction(admin, replAllow) }, async (_req, reply) => {
+    try {
+      return await admin.replStatus();
+    } catch (e) {
+      return replProxyErr(e, reply);
+    }
+  });
+  app.get("/api/replication/slots", { preHandler: requireIamAction(admin, replAllow) }, async (_req, reply) => {
+    try {
+      return await admin.replSlots();
+    } catch (e) {
+      return replProxyErr(e, reply);
+    }
+  });
+  app.post(
+    "/api/replication/pause",
+    { preHandler: requireIamAction(admin, replAllow, ownTenant) },
+    async (req, reply) => {
+      try {
+        return await admin.replPause({ operator: requestSub(req) || "admin" });
+      } catch (e) {
+        return replProxyErr(e, reply);
+      }
+    },
+  );
+  app.post(
+    "/api/replication/resume",
+    { preHandler: requireIamAction(admin, replAllow, ownTenant) },
+    async (req, reply) => {
+      try {
+        return await admin.replResume({ operator: requestSub(req) || "admin" });
+      } catch (e) {
+        return replProxyErr(e, reply);
+      }
+    },
+  );
+  app.post(
+    "/api/replication/demote",
+    { preHandler: requireIamAction(admin, replAllow, ownTenant) },
+    async (req, reply) => {
+      try {
+        return await admin.replDemote({ operator: requestSub(req) || "admin" });
+      } catch (e) {
+        return replProxyErr(e, reply);
+      }
+    },
+  );
+  app.post<{ Querystring: { dry_run?: string; force?: string } }>(
+    "/api/replication/promote",
+    { preHandler: requireIamAction(admin, replAllow, ownTenant) },
+    async (req, reply) => {
+      try {
+        return await admin.replPromote({
+          dry_run: req.query.dry_run === "true",
+          force: req.query.force === "true",
+          operator: requestSub(req) || "admin",
+        });
+      } catch (e) {
+        return replProxyErr(e, reply);
+      }
+    },
+  );
+  app.post<{ Body: { from?: string; slot?: string } }>(
+    "/api/replication/rebuild",
+    { preHandler: requireIamAction(admin, replAllow, ownTenant) },
+    async (req, reply) => {
+      try {
+        return await admin.replRebuild({
+          from: req.body?.from,
+          slot: req.body?.slot,
+          operator: requestSub(req) || "admin",
+        });
+      } catch (e) {
+        return replProxyErr(e, reply);
+      }
+    },
+  );
+
   // ── 密钥管理(M18 C1:legacy 无属主密钥映射 SA 动作族;见 compat) ──
   app.get(
     "/api/keys",
@@ -2039,6 +2128,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       can_batch: await probe("admin:CreateBatchJob"),
       // M20 G2:KMS 页(consoleAdmin 域;admin:ListTenants,不走 diagnostics Get*)
       can_kms: await probe("admin:ListTenants"),
+      // M21 F2:复制拓扑页(consoleAdmin 域;同 KMS 口径——实例级运维动作)
+      can_replication: await probe("admin:ListTenants"),
     };
   });
 

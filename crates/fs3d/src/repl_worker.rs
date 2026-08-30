@@ -32,8 +32,8 @@
 //!   验签/范围强制在 fs3-s3(service.rs 委派分支)。
 //! - **生命周期**:`role=standby` 才启动(spawn 硬校验,非备显式报错);
 //!   `shutdown()` 置停止标志 + join(长轮询请求有界,退出延迟 ≤
-//!   long_poll_ms + retry 退避);暂停/恢复(pause/resume)语义属 F2,
-//!   本结构经停止标志已可停。
+//!   long_poll_ms + retry 退避);暂停/恢复(pause/resume,F2)经
+//!   RebuildService 停/重启整栈实现,本结构提供停止标志与活性探针。
 //! - **apply 不经 S3 层**:直调 MetaStore(S3 写隔离 501 属 E5)。
 //!
 //! 配置(M21 F3 收口,设计稿 §6.1):`[replication]` 段为准——
@@ -263,8 +263,8 @@ impl PullWorker {
     }
 
     /// worker 线程存活探针(C5:Fatal 退出可观测——断档/分歧不停机热
-    /// 循环,而是退出待显式 rebuild;测试断言用)。
-    #[cfg(test)]
+    /// 循环,而是退出待显式 rebuild;F2 起 status 端点的
+    /// upstream.pull_running 同用,故非 test-only)。
     pub fn is_alive(&self) -> bool {
         self.handle.as_ref().is_some_and(|h| !h.is_finished())
     }

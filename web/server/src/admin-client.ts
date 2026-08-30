@@ -111,6 +111,25 @@ export interface AdminApi {
   kmsServiceDeploy(body?: { operator?: string }): Promise<Record<string, unknown>>;
   kmsServiceStart(body?: { operator?: string }): Promise<Record<string, unknown>>;
   kmsServiceStop(body?: { operator?: string }): Promise<Record<string, unknown>>;
+  /** M21 F2:复制拓扑观测(status/slots;纯读)。 */
+  replStatus(): Promise<Record<string, unknown>>;
+  replSlots(): Promise<Record<string, unknown>>;
+  /** M21 F2:暂停/恢复 pull worker 与回填池;demote 主→备只读。 */
+  replPause(body?: { operator?: string }): Promise<Record<string, unknown>>;
+  replResume(body?: { operator?: string }): Promise<Record<string, unknown>>;
+  replDemote(body?: { operator?: string }): Promise<Record<string, unknown>>;
+  /** M21 E3:手动 promote(dry_run = 纯读丢弃清单;force = 丢弃 pending 尾事务)。 */
+  replPromote(opts?: {
+    dry_run?: boolean;
+    force?: boolean;
+    operator?: string;
+  }): Promise<Record<string, unknown>>;
+  /** M21 C5:断档显式重建(from/slot 可缺省 = 现配置)。 */
+  replRebuild(body?: {
+    from?: string;
+    slot?: string;
+    operator?: string;
+  }): Promise<Record<string, unknown>>;
   /** 在线加盘。 */
   deviceAdd(path: string, force?: boolean): Promise<Record<string, unknown>>;
   // M18 S1(ADR-28 DI2.4/DI8):IAM 用户查询 + 服务账号 CRUD(自助/代管)
@@ -756,6 +775,36 @@ export class AdminClient implements AdminApi {
   }
   kmsServiceStop(body?: { operator?: string }): Promise<Record<string, unknown>> {
     return this.expect("POST", "/v1/admin/kms/service/stop", body ?? {});
+  }
+
+  // ── M21 F2:主备复制管理面(ADR-33;设计稿 §5.3) ──
+
+  replStatus(): Promise<Record<string, unknown>> {
+    return this.expect("GET", "/v1/admin/replication/status");
+  }
+  replSlots(): Promise<Record<string, unknown>> {
+    return this.expect("GET", "/v1/admin/replication/slots");
+  }
+  replPause(body?: { operator?: string }): Promise<Record<string, unknown>> {
+    return this.expect("POST", "/v1/admin/replication/pause", body ?? {});
+  }
+  replResume(body?: { operator?: string }): Promise<Record<string, unknown>> {
+    return this.expect("POST", "/v1/admin/replication/resume", body ?? {});
+  }
+  replDemote(body?: { operator?: string }): Promise<Record<string, unknown>> {
+    return this.expect("POST", "/v1/admin/replication/demote", body ?? {});
+  }
+  replPromote(opts?: { dry_run?: boolean; force?: boolean; operator?: string }): Promise<Record<string, unknown>> {
+    const q = new URLSearchParams();
+    if (opts?.dry_run) q.set("dry_run", "true");
+    if (opts?.force) q.set("force", "true");
+    const qs = q.toString();
+    return this.expect("POST", `/v1/admin/replication/promote${qs ? `?${qs}` : ""}`, {
+      operator: opts?.operator,
+    });
+  }
+  replRebuild(body?: { from?: string; slot?: string; operator?: string }): Promise<Record<string, unknown>> {
+    return this.expect("POST", "/v1/admin/replication/rebuild", body ?? {});
   }
 
   deviceAdd(path: string, force = false): Promise<Record<string, unknown>> {
