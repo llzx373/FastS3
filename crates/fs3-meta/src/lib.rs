@@ -9567,3 +9567,223 @@ mod m13_spike_tests {
         assert_eq!(db.get(b"k").unwrap().unwrap(), b"v");
     }
 }
+
+#[cfg(test)]
+mod m21_bench_tests {
+    //! M21 A5(perf-M21):binlog 开关对提交路径开销的控制变量微基准。
+    //! 同进程同机隔离变量:两类典型 PUT 提交事务(① 非内联对象,op 载荷
+    //! ~1-2KB;② ≤32KiB 内联小对象)× repl_binlog off/on,各 N=20000 次
+    //! commit,输出 p50/p99/均值 + ReplRecord 序列化分量 + 目录字节放大。
+    //!
+    //! 跑法:`cargo test -p fs3-meta repl_binlog_commit_microbench -- --ignored --nocapture`
+    //! (#[ignore] 微基准,仿 fs3-s3 authorize_hotpath_microbench 先例;
+    //! 不计入常规门禁,数字落 docs/perf-M21.md)。
+
+    use super::*;
+    use crate::repl::ReplRecord;
+    use fs3_core::BucketStats;
+    use std::time::Instant;
+
+    fn bench_bucket_meta(name: &str) -> BucketMeta {
+        BucketMeta {
+            created: 1,
+            owner: name.to_string(),
+            stats: BucketStats::default(),
+            quota: None,
+            created_with_acl: false,
+            versioning: fs3_core::VersioningState::Off,
+            default_encryption: None,
+            object_lock: false,
+            default_retention: None,
+            default_kms_key: None,
+        }
+    }
+
+    fn bench_object_meta(size: u64) -> ObjectMeta {
+        ObjectMeta {
+            size,
+            etag: [0u8; 16],
+            mtime: 1,
+            extents: vec![],
+            content_type: "application/octet-stream".into(),
+            user_meta: vec![],
+            inline: None,
+            parts: vec![],
+            resp_headers: vec![],
+            version_id: None,
+            is_delete_marker: false,
+            tags: vec![],
+            sse: None,
+            checksum: None,
+            retention: None,
+            legal_hold: false,
+            part_checksums: Vec::new(),
+            compressed: None,
+            requested_storage_class: None,
+            storage_class: None,
+            restore_state: None,
+        }
+    }
+
+    /// 目录字节总量(WAL + SST + MANIFEST 等;实测写放大输入)。
+    fn dir_bytes(dir: &std::path::Path) -> u64 {
+        walk(dir)
+    }
+    fn walk(dir: &std::path::Path) -> u64 {
+        let mut sum = 0;
+        for e in std::fs::read_dir(dir).unwrap() {
+            let e = e.unwrap();
+            let m = e.metadata().unwrap();
+            if m.is_dir() {
+                sum += walk(&e.path());
+            } else {
+                sum += m.len();
+            }
+        }
+        sum
+    }
+
+    fn pct(sorted_ns: &[u128], q: f64) -> f64 {
+        let i = ((sorted_ns.len() as f64 - 1.0) * q).round() as usize;
+        sorted_ns[i] as f64 / 1000.0 // µs
+    }
+
+    /// 构造一次 PUT 提交的 ops(与 commit_object_put 同形态 3-op 事务)。
+    fn put_ops(bucket: &str, key: &str, meta: &ObjectMeta, size: u64) -> Vec<Op> {
+        vec![
+            Op::ObjectPut {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                meta: meta.clone(),
+            },
+            Op::Alloc {
+                draft: AllocDraft::default(),
+            },
+            Op::Stats {
+                bucket: bucket.to_string(),
+                delta: StatsDelta {
+                    objects: 1,
+                    bytes: size as i64,
+                    by_class: Vec::new(),
+                },
+            },
+        ]
+    }
+
+    /// ReplRecord 构造 + postcard 序列化分量(N 次均值,ns/op 与字节/条)。
+    fn encode_component(ops: &[Op], n: usize) -> (f64, usize) {
+        let mut bytes = 0;
+        let t0 = Instant::now();
+        for _ in 0..n {
+            let rec = ReplRecord::new(1, ops);
+            let v = rec.encode_value().unwrap();
+            bytes = v.len();
+            std::hint::black_box(v);
+        }
+        (t0.elapsed().as_nanos() as f64 / n as f64, bytes)
+    }
+
+    /// 单臂:对 store 跑 N 次 commit,返回 (p50µs, p99µs, meanµs, 目录字节增量)。
+    fn arm(
+        store: &MetaStore,
+        dir: &std::path::Path,
+        key_prefix: &str,
+        meta: &ObjectMeta,
+        size: u64,
+        n: usize,
+    ) -> (f64, f64, f64, u64) {
+        // 预热(rocksdb memtable/事务池等一次性成本)
+        for i in 0..500 {
+            store
+                .commit(&put_ops(
+                    "bench",
+                    &format!("{key_prefix}warm{i}"),
+                    meta,
+                    size,
+                ))
+                .unwrap();
+        }
+        let before = dir_bytes(dir);
+        let mut lat = Vec::with_capacity(n);
+        for i in 0..n {
+            let ops = put_ops("bench", &format!("{key_prefix}{i}"), meta, size);
+            let t0 = Instant::now();
+            store.commit(&ops).unwrap();
+            lat.push(t0.elapsed().as_nanos());
+        }
+        let after = dir_bytes(dir);
+        lat.sort_unstable();
+        let mean = lat.iter().sum::<u128>() as f64 / lat.len() as f64 / 1000.0;
+        (pct(&lat, 0.50), pct(&lat, 0.99), mean, after - before)
+    }
+
+    #[test]
+    #[ignore]
+    fn repl_binlog_commit_microbench() {
+        const N: usize = 20_000;
+        // ① 非内联对象:ObjectMeta 带段引用 + ~1KB user_meta(op 载荷 ~1-2KB)
+        let mut m_plain = bench_object_meta(16 * 1024 * 1024);
+        m_plain.extents = vec![Segment {
+            extent_id: 7,
+            offset: 0,
+            len: 16 * 1024 * 1024,
+            crcs: vec![0xDEAD_BEEF; 4],
+        }];
+        m_plain.user_meta = (0..10)
+            .map(|i| (format!("x-amz-meta-k{i:02}"), "v".repeat(96)))
+            .collect();
+        // ② 内联小对象:32KiB inline 字节随 Op 值直达
+        let mut m_inline = bench_object_meta(32 * 1024);
+        m_inline.inline = Some(vec![0xABu8; 32 * 1024]);
+
+        let ops_plain = put_ops("bench", "probe-plain", &m_plain, m_plain.size);
+        let ops_inline = put_ops("bench", "probe-inline", &m_inline, m_inline.size);
+        let (enc_plain_ns, enc_plain_b) = encode_component(&ops_plain, N);
+        let (enc_inline_ns, enc_inline_b) = encode_component(&ops_inline, N);
+        println!("== ReplRecord 构造+postcard 序列化分量(N={N})==");
+        println!("① 非内联: {enc_plain_ns:.0} ns/op, {enc_plain_b} B/条");
+        println!("② 内联32KiB: {enc_inline_ns:.0} ns/op, {enc_inline_b} B/条");
+
+        for (tag, meta) in [
+            ("① 非内联(~1-2KB op)", &m_plain),
+            ("② 内联 32KiB", &m_inline),
+        ] {
+            let mut row = Vec::new();
+            for repl in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let store = MetaStore::open(
+                    dir.path(),
+                    &MetaConfig {
+                        repl_binlog: repl,
+                        ..MetaConfig::default()
+                    },
+                )
+                .unwrap();
+                store
+                    .commit_bucket_put("bench", &bench_bucket_meta("bench"))
+                    .unwrap();
+                let r = arm(&store, dir.path(), &format!("{tag}-"), meta, meta.size, N);
+                row.push((repl, r));
+                drop(store);
+            }
+            let (off, on) = (row[0].1, row[1].1);
+            let d = |a: f64, b: f64| (b - a) / a * 100.0;
+            println!("== {tag} commit 路径(N={N},同进程 off→on)==");
+            println!(
+                "  off: p50={:.1}µs p99={:.1}µs mean={:.1}µs dir+={}B",
+                off.0, off.1, off.2, off.3
+            );
+            println!(
+                "  on : p50={:.1}µs p99={:.1}µs mean={:.1}µs dir+={}B",
+                on.0, on.1, on.2, on.3
+            );
+            println!(
+                "  Δ  : p50 {:+.1}% | p99 {:+.1}% | mean {:+.1}% | 目录字节 ×{:.2}",
+                d(off.0, on.0),
+                d(off.1, on.1),
+                d(off.2, on.2),
+                on.3 as f64 / off.3 as f64
+            );
+        }
+    }
+}
