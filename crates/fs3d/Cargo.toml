@@ -14,6 +14,8 @@ path = "src/main.rs"
 tempfile.workspace = true
 # 测试夹具:v2 存量值编码(V5-3 rewrite 混合库测试;复用 workspace 既有依赖)
 postcard.workspace = true
+# M21 B1:复制口 mTLS 测试自签 CA/证书(锁树已有 rcgen 0.13,零新增包)
+rcgen.workspace = true
 
 [dependencies]
 hmac.workspace = true
@@ -29,6 +31,18 @@ fs3-engine.workspace = true
 fs3-s3.workspace = true
 fs3-http.workspace = true
 fs3-admin.workspace = true
+# M21 B1(ADR-33 RP6):复制口服务端(repl.rs)——rustls 服务端 mTLS 强制 +
+# 手写 HTTP/1.1,独立线程 current_thread runtime(照 fs3-admin 先例,
+# 数据面热路径零 tokio)。全部已在锁树(fs3-agent/fs3-http/fs3-admin
+# 同版本),零新增包。
+tokio = { version = "1.40", features = ["rt", "net", "io-util", "time", "macros"] }
+hyper = { version = "1.5", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
 # M20(ADR-29):SSE-KMS 密钥托管——fs3-kms 客户端 + 托管管理器
 fs3-kms.workspace = true
 # M14 G1-1(ADR-17 DV1):纳管 agent 可选模块;feature 默认关,

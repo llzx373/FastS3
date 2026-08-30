@@ -3221,6 +3221,33 @@ impl MetaStore {
         Ok(out)
     }
 
+    /// 复制口增量拉取的有界迭代(M21 B1;ADR-33 RP6;A1 注释预留的带界
+    /// 迭代在此落地):从 `after_seq` 之后起取至多 `limit` 条(seq 升序)。
+    /// binlog 键序 = s:seq 提交序且 epoch 单调不减(truncate_binlog 注释
+    /// 口径),扫描序 = GTID 序;after GTID 的 epoch 维字典序过滤由复制口
+    /// 在记录层做(repl.rs)。
+    pub fn repl_binlog_scan(&self, after_seq: u64, limit: usize) -> Result<Vec<(u64, ReplRecord)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::with_capacity(limit.min(1024));
+        let start = binlog_key(after_seq.saturating_add(1));
+        for item in self
+            .db
+            .iterator(IteratorMode::From(&start, Direction::Forward))
+        {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(PREFIX_BINLOG) {
+                break;
+            }
+            out.push((parse_binlog_seq(&k)?, ReplRecord::decode_value(&v)?));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// 归档恢复作业队列读取(M16 A2,ADR-19 DA2.3):从 `after_seq` 之后
     /// 起取至多 `limit` 条(队首续跑;None = 从头)。
     pub fn restore_jobs(
@@ -6193,6 +6220,38 @@ mod tests {
             assert_eq!(entries.len(), 5);
             assert_eq!(entries[4].0, s5);
         }
+    }
+
+    /// M21 B1(ADR-33 RP6):`repl_binlog_scan` 有界迭代——after_seq 断点
+    /// 续拉、limit 截断、边界(after=0 从头 / after=尾 空批 / limit=0)。
+    #[test]
+    fn repl_binlog_scan_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaStore::open(
+            dir.path(),
+            &MetaConfig {
+                repl_binlog: true,
+                ..MetaConfig::default()
+            },
+        )
+        .unwrap();
+        for i in 0..5 {
+            meta.commit_bucket_put(&format!("b{i}"), &bucket_meta(&format!("b{i}")))
+                .unwrap();
+        }
+        let all = meta.repl_binlog_scan(0, 100).unwrap();
+        assert_eq!(
+            all.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+        // 断点续拉 + limit 截断
+        let page = meta.repl_binlog_scan(2, 2).unwrap();
+        assert_eq!(page.iter().map(|(s, _)| *s).collect::<Vec<_>>(), vec![3, 4]);
+        let tail = meta.repl_binlog_scan(4, 100).unwrap();
+        assert_eq!(tail.iter().map(|(s, _)| *s).collect::<Vec<_>>(), vec![5]);
+        // 边界:尾后空批(长轮询前的现状口径)/ limit=0
+        assert!(meta.repl_binlog_scan(5, 100).unwrap().is_empty());
+        assert!(meta.repl_binlog_scan(0, 0).unwrap().is_empty());
     }
 
     /// M21 A2(ADR-33 RP2/R12;设计稿 §2.1/§3.1):executed GTID 集持久化——

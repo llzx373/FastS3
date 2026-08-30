@@ -7015,6 +7015,39 @@ impl Engine {
 
     // ─────────────────────────── 零拷贝读路径(B3/D2) ───────────────────────────
 
+    /// M21 B1(ADR-33 RP6;docs/replication-design.md §3.2):复制口段数据
+    /// 拉取——按 DataRef(extent_id, offset, len)Range 读原始段字节。
+    /// ReadPin 钉扎防导出期间 compaction 迁移(ADR-22,与对象读路径同一
+    /// 机制);整段 CRC32C 由复制口对返回字节计算置于响应头(段提交即
+    /// 不可变,ADR-9),此处不叠加引擎 verify_reads 网格校验。
+    pub fn read_extent_range(&self, extent_id: u32, offset: u64, len: u64) -> Result<Vec<u8>> {
+        if len == 0 {
+            return Err(Error::InvalidArgument("extent-data len must be > 0".into()));
+        }
+        let gid = u64::from(extent_id);
+        let (di, _local) = self
+            .resolve_extent(gid)
+            .ok_or_else(|| Error::NotFound(format!("extent {extent_id} not present in pool")))?;
+        let cap = self.devices[di].extent_capacity();
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| Error::InvalidArgument("extent-data range overflow".into()))?;
+        if end > cap {
+            return Err(Error::InvalidArgument(format!(
+                "extent-data range [{offset}, {end}) exceeds extent capacity {cap}"
+            )));
+        }
+        let _pin = ReadPin::new(Arc::clone(&self.alloc), vec![gid]);
+        let dev_off = self.extent_data_offset(gid)? + offset;
+        let fd = self.device_fd_of(gid)?;
+        let mut out = Vec::with_capacity(len as usize);
+        self.read_batched_blocks(fd, dev_off, len as usize, |data| {
+            out.extend_from_slice(data);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
     /// ADR-22 (c):对对象当前读视图涉及的 extent 钉扎,Drop 时 unpin。
     pub fn pin_extents_for_meta(&self, meta: &ObjectMeta) -> ReadPin {
         let restored_view;

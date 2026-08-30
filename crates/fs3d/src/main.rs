@@ -20,6 +20,7 @@ mod doctor;
 mod loadgen;
 mod meta;
 mod pool_cmds;
+mod repl;
 mod rewrite;
 mod settings;
 mod signal;
@@ -1151,6 +1152,23 @@ fn cmd_serve(
                 "agent.enabled=true but build lacks `agent` feature (cargo build --features agent); ignoring"
             );
         }
+    }
+
+    // M21 B1(ADR-33 RP6;设计稿 §6.1):复制口独立监听(默认 9445,mTLS
+    // 强制)。配置走 env 最小入口(FS3D_REPL_*;[replication] 完整配置段
+    // 属 F3 收口)。TLS 材料装配期装载,坏材料 = 启动显式失败(不静默降级
+    // 为无 mTLS,红线 RP6.2)。
+    match repl::ReplConfig::from_env() {
+        Ok(Some(repl_cfg)) => {
+            let meta = engine.read().meta_arc();
+            let handle = repl::ReplServer::new(engine.clone(), meta, repl_cfg)
+                .map_err(fs3_core::Error::InvalidArgument)?
+                .spawn()
+                .map_err(fs3_core::Error::Io)?;
+            tracing::info!("replication port bound on {}", handle.local_addr);
+        }
+        Ok(None) => {}
+        Err(e) => return Err(fs3_core::Error::InvalidArgument(e)),
     }
 
     // 生命周期 worker 启动(创建见 admin 装配前;解耦仅为注入 stats Arc)
