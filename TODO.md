@@ -112,11 +112,11 @@
   复用 agent `http1.rs` 样板;端点 `GET /v1/repl/v1/{binlog,extent-data,slots}` +
   `POST /v1/repl/v1/{snapshot,hello}`
   - 用例:`repl_port_requires_mtls`(无证书/错误 CN 拒连);`repl_port_independent_of_s3`
-- [ ] B2 握手协议:HELLO 校验三件套(起始位点可用 / executed 集 ⊆ 上游 / 过滤器一致)
+- [x] B2 握手协议:HELLO 校验三件套(起始位点可用 / executed 集 ⊆ 上游 / 过滤器一致)
   → 正常续流 / `ErrBinlogGone` / `ErrDiverged`;环检测(链路 node_id 列表)
   - 用例:`repl_handshake_rejects_diverged_gtid`;`repl_handshake_rejects_stale_cursor`;
     `repl_handshake_rejects_topology_loop`
-- [ ] B3 复制槽生命周期:握手自动登记 / admin 预登记(带 BucketFilter)/ drop;
+- [x] B3 复制槽生命周期:握手自动登记 / admin 预登记(带 BucketFilter)/ drop;
   `s:repl_slot\0{name}` 持久化;`confirmed_gtid` 回执更新;`max_slots` 硬限制
   - 用例:`slot_register_confirm_drop_roundtrip`;`slot_17th_rejected`
 - [ ] B4 下游 pull worker:apply 单流严格按 GTID 序;游标与 apply 事务同盘;长轮询空挂;
