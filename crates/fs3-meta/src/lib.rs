@@ -3975,6 +3975,28 @@ impl MetaStore {
         Ok(out)
     }
 
+    /// retained binlog 内 seq > `after_seq` 的**编码值字节**合计(M21 D1
+    /// lag_bytes 估算输入;ADR-33 RP3.3 槽位观测)。口径:retained 窗口内
+    /// 未消费字节——已被截断的部分不可知不计(截断后槽位 lag 以
+    /// lag_seq/stale 为准);binlog 键序 = GTID 序(同 repl_binlog_scan
+    /// 口径),跨 epoch 为下界。观测面低频全扫,规模受 RP8 retain 水位
+    /// 约束,不进热路径。
+    pub fn repl_binlog_bytes_after(&self, after_seq: u64) -> Result<u64> {
+        let mut total = 0u64;
+        let start = binlog_key(after_seq.saturating_add(1));
+        for item in self
+            .db
+            .iterator(IteratorMode::From(&start, Direction::Forward))
+        {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(PREFIX_BINLOG) {
+                break;
+            }
+            total = total.saturating_add(v.len() as u64);
+        }
+        Ok(total)
+    }
+
     /// 归档恢复作业队列读取(M16 A2,ADR-19 DA2.3):从 `after_seq` 之后
     /// 起取至多 `limit` 条(队首续跑;None = 从头)。
     pub fn restore_jobs(

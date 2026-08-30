@@ -73,9 +73,11 @@
 //!   现有 bl: 存储做 epoch 重编号)。
 //!
 //! 本任务边界(后续任务接线,勿在此抢跑):槽过滤/心跳(D2,binlog 拉取
-//! 全量不过滤;快照导出的过滤器参数已带,见下)、lag 计算(D1,slots 先给
-//! 原始字段)、委派凭证(D3)。长轮询空挂已落地(B4;`wait={ms}` 参数,见
-//! handle_binlog)。
+//! 全量不过滤;快照导出的过滤器参数已带,见下)、委派凭证(D3)。D1 已落
+//! 地:slots 端点 lag 三件套(lag_seq/lag_bytes/lag_seconds,口径见
+//! handle_slots 注释);多槽位点独立 = binlog 端点按 after 参数无状态
+//! 服务(B1 形态),截断下限 = min(活跃槽 confirmed)(A3)。长轮询空挂
+//! 已落地(B4;`wait={ms}` 参数,见 handle_binlog)。
 //!
 //! 快照导出会话线格式(C1;设计稿 §3.1;ADR-33 RP8.3):
 //! - `POST /v1/repl/v1/snapshot`:`{slot_name?, filters?}`(filters =
@@ -679,7 +681,20 @@ impl ReplServer {
             .expect("static response")
     }
 
-    /// `GET /v1/repl/v1/slots`:槽位观测(原始字段;lag 计算/指标导出属 D1)。
+    /// `GET /v1/repl/v1/slots`:槽位观测(D1 升级;设计稿 §3.3;ADR-33
+    /// RP3.1)。每槽在原始字段(B1 形状)上并 lag 三件套,口径钉死:
+    /// - `lag_seq` = 水位 seq − confirmed seq(同 epoch 精确;跨 epoch
+    ///   ——promote 后新代 seq 自 1 重计——旧代尾部不可由减法表达,取
+    ///   新代水位 seq 为下界;E3 前恒同 epoch);
+    /// - `lag_bytes` = retained binlog 内 seq > confirmed 的编码值字节
+    ///   合计(已被截断部分不可知不计;binlog 关闭/空 = 0);
+    /// - `lag_seconds` 估算:主口径 = now − 首条未消费 retained 记录
+    ///   (seq = confirmed+1)的提交 ts——「最老未消费事务已等待时长」,
+    ///   点读 O(1);该记录已截断/A1 存量 ts=None 时回退 =
+    ///   now − last_ack_at(回执陈旧度,语义更宽:含下游离线时间,
+    ///   stale 槽只剩此口径);`lag_seq == 0` → 0。
+    ///
+    /// stale 槽照常列出(可见性 = 运维发现断档的唯一面,RP8)。
     fn handle_slots(&self) -> Response<Full<Bytes>> {
         let watermark = match self.high_watermark() {
             Ok(g) => g,
@@ -689,11 +704,60 @@ impl ReplServer {
             Ok(v) => v,
             Err(e) => return internal_err("slots list", &e),
         };
-        let items: Vec<serde_json::Value> = slots.iter().map(slot_json).collect();
+        let mut items = Vec::with_capacity(slots.len());
+        for s in &slots {
+            match self.slot_lag_json(s, watermark) {
+                Ok(v) => items.push(v),
+                Err(e) => return internal_err("slot lag", &e),
+            }
+        }
         json_ok(serde_json::json!({
             "high_watermark": fmt_gtid(watermark),
             "slots": items,
         }))
+    }
+
+    /// 单槽观测 JSON(B1 原始字段 + D1 lag 三件套;口径见 handle_slots
+    /// 注释)。
+    fn slot_lag_json(
+        &self,
+        s: &Slot,
+        watermark: Gtid,
+    ) -> Result<serde_json::Value, fs3_core::Error> {
+        let lag_seq = if s.confirmed_gtid.epoch == watermark.epoch {
+            watermark.seq.saturating_sub(s.confirmed_gtid.seq)
+        } else {
+            // 跨 epoch(仅在 promote 后出现):旧代尾部不可由减法表达,
+            // 新代水位 seq 为下界
+            watermark.seq
+        };
+        let lag_bytes = if s.confirmed_gtid.epoch <= watermark.epoch {
+            self.meta.repl_binlog_bytes_after(s.confirmed_gtid.seq)?
+        } else {
+            0
+        };
+        let lag_seconds = if lag_seq == 0 {
+            0
+        } else {
+            // 主口径:首条未消费 retained 记录的提交 ts 至今的等待时长
+            let waited = self
+                .meta
+                .repl_record(s.confirmed_gtid.seq.saturating_add(1))?
+                .and_then(|rec| rec.ts)
+                .map(|ts| now_unix_secs().saturating_sub(ts))
+                .filter(|d| *d >= 0);
+            match waited {
+                Some(d) => d,
+                // 回退:回执陈旧度(stale/截断/ts 缺失时唯一可读口径)
+                None => now_unix_secs().saturating_sub(s.last_ack_at).max(0),
+            }
+        };
+        let mut item = slot_json(s);
+        let obj = item.as_object_mut().expect("slot json is object");
+        obj.insert("lag_seq".into(), serde_json::json!(lag_seq));
+        obj.insert("lag_bytes".into(), serde_json::json!(lag_bytes));
+        obj.insert("lag_seconds".into(), serde_json::json!(lag_seconds));
+        Ok(item)
     }
 
     /// `POST /v1/repl/v1/hello`(B2;设计稿 §2.2/§3.6;线格式与错误码见
@@ -2633,6 +2697,269 @@ mod tests {
         .await;
         assert_eq!(st, 200, "{v}");
         assert_eq!(v["slot"]["name"], "s00");
+    }
+
+    // ── D1 测试夹具:binlog 拉取 / ack / slots 观测的小件 ──
+
+    /// GET binlog 并返回条目 gtid 文本表(200 断言内置)。
+    async fn binlog_get(fx: &Fixture, cli: (&str, &str), slot: &str, after: &str) -> Vec<String> {
+        let (st, _, body) = mtls_request(
+            fx.addr,
+            &fx.ca_pem,
+            Some(cli),
+            &get_req(&format!(
+                "/v1/repl/v1/binlog?slot={slot}&after={after}&limit=16"
+            )),
+        )
+        .await
+        .unwrap();
+        assert_eq!(st, 200, "{}", String::from_utf8_lossy(&body));
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["gtid"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// POST ack(200 断言内置)。
+    async fn slot_ack_ok(fx: &Fixture, cli: (&str, &str), slot: &str, gtid: &str) {
+        let (st, _, body) = mtls_request(
+            fx.addr,
+            &fx.ca_pem,
+            Some(cli),
+            &post_json_req(
+                &format!("/v1/repl/v1/slots/{slot}/ack"),
+                &serde_json::json!({"confirmed_gtid": gtid}).to_string(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(st, 200, "{}", String::from_utf8_lossy(&body));
+    }
+
+    /// GET slots(200 断言内置)。
+    async fn slots_get(fx: &Fixture, cli: (&str, &str)) -> serde_json::Value {
+        let (st, _, body) = mtls_request(
+            fx.addr,
+            &fx.ca_pem,
+            Some(cli),
+            &get_req("/v1/repl/v1/slots"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(st, 200, "{}", String::from_utf8_lossy(&body));
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// 软上限期望全截(retain_bytes=1B)的截断配置夹具(槽钳回输入)。
+    fn truncate_soft_cfg() -> fs3_meta::ReplRetainConfig {
+        fs3_meta::ReplRetainConfig {
+            retain_hours: 24,
+            retain_bytes: 1,
+            retain_bytes_hard: u64::MAX,
+        }
+    }
+
+    /// M21 D1(ADR-33 RP3.1/RP8;设计稿 §3.3/§3.4;TODO M21/D1 具名用例):
+    /// **一主多备 fan-out——三槽位点独立推进、互不影响**——
+    /// ① 三槽经 hello 登记于不同位点(1-1/1-3/1-6);各按自身 after 拉
+    ///    binlog,批内容只随各自位点(独立性 = 端点按 after 无状态服务,
+    ///    单写者 binlog 天然全序);
+    /// ② ack 只推进本槽 confirmed,他槽位点不动;
+    /// ③ 截断下限 = min(活跃槽 confirmed)(A3 多槽场景补齐验证):最
+    ///    滞后槽钳制截断;其追平后下限推进到次滞后槽,逐槽独立释放。
+    #[tokio::test]
+    async fn three_standbys_independent_cursors() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = repl_meta_with_entries(dir.path(), 6); // seq 1..=6,水位 1-6
+        let fx = start_repl_server(Some(meta.clone()));
+        let (cert, key) = fx.client_cert(Some("node-ops"));
+        let cli = (cert, key);
+        let cli_ref = (cli.0.as_str(), cli.1.as_str());
+
+        // ① 三槽经 hello 登记于不同位点(confirmed 初值 = executed 集最大值)
+        for (node, slot, hi) in [
+            ("node-b", "sa", 1u64),
+            ("node-c", "sb", 3),
+            ("node-d", "sc", 6),
+        ] {
+            let (st, v) = hello_call(
+                &fx,
+                node,
+                &hello_json(node, slot, &[(1, 1, hi)], serde_json::json!("All"), &[]),
+            )
+            .await;
+            assert_eq!(st, 200, "{v}");
+            assert_eq!(v["slot"]["confirmed_gtid"], format!("1-{hi}"));
+        }
+
+        // ② 各按自身位点拉流:批内容只随各自 after(互不干扰)
+        let a = binlog_get(&fx, cli_ref, "sa", "1-1").await;
+        assert_eq!(a, ["1-2", "1-3", "1-4", "1-5", "1-6"], "sa 从 1-1 续流");
+        let b = binlog_get(&fx, cli_ref, "sb", "1-3").await;
+        assert_eq!(b, ["1-4", "1-5", "1-6"], "sb 从 1-3 续流");
+        let c = binlog_get(&fx, cli_ref, "sc", "1-6").await;
+        assert!(c.is_empty(), "sc 已追平,空批");
+
+        // ③ ack 只推进本槽
+        slot_ack_ok(&fx, cli_ref, "sa", "1-2").await;
+        assert_eq!(
+            meta.repl_slot("sa").unwrap().unwrap().confirmed_gtid,
+            Gtid { epoch: 1, seq: 2 }
+        );
+        assert_eq!(
+            meta.repl_slot("sb").unwrap().unwrap().confirmed_gtid,
+            Gtid { epoch: 1, seq: 3 },
+            "他槽位点不受 sa 回执影响"
+        );
+        assert_eq!(
+            meta.repl_slot("sc").unwrap().unwrap().confirmed_gtid,
+            Gtid { epoch: 1, seq: 6 }
+        );
+
+        // ③ 截断下限 = min(活跃槽 confirmed) = 1-2:软上限期望全截,
+        //    钳回后只删 seq 1..=2
+        let stats = meta
+            .truncate_binlog(now_unix_secs(), &truncate_soft_cfg())
+            .unwrap();
+        assert_eq!(stats.truncated, 2);
+        assert!(stats.soft_capped);
+        assert!(meta.repl_record(2).unwrap().is_none());
+        assert!(
+            meta.repl_record(3).unwrap().is_some(),
+            "sb 未消费的 seq 3 受槽保护"
+        );
+
+        // ④ 最滞后槽 sa 追平 → 下限推进到 sb 的 1-3:再截只删 seq 3
+        slot_ack_ok(&fx, cli_ref, "sa", "1-6").await;
+        let stats = meta
+            .truncate_binlog(now_unix_secs(), &truncate_soft_cfg())
+            .unwrap();
+        assert_eq!(stats.truncated, 1, "sa 追平后 seq 3 截断");
+        assert!(
+            meta.repl_record(4).unwrap().is_some(),
+            "sb @1-3 仍钳制 seq 4+"
+        );
+
+        // ⑤ 槽位观测:三槽各见自身位点的 lag(sa/sc 追平 = 0,sb = 3)
+        let v = slots_get(&fx, cli_ref).await;
+        assert_eq!(v["high_watermark"], "1-6");
+        let slots = v["slots"].as_array().unwrap();
+        assert_eq!(slots.len(), 3, "三槽同列(fan-out 可见)");
+        let lag_of = |name: &str| -> u64 {
+            slots
+                .iter()
+                .find(|s| s["name"] == name)
+                .unwrap_or_else(|| panic!("slot {name} missing"))["lag_seq"]
+                .as_u64()
+                .unwrap()
+        };
+        assert_eq!(lag_of("sa"), 0);
+        assert_eq!(lag_of("sb"), 3);
+        assert_eq!(lag_of("sc"), 0);
+    }
+
+    /// M21 D1(设计稿 §3.3;TODO M21/D1 具名用例):**slots 端点 lag 观测
+    /// 口径**——
+    /// ① 主口径:lag_seq = 水位 seq − confirmed;lag_bytes = retained
+    ///    binlog 未消费编码值字节精确合计;lag_seconds = 首条未消费记录
+    ///    (confirmed+1)提交 ts 至今的等待时长(同秒提交 ≈ 0);
+    /// ② 硬上限强截后槽标 stale:**stale 槽仍可见**;记录已截断 →
+    ///    lag_seconds 回退 = now − last_ack_at(回执陈旧度);lag_bytes
+    ///    对截断部分不可知 = 0;
+    /// ③ 追平槽对照:lag 三件套全零。
+    #[tokio::test]
+    async fn slots_endpoint_reports_lag() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = repl_meta_with_entries(dir.path(), 6); // seq 1..=6,水位 1-6
+        let fx = start_repl_server(Some(meta.clone()));
+        let (cert, key) = fx.client_cert(Some("node-ops"));
+        let cli = (cert, key);
+        let cli_ref = (cli.0.as_str(), cli.1.as_str());
+
+        let now = now_unix_secs();
+        meta.put_repl_slot(&Slot {
+            name: "s1".into(),
+            consumer_node_id: "node-b".into(),
+            confirmed_gtid: Gtid { epoch: 1, seq: 2 },
+            filters: BucketFilter::All,
+            created_at: now,
+            last_ack_at: now,
+            stale: false,
+        })
+        .unwrap();
+
+        // ① 主口径
+        let v = slots_get(&fx, cli_ref).await;
+        assert_eq!(v["high_watermark"], "1-6");
+        let slots = v["slots"].as_array().unwrap();
+        let s1 = slots.iter().find(|s| s["name"] == "s1").expect("s1");
+        assert_eq!(s1["confirmed_gtid"], "1-2");
+        assert_eq!(s1["lag_seq"], 4, "lag_seq = 6 − 2");
+        let want_bytes: u64 = meta
+            .repl_binlog_scan(2, 16)
+            .unwrap()
+            .iter()
+            .map(|(_, r)| r.encode_value().unwrap().len() as u64)
+            .sum();
+        assert!(want_bytes > 0);
+        assert_eq!(
+            s1["lag_bytes"].as_u64().unwrap(),
+            want_bytes,
+            "lag_bytes = seq 3..=6 编码值字节合计"
+        );
+        assert!(
+            s1["lag_seconds"].as_i64().unwrap() <= 2,
+            "同秒提交:首条未消费记录等待 ≈ 0"
+        );
+        assert_eq!(s1["stale"], false);
+
+        // ② 硬上限强截全部 → s1 被越过标 stale;last_ack_at 回拨 30s
+        //    使回退口径可判
+        let mut s = meta.repl_slot("s1").unwrap().unwrap();
+        s.last_ack_at = now - 30;
+        meta.put_repl_slot(&s).unwrap();
+        let stats = meta
+            .truncate_binlog(
+                now,
+                &fs3_meta::ReplRetainConfig {
+                    retain_hours: 24,
+                    retain_bytes: u64::MAX,
+                    retain_bytes_hard: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(stats.truncated, 6);
+        assert_eq!(stats.stale_marked, 1);
+        // 追平槽对照
+        meta.put_repl_slot(&Slot {
+            name: "s2".into(),
+            consumer_node_id: "node-c".into(),
+            confirmed_gtid: Gtid { epoch: 1, seq: 6 },
+            filters: BucketFilter::All,
+            created_at: now,
+            last_ack_at: now,
+            stale: false,
+        })
+        .unwrap();
+
+        let v = slots_get(&fx, cli_ref).await;
+        let slots = v["slots"].as_array().unwrap();
+        let s1 = slots
+            .iter()
+            .find(|s| s["name"] == "s1")
+            .expect("stale 槽仍须可见");
+        assert_eq!(s1["stale"], true);
+        assert_eq!(s1["lag_seq"], 4, "lag_seq 口径不随截断失真(水位−confirmed)");
+        assert_eq!(s1["lag_bytes"], 0, "截断部分不可知不计");
+        let lag = s1["lag_seconds"].as_i64().unwrap();
+        assert!(lag >= 25, "回退口径 = now − last_ack_at: {lag}");
+        let s2 = slots.iter().find(|s| s["name"] == "s2").expect("s2");
+        assert_eq!(s2["lag_seq"], 0);
+        assert_eq!(s2["lag_bytes"], 0);
+        assert_eq!(s2["lag_seconds"], 0, "追平槽 lag 全零");
     }
 
     /// M21 B4(设计稿 §3.2;ADR-33 RP6.3):binlog 长轮询空挂——
