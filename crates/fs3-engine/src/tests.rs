@@ -8559,3 +8559,190 @@ fn ssekms_ingest_channel_default_encryption() {
     assert_eq!(out, body);
     e.close().unwrap();
 }
+
+fn bytes_contain(hay: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && hay.len() >= needle.len() && hay.windows(needle.len()).any(|w| w == needle)
+}
+
+fn tree_contains(root: &Path, needle: &[u8]) -> bool {
+    fn walk(p: &Path, needle: &[u8]) -> bool {
+        if p.is_dir() {
+            std::fs::read_dir(p)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|e| walk(&e.path(), needle))
+        } else {
+            std::fs::read(p)
+                .map(|b| bytes_contain(&b, needle))
+                .unwrap_or(false)
+        }
+    }
+    walk(root, needle)
+}
+
+fn put_kms(e: &mut Engine, key: &str, body: &[u8]) -> ObjectMeta {
+    let wk = e.kms_mint_write_key("b1", key, None, None).unwrap();
+    let r = fs3_core::SseWriteKey::SseKms(wk);
+    let m = e
+        .put_with_meta(
+            "b1",
+            key,
+            &mut Cursor::new(body.to_vec()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            Some(&r),
+        )
+        .unwrap();
+    drop(r);
+    m
+}
+
+/// M20 H2:同明文两次写 → 密文不同;盘上抽不到明文(RustFS #1278 反例)。
+#[test]
+fn ssekms_ciphertext_on_disk_sampling() {
+    let kms = std::sync::Arc::new(fs3_kms::MemoryKms::new());
+    let (d, mut cfg) = setup();
+    cfg.kms = Some(kms);
+    let mut e = open_engine(&cfg);
+    let mut plain = rnd(80_000, 91);
+    plain[..32].copy_from_slice(b"PLAINTEXT-MARKER-SSEKMS-H2-TEST!");
+    let m1 = put_kms(&mut e, "kms-a", &plain);
+    let m2 = put_kms(&mut e, "kms-b", &plain);
+    assert!(m1.inline.is_none() && m2.inline.is_none(), "80KiB 走 extent");
+    let c1 = m1.sse.as_ref().unwrap().kms_parts().unwrap().ciphertext;
+    let c2 = m2.sse.as_ref().unwrap().kms_parts().unwrap().ciphertext;
+    assert_ne!(c1, c2, "两次 mint DEK 独立,wrapped_dek 必不同");
+    let small = rnd(1_500, 92);
+    let s1 = put_kms(&mut e, "kms-s1", &small);
+    let s2 = put_kms(&mut e, "kms-s2", &small);
+    assert_ne!(s1.inline, s2.inline, "同明文两次内联密文必不同");
+    e.close().unwrap();
+    let img = std::fs::read(d.path().join("disk.img")).unwrap();
+    assert!(
+        !bytes_contain(&img, &plain[..32]),
+        "设备镜像不得出现明文标记"
+    );
+    assert!(
+        !tree_contains(&d.path().join("meta"), &plain[..32]),
+        "meta 不得出现明文标记"
+    );
+}
+
+/// M20 H2:明文 DEK 32B 不得以原样出现在设备/meta(红线;MemoryKms wrap
+/// 为 b64,原样 32B 仍不得落盘)。
+#[test]
+fn ssekms_no_plaintext_dek_on_disk() {
+    let kms = std::sync::Arc::new(fs3_kms::MemoryKms::new());
+    let (d, mut cfg) = setup();
+    cfg.kms = Some(kms);
+    let mut e = open_engine(&cfg);
+    let body = rnd(4_000, 93);
+    let wk = e.kms_mint_write_key("b1", "kms-dek", None, None).unwrap();
+    let dek = wk.data_key();
+    let wrap = wk.wrapped_dek().to_string();
+    let r = fs3_core::SseWriteKey::SseKms(wk);
+    e.put_with_meta(
+        "b1",
+        "kms-dek",
+        &mut Cursor::new(body),
+        None,
+        vec![],
+        vec![],
+        vec![],
+        None,
+        None,
+        Some(&r),
+    )
+    .unwrap();
+    drop(r);
+    e.close().unwrap();
+    let img = std::fs::read(d.path().join("disk.img")).unwrap();
+    assert!(!bytes_contain(&img, &dek), "disk.img 不得含明文 DEK");
+    assert!(
+        !tree_contains(&d.path().join("meta"), &dek),
+        "meta 不得含明文 DEK 32B"
+    );
+    assert!(
+        wrap.starts_with("mem:v1:") || wrap.starts_with("vault:v"),
+        "wrap 形态: {wrap}"
+    );
+}
+
+/// M20 H2:KMS 停机必须阻断解密,不得离线解开(RustFS #1490 反例)。
+#[test]
+fn ssekms_vault_down_blocks_decrypt() {
+    let kms = std::sync::Arc::new(fs3_kms::MemoryKms::new());
+    let (_d, mut cfg) = setup();
+    cfg.kms = Some(kms.clone());
+    let mut e = open_engine(&cfg);
+    let body = rnd(2_000, 94);
+    put_kms(&mut e, "kms-down", &body);
+    kms.set_unavailable(true);
+    let mut buf = vec![0u8; body.len()];
+    let err = e
+        .read_at_version_for(
+            "b1",
+            "kms-down",
+            None,
+            0,
+            &mut buf,
+            VersioningState::Off,
+            None,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::Kms {
+                fault: fs3_core::KmsFault::Unavailable,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    kms.set_unavailable(false);
+    let n = e
+        .read_at_version_for(
+            "b1",
+            "kms-down",
+            None,
+            0,
+            &mut buf,
+            VersioningState::Off,
+            None,
+        )
+        .unwrap();
+    assert_eq!(&buf[..n], body.as_slice());
+    e.close().unwrap();
+}
+
+/// M20 H2:崩溃恢复后加密对象可解(m4 close/reopen 工具链,≥200 轮)。
+#[test]
+fn ssekms_crash_recovery_roundtrip_200_rounds() {
+    let kms = std::sync::Arc::new(fs3_kms::MemoryKms::new());
+    let (_d, mut cfg) = setup();
+    cfg.kms = Some(kms);
+    const ROUNDS: u32 = 200;
+    for round in 0..ROUNDS {
+        let payload = vec![(round % 251) as u8; 3_000];
+        {
+            let mut e = open_engine(&cfg);
+            put_kms(&mut e, "kms-crash", &payload);
+            e.close().unwrap();
+        }
+        {
+            let mut e = Engine::open(&cfg).unwrap();
+            e.debug_wait_drain_open_tick();
+            let mut out = Vec::new();
+            let m = e.head("b1", "kms-crash").unwrap().expect("head");
+            e.get_to_meta(&m, 0..u64::MAX, &mut out, None).unwrap();
+            assert_eq!(out, payload, "round {round}: KMS object torn after reopen");
+            e.close().unwrap();
+        }
+    }
+}

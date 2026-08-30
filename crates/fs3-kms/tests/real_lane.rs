@@ -268,6 +268,31 @@ fn kms_mint_dek_randomness_two_writes_differ() {
     assert_ne!(m1.data_key.expose(), m2.data_key.expose());
 }
 
+/// M20 H2:真 transit 密文不得内嵌明文 DEK 或其标准 Base64(对比 MemoryKms
+/// wrap = mem:v1:{b64(dek)} 的测试桩形态)。
+#[test]
+fn ssekms_no_plaintext_dek_in_vault_wrap() {
+    let Some(v) = spawn_dev_vault() else {
+        skip("no_plaintext_dek_in_vault_wrap")
+    };
+    let c = kms(&v.addr);
+    c.create_key("kms-nodek-key").expect("create_key");
+    let ctx = KmsContext::object("b", "k");
+    let m = c.mint(Some("kms-nodek-key"), &ctx).expect("mint");
+    assert!(m.wrapped_dek.starts_with("vault:v"), "{}", m.wrapped_dek);
+    let dek = m.data_key.expose();
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, dek);
+    assert!(
+        !m.wrapped_dek.contains(&b64),
+        "vault wrap 不得含 DEK 的标准 Base64"
+    );
+    let wrap_bytes = m.wrapped_dek.as_bytes();
+    assert!(
+        wrap_bytes.windows(32).all(|w| w != dek),
+        "vault wrap ASCII 不得含明文 DEK 32B"
+    );
+}
+
 #[test]
 fn kms_status_reports_reachable_and_token_ttl() {
     let Some(v) = spawn_dev_vault() else {

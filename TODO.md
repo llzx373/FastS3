@@ -205,7 +205,7 @@
 - [x] H1 集成 harness:自起 `vault server -dev` / `bao server -dev`(动态端口)+ fs3d 指向,
   跑通 D/E/G 具名用例;轮换/版本化一律真车道(B3)
   - 用例:`ssekms_rotate_key_old_objects_readable`(transit 版本历史,无 rewrap)
-- [ ] H2 安全断言(对标 RustFS #1278/#1490 反例):**落盘密文抽样比对**(同明文两次写
+- [x] H2 安全断言(对标 RustFS #1278/#1490 反例):**落盘密文抽样比对**(同明文两次写
   密文不同;盘上无明文 DEK、无未加密密文形态);**Vault 停机阻断解密**;
   崩溃恢复后加密对象可解(m4 工具链,≥200 轮混载)
   - 用例:`ssekms_ciphertext_on_disk_sampling`;`ssekms_no_plaintext_dek_on_disk`;
