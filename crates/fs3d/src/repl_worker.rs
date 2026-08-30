@@ -20,8 +20,10 @@
 //!   校验分歧/位点),从本地游标续传;重叠前缀由 apply 幂等丢弃,不重拉
 //!   不产生重复副作用。
 //! - **致命分歧**:hello 返回 ErrBinlogGone(410)/ErrDiverged(409)等
-//!   「显式重建」类错误(ADR-33 RP2.3)→ 记 error 日志后 worker 退出,
-//!   不热循环(唯一出路 = 运维显式 rebuild,C 组);is_alive() 可观测。
+//!   「显式重建」类错误(ADR-33 RP2.3)→ 记 error 日志(日志明示
+//!   `fasts3d replication rebuild` 命令)后 worker 退出,不热循环
+//!   (唯一出路 = 运维显式 rebuild,C5;CLI/admin 是唯一入口,本模块
+//!   永不自调);is_alive() 可观测。
 //! - **epoch fencing**(§2.3):hello 成功响应的上游 epoch 推进本地
 //!   `s:repl_epoch`(取大),apply 层拒绝低于本地 epoch 的流。
 //! - **生命周期**:`role=standby` 才启动(spawn 硬校验,非备显式报错);
@@ -197,6 +199,13 @@ impl PullWorker {
             let _ = h.join();
         }
     }
+
+    /// worker 线程存活探针(C5:Fatal 退出可观测——断档/分歧不停机热
+    /// 循环,而是退出待显式 rebuild;测试断言用)。
+    #[cfg(test)]
+    pub fn is_alive(&self) -> bool {
+        self.handle.as_ref().is_some_and(|h| !h.is_finished())
+    }
 }
 
 /// 主循环:hello →(空库/位点判死 → C2 快照 bootstrap)→ 续流拉取 →
@@ -222,7 +231,11 @@ async fn run(
                 // C2:位点判死但本地 executed 为空 = 无本地历史可分歧,
                 // 快照 bootstrap;非空库 = 显式重建红线(C5),Fatal 退出
                 if !executed_is_empty(&meta) {
-                    tracing::error!("repl pull handshake fatal (explicit rebuild required): {e}");
+                    tracing::error!(
+                        "repl pull handshake fatal: {e}; explicit rebuild required — run \
+                         `fasts3d replication rebuild --as-standby --from <primary>` \
+                         (M21 C5, ADR-33 RP5.4; no automatic rebuild)"
+                    );
                     return;
                 }
                 match bootstrap(&engine, &meta, &cfg, &tls).await {
@@ -241,7 +254,11 @@ async fn run(
                 }
             }
             Err(PullError::Fatal(e)) => {
-                tracing::error!("repl pull handshake fatal (explicit rebuild required): {e}");
+                tracing::error!(
+                    "repl pull handshake fatal: {e}; explicit rebuild required — run \
+                     `fasts3d replication rebuild --as-standby --from <primary>` \
+                     (M21 C5, ADR-33 RP5.4; no automatic rebuild)"
+                );
                 return;
             }
             Err(PullError::Transient(e)) => {
@@ -295,7 +312,11 @@ async fn run(
                 Ok(b) => b,
                 Err(PullError::Gone(e)) => {
                     if !executed_is_empty(&meta) {
-                        tracing::error!("repl pull fatal (explicit rebuild required): {e}");
+                        tracing::error!(
+                            "repl pull fatal: {e}; explicit rebuild required — run \
+                             `fasts3d replication rebuild --as-standby --from <primary>` \
+                             (M21 C5, ADR-33 RP5.4; no automatic rebuild)"
+                        );
                         return;
                     }
                     match bootstrap(&engine, &meta, &cfg, &tls).await {
@@ -768,6 +789,22 @@ fn parse_gtid_str(s: &str) -> Option<Gtid> {
     })
 }
 
+/// M21 C5:显式重建前置——在上游 drop 本地同名槽(设计稿 §3.3「drop
+/// 释放保留约束」)。stale 槽不 drop 则重建后 hello 永拒(410
+/// ErrBinlogGone),重建成死循环;404 ErrSlotUnknown = 槽本就不存在,
+/// 幂等放行。其余错误原样上抛(重建编排据此 fail-fast,本地状态未动)。
+pub(crate) async fn drop_upstream_slot(
+    cfg: &PullConfig,
+    tls: &Arc<rustls::ClientConfig>,
+) -> Result<(), PullError> {
+    let path = format!("/v1/repl/v1/slots/{}", cfg.slot_name);
+    let (status, json) = call(cfg, tls, "DELETE", &path, None).await?;
+    if status == 200 || (status == 404 && json["error"].as_str() == Some("ErrSlotUnknown")) {
+        return Ok(());
+    }
+    Err(classify(status, &json, "drop slot"))
+}
+
 /// 装载 mTLS 客户端配置(根信任 + 客户端证书;照 fs3-agent tls.rs
 /// load_client_tls 样板——fs3-agent 在 fs3d 是可选依赖(agent feature
 /// 默认关,ADR-17 DV1 门禁),复制链路不挂该 feature,此处最小复刻)。
@@ -813,7 +850,8 @@ pub(crate) fn build_client_tls(cfg: &PullConfig) -> Result<Arc<rustls::ClientCon
 /// 单请求一条 mTLS 连接(复制面低频;不 keep-alive)。照 fs3-agent
 /// center.rs connect() + http1.rs request_json 样板(依赖同上注释)。
 /// 返回 (status, json);JSON 解析失败 → Transient(上游形状漂移显式化)。
-async fn call(
+/// C5 重建编排(repl_rebuild)复用(上游槽 drop)。
+pub(crate) async fn call(
     cfg: &PullConfig,
     tls: &Arc<rustls::ClientConfig>,
     method: &str,

@@ -143,6 +143,10 @@ pub struct AdminServer {
     /// M20 A3(ADR-29 KR5):KMS 托管服务控制面(fs3d 注入;None = 未配置
     /// [kms.deploy],kms/service/* 返回 501)。
     kms_service: Option<Arc<dyn KmsServiceControl>>,
+    /// M21 C5(ADR-33 RP5.4):复制重建控制面(fs3d RebuildService 注入;
+    /// None = 未配置 pull(FS3D_REPL_* 缺席),replication/rebuild 返回
+    /// 501)。
+    replication: Option<Arc<dyn ReplicationControl>>,
 }
 
 /// M20 A3:KMS 托管服务控制抽象(fs3d 以 KmsServiceManager 适配实现;
@@ -154,6 +158,45 @@ pub trait KmsServiceControl: Send + Sync {
     fn stop(&self) -> Result<serde_json::Value, String>;
     fn status(&self) -> Result<serde_json::Value, String>;
 }
+
+/// M21 C5(ADR-33 RP2.3/RP5.4;设计稿 §5.2):断档显式重建控制抽象
+/// (fs3d 以 RebuildService 适配实现;放 trait 照 KmsServiceControl 先例,
+/// 避免 fs3-admin → fs3d 依赖)。**不自动触发红线**:本端点与 CLI 是
+/// 重建唯一入口;pull worker 命中 ErrBinlogGone/ErrDiverged 只 Fatal
+/// 退出,绝不自调。
+pub trait ReplicationControl: Send + Sync {
+    /// 清空本地复制状态并以 standby 从 `from`(缺省 = 现配置上游)全量
+    /// 重建(C1/C2 快照导入 + 从 P 追赶);`slot` 缺省 = 现配置槽名。
+    fn rebuild(&self, req: RebuildRequest) -> Result<serde_json::Value, RebuildError>;
+}
+
+/// rebuild 请求面(admin body 的 from/slot 字段)。
+#[derive(Debug, Clone, Default)]
+pub struct RebuildRequest {
+    /// 新主复制口(https://host:port;旧主重加入 = 显式给新主)。
+    pub from: Option<String>,
+    /// 复制槽名(缺省 = 节点现配置)。
+    pub slot: Option<String>,
+}
+
+/// rebuild 失败分类(HTTP 映射:Busy → 409,Failed → 500)。
+#[derive(Debug)]
+pub enum RebuildError {
+    /// 已有重建在执行(幂等重入护栏,并发 rebuild 不叠加)。
+    Busy(String),
+    /// 执行失败(上游不可达/清空失败/worker 重启失败等)。
+    Failed(String),
+}
+
+impl std::fmt::Display for RebuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RebuildError::Busy(m) | RebuildError::Failed(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for RebuildError {}
 
 impl AdminServer {
     pub fn new(engine: Arc<RwLock<Engine>>, service: Arc<S3Service>, cfg: AdminConfig) -> Self {
@@ -169,12 +212,20 @@ impl AdminServer {
             inventory_stats: None,
             restore_stats: None,
             kms_service: None,
+            replication: None,
         }
     }
 
     /// 注入 KMS 托管服务控制面(M20 A3;fs3d 装配 [kms.deploy] 时调用)。
     pub fn with_kms_service(mut self, ctrl: Option<Arc<dyn KmsServiceControl>>) -> Self {
         self.kms_service = ctrl;
+        self
+    }
+
+    /// 注入复制重建控制面(M21 C5;fs3d 配置 pull 时调用;None →
+    /// /v1/admin/replication/rebuild 返回 501)。
+    pub fn with_replication_control(mut self, ctrl: Option<Arc<dyn ReplicationControl>>) -> Self {
+        self.replication = ctrl;
         self
     }
 
@@ -307,6 +358,7 @@ impl AdminServer {
             inventory_stats: self.inventory_stats.clone(),
             restore_stats: self.restore_stats.clone(),
             kms_service: self.kms_service.clone(),
+            replication: self.replication.clone(),
         })
     }
 
@@ -593,6 +645,10 @@ impl AdminServer {
             ("POST", ["kms", "keys"]) => self.handle_kms_key_create(body),
             ("GET", ["kms", "keys", name]) => self.handle_kms_key_get(name),
             ("POST", ["kms", "keys", name, "rotate"]) => self.handle_kms_key_rotate(name, body),
+            // M21 C5(ADR-33 RP5.4;设计稿 §5.2):断档显式重建——唯一入口
+            // (不自动触发红线);未注入 = 501。status/slots/pause/resume/
+            // promote/demote 属 F2,不在本路由
+            ("POST", ["replication", "rebuild"]) => self.handle_replication_rebuild(body),
             _ => json::err(StatusCode::NOT_FOUND, "not_found", "unknown admin endpoint"),
         }
     }
@@ -636,14 +692,63 @@ impl AdminServer {
         }
     }
 
+    /// M21 C5(ADR-33 RP5.4):`POST /v1/admin/replication/rebuild`,body
+    /// `{from?, slot?, operator?}`。审计:who = operator(沿 M19 J3/M20 A3
+    /// 先例),op = ReplicationRebuild,key = from/slot 摘要;Busy → 409,
+    /// Failed → 500,未注入 → 501。
+    fn handle_replication_rebuild(&self, body: &[u8]) -> Response<String> {
+        let Some(ctrl) = &self.replication else {
+            return json::err(
+                StatusCode::NOT_IMPLEMENTED,
+                "not_implemented",
+                "replication 未配置(FS3D_REPL_* 缺席);断档重建入口不可用",
+            );
+        };
+        let v: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+        let operator = v
+            .get("operator")
+            .and_then(|x| x.as_str())
+            .unwrap_or("admin")
+            .to_string();
+        let req = RebuildRequest {
+            from: v
+                .get("from")
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            slot: v
+                .get("slot")
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        };
+        let key = format!(
+            "from={} slot={}",
+            req.from.as_deref().unwrap_or("(configured)"),
+            req.slot.as_deref().unwrap_or("(configured)")
+        );
+        match ctrl.rebuild(req) {
+            Ok(out) => {
+                self.service
+                    .audit()
+                    .push(&operator, "ReplicationRebuild", "", &key, 200, "");
+                json::ok(out)
+            }
+            Err(RebuildError::Busy(e)) => {
+                json::err(StatusCode::CONFLICT, "rebuild_in_progress", &e)
+            }
+            Err(RebuildError::Failed(e)) => {
+                json::err(StatusCode::INTERNAL_SERVER_ERROR, "rebuild_failed", &e)
+            }
+        }
+    }
+
     fn kms_admin_result(r: Result<serde_json::Value, String>) -> Response<String> {
         match r {
             Ok(v) => json::ok(v),
-            Err(e) if e.contains("not configured") => json::err(
-                StatusCode::NOT_IMPLEMENTED,
-                "not_implemented",
-                &e,
-            ),
+            Err(e) if e.contains("not configured") => {
+                json::err(StatusCode::NOT_IMPLEMENTED, "not_implemented", &e)
+            }
             Err(e) if e.to_ascii_lowercase().contains("not found") => {
                 json::err(StatusCode::NOT_FOUND, "not_found", &e)
             }
@@ -674,15 +779,13 @@ impl AdminServer {
     fn handle_kms_key_create(&self, body: &[u8]) -> Response<String> {
         let v: serde_json::Value = match serde_json::from_slice(body) {
             Ok(v) => v,
-            Err(e) => {
-                return json::err(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_json",
-                    &e.to_string(),
-                )
-            }
+            Err(e) => return json::err(StatusCode::BAD_REQUEST, "invalid_json", &e.to_string()),
         };
-        let Some(name) = v.get("name").and_then(|n| n.as_str()).filter(|s| !s.is_empty()) else {
+        let Some(name) = v
+            .get("name")
+            .and_then(|n| n.as_str())
+            .filter(|s| !s.is_empty())
+        else {
             return json::err(
                 StatusCode::BAD_REQUEST,
                 "invalid_argument",

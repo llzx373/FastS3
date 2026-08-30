@@ -36,7 +36,8 @@
 //! `s:trusted_clock`(M12 W1-1;ADR-13 DL6 可信时钟 wall+mono 对)、
 //! `s:repl_role` / `s:repl_epoch` / `s:repl_executed`(M21 A1/A2;
 //! ADR-33 RP2 复制角色/epoch/executed GTID 集)、
-//! `s:repl_slot\0{name}` 复制槽(M21 A3;ADR-33 RP3/RP8)。
+//! `s:repl_slot\0{name}` 复制槽(M21 A3;ADR-33 RP3/RP8)、
+//! `s:rebuild_pending` 断档重建中断续清标记(M21 C5;ADR-33 RP5.4)。
 //!
 //! 转义规则:0x00 → 0xFF 0x00;0xFF → 0xFF 0xFF;其余原样。
 //! 保证 `o:{bucket}\0` 前缀扫描恰好覆盖该桶全部对象。
@@ -251,6 +252,13 @@ pub const PREFIX_SESSION: &[u8] = b"s:session\x00";
 /// 扫描只读 `o:`/`p:` 段引用键,槽值不含 extent 引用,天然安全(M21/A4
 /// 登记,见 fs3-engine collect_reachable_extents 注释)。
 pub const PREFIX_REPL_SLOT: &[u8] = b"s:repl_slot\x00";
+
+/// 断档重建中断续清标记(M21 C5;ADR-33 RP5.4;`MetaStore::clear_for_rebuild`):
+/// 重建清空分块提交,首块先落本键(fsync)再清各族,末块摘除;open() 见
+/// 标记 = 上轮 rebuild 清空未走完 → 补清完成后才服务(半清空 + 旧游标续流
+/// = 静默分歧,红线)。s: 既有前缀下的新系统键,不新增前缀;meta-export
+/// 不导出(s: 系统键不入导出)、check 扫描不相交(同 SYS_REPL_ROLE 口径)。
+pub const SYS_REBUILD_PENDING: &[u8] = b"s:rebuild_pending";
 
 /// 转义:S3 对象键可含任意字节,0x00/0xFF 需转义以保持键内无分隔符。
 pub fn escape(raw: &[u8]) -> Vec<u8> {

@@ -89,6 +89,22 @@ pub enum ReplApplyOutcome {
     SkippedDuplicate,
 }
 
+/// 断档显式重建的本地清空统计(M21 C5;MetaStore::clear_for_rebuild
+/// 返回值;清空范围见该方法上方小节注释)。审计回显/运维观测用。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RebuildClearStats {
+    /// 复制面元数据族删除键数(b:/o:/p:/k:/IAM 等 C1 快照导出面全族)。
+    pub replicated_meta_deleted: u64,
+    /// `bl:` binlog 条目删除数。
+    pub binlog_deleted: u64,
+    /// `s:repl_pending` 待回填队列删除数。
+    pub pending_deleted: u64,
+    /// `s:repl_pdobj` 对象级 pending 标记删除数。
+    pub pending_obj_deleted: u64,
+    /// 本地复制槽删除数。
+    pub slots_deleted: u64,
+}
+
 /// 段回填清算的单键替换项(M21 C3;MetaStore::repl_localize_segments
 /// 入参):目标原始键(o: 当前/版本键或 p: 分片键)+ 该键内上游段的
 /// 本地替换表。语义见 repl_localize_segments 上方小节注释。
@@ -1721,6 +1737,24 @@ impl MetaStore {
             repl_binlog: cfg.repl_binlog,
             repl_soft_cap_alerts: AtomicU64::new(0),
         };
+        // M21 C5(ADR-33 RP5.4):断档重建中断续清——上轮 clear_for_rebuild
+        // 崩溃于族清空中途(标记在)时,补清完成才允许服务;半清空 + 旧
+        // 游标续流 = 静默分歧(红线)。幂等(重清同范围),正常路径标记
+        // 缺席零开销(单键点读)。
+        if store
+            .db
+            .get(SYS_REBUILD_PENDING)
+            .map_err(rocks_err)?
+            .is_some()
+        {
+            tracing::warn!(
+                "interrupted replication rebuild detected; completing state wipe before serving"
+            );
+            let stats = store.wipe_replicated_families()?;
+            store.db.delete(SYS_REBUILD_PENDING).map_err(rocks_err)?;
+            store.db.flush_wal(true).map_err(rocks_err)?;
+            tracing::warn!("replication rebuild wipe completed: {stats:?}");
+        }
         // M18 I1(ADR-28 DI1.3)升级迁移:存量部署隐式落入租户 default
         // (canonical_id 钉死 "fasts3");幂等,首次打开即落地。
         store.ensure_default_tenant()?;
@@ -3293,6 +3327,127 @@ impl MetaStore {
                 Err(e) => return Err(rocks_err(e)),
             }
         }
+    }
+
+    // —— 断档显式重建(M21 C5;ADR-33 RP2.3/RP5.4;设计稿 §3.4/§5.2) ——
+    //
+    // `ErrBinlogGone`/`ErrDiverged` 的唯一出路 = 运维显式 rebuild(红线:
+    // 不自动回退、不做冲突合并、不做尾事务抢救)。本层只提供清空原语;
+    // 编排(停 pull worker → 清 → C1/C2 快照重建 → 按新位点重启追赶)
+    // 在 fs3d RebuildService。
+    //
+    // 清空范围(裁决钉死,改动走 ADR):
+    // - **复制状态**:`s:repl_cursor` / `s:repl_executed` / `s:repl_epoch`
+    //   删键(= 读默认 {0,0}/空集/初始代;快照 finalize 按导出位点 P
+    //   重新落定,RP2.4)、`s:repl_role` → standby、`s:repl_pending*` /
+    //   `s:repl_pdobj*` / `s:repl_slot\0*`(本地槽)全清;
+    // - **复制面元数据 = C1 快照导出面全族**(repl.rs 模块注释钉死的
+    //   口径):b:/l:/bc:/bt:/bo:/ba:/bp:/o:/u:/m:/p:/k:/r:/n:/iv:/
+    //   tn:/iu:/ig:/ip:/ir: ——清空后由快照导入整体重建,杜绝「上游
+    //   已删、本地残留」的假一致;
+    // - **保留**(本机状态 = 导出排除族):`s:` 其余系统键(seq/audit/
+    //   session/pool/sse/trusted_clock)、`a:`/`t:`(本地分配记录)、
+    //   `e:`/`x:`/`ij:`/`jb:`(运维瞬态队列)。**设备字节不原地重写**:
+    //   重建前旧布局的段成为孤儿,由离线 `fasts3d check --fix` 可达性
+    //   扫描回收(同 C2 重复导入的泄漏裁决口径);
+    // - **崩溃续清**:清空分块提交,首块先落 `s:rebuild_pending` 标记
+    //   (fsync)再清各族,末块摘除;open() 见标记即补清完成才服务——
+    //   任何中间态都不会以「半清空 + 旧游标续流」形态上线(静默分歧,
+    //   红线)。幂等:重入 = 重清。
+
+    /// 显式重建的本地状态清空(语义见上方小节注释;统计结构 =
+    /// 模块级 RebuildClearStats)。调用方(fs3d RebuildService)保证:
+    /// pull worker/回填池已停,随后走 C1/C2 快照重建;本函数返回后
+    /// 游标 = {0,0}、role = standby、executed 空集。
+    pub fn clear_for_rebuild(&self) -> Result<RebuildClearStats> {
+        // ① 续清标记 + 复制状态复位(单批 + 强制 fsync:必须先于族清空
+        //    落盘——崩溃于此后任意点,open() 续清兜底)
+        let mut batch = WriteBatchWithTransaction::<true>::default();
+        batch.put(SYS_REBUILD_PENDING, now_ts().to_be_bytes());
+        batch.put(SYS_REPL_ROLE, ReplRole::Standby.as_str().as_bytes());
+        batch.delete(SYS_REPL_CURSOR);
+        batch.delete(SYS_REPL_EXECUTED);
+        batch.delete(SYS_REPL_EPOCH);
+        self.db
+            .write_opt(batch, &self.write_opts)
+            .map_err(rocks_err)?;
+        self.db.flush_wal(true).map_err(rocks_err)?;
+        // ② 族清空(分块)
+        let stats = self.wipe_replicated_families()?;
+        // ③ 摘标记(单批 + fsync;此后 open() 不再续清)
+        self.db.delete(SYS_REBUILD_PENDING).map_err(rocks_err)?;
+        self.db.flush_wal(true).map_err(rocks_err)?;
+        Ok(stats)
+    }
+
+    /// 族清空本体(clear_for_rebuild 与 open() 续清共用;幂等)。
+    fn wipe_replicated_families(&self) -> Result<RebuildClearStats> {
+        let mut stats = RebuildClearStats {
+            binlog_deleted: self.delete_prefix_chunked(PREFIX_BINLOG)?,
+            pending_deleted: self.delete_prefix_chunked(PREFIX_REPL_PENDING)?,
+            pending_obj_deleted: self.delete_prefix_chunked(PREFIX_REPL_PENDING_OBJ)?,
+            slots_deleted: self.delete_prefix_chunked(PREFIX_REPL_SLOT)?,
+            ..RebuildClearStats::default()
+        };
+        // 复制面元数据 = C1 快照导出面(排除族 = 本机状态,见上方注释)
+        const REPLICATED_META_PREFIXES: &[&[u8]] = &[
+            PREFIX_BUCKET,
+            PREFIX_BUCKET_LOC,
+            PREFIX_BUCKET_CORS,
+            PREFIX_BUCKET_TAGGING,
+            PREFIX_BUCKET_OWNERSHIP,
+            PREFIX_BUCKET_BPA,
+            PREFIX_BUCKET_POLICY,
+            PREFIX_OBJECT,
+            PREFIX_UPLOAD,
+            PREFIX_UPLOAD_INDEX,
+            PREFIX_PART,
+            PREFIX_KEY,
+            PREFIX_LIFECYCLE_RULE,
+            PREFIX_NOTIFICATION,
+            PREFIX_INVENTORY,
+            PREFIX_TENANT,
+            PREFIX_IAM_USER,
+            PREFIX_IAM_GROUP,
+            PREFIX_IAM_POLICY,
+            PREFIX_IAM_ROLE,
+        ];
+        for p in REPLICATED_META_PREFIXES {
+            stats.replicated_meta_deleted += self.delete_prefix_chunked(p)?;
+        }
+        // 收尾确定性落盘(组提交窗口外的显式运维动作,同 truncate 族口径)
+        self.db.flush_wal(true).map_err(rocks_err)?;
+        Ok(stats)
+    }
+
+    /// 分块前缀清空(scan_prefix + WriteBatch 单批删,照 truncate_binlog
+    /// 先例;块边界防「全库删除单批」的巨型 WriteBatch)。
+    fn delete_prefix_chunked(&self, prefix: &[u8]) -> Result<u64> {
+        const CHUNK: usize = 4096;
+        let mut total = 0u64;
+        loop {
+            let mut batch = WriteBatchWithTransaction::<true>::default();
+            let mut n = 0usize;
+            for item in scan_prefix(&self.db, prefix) {
+                let (k, _v) = item?;
+                batch.delete(&k);
+                n += 1;
+                if n >= CHUNK {
+                    break;
+                }
+            }
+            if n == 0 {
+                break;
+            }
+            self.db
+                .write_opt(batch, &self.write_opts)
+                .map_err(rocks_err)?;
+            total += n as u64;
+            if n < CHUNK {
+                break;
+            }
+        }
+        Ok(total)
     }
 
     // —— 复制槽(M21 A3;ADR-33 RP3/RP8;设计稿 §3.3;键 `s:repl_slot\0{name}`) ——
@@ -7425,6 +7580,100 @@ mod tests {
         assert!(got.contains(gtid(3, 80)));
         assert_eq!(meta.repl_role().unwrap(), ReplRole::Standby);
         assert_eq!(meta.repl_epoch().unwrap(), 2);
+    }
+
+    /// M21 C5(ADR-33 RP2.3/RP5.4;TODO M21/C5):clear_for_rebuild 清空范围
+    /// 与崩溃续清——
+    /// ① 清空:复制面元数据族(b:/o:/iv: 等 C1 快照导出面)+ bl: +
+    ///    s:repl_pending/s:repl_pdobj + 本地槽全删;s:repl_cursor /
+    ///    s:repl_executed / s:repl_epoch 复位到读默认;role → standby;
+    /// ② 保留:本机状态不动(s:seq 水位、s:audit、e: 瞬态队列、a:/t:
+    ///    分配记录);
+    /// ③ 崩溃续清:标记在 + 半清空形态重开 → open() 补清完成(各族清
+    ///    空、标记摘除)才服务——半清空 + 旧游标续流 = 静默分歧(红线);
+    /// ④ 幂等:重复 clear 全零统计不报错。
+    #[test]
+    fn clear_for_rebuild_wipes_replicated_state() {
+        let g = |seq: u64| Gtid { epoch: 1, seq };
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MetaConfig {
+            repl_binlog: true,
+            ..MetaConfig::default()
+        };
+        let meta = MetaStore::open(dir.path(), &cfg).unwrap();
+        // 复制面数据:桶 + 对象(各一条 bl:);复制状态:槽/游标/executed/
+        // epoch;探针键:复制面族(iv:)与本机族(e:/a:)
+        meta.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        meta.commit(&[Op::ObjectPut {
+            bucket: "b1".into(),
+            key: "k0".into(),
+            meta: object_meta(1),
+        }])
+        .unwrap();
+        meta.put_repl_slot(&Slot {
+            name: "s1".into(),
+            consumer_node_id: "node-b".into(),
+            confirmed_gtid: g(2),
+            filters: BucketFilter::All,
+            created_at: 1,
+            last_ack_at: 1,
+            stale: true,
+        })
+        .unwrap();
+        meta.set_repl_cursor(g(2)).unwrap();
+        let mut executed = GtidSet::new();
+        executed.insert_range(1, 1, 2);
+        meta.set_repl_executed(&executed).unwrap();
+        meta.set_repl_epoch(3).unwrap();
+        meta.db.put(b"iv:probe", b"v").unwrap();
+        meta.db.put(b"s:repl_pending\x00p", b"v").unwrap();
+        meta.db.put(b"s:repl_pdobj\x00p", b"").unwrap();
+        meta.db.put(b"e:\0\0\0\0\0\0\0\x01", b"v").unwrap();
+        meta.db.put(b"a:\0\0\0\0\0\0\0\x63", b"v").unwrap();
+        meta.flush().unwrap();
+
+        // ①② 清空
+        let stats = meta.clear_for_rebuild().unwrap();
+        assert_eq!(stats.binlog_deleted, 2, "桶 + 对象各一条 bl:");
+        assert_eq!(stats.pending_deleted, 1);
+        assert_eq!(stats.pending_obj_deleted, 1);
+        assert_eq!(stats.slots_deleted, 1);
+        // b:/o:/iv: + open 期 ensure 的 tn:default/iu:bootstrap 同清
+        assert!(stats.replicated_meta_deleted >= 3, "{stats:?}");
+        assert!(meta.get_bucket("b1").unwrap().is_none(), "b: 清空");
+        assert!(meta.db.get(b"iv:probe").unwrap().is_none());
+        assert!(meta.db.get(b"s:repl_pending\x00p").unwrap().is_none());
+        assert!(meta.db.get(b"s:repl_pdobj\x00p").unwrap().is_none());
+        assert!(meta.list_repl_slots().unwrap().is_empty());
+        assert_eq!(meta.repl_cursor().unwrap(), Gtid { epoch: 0, seq: 0 });
+        assert!(meta.repl_executed().unwrap().is_empty());
+        assert_eq!(meta.repl_epoch().unwrap(), REPL_INITIAL_EPOCH);
+        assert_eq!(meta.repl_role().unwrap(), ReplRole::Standby);
+        // 本机状态保留
+        assert_eq!(meta.last_seq().unwrap(), 2, "s:seq 水位不动");
+        assert!(meta.db.get(b"e:\0\0\0\0\0\0\0\x01").unwrap().is_some());
+        assert!(meta.db.get(b"a:\0\0\0\0\0\0\0\x63").unwrap().is_some());
+        assert!(meta.db.get(SYS_REBUILD_PENDING).unwrap().is_none());
+        meta.flush().unwrap();
+
+        // ④ 幂等:重复清空 = 全零统计
+        let again = meta.clear_for_rebuild().unwrap();
+        assert_eq!(again, RebuildClearStats::default());
+
+        // ③ 崩溃续清:重演「标记已落 + 族清空未走完」中间态,重开补清
+        meta.db.put(b"iv:probe2", b"v").unwrap();
+        meta.db.put(b"o:bx\0k1", b"v").unwrap();
+        meta.db
+            .put(SYS_REBUILD_PENDING, 1i64.to_be_bytes())
+            .unwrap();
+        meta.flush().unwrap();
+        drop(meta);
+        let meta = MetaStore::open(dir.path(), &cfg).unwrap();
+        assert!(meta.db.get(b"iv:probe2").unwrap().is_none(), "续清补删");
+        assert!(meta.db.get(b"o:bx\0k1").unwrap().is_none());
+        assert!(meta.db.get(SYS_REBUILD_PENDING).unwrap().is_none());
+        // 保留族在续清中同样不动
+        assert!(meta.db.get(b"e:\0\0\0\0\0\0\0\x01").unwrap().is_some());
     }
 
     /// ranges 辅助:GTID 集 → (epoch, start, end) 升序表(测试断言用)。

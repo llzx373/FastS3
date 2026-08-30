@@ -22,6 +22,7 @@ mod meta;
 mod pool_cmds;
 mod repl;
 mod repl_backfill;
+mod repl_rebuild;
 mod repl_worker;
 mod rewrite;
 mod settings;
@@ -166,6 +167,9 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         rounds: u32,
     },
+    /// 主备复制运维动作(M21 C5 起:断档/旧主重加入的显式重建;经运行中
+    /// 实例的 admin API 执行,不自动触发——ADR-33 RP5.4 红线)
+    Replication(repl_rebuild::ReplicationArgs),
     /// 启动 S3 数据面 HTTP 服务
     Serve {
         /// 监听地址(如 0.0.0.0:9000)
@@ -507,6 +511,15 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 false,
             )?;
             stress::run(&args, &engine_cfg)
+        }
+        Cmd::Replication(args) => {
+            // M21 C5:经运行中实例的 admin 通道执行(本地裁决 + worker
+            // 停启编排只在进程内成立;CLI 不直接开库)
+            repl_rebuild::run_cli(
+                &args,
+                cfg.admin.listen.as_deref(),
+                cfg.admin.token.as_deref(),
+            )
         }
         Cmd::Serve {
             listen,
@@ -1064,6 +1077,24 @@ fn cmd_serve(
     // M20 A3:kms_manager 已在 Engine::open 前由 assemble_kms 拉起;
     // 此处只注入 admin 控制面(未配置 = None → 501)。
 
+    // M21 B4/C5:pull 配置提前解析(纯 env/证书读取,无引擎依赖)——
+    // 重建编排 RebuildService 需随 admin 装配注入;worker 本体仍在
+    // admin 装配之后启动(见下)。
+    let pull_cfg_env: Option<repl_worker::PullConfig> = match repl_worker::PullConfig::from_env() {
+        Ok(v) => v,
+        Err(e) => return Err(fs3_core::Error::InvalidArgument(e)),
+    };
+    // M21 C5(ADR-33 RP2.3/RP5.4):断档显式重建编排(pull 配置在 = 可
+    // 重建;纯主无上游 = 不注入,admin rebuild 端点 501)
+    let rebuild_svc: Option<Arc<repl_rebuild::RebuildService>> = pull_cfg_env.as_ref().map(|pc| {
+        Arc::new(repl_rebuild::RebuildService::new(
+            engine.clone(),
+            service.clone(),
+            engine.read().meta_arc(),
+            pc.clone(),
+        ))
+    });
+
     // 管理 API(H1;可选)
     let admin_listen = cli_admin_listen.or_else(|| cfg.admin.listen.clone());
     if let Some(listen) = admin_listen {
@@ -1108,7 +1139,14 @@ fn cmd_serve(
                 // M20 A3(ADR-29 KR5):KMS 托管服务控制面(未配置 = None → 501)
                 .with_kms_service(kms_manager.clone().map(|m| {
                     Arc::new(KmsServiceAdapter(m)) as Arc<dyn fs3_admin::KmsServiceControl>
-                }));
+                }))
+                // M21 C5(ADR-33 RP5.4):断档显式重建控制面(未配置 pull =
+                // None → 501;CLI/本端点 = 重建唯一入口,不自动触发红线)
+                .with_replication_control(
+                    rebuild_svc
+                        .clone()
+                        .map(|s| s as Arc<dyn fs3_admin::ReplicationControl>),
+                );
         // M6 / J5:设置页供应器(admin GET/PATCH /v1/admin/config)
         let provider = Arc::new(settings::SettingsProvider::new(
             config_path.clone(),
@@ -1185,7 +1223,7 @@ fn cmd_serve(
 
     // M21 B4(ADR-33 RP4.2;设计稿 §4.1):下游 pull worker。role 的 env
     // 最小入口 FS3D_REPL_ROLE(primary|standby;设置即落 s:repl_role,
-    // 幂等直写);pull 配置 FS3D_REPL_PRIMARY_URL 设置即启用,worker 内
+    // 幂等直写);pull 配置已在 admin 装配前解析(C5 注入用),worker 内
     // role=standby 硬校验(配了上游但角色是主 = 配置矛盾,启动显式失败,
     // 不静默)。pause/resume 语义属 F2;promote 停 worker 属 E3。
     if let Ok(role) = std::env::var("FS3D_REPL_ROLE") {
@@ -1200,8 +1238,8 @@ fn cmd_serve(
         };
         engine.read().meta().set_repl_role(role)?;
     }
-    let mut pull_worker = match repl_worker::PullConfig::from_env() {
-        Ok(Some(pull_cfg)) => {
+    let mut pull_worker = match pull_cfg_env {
+        Some(pull_cfg) => {
             let meta = engine.read().meta_arc();
             let worker =
                 repl_worker::PullWorker::spawn(Arc::clone(&engine), meta, pull_cfg.clone())
@@ -1209,8 +1247,7 @@ fn cmd_serve(
             tracing::info!("replication pull worker started (role=standby)");
             Some((worker, pull_cfg))
         }
-        Ok(None) => None,
-        Err(e) => return Err(fs3_core::Error::InvalidArgument(e)),
+        None => None,
     };
     // M21 C3(ADR-33 RP4.2;设计稿 §3.2/§4.2):段回填池——apply 落的
     // data_pending 段引用经上游 extent-data 并发拉取(默认 8,
@@ -1235,6 +1272,12 @@ fn cmd_serve(
         }
         None => None,
     };
+    // M21 C5:worker/回填池收养进重建编排(重建的停/重启与进程收尾的
+    // 停机统一走 RebuildService;收养后本地 pull_worker/backfill 清空,
+    // 下方收尾的 take() 为空转)
+    if let Some(svc) = &rebuild_svc {
+        svc.adopt(pull_worker.take().map(|(w, _)| w), backfill.take());
+    }
 
     // 生命周期 worker 启动(创建见 admin 装配前;解耦仅为注入 stats Arc)
     let mut lifecycle_worker = lifecycle_worker.map(|(worker, throttle)| {
@@ -1432,6 +1475,11 @@ fn cmd_serve(
     // 本地游标续传;先于引擎收尾,避免与 meta 关闭竞写)
     if let Some((h, _)) = pull_worker.take() {
         h.shutdown();
+    }
+    // M21 C5:收养态——worker/回填池在 RebuildService 内时经其停止
+    // (上方两个 take() 为空转)
+    if let Some(svc) = &rebuild_svc {
+        svc.shutdown();
     }
     // M21 C3:段回填池停止(拉取中任务在当前块完成后退出;pending 队列
     // 持久化,重启续回填)。关停口径日志带待回填字节/累计拉取计数

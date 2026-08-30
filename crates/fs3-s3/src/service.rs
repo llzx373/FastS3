@@ -199,9 +199,10 @@ pub struct S3Service {
     /// put_tenant/delete_tenant 双写即时生效。缺席(未知租户)→ 按
     /// default 租户 canonical 处理(compat 钉死)。
     tenants: std::sync::Mutex<std::collections::HashMap<String, String>>,
-    /// M21 C4(ADR-33 RP4.2):standby 读路径缺数据同步拉取通道(OnceLock
-    /// 一次性装配;None = primary/未装配,热路径一次原子读判空)。
-    repl_data_fetch: std::sync::OnceLock<Arc<dyn ReplDataFetch>>,
+    /// M21 C4(ADR-33 RP4.2):standby 读路径缺数据同步拉取通道(None =
+    /// primary/未装配,热路径一次读判空)。**C5 起可替换**(RwLock):
+    /// 断档重建重启回填池后旧通道随旧池关停失效,必须换绑新池。
+    repl_data_fetch: std::sync::RwLock<Option<Arc<dyn ReplDataFetch>>>,
 }
 
 /// M21 C4(ADR-33 RP4.2):standby 读路径的缺数据拉取通道——实现 =
@@ -367,16 +368,15 @@ impl S3Service {
             key_owners: std::sync::Mutex::new(std::collections::HashMap::new()),
             tenants: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_clock_secs: std::sync::atomic::AtomicI64::new(unix_now() as i64),
-            repl_data_fetch: std::sync::OnceLock::new(),
+            repl_data_fetch: std::sync::RwLock::new(None),
         }
     }
 
-    /// M21 C4:装配 standby 缺数据拉取通道(fs3d 回填服务;OnceLock
-    /// 一次性装配,重复调用告警忽略)。
+    /// M21 C4:装配 standby 缺数据拉取通道(fs3d 回填服务)。**M21 C5 起
+    /// 可重复调用换绑**:断档显式重建停旧回填池后起新池,旧通道的按需
+    /// 拉取会打到已关停的池(发送即败 → 读路径 503),必须替换。
     pub fn set_repl_data_fetch(&self, fetch: Arc<dyn ReplDataFetch>) {
-        if self.repl_data_fetch.set(fetch).is_err() {
-            tracing::warn!("repl_data_fetch already installed; ignoring");
-        }
+        *self.repl_data_fetch.write().unwrap() = Some(fetch);
     }
 
     /// M21 C4(ADR-33 RP4.2):standby 读路径缺数据确保——标记在则同步
@@ -384,7 +384,8 @@ impl S3Service {
     /// 耗尽 → 503 ServiceUnavailable + Retry-After。**调用方不得持有
     /// engine 读锁**(fetch 清算需写锁,持读锁调用死锁)。
     fn repl_ensure_data(&self, bucket: &str, key: &str) -> Result<(), S3Error> {
-        let Some(fetch) = self.repl_data_fetch.get() else {
+        let fetch = self.repl_data_fetch.read().unwrap().clone();
+        let Some(fetch) = fetch else {
             return Ok(());
         };
         for _ in 0..8 {

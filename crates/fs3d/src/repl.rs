@@ -3442,6 +3442,163 @@ mod tests {
         );
     }
 
+    /// M21 C5(TODO M21/C5 具名用例;ADR-33 RP2.3/RP5.4;设计稿 §3.4/§5.2):
+    /// **断档显式重建**——
+    /// ① 下游滞后期间上游 binlog 被硬上限强截(槽 stale):重连握手命中
+    ///    ErrBinlogGone 且 executed 非空 → pull worker Fatal 退出
+    ///    (is_alive 转 false),**不自动重建**(红线);
+    /// ② 数据不因截断静默改变语义:下游停在此前位点——游标不动、旧
+    ///    对象逐字节可读、截断后的新对象缺席;
+    /// ③ 显式 rebuild(CLI/admin 唯一入口的编排本体):清空复制状态 +
+    ///    复制面元数据 → C1/C2 快照重建 → 追平新水位;新旧对象逐字节
+    ///    一致,executed 按新 P 重置,role = standby;④ 幂等重入:重复
+    ///    rebuild 安全(再清再追平)。
+    #[test]
+    fn binlog_gone_requires_explicit_rebuild() {
+        use crate::repl_rebuild::RebuildService;
+        use crate::repl_worker::PullWorker;
+        let dir = tempfile::tempdir().unwrap();
+        // 上游:binlog 开;桶 + 1MiB 段对象(seq 1..=2)
+        let up_engine = test_engine_opts(&dir.path().join("up"), 4 * 1024 * 1024, true);
+        let big: Vec<u8> = (0..1024 * 1024usize).map(|i| (i % 251) as u8).collect();
+        {
+            let mut e = up_engine.write();
+            e.create_bucket_with_quota("b0", None).unwrap();
+            e.put("b0", "big", &mut &big[..]).unwrap();
+        }
+        let up_meta = up_engine.read().meta_arc();
+        let p0 = up_meta.last_seq().unwrap();
+        assert_eq!(p0, 2);
+        let fx = start_server_on(up_engine.clone(), up_meta.clone());
+
+        // 下游 standby 追平 P0(段对象真到位)
+        let down_engine = test_engine(&dir.path().join("down"));
+        let down = down_engine.read().meta_arc();
+        down.set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
+        let cfg = pull_cfg(dir.path(), &fx, "s1", "node-b");
+        let w1 = PullWorker::spawn(down_engine.clone(), down.clone(), cfg.clone()).unwrap();
+        wait_repl_cursor(&down, Gtid { epoch: 1, seq: p0 });
+        let mut out = Vec::new();
+        down_engine
+            .read()
+            .get_to("b0", "big", 0..u64::MAX, &mut out)
+            .unwrap();
+        assert_eq!(out, big, "追平后段对象逐字节可读");
+        w1.shutdown();
+
+        // 下游停下后:上游再写 inline2(seq p0+1),随后硬上限强截全部
+        // binlog + 槽 s1 被越过标 stale(保数据还是保磁盘由硬上限裁决,
+        // RP8;下游下次握手命中 ErrBinlogGone)
+        let inline2 = b"post-cut-inline".to_vec();
+        up_engine
+            .write()
+            .put("b0", "inline2", &mut &inline2[..])
+            .unwrap();
+        let wm = up_meta.last_seq().unwrap();
+        assert_eq!(wm, p0 + 1);
+        let stats = up_meta
+            .truncate_binlog(
+                now_unix_secs(),
+                &fs3_meta::ReplRetainConfig {
+                    retain_hours: 24,
+                    retain_bytes: 1,
+                    retain_bytes_hard: 1,
+                },
+            )
+            .unwrap();
+        assert!(stats.truncated >= wm, "{stats:?}");
+        assert_eq!(stats.stale_marked, 1, "槽 s1 被硬截越过标 stale");
+        assert!(up_meta.repl_slot("s1").unwrap().unwrap().stale);
+        assert!(up_meta.repl_binlog_entries().unwrap().is_empty());
+
+        // ① 重连:hello 命中 ErrBinlogGone(stale 槽),executed 非空 →
+        //    Fatal 退出,不自动重建
+        let w2 = PullWorker::spawn(down_engine.clone(), down.clone(), cfg.clone()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while w2.is_alive() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker 必须 Fatal 退出(不自动重建)"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        w2.shutdown();
+
+        // ② 下游停在此前位点:游标不动、旧数据逐字节可读、新对象缺席
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            down.repl_cursor().unwrap(),
+            Gtid { epoch: 1, seq: p0 },
+            "不自动重建:游标停在断档前位点"
+        );
+        out.clear();
+        down_engine
+            .read()
+            .get_to("b0", "big", 0..u64::MAX, &mut out)
+            .unwrap();
+        assert_eq!(out, big, "旧对象不因截断丢失");
+        assert!(
+            down.get_object("b0", "inline2").unwrap().is_none(),
+            "截断后的新对象缺席(未送达,不静默)"
+        );
+
+        // ③ 显式 rebuild(admin/CLI 唯一入口的编排本体):清空 → C1/C2
+        //    快照重建 → 追平新水位
+        let svc = Arc::new(fs3_s3::S3Service::new(
+            down_engine.clone(),
+            vec![],
+            "us-east-1".into(),
+            false,
+        ));
+        let rebuild = RebuildService::new(down_engine.clone(), svc, down.clone(), cfg.clone());
+        let v = rebuild.rebuild(Some(&cfg.primary_url), None).unwrap();
+        assert_eq!(v["status"], serde_json::json!("rebuilding"), "{v}");
+        assert!(
+            v["cleared"]["replicated_meta"].as_u64().unwrap() >= 2,
+            "桶 + 对象键已清(下游非中继,binlog 关闭,本地 bl: 恒空): {v}"
+        );
+        wait_repl_cursor(&down, Gtid { epoch: 1, seq: wm });
+        rebuild.shutdown();
+
+        // 数据一致:新旧对象逐字节等同上游;复制状态按新位点落定
+        out.clear();
+        down_engine
+            .read()
+            .get_to("b0", "big", 0..u64::MAX, &mut out)
+            .unwrap();
+        assert_eq!(out, big, "重建后旧对象逐字节一致(快照重拉)");
+        out.clear();
+        down_engine
+            .read()
+            .get_to("b0", "inline2", 0..u64::MAX, &mut out)
+            .unwrap();
+        assert_eq!(out, inline2, "重建后追平新对象");
+        assert_eq!(
+            down.repl_executed().unwrap().ranges().collect::<Vec<_>>(),
+            vec![(1, 1, wm)],
+            "executed 按新导出位点重置(R12)"
+        );
+        assert_eq!(down.repl_role().unwrap(), fs3_meta::ReplRole::Standby);
+        assert!(down.list_repl_slots().unwrap().is_empty(), "本地槽已清");
+        assert!(down.list_repl_pending(10).unwrap().is_empty());
+        assert!(
+            down.repl_binlog_entries().unwrap().is_empty(),
+            "下游 bl: 为空(快照不带 binlog;P 即新水位,无追赶条目)"
+        );
+
+        // ④ 幂等重入:重复 rebuild 安全(再清再追平,数据仍一致)
+        let v2 = rebuild.rebuild(Some(&cfg.primary_url), None).unwrap();
+        assert_eq!(v2["status"], serde_json::json!("rebuilding"), "{v2}");
+        wait_repl_cursor(&down, Gtid { epoch: 1, seq: wm });
+        rebuild.shutdown();
+        out.clear();
+        down_engine
+            .read()
+            .get_to("b0", "big", 0..u64::MAX, &mut out)
+            .unwrap();
+        assert_eq!(out, big, "幂等重入后数据仍一致");
+    }
+
     /// subject CN 提取:rcgen 证书正/反向 + 垃圾输入不 panic。
     #[test]
     fn subject_cn_extraction() {
