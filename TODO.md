@@ -153,11 +153,11 @@
 - [x] D2 桶级过滤:槽位 BucketFilter(include/exclude)上游侧过滤;被过滤 seq 心跳带过;
   过滤器变更 = drop + 重建槽(admin 强制,禁原地改)
   - 用例:`bucket_filter_ships_only_scoped_buckets`;`filter_change_requires_slot_rebuild`
-- [ ] D3 上游委派凭证:admin 为槽位签发绑定 `{slot_name, bucket_scope}` 只读 HMAC 凭证,
+- [x] D3 上游委派凭证:admin 为槽位签发绑定 `{slot_name, bucket_scope}` 只读 HMAC 凭证,
   mTLS 握手一次性下发;备端验签放行,权限恒等于"范围内桶 GET/HEAD/List";删槽即吊销
   - 用例:`delegated_credential_scope_enforced`(越界桶/写动词 403);
     `drop_slot_revokes_delegated_credential`
-- [ ] D4 指标:`fasts3_repl_slot_lag_seconds{slot=}` / `lag_bytes` + 下游
+- [x] D4 指标:`fasts3_repl_slot_lag_seconds{slot=}` / `lag_bytes` + 下游
   `applied_gtid` / `data_pending_bytes`;裸 AtomicU64 先例;slot 名进标签(基数 ≤16 可控)
   - 用例:`repl_metrics_per_slot_attribution`;admin `/metrics` 可见
 
