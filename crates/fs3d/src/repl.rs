@@ -14,8 +14,8 @@
 //!   每条连接握手后从 peer 证书 DER 解析 subject CN(`subject_cn_from_der`,
 //!   零新增 x509 依赖的最小 DER 走读,见函数注释),随 service_fn 闭包传入
 //!   handler;**无 CN 的证书 = 应用层显式 403**(拒绝口径注释:TLS 层拒
-//!   无证书/不受信证书;应用层 403 拒无 CN 证书)。CN == hello 自报 node_id
-//!   的比对属 B2(hello handler 接线点已预留 peer_cn 参数)。
+//!   无证书/不受信证书;应用层 403 拒无 CN 证书)。B2 hello 比对
+//!   CN == 自报 node_id(不一致 → 403 `ErrNodeIdMismatch`)。
 //! - **手写 HTTP/1.1 服务**:hyper http1 server(照 fs3-admin serve_conn_tcp
 //!   样板;协议面手写路由,不引 web 框架)。
 //!
@@ -23,7 +23,8 @@
 //! - `GET  /v1/repl/v1/binlog?slot={name}&after={gtid}&limit=N`
 //! - `GET  /v1/repl/v1/extent-data?extent_id=&offset=&len=`
 //! - `GET  /v1/repl/v1/slots`
-//! - `POST /v1/repl/v1/{hello,snapshot}` —— 本任务 501 占位(B2/C1 实现)。
+//! - `POST /v1/repl/v1/hello` —— B2 握手(三件套校验 + 环检测,见下)。
+//! - `POST /v1/repl/v1/snapshot` —— 501 占位(C1 实现)。
 //!
 //! 线格式(B1 自定,注释钉死):
 //! - binlog/slots 响应为 JSON;binlog `entries[i].record` =
@@ -39,29 +40,62 @@
 //! - query 参数不做百分号解码:slot 名/GTID/数值均为 URL 安全字符(B3 若
 //!   放开槽名字符集再补解码)。
 //!
-//! 本任务边界(后续任务接线,勿在此抢跑):槽过滤/心跳(B3/D2,本任务全量
-//! 不过滤)、长轮询空挂(B4,空批立即返回)、hello 三件套校验与 CN==node_id
-//! 比对(B2)、snapshot 导出(C1)、lag 计算(D1,slots 先给原始字段)。
+//! HELLO 握手线格式(B2;设计稿 §2.2/§3.6;ADR-33 RP2.3/RP3.3):
+//! - 请求 JSON:`{node_id, slot_name, executed_gtid_set, want_filters, chain}`;
+//!   `executed_gtid_set` = `[{epoch, start, end}, ...]` 闭区间表(对应
+//!   GtidSet::ranges() 的确定性输出,不用 `epoch-seq` 文本形——区间集无双
+//!   义文本形先例,结构化 JSON 免二义解析);`want_filters` = BucketFilter
+//!   的 serde JSON 形(`"All"` / `{"Include":[...]}` / `{"Exclude":[...]}`,
+//!   下游同为 Rust 端,直用持久化枚举的 serde 面,不引入第二套语法);
+//!   `chain` = 上游链路 node_id 列表(本端为直连上游时含本端之后逐跳上溯,
+//!   缺省 [])。请求体上限 `MAX_HELLO_BODY`。
+//! - 成功 200:`{slot, high_watermark, epoch}`——slot = 登记结果(首次握手
+//!   自动登记,设计稿 §3.3;confirmed_gtid 初值 = 下游 executed 集最大值)。
+//! - 失败:统一 JSON `{error, detail}`,`error` 为机器可判错误码:
+//!   `ErrNodeIdMismatch`(403,mTLS peer CN ≠ 自报 node_id)、
+//!   `ErrTopologyLoop`(403,chain 含本节点/有重复/超 8 跳,§3.6 成环即拒)、
+//!   `ErrBinlogGone`(410,续流位点低于 binlog 可用下界 / 槽 stale,
+//!   → 显式重建)、`ErrDiverged`(409,下游 executed ⊄ 上游 GTID 集,
+//!   → 显式重建)、`ErrFilterMismatch`(409,want_filters ≠ 槽登记,
+//!   禁原地改,须 drop + 重建槽,R9)、`ErrSlotOwnerMismatch`(409,
+//!   槽已绑定其它 node_id)、`bad_request`(400,体/参数形状错)。
+//! - 校验顺序:CN == node_id → 环检测 → 起始位点可用(§2.2 ①)→ stale
+//!   槽(等同 ErrBinlogGone,先于②——槽已被硬上限判死,唯一出路恒为重建,
+//!   binlog 截空后②必假分歧)→ executed ⊆ 上游(②)→ 过滤器/归属一致(③)。
+//!   ②的上游 GTID 集口径 = 本机 executed ∪ 本机 binlog 覆盖(§2.2 ②);
+//!   binlog 前缀截断 ⇒ 截断前缀历史上游必已执行,故每 epoch 覆盖按
+//!   `[1, 最大 retained seq]` 并入(纯主端 s:repl_executed 为空时由此兜底,
+//!   否则已截断的正常历史会被误判分歧)。
+//! - epoch 语义:握手按 (epoch, seq) 二元组字典序比较;RP2「新 epoch 从
+//!   seq=1 重计」落地属 E3 promote,届时复核跨 epoch 续流边界(本任务不对
+//!   现有 bl: 存储做 epoch 重编号)。
+//!
+//! 本任务边界(后续任务接线,勿在此抢跑):槽过滤/心跳(D2,本任务全量
+//! 不过滤)、长轮询空挂(B4,空批立即返回)、snapshot 导出(C1)、
+//! lag 计算(D1,slots 先给原始字段)、max_slots 硬限制与槽 POST/DELETE/
+//! ack 端点(B3)。
 //!
 //! 配置(F3 收口 [replication] 配置段前的最小入口,仿 FS3D_REPL_BINLOG
 //! 开发态开关先例):env `FS3D_REPL_CA_CERT` 设置即启用复制口,
 //! `FS3D_REPL_SERVER_CERT`/`FS3D_REPL_SERVER_KEY` 必须同设(缺任一项 =
 //! 启动显式报错,不静默降级);`FS3D_REPL_LISTEN` 覆盖监听地址。
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use fs3_core::Gtid;
+use fs3_core::{Gtid, GtidSet};
 use fs3_engine::Engine;
-use fs3_meta::MetaStore;
-use http_body_util::Full;
+use fs3_meta::{BucketFilter, MetaStore, Slot};
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use parking_lot::RwLock;
+use serde::Deserialize;
 use tokio_rustls::TlsAcceptor;
 
 /// extent-data 单请求 len 上限(64 MiB;下游回填池分块,见模块注释)。
@@ -69,6 +103,10 @@ const MAX_EXTENT_DATA_LEN: u64 = 64 * 1024 * 1024;
 /// binlog 单批默认/上限条数(长轮询属 B4,本任务立即返回)。
 const DEFAULT_BINLOG_LIMIT: usize = 256;
 const MAX_BINLOG_LIMIT: usize = 4096;
+/// hello 请求体上限(64 KiB;executed 区间表/chain 均有界,超限 = 400)。
+const MAX_HELLO_BODY: usize = 64 * 1024;
+/// 拓扑链路上限(设计稿 §3.6:上游链 ≤8 跳,成环即拒)。
+const MAX_CHAIN_HOPS: usize = 8;
 
 /// 复制口配置(F3 前的 env 最小面;装配校验在 from_env/ServerTls::build)。
 #[derive(Debug, Clone)]
@@ -123,8 +161,12 @@ fn load_certs(path: &Path) -> Result<Vec<rustls::pki_types::CertificateDer<'stat
 }
 
 /// 构建 mTLS 服务端配置(启动期 fail-fast;客户端证书强制 = 根信任 + 无
-/// allow_unauthenticated 变体)。
-fn build_server_tls(cfg: &ReplConfig) -> Result<Arc<rustls::ServerConfig>, String> {
+/// allow_unauthenticated 变体)。返回服务端证书 subject CN = 本节点 node_id
+/// (B2 环检测「chain 含本节点即拒」的自标识;证书 CN 即节点身份的部署
+/// 约定同 §6.1,无 CN = None,自检退化为仅重复/跳数检查)。
+fn build_server_tls(
+    cfg: &ReplConfig,
+) -> Result<(Arc<rustls::ServerConfig>, Option<String>), String> {
     let provider = rustls::crypto::ring::default_provider();
     provider.install_default().ok(); // 幂等;已安装则忽略
 
@@ -143,6 +185,7 @@ fn build_server_tls(cfg: &ReplConfig) -> Result<Arc<rustls::ServerConfig>, Strin
         .map_err(|e| format!("client verifier: {e}"))?;
 
     let certs = load_certs(&cfg.server_cert)?;
+    let self_cn = certs.first().and_then(|c| subject_cn_from_der(c.as_ref()));
     let key_f = std::fs::File::open(&cfg.server_key)
         .map_err(|e| format!("open {}: {e}", cfg.server_key.display()))?;
     let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(key_f))
@@ -153,7 +196,7 @@ fn build_server_tls(cfg: &ReplConfig) -> Result<Arc<rustls::ServerConfig>, Strin
         .with_client_cert_verifier(verifier)
         .with_single_cert(certs, key)
         .map_err(|e| format!("server cert config: {e}"))?;
-    Ok(Arc::new(scfg))
+    Ok((Arc::new(scfg), self_cn))
 }
 
 /// 复制口服务(持有引擎/元数据句柄;自身无状态)。
@@ -162,6 +205,8 @@ pub struct ReplServer {
     meta: Arc<MetaStore>,
     tls: Arc<rustls::ServerConfig>,
     listen: SocketAddr,
+    /// 本节点 node_id = 服务端证书 CN(B2 环检测自标识;见 build_server_tls)。
+    node_id: Option<String>,
 }
 
 /// 运行句柄(bind 成功后回传实际监听地址;测试用 ephemeral 端口)。
@@ -176,12 +221,13 @@ impl ReplServer {
         meta: Arc<MetaStore>,
         cfg: ReplConfig,
     ) -> Result<ReplServer, String> {
-        let tls = build_server_tls(&cfg)?;
+        let (tls, node_id) = build_server_tls(&cfg)?;
         Ok(ReplServer {
             engine,
             meta,
             tls,
             listen: cfg.listen,
+            node_id,
         })
     }
 
@@ -283,18 +329,13 @@ impl ReplServer {
                 "client certificate must carry CN = node_id (ADR-33 RP6)",
             );
         };
-        let _ = cn; // B2 hello 比对 CN == 自报 node_id 时使用
         let path = req.uri().path();
         let method = req.method();
         match (method, path) {
             (&Method::GET, "/v1/repl/v1/binlog") => self.handle_binlog(&req),
             (&Method::GET, "/v1/repl/v1/extent-data") => self.handle_extent_data(&req),
             (&Method::GET, "/v1/repl/v1/slots") => self.handle_slots(),
-            (&Method::POST, "/v1/repl/v1/hello") => json_err(
-                StatusCode::NOT_IMPLEMENTED,
-                "not_implemented",
-                "replication handshake is TODO M21/B2",
-            ),
+            (&Method::POST, "/v1/repl/v1/hello") => self.handle_hello(req, cn).await,
             (&Method::POST, "/v1/repl/v1/snapshot") => json_err(
                 StatusCode::NOT_IMPLEMENTED,
                 "not_implemented",
@@ -449,24 +490,212 @@ impl ReplServer {
             Ok(v) => v,
             Err(e) => return internal_err("slots list", &e),
         };
-        let items: Vec<serde_json::Value> = slots
-            .iter()
-            .map(|s| {
-                serde_json::json!({
-                    "name": s.name,
-                    "consumer_node_id": s.consumer_node_id,
-                    "confirmed_gtid": fmt_gtid(s.confirmed_gtid),
-                    "filters": s.filters,
-                    "created_at": s.created_at,
-                    "last_ack_at": s.last_ack_at,
-                    "stale": s.stale,
-                })
-            })
-            .collect();
+        let items: Vec<serde_json::Value> = slots.iter().map(slot_json).collect();
         json_ok(serde_json::json!({
             "high_watermark": fmt_gtid(watermark),
             "slots": items,
         }))
+    }
+
+    /// `POST /v1/repl/v1/hello`(B2;设计稿 §2.2/§3.6;线格式与错误码见
+    /// 模块注释)。校验顺序 = 模块注释钉死的顺序;成功 = 槽登记(已登记则
+    /// 校验一致后直接复用)+ 水位/epoch。
+    async fn handle_hello(&self, req: Request<Incoming>, cn: &str) -> Response<Full<Bytes>> {
+        let hello = match read_json_body::<HelloRequest>(req, MAX_HELLO_BODY).await {
+            Ok(h) => h,
+            Err(resp) => return resp,
+        };
+        // ① CN == 自报 node_id(RP6:CN 承载 node_id,防伪冒他节点身份)
+        if hello.node_id != cn {
+            return json_err(
+                StatusCode::FORBIDDEN,
+                "ErrNodeIdMismatch",
+                "mTLS peer CN must equal hello node_id (ADR-33 RP6)",
+            );
+        }
+        if !valid_slot_name(&hello.slot_name) {
+            return bad_slot_name();
+        }
+        // ② 环检测(§3.6):chain ≤8 跳、无重复、不含本节点
+        if hello.chain.len() > MAX_CHAIN_HOPS {
+            return json_err(
+                StatusCode::FORBIDDEN,
+                "ErrTopologyLoop",
+                "upstream chain exceeds 8 hops (replication-design §3.6)",
+            );
+        }
+        let mut seen = std::collections::HashSet::with_capacity(hello.chain.len());
+        if !hello.chain.iter().all(|n| seen.insert(n)) {
+            return json_err(
+                StatusCode::FORBIDDEN,
+                "ErrTopologyLoop",
+                "duplicate node_id in chain = topology loop (replication-design §3.6)",
+            );
+        }
+        if self.node_id.as_ref().is_some_and(|id| seen.contains(id)) {
+            return json_err(
+                StatusCode::FORBIDDEN,
+                "ErrTopologyLoop",
+                "chain contains this node's node_id = topology loop (replication-design §3.6)",
+            );
+        }
+        // 下游 executed 集(区间表 → GtidSet;形状非法 = 400)
+        let mut executed = GtidSet::new();
+        for r in &hello.executed_gtid_set {
+            if r.start == 0 || r.start > r.end {
+                return json_err(
+                    StatusCode::BAD_REQUEST,
+                    "bad_request",
+                    "executed_gtid_set ranges must satisfy 1 <= start <= end",
+                );
+            }
+            executed.insert_range(r.epoch, r.start, r.end);
+        }
+        // 续流位点 = executed 集最大值(GTID 字典序;空集 = 全新下游,走
+        // §3.1 快照流程,位点检查跳过)
+        let cursor = executed
+            .ranges()
+            .map(|(epoch, _s, e)| Gtid { epoch, seq: e })
+            .max();
+        let watermark = match self.high_watermark() {
+            Ok(g) => g,
+            Err(e) => return internal_err("hello watermark", &e),
+        };
+        // ③ 起始位点可用(§2.2 ①):续流所需的下一个 GTID 必须仍在 binlog
+        // 内——位点+1 低于可用下界 = 中间已被截断 → ErrBinlogGone
+        if let Some(cursor) = cursor {
+            match self.binlog_floor() {
+                Ok(Some(floor)) => {
+                    let next = Gtid {
+                        epoch: cursor.epoch,
+                        seq: cursor.seq.saturating_add(1),
+                    };
+                    if next < floor {
+                        return json_err(
+                            StatusCode::GONE,
+                            "ErrBinlogGone",
+                            "resume position below binlog floor (truncated); explicit rebuild required (ADR-33 RP2.3)",
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => return internal_err("binlog floor", &e),
+            }
+        }
+        // ⑤ 槽 stale(硬上限强截越过,RP8)= 等同 ErrBinlogGone;先于 ④
+        // 包含性检查——槽已被硬上限判死,无论 GTID 集形如何唯一出路都是
+        // 显式重建(binlog 截空后包含性必假分歧,先报 stale 口径更准)。
+        let slot = match self.meta.repl_slot(&hello.slot_name) {
+            Ok(s) => s,
+            Err(e) => return internal_err("slot lookup", &e),
+        };
+        if let Some(s) = &slot {
+            if s.stale {
+                return json_err(
+                    StatusCode::GONE,
+                    "ErrBinlogGone",
+                    "slot marked stale by hard-cap truncation; explicit rebuild required (ADR-33 RP8)",
+                );
+            }
+        }
+        // ④ executed ⊆ 上游 GTID 集(§2.2 ②,口径 = 本机 executed ∪ 本机
+        // binlog 覆盖,见模块注释)→ 否 = ErrDiverged(确定性分歧检出)
+        let upstream = match self.upstream_gtid_set() {
+            Ok(s) => s,
+            Err(e) => return internal_err("upstream gtid set", &e),
+        };
+        if !executed.is_subset(&upstream) {
+            return json_err(
+                StatusCode::CONFLICT,
+                "ErrDiverged",
+                "downstream executed set not a subset of upstream; explicit rebuild required (ADR-33 RP2.3)",
+            );
+        }
+        // ⑥ 已登记槽:归属他节点 = 冲突;过滤器不一致禁原地改(R9,须
+        // drop + 重建);一致则复用
+        let slot = match slot {
+            Some(s) => {
+                if s.consumer_node_id != hello.node_id {
+                    return json_err(
+                        StatusCode::CONFLICT,
+                        "ErrSlotOwnerMismatch",
+                        "slot is bound to a different consumer node",
+                    );
+                }
+                if s.filters != hello.want_filters {
+                    return json_err(
+                        StatusCode::CONFLICT,
+                        "ErrFilterMismatch",
+                        "filter change requires drop + recreate of the slot (R9; no in-place edit)",
+                    );
+                }
+                s
+            }
+            None => {
+                // 首次握手自动登记(设计稿 §3.3;max_slots 硬限制属 B3)
+                let now = now_unix_secs();
+                let slot = Slot {
+                    name: hello.slot_name.clone(),
+                    consumer_node_id: hello.node_id.clone(),
+                    confirmed_gtid: cursor.unwrap_or(Gtid { epoch: 0, seq: 0 }),
+                    filters: hello.want_filters.clone(),
+                    created_at: now,
+                    last_ack_at: now,
+                    stale: false,
+                };
+                if let Err(e) = self.meta.put_repl_slot(&slot) {
+                    return internal_err("slot register", &e);
+                }
+                slot
+            }
+        };
+        json_ok(serde_json::json!({
+            "slot": slot_json(&slot),
+            "high_watermark": fmt_gtid(watermark),
+            "epoch": watermark.epoch,
+        }))
+    }
+
+    /// binlog 可用下界 = 最小 retained 条目的 GTID(无条目 = None)。
+    fn binlog_floor(&self) -> Result<Option<Gtid>, fs3_core::Error> {
+        Ok(self
+            .meta
+            .repl_binlog_scan(0, 1)?
+            .first()
+            .map(|(seq, rec)| Gtid {
+                epoch: rec.epoch,
+                seq: *seq,
+            }))
+    }
+
+    /// 上游 GTID 集 = 本机 executed ∪ 本机 binlog 覆盖(§2.2 ②口径)。
+    /// binlog 前缀截断 ⇒ 截掉的前缀历史上游必已执行(截断只删头部,
+    /// truncate_binlog),故每 epoch 按 `[1, 最大 retained seq]` 并入——
+    /// 纯主端 s:repl_executed 恒空,无此兜底则已截断的正常历史对滞后
+    /// 下游形成假分歧。握手为低频路径,分页全扫 retained binlog(规模
+    /// 受 retain 水位约束;同 truncate_binlog 的全扫先例)。
+    fn upstream_gtid_set(&self) -> Result<GtidSet, fs3_core::Error> {
+        let mut set = self.meta.repl_executed()?;
+        let mut max_per_epoch: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut after = 0u64;
+        loop {
+            let page = self.meta.repl_binlog_scan(after, MAX_BINLOG_LIMIT)?;
+            if page.is_empty() {
+                break;
+            }
+            for (seq, rec) in &page {
+                let m = max_per_epoch.entry(rec.epoch).or_insert(0);
+                *m = (*m).max(*seq);
+                after = *seq;
+            }
+            if page.len() < MAX_BINLOG_LIMIT {
+                break;
+            }
+        }
+        for (epoch, hi) in max_per_epoch {
+            set.insert_range(epoch, 1, hi);
+        }
+        Ok(set)
     }
 
     /// 上游当前水位 = {当前 epoch, 最新事务 seq}(binlog 开启时每事务一条
@@ -480,6 +709,89 @@ impl ReplServer {
 }
 
 // ─────────────────────────── 协议小件 ───────────────────────────
+
+/// hello 请求体(B2 线格式,见模块注释)。`chain` 缺省 = [](直连上游)。
+#[derive(Debug, Deserialize)]
+struct HelloRequest {
+    node_id: String,
+    slot_name: String,
+    executed_gtid_set: Vec<GtidRangeJson>,
+    want_filters: BucketFilter,
+    #[serde(default)]
+    chain: Vec<String>,
+}
+
+/// executed GTID 集的线格式区间(对应 GtidSet::ranges() 输出三元组)。
+#[derive(Debug, Deserialize)]
+struct GtidRangeJson {
+    epoch: u64,
+    start: u64,
+    end: u64,
+}
+
+/// 槽的 JSON 投影(slots 观测端点与 hello 成功响应共用同一形状)。
+fn slot_json(s: &Slot) -> serde_json::Value {
+    serde_json::json!({
+        "name": s.name,
+        "consumer_node_id": s.consumer_node_id,
+        "confirmed_gtid": fmt_gtid(s.confirmed_gtid),
+        "filters": s.filters,
+        "created_at": s.created_at,
+        "last_ack_at": s.last_ack_at,
+        "stale": s.stale,
+    })
+}
+
+/// 读 JSON 请求体(有界;超限/IO/解析失败 = 400)。
+async fn read_json_body<T: for<'de> Deserialize<'de>>(
+    req: Request<Incoming>,
+    cap: usize,
+) -> Result<T, Response<Full<Bytes>>> {
+    let body = http_body_util::Limited::new(req.into_body(), cap)
+        .collect()
+        .await
+        .map_err(|_| {
+            json_err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "request body unreadable or too large",
+            )
+        })?
+        .to_bytes();
+    serde_json::from_slice(&body).map_err(|e| {
+        json_err(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            &format!("bad json body: {e}"),
+        )
+    })
+}
+
+/// 槽名字符合法性:URL 安全(query 参数不做百分号解码,见模块注释)。
+fn valid_slot_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// 非法槽名的统一 400 响应。
+fn bad_slot_name() -> Response<Full<Bytes>> {
+    json_err(
+        StatusCode::BAD_REQUEST,
+        "bad_request",
+        "slot_name must be 1..=128 chars of [A-Za-z0-9._-]",
+    )
+}
+
+/// 墙钟 Unix 秒(槽 created_at/last_ack_at;照 fs3d meta.rs 先例)。
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 /// GTID 文本形 `{epoch}-{seq}`(模块注释的线格式)。
 fn fmt_gtid(g: Gtid) -> String {
@@ -1121,14 +1433,19 @@ mod tests {
             0
         );
 
-        // POST 占位 501 / 未知路径 404 / 错误动词 405
-        for p in ["/v1/repl/v1/hello", "/v1/repl/v1/snapshot"] {
-            let req = format!(
-                "POST {p} HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-            );
-            let (st, _, body) = mtls_request(addr, &ca_pem, cli, &req).await.unwrap();
-            assert_eq!(st, 501, "{p}: {}", String::from_utf8_lossy(&body));
-        }
+        // POST snapshot 占位 501 / hello 空体 400(B2 已实现)/ 未知路径 404 /
+        // 错误动词 405
+        let req = "POST /v1/repl/v1/snapshot HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+        let (st, _, body) = mtls_request(addr, &ca_pem, cli, req).await.unwrap();
+        assert_eq!(st, 501, "snapshot: {}", String::from_utf8_lossy(&body));
+        let req = "POST /v1/repl/v1/hello HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+        let (st, _, body) = mtls_request(addr, &ca_pem, cli, req).await.unwrap();
+        assert_eq!(
+            st,
+            400,
+            "hello empty body: {}",
+            String::from_utf8_lossy(&body)
+        );
         let (st, _, _) = mtls_request(addr, &ca_pem, cli, &get_req("/v1/repl/v1/nope"))
             .await
             .unwrap();
@@ -1137,6 +1454,311 @@ mod tests {
             "DELETE /v1/repl/v1/slots HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n";
         let (st, _, _) = mtls_request(addr, &ca_pem, cli, req).await.unwrap();
         assert_eq!(st, 405);
+    }
+
+    // ── B2 握手测试夹具 ──
+
+    /// 开 repl_binlog 的独立 MetaStore + n 条 BucketPut 提交(seq 1..=n)。
+    fn repl_meta_with_entries(dir: &Path, n: usize) -> Arc<MetaStore> {
+        let meta = Arc::new(
+            MetaStore::open(
+                &dir.join("repl-meta"),
+                &fs3_meta::MetaConfig {
+                    repl_binlog: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        for i in 0..n {
+            meta.commit_bucket_put(
+                &format!("b{i}"),
+                &fs3_core::BucketMeta {
+                    created: 1,
+                    owner: "t".into(),
+                    stats: Default::default(),
+                    quota: None,
+                    created_with_acl: false,
+                    versioning: Default::default(),
+                    default_encryption: None,
+                    object_lock: false,
+                    default_retention: None,
+                    default_kms_key: None,
+                },
+            )
+            .unwrap();
+        }
+        meta
+    }
+
+    fn post_json_req(path: &str, body: &str) -> String {
+        format!(
+            "POST {path} HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// hello 请求体(B2 线格式:executed = [{epoch,start,end}] 闭区间表)。
+    fn hello_json(
+        node_id: &str,
+        slot_name: &str,
+        executed: &[(u64, u64, u64)],
+        want_filters: serde_json::Value,
+        chain: &[&str],
+    ) -> String {
+        let executed: Vec<serde_json::Value> = executed
+            .iter()
+            .map(|&(epoch, start, end)| {
+                serde_json::json!({"epoch": epoch, "start": start, "end": end})
+            })
+            .collect();
+        serde_json::json!({
+            "node_id": node_id,
+            "slot_name": slot_name,
+            "executed_gtid_set": executed,
+            "want_filters": want_filters,
+            "chain": chain,
+        })
+        .to_string()
+    }
+
+    /// 以 client_cn 签客户端证书并发 hello;返回 (status, 响应 JSON)。
+    async fn hello_call(fx: &Fixture, client_cn: &str, body: &str) -> (u16, serde_json::Value) {
+        let (cert, key) = fx.client_cert(Some(client_cn));
+        let (st, _, raw) = mtls_request(
+            fx.addr,
+            &fx.ca_pem,
+            Some((&cert, &key)),
+            &post_json_req("/v1/repl/v1/hello", body),
+        )
+        .await
+        .unwrap();
+        (st, serde_json::from_slice(&raw).unwrap())
+    }
+
+    /// M21 B2(ADR-33 RP2.3;设计稿 §2.2 ②):GTID 包含性校验——下游
+    /// executed 集 ⊄ 上游(本机 executed ∪ binlog 覆盖)→ 409 ErrDiverged;
+    /// CN ≠ 自报 node_id → 403 ErrNodeIdMismatch;合法前缀 → 200 + 自动
+    /// 登记槽(正向对照)。
+    #[tokio::test]
+    async fn repl_handshake_rejects_diverged_gtid() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = repl_meta_with_entries(dir.path(), 2); // seq 1..=2,水位 1-2
+        let fx = start_repl_server(Some(meta.clone()));
+
+        // ① 同 epoch 尾部超出(旧主未复制尾事务形态)→ ErrDiverged
+        let (st, v) = hello_call(
+            &fx,
+            "node-b",
+            &hello_json("node-b", "s1", &[(1, 1, 5)], serde_json::json!("All"), &[]),
+        )
+        .await;
+        assert_eq!(st, 409, "{v}");
+        assert_eq!(v["error"], "ErrDiverged");
+
+        // ② 含上游缺席的 epoch → ErrDiverged
+        let (st, v) = hello_call(
+            &fx,
+            "node-b",
+            &hello_json(
+                "node-b",
+                "s1",
+                &[(1, 1, 2), (2, 1, 1)],
+                serde_json::json!("All"),
+                &[],
+            ),
+        )
+        .await;
+        assert_eq!(st, 409, "{v}");
+        assert_eq!(v["error"], "ErrDiverged");
+
+        // ③ mTLS CN(node-c)≠ 自报 node_id(node-b)→ 403 ErrNodeIdMismatch
+        let (st, v) = hello_call(
+            &fx,
+            "node-c",
+            &hello_json("node-b", "s1", &[], serde_json::json!("All"), &[]),
+        )
+        .await;
+        assert_eq!(st, 403, "{v}");
+        assert_eq!(v["error"], "ErrNodeIdMismatch");
+
+        // ④ 正向对照:executed = 上游真子集 → 200,首次握手自动登记槽
+        let (st, v) = hello_call(
+            &fx,
+            "node-b",
+            &hello_json("node-b", "s1", &[(1, 1, 2)], serde_json::json!("All"), &[]),
+        )
+        .await;
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(v["high_watermark"], "1-2");
+        assert_eq!(v["epoch"], 1);
+        assert_eq!(v["slot"]["name"], "s1");
+        assert_eq!(v["slot"]["consumer_node_id"], "node-b");
+        assert_eq!(v["slot"]["confirmed_gtid"], "1-2");
+        let slot = meta.repl_slot("s1").unwrap().expect("slot persisted");
+        assert_eq!(slot.confirmed_gtid, Gtid { epoch: 1, seq: 2 });
+        assert!(!slot.stale);
+    }
+
+    /// M21 B2(ADR-33 RP2.3/RP8;设计稿 §2.2 ①/§3.4):起始位点可用性——
+    /// 续流位点低于 binlog 可用下界(已被截断)→ 410 ErrBinlogGone;硬上限
+    /// 强截越过槽位点 → 槽 stale,握手等同 ErrBinlogGone;位点仍在覆盖内
+    /// 的正常续流不误伤(200 对照)。
+    #[tokio::test]
+    async fn repl_handshake_rejects_stale_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = repl_meta_with_entries(dir.path(), 4); // seq 1..=4
+                                                          // 预登记槽 pin @ 1-2(截断下限钳制输入)
+        meta.put_repl_slot(&Slot {
+            name: "pin".into(),
+            consumer_node_id: "node-b".into(),
+            confirmed_gtid: Gtid { epoch: 1, seq: 2 },
+            filters: BucketFilter::All,
+            created_at: 1,
+            last_ack_at: 1,
+            stale: false,
+        })
+        .unwrap();
+        let fx = start_repl_server(Some(meta.clone()));
+        let now = now_unix_secs();
+
+        // 软上限(retain_bytes=1B)期望全截,槽 pin 钳回 → 删 seq 1..=2,
+        // binlog 可用下界 = 1-3
+        let stats = meta
+            .truncate_binlog(
+                now,
+                &fs3_meta::ReplRetainConfig {
+                    retain_hours: 24,
+                    retain_bytes: 1,
+                    retain_bytes_hard: u64::MAX,
+                },
+            )
+            .unwrap();
+        assert_eq!(stats.truncated, 2);
+        assert!(stats.soft_capped);
+        assert_eq!(stats.stale_marked, 0);
+
+        // ① 续流位点 1-1:下一 GTID 1-2 < 下界 1-3 → 410 ErrBinlogGone
+        let (st, v) = hello_call(
+            &fx,
+            "node-c",
+            &hello_json(
+                "node-c",
+                "fresh",
+                &[(1, 1, 1)],
+                serde_json::json!("All"),
+                &[],
+            ),
+        )
+        .await;
+        assert_eq!(st, 410, "{v}");
+        assert_eq!(v["error"], "ErrBinlogGone");
+
+        // ② 对照:位点 1-3 仍在覆盖内 → 200(截断不误伤合法续流)
+        let (st, v) = hello_call(
+            &fx,
+            "node-c",
+            &hello_json(
+                "node-c",
+                "fresh",
+                &[(1, 3, 3)],
+                serde_json::json!("All"),
+                &[],
+            ),
+        )
+        .await;
+        assert_eq!(st, 200, "{v}");
+
+        // ③ 硬上限强截到底 → 位点被越过的槽标 stale;stale 槽握手等同
+        // ErrBinlogGone(先于包含性——槽已判死,唯一出路恒为显式重建)
+        let stats = meta
+            .truncate_binlog(
+                now,
+                &fs3_meta::ReplRetainConfig {
+                    retain_hours: 24,
+                    retain_bytes: u64::MAX,
+                    retain_bytes_hard: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(stats.truncated, 2);
+        assert_eq!(stats.stale_marked, 2, "pin 与 fresh 的位点同被越过");
+        assert!(meta.repl_slot("pin").unwrap().unwrap().stale);
+        let (st, v) = hello_call(
+            &fx,
+            "node-b",
+            &hello_json("node-b", "pin", &[(1, 1, 2)], serde_json::json!("All"), &[]),
+        )
+        .await;
+        assert_eq!(st, 410, "{v}");
+        assert_eq!(v["error"], "ErrBinlogGone");
+    }
+
+    /// M21 B2(ADR-33 RP3.3;设计稿 §3.6):拓扑环检测——chain 含本节点
+    /// node_id / 含重复 node_id / 超 8 跳 → 403 ErrTopologyLoop;合法链
+    /// 200 对照(本节点 node_id = 服务端证书 CN = "repl-server")。
+    #[tokio::test]
+    async fn repl_handshake_rejects_topology_loop() {
+        let fx = start_repl_server(None);
+
+        // ① chain 含本节点 → 成环即拒
+        let (st, v) = hello_call(
+            &fx,
+            "node-b",
+            &hello_json(
+                "node-b",
+                "s1",
+                &[],
+                serde_json::json!("All"),
+                &["repl-server"],
+            ),
+        )
+        .await;
+        assert_eq!(st, 403, "{v}");
+        assert_eq!(v["error"], "ErrTopologyLoop");
+
+        // ② chain 内重复 node_id → 成环即拒
+        let (st, v) = hello_call(
+            &fx,
+            "node-b",
+            &hello_json(
+                "node-b",
+                "s1",
+                &[],
+                serde_json::json!("All"),
+                &["node-a", "node-c", "node-a"],
+            ),
+        )
+        .await;
+        assert_eq!(st, 403, "{v}");
+        assert_eq!(v["error"], "ErrTopologyLoop");
+
+        // ③ chain 超 8 跳 → 拒
+        let long_chain: Vec<&str> = vec!["n1", "n2", "n3", "n4", "n5", "n6", "n7", "n8", "n9"];
+        let (st, v) = hello_call(
+            &fx,
+            "node-b",
+            &hello_json("node-b", "s1", &[], serde_json::json!("All"), &long_chain),
+        )
+        .await;
+        assert_eq!(st, 403, "{v}");
+        assert_eq!(v["error"], "ErrTopologyLoop");
+
+        // ④ 正向对照:合法链(8 跳内、无重复、不含本节点)→ 200
+        let (st, v) = hello_call(
+            &fx,
+            "node-b",
+            &hello_json(
+                "node-b",
+                "s1",
+                &[],
+                serde_json::json!("All"),
+                &["node-a", "node-c"],
+            ),
+        )
+        .await;
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(v["slot"]["name"], "s1");
     }
 
     /// subject CN 提取:rcgen 证书正/反向 + 垃圾输入不 panic。

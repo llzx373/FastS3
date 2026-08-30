@@ -45,27 +45,30 @@ impl GtidSet {
         self.ranges.values().all(Vec::is_empty)
     }
 
-    /// 插入单个 GTID;落入既有区间 = 幂等,与既有区间重叠/相邻
-    /// (`seq == end+1` 或 `start == seq+1`)即合并并吞并右侧相邻区间。
+    /// 插入单个 GTID(= 单元区间,见 insert_range)。
     pub fn insert(&mut self, g: Gtid) {
-        assert!(g.seq >= 1, "gtid seq starts at 1");
-        let v = self.ranges.entry(g.epoch).or_default();
-        let p = g.seq;
-        // 首个 `end+1 >= p` 的区间 = 唯一可能吞并 p 的区间(区间升序不相交)
-        let idx = v.partition_point(|&(_, e)| e.saturating_add(1) < p);
-        if idx < v.len() && v[idx].0 <= p.saturating_add(1) {
-            let s = v[idx].0.min(p);
-            let mut e = v[idx].1.max(p);
-            // 向右吞并被 p 桥接的相邻/重叠区间
-            let mut j = idx + 1;
-            while j < v.len() && v[j].0 <= e.saturating_add(1) {
-                e = e.max(v[j].1);
-                j += 1;
-            }
-            v.splice(idx..j, [(s, e)]);
-        } else {
-            v.insert(idx, (p, p));
+        self.insert_range(g.epoch, g.seq, g.seq);
+    }
+
+    /// 插入整个闭区间 `[start, end]`;与既有区间重叠/相邻(端点差 ≤1)
+    /// 即合并并吞并全部被桥接的区间。M21 B2 握手:上游 binlog 覆盖段按
+    /// epoch 以区间形态并入「上游 GTID 集」(逐点 insert 在大 binlog 上是
+    /// O(seq) 次合并,区间插入为 O(区间数))。
+    pub fn insert_range(&mut self, epoch: u64, start: u64, end: u64) {
+        assert!(start >= 1, "gtid seq starts at 1");
+        assert!(start <= end, "range start must be <= end");
+        let v = self.ranges.entry(epoch).or_default();
+        // 首个 `end+1 >= start` 的区间 = 首个可能与本区间重叠/相邻的区间
+        let idx = v.partition_point(|&(_, e)| e.saturating_add(1) < start);
+        let (mut s, mut e) = (start, end);
+        // 吞并全部重叠/相邻区间(含 idx 自身)
+        let mut j = idx;
+        while j < v.len() && v[j].0 <= e.saturating_add(1) {
+            s = s.min(v[j].0);
+            e = e.max(v[j].1);
+            j += 1;
         }
+        v.splice(idx..j, [(s, e)]);
     }
 
     /// 包含判定:GTID 是否已在集合内(幂等重放 `seq <= cursor` 丢弃的
@@ -273,5 +276,39 @@ mod tests {
         let zero: BTreeMap<u64, Vec<(u64, u64)>> = [(1, vec![(0, 3)])].into_iter().collect();
         let zero = postcard::to_allocvec(&zero).unwrap();
         assert!(GtidSet::decode(&zero).is_err(), "seq 从 1 起");
+    }
+
+    /// M21 B2(握手包含性校验的上游集构造):insert_range 区间插入——
+    /// ① 空集插入 / 与既有区间不相邻时并存;
+    /// ② 重叠、相邻(端点差 1)、桥接多个区间时归并;
+    /// ③ insert(单点)等价单元区间;跨 epoch 不合并。
+    #[test]
+    fn gtid_set_insert_range_merges() {
+        let mut s = GtidSet::new();
+        s.insert_range(1, 1, 500);
+        assert_eq!(ranges_of(&s), vec![(1, 1, 500)]);
+        s.insert_range(1, 600, 700);
+        assert_eq!(ranges_of(&s), vec![(1, 1, 500), (1, 600, 700)]);
+        // 相邻合并(501 = 500+1)
+        s.insert_range(1, 501, 599);
+        assert_eq!(ranges_of(&s), vec![(1, 1, 700)]);
+        // 桥接吞并两侧
+        s.insert_range(1, 800, 900);
+        s.insert_range(1, 701, 799);
+        assert_eq!(ranges_of(&s), vec![(1, 1, 900)]);
+        // 被包含的重插幂等
+        s.insert_range(1, 100, 200);
+        assert_eq!(ranges_of(&s), vec![(1, 1, 900)]);
+        // insert 单点等价单元区间;跨 epoch 不合并
+        s.insert(g(1, 901));
+        s.insert_range(2, 1, 5);
+        assert_eq!(ranges_of(&s), vec![(1, 1, 901), (2, 1, 5)]);
+        // 上游集口径:包含性按区间成立(B2 握手 ② 的集合形态)
+        let downstream = {
+            let mut d = GtidSet::new();
+            d.insert_range(1, 1, 900);
+            d
+        };
+        assert!(downstream.is_subset(&s));
     }
 }
