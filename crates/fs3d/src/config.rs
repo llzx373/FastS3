@@ -180,8 +180,11 @@ pub struct KmsDeployConfig {
 #[derive(Debug, Default, Clone, serde::Deserialize)]
 pub struct ReplicationConfig {
     /// 节点角色:primary(缺省)| standby。standby = 只读承接读 +
-    /// pull 追赶;promote/demote 走 admin 面(运行期翻转落 s:repl_role,
-    /// 重启以本字段为准——切换后须同步改配置)。
+    /// pull 追赶。**首次引导种子**(M21 gate 修复,ADR-33 RP5):仅当
+    /// meta `s:repl_role` 缺席(全新库)时落 meta;此后 meta 为权威——
+    /// promote/demote 走 admin 面(运行期翻转持久于 s:repl_role),重启
+    /// 以 meta 为准,本字段与 meta 不一致时启动打 warn! 明示(运维应
+    /// 同步改配置,但不被配置盖回)。
     pub role: Option<String>,
     /// 复制入站口监听(独立口,mTLS 强制;缺省 0.0.0.0:9445)。
     /// standby 设了才开中继(对下服务)。

@@ -2880,6 +2880,17 @@ impl MetaStore {
         }
     }
 
+    /// 本节点复制角色原值(键缺席 → None;**首启种子判定用**,区别于
+    /// repl_role() 的「缺席 = Primary」缺省口径——种子语义(M21 gate
+    /// 修复,ADR-33 RP5)要求区分「从未落定(全新库,配置可播种)」与
+    /// 「显式 primary(promote/rebuild 等已裁决,重启以 meta 为准)」)。
+    pub fn repl_role_raw(&self) -> Result<Option<ReplRole>> {
+        match self.db.get(SYS_REPL_ROLE).map_err(rocks_err)? {
+            Some(v) => Ok(Some(ReplRole::parse(&String::from_utf8_lossy(&v))?)),
+            None => Ok(None),
+        }
+    }
+
     /// 写复制角色(直写 + fsync,照 trusted_clock 先例;promote/demote
     /// 为本地裁决动作,E3 接线,调用方持单点)。
     pub fn set_repl_role(&self, role: ReplRole) -> Result<()> {

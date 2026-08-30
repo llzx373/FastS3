@@ -738,6 +738,85 @@ fn assemble_kms(cfg: &config::RootConfig) -> fs3_core::Result<AssembledKms> {
     }
 }
 
+/// 启动时复制角色裁决结果(测试可断言种子/分歧分支;warn! 在分歧
+/// 分支内同步打出)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BootRoleResolution {
+    /// 生效角色(meta 裁决后)。
+    role: fs3_meta::ReplRole,
+    /// 本次是否为首启种子落 meta(全新库 + 配置在)。
+    seeded: bool,
+    /// 配置与 meta 分歧(warn! 分支;运维应同步改配置)。
+    config_mismatch: bool,
+}
+
+/// M21 gate 修复(ADR-33 RP5;promote/demote 抗重启;语义钉死,改动
+/// 走 ADR):[replication].role / env FS3D_REPL_ROLE(测试钩子)=
+/// **首次引导种子**——仅当 meta `s:repl_role` 缺席(全新库)时落
+/// meta;此后 **meta 为权威**:promote(E3)/demote(F2)/rebuild(C5
+/// clear_for_rebuild 显式复位 standby)的角色翻转均持久于 meta,重启
+/// 以 meta 为准,配置与 meta 不一致只 warn! 明示(运维应同步改配置,
+/// 但不被配置盖回——被 promote 的节点带旧配置重启不得静默回退
+/// standby 把 pull 指回旧主)。rebuild 后边界:rebuild 显式带
+/// --as-standby 语义且 meta 已落定 standby,重启仍以 meta 为准,种子
+/// 语义不复活(种子只在键缺席时生效,而 rebuild 写入了键)。
+/// 非法配置值维持旧口径:启动显式失败。
+fn resolve_repl_role_at_boot(
+    meta: &fs3_meta::MetaStore,
+    seed: Option<&str>,
+) -> Result<BootRoleResolution, fs3_core::Error> {
+    let seed_role = match seed {
+        None => None,
+        Some("primary") => Some(fs3_meta::ReplRole::Primary),
+        Some("standby") => Some(fs3_meta::ReplRole::Standby),
+        Some(other) => {
+            return Err(fs3_core::Error::InvalidArgument(format!(
+                "bad [replication].role {other:?} (expect primary|standby)"
+            )))
+        }
+    };
+    match meta.repl_role_raw()? {
+        // 首启种子:全新库 meta 缺席,配置落定;无配置 = 缺省 primary
+        // 惰性不落盘(同 MetaStore::repl_role() 缺省口径)
+        None => match seed_role {
+            Some(role) => {
+                meta.set_repl_role(role)?;
+                tracing::info!(
+                    "replication role seeded from [replication].role = {role:?} \
+                     (首次引导种子;此后 meta s:repl_role 为权威)"
+                );
+                Ok(BootRoleResolution {
+                    role,
+                    seeded: true,
+                    config_mismatch: false,
+                })
+            }
+            None => Ok(BootRoleResolution {
+                role: fs3_meta::ReplRole::Primary,
+                seeded: false,
+                config_mismatch: false,
+            }),
+        },
+        // meta 权威:重启不盖回 promote/demote/rebuild 的持久裁决
+        Some(current) => {
+            let mismatch = matches!(seed_role, Some(s) if s != current);
+            if mismatch {
+                tracing::warn!(
+                    "[replication].role = {:?} 与 meta s:repl_role = {:?} 分歧:以 meta 为准 \
+                     (promote/demote 是本地裁决持久状态,ADR-33 RP5);请同步修改配置",
+                    seed_role.unwrap(),
+                    current
+                );
+            }
+            Ok(BootRoleResolution {
+                role: current,
+                seeded: false,
+                config_mismatch: mismatch,
+            })
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_serve(
     config_path: Option<PathBuf>,
@@ -1310,34 +1389,24 @@ fn cmd_serve(
         }
     }
 
-    // M21 B4(ADR-33 RP4.2;设计稿 §4.1):下游 pull worker。role 取值 =
-    // [replication].role(primary|standby;F3 收口,缺省不覆写 meta 现状
-    // ——promote 的运行期翻转不被重启意外盖回;env FS3D_REPL_ROLE 仅测试
-    // 钩子回退);设置即落 s:repl_role(幂等直写)。pull 配置已在 admin
-    // 装配前解析(C5 注入用),worker 内 role=standby 硬校验(配了上游但
-    // 角色是主 = 配置矛盾,启动显式失败,不静默)。pause/resume 语义属
-    // F2;promote 停 worker 已在 E3 落(RebuildService::promote,经
-    // admin 面 /v1/admin/replication/promote)。
+    // M21 B4(ADR-33 RP4.2;设计稿 §4.1):下游 pull worker。role 裁决
+    // 见 resolve_repl_role_at_boot(M21 gate 修复:promote 抗重启,
+    // RP5「promote 是本地裁决持久状态」;配置仅首启种子,meta 为权威,
+    // 分歧 warn! 不盖回)。pull 配置已在 admin 装配前解析(C5 注入用),
+    // worker 内 role=standby 硬校验(配了上游但角色是主 = 配置矛盾,
+    // 启动显式失败,不静默)。pause/resume 语义属 F2;promote 停 worker
+    // 已在 E3 落(RebuildService::promote,经 admin 面
+    // /v1/admin/replication/promote)。
     let repl_role_cfg = cfg
         .replication
         .as_ref()
         .and_then(|c| c.role.clone())
         .or_else(|| std::env::var("FS3D_REPL_ROLE").ok());
-    if let Some(role) = repl_role_cfg {
-        let role = match role.as_str() {
-            "primary" => fs3_meta::ReplRole::Primary,
-            "standby" => fs3_meta::ReplRole::Standby,
-            other => {
-                return Err(fs3_core::Error::InvalidArgument(format!(
-                    "bad [replication].role {other:?} (expect primary|standby)"
-                )))
-            }
-        };
-        engine.read().meta().set_repl_role(role)?;
-        // M21 E5:S3 层角色缓存同步(env 应用在 service 装配之后,
-        // with_observability 的启动初始化读不到本次翻转)
-        service.set_repl_role(role);
-    }
+    let boot_role = resolve_repl_role_at_boot(engine.read().meta(), repl_role_cfg.as_deref())?;
+    // M21 E5:S3 层角色缓存同步(with_observability 的启动初始化按 meta
+    // 落定;首启种子写 meta 发生于 service 装配之后,此处对齐为裁决后
+    // 的生效角色——幂等,meta 已落定场景为重写同值)
+    service.set_repl_role(boot_role.role);
     let mut pull_worker = match pull_cfg_env {
         Some(pull_cfg) => {
             let meta = engine.read().meta_arc();
@@ -2044,5 +2113,85 @@ impl fs3_admin::KmsServiceControl for KmsServiceAdapter {
 
     fn status(&self) -> Result<serde_json::Value, String> {
         serde_json::to_value(self.0.status().map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M21 gate 回归(ADR-33 RP5;「promote 无半状态」门禁):promote
+    /// 抗重启——E3 promote 把 role=primary 落 meta `s:repl_role` 后,
+    /// 带旧配置(role="standby")重启(重跑装配裁决)不得被盖回
+    /// standby;配置仅首启种子,meta 为权威,分歧走 warn 分支(以
+    /// config_mismatch 断言)。demote/rebuild 两条翻转路径同口径覆盖。
+    #[test]
+    fn promoted_role_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = fs3_meta::MetaStore::open(dir.path(), &fs3_meta::MetaConfig::default()).unwrap();
+
+        // 首启种子:全新库 meta 缺席,配置 standby 落 meta
+        let r = resolve_repl_role_at_boot(&meta, Some("standby")).unwrap();
+        assert_eq!(
+            r,
+            BootRoleResolution {
+                role: fs3_meta::ReplRole::Standby,
+                seeded: true,
+                config_mismatch: false,
+            }
+        );
+        assert_eq!(meta.repl_role().unwrap(), fs3_meta::ReplRole::Standby);
+
+        // promote(E3 本地裁决,持久于 meta)→ 模拟重启(重跑装配裁决,
+        // 旧配置仍 role="standby"):不得盖回,分歧 warn 分支触发
+        meta.promote(false).unwrap();
+        let r = resolve_repl_role_at_boot(&meta, Some("standby")).unwrap();
+        assert_eq!(
+            r.role,
+            fs3_meta::ReplRole::Primary,
+            "promote 后重启不得被旧配置盖回 standby"
+        );
+        assert!(!r.seeded);
+        assert!(r.config_mismatch, "配置与 meta 分歧应走 warn 分支");
+        assert_eq!(meta.repl_role().unwrap(), fs3_meta::ReplRole::Primary);
+
+        // demote 路径(主→备持久于 meta):重启带 role="primary" 旧配置
+        // 不得翻回
+        meta.set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
+        let r = resolve_repl_role_at_boot(&meta, Some("primary")).unwrap();
+        assert_eq!(r.role, fs3_meta::ReplRole::Standby);
+        assert!(r.config_mismatch);
+
+        // rebuild 路径(C5 clear_for_rebuild 显式复位 standby 已落
+        // meta):重启带 role="primary" 配置仍以 meta 为准,种子语义不
+        // 复活(种子只在键缺席时生效)
+        meta.clear_for_rebuild().unwrap();
+        assert_eq!(meta.repl_role().unwrap(), fs3_meta::ReplRole::Standby);
+        let r = resolve_repl_role_at_boot(&meta, Some("primary")).unwrap();
+        assert_eq!(
+            r.role,
+            fs3_meta::ReplRole::Standby,
+            "rebuild 后重启仍以 meta 为准"
+        );
+        assert!(r.config_mismatch);
+
+        // 全新库无配置:缺省 primary 惰性不落盘(同 repl_role() 口径)
+        let dir2 = tempfile::tempdir().unwrap();
+        let meta2 =
+            fs3_meta::MetaStore::open(dir2.path(), &fs3_meta::MetaConfig::default()).unwrap();
+        let r = resolve_repl_role_at_boot(&meta2, None).unwrap();
+        assert_eq!(
+            r,
+            BootRoleResolution {
+                role: fs3_meta::ReplRole::Primary,
+                seeded: false,
+                config_mismatch: false,
+            }
+        );
+        assert_eq!(meta2.repl_role_raw().unwrap(), None, "无配置首启不落盘");
+
+        // 非法配置值:启动显式失败(旧口径保留;meta 已落定同样拒绝)
+        assert!(resolve_repl_role_at_boot(&meta2, Some("bogus")).is_err());
+        assert!(resolve_repl_role_at_boot(&meta, Some("bogus")).is_err());
     }
 }

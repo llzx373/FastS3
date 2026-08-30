@@ -14,7 +14,8 @@
 #      使备 ErrBinlogGone → 备 worker Fatal 不自动重追 →
 #      fasts3d replication rebuild --as-standby --from <主> → 追平;
 #   5) promote 切换不丢已复制数据:dry-run 清单(无副作用)→ 真实 promote
-#      → 备变主可写、已复制数据逐字节一致;
+#      → 备变主可写、已复制数据逐字节一致;5b) promote 抗重启:带旧配置
+#      (role=standby 种子)重启仍以 meta 为准(primary),分歧 warn;
 #   6) 旧主重加入被拒后重建:旧主改配 standby 指新主 → hello ErrDiverged
 #      (worker Fatal)→ rebuild 归队 → 追平,分歧写(X)被清。
 #
@@ -223,6 +224,31 @@ for k in small-1 small-2 small-3 big-1; do
   getb "$k" "$WORK/got-p-$k" && cmp -s "$WORK/data/$k" "$WORK/got-p-$k" || { OK=0; fail "promote 后数据 $k"; }
 done
 [ "$OK" = "1" ] && pass "promote 不丢已复制数据(4 对象抽验逐字节一致)"
+
+# ── 5b) promote 抗重启(M21 gate 回归;ADR-33 RP5「promote 是本地裁决
+# 持久状态」)──
+# node-b 带旧配置重启:role = "standby" 行故意保留(制造配置/meta 分
+# 歧,期望 warn + 以 meta 为准不被盖回),仅摘除 primary_url(promote
+# 后运维同步改配的「去掉上游」半步;保留它则 pull worker 硬校验配置
+# 矛盾显式拒启动,是另一条 Loud 路径,不在本用例)。
+B_PID=$(pgrep -f "serve --config $B_CFG" | head -1 || true)
+kill -9 "$B_PID"
+# 等旧进程真正退出(crash 重启口径,同步骤 3/6 先例;promote 的
+# role=primary 已随 R12 无条件 fsync 落 meta,崩离无半状态)
+for _ in $(seq 1 40); do pgrep -f "serve --config $B_CFG" >/dev/null || break; sleep 0.25; done
+pgrep -f "serve --config $B_CFG" >/dev/null && { fail "node-b 旧进程未退出"; exit 1; }
+B_CFG2="$B_DIR/fasts3-promoted.toml"
+grep -v '^primary_url' "$B_CFG" > "$B_CFG2"
+m21_serve node-b "$B_CFG2"
+m21_wait_admin "$B_SOCK" "$B_TOK" || { fail "node-b promote 后重启 admin"; exit 1; }
+ROLE=$(m21_gtid "$B_SOCK" "$B_TOK" role)
+[ "$ROLE" = "primary" ] || fail "promote 后重启 role=$ROLE(被旧配置盖回,期望 primary=meta 权威)"
+grep -qF "与 meta s:repl_role" "$WORK/node-b.log" \
+  || fail "promote 后重启缺配置/meta 分歧 warn(node-b.log)"
+echo "post-restart-$(date +%s%N)" > "$WORK/data/post-2"
+mc $MCB cp "$WORK/data/post-2" ALTB/drill/ >/dev/null 2>&1 \
+  && pass "promote 抗重启:带旧配置(role=standby 种子)重启仍 primary 可写,分歧 warn 在" \
+  || fail "promote 后重启不可写"
 
 # ── 6) 旧主重加入被拒后重建 ────────────────────────────────────────
 # 旧主仍有未复制分歧写:promote 后写 X 于 node-a(epoch 1,node-b 无)
