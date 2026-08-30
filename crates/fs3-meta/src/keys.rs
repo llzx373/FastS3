@@ -35,7 +35,8 @@
 //! `s:audit\0{seq be64}` 审计环形条目(M11 L3-1;ADR-12 DL5)、
 //! `s:trusted_clock`(M12 W1-1;ADR-13 DL6 可信时钟 wall+mono 对)、
 //! `s:repl_role` / `s:repl_epoch` / `s:repl_executed`(M21 A1/A2;
-//! ADR-33 RP2 复制角色/epoch/executed GTID 集)。
+//! ADR-33 RP2 复制角色/epoch/executed GTID 集)、
+//! `s:repl_slot\0{name}` 复制槽(M21 A3;ADR-33 RP3/RP8)。
 //!
 //! 转义规则:0x00 → 0xFF 0x00;0xFF → 0xFF 0xFF;其余原样。
 //! 保证 `o:{bucket}\0` 前缀扫描恰好覆盖该桶全部对象。
@@ -204,6 +205,13 @@ pub const PREFIX_AUDIT: &[u8] = b"s:audit\x00";
 /// PREFIX_AUDIT 口径:不新增一级前缀,DTO/check/删桶三处无需联动);
 /// 会话撤销 = 删键;过期由数据面按记录 expires_at 判定。
 pub const PREFIX_SESSION: &[u8] = b"s:session\x00";
+
+/// 复制槽(M21 A3;ADR-33 RP3/RP8;设计稿 §3.3:`s:repl_slot\0{name}` →
+/// postcard fs3_meta::Slot;每下游一键,confirmed_gtid 随回执更新)。
+/// s: 既有前缀下的系统键族(同 PREFIX_AUDIT 口径:不新增一级前缀);
+/// 演进三处同步中 meta-export/import DTO 与 check 可达性扫描登记在
+/// TODO M21/A4 落。
+pub const PREFIX_REPL_SLOT: &[u8] = b"s:repl_slot\x00";
 
 /// 转义:S3 对象键可含任意字节,0x00/0xFF 需转义以保持键内无分隔符。
 pub fn escape(raw: &[u8]) -> Vec<u8> {
@@ -430,6 +438,36 @@ pub fn parse_audit_seq(raw: &[u8]) -> Result<u64> {
         return Err(Error::Corrupt("audit key malformed".into()));
     }
     Ok(u64::from_be_bytes(body.try_into().unwrap()))
+}
+
+/// 复制槽键:`s:repl_slot\0{name}`(M21 A3)。槽名 = mTLS CN / admin 命名,
+/// 非空且不得含 0x00(键内分隔符;同 IAM 名不转义口径,非法名直接拒绝)。
+pub fn repl_slot_key(name: &str) -> Result<Vec<u8>> {
+    if name.is_empty() || name.as_bytes().contains(&0x00) {
+        return Err(Error::InvalidArgument(format!(
+            "repl slot name {name:?} invalid (empty or contains NUL)"
+        )));
+    }
+    let mut k = Vec::with_capacity(PREFIX_REPL_SLOT.len() + name.len());
+    k.extend_from_slice(PREFIX_REPL_SLOT);
+    k.extend_from_slice(name.as_bytes());
+    Ok(k)
+}
+
+/// 解析 `s:repl_slot\0` 键 → 槽名。
+pub fn parse_repl_slot_name(raw: &[u8]) -> Result<String> {
+    let body = raw
+        .strip_prefix(PREFIX_REPL_SLOT)
+        .ok_or_else(|| Error::Corrupt("repl slot key missing prefix".into()))?;
+    String::from_utf8(body.to_vec())
+        .map_err(|_| Error::Corrupt("repl slot name not utf8".into()))
+        .and_then(|s| {
+            if s.is_empty() {
+                Err(Error::Corrupt("repl slot name empty".into()))
+            } else {
+                Ok(s)
+            }
+        })
 }
 
 /// 会话主键:`u:{uploadId}`。

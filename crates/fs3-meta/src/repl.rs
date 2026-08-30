@@ -70,16 +70,79 @@ pub struct ReplRecord {
     pub data_refs: Vec<DataRef>,
     /// 桶级槽过滤输入。
     pub bucket_scope: BucketScope,
+    /// 提交墙钟 Unix 秒(M21 A3:`repl_retain_hours` 软上限的年龄输入;
+    /// A1 存量记录无此字段,解码侧按尾部追加双读回退补 None = 年龄未知,
+    /// 时限判定保守视为不超龄保数据;回退分支在演进发生处显式添加,照
+    /// decode_notification_rule 先例——postcard 非自描述,serde default
+    /// 只覆盖 JSON/自描述面)。
+    #[serde(default)]
+    pub ts: Option<i64>,
+}
+
+/// 桶级槽过滤器(M21 A3;ADR-33 RP3;设计稿 §3.3:`include: [...]` /
+/// `exclude: [...]`,空 = 实例级全量)。上游侧过滤的判定输入(B3 登记/
+/// D2 过滤接线)。postcard 持久化兼容面:变体只允许尾部追加。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BucketFilter {
+    /// 实例级全量(设计稿「空」;默认)。
+    #[default]
+    All,
+    /// 只复制名单内桶。
+    Include(Vec<String>),
+    /// 复制名单外全部桶。
+    Exclude(Vec<String>),
+}
+
+/// 复制槽持久化记录(M21 A3;ADR-33 RP3/RP8;设计稿 §3.3;键
+/// `s:repl_slot\0{name}` → postcard Slot,每下游一键)。
+/// 本任务只落存储层;握手自动登记/admin 预登记/drop/max_slots 属 B3。
+/// serde 形状自此成为持久化兼容面:演进只允许尾部追加字段(解码侧
+/// 在演进发生处加旧版双读回退分支,照 decode_notification_rule 先例;
+/// serde(default) 兜底自描述/JSON 面,如 meta-export DTO)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Slot {
+    /// 槽名(键内同名;mTLS CN / admin 命名,B1/B3 接线)。
+    pub name: String,
+    /// 下游节点标识(握手 HELLO 的 node_id)。
+    pub consumer_node_id: String,
+    /// 下游已 apply 位点(回执更新;binlog 截断下限输入,§3.4)。
+    pub confirmed_gtid: fs3_core::Gtid,
+    /// 桶级过滤器(空 = 实例级全量)。
+    pub filters: BucketFilter,
+    /// 登记墙钟 Unix 秒。
+    pub created_at: i64,
+    /// 最近一次回执墙钟 Unix 秒(滞后观测输入;D1 指标接线)。
+    pub last_ack_at: i64,
+    /// 硬上限强截越过本槽位点 → 置位(ADR-33 RP8;该下游下次握手命中
+    /// ErrBinlogGone → 显式重建,B2 接线)。
+    #[serde(default)]
+    pub stale: bool,
+}
+
+impl Slot {
+    /// 持久化编码:postcard(同 GtidSet 口径;演进 = 尾部追加 + 解码侧
+    /// 双读回退,零迁移)。
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        postcard::to_allocvec(self)
+            .map_err(|e| Error::Meta(format!("postcard encode repl slot: {e}")))
+    }
+
+    /// 解码;损坏 → Corrupt(不静默接受)。
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        postcard::from_bytes(buf).map_err(|e| Error::Corrupt(format!("repl slot: {e}")))
+    }
 }
 
 impl ReplRecord {
-    /// 由已应用的事务 ops 构造记录(data_refs/bucket_scope 从 ops 提取)。
+    /// 由已应用的事务 ops 构造记录(data_refs/bucket_scope 从 ops 提取;
+    /// ts 由写入路径补填,见 apply_ops)。
     pub fn new(epoch: u64, ops: &[Op]) -> Self {
         ReplRecord {
             epoch,
             ops: ops.to_vec(),
             data_refs: data_refs_of(ops),
             bucket_scope: bucket_scope_of(ops),
+            ts: None,
         }
     }
 
@@ -102,12 +165,36 @@ impl ReplRecord {
             return Err(Error::Corrupt("repl record value too short".into()));
         };
         match ver {
-            REPL_RECORD_VERSION => postcard::from_bytes(&buf[1..])
-                .map_err(|e| Error::Corrupt(format!("postcard decode repl record: {e}"))),
+            REPL_RECORD_VERSION => Self::decode_v1(&buf[1..]),
             _ => Err(Error::Corrupt(format!(
                 "repl record version {ver} unsupported (expected {REPL_RECORD_VERSION})"
             ))),
         }
+    }
+
+    /// v1 解码 + 尾部追加双读回退(M21 A3 追加 `ts`;postcard 非自描述,
+    /// 缺尾字段的旧字节走显式回退分支,照 decode_notification_rule 先例):
+    /// A1 初版四字段记录 → ts=None(年龄未知,时限判定保守保数据)。
+    fn decode_v1(buf: &[u8]) -> Result<Self> {
+        postcard::from_bytes(buf).or_else(|_| {
+            /// A1 初版格式(无 ts 尾部;A3 回退用)。
+            #[derive(Deserialize)]
+            struct ReplRecordV1 {
+                epoch: u64,
+                ops: Vec<Op>,
+                data_refs: Vec<DataRef>,
+                bucket_scope: BucketScope,
+            }
+            let old: ReplRecordV1 = postcard::from_bytes(buf)
+                .map_err(|e| Error::Corrupt(format!("postcard decode repl record: {e}")))?;
+            Ok(ReplRecord {
+                epoch: old.epoch,
+                ops: old.ops,
+                data_refs: old.data_refs,
+                bucket_scope: old.bucket_scope,
+                ts: None,
+            })
+        })
     }
 }
 
@@ -276,4 +363,106 @@ fn data_refs_of(ops: &[Op]) -> Vec<DataRef> {
     out.sort();
     out.dedup();
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fs3_core::Gtid;
+
+    /// M21 A3:ReplRecord 尾部追加 `ts` 双读——A1 初版四字段字节回退
+    /// ts=None;新格式往返带 ts;损坏字节两版均拒。
+    #[test]
+    fn repl_record_ts_tail_dual_read() {
+        let ops = vec![Op::EventDelete { seq: 7 }];
+        let rec = ReplRecord {
+            ts: Some(1_700_000_000),
+            ..ReplRecord::new(3, &ops)
+        };
+        let buf = rec.encode_value().unwrap();
+        assert_eq!(ReplRecord::decode_value(&buf).unwrap(), rec);
+        assert!(ReplRecord::decode_value(&[]).is_err());
+        // 未知版本字节拒绝(截断字节可能恰为合法 V1 负载——varint 尾部
+        // 截断的固有歧义,双读口径同 decode_notification_rule 先例)
+        assert!(ReplRecord::decode_value(&[0xFF, 0x00]).is_err());
+
+        // A1 初版格式(无 ts 尾部)直读 → ts = None
+        #[derive(serde::Serialize)]
+        struct ReplRecordV1 {
+            epoch: u64,
+            ops: Vec<Op>,
+            data_refs: Vec<DataRef>,
+            bucket_scope: BucketScope,
+        }
+        let old = ReplRecordV1 {
+            epoch: 3,
+            ops: ops.clone(),
+            data_refs: Vec::new(),
+            bucket_scope: bucket_scope_of(&ops),
+        };
+        let mut old_buf = vec![REPL_RECORD_VERSION];
+        old_buf.extend_from_slice(&postcard::to_allocvec(&old).unwrap());
+        let got = ReplRecord::decode_value(&old_buf).unwrap();
+        assert_eq!(got.ts, None);
+        assert_eq!(got.ops, ops);
+        assert_eq!(got.epoch, 3);
+    }
+
+    /// M21 A3(ADR-33 RP3/RP8;设计稿 §3.3):Slot 持久化编码——
+    /// ① postcard 往返(name/node_id/confirmed/filters/时间戳/stale 全字段);
+    /// ② 损坏/截断字节拒绝(尾部追加演进须配解码侧双读回退分支,照
+    ///    decode_notification_rule 先例——postcard 非自描述,缺尾字段的
+    ///    旧字节在加回退前是显式拒绝而非静默默认);
+    /// ③ BucketFilter 三态编码往返。
+    #[test]
+    fn repl_slot_codec_roundtrip() {
+        let slot = Slot {
+            name: "stb-1".into(),
+            consumer_node_id: "node-b".into(),
+            confirmed_gtid: Gtid { epoch: 2, seq: 120 },
+            filters: BucketFilter::Include(vec!["b1".into(), "b2".into()]),
+            created_at: 1_700_000_000,
+            last_ack_at: 1_700_000_100,
+            stale: true,
+        };
+        let buf = slot.encode().unwrap();
+        assert_eq!(Slot::decode(&buf).unwrap(), slot);
+        assert!(Slot::decode(&[]).is_err());
+        assert!(Slot::decode(&buf[..buf.len() - 1]).is_err());
+
+        // ② 缺尾字段的短字节显式拒绝(演进 = 尾部追加 + 解码侧回退)
+        #[derive(serde::Serialize)]
+        struct SlotV1 {
+            name: String,
+            consumer_node_id: String,
+            confirmed_gtid: Gtid,
+            filters: BucketFilter,
+            created_at: i64,
+            last_ack_at: i64,
+        }
+        let old = SlotV1 {
+            name: slot.name.clone(),
+            consumer_node_id: slot.consumer_node_id.clone(),
+            confirmed_gtid: slot.confirmed_gtid,
+            filters: slot.filters.clone(),
+            created_at: slot.created_at,
+            last_ack_at: slot.last_ack_at,
+        };
+        let old_bytes = postcard::to_allocvec(&old).unwrap();
+        assert!(Slot::decode(&old_bytes).is_err());
+
+        // ③ 过滤器三态
+        for f in [
+            BucketFilter::All,
+            BucketFilter::Include(vec!["a".into()]),
+            BucketFilter::Exclude(vec!["a".into()]),
+        ] {
+            let s = Slot {
+                filters: f.clone(),
+                ..slot.clone()
+            };
+            assert_eq!(Slot::decode(&s.encode().unwrap()).unwrap().filters, f);
+        }
+        assert_eq!(BucketFilter::default(), BucketFilter::All);
+    }
 }

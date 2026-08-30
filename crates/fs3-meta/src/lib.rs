@@ -13,7 +13,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use fs3_core::{
-    AllocRecord, BucketMeta, Error, GtidSet, ObjectMeta, Result, Segment, MAX_OBJECT_SIZE,
+    AllocRecord, BucketMeta, Error, Gtid, GtidSet, ObjectMeta, Result, Segment, MAX_OBJECT_SIZE,
 };
 use rocksdb::{
     BlockBasedOptions, Cache, DBCompressionType, Direction, Error as RocksError, ErrorKind,
@@ -33,7 +33,7 @@ pub mod audit;
 pub mod repl;
 
 pub use audit::AuditStore;
-pub use repl::{BucketScope, DataRef, ReplRecord, REPL_RECORD_VERSION};
+pub use repl::{BucketFilter, BucketScope, DataRef, ReplRecord, Slot, REPL_RECORD_VERSION};
 
 /// 元数据同步模式(DESIGN §4.4 / E2)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -100,6 +100,46 @@ impl Default for MetaConfig {
             repl_binlog: false,
         }
     }
+}
+
+/// binlog 两级水位参数(M21 A3;ADR-33 RP8;设计稿 §3.4,风险 R7)。
+/// [replication] 配置段接线在 TODO M21/F3;truncate_binlog 以本结构为输入。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplRetainConfig {
+    /// 软上限:binlog 保留时长(小时;默认 24h)。与 retain_bytes 同时
+    /// 约束保留尾(任一超限即触发);超限但仍有槽未消费 → 停截断 + 告警
+    /// 保槽。
+    pub retain_hours: u64,
+    /// 软上限:binlog 保留字节(默认 8GiB;按编码值字节近似记账)。
+    pub retain_bytes: u64,
+    /// 硬上限:binlog 保留字节(默认 32GiB)。超限 → 强制截断 + 被越过
+    /// 的槽标记 stale(下次握手 ErrBinlogGone → 显式重建,B2 接线);
+    /// 保数据还是保磁盘由本上限裁决,行为确定。
+    pub retain_bytes_hard: u64,
+}
+
+impl Default for ReplRetainConfig {
+    fn default() -> Self {
+        ReplRetainConfig {
+            retain_hours: 24,
+            retain_bytes: 8 * 1024 * 1024 * 1024,
+            retain_bytes_hard: 32 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
+/// binlog 截断统计(M21 A3;truncate_binlog 返回值)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BinlogTruncateStats {
+    /// 删除的 binlog 条数。
+    pub truncated: u64,
+    /// 删除条目的编码值字节合计(近似;rocksdb 层另含键/开销)。
+    pub truncated_bytes: u64,
+    /// 软上限保槽:期望截断点越过 min(活跃槽 confirmed) 被钳回(停截断
+    /// + 告警计数,repl_soft_cap_alerts)。
+    pub soft_capped: bool,
+    /// 硬上限强截时被标记 stale 的槽数。
+    pub stale_marked: u64,
 }
 
 /// 分配器变更草稿(随事务写入 a:/t: 记录;M13 起类型本体移至 fs3_core,
@@ -858,6 +898,10 @@ pub struct MetaStore {
     event_queue_max: usize,
     /// 复制 binlog 开关(M21 A1;MetaConfig.repl_binlog 快照)。
     repl_binlog: bool,
+    /// binlog 软上限保槽告警计数(M21 A3;ADR-33 RP8/R7:软上限超限但仍
+    /// 有槽未消费 → 停截断并 +1;裸 AtomicU64,照引擎 trusted_clock_
+    /// divergence 先例;指标导出在 TODO M21/D4 接线)。
+    repl_soft_cap_alerts: AtomicU64,
 }
 
 /// rocksdb 错误 → fs3 Error。
@@ -1637,6 +1681,7 @@ impl MetaStore {
             notification_cache: Mutex::new(HashMap::new()),
             event_queue_max: cfg.event_queue_max.max(1),
             repl_binlog: cfg.repl_binlog,
+            repl_soft_cap_alerts: AtomicU64::new(0),
         };
         // M18 I1(ADR-28 DI1.3)升级迁移:存量部署隐式落入租户 default
         // (canonical_id 钉死 "fasts3");幂等,首次打开即落地。
@@ -2676,6 +2721,186 @@ impl MetaStore {
             .put(SYS_REPL_EXECUTED, set.encode()?)
             .map_err(rocks_err)?;
         self.db.flush_wal(true).map_err(rocks_err)
+    }
+
+    // —— 复制槽(M21 A3;ADR-33 RP3/RP8;设计稿 §3.3;键 `s:repl_slot\0{name}`) ——
+    // 本层只做存取;握手自动登记/admin 预登记/drop/max_slots 编排属 B3。
+
+    /// 写入/更新复制槽(直写 + fsync,照 trusted_clock 先例;回执确认
+    /// 走整记录覆盖写,单写者语义由调用方保证,同 IngestJob 口径)。
+    pub fn put_repl_slot(&self, slot: &Slot) -> Result<()> {
+        self.db
+            .put(repl_slot_key(&slot.name)?, slot.encode()?)
+            .map_err(rocks_err)?;
+        self.db.flush_wal(true).map_err(rocks_err)
+    }
+
+    /// 读单槽(缺席 → None)。
+    pub fn repl_slot(&self, name: &str) -> Result<Option<Slot>> {
+        match self.db.get(repl_slot_key(name)?).map_err(rocks_err)? {
+            Some(v) => Slot::decode(&v).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// 全量列举(名序;截断水位/槽观测输入;max_slots ≤16,规模有界)。
+    pub fn list_repl_slots(&self) -> Result<Vec<Slot>> {
+        let mut out = Vec::new();
+        for item in scan_prefix(&self.db, PREFIX_REPL_SLOT) {
+            let (_k, v) = item?;
+            out.push(Slot::decode(&v)?);
+        }
+        Ok(out)
+    }
+
+    /// 删除复制槽(drop 释放保留约束;幂等:缺席同样 Ok)。
+    pub fn delete_repl_slot(&self, name: &str) -> Result<()> {
+        self.db.delete(repl_slot_key(name)?).map_err(rocks_err)?;
+        self.db.flush_wal(true).map_err(rocks_err)
+    }
+
+    /// binlog 软上限保槽告警计数(M21 A3;指标导出在 TODO M21/D4 接线)。
+    pub fn repl_soft_cap_alerts(&self) -> u64 {
+        self.repl_soft_cap_alerts.load(Ordering::Relaxed)
+    }
+
+    /// binlog 两级水位截断(M21 A3;ADR-33 RP8;设计稿 §3.4,风险 R7;
+    /// 仿 truncate_alloc_records/truncate_events 模式:scan_prefix +
+    /// WriteBatch 单批删 + SyncMode::Full 时 flush_wal)。
+    ///
+    /// 顺序:① 截断下限 = min(活跃槽 confirmed_gtid)(stale 槽位点已被
+    /// 越过,约束随标记释放——不释放则硬上限永被同一槽堵死;stale 下游
+    /// 唯一出路 = 显式重建);② 软上限 retain_hours/retain_bytes 期望的
+    /// 截断点越过下限 → 钳回下限停截断 + warn! + 计数器(保槽位);
+    /// ③ 钳回后保留字节仍超 retain_bytes_hard → 强制截断并把被越过的
+    /// 槽标记 stale(同批落盘,下次握手 ErrBinlogGone → 显式重建)。
+    /// 只在 repl_binlog 启用时有意义(关闭时恒零统计)。
+    pub fn truncate_binlog(
+        &self,
+        now: i64,
+        retain: &ReplRetainConfig,
+    ) -> Result<BinlogTruncateStats> {
+        let mut stats = BinlogTruncateStats::default();
+        if !self.repl_binlog {
+            return Ok(stats);
+        }
+        let slots: Vec<Slot> = self
+            .list_repl_slots()?
+            .into_iter()
+            .filter(|s| !s.stale)
+            .collect();
+        // GTID 字典序 = 发生序(设计稿 §2.1);binlog 键序(seq)与提交序
+        // 一致,epoch 单调不减,故扫描序 = GTID 序。
+        let floor: Option<Gtid> = slots.iter().map(|s| s.confirmed_gtid).min();
+
+        struct Entry {
+            gtid: Gtid,
+            /// 编码值字节(水位记账口径)。
+            bytes: u64,
+            /// 提交墙钟(A1 存量记录 None = 年龄未知,时限判定保守保数据)。
+            ts: Option<i64>,
+        }
+        let mut entries: Vec<Entry> = Vec::new();
+        for item in scan_prefix(&self.db, PREFIX_BINLOG) {
+            let (k, v) = item?;
+            let rec = ReplRecord::decode_value(&v)?;
+            entries.push(Entry {
+                gtid: Gtid {
+                    epoch: rec.epoch,
+                    seq: parse_binlog_seq(&k)?,
+                },
+                bytes: v.len() as u64,
+                ts: rec.ts,
+            });
+        }
+        if entries.is_empty() {
+            return Ok(stats);
+        }
+
+        // 软上限期望截断点:从最新侧累计保留尾,任一顶限(字节/时长)
+        // 被突破即停——cut 为首个必须保留的下标,entries[..cut] 为候选删除。
+        let max_age_secs = retain.retain_hours.saturating_mul(3600) as i64;
+        let mut tail_bytes = 0u64;
+        let mut cut = entries.len();
+        for i in (0..entries.len()).rev() {
+            let e = &entries[i];
+            let over_bytes = tail_bytes.saturating_add(e.bytes) > retain.retain_bytes;
+            let over_age =
+                e.ts.map(|ts| now.saturating_sub(ts) > max_age_secs)
+                    .unwrap_or(false);
+            if over_bytes || over_age {
+                break;
+            }
+            tail_bytes += e.bytes;
+            cut = i;
+        }
+
+        // ② 槽位下限钳制:候选只可含全部活跃槽均已消费的条目
+        // (gtid <= floor;无活跃槽 = 无约束)。期望点越过下限 → 停截断 +
+        // 告警保槽。
+        let allowed = match floor {
+            Some(f) => entries.iter().take_while(|e| e.gtid <= f).count(),
+            None => entries.len(),
+        };
+        if cut > allowed {
+            stats.soft_capped = true;
+            self.repl_soft_cap_alerts.fetch_add(1, Ordering::Relaxed);
+            let kept = entries.len() - allowed;
+            let kept_bytes: u64 = entries[allowed..].iter().map(|e| e.bytes).sum();
+            tracing::warn!(
+                retain_bytes = retain.retain_bytes,
+                retain_hours = retain.retain_hours,
+                kept,
+                kept_bytes,
+                floor = ?floor,
+                "repl binlog soft cap exceeded with unconsumed slots; truncation stopped to protect slots (R7)"
+            );
+            cut = allowed;
+        }
+
+        // ③ 硬上限:钳回后保留尾仍超限 → 强制截断,被越过的槽标记 stale
+        // (与删除同 WriteBatch 落盘)。
+        let prefix_bytes = |c: usize| -> u64 { entries[..c].iter().map(|e| e.bytes).sum() };
+        let mut retained = prefix_bytes(entries.len()) - prefix_bytes(cut);
+        let mut forced = false;
+        while retained > retain.retain_bytes_hard && cut < entries.len() {
+            retained -= entries[cut].bytes;
+            cut += 1;
+            forced = true;
+        }
+
+        if cut == 0 {
+            return Ok(stats);
+        }
+        let cut_through = entries[cut - 1].gtid;
+        let mut batch = WriteBatchWithTransaction::<true>::default();
+        for e in &entries[..cut] {
+            batch.delete(binlog_key(e.gtid.seq));
+        }
+        if forced {
+            for s in &slots {
+                if s.confirmed_gtid < cut_through {
+                    let mut s = s.clone();
+                    s.stale = true;
+                    batch.put(repl_slot_key(&s.name)?, s.encode()?);
+                    stats.stale_marked += 1;
+                }
+            }
+            tracing::warn!(
+                cut_through = ?cut_through,
+                stale_marked = stats.stale_marked,
+                "repl binlog hard cap exceeded; forced truncation past slot floor, overtaken slots marked stale (R7)"
+            );
+        }
+        stats.truncated = cut as u64;
+        stats.truncated_bytes = prefix_bytes(cut);
+        self.db
+            .write_opt(batch, &self.write_opts)
+            .map_err(rocks_err)?;
+        if self.sync_mode == SyncMode::Full {
+            self.db.flush_wal(true).map_err(rocks_err)?;
+        }
+        Ok(stats)
     }
 
     // —— 池清单(M13 M1-1,ADR-15 DM1/DM1';键 s:pool) ——
@@ -5254,7 +5479,10 @@ fn apply_ops(
         let epoch = tget(tx, SYS_REPL_EPOCH)?
             .map(|v| u64::from_be_bytes(v.as_slice().try_into().unwrap()))
             .unwrap_or(REPL_INITIAL_EPOCH);
-        let rec = ReplRecord::new(epoch, ops);
+        let mut rec = ReplRecord::new(epoch, ops);
+        // M21 A3:提交墙钟,repl_retain_hours 软上限的年龄输入(截断侧
+        // 双读:A1 存量记录 ts=None 保守保数据)。
+        rec.ts = Some(now_ts());
         tinsert(tx, binlog_key(seq), rec.encode_value()?)?;
     }
 
@@ -6048,6 +6276,147 @@ mod tests {
     /// ranges 辅助:GTID 集 → (epoch, start, end) 升序表(测试断言用)。
     fn ranges(s: &GtidSet) -> Vec<(u64, u64, u64)> {
         s.ranges().collect()
+    }
+
+    /// M21 A3 测试夹具:binlog 开启的库,建桶 + 10 个对象事务
+    /// (seq 1 = 建桶,seq 2..=11 = 对象;每事务恰一条 bl: 记录)。
+    /// 返回 (store, 各条目编码值字节)。
+    fn binlog_fixture() -> (tempfile::TempDir, MetaStore, Vec<u64>) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MetaConfig {
+            repl_binlog: true,
+            ..MetaConfig::default()
+        };
+        let meta = MetaStore::open(dir.path(), &cfg).unwrap();
+        meta.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        for i in 0..10 {
+            meta.commit(&[Op::ObjectPut {
+                bucket: "b1".into(),
+                key: format!("k{i}"),
+                meta: object_meta(1),
+            }])
+            .unwrap();
+        }
+        let entries = meta.repl_binlog_entries().unwrap();
+        assert_eq!(entries.len(), 11);
+        assert_eq!(entries[0].0, 1, "首事务 seq=1(建桶)");
+        let bytes: Vec<u64> = entries
+            .iter()
+            .map(|(_, r)| r.encode_value().unwrap().len() as u64)
+            .collect();
+        // 写入路径补填提交墙钟(A3 ts 字段)
+        assert!(entries.iter().all(|(_, r)| r.ts.is_some()));
+        (dir, meta, bytes)
+    }
+
+    fn test_slot(name: &str, confirmed_seq: u64) -> Slot {
+        Slot {
+            name: name.into(),
+            consumer_node_id: format!("node-{name}"),
+            confirmed_gtid: Gtid {
+                epoch: REPL_INITIAL_EPOCH,
+                seq: confirmed_seq,
+            },
+            filters: BucketFilter::All,
+            created_at: 1_700_000_000,
+            last_ack_at: 1_700_000_100,
+            stale: false,
+        }
+    }
+
+    /// M21 A3(ADR-33 RP8;设计稿 §3.4,风险 R7):软上限保槽——
+    /// 滞后槽 confirmed 远低于新写入,软上限(retain_bytes)要求截过
+    /// 槽位点;断言截断停在 min(各槽 confirmed)(滞后槽未消费条目全部
+    /// 保留),告警计数 +1,槽不被标 stale。附槽 CRUD 往返。
+    #[test]
+    fn repl_retention_soft_cap_protects_lagging_slot() {
+        let (_dir, meta, bytes) = binlog_fixture();
+        // 槽 CRUD 往返:put → get/list → 值全字段一致
+        let slow = test_slot("slow", 4);
+        meta.put_repl_slot(&slow).unwrap();
+        assert_eq!(meta.repl_slot("slow").unwrap(), Some(slow.clone()));
+        assert_eq!(meta.list_repl_slots().unwrap(), vec![slow.clone()]);
+        assert!(meta.repl_slot("ghost").unwrap().is_none());
+        assert!(repl_slot_key("").is_err());
+        assert_eq!(
+            parse_repl_slot_name(&repl_slot_key("slow").unwrap()).unwrap(),
+            "slow"
+        );
+
+        let alerts0 = meta.repl_soft_cap_alerts();
+        // 软上限只够保留最新 2 条 → 期望截到 seq 9;滞后槽 confirmed=4
+        // → 截断下限钳回 seq 4,停截断保槽
+        let retain = ReplRetainConfig {
+            retain_hours: 24, // 条目刚写入,时限不触发
+            retain_bytes: bytes[9] + bytes[10],
+            retain_bytes_hard: 32 * 1024 * 1024 * 1024,
+        };
+        let stats = meta.truncate_binlog(now_ts(), &retain).unwrap();
+        assert!(stats.soft_capped);
+        assert_eq!(stats.truncated, 4, "只截全部槽均已消费的 seq 1..=4");
+        assert_eq!(stats.truncated_bytes, bytes[..4].iter().sum::<u64>());
+        assert_eq!(stats.stale_marked, 0);
+        assert_eq!(meta.repl_soft_cap_alerts(), alerts0 + 1, "软上限告警计数");
+        // 槽受保护:位点之上(seq>4)的 binlog 一条不丢
+        for seq in 5..=11 {
+            assert!(
+                meta.repl_record(seq).unwrap().is_some(),
+                "滞后槽未消费条目 seq={seq} 必须保留"
+            );
+        }
+        assert!(meta.repl_record(4).unwrap().is_none());
+        assert_eq!(meta.repl_binlog_entries().unwrap().len(), 7);
+        // 槽不被标 stale;约束仍生效(再次截断仍停在位点)
+        assert!(!meta.repl_slot("slow").unwrap().unwrap().stale);
+        let stats2 = meta.truncate_binlog(now_ts(), &retain).unwrap();
+        assert!(stats2.soft_capped && stats2.truncated == 0);
+        assert_eq!(meta.repl_soft_cap_alerts(), alerts0 + 2);
+    }
+
+    /// M21 A3(ADR-33 RP8;设计稿 §3.4,风险 R7):硬上限强截——
+    /// 软上限宽松但保留尾超 retain_bytes_hard → 强制截断越过滞后槽
+    /// 位点,被越过槽 stale=true,未越过槽不受影响。
+    #[test]
+    fn repl_retention_hard_cap_marks_slot_stale() {
+        let (_dir, meta, bytes) = binlog_fixture();
+        meta.put_repl_slot(&test_slot("slow", 4)).unwrap();
+        meta.put_repl_slot(&test_slot("fast", 11)).unwrap();
+
+        // 软上限宽松(不触发钳制/告警);硬上限只够保留最新 3 条
+        // (seq 9..=11)→ 强截 seq 1..=8,越过 slow(位点 4)不越过 fast
+        let retain = ReplRetainConfig {
+            retain_hours: 24 * 365,
+            retain_bytes: 1 << 60,
+            retain_bytes_hard: bytes[8] + bytes[9] + bytes[10],
+        };
+        let stats = meta.truncate_binlog(now_ts(), &retain).unwrap();
+        assert!(!stats.soft_capped, "软上限未超限,无保槽告警");
+        assert_eq!(stats.truncated, 8, "硬上限强截 seq 1..=8");
+        assert_eq!(stats.stale_marked, 1);
+        // 强制截断发生:seq 8 已删,seq 9 起保留
+        assert!(meta.repl_record(8).unwrap().is_none());
+        assert!(meta.repl_record(9).unwrap().is_some());
+        assert_eq!(meta.repl_binlog_entries().unwrap().len(), 3);
+        // 被越过的 slow 标记 stale(下次握手 ErrBinlogGone → 显式重建,
+        // B2 接线);fast 位点在截断点之上,不受影响
+        let slow = meta.repl_slot("slow").unwrap().unwrap();
+        assert!(slow.stale);
+        assert_eq!(slow.confirmed_gtid.seq, 4);
+        let fast = meta.repl_slot("fast").unwrap().unwrap();
+        assert!(!fast.stale);
+        assert_eq!(fast.confirmed_gtid.seq, 11);
+        // stale 槽不再占截断下限:再截断不再被它堵(约束随标记释放)
+        let stats2 = meta
+            .truncate_binlog(
+                now_ts(),
+                &ReplRetainConfig {
+                    retain_bytes_hard: 0, // 硬上限归零 → 截到最新条
+                    ..retain
+                },
+            )
+            .unwrap();
+        assert_eq!(stats2.truncated, 3, "stale 槽释放约束后可继续截断");
+        assert_eq!(meta.repl_binlog_entries().unwrap().len(), 0);
     }
 
     /// F5-3:worker 关闭时入队路径仍按 event_queue_max 截断,e: 不无界堆积。

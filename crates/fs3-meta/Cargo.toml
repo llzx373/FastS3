@@ -14,6 +14,8 @@ fs3-core.workspace = true
 rocksdb = { workspace = true, default-features = false, features = ["bindgen-runtime"] }
 serde.workspace = true
 postcard.workspace = true
+# M21 A3:binlog 两级水位告警(warn!)走全仓 tracing 栈(同引擎口径)。
+tracing.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
