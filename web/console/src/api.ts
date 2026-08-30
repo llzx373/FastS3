@@ -154,6 +154,32 @@ export interface AdminConfig {
       key_file?: string | null;
     } | null;
   };
+  /** M21 F3:主备复制(`[replication]`;段缺席 = 服务端回缺省填充视图) */
+  replication?: {
+    role?: "primary" | "standby";
+    listen?: string;
+    ca_cert?: string | null;
+    client_cert?: string | null;
+    client_key?: string | null;
+    server_cert?: string | null;
+    server_key?: string | null;
+    primary_url?: string | null;
+    slot_name?: string | null;
+    bucket_include?: string[];
+    bucket_exclude?: string[];
+    repl_retain_hours?: number;
+    repl_retain_bytes?: string;
+    repl_retain_bytes_hard?: string;
+    max_slots?: number;
+    data_pull_concurrency?: number;
+    read_fetch_timeout_secs?: number;
+    export_rate?: string;
+    traffic_weights?: {
+      serve?: number;
+      backfill?: number;
+      on_demand?: number;
+    } | null;
+  };
 }
 
 /** PATCH /api/config 返回:applied 已热生效 / restart_required 需重启。 */

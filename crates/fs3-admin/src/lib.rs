@@ -144,12 +144,12 @@ pub struct AdminServer {
     /// [kms.deploy],kms/service/* 返回 501)。
     kms_service: Option<Arc<dyn KmsServiceControl>>,
     /// M21 C5(ADR-33 RP5.4):复制重建控制面(fs3d RebuildService 注入;
-    /// None = 未配置 pull(FS3D_REPL_* 缺席),replication/rebuild 返回
-    /// 501)。
+    /// None = 未配置 pull([replication].primary_url 与 env 测试钩子
+    /// 均缺席),replication/rebuild 返回 501)。
     replication: Option<Arc<dyn ReplicationControl>>,
     /// M21 D4(ADR-33 RP8.3):逐槽复制指标源(fs3d ReplMetricsProvider
-    /// 注入;None = 未配置任何复制(FS3D_REPL_* 全缺席),/metrics 相应
-    /// 指标组缺席)。
+    /// 注入;None = 未配置任何复制([replication] 段与 env 测试钩子均
+    /// 缺席),/metrics 相应指标组缺席)。
     repl_metrics: Option<Arc<dyn ReplMetricsSource>>,
 }
 
@@ -276,8 +276,8 @@ impl AdminServer {
         self
     }
 
-    /// 注入逐槽复制指标源(M21 D4;fs3d 配置任一 FS3D_REPL_* 时调用;
-    /// None → /metrics 的 fasts3_repl_* 组缺席)。
+    /// 注入逐槽复制指标源(M21 D4;fs3d 配置任一 [replication] 字段/env
+    /// 测试钩子时调用;None → /metrics 的 fasts3_repl_* 组缺席)。
     pub fn with_repl_metrics(mut self, src: Option<Arc<dyn ReplMetricsSource>>) -> Self {
         self.repl_metrics = src;
         self
@@ -760,7 +760,7 @@ impl AdminServer {
             return json::err(
                 StatusCode::NOT_IMPLEMENTED,
                 "not_implemented",
-                "replication 未配置(FS3D_REPL_* 缺席);断档重建入口不可用",
+                "replication 未配置([replication].primary_url 缺席);断档重建入口不可用",
             );
         };
         let v: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
@@ -816,7 +816,7 @@ impl AdminServer {
             return json::err(
                 StatusCode::NOT_IMPLEMENTED,
                 "not_implemented",
-                "replication 未配置(FS3D_REPL_* 缺席);promote 入口不可用",
+                "replication 未配置([replication].primary_url 缺席);promote 入口不可用",
             );
         };
         let req = PromoteRequest {

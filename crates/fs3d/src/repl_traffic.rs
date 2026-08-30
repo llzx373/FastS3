@@ -30,11 +30,13 @@
 //! - `TrafficClass::OnDemand`:读路径命中 data_pending 的按需拉取
 //!   (repl_backfill.rs fetch_object,C4)。
 //!
-//! 配置(env 最小入口,F3 收口 [replication].traffic_weights):
-//! `FS3D_REPL_TRAFFIC_WEIGHTS`,形如 `serve=100,backfill=50,on_demand=10`
-//! (缺省即此);三键必须同设、权重 ≥ 1(0 = 该类信用永不回充,等价
-//! 配置死锁,启动期 fail-fast 不静默)。总速率 = 复制口限速
-//! (`FS3D_REPL_EXPORT_RATE`,缺省 64 MiB/s)——同一共享桶速率。
+//! 配置(M21 F3 收口):`[replication.traffic_weights]` 子表为准,形如
+//! `{ serve = 100, backfill = 50, on_demand = 10 }`(缺省即此,字段缺席
+//! = 该项取缺省);权重 ≥ 1(0 = 该类信用永不回充,等价配置死锁,启动
+//! fail-fast 不静默)。**env `FS3D_REPL_TRAFFIC_WEIGHTS` 保留为测试钩子**
+//! (`serve=100,backfill=50,on_demand=10` 形;三键必须同设),仅当配置
+//! 子表缺席时回退。总速率 = 复制口限速(`[replication].export_rate`,
+//! 缺省 64 MiB/s)——同一共享桶速率。
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -133,7 +135,43 @@ impl std::str::FromStr for TrafficWeights {
 }
 
 impl TrafficWeights {
-    /// env 最小配置入口:`FS3D_REPL_TRAFFIC_WEIGHTS` 缺席 = 缺省权重;
+    /// 配置段入口(M21 F3):`[replication.traffic_weights]` 为准(权重
+    /// ≥1 校验同 env 口径);子表缺席回退 env 测试钩子
+    /// `FS3D_REPL_TRAFFIC_WEIGHTS`,再缺席 = 缺省权重。
+    pub fn from_config_or_env(
+        c: Option<&crate::config::ReplicationTrafficWeights>,
+    ) -> Result<TrafficWeights, String> {
+        let Some(c) = c else {
+            return Self::from_env();
+        };
+        let w = TrafficWeights {
+            serve: c.serve,
+            backfill: c.backfill,
+            on_demand: c.on_demand,
+        };
+        w.validate()?;
+        Ok(w)
+    }
+
+    /// 权重 ≥1 校验(0 = 该类信用永不回充,等价配置死锁,装配期
+    /// fail-fast 不静默)。
+    fn validate(&self) -> Result<(), String> {
+        for (k, v) in [
+            ("serve", self.serve),
+            ("backfill", self.backfill),
+            ("on_demand", self.on_demand),
+        ] {
+            if v == 0 {
+                return Err(format!(
+                    "[replication.traffic_weights] {k} must be >= 1 (0 = 该类流量永久制动,等价配置死锁)"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// env 测试钩子回退(F3 后仅配置子表缺席时走到):
+    /// `FS3D_REPL_TRAFFIC_WEIGHTS` 缺席 = 缺省权重;
     /// 形状非法 = 显式报错(启动 fail-fast,照 FS3D_REPL_* 先例)。
     pub fn from_env() -> Result<TrafficWeights, String> {
         match std::env::var("FS3D_REPL_TRAFFIC_WEIGHTS") {

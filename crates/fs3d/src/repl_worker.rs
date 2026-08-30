@@ -36,21 +36,26 @@
 //!   本结构经停止标志已可停。
 //! - **apply 不经 S3 层**:直调 MetaStore(S3 写隔离 501 属 E5)。
 //!
-//! 配置(F3 收口 [replication] 配置段前的 env 最小入口,照
-//! FS3D_REPL_* 先例):
-//! - `FS3D_REPL_PRIMARY_URL`(如 https://node-a:9445;设置即启用 pull,
+//! 配置(M21 F3 收口,设计稿 §6.1):`[replication]` 段为准——
+//! - `primary_url`(如 https://node-a:9445;设置即启用 pull,
 //!   缺省 = 纯主/不中继);
-//! - `FS3D_REPL_SLOT_NAME`(缺省 = 客户端证书 CN,设计稿 §6.1
+//! - `slot_name`(缺省 = 客户端证书 CN,设计稿 §6.1
 //!   「slot_name 缺省 = node_id」);
-//! - `FS3D_REPL_SLOT_FILTERS`(D2 桶级槽;BucketFilter serde JSON 形,
-//!   缺省 `"All"`;变更 = 上游 drop + 重建槽,禁原地改);
-//! - TLS 三件套:`FS3D_REPL_CA_CERT`(与服务端共用根)+
-//!   `FS3D_REPL_CLIENT_CERT`/`FS3D_REPL_CLIENT_KEY`(CN = 本节点
+//! - `bucket_include` / `bucket_exclude`(D2 桶级槽;互斥,皆空 =
+//!   实例级;变更 = 上游 drop + 重建槽,禁原地改);
+//! - TLS 三件套:`ca_cert`(与服务端共用根)+
+//!   `client_cert`/`client_key`(CN = 本节点
 //!   node_id;三件套缺任一项 = 启动显式报错,mTLS 红线不降级);
-//! - `FS3D_REPL_LONGPOLL_MS` / `FS3D_REPL_RETRY_MS`(缺省 30000/1000;
-//!   开发调参,非产品配置面);
-//! - role 由 `FS3D_REPL_ROLE=standby` 在装配处落 `s:repl_role`
-//!   (main.rs cmd_serve)。
+//! - role 由 `[replication].role`(primary|standby)在装配处落
+//!   `s:repl_role`(main.rs cmd_serve)。
+//!
+//! **env `FS3D_REPL_*` 保留为测试钩子**(tests/ 演练不经配置文件):
+//! 逐字段回退——配置字段缺席才读同名 env(FS3D_REPL_PRIMARY_URL/
+//! SLOT_NAME/CA_CERT/CLIENT_CERT/CLIENT_KEY);桶过滤器的 env 回退
+//! `FS3D_REPL_SLOT_FILTERS` 为 BucketFilter serde JSON 形(开发面,
+//! 配置段用 bucket_include/exclude 数组,不引第二语法进配置)。
+//! `FS3D_REPL_LONGPOLL_MS` / `FS3D_REPL_RETRY_MS`(缺省 30000/1000)
+//! 维持纯 env 开发调参,不进配置段。
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -72,7 +77,7 @@ const DEFAULT_RETRY_MS: u64 = 1_000;
 /// 单批拉取条数(与服务端 MAX_BINLOG_LIMIT 内)。
 const BATCH_LIMIT: usize = 256;
 
-/// pull worker 配置(env 最小面;装配校验在 from_env/load)。
+/// pull worker 配置([replication] 段装配,F3;校验在 from_config_or_env/load)。
 #[derive(Debug, Clone)]
 pub struct PullConfig {
     /// 上游复制口(https://host:port)。
@@ -96,28 +101,46 @@ pub struct PullConfig {
 }
 
 impl PullConfig {
-    /// env 最小配置入口(见模块注释):`FS3D_REPL_PRIMARY_URL` 缺席 =
-    /// None(不启用);启用则三件套必须同设(缺任一项 = 显式报错)。
-    /// node_id 自客户端证书 CN 提取(部署约定同 §6.1;无 CN = 显式报错,
-    /// 握手必然 403,不如启动期 fail-fast)。
-    pub fn from_env() -> Result<Option<PullConfig>, String> {
-        let Some(primary_url) = std::env::var("FS3D_REPL_PRIMARY_URL").ok() else {
+    /// 配置段入口(M21 F3;见模块注释):`[replication].primary_url` 缺席
+    /// (且 env 测试钩子亦缺席)= None(不启用);启用则 TLS 三件套必须
+    /// 同设(缺任一项 = 显式报错)。node_id 自客户端证书 CN 提取(部署
+    /// 约定同 §6.1;无 CN = 显式报错,握手必然 403,不如启动期
+    /// fail-fast)。
+    pub fn from_config_or_env(
+        c: Option<&crate::config::ReplicationConfig>,
+    ) -> Result<Option<PullConfig>, String> {
+        let pick = |field: Option<&String>, env_key: &str| {
+            field.cloned().or_else(|| std::env::var(env_key).ok())
+        };
+        let Some(primary_url) = pick(
+            c.and_then(|c| c.primary_url.as_ref()),
+            "FS3D_REPL_PRIMARY_URL",
+        ) else {
             return Ok(None);
         };
-        let get = |k: &str| {
-            std::env::var(k).map_err(|_| {
-                "replication pull TLS material incomplete: FS3D_REPL_CA_CERT / \
-                 FS3D_REPL_CLIENT_CERT / FS3D_REPL_CLIENT_KEY must be set together \
-                 with FS3D_REPL_PRIMARY_URL (mTLS mandatory, ADR-33 RP6)"
+        let get = |field: Option<&String>, env_key: &str| {
+            pick(field, env_key).ok_or_else(|| {
+                "replication pull TLS material incomplete: [replication].ca_cert / client_cert / \
+                 client_key must be set together with primary_url (env fallback FS3D_REPL_CA_CERT / \
+                 FS3D_REPL_CLIENT_CERT / FS3D_REPL_CLIENT_KEY; mTLS mandatory, ADR-33 RP6)"
                     .to_string()
             })
         };
-        let ca_cert = PathBuf::from(get("FS3D_REPL_CA_CERT")?);
-        let client_cert = PathBuf::from(get("FS3D_REPL_CLIENT_CERT")?);
-        let client_key = PathBuf::from(get("FS3D_REPL_CLIENT_KEY")?);
+        let ca_cert = PathBuf::from(get(
+            c.and_then(|c| c.ca_cert.as_ref()),
+            "FS3D_REPL_CA_CERT",
+        )?);
+        let client_cert = PathBuf::from(get(
+            c.and_then(|c| c.client_cert.as_ref()),
+            "FS3D_REPL_CLIENT_CERT",
+        )?);
+        let client_key = PathBuf::from(get(
+            c.and_then(|c| c.client_key.as_ref()),
+            "FS3D_REPL_CLIENT_KEY",
+        )?);
         if !primary_url.starts_with("https://") {
             return Err(format!(
-                "FS3D_REPL_PRIMARY_URL must be https://host:port, got {primary_url:?}"
+                "[replication].primary_url must be https://host:port, got {primary_url:?}"
             ));
         }
         // node_id = 客户端证书 subject CN(复用 repl.rs 的 DER 走读)
@@ -136,14 +159,31 @@ impl PullConfig {
                 )
             })?
         };
-        let slot_name = std::env::var("FS3D_REPL_SLOT_NAME").unwrap_or_else(|_| node_id.clone());
-        // 槽桶级过滤器(D2):BucketFilter 的 serde JSON 形
-        // (`"All"` / `{"Include":[...]}` / `{"Exclude":[...]}`,同 B2
-        // hello 线格式——下游同为 Rust 端,不引入第二套语法);缺省 All
-        let filters: BucketFilter = match std::env::var("FS3D_REPL_SLOT_FILTERS") {
-            Ok(s) => serde_json::from_str(&s)
-                .map_err(|e| format!("bad FS3D_REPL_SLOT_FILTERS (BucketFilter json): {e}"))?,
-            Err(_) => BucketFilter::All,
+        let slot_name = pick(c.and_then(|c| c.slot_name.as_ref()), "FS3D_REPL_SLOT_NAME")
+            .unwrap_or_else(|| node_id.clone());
+        // 槽桶级过滤器(D2;配置段 = bucket_include/bucket_exclude 数组,
+        // 互斥;皆空 = All 实例级)。env 回退 FS3D_REPL_SLOT_FILTERS 为
+        // BucketFilter 的 serde JSON 形(`"All"` / `{"Include":[...]}` /
+        // `{"Exclude":[...]}`,同 B2 hello 线格式——测试钩子,不引第二
+        // 语法进配置段)。
+        let filters: BucketFilter = match c {
+            Some(c) if !c.bucket_include.is_empty() || !c.bucket_exclude.is_empty() => {
+                if !c.bucket_include.is_empty() && !c.bucket_exclude.is_empty() {
+                    return Err(
+                        "[replication].bucket_include 与 bucket_exclude 互斥(只设其一)".into(),
+                    );
+                }
+                if !c.bucket_include.is_empty() {
+                    BucketFilter::Include(c.bucket_include.clone())
+                } else {
+                    BucketFilter::Exclude(c.bucket_exclude.clone())
+                }
+            }
+            _ => match std::env::var("FS3D_REPL_SLOT_FILTERS") {
+                Ok(s) => serde_json::from_str(&s)
+                    .map_err(|e| format!("bad FS3D_REPL_SLOT_FILTERS (BucketFilter json): {e}"))?,
+                Err(_) => BucketFilter::All,
+            },
         };
         let parse_ms = |k: &str, default: u64| -> Result<u64, String> {
             std::env::var(k)
@@ -160,6 +200,8 @@ impl PullConfig {
             ca_cert,
             client_cert,
             client_key,
+            // 长轮询/退避维持纯 env 开发调参(FS3D_REPL_LONGPOLL_MS /
+            // FS3D_REPL_RETRY_MS;非产品配置面,不进 [replication])
             long_poll_ms: parse_ms("FS3D_REPL_LONGPOLL_MS", DEFAULT_LONGPOLL_MS)?,
             retry_ms: parse_ms("FS3D_REPL_RETRY_MS", DEFAULT_RETRY_MS)?,
         }))
@@ -175,7 +217,7 @@ pub struct PullWorker {
 impl PullWorker {
     /// 装配 + 启动(独立线程 + current_thread runtime,照 ReplServer 先例,
     /// 数据面热路径零 tokio)。**role=standby 硬校验**:非备显式报错
-    /// (上游配了 FS3D_REPL_PRIMARY_URL 但角色是主 = 配置矛盾,不静默)。
+    /// (配了 [replication].primary_url 但角色是主 = 配置矛盾,不静默)。
     /// engine 随 C2 快照导入引入(段数据本地落盘 + 导入后 checkpoint)。
     pub fn spawn(
         engine: Arc<RwLock<Engine>>,
@@ -186,7 +228,8 @@ impl PullWorker {
             fs3_meta::ReplRole::Standby => {}
             fs3_meta::ReplRole::Primary => {
                 return Err(
-                    "replication pull worker requires role=standby (set FS3D_REPL_ROLE=standby); \
+                    "replication pull worker requires role=standby (set [replication].role = \
+                     \"standby\"; env 测试钩子 FS3D_REPL_ROLE=standby); \
                      refusing to pull into a primary (ADR-33 RP4)"
                         .into(),
                 );

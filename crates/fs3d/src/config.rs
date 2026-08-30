@@ -39,6 +39,13 @@ pub struct RootConfig {
     /// M20(ADR-29):SSE-KMS 密钥托管(`[kms]`;G1 补 backend/external 字段)。
     #[serde(default)]
     pub kms: KmsConfig,
+    /// M21 F3(ADR-33;docs/replication-design.md §6.1):主备异步复制
+    /// (`[replication]`;段缺席 = 不启用复制,纯单机现状)。消费点:
+    /// 复制口 repl.rs / pull worker repl_worker.rs / 回填池
+    /// repl_backfill.rs / 流量权重 repl_traffic.rs;role 与 binlog
+    /// 开关在 main.rs cmd_serve 装配。
+    #[serde(default)]
+    pub replication: Option<ReplicationConfig>,
 }
 
 /// M20 G1(ADR-29 KR5):`[kms]` 段。
@@ -164,6 +171,90 @@ pub struct KmsDeployConfig {
     pub auto_unseal: Option<bool>,
     /// auto_unseal 的 unseal key 文件(0600)。
     pub key_file: Option<String>,
+}
+
+/// M21 F3(ADR-33;设计稿 §6.1 toml 草案):`[replication]` 段——主备
+/// 异步复制的全部配置面。**以配置段为准**;同名 env(`FS3D_REPL_*`)
+/// 仅保留为测试钩子(逐字段回退:配置缺席才读 env;语义钉死在各
+/// 消费点模块注释)。
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+pub struct ReplicationConfig {
+    /// 节点角色:primary(缺省)| standby。standby = 只读承接读 +
+    /// pull 追赶;promote/demote 走 admin 面(运行期翻转落 s:repl_role,
+    /// 重启以本字段为准——切换后须同步改配置)。
+    pub role: Option<String>,
+    /// 复制入站口监听(独立口,mTLS 强制;缺省 0.0.0.0:9445)。
+    /// standby 设了才开中继(对下服务)。
+    pub listen: Option<String>,
+    /// mTLS 根信任 PEM(复制口服务端校验下游 + pull 客户端校验上游,
+    /// 同 center 部署形态共用一根)。
+    pub ca_cert: Option<String>,
+    /// 本节点客户端证书 PEM(CN = node_id;pull/hello 身份)。
+    pub client_cert: Option<String>,
+    /// 本节点客户端私钥 PEM(0600)。
+    pub client_key: Option<String>,
+    /// 复制口服务端证书 PEM(设计稿 §6.1 只列 client_*;服务端材料按
+    /// 实现需要补齐——ca_cert/server_cert/server_key 三件套同设才开
+    /// 复制口,缺任一项启动显式失败,mTLS 红线 RP6 不降级)。
+    pub server_cert: Option<String>,
+    /// 复制口服务端私钥 PEM(0600)。
+    pub server_key: Option<String>,
+    /// 上游复制口(https://host:9445;standby/中继必填;设置即启用
+    /// pull worker,缺省 = 纯主/不中继)。
+    pub primary_url: Option<String>,
+    /// 复制槽名(缺省 = node_id = client_cert 的 subject CN)。
+    pub slot_name: Option<String>,
+    /// 桶级复制:只复制名单内桶(与 bucket_exclude 互斥;两者皆空 =
+    /// 实例级全量)。过滤器变更 = 上游 drop + 重建槽(禁原地改,R9)。
+    #[serde(default)]
+    pub bucket_include: Vec<String>,
+    /// 桶级复制:复制名单外全部桶(与 bucket_include 互斥)。
+    #[serde(default)]
+    pub bucket_exclude: Vec<String>,
+    /// binlog 保留软上限时长(小时;默认 24;A3 两级水位:超限停截断
+    /// + 告警保槽)。
+    pub repl_retain_hours: Option<u64>,
+    /// binlog 保留软上限字节(容量字符串如 "8GiB",parse_size 口径;
+    /// 默认 8GiB)。
+    pub repl_retain_bytes: Option<String>,
+    /// binlog 保留硬上限字节(容量字符串;默认 32GiB;超限强截 + 被
+    /// 越过槽标记 stale → 下次握手 ErrBinlogGone → 显式重建)。
+    pub repl_retain_bytes_hard: Option<String>,
+    /// 复制槽扇出硬上限(默认 16;ADR-33 RP3.1/裁定 2;握手自动登记
+    /// 与预登记共用同一闸)。
+    pub max_slots: Option<usize>,
+    /// 段回填池并发(默认 8)。
+    pub data_pull_concurrency: Option<usize>,
+    /// 读路径按需拉取(C4)同步等待上限秒(默认 30;超时 → 读路径 503)。
+    pub read_fetch_timeout_secs: Option<u64>,
+    /// 复制口 serve/中继流量共享桶限速(字节/秒;容量字符串如 "64MiB",
+    /// 默认 64MiB/s;装配钳下限 1MiB/s,0 速率 = 永不回充死锁)。
+    pub export_rate: Option<String>,
+    /// 中继流量权重(`[replication.traffic_weights]`;裁定 4;
+    /// 缺省 serve=100/backfill=50/on_demand=10)。
+    pub traffic_weights: Option<ReplicationTrafficWeights>,
+}
+
+/// `[replication.traffic_weights]` 子表(字段缺席 = 该项取缺省;
+/// 权重 ≥1——0 = 该类信用永不回充,等价配置死锁,装配期 fail-fast)。
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+pub struct ReplicationTrafficWeights {
+    #[serde(default = "default_traffic_serve")]
+    pub serve: u64,
+    #[serde(default = "default_traffic_backfill")]
+    pub backfill: u64,
+    #[serde(default = "default_traffic_on_demand")]
+    pub on_demand: u64,
+}
+
+fn default_traffic_serve() -> u64 {
+    100
+}
+fn default_traffic_backfill() -> u64 {
+    50
+}
+fn default_traffic_on_demand() -> u64 {
+    10
 }
 
 /// M19 J:`[batch]` 段(Batch worker;ADR-26 DR4)。
@@ -466,6 +557,80 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.audit.persist, Some(false));
         assert_eq!(cfg.audit.max_entries, Some(1000));
+    }
+
+    /// M21 F3:[replication] 段解析(段缺席 = None;全字段 + traffic_weights
+    /// 子表;子表字段缺席取缺省)。
+    #[test]
+    fn replication_config_parse() {
+        let cfg: RootConfig = toml::from_str("[storage]\ndevices=[\"/d\"]\n").unwrap();
+        assert!(cfg.replication.is_none(), "段缺席 = 不启用复制");
+        let cfg: RootConfig = toml::from_str(
+            r#"
+[storage]
+devices=["/d"]
+[replication]
+role = "standby"
+listen = "0.0.0.0:9445"
+ca_cert = "tls/ca.pem"
+client_cert = "tls/node-b.pem"
+client_key = "tls/node-b.key"
+server_cert = "tls/node-b-server.pem"
+server_key = "tls/node-b-server.key"
+primary_url = "https://node-a:9445"
+slot_name = "node-b"
+bucket_include = ["a", "b"]
+repl_retain_hours = 48
+repl_retain_bytes = "4GiB"
+repl_retain_bytes_hard = "32GiB"
+max_slots = 8
+data_pull_concurrency = 4
+read_fetch_timeout_secs = 15
+export_rate = "128MiB"
+[replication.traffic_weights]
+serve = 100
+backfill = 50
+on_demand = 10
+"#,
+        )
+        .unwrap();
+        let r = cfg.replication.as_ref().unwrap();
+        assert_eq!(r.role.as_deref(), Some("standby"));
+        assert_eq!(r.listen.as_deref(), Some("0.0.0.0:9445"));
+        assert_eq!(r.ca_cert.as_deref(), Some("tls/ca.pem"));
+        assert_eq!(r.client_cert.as_deref(), Some("tls/node-b.pem"));
+        assert_eq!(r.client_key.as_deref(), Some("tls/node-b.key"));
+        assert_eq!(r.server_cert.as_deref(), Some("tls/node-b-server.pem"));
+        assert_eq!(r.server_key.as_deref(), Some("tls/node-b-server.key"));
+        assert_eq!(r.primary_url.as_deref(), Some("https://node-a:9445"));
+        assert_eq!(r.slot_name.as_deref(), Some("node-b"));
+        assert_eq!(r.bucket_include, vec!["a".to_string(), "b".to_string()]);
+        assert!(r.bucket_exclude.is_empty());
+        assert_eq!(r.repl_retain_hours, Some(48));
+        assert_eq!(r.repl_retain_bytes.as_deref(), Some("4GiB"));
+        assert_eq!(r.repl_retain_bytes_hard.as_deref(), Some("32GiB"));
+        assert_eq!(r.max_slots, Some(8));
+        assert_eq!(r.data_pull_concurrency, Some(4));
+        assert_eq!(r.read_fetch_timeout_secs, Some(15));
+        assert_eq!(r.export_rate.as_deref(), Some("128MiB"));
+        let w = r.traffic_weights.unwrap();
+        assert_eq!((w.serve, w.backfill, w.on_demand), (100, 50, 10));
+        // traffic_weights 子表字段缺席 = 该项取缺省(100/50/10)
+        let cfg: RootConfig = toml::from_str(
+            "[storage]\ndevices=[\"/d\"]\n[replication.traffic_weights]\nserve=200\n",
+        )
+        .unwrap();
+        let w = cfg
+            .replication
+            .as_ref()
+            .unwrap()
+            .traffic_weights
+            .as_ref()
+            .unwrap();
+        assert_eq!((w.serve, w.backfill, w.on_demand), (200, 50, 10));
+        // 容量字符串合法性由消费侧 parse_size 裁决(装配 fail-fast);
+        // 此处仅断言解析面接受字符串形
+        assert_eq!(parse_size("32GiB").unwrap(), 32 * 1024 * 1024 * 1024);
     }
 
     /// M20 G1:`[kms]` backend 三态 + A2 兼容(仅 deploy → managed)。

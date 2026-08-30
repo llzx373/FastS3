@@ -129,9 +129,9 @@
 //!   幂等,未知/已过期 = 410 ErrSnapshotGone)。
 //! - 限速(R5/RP8.3;E2 起经 `ReplTraffic` 旁路桶,不动 fs3-engine
 //!   worker::Throttle):复制口 serve 字节(extent-data 响应、快照
-//!   meta 页)记账进中继流量共享桶,速率 `FS3D_REPL_EXPORT_RATE`
+//!   meta 页)记账进中继流量共享桶,速率 `[replication].export_rate`
 //!   字节/秒(默认 64 MiB/s),透支即挂起等回充;三类流量权重
-//!   `FS3D_REPL_TRAFFIC_WEIGHTS`(默认 serve=100,backfill=50,
+//!   `[replication.traffic_weights]`(默认 serve=100,backfill=50,
 //!   on_demand=10;共享桶 + 每类保底信用,语义见 repl_traffic.rs)。
 //!
 //! 复制槽生命周期线格式(B3;设计稿 §3.3;ADR-33 RP3/RP8):
@@ -149,16 +149,19 @@
 //!   低频写(设计稿 §3.3「回执更新」),独立端点语义单一、可单独拒绝
 //!   (回退/未知槽/stale)。回退 confirmed → 400;stale 槽 → 410
 //!   `ErrBinlogGone`;更新 confirmed_gtid + last_ack_at 落盘。
-//! - `max_slots` 硬限制(默认 16,RP3.1/裁定 2;ReplConfig 字段,env
-//!   `FS3D_REPL_MAX_SLOTS` 覆盖,F3 收口进 [replication] 配置段):
+//! - `max_slots` 硬限制(默认 16,RP3.1/裁定 2;ReplConfig 字段,配置
+//!   `[replication].max_slots`,F3 收口):
 //!   握手自动登记与预登记共用同一闸;超限 → 403 `ErrSlotLimit`。
 //!   检查-登记非事务(单写者进程内串行度由 meta 层 fsync 写保证持久,
 //!   并发溢出至多超 1 槽,一期可接受,注释钉死)。
 //!
-//! 配置(F3 收口 [replication] 配置段前的最小入口,仿 FS3D_REPL_BINLOG
-//! 开发态开关先例):env `FS3D_REPL_CA_CERT` 设置即启用复制口,
-//! `FS3D_REPL_SERVER_CERT`/`FS3D_REPL_SERVER_KEY` 必须同设(缺任一项 =
-//! 启动显式报错,不静默降级);`FS3D_REPL_LISTEN` 覆盖监听地址。
+//! 配置(M21 F3 收口,设计稿 §6.1):`[replication]` 段为准——
+//! ca_cert/server_cert/server_key 三件套同设即启用复制口(缺任一项 =
+//! 启动显式报错,不静默降级),listen/max_slots/export_rate/
+//! traffic_weights/repl_retain_* 同段。**env `FS3D_REPL_*` 保留为测试
+//! 钩子**(tests/ 演练不经配置文件):逐字段回退,配置字段缺席才读
+//! env;回退集合 = FS3D_REPL_CA_CERT/SERVER_CERT/SERVER_KEY/LISTEN/
+//! MAX_SLOTS/EXPORT_RATE/TRAFFIC_WEIGHTS。
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -179,6 +182,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::Deserialize;
 use tokio_rustls::TlsAcceptor;
 
+use crate::config::ReplicationConfig;
 use crate::repl_traffic::{ReplTraffic, TrafficClass, TrafficWeights};
 
 /// extent-data 单请求 len 上限(64 MiB;下游回填池分块,见模块注释)。
@@ -218,7 +222,8 @@ const SNAPSHOT_SESSION_TTL: std::time::Duration = std::time::Duration::from_secs
 /// ReadPin;快照会话是主端读压来源,R5)。
 const MAX_SNAPSHOT_SESSIONS: usize = 4;
 
-/// 复制口配置(F3 前的 env 最小面;装配校验在 from_env/ServerTls::build)。
+/// 复制口配置([replication] 段装配,M21 F3;校验在 from_config_or_env /
+/// build_server_tls)。
 #[derive(Debug, Clone)]
 pub struct ReplConfig {
     pub listen: SocketAddr,
@@ -230,9 +235,13 @@ pub struct ReplConfig {
     pub max_slots: usize,
     /// 快照导出限速(字节/秒;C1;服务级令牌桶速率,默认 64 MiB/s)。
     pub export_rate: u64,
-    /// 中继流量权重(M21 E2;裁定 4;env `FS3D_REPL_TRAFFIC_WEIGHTS`,
+    /// 中继流量权重(M21 E2;裁定 4;[replication.traffic_weights],
     /// 缺省 serve=100/backfill=50/on_demand=10)。
     pub traffic_weights: TrafficWeights,
+    /// binlog 两级水位参数(M21 A3;[replication].repl_retain_* 收口,F3)。
+    /// 消费点 = binlog 周期截断循环(fs3-meta truncate_binlog API 已备,
+    /// 周期循环的装配属后续任务,参数先随本配置承载,不留第二入口)。
+    pub retain: fs3_meta::ReplRetainConfig,
     /// 装配注入的中继流量共享桶(E2;main.rs cmd_serve 在复制口或
     /// pull/backfill 任一启用时建桶并注入,serve/backfill/on_demand
     /// 三类共持同一 Arc)。None = 按 export_rate/traffic_weights 自建
@@ -240,44 +249,83 @@ pub struct ReplConfig {
     pub traffic: Option<Arc<ReplTraffic>>,
 }
 
+/// A3 两级水位参数收口(F3):[replication].repl_retain_* →
+/// fs3_meta::ReplRetainConfig(容量字符串走 config::parse_size,
+/// 与 [cache].max_bytes 同口径;字段缺席 = fs3-meta 缺省 24h/8GiB/32GiB)。
+fn resolve_retain(c: Option<&ReplicationConfig>) -> Result<fs3_meta::ReplRetainConfig, String> {
+    let mut r = fs3_meta::ReplRetainConfig::default();
+    if let Some(c) = c {
+        if let Some(h) = c.repl_retain_hours {
+            r.retain_hours = h;
+        }
+        if let Some(s) = &c.repl_retain_bytes {
+            r.retain_bytes = crate::config::parse_size(s)
+                .map_err(|e| format!("bad [replication].repl_retain_bytes: {e}"))?;
+        }
+        if let Some(s) = &c.repl_retain_bytes_hard {
+            r.retain_bytes_hard = crate::config::parse_size(s)
+                .map_err(|e| format!("bad [replication].repl_retain_bytes_hard: {e}"))?;
+        }
+    }
+    Ok(r)
+}
+
 impl ReplConfig {
-    /// env 最小配置入口(见模块注释):三件套同设才启用;部分设置 = 显式
-    /// 报错(复制口无 mTLS 不合入红线,不得静默降级)。
-    pub fn from_env() -> Result<Option<ReplConfig>, String> {
-        let ca = std::env::var("FS3D_REPL_CA_CERT").ok();
-        let cert = std::env::var("FS3D_REPL_SERVER_CERT").ok();
-        let key = std::env::var("FS3D_REPL_SERVER_KEY").ok();
+    /// 配置段入口(M21 F3;见模块注释):[replication] 字段为准,env
+    /// `FS3D_REPL_*` 逐字段回退(仅测试钩子)。TLS 三件套同设才启用;
+    /// 部分设置 = 显式报错(复制口无 mTLS 不合入红线,不得静默降级)。
+    pub fn from_config_or_env(c: Option<&ReplicationConfig>) -> Result<Option<ReplConfig>, String> {
+        let pick = |field: Option<&String>, env_key: &str| {
+            field.cloned().or_else(|| std::env::var(env_key).ok())
+        };
+        let ca = pick(c.and_then(|c| c.ca_cert.as_ref()), "FS3D_REPL_CA_CERT");
+        let cert = pick(
+            c.and_then(|c| c.server_cert.as_ref()),
+            "FS3D_REPL_SERVER_CERT",
+        );
+        let key = pick(
+            c.and_then(|c| c.server_key.as_ref()),
+            "FS3D_REPL_SERVER_KEY",
+        );
         if ca.is_none() && cert.is_none() && key.is_none() {
             return Ok(None);
         }
         let (Some(ca_cert), Some(server_cert), Some(server_key)) = (ca, cert, key) else {
             return Err(
-                "replication TLS material incomplete: FS3D_REPL_CA_CERT / FS3D_REPL_SERVER_CERT \
-                 / FS3D_REPL_SERVER_KEY must be set together (mTLS mandatory, ADR-33 RP6)"
+                "replication TLS material incomplete: [replication].ca_cert / server_cert / \
+                 server_key must be set together (env fallback FS3D_REPL_CA_CERT / \
+                 FS3D_REPL_SERVER_CERT / FS3D_REPL_SERVER_KEY; mTLS mandatory, ADR-33 RP6)"
                     .into(),
             );
         };
-        let listen = std::env::var("FS3D_REPL_LISTEN")
-            .unwrap_or_else(|_| "0.0.0.0:9445".into())
+        let listen = pick(c.and_then(|c| c.listen.as_ref()), "FS3D_REPL_LISTEN")
+            .unwrap_or_else(|| "0.0.0.0:9445".into())
             .parse()
-            .map_err(|e| format!("bad FS3D_REPL_LISTEN: {e}"))?;
-        let max_slots = std::env::var("FS3D_REPL_MAX_SLOTS")
-            .ok()
-            .map(|s| {
-                s.parse()
-                    .map_err(|e| format!("bad FS3D_REPL_MAX_SLOTS: {e}"))
-            })
-            .transpose()?
-            .unwrap_or(DEFAULT_MAX_SLOTS);
-        let export_rate = std::env::var("FS3D_REPL_EXPORT_RATE")
-            .ok()
-            .map(|s| {
-                s.parse()
-                    .map_err(|e| format!("bad FS3D_REPL_EXPORT_RATE: {e}"))
-            })
-            .transpose()?
-            .unwrap_or(DEFAULT_EXPORT_RATE)
-            .max(MIN_EXPORT_RATE);
+            .map_err(|e| format!("bad [replication].listen / FS3D_REPL_LISTEN: {e}"))?;
+        let max_slots = match c.and_then(|c| c.max_slots) {
+            Some(v) => v,
+            None => std::env::var("FS3D_REPL_MAX_SLOTS")
+                .ok()
+                .map(|s| {
+                    s.parse()
+                        .map_err(|e| format!("bad FS3D_REPL_MAX_SLOTS: {e}"))
+                })
+                .transpose()?
+                .unwrap_or(DEFAULT_MAX_SLOTS),
+        };
+        let export_rate = match c.and_then(|c| c.export_rate.as_ref()) {
+            Some(s) => crate::config::parse_size(s)
+                .map_err(|e| format!("bad [replication].export_rate: {e}"))?,
+            None => std::env::var("FS3D_REPL_EXPORT_RATE")
+                .ok()
+                .map(|s| {
+                    s.parse()
+                        .map_err(|e| format!("bad FS3D_REPL_EXPORT_RATE: {e}"))
+                })
+                .transpose()?
+                .unwrap_or(DEFAULT_EXPORT_RATE),
+        }
+        .max(MIN_EXPORT_RATE);
         Ok(Some(ReplConfig {
             listen,
             ca_cert: PathBuf::from(ca_cert),
@@ -285,7 +333,10 @@ impl ReplConfig {
             server_key: PathBuf::from(server_key),
             max_slots,
             export_rate,
-            traffic_weights: TrafficWeights::from_env()?,
+            traffic_weights: TrafficWeights::from_config_or_env(
+                c.and_then(|c| c.traffic_weights.as_ref()),
+            )?,
+            retain: resolve_retain(c)?,
             traffic: None,
         }))
     }
@@ -356,6 +407,10 @@ pub struct ReplServer {
     /// TrafficClass::Serve 记账(投递下游类;与回填/按需拉取按权重
     /// 共享同一预算,实现形态见 repl_traffic.rs 模块注释)。
     traffic: Arc<ReplTraffic>,
+    /// binlog 两级水位参数(A3;[replication].repl_retain_*,F3 收口)。
+    /// 当前消费 = 启动日志公示实际生效值;周期截断循环
+    /// (truncate_binlog 调用方)装配属后续任务,届时直接读本字段。
+    retain: fs3_meta::ReplRetainConfig,
     /// 在线快照导出会话注册表(C1;snapshot_id → 会话;空闲 TTL 回收)。
     snapshots: Mutex<HashMap<u64, Arc<SnapshotSession>>>,
     /// 会话 id 分配(进程内单调;1 起)。
@@ -398,6 +453,7 @@ impl ReplServer {
             traffic: cfg
                 .traffic
                 .unwrap_or_else(|| ReplTraffic::new(cfg.export_rate, cfg.traffic_weights)),
+            retain: cfg.retain,
             snapshots: Mutex::new(HashMap::new()),
             next_snapshot_id: AtomicU64::new(1),
         })
@@ -438,7 +494,12 @@ impl ReplServer {
             }
         };
         let _ = bound.send(Ok(local_addr));
-        tracing::info!("replication port listening on {local_addr} (mTLS mandatory)");
+        tracing::info!(
+            retain_hours = self.retain.retain_hours,
+            retain_bytes = self.retain.retain_bytes,
+            retain_bytes_hard = self.retain.retain_bytes_hard,
+            "replication port listening on {local_addr} (mTLS mandatory)"
+        );
         let acceptor = TlsAcceptor::from(self.tls.clone());
         let this = Arc::new(self);
         loop {
@@ -2136,6 +2197,7 @@ mod tests {
             max_slots: DEFAULT_MAX_SLOTS,
             export_rate: DEFAULT_EXPORT_RATE,
             traffic_weights: TrafficWeights::default(),
+            retain: Default::default(),
             traffic: None,
         };
         let server = ReplServer::new(engine.clone(), meta, cfg).unwrap();
@@ -2442,6 +2504,7 @@ mod tests {
             max_slots: DEFAULT_MAX_SLOTS,
             export_rate: DEFAULT_EXPORT_RATE,
             traffic_weights: TrafficWeights::default(),
+            retain: Default::default(),
             traffic: None,
         };
         let addr = ReplServer::new(engine.clone(), meta, cfg)
@@ -3855,6 +3918,7 @@ mod tests {
             max_slots: DEFAULT_MAX_SLOTS,
             export_rate: DEFAULT_EXPORT_RATE,
             traffic_weights: TrafficWeights::default(),
+            retain: Default::default(),
             traffic: None,
         };
         let server = ReplServer::new(engine.clone(), meta, cfg).unwrap();
@@ -4922,8 +4986,14 @@ mod tests {
             "us-east-1".into(),
             false,
         ));
-        let rebuild =
-            RebuildService::new(down_engine.clone(), svc, down.clone(), cfg.clone(), None);
+        let rebuild = RebuildService::new(
+            down_engine.clone(),
+            svc,
+            down.clone(),
+            cfg.clone(),
+            None,
+            None,
+        );
         let v = rebuild.rebuild(Some(&cfg.primary_url), None).unwrap();
         assert_eq!(v["status"], serde_json::json!("rebuilding"), "{v}");
         assert!(
@@ -5214,7 +5284,14 @@ mod tests {
             "us-east-1".into(),
             false,
         ));
-        let rb = RebuildService::new(b_engine.clone(), svc_b, b_meta.clone(), cfg_b.clone(), None);
+        let rb = RebuildService::new(
+            b_engine.clone(),
+            svc_b,
+            b_meta.clone(),
+            cfg_b.clone(),
+            None,
+            None,
+        );
         rb.adopt(Some(wb), None);
         let v = rb.promote(false, false).unwrap();
         assert_eq!(v["status"], serde_json::json!("promoted"), "{v}");
@@ -5251,7 +5328,14 @@ mod tests {
             "us-east-1".into(),
             false,
         ));
-        let ra = RebuildService::new(a_engine.clone(), svc_a, a_meta.clone(), cfg_a.clone(), None);
+        let ra = RebuildService::new(
+            a_engine.clone(),
+            svc_a,
+            a_meta.clone(),
+            cfg_a.clone(),
+            None,
+            None,
+        );
         let v = ra.rebuild(None, None).unwrap();
         assert_eq!(v["status"], serde_json::json!("rebuilding"), "{v}");
         wait_repl_cursor(&a_meta, Gtid { epoch: 2, seq: 1 });

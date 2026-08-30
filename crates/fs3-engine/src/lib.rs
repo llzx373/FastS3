@@ -121,7 +121,8 @@ pub struct EngineConfig {
     /// 引擎只持客户端句柄(mint/unwrap 逐次在线调用)。
     #[doc(hidden)]
     pub kms: Option<std::sync::Arc<dyn fs3_kms::RootKms>>,
-    /// M21 C2:复制 binlog 记录开关(等价 env `FS3D_REPL_BINLOG`;进程级
+    /// M21 C2/F3:复制 binlog 记录开关(装配 = fs3d cmd_serve 按
+    /// `[replication]` 段置位;env `FS3D_REPL_BINLOG` 等价或值合并,进程级
     /// env 在并行测试间有竞态,配置字段供测试/装配显式按实例开启)。
     #[doc(hidden)]
     pub repl_binlog: bool,
@@ -432,9 +433,10 @@ pub trait ReplPendingProbe: Send + Sync {
     fn object_data_pending(&self, bucket: &str, key: &str) -> bool;
 }
 
-/// M21 A5 开发态开关(风格仿 fs3-agent `FS3_SYNC_MC_WORKERS` env 先例):
-/// env `FS3D_REPL_BINLOG` 为 `1`/`true` 时返回 true。
-/// 仅 M21 期 binlog 写放大 perf 验证/演练使用,非产品配置面。
+/// M21 F3 后保留的测试钩子(风格仿 fs3-agent `FS3_SYNC_MC_WORKERS` env
+/// 先例):env `FS3D_REPL_BINLOG` 为 `1`/`true` 时返回 true。
+/// 供 binlog 写放大 perf 验证/不经配置文件的演练使用;产品配置面 =
+/// `[replication]` 段(fs3d cmd_serve 装配),env 仅或值合并、不取代。
 fn repl_binlog_env_enabled() -> bool {
     matches!(
         std::env::var("FS3D_REPL_BINLOG").as_deref(),
@@ -460,15 +462,16 @@ impl Engine {
             flush_every_ms: cfg.group_commit_ms,
             sync_mode: cfg.sync_mode,
             cache_capacity: None,
-            // M21 A5:开发态开关 — env `FS3D_REPL_BINLOG=1` 时开启 binlog
-            // 记录(apply_ops 同事务写 `bl:{seq}`)。仅用于 M21 期性能验证/
-            // 演练(perf-m21-binlog-compare.sh);正式引擎/[replication]
-            // 配置接线属后续 B/F 组任务,届时本 env 入口由配置取代。
+            // M21 F3:binlog 记录开关(apply_ops 同事务写 `bl:{seq}`)。
+            // 正式配置面 = fs3d `[replication]` 段(server_cert 在 = 开,
+            // 装配处置位 cfg.repl_binlog);env `FS3D_REPL_BINLOG=1` 保留为
+            // 测试钩子(perf-m21-binlog-compare.sh / 演练不经配置文件),
+            // 或值合并,不随配置段移除。
             repl_binlog: cfg.repl_binlog || repl_binlog_env_enabled(),
             ..Default::default()
         };
         if meta_cfg.repl_binlog {
-            tracing::info!("repl_binlog enabled via FS3D_REPL_BINLOG (M21 A5 dev switch)");
+            tracing::info!("repl_binlog enabled ([replication] or FS3D_REPL_BINLOG test hook)");
         }
         let meta = Arc::new(MetaStore::open(&cfg.meta_dir, &meta_cfg)?);
 

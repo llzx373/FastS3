@@ -775,6 +775,16 @@ fn cmd_serve(
         );
         tracing::info!("kms client attached (token renewer spawned)");
     }
+    // M21 F3(ADR-33):[replication] 段配了复制口服务端材料(server_cert)
+    // → 开启 binlog 记录(主/中继对下服务的前提;pull-only 纯备不开)。
+    // env FS3D_REPL_BINLOG 保留为测试钩子,Engine::open 内或值合并。
+    if cfg
+        .replication
+        .as_ref()
+        .is_some_and(|r| r.server_cert.is_some())
+    {
+        engine_cfg.repl_binlog = true;
+    }
     let engine = Arc::new(parking_lot::RwLock::new(Engine::open(&engine_cfg)?));
     // M11 K1-1(ADR-12 DS1):SSE-S3 重包裹待办续跑——重启后 gen >
     // rewrap_done_gen ⇒ 上轮重包裹未完成,自动起后台线程收敛(幂等;
@@ -1079,26 +1089,34 @@ fn cmd_serve(
     // M20 A3:kms_manager 已在 Engine::open 前由 assemble_kms 拉起;
     // 此处只注入 admin 控制面(未配置 = None → 501)。
 
-    // M21 B4/C5:pull 配置提前解析(纯 env/证书读取,无引擎依赖)——
+    // M21 B4/C5:pull 配置提前解析(纯配置/证书读取,无引擎依赖)——
     // 重建编排 RebuildService 需随 admin 装配注入;worker 本体仍在
-    // admin 装配之后启动(见下)。
-    let pull_cfg_env: Option<repl_worker::PullConfig> = match repl_worker::PullConfig::from_env() {
-        Ok(v) => v,
-        Err(e) => return Err(fs3_core::Error::InvalidArgument(e)),
-    };
-    // M21 D4:复制口配置同样提前解析(纯 env/证书路径读取;原位置在
+    // admin 装配之后启动(见下)。F3:[replication] 段为准,env
+    // FS3D_REPL_* 逐字段回退(测试钩子,语义见 repl_worker.rs 模块注释)。
+    let pull_cfg_env: Option<repl_worker::PullConfig> =
+        match repl_worker::PullConfig::from_config_or_env(cfg.replication.as_ref()) {
+            Ok(v) => v,
+            Err(e) => return Err(fs3_core::Error::InvalidArgument(e)),
+        };
+    // M21 D4:复制口配置同样提前解析(纯配置/证书路径读取;原位置在
     // admin 装配之后)——D4 逐槽指标源按「任一复制配置在」判定注入。
-    let repl_cfg_env: Option<repl::ReplConfig> = match repl::ReplConfig::from_env() {
-        Ok(v) => v,
-        Err(e) => return Err(fs3_core::Error::InvalidArgument(e)),
-    };
+    let repl_cfg_env: Option<repl::ReplConfig> =
+        match repl::ReplConfig::from_config_or_env(cfg.replication.as_ref()) {
+            Ok(v) => v,
+            Err(e) => return Err(fs3_core::Error::InvalidArgument(e)),
+        };
     // M21 E2(ADR-33 裁定 4):中继流量共享桶(任一复制配置在 = 建桶;
     // serve/backfill/on_demand 三类共用同一预算,权重
-    // FS3D_REPL_TRAFFIC_WEIGHTS,速率 = 复制口限速 FS3D_REPL_EXPORT_RATE)
+    // [replication.traffic_weights],速率 = 复制口限速
+    // [replication].export_rate)
     let repl_traffic: Option<Arc<repl_traffic::ReplTraffic>> =
         if repl_cfg_env.is_some() || pull_cfg_env.is_some() {
-            let weights = repl_traffic::TrafficWeights::from_env()
-                .map_err(fs3_core::Error::InvalidArgument)?;
+            let weights = repl_traffic::TrafficWeights::from_config_or_env(
+                cfg.replication
+                    .as_ref()
+                    .and_then(|c| c.traffic_weights.as_ref()),
+            )
+            .map_err(fs3_core::Error::InvalidArgument)?;
             let rate = repl_cfg_env
                 .as_ref()
                 .map(|c| c.export_rate)
@@ -1116,6 +1134,8 @@ fn cmd_serve(
             engine.read().meta_arc(),
             pc.clone(),
             repl_traffic.clone(),
+            // F3:重建后重起回填池的并发/超时与启动装配同源
+            cfg.replication.clone(),
         ))
     });
 
@@ -1239,8 +1259,8 @@ fn cmd_serve(
     }
 
     // M21 B1(ADR-33 RP6;设计稿 §6.1):复制口独立监听(默认 9445,mTLS
-    // 强制)。配置走 env 最小入口(FS3D_REPL_*;[replication] 完整配置段
-    // 属 F3 收口)。TLS 材料装配期装载,坏材料 = 启动显式失败(不静默降级
+    // 强制)。配置 = [replication] 段(F3 收口;env FS3D_REPL_* 仅测试
+    // 钩子回退)。TLS 材料装配期装载,坏材料 = 启动显式失败(不静默降级
     // 为无 mTLS,红线 RP6.2)。
     if let Some(mut repl_cfg) = repl_cfg_env {
         repl_cfg.traffic = repl_traffic.clone();
@@ -1252,19 +1272,26 @@ fn cmd_serve(
         tracing::info!("replication port bound on {}", handle.local_addr);
     }
 
-    // M21 B4(ADR-33 RP4.2;设计稿 §4.1):下游 pull worker。role 的 env
-    // 最小入口 FS3D_REPL_ROLE(primary|standby;设置即落 s:repl_role,
-    // 幂等直写);pull 配置已在 admin 装配前解析(C5 注入用),worker 内
-    // role=standby 硬校验(配了上游但角色是主 = 配置矛盾,启动显式失败,
-    // 不静默)。pause/resume 语义属 F2;promote 停 worker 已在 E3 落
-    // (RebuildService::promote,经 admin 面 /v1/admin/replication/promote)。
-    if let Ok(role) = std::env::var("FS3D_REPL_ROLE") {
+    // M21 B4(ADR-33 RP4.2;设计稿 §4.1):下游 pull worker。role 取值 =
+    // [replication].role(primary|standby;F3 收口,缺省不覆写 meta 现状
+    // ——promote 的运行期翻转不被重启意外盖回;env FS3D_REPL_ROLE 仅测试
+    // 钩子回退);设置即落 s:repl_role(幂等直写)。pull 配置已在 admin
+    // 装配前解析(C5 注入用),worker 内 role=standby 硬校验(配了上游但
+    // 角色是主 = 配置矛盾,启动显式失败,不静默)。pause/resume 语义属
+    // F2;promote 停 worker 已在 E3 落(RebuildService::promote,经
+    // admin 面 /v1/admin/replication/promote)。
+    let repl_role_cfg = cfg
+        .replication
+        .as_ref()
+        .and_then(|c| c.role.clone())
+        .or_else(|| std::env::var("FS3D_REPL_ROLE").ok());
+    if let Some(role) = repl_role_cfg {
         let role = match role.as_str() {
             "primary" => fs3_meta::ReplRole::Primary,
             "standby" => fs3_meta::ReplRole::Standby,
             other => {
                 return Err(fs3_core::Error::InvalidArgument(format!(
-                    "bad FS3D_REPL_ROLE {other:?} (expect primary|standby)"
+                    "bad [replication].role {other:?} (expect primary|standby)"
                 )))
             }
         };
@@ -1286,13 +1313,14 @@ fn cmd_serve(
     };
     // M21 C3(ADR-33 RP4.2;设计稿 §3.2/§4.2):段回填池——apply 落的
     // data_pending 段引用经上游 extent-data 并发拉取(默认 8,
-    // FS3D_REPL_DATA_PULL_CONCURRENCY)+ 本地分配器重落盘 + 单事务清算;
-    // C4 读路径按需拉取共用本服务的拉取原语与清算互斥。
+    // [replication].data_pull_concurrency,F3 收口)+ 本地分配器重落盘
+    // + 单事务清算;C4 读路径按需拉取共用本服务的拉取原语与清算互斥。
     let mut backfill = match pull_worker.as_ref() {
         Some((_, pull_cfg)) => {
             let meta = engine.read().meta_arc();
-            let mut bf_cfg = repl_backfill::BackfillConfig::from_env(pull_cfg.clone())
-                .map_err(fs3_core::Error::InvalidArgument)?;
+            let mut bf_cfg =
+                repl_backfill::BackfillConfig::resolve(pull_cfg.clone(), cfg.replication.as_ref())
+                    .map_err(fs3_core::Error::InvalidArgument)?;
             bf_cfg.traffic = repl_traffic.clone();
             let svc = repl_backfill::BackfillService::spawn(Arc::clone(&engine), meta, bf_cfg)
                 .map_err(fs3_core::Error::InvalidArgument)?;
@@ -1571,8 +1599,9 @@ pub(crate) fn engine_config_inner_multi(
         rebalance: fs3_engine::RebalanceConfig::default(),
         compression: fs3_core::CompressionConfig::default(),
         clock_offset_secs: 0,
-        // M21:复制 binlog 仍走 env FS3D_REPL_BINLOG 开发态开关
-        // (Engine::open 内或值合并;配置字段接线属 F 组)
+        // M21 F3:复制 binlog 由 [replication] 段驱动(cmd_serve 装配;
+        // 单次 CLI 命令恒不开)。env FS3D_REPL_BINLOG 保留为测试钩子,
+        // Engine::open 内或值合并。
         repl_binlog: false,
     })
 }
@@ -1624,8 +1653,9 @@ fn engine_config(
         rebalance: fs3_engine::RebalanceConfig::default(),
         compression: fs3_core::CompressionConfig::default(),
         clock_offset_secs,
-        // M21:复制 binlog 仍走 env FS3D_REPL_BINLOG 开发态开关
-        // (Engine::open 内或值合并;配置字段接线属 F 组)
+        // M21 F3:复制 binlog 由 [replication] 段驱动(cmd_serve 装配;
+        // 单次 CLI 命令恒不开)。env FS3D_REPL_BINLOG 保留为测试钩子,
+        // Engine::open 内或值合并。
         repl_binlog: false,
     })
 }

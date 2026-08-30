@@ -105,6 +105,9 @@ impl SettingsProvider {
                     "key_file": d.key_file,
                 })),
             },
+            // M21 F3:主备复制视图(段缺席 = 缺省填充;证书/私钥只回显
+            // 路径,与 kms token_file 同口径——路径非机密)
+            "replication": replication_view(cfg.replication.as_ref()),
         }))
     }
 
@@ -182,6 +185,29 @@ impl SettingsProvider {
             ),
             ("auth", &["region"][..]),
             (
+                "replication",
+                &[
+                    "role",
+                    "listen",
+                    "ca_cert",
+                    "client_cert",
+                    "client_key",
+                    "server_cert",
+                    "server_key",
+                    "primary_url",
+                    "slot_name",
+                    "bucket_include",
+                    "bucket_exclude",
+                    "repl_retain_hours",
+                    "repl_retain_bytes",
+                    "repl_retain_bytes_hard",
+                    "max_slots",
+                    "data_pull_concurrency",
+                    "read_fetch_timeout_secs",
+                    "export_rate",
+                ][..],
+            ),
+            (
                 "kms",
                 &[
                     "backend",
@@ -208,6 +234,16 @@ impl SettingsProvider {
         if let Some(dep) = obj.get("kms").and_then(|k| k.get("deploy")) {
             file_fields.push(("kms.deploy".into(), dep.clone()));
             restart.push("kms.deploy".into());
+        }
+
+        // M21 F3:`[replication.traffic_weights]` 整表写入(权重需重启;
+        // 照 kms.deploy 先例)
+        if let Some(w) = obj
+            .get("replication")
+            .and_then(|r| r.get("traffic_weights"))
+        {
+            file_fields.push(("replication.traffic_weights".into(), w.clone()));
+            restart.push("replication.traffic_weights".into());
         }
 
         // 写入配置文件
@@ -276,8 +312,45 @@ impl SettingsProvider {
     }
 }
 
-// ── 日志级别热重载(全局;main.rs 初始化) ──
+/// M21 F3:[replication] 段的设置页视图(段缺席 = 缺省填充;缺省口径
+/// 与 repl.rs / repl_worker.rs / repl_backfill.rs 装配一致)。
+fn replication_view(c: Option<&crate::config::ReplicationConfig>) -> Value {
+    let empty;
+    let c = match c {
+        Some(c) => c,
+        None => {
+            empty = crate::config::ReplicationConfig::default();
+            &empty
+        }
+    };
+    json!({
+        "role": c.role.clone().unwrap_or_else(|| "primary".into()),
+        "listen": c.listen.clone().unwrap_or_else(|| "0.0.0.0:9445".into()),
+        "ca_cert": c.ca_cert,
+        "client_cert": c.client_cert,
+        "client_key": c.client_key,
+        "server_cert": c.server_cert,
+        "server_key": c.server_key,
+        "primary_url": c.primary_url,
+        "slot_name": c.slot_name,
+        "bucket_include": c.bucket_include,
+        "bucket_exclude": c.bucket_exclude,
+        "repl_retain_hours": c.repl_retain_hours.unwrap_or(24),
+        "repl_retain_bytes": c.repl_retain_bytes.clone().unwrap_or_else(|| "8GiB".into()),
+        "repl_retain_bytes_hard": c.repl_retain_bytes_hard.clone().unwrap_or_else(|| "32GiB".into()),
+        "max_slots": c.max_slots.unwrap_or(16),
+        "data_pull_concurrency": c.data_pull_concurrency.unwrap_or(8),
+        "read_fetch_timeout_secs": c.read_fetch_timeout_secs.unwrap_or(30),
+        "export_rate": c.export_rate.clone().unwrap_or_else(|| "64MiB".into()),
+        "traffic_weights": c.traffic_weights.map(|w| json!({
+            "serve": w.serve,
+            "backfill": w.backfill,
+            "on_demand": w.on_demand,
+        })),
+    })
+}
 
+// ── 日志级别热重载(全局;main.rs 初始化) ──
 static LOG_LEVEL: std::sync::OnceLock<Arc<std::sync::Mutex<String>>> = std::sync::OnceLock::new();
 
 /// 记录当前日志级别(供设置页显示)。
@@ -397,5 +470,119 @@ mod tests {
             loaded.kms.token_file.as_deref(),
             Some("/etc/fasts3/kms.token")
         );
+    }
+
+    /// M21 F3:PATCH [replication] 字段写入配置并标记 restart_required;
+    /// traffic_weights 整表写入;get 视图回读一致。
+    #[test]
+    fn repl_config_settings_patch_restart_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("disk.img");
+        std::fs::File::create(&img)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
+        let cfg = fs3_engine::EngineConfig {
+            devices: vec![img.clone()],
+            meta_dir: dir.path().join("meta"),
+            compaction: fs3_engine::CompactionConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let engine = std::sync::Arc::new(parking_lot::RwLock::new(
+            fs3_engine::Engine::open(&cfg).unwrap(),
+        ));
+        let svc = std::sync::Arc::new(fs3_s3::S3Service::new(
+            engine,
+            vec![fs3_s3::auth::Credentials {
+                access_key: "ak".into(),
+                secret_key: "sk".into(),
+            }],
+            "us-east-1".into(),
+            false,
+        ));
+        let toml_path = dir.path().join("fasts3.toml");
+        std::fs::write(&toml_path, "[storage]\ndevices=[\"/d\"]\nmeta_dir=\"/m\"\n").unwrap();
+        let p = SettingsProvider::new(Some(toml_path.clone()), svc);
+        let out = p
+            .patch(&json!({
+                "replication": {
+                    "role": "standby",
+                    "listen": "0.0.0.0:9445",
+                    "ca_cert": "tls/ca.pem",
+                    "client_cert": "tls/node-b.pem",
+                    "client_key": "tls/node-b.key",
+                    "primary_url": "https://node-a:9445",
+                    "slot_name": "node-b",
+                    "bucket_include": ["a", "b"],
+                    "repl_retain_hours": 48,
+                    "repl_retain_bytes_hard": "32GiB",
+                    "max_slots": 8,
+                    "data_pull_concurrency": 4,
+                    "read_fetch_timeout_secs": 15,
+                    "export_rate": "128MiB",
+                    "traffic_weights": { "serve": 100, "backfill": 50, "on_demand": 10 }
+                }
+            }))
+            .unwrap();
+        let restart: Vec<String> = out["restart_required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        for k in [
+            "replication.role",
+            "replication.listen",
+            "replication.primary_url",
+            "replication.bucket_include",
+            "replication.repl_retain_bytes_hard",
+            "replication.max_slots",
+            "replication.export_rate",
+            "replication.traffic_weights",
+        ] {
+            assert!(
+                restart.iter().any(|s| s == k),
+                "{k} 需标注 restart: {restart:?}"
+            );
+        }
+        assert_eq!(out["saved_to_file"], json!(true));
+        // 写盘回读:toml 含 [replication] 段且 load_config 解析一致
+        let text = std::fs::read_to_string(&toml_path).unwrap();
+        assert!(text.contains("[replication]"), "{text}");
+        let loaded = crate::config::load_config(Some(&toml_path)).unwrap();
+        let r = loaded.replication.as_ref().unwrap();
+        assert_eq!(r.role.as_deref(), Some("standby"));
+        assert_eq!(r.listen.as_deref(), Some("0.0.0.0:9445"));
+        assert_eq!(r.ca_cert.as_deref(), Some("tls/ca.pem"));
+        assert_eq!(r.client_cert.as_deref(), Some("tls/node-b.pem"));
+        assert_eq!(r.client_key.as_deref(), Some("tls/node-b.key"));
+        assert_eq!(r.primary_url.as_deref(), Some("https://node-a:9445"));
+        assert_eq!(r.slot_name.as_deref(), Some("node-b"));
+        assert_eq!(r.bucket_include, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(r.repl_retain_hours, Some(48));
+        assert_eq!(r.repl_retain_bytes_hard.as_deref(), Some("32GiB"));
+        assert_eq!(r.max_slots, Some(8));
+        assert_eq!(r.data_pull_concurrency, Some(4));
+        assert_eq!(r.read_fetch_timeout_secs, Some(15));
+        assert_eq!(r.export_rate.as_deref(), Some("128MiB"));
+        let w = r.traffic_weights.unwrap();
+        assert_eq!((w.serve, w.backfill, w.on_demand), (100, 50, 10));
+        // get 视图回读一致(含缺省填充字段)
+        let view = p.get().unwrap();
+        let rv = &view["replication"];
+        assert_eq!(rv["role"], json!("standby"));
+        assert_eq!(rv["primary_url"], json!("https://node-a:9445"));
+        assert_eq!(rv["bucket_include"], json!(["a", "b"]));
+        assert_eq!(rv["repl_retain_hours"], json!(48));
+        assert_eq!(rv["repl_retain_bytes_hard"], json!("32GiB"));
+        assert_eq!(rv["max_slots"], json!(8));
+        assert_eq!(rv["traffic_weights"]["backfill"], json!(50));
+        // 未配置的容量软上限给缺省展示值
+        assert_eq!(rv["repl_retain_bytes"], json!("8GiB"));
+        assert_eq!(rv["server_cert"], json!(null));
     }
 }

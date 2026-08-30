@@ -9,8 +9,8 @@
 //!   ReplImportWriter 路径,布局独立 §4.3),再单事务清算
 //!   (`MetaStore::repl_localize_segments`:meta 段表改写 + pending
 //!   引用摘除 + a:/t: 分配记录,崩溃安全,语义钉死在 fs3-meta 层)。
-//! - **并发**:池并发默认 8(env `FS3D_REPL_DATA_PULL_CONCURRENCY`,F3
-//!   收口前的最小入口);并发单位 = 一个 pending 条目内目标键的拉取 +
+//! - **并发**:池并发默认 8(`[replication].data_pull_concurrency`,
+//!   M21 F3 收口);并发单位 = 一个 pending 条目内目标键的拉取 +
 //!   清算任务,信号量收口。
 //! - **失败口径**:本地写失败 / CRC 不符 / 上游 5xx → warn 日志 + 退避
 //!   重试(条目留在队列,下轮重来;**不静默吞错**);「显式重建」类
@@ -69,8 +69,7 @@ const POOL_SCAN_BATCH: usize = 256;
 /// 下轮池扫描重来;防活锁)。
 const LOCALIZE_MAX_ROUNDS: u32 = 8;
 
-/// 回填池配置(env 最小入口,照 FS3D_REPL_* 先例;F3 收口 [replication]
-/// 配置段前的开发面)。
+/// 回填池配置([replication] 段装配,M21 F3;见模块注释)。
 #[derive(Debug, Clone)]
 pub struct BackfillConfig {
     /// 上游连接面(mTLS 材料/槽名与 pull worker 同源)。
@@ -86,24 +85,34 @@ pub struct BackfillConfig {
 }
 
 impl BackfillConfig {
-    /// env 最小配置入口:`FS3D_REPL_DATA_PULL_CONCURRENCY`(缺省 8)、
-    /// `FS3D_REPL_READ_FETCH_TIMEOUT_SECS`(缺省 30)。
-    pub fn from_env(pull: PullConfig) -> Result<BackfillConfig, String> {
-        let parse = |k: &str, default: u64| -> Result<u64, String> {
-            std::env::var(k)
-                .ok()
-                .map(|s| s.parse().map_err(|e| format!("bad {k}: {e}")))
-                .transpose()
-                .map(|v| v.unwrap_or(default))
+    /// 配置段入口(M21 F3):`[replication].data_pull_concurrency`(缺省
+    /// 8)、`[replication].read_fetch_timeout_secs`(缺省 30)为准;字段
+    /// 缺席回退 env 测试钩子 `FS3D_REPL_DATA_PULL_CONCURRENCY` /
+    /// `FS3D_REPL_READ_FETCH_TIMEOUT_SECS`。
+    pub fn resolve(
+        pull: PullConfig,
+        c: Option<&crate::config::ReplicationConfig>,
+    ) -> Result<BackfillConfig, String> {
+        let parse = |field: Option<u64>, k: &str, default: u64| -> Result<u64, String> {
+            match field {
+                Some(v) => Ok(v),
+                None => std::env::var(k)
+                    .ok()
+                    .map(|s| s.parse().map_err(|e| format!("bad {k}: {e}")))
+                    .transpose()
+                    .map(|v| v.unwrap_or(default)),
+            }
         };
         Ok(BackfillConfig {
             pull,
             data_pull_concurrency: parse(
+                c.and_then(|c| c.data_pull_concurrency).map(|v| v as u64),
                 "FS3D_REPL_DATA_PULL_CONCURRENCY",
                 DEFAULT_DATA_PULL_CONCURRENCY as u64,
             )? as usize,
             pool_enabled: true,
             read_fetch_timeout: Duration::from_secs(parse(
+                c.and_then(|c| c.read_fetch_timeout_secs),
                 "FS3D_REPL_READ_FETCH_TIMEOUT_SECS",
                 DEFAULT_READ_FETCH_TIMEOUT_SECS,
             )?),

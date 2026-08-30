@@ -120,3 +120,37 @@ key_rps = 0
 # # auto_unseal = false
 # # key_file = "/etc/fasts3/kms-unseal.key"
 
+# ── M21 主备复制(ADR-33;docs/replication-design.md §6.1)──
+# 段缺席 = 单机(默认)。两台 FastS3 = 一个主备对:写走主、读走备,
+# 主机故障手动 promote(admin /v1/admin/replication/promote,dry-run 前置)。
+# 复制口独立监听(mTLS 强制,客户端证书 CN = node_id;证书签发走
+# deploy/tls/ 手工或 center 登记);ca_cert/server_cert/server_key 同设才开
+# 复制入站口(缺任一项启动显式失败,不静默降级);备端配 primary_url 即
+# 启用 pull 追赶(须 role = "standby",配了上游但角色是主 = 启动报错)。
+# env FS3D_REPL_* 保留为测试钩子(tests/ 演练),配置字段缺席才回退。
+#
+# [replication]
+# role = "standby"                     # primary(缺省) | standby
+# listen = "0.0.0.0:9445"              # 复制入站口(standby 设了才开中继对下服务)
+# ca_cert = "/etc/fasts3/tls/ca.pem"   # 根信任(校验下游客户端 + 上游服务端)
+# client_cert = "/etc/fasts3/tls/node.pem"   # CN = node_id(pull/hello 身份)
+# client_key = "/etc/fasts3/tls/node.key"    # 0600
+# server_cert = "/etc/fasts3/tls/repl-server.pem"   # 复制口服务端材料
+# server_key = "/etc/fasts3/tls/repl-server.key"    # 0600
+# primary_url = "https://node-a:9445"  # 备端/中继的上游复制口
+# slot_name = "node-b"                 # 缺省 = client_cert 的 CN(node_id)
+# bucket_include = []                  # 桶级:只复制名单内桶(与 exclude 互斥)
+# bucket_exclude = []                  # 皆空 = 实例级全量;变更 = drop + 重建槽
+# repl_retain_hours = 24               # binlog 保留软上限(超限停截断告警保槽)
+# repl_retain_bytes = "8GiB"           # 软上限字节(与 hours 任一超限即触发)
+# repl_retain_bytes_hard = "32GiB"     # 硬上限(强截 + 被越过槽 stale → 显式重建)
+# max_slots = 16                       # 复制槽扇出硬上限(裁定 2;第 17 槽 403)
+# data_pull_concurrency = 8            # 段回填池并发
+# read_fetch_timeout_secs = 30         # 读路径按需拉取超时(超时 503)
+# export_rate = "64MiB"                # 复制口 serve/中继共享桶限速(字节/秒)
+#
+# [replication.traffic_weights]        # 裁定 4:投递 > 回填 > 按需拉取;权重 ≥1
+# serve = 100
+# backfill = 50
+# on_demand = 10
+

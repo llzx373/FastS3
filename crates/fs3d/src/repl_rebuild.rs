@@ -59,6 +59,9 @@ pub struct RebuildService {
     /// 中继流量共享桶(E2;重建后重起的回填池注入同一预算;None =
     /// 回填池独立无限桶)。
     traffic: Option<Arc<ReplTraffic>>,
+    /// `[replication]` 配置段(M21 F3;重建后重起回填池的并发/超时
+    /// 取值源,与启动装配同口径;None = 纯 env 测试钩子形态)。
+    repl_cfg: Option<crate::config::ReplicationConfig>,
     inner: Mutex<Inner>,
 }
 
@@ -82,12 +85,14 @@ impl RebuildService {
         meta: Arc<MetaStore>,
         pull_cfg: PullConfig,
         traffic: Option<Arc<ReplTraffic>>,
+        repl_cfg: Option<crate::config::ReplicationConfig>,
     ) -> RebuildService {
         RebuildService {
             engine,
             service,
             meta,
             traffic,
+            repl_cfg,
             inner: Mutex::new(Inner {
                 pull: None,
                 backfill: None,
@@ -248,7 +253,8 @@ impl RebuildService {
             cfg.clone(),
         )
         .map_err(|e| RebuildError::Failed(format!("restart pull worker: {e}")))?;
-        let mut bf_cfg = BackfillConfig::from_env(cfg.clone()).map_err(RebuildError::Failed)?;
+        let mut bf_cfg = BackfillConfig::resolve(cfg.clone(), self.repl_cfg.as_ref())
+            .map_err(RebuildError::Failed)?;
         bf_cfg.traffic = self.traffic.clone();
         let backfill =
             BackfillService::spawn(Arc::clone(&self.engine), Arc::clone(&self.meta), bf_cfg)
@@ -441,7 +447,7 @@ pub struct RebuildArgs {
     /// 新主复制口(https://host:9445;旧主重加入 = 给新主地址)
     #[arg(long)]
     pub from: String,
-    /// 复制槽名(缺省 = 节点现配置 FS3D_REPL_SLOT_NAME/node_id)
+    /// 复制槽名(缺省 = 节点现配置 [replication].slot_name/node_id)
     #[arg(long)]
     pub slot: Option<String>,
     /// 本机 admin 通道(unix:///path 或 127.0.0.1:9001;缺省取配置

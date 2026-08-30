@@ -258,6 +258,32 @@ key_rps = 0                    # 每密钥每秒请求上限(0 = 关闭)
 # 无 KMS 企业走控制台托管向导(backend=managed + [kms.deploy])。token 不进本文件。
 # [kms]
 # backend = "none"
+
+# M21 主备复制(ADR-33;docs/replication-design.md §6.1):段缺席 = 单机(默认)。
+# 复制口独立监听(mTLS 强制,客户端证书 CN = node_id);配了 primary_url 即启用
+# pull(须 role = "standby");ca_cert/server_cert/server_key 同设才开复制入站口。
+# 证书签发走 deploy/tls/ 或 center 登记流程;字段全集见 deploy/config/fasts3.example.toml。
+# [replication]
+# role = "standby"                 # primary(缺省) | standby
+# listen = "0.0.0.0:9445"
+# ca_cert = "/etc/fasts3/tls/ca.pem"
+# client_cert = "/etc/fasts3/tls/node.pem"
+# client_key = "/etc/fasts3/tls/node.key"
+# server_cert = "/etc/fasts3/tls/repl-server.pem"
+# server_key = "/etc/fasts3/tls/repl-server.key"
+# primary_url = "https://node-a:9445"
+# slot_name = "node-b"             # 缺省 = client_cert 的 CN(node_id)
+# bucket_include = []              # 与 bucket_exclude 互斥;皆空 = 实例级全量
+# repl_retain_hours = 24
+# repl_retain_bytes_hard = "32GiB"
+# max_slots = 16
+# data_pull_concurrency = 8
+# read_fetch_timeout_secs = 30
+# export_rate = "64MiB"            # 复制口 serve/中继共享桶限速(字节/秒)
+# [replication.traffic_weights]    # 裁定 4:投递 > 回填 > 按需拉取
+# serve = 100
+# backfill = 50
+# on_demand = 10
 "#,
         device = device.display(),
         meta = meta_dir.display(),
