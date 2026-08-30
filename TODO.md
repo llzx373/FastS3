@@ -175,12 +175,12 @@
   EpochBarrier 同事务落盘 → role=primary → 开写路径
   - 用例:`promote_dry_run_lists_discards_without_side_effect`;
     `promote_crash_no_half_state`(R12:promote 中途 kill -9 重启后状态唯一)
-- [ ] E4 fencing 与重加入:旧 epoch 写入全网络拒收;旧主握手必中 `ErrDiverged`;
+- [x] E4 fencing 与重加入:旧 epoch 写入全网络拒收;旧主握手必中 `ErrDiverged`;
   唯一路径 `rebuild --as-standby --from <new_primary>`;级联 promote 后下游重握手
   自动续流(executed 含旧 epoch 段,新主 GTID 集继承包含)
   - 用例:`old_primary_rejoin_rejected_then_rebuilt`;
     `cascade_downstreams_follow_promoted_relay`
-- [ ] E5 备端只读面:S3 层写动词统一 501 `ReplicationStandby`;响应头
+- [x] E5 备端只读面:S3 层写动词统一 501 `ReplicationStandby`;响应头
   `X-FastS3-Repl-Applied-Gtid`;promote 后全功能恢复(compaction 等后台恢复)
   - 用例:`standby_rejects_all_write_verbs`;`promoted_standby_serves_writes`
 
