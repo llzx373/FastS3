@@ -45,8 +45,8 @@
 //!   (main.rs cmd_serve)。
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use fs3_core::{AllocDraft, Gtid, Segment};
@@ -377,8 +377,9 @@ async fn backoff(cfg: &PullConfig, stop: &Arc<AtomicBool>) -> bool {
 /// 错误分类:Fatal = 「显式重建/配置修正」类,不热循环(ADR-33 RP2.3);
 /// Gone = ErrBinlogGone 特化(调用方按本地 executed 空/非空裁决:
 /// 空 = C2 快照 bootstrap,非空 = Fatal 显式重建)。
+/// C3 回填池复用(上游错误口径同一分类)。
 #[derive(Debug)]
-enum PullError {
+pub(crate) enum PullError {
     Fatal(String),
     Gone(String),
     Transient(String),
@@ -499,7 +500,8 @@ async fn ack(
 // ─────────────────── C2 快照 bootstrap(空库引导/位点判死重建;语义见模块注释) ───────────────────
 
 /// extent-data 单块上限(与服务端 MAX_EXTENT_DATA_LEN 对齐;大段分块)。
-const EXTENT_DATA_CHUNK: u64 = 64 * 1024 * 1024;
+/// C3 回填池(repl_backfill)同口径复用。
+pub(crate) const EXTENT_DATA_CHUNK: u64 = 64 * 1024 * 1024;
 /// 快照 meta 页拉取批大小(与服务端 MAX_SNAPSHOT_PAGE_LIMIT 内)。
 const SNAPSHOT_PAGE_LIMIT: usize = 256;
 
@@ -736,8 +738,8 @@ async fn import_segments(
 }
 
 /// 错误码分类(ADR-33 RP2.3/RP3):「显式重建/配置修正」类 = Fatal,
-/// 其余 = Transient(退避重连)。
-fn classify(status: u16, json: &serde_json::Value, what: &str) -> PullError {
+/// 其余 = Transient(退避重连)。C3 回填池同口径复用。
+pub(crate) fn classify(status: u16, json: &serde_json::Value, what: &str) -> PullError {
     let code = json["error"].as_str().unwrap_or("");
     let detail = json["detail"].as_str().unwrap_or("");
     let msg = || format!("{what}: HTTP {status} {code} {detail}");
@@ -769,7 +771,8 @@ fn parse_gtid_str(s: &str) -> Option<Gtid> {
 /// 装载 mTLS 客户端配置(根信任 + 客户端证书;照 fs3-agent tls.rs
 /// load_client_tls 样板——fs3-agent 在 fs3d 是可选依赖(agent feature
 /// 默认关,ADR-17 DV1 门禁),复制链路不挂该 feature,此处最小复刻)。
-fn build_client_tls(cfg: &PullConfig) -> Result<Arc<rustls::ClientConfig>, String> {
+/// C3 回填池(repl_backfill)复用同一装载实现。
+pub(crate) fn build_client_tls(cfg: &PullConfig) -> Result<Arc<rustls::ClientConfig>, String> {
     fn load_certs(
         path: &std::path::Path,
     ) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, String> {
@@ -823,8 +826,9 @@ async fn call(
     Ok((status, json))
 }
 
-/// extent-data 用原始字节变体(C2):返回 (status, crc32c 响应头, 字节)。
-async fn call_raw(
+/// extent-data 用原始字节变体(C2;C3 回填池同路径复用):返回
+/// (status, crc32c 响应头, 字节)。
+pub(crate) async fn call_raw(
     cfg: &PullConfig,
     tls: &Arc<rustls::ClientConfig>,
     method: &str,

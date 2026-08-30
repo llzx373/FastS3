@@ -21,6 +21,7 @@ mod loadgen;
 mod meta;
 mod pool_cmds;
 mod repl;
+mod repl_backfill;
 mod repl_worker;
 mod rewrite;
 mod settings;
@@ -680,16 +681,26 @@ fn assemble_kms(cfg: &config::RootConfig) -> fs3_core::Result<AssembledKms> {
             Ok((Some(mgr), Some(Arc::new(v))))
         }
         KmsBackendMode::External => {
-            let addr = cfg.kms.vault_addr.as_deref().filter(|s| !s.is_empty()).ok_or_else(|| {
-                fs3_core::Error::InvalidArgument(
-                    "[kms].backend=external requires vault_addr".into(),
-                )
-            })?;
-            let token_path = cfg.kms.token_file.as_deref().filter(|s| !s.is_empty()).ok_or_else(|| {
-                fs3_core::Error::InvalidArgument(
-                    "[kms].backend=external requires token_file (0600; token 不进 toml)".into(),
-                )
-            })?;
+            let addr = cfg
+                .kms
+                .vault_addr
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    fs3_core::Error::InvalidArgument(
+                        "[kms].backend=external requires vault_addr".into(),
+                    )
+                })?;
+            let token_path = cfg
+                .kms
+                .token_file
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    fs3_core::Error::InvalidArgument(
+                        "[kms].backend=external requires token_file (0600; token 不进 toml)".into(),
+                    )
+                })?;
             let token = read_kms_token_file(std::path::Path::new(token_path))?;
             let v = fs3_kms::VaultKms::new(fs3_kms::VaultKmsConfig {
                 addr: addr.to_string(),
@@ -1192,13 +1203,30 @@ fn cmd_serve(
     let mut pull_worker = match repl_worker::PullConfig::from_env() {
         Ok(Some(pull_cfg)) => {
             let meta = engine.read().meta_arc();
-            let worker = repl_worker::PullWorker::spawn(Arc::clone(&engine), meta, pull_cfg)
-                .map_err(fs3_core::Error::InvalidArgument)?;
+            let worker =
+                repl_worker::PullWorker::spawn(Arc::clone(&engine), meta, pull_cfg.clone())
+                    .map_err(fs3_core::Error::InvalidArgument)?;
             tracing::info!("replication pull worker started (role=standby)");
-            Some(worker)
+            Some((worker, pull_cfg))
         }
         Ok(None) => None,
         Err(e) => return Err(fs3_core::Error::InvalidArgument(e)),
+    };
+    // M21 C3(ADR-33 RP4.2;设计稿 §3.2/§4.2):段回填池——apply 落的
+    // data_pending 段引用经上游 extent-data 并发拉取(默认 8,
+    // FS3D_REPL_DATA_PULL_CONCURRENCY)+ 本地分配器重落盘 + 单事务清算;
+    // C4 读路径按需拉取共用本服务的拉取原语与清算互斥。
+    let mut backfill = match pull_worker.as_ref() {
+        Some((_, pull_cfg)) => {
+            let meta = engine.read().meta_arc();
+            let bf_cfg = repl_backfill::BackfillConfig::from_env(pull_cfg.clone())
+                .map_err(fs3_core::Error::InvalidArgument)?;
+            let svc = repl_backfill::BackfillService::spawn(Arc::clone(&engine), meta, bf_cfg)
+                .map_err(fs3_core::Error::InvalidArgument)?;
+            tracing::info!("replication backfill pool started");
+            Some(svc)
+        }
+        None => None,
     };
 
     // 生命周期 worker 启动(创建见 admin 装配前;解耦仅为注入 stats Arc)
@@ -1395,8 +1423,19 @@ fn cmd_serve(
     }
     // M21 B4:复制 pull worker 停止(游标/executed 同事务落盘,重启从
     // 本地游标续传;先于引擎收尾,避免与 meta 关闭竞写)
-    if let Some(h) = pull_worker.take() {
+    if let Some((h, _)) = pull_worker.take() {
         h.shutdown();
+    }
+    // M21 C3:段回填池停止(拉取中任务在当前块完成后退出;pending 队列
+    // 持久化,重启续回填)。关停口径日志带待回填字节/累计拉取计数
+    // (D4 指标导出前的运维可观测面)
+    if let Some(svc) = backfill.take() {
+        tracing::info!(
+            data_pending_bytes = svc.data_pending_bytes(),
+            extent_data_requests = svc.extent_data_requests(),
+            "replication backfill pool stopping"
+        );
+        svc.shutdown();
     }
     tracing::info!("http workers drained; finalizing engine (checkpoint + meta close)");
     let mut eng = engine.write();

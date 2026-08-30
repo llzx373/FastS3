@@ -89,6 +89,20 @@ pub enum ReplApplyOutcome {
     SkippedDuplicate,
 }
 
+/// 段回填清算的单键替换项(M21 C3;MetaStore::repl_localize_segments
+/// 入参):目标原始键(o: 当前/版本键或 p: 分片键)+ 该键内上游段的
+/// 本地替换表。语义见 repl_localize_segments 上方小节注释。
+#[derive(Debug, Clone)]
+pub struct ReplLocalizeItem {
+    /// 目标原始键(`o:{bucket}\0{esc(key)}[\0{vk16}]` 或
+    /// `p:{upload_id}\0{part_no}`)。
+    pub key: Vec<u8>,
+    /// 上游段身份 → 本地段表(调用方已把字节经本地分配器落盘;按对象
+    /// 字节序)。替换按 (extent_id, offset, len) 身份精确匹配,允许
+    /// 一项替换表覆盖 extents 与 restore_state.restored_extents 两侧。
+    pub subs: Vec<(repl::DataRef, Vec<fs3_core::Segment>)>,
+}
+
 #[derive(Debug, Clone)]
 pub struct MetaConfig {
     pub flush_every_ms: u64,
@@ -2823,6 +2837,196 @@ impl MetaStore {
             }
         }
         Ok(out)
+    }
+
+    /// 原始键点读(C3 回填池的段匹配输入:o:/p: 全形态;值含版本字节)。
+    pub fn repl_raw_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.db.get(key).map_err(rocks_err)
+    }
+
+    // —— 段回填清算(M21 C3;ADR-33 RP4.2;设计稿 §3.2/§4.2) ——
+    //
+    // 语义钉死(实现注释 = 唯一事实补充,偏离走 ADR):
+    // - **meta 改写 + pending 清算 + 本地段分配记录 = 一个事务**(崩溃
+    //   安全):本地段字节在事务前已落盘,事务失败由调用方
+    //   repl_import_abort 精确逆转分配账目(同 put 路径 abort_draft
+    //   口径),孤儿字节由恢复按活段 max_end 覆盖;
+    // - **替换按上游段身份 (extent_id, offset, len) 精确匹配**:并发
+    //   apply 覆盖了对象 → 旧引用不再出现 → 乐观事务读集冲突,提交
+    //   失败显式返回 ObjectChanged 交调用方重取状态重组——绝不把本地
+    //   段写进已不属于它的段表槽位;
+    // - **pending 清算按记录粒度**:`consumed` 从所属条目摘除引用
+    //   (extent_id/offset/len 匹配),条目引空即删键;失去引用的
+    //   「死引用」(对象被并发覆盖/删除)以零替换 consumed 摘除,
+    //   无需拉取;
+    // - **COW 共享段**(CopyObject/UploadPartCopy 跨记录共享同一上游
+    //   段):同一引用可出现于多个 pending 条目;清算只摘 `consumed`
+    //   指明条目的那份,其余条目处理时独立拉取落盘——复制边界上不保
+    //   COW 共享(布局独立 §4.3 的当然代价);
+    // - **无内部重试**:items/consumed/alloc 是调用方对当前状态的快照
+    //   推导,提交冲突 = 状态已变,一律 ObjectChanged 交调用方重组
+    //   (替换表身份匹配幂等,重组安全)。
+
+    /// 段回填清算(单个乐观事务;语义见上方小节注释)。返回替换段数
+    /// (观测/测试用)。`alloc_seq` = 分配记录挂载位点(回填池 =
+    /// 待回填条目的 gtid.seq,恢复重放语义同 import_repl_batch 的
+    /// import_seq 口径)。
+    pub fn repl_localize_segments(
+        &self,
+        items: &[ReplLocalizeItem],
+        consumed: &[(Gtid, repl::DataRef)],
+        alloc: Option<&AllocDraft>,
+        alloc_seq: u64,
+    ) -> Result<u64> {
+        let tx = self.db.transaction_opt(&self.write_opts, &self.txn_opts);
+        let mut substituted = 0u64;
+        for item in items {
+            let Some(raw) = tx.get(&item.key).map_err(rocks_err)? else {
+                // 键在快照后被删:替换表失去落点,显式失败交调用方重组
+                // (本地段账目由调用方 abort 逆转)
+                tx.rollback().map_err(rocks_err)?;
+                return Err(Error::ObjectChanged(format!(
+                    "repl localize target key ({} bytes) deleted",
+                    item.key.len()
+                )));
+            };
+            let mut matched = vec![false; item.subs.len()];
+            // 段表替换:身份匹配 → 本地段表拼接(一项替换表覆盖主段与
+            // 恢复副本段两侧;同一引用在单键内至多出现一次)
+            let mut remap = |list: &[fs3_core::Segment]| -> Result<Vec<fs3_core::Segment>> {
+                let mut out = Vec::with_capacity(list.len());
+                for s in list {
+                    let mut hit = false;
+                    for (i, (dref, local)) in item.subs.iter().enumerate() {
+                        if dref.extent_id == s.extent_id
+                            && dref.offset == s.offset
+                            && dref.len == s.len
+                        {
+                            if matched[i] {
+                                tx.rollback().map_err(rocks_err)?;
+                                return Err(Error::Corrupt(format!(
+                                    "repl localize: segment {dref:?} referenced twice in one key"
+                                )));
+                            }
+                            matched[i] = true;
+                            substituted += 1;
+                            out.extend(local.iter().cloned());
+                            hit = true;
+                            break;
+                        }
+                    }
+                    if !hit {
+                        out.push(s.clone());
+                    }
+                }
+                Ok(out)
+            };
+            if item.key.starts_with(PREFIX_OBJECT) {
+                let mut meta = decode_object(&raw)?;
+                let new_extents = remap(&meta.extents)?;
+                let new_restored = match &meta.restore_state {
+                    Some(st) => Some(remap(&st.restored_extents)?),
+                    None => None,
+                };
+                if matched.iter().all(|m| *m) && !item.subs.is_empty() {
+                    meta.extents = new_extents;
+                    if let (Some(st), Some(r)) = (&mut meta.restore_state, new_restored) {
+                        st.restored_extents = r;
+                    }
+                    tx.put(&item.key, meta.encode_value()?).map_err(rocks_err)?;
+                } else if !item.subs.is_empty() {
+                    // 部分/零匹配 = 快照后并发变更(读集冲突未覆盖的
+                    // 残留形态;正常应被提交冲突截获,双保险显式化)
+                    tx.rollback().map_err(rocks_err)?;
+                    return Err(Error::ObjectChanged(format!(
+                        "repl localize: segment refs no longer match key ({} bytes)",
+                        item.key.len()
+                    )));
+                }
+            } else if item.key.starts_with(PREFIX_PART) {
+                let mut part = decode_part(&raw)?;
+                let new_extents = remap(&part.extents)?;
+                if matched.iter().all(|m| *m) && !item.subs.is_empty() {
+                    part.extents = new_extents;
+                    tx.put(&item.key, encode_part_meta(&part)?)
+                        .map_err(rocks_err)?;
+                } else if !item.subs.is_empty() {
+                    tx.rollback().map_err(rocks_err)?;
+                    return Err(Error::ObjectChanged(format!(
+                        "repl localize: part segment refs no longer match ({} bytes)",
+                        item.key.len()
+                    )));
+                }
+            } else {
+                tx.rollback().map_err(rocks_err)?;
+                return Err(Error::InvalidArgument(format!(
+                    "repl localize target key ({} bytes) not o:/p: family",
+                    item.key.len()
+                )));
+            }
+        }
+        // pending 清算:按记录条目摘除已处理引用(幂等:条目缺席/引用
+        // 不在 = 跳过),引空删键
+        let mut by_entry: std::collections::BTreeMap<Gtid, Vec<&repl::DataRef>> =
+            std::collections::BTreeMap::new();
+        for (g, dref) in consumed {
+            by_entry.entry(*g).or_default().push(dref);
+        }
+        for (g, refs) in by_entry {
+            let pk = repl_pending_key(g);
+            let Some(raw) = tx.get(&pk).map_err(rocks_err)? else {
+                continue;
+            };
+            let mut pending: Vec<repl::DataRef> = decode(&raw)?;
+            for r in refs {
+                if let Some(pos) = pending.iter().position(|p| {
+                    p.extent_id == r.extent_id && p.offset == r.offset && p.len == r.len
+                }) {
+                    pending.swap_remove(pos);
+                }
+            }
+            if pending.is_empty() {
+                tx.delete(&pk).map_err(rocks_err)?;
+            } else {
+                tx.put(&pk, encode(&pending)?).map_err(rocks_err)?;
+            }
+        }
+        // 本地段分配记录(RMW 合并,同 import_repl_batch 口径)
+        if let Some(d) = alloc {
+            if !d.is_empty() {
+                let ak = alloc_key(alloc_seq);
+                let mut rec = match tx.get(&ak).map_err(rocks_err)? {
+                    Some(v) => decode_alloc(&v)?,
+                    None => AllocRecord {
+                        seq: alloc_seq,
+                        txn: alloc_seq,
+                        alloc: Vec::new(),
+                        ref_inc: Vec::new(),
+                        ref_dec: Vec::new(),
+                    },
+                };
+                rec.alloc.extend(d.alloc.iter().copied());
+                rec.ref_inc.extend(d.ref_inc.iter().copied());
+                rec.ref_dec.extend(d.ref_dec.iter().copied());
+                tx.put(&ak, encode(&rec)?).map_err(rocks_err)?;
+                tx.put(txn_key(alloc_seq), alloc_seq.to_be_bytes())
+                    .map_err(rocks_err)?;
+            }
+        }
+        match tx.commit() {
+            Ok(()) => {
+                if self.sync_mode == SyncMode::Full {
+                    self.db.flush_wal(true).map_err(rocks_err)?;
+                }
+                Ok(substituted)
+            }
+            // 提交冲突 = 读集(目标键/pending 条目/分配键)被并发写
+            // (apply 流或另一路清算)——无内部重试,交调用方重组
+            Err(e) if e.kind() == ErrorKind::Busy || e.kind() == ErrorKind::TryAgain => Err(
+                Error::ObjectChanged(format!("repl localize txn conflict: {e}")),
+            ),
+            Err(e) => Err(rocks_err(e)),
+        }
     }
 
     /// 复制 apply:把上游一条 binlog 记录应用进本库(单个乐观事务,
@@ -6753,6 +6957,135 @@ mod tests {
         }
     }
 
+    /// M21 C3(ADR-33 RP4.2;设计稿 §3.2/§4.2):段回填清算事务——
+    /// ① meta 段表按上游段身份改写为本地段 + pending 引用摘除(引空删
+    ///    键)+ a:/t: 分配记录 RMW 合并,单事务落定(崩溃零漂移);
+    /// ② 身份失配(快照后并发覆盖)/目标键删除 → ObjectChanged 显式
+    ///    失败,pending 与 meta 零残留变更;
+    /// ③ 死引用(对象已被覆盖,引用不再出现)零替换 consumed 摘除;
+    /// ④ 崩溃重放:重开后本地段表/空队列/a: 记录保持。
+    #[test]
+    fn repl_localize_segments_atomic_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let up_seg = Segment {
+            extent_id: 7,
+            offset: 4096,
+            len: 8192,
+            crcs: vec![0xAAAA],
+        };
+        let dref = DataRef {
+            extent_id: 7,
+            offset: 4096,
+            len: 8192,
+            crc32c: None,
+        };
+        let local_seg = Segment {
+            extent_id: 2,
+            offset: 0,
+            len: 8192,
+            crcs: vec![0xBBBB],
+        };
+        let g = |seq: u64| Gtid { epoch: 1, seq };
+        {
+            let meta = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
+            meta.apply_repl_record(
+                g(1),
+                &ReplRecord::new(
+                    1,
+                    &[Op::BucketPut {
+                        name: "b1".into(),
+                        meta: bucket_meta("b1"),
+                        location: None,
+                    }],
+                ),
+            )
+            .unwrap();
+            let mut big = object_meta(8192);
+            big.extents = vec![up_seg.clone()];
+            meta.apply_repl_record(
+                g(2),
+                &ReplRecord::new(
+                    1,
+                    &[Op::ObjectPut {
+                        bucket: "b1".into(),
+                        key: "big".into(),
+                        meta: big,
+                    }],
+                ),
+            )
+            .unwrap();
+            assert_eq!(meta.list_repl_pending(100).unwrap().len(), 1);
+
+            // ② 身份失配(不存在的上游段)→ ObjectChanged,零副作用
+            let stale = DataRef {
+                extent_id: 9,
+                ..dref
+            };
+            let err = meta
+                .repl_localize_segments(
+                    &[ReplLocalizeItem {
+                        key: object_key("b1", "big"),
+                        subs: vec![(stale, vec![local_seg.clone()])],
+                    }],
+                    &[],
+                    None,
+                    2,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::ObjectChanged(_)),
+                "失配必须显式失败: {err}"
+            );
+            assert_eq!(meta.list_repl_pending(100).unwrap().len(), 1);
+            assert_eq!(
+                meta.get_object("b1", "big").unwrap().unwrap().extents,
+                vec![up_seg.clone()]
+            );
+
+            // ① 清算:段表本地化 + pending 引空删键 + a:/t: 记录
+            let alloc = AllocDraft {
+                alloc: vec![(2, 1)],
+                ..AllocDraft::default()
+            };
+            let n = meta
+                .repl_localize_segments(
+                    &[ReplLocalizeItem {
+                        key: object_key("b1", "big"),
+                        subs: vec![(dref, vec![local_seg.clone()])],
+                    }],
+                    &[(g(2), dref)],
+                    Some(&alloc),
+                    2,
+                )
+                .unwrap();
+            assert_eq!(n, 1);
+            assert_eq!(
+                meta.get_object("b1", "big").unwrap().unwrap().extents,
+                vec![local_seg.clone()],
+                "段表改写为本地段"
+            );
+            assert!(
+                meta.list_repl_pending(100).unwrap().is_empty(),
+                "pending 引空删键"
+            );
+            let recs = meta.list_alloc_records(0).unwrap();
+            assert_eq!(recs.len(), 1);
+            assert_eq!(recs[0].seq, 2);
+            assert_eq!(recs[0].alloc, vec![(2, 1)]);
+            meta.flush().unwrap();
+        }
+        // ④ 崩溃重放:清算结果保持
+        {
+            let meta = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
+            assert_eq!(
+                meta.get_object("b1", "big").unwrap().unwrap().extents,
+                vec![local_seg.clone()]
+            );
+            assert!(meta.list_repl_pending(100).unwrap().is_empty());
+            assert_eq!(meta.list_alloc_records(0).unwrap().len(), 1);
+        }
+    }
+
     /// M21 C2(ADR-33 RP2.4/R12;设计稿 §4.3):快照导入落库与收口——
     /// ① import_repl_batch:raw put 原样落键,**不增 s:seq、不写 bl:**;
     /// ② a:{import_seq}/t:{import_seq} 多批 RMW 合并(两批同位点 →
@@ -6767,7 +7100,8 @@ mod tests {
         {
             let meta = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
             // 预置:本地既有历史(重建前的残留;finalize 必须重置而非累加)
-            meta.commit_bucket_put("stale", &bucket_meta("stale")).unwrap();
+            meta.commit_bucket_put("stale", &bucket_meta("stale"))
+                .unwrap();
             assert_eq!(meta.last_seq().unwrap(), 1);
 
             // ① 纯元数据批:不增 s:seq、不写 bl:
@@ -10481,4 +10815,3 @@ mod m21_bench_tests {
         }
     }
 }
-

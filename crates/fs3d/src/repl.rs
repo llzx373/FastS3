@@ -134,13 +134,13 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use fs3_core::{Gtid, GtidSet};
-use fs3_engine::Engine;
 use fs3_engine::worker::Throttle;
+use fs3_engine::Engine;
 use fs3_meta::{BucketFilter, MetaStore, ReplExportSession, Slot};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -3430,5 +3430,201 @@ mod tests {
         assert_eq!(subject_cn_from_der(&[0x30, 0x03, 0x02, 0x01]), None);
         let der = pem_to_der(&ca.pem());
         assert_eq!(subject_cn_from_der(&der[..der.len() / 2]), None);
+    }
+
+    /// M21 C3(ADR-33 RP4.2;设计稿 §3.2/§4.2;TODO M21/C3 具名用例):
+    /// **段回填池并发拉取 + 逐段 CRC 校验 + 终局本地化**——
+    /// ① 上游 3 对象多段(9MiB/5MiB/2.5MiB,4MiB extent),pull worker
+    ///    只 apply(回填未起):pending 队列全引用驻留;
+    /// ② 回填池(并发 4)起动后全部 pending 清空;extent-data 请求计数
+    ///    = 上游段数(逐段一次拉取,64MiB 内单块;响应头 CRC32C 逐块校
+    ///    验——校验失败必重试,队列不清空即超时,正向通路即校验兑现);
+    /// ③ 终局段表本地化:下游 extents ≠ 上游 extents(本地分配器重
+    ///    布局),三对象逐字节一致;
+    /// ④ data_pending_bytes gauge:回填前 >0,清空后归 0。
+    #[test]
+    fn backfill_pool_parallel_fetch_crc_verified() {
+        use crate::repl_backfill::{BackfillConfig, BackfillService};
+        use crate::repl_worker::PullWorker;
+        let dir = tempfile::tempdir().unwrap();
+        let up_engine = test_engine_opts(&dir.path().join("up"), 4 * 1024 * 1024, true);
+        {
+            let mut e = up_engine.write();
+            e.create_bucket_with_quota("b0", None).unwrap();
+        }
+        let up_meta = up_engine.read().meta_arc();
+        let fx = start_server_on(up_engine.clone(), up_meta.clone());
+
+        // 下游先空库引导(C2 bootstrap 不产 pending;增量才进回填通道)
+        let down_engine = test_engine(&dir.path().join("down"));
+        let down = down_engine.read().meta_arc();
+        down.set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
+        let cfg = pull_cfg(dir.path(), &fx, "s1", "node-b");
+        let w = PullWorker::spawn(down_engine.clone(), down.clone(), cfg.clone()).unwrap();
+        wait_repl_cursor(
+            &down,
+            Gtid {
+                epoch: 1,
+                seq: up_meta.last_seq().unwrap(),
+            },
+        );
+
+        // ① 增量:上游写 3 个多段对象,binlog 流 apply → pending 驻留
+        let payloads: Vec<(&str, Vec<u8>)> = [
+            ("o1", 9 * 1024 * 1024usize),
+            ("o2", 5 * 1024 * 1024usize),
+            ("o3", 5 * 512 * 1024usize),
+        ]
+        .into_iter()
+        .map(|(k, n)| (k, (0..n).map(|i| (i % 241) as u8).collect()))
+        .collect();
+        {
+            let mut e = up_engine.write();
+            for (k, p) in &payloads {
+                e.put("b0", k, &mut &p[..]).unwrap();
+            }
+        }
+        let up_seq = up_meta.last_seq().unwrap();
+        let up_segs: usize = payloads
+            .iter()
+            .map(|(k, _)| up_meta.get_object("b0", k).unwrap().unwrap().extents.len())
+            .sum();
+        assert!(up_segs >= 4, "夹具:多段并发面(实测 {up_segs} 段)");
+        wait_repl_cursor(
+            &down,
+            Gtid {
+                epoch: 1,
+                seq: up_seq,
+            },
+        );
+        let pending = down.list_repl_pending(1000).unwrap();
+        let pending_refs: usize = pending.iter().map(|(_, r)| r.len()).sum();
+        assert_eq!(pending_refs, up_segs, "apply 后全部段引用待回填");
+        assert!(!pending.is_empty());
+
+        // ② 回填池(并发 4)起动 → 清空
+        let bf = BackfillService::spawn(
+            down_engine.clone(),
+            down.clone(),
+            BackfillConfig {
+                pull: cfg,
+                data_pull_concurrency: 4,
+                pool_enabled: true,
+            },
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if down.list_repl_pending(1000).unwrap().is_empty() && bf.data_pending_bytes() == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "回填池未在限时内清空 pending(剩 {:?})",
+                down.list_repl_pending(1000).unwrap()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            bf.extent_data_requests() as usize,
+            up_segs,
+            "逐段一次 extent-data 拉取(CRC 响应头逐块校验;失败必重试)"
+        );
+        w.shutdown();
+        bf.shutdown();
+
+        // ③ 终局:段表本地化 + 逐字节一致
+        for (k, p) in &payloads {
+            let up_obj = up_meta.get_object("b0", k).unwrap().unwrap();
+            let down_obj = down.get_object("b0", k).unwrap().unwrap();
+            assert_ne!(
+                down_obj.extents, up_obj.extents,
+                "{k}: 段引用必须改写为本地段(布局独立 §4.3)"
+            );
+            assert_eq!(
+                down_obj.extents.iter().map(|s| s.len as u64).sum::<u64>(),
+                p.len() as u64,
+                "{k}: 本地段表覆盖全长"
+            );
+            let mut out = Vec::new();
+            down_engine
+                .read()
+                .get_to("b0", k, 0..u64::MAX, &mut out)
+                .unwrap();
+            assert_eq!(&out, p, "{k}: 回填后逐字节一致");
+        }
+    }
+
+    /// M21 C3(设计稿 §3.2;TODO M21/C3 具名用例):**小对象内联随
+    /// binlog 直达零往返**——内联对象字节随 Op 值直达(A1 形态),apply
+    /// 后立即可读,不进 pending 队列;回填池在侧运行仍零 extent-data
+    /// 往返(上游请求计数断言)。
+    #[test]
+    fn inline_objects_arrive_with_binlog() {
+        use crate::repl_backfill::{BackfillConfig, BackfillService};
+        use crate::repl_worker::PullWorker;
+        let dir = tempfile::tempdir().unwrap();
+        let up_engine = test_engine_opts(&dir.path().join("up"), 4 * 1024 * 1024, true);
+        {
+            let mut e = up_engine.write();
+            e.create_bucket_with_quota("b0", None).unwrap();
+        }
+        let up_meta = up_engine.read().meta_arc();
+        let fx = start_server_on(up_engine.clone(), up_meta.clone());
+
+        let down_engine = test_engine(&dir.path().join("down"));
+        let down = down_engine.read().meta_arc();
+        down.set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
+        let cfg = pull_cfg(dir.path(), &fx, "s1", "node-b");
+        // 回填池与 pull worker 同时在侧:内联对象不触发任何拉取
+        let bf = BackfillService::spawn(
+            down_engine.clone(),
+            down.clone(),
+            BackfillConfig {
+                pull: cfg.clone(),
+                data_pull_concurrency: 4,
+                pool_enabled: true,
+            },
+        )
+        .unwrap();
+        let w = PullWorker::spawn(down_engine.clone(), down.clone(), cfg).unwrap();
+        // 空库引导(bucket 经快照导入)
+        wait_repl_cursor(
+            &down,
+            Gtid {
+                epoch: 1,
+                seq: up_meta.last_seq().unwrap(),
+            },
+        );
+        // 增量:内联对象经 binlog 流直达(字节随 Op 值)
+        let inline1 = b"inline-payload-c3".to_vec();
+        up_engine
+            .write()
+            .put("b0", "inline1", &mut &inline1[..])
+            .unwrap();
+        wait_repl_cursor(
+            &down,
+            Gtid {
+                epoch: 1,
+                seq: up_meta.last_seq().unwrap(),
+            },
+        );
+
+        // apply 后立即可读(字节随 Op 直达,零等待回填)
+        let mut out = Vec::new();
+        down_engine
+            .read()
+            .get_to("b0", "inline1", 0..u64::MAX, &mut out)
+            .unwrap();
+        assert_eq!(out, inline1, "内联对象 apply 后立即可读");
+        assert!(
+            down.list_repl_pending(1000).unwrap().is_empty(),
+            "内联对象不进 pending 队列"
+        );
+        // 零 extent-data 往返:等两个池周期后计数仍 0
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        assert_eq!(bf.extent_data_requests(), 0, "内联对象零 extent-data 往返");
+        w.shutdown();
+        bf.shutdown();
     }
 }
