@@ -93,12 +93,12 @@
   postcard);GTID 集序列化/比较/包含性判定纯函数
   - 用例:`gtid_set_contains_and_divergence_matrix`(含跨 epoch 区间合并);
     `executed_set_reset_to_snapshot_point`(R12:重建后按导出位点重置,不累加)
-- [ ] A3 两级水位截断:`min(各槽 confirmed)` 约束 + `repl_retain_hours` 软上限(超限停截断
+- [x] A3 两级水位截断:`min(各槽 confirmed)` 约束 + `repl_retain_hours` 软上限(超限停截断
   + 告警)+ `repl_retain_bytes_hard` 硬上限(强截 + 槽标记 stale);仿
   `truncate_alloc_records`
   - 用例:`repl_retention_soft_cap_protects_lagging_slot`;
     `repl_retention_hard_cap_marks_slot_stale`
-- [ ] A4 演进三处同步:`keys.rs` 前缀表 + meta-export/import DTO + check 可达性扫描覆盖
+- [x] A4 演进三处同步:`keys.rs` 前缀表 + meta-export/import DTO + check 可达性扫描覆盖
   `bl:`/`s:repl_*`;layout_version 不变(纯键前缀新增,升级框架内声明)
   - 用例:`meta_export_import_carries_repl_state`;`check_scans_repl_prefixes`
 - [ ] A5 perf 验证:binlog 写放大量化(组提交路径 p99 增量 <5% 为及格线),结论落
