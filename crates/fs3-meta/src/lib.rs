@@ -2911,6 +2911,38 @@ impl MetaStore {
         }
     }
 
+    /// 本机 GTID 集 = executed ∪ 本地 binlog 覆盖(M21 E4;hello 自报
+    /// 口径)。纯主端 executed 恒空(executed 是下游 apply 侧状态),其
+    /// 本地提交历史只在 `bl:`——旧主修复后直连新主若只报 executed 会被
+    /// 当全新下游静默走快照 bootstrap(本地数据被快照导入覆盖),违反
+    /// §5.2「握手必然触发 ErrDiverged」;并上 binlog 覆盖后「有新主没
+    /// 有的 GTID」在 ② 包含性检查被确定性检出。备端 bl: ⊆ executed
+    /// (replay 同事务落),并集对纯备端零行为差。
+    pub fn repl_local_gtid_set(&self) -> Result<GtidSet> {
+        let mut set = self.repl_executed()?;
+        let mut max_per_epoch: std::collections::BTreeMap<u64, u64> =
+            std::collections::BTreeMap::new();
+        let mut after = Gtid { epoch: 0, seq: 0 };
+        loop {
+            let page = self.repl_binlog_scan(after, 1024)?;
+            if page.is_empty() {
+                break;
+            }
+            for (gtid, _) in &page {
+                let m = max_per_epoch.entry(gtid.epoch).or_insert(0);
+                *m = (*m).max(gtid.seq);
+                after = *gtid;
+            }
+            if page.len() < 1024 {
+                break;
+            }
+        }
+        for (epoch, hi) in max_per_epoch {
+            set.insert_range(epoch, 1, hi);
+        }
+        Ok(set)
+    }
+
     /// 整体重置 executed 集(直写 + fsync,照 trusted_clock 先例)。
     /// R12(ADR-33 RP2.4):快照重建后按导出位点 P 对应集合**重置替换,
     /// 不累加**——累加会残留本地旧历史段,对上游形成假分歧。下游 apply
@@ -2935,9 +2967,16 @@ impl MetaStore {
     //   并入——GTID 集无洞(§4.1/RP3.2);
     // - **不重编号**(级联预备,RP3.3/E1 中继直接受益):
     //   `bl:{原epoch}{原seq}` 写**原样 ReplRecord**(原 epoch/ops/
-    //   data_refs/ts;E3 起键含 epoch,跨代不碰撞),s:seq 推进至
-    //   max(当前, 原 seq)——防本节点 promote 转正后 seq 回退与已重放
-    //   的 bl: 键碰撞;promote 后本地写走 A1 原路径(cur+1 自增);
+    //   data_refs/ts/raw_seq;E3 起键含 epoch,跨代不碰撞),s:seq 推进至
+    //   max(当前, 原 raw seq)——防本节点 promote 转正后 seq 回退与已重放
+    //   的 bl: 键/镜像 e:/x: 队列键碰撞;promote 后本地写走 A1 原路径
+    //   (cur+1 自增);
+    // - **`e:`/`x:` 镜像键序 = 上游 raw s:seq**(M21 E4 裁决,ADR-33
+    //   RP2.1 旁注的跨代碰撞复核):上游 promote 后代内 GTID seq 从 1
+    //   重计而 raw s:seq 不回退,上游队列键与 EventDelete/EventMarkDead/
+    //   RestoreJobDelete 携带序号恒为 raw——replay 按记录尾部 raw_seq
+    //   落键(存量 None 回退 gtid.seq,初始代两口径恒等),delete 系 op
+    //   精确命中、新代重计不与旧代残留碰撞;
     // - **`Op::Alloc` 跳过不落盘**(§4.3 布局独立):a:/t: 是上游分配器
     //   的恢复记录,备端本地分配器不认识上游 extent;段数据到位后由本地
     //   分配器重新分配(C2/C3 接线),备端位图不含上游段;
@@ -2945,9 +2984,11 @@ impl MetaStore {
     //   → postcard Vec<DataRef>(不改 ObjectMeta 持久化值格式):apply
     //   同事务入队,C3 回填池消费(拉取/本地重分配/删键);段数据未回填
     //   前读路径语义属 C2(缺数据等待),本层只保证队列与元数据零漂移;
-    // - **epoch fencing**(§2.3):记录 epoch 低于本地 s:repl_epoch 显式
-    //   拒绝(旧 epoch 的写全网络拒收);本地 epoch 由 pull worker 在握手
-    //   成功时随上游水位推进(B4 repl_worker.rs)。
+    // - **epoch fencing**(§2.3;M21 E4 复核后锚点 = **游标代序**):拒绝
+    //   比已越过代更旧的记录(floor = max(游标 epoch, 初始代));本地
+    //   s:repl_epoch 由 pull worker 握手预提(B4)、由本层随更高代记录
+    //   在 apply 事务内落定——以本地 epoch 为锚会误杀级联 promote 后的
+    //   旧代尾段续流(设计稿 §5.1.4),裁决细节见 apply_repl_record。
 
     /// 读下游 apply 游标(键缺席 = {0,0},全新下游)。
     pub fn repl_cursor(&self) -> Result<Gtid> {
@@ -3307,15 +3348,6 @@ impl MetaStore {
                 rec.epoch, gtid.epoch
             )));
         }
-        // epoch fencing(§2.3):旧 epoch 的流显式拒绝;本地 epoch 由
-        // worker 握手推进,promote(E3)在此基础上 +1
-        let local_epoch = self.repl_epoch()?;
-        if rec.epoch < local_epoch {
-            return Err(Error::InvalidArgument(format!(
-                "repl record epoch {} fenced by local epoch {} (replication-design §2.3)",
-                rec.epoch, local_epoch
-            )));
-        }
         const MAX_TXN_RETRIES: u32 = 10_000;
         let mut retries = 0u32;
         loop {
@@ -3329,6 +3361,44 @@ impl MetaStore {
                 // 幂等丢弃:崩溃重放/重连重拉的重叠前缀,零副作用
                 tx.rollback().map_err(rocks_err)?;
                 return Ok(ReplApplyOutcome::SkippedDuplicate);
+            }
+            // epoch fencing(M21 E4 复核裁决,§2.3;锚点 = **游标代序**而非
+            // 本地 s:repl_epoch):拒绝比「已越过的代」更旧的记录——
+            //   floor = max(游标 epoch, 初始代):
+            // - 游标 {2,*} 已跨代 → 旧代(epoch 1)记录显式拒收(旧 epoch
+            //   的写全网络拒收;注:gtid 字典序下它们其实先被上方幂等
+            //   丢弃兜住,fencing 拒收防御的是「游标未越过但代更旧」的
+            //   畸形/绕流记录与初始代的 epoch 0);
+            // - 游标仍在旧代 {1,N} 而本地 epoch 已被 hello 推进到 2 →
+            //   旧代**尾段 {1,N+1..M} 必须照常收下**(级联 promote 后下游
+            //   重握手续流,设计稿 §5.1.4:新主 executed 继承含旧代段,
+            //   续流先补旧代尾再跨 barrier)——以本地 epoch 为锚会误杀
+            //   这条合法路径(B4 初形的缺陷,E4 修正);
+            // - 分歧流的权威检出仍在握手(executed ⊆ 上游 GTID 集,
+            //   ErrDiverged);fencing 是 apply 侧兜底,两层的拒绝语义
+            //   互不替代。
+            let fence_floor = cursor.epoch.max(REPL_INITIAL_EPOCH);
+            if rec.epoch < fence_floor {
+                tx.rollback().map_err(rocks_err)?;
+                return Err(Error::InvalidArgument(format!(
+                    "repl record epoch {} fenced (cursor {cursor:?}, floor {fence_floor}; \
+                     replication-design §2.3)",
+                    rec.epoch
+                )));
+            }
+            // 本地代际随更高代记录同事务推进(promote 的 epoch 分配基线
+            // 不得与上游在途代际重用;hello 的推进是预提,此处落定)
+            let local_epoch = match tx.get(SYS_REPL_EPOCH).map_err(rocks_err)? {
+                Some(v) => u64::from_be_bytes(
+                    v.as_slice()
+                        .try_into()
+                        .map_err(|_| Error::Corrupt("s:repl_epoch not u64".into()))?,
+                ),
+                None => REPL_INITIAL_EPOCH,
+            };
+            if rec.epoch > local_epoch {
+                tx.put(SYS_REPL_EPOCH, rec.epoch.to_be_bytes())
+                    .map_err(rocks_err)?;
             }
             if let Err(e) = apply_ops(&tx, &rec.ops, ApplyMode::Replay { gtid, record: rec }) {
                 tx.rollback().map_err(rocks_err)?;
@@ -3671,8 +3741,8 @@ impl MetaStore {
     //   并入),跨代续流由 bl: 键序免费获得(repl_binlog_scan 注释);
     // - **代内 seq 重计**:新代 GTID seq 从 1 起(= s:seq − ebase,见
     //   apply_ops Commit 臂);s:seq 全局不回退(a:/t:/e: 键内序号以它
-    //   为锚)。E4 待办:replay 侧 e:/x: 键内序号在上游 promote 后跨代
-    //   碰撞的复核归 E4(DESIGN.md ADR-33 RP2.1 旁注);
+    //   为锚)。E4 已裁决:replay 侧 e:/x: 键内序号以记录尾部 raw_seq
+    //   (上游 raw s:seq)落键,跨代不碰撞(apply_ops op_seq 裁决注释);
     // - **桶级备拒绝**:s:repl_bscoped 置位 → BucketScoped(GTID 集有
     //   洞,§5.4/RP4.5;唯一转正路径 = 先显式 rebuild 为全量备);
     // - **force 丢弃**:data_pending 尾事务的 pending 条目、pdobj 标记、
@@ -6025,18 +6095,23 @@ enum ApplyMode<'a> {
     /// 事务 ops 以 ReplRecord 写 `bl:{新 seq}`(A1)。
     Commit { repl_binlog: bool },
     /// 下游复制重放(**不重编号**,RP3.3;级联中继 E1 直接复用本地 bl:):
-    /// - 键内序号(`e:`/`x:`/`bl:` 键与 EventEnqueue/RestoreJobPut 的
-    ///   record.seq)一律用**上游原 seq**(gtid.seq),与上游键形逐键一致;
-    /// - `s:seq` 推进至 `max(当前, gtid.seq)`(防 promote 转正后 seq
-    ///   回退、与已重放 bl: 键碰撞);
-    /// - `bl:{原epoch}{原seq}` 写**原样 ReplRecord**(原 epoch/ops/
-    ///   data_refs/ts;不从 ops 重建——重建会丢 ts/原 data_refs 形态);
+    /// - `bl:` 键以原 GTID(`bl:{原epoch}{原seq}`)写**原样 ReplRecord**
+    ///   (原 epoch/ops/data_refs/ts/raw_seq;不从 ops 重建——重建会丢
+    ///   ts/原 data_refs 形态);
+    /// - `e:`/`x:` 键内序号(EventEnqueue/RestoreJobPut 落键与事件值
+    ///   record.seq)= 上游 **raw s:seq**(记录尾部 raw_seq;M21 E4 裁决,
+    ///   存量 None 回退 gtid.seq)——上游队列键与 delete 系 op 携带序号
+    ///   恒为 raw(promote 后 raw 不回退、代内 seq 重计),镜像键形才
+    ///   逐键一致、跨代不碰撞;
+    /// - `s:seq` 推进至 `max(当前, raw_seq)`(防 promote 转正后 seq
+    ///   回退、与已重放 bl: 键及镜像 e:/x: 队列键碰撞);
     /// - `Op::Alloc`(a:/t: 上游分配记录)**跳过不落盘**(§4.3 布局独立:
     ///   备端本地分配器不认识上游 extent;段数据到位后由本地分配器重新
     ///   分配,C2/C3 接线);
-    /// - 跨 epoch 续流(E3 已落:epoch 入 bl: 键 + barrier 条目心跳式
-    ///   apply;seq 重计后 `e:`/`x:` 键内序号的跨代碰撞复核归 E4,
-    ///   DESIGN.md ADR-33 RP2.1 旁注)。
+    /// - 跨 epoch 续流:epoch 入 bl: 键(E3)+ barrier 条目心跳式 apply;
+    ///   apply 侧 fencing 锚点 = 游标代序(E4 复核裁决,见
+    ///   apply_repl_record 注释),本地 s:repl_epoch 随更高代记录在同事务
+    ///   内推进(promote 的 epoch 分配基线不与上游在途代际重用)。
     Replay { gtid: Gtid, record: &'a ReplRecord },
 }
 
@@ -6136,9 +6211,19 @@ fn apply_ops(
     // M21 B4:键内序号(op_seq)与 s:seq 推进值(new_seq)分离——Commit
     // 两者同为 cur+1;Replay 键内序号 = 上游原 seq(不重编号,键形与上游
     // 逐键一致),s:seq 只进不退(max)。
+    // M21 E4(ADR-33 RP2.1 旁注的跨代碰撞裁决):「上游原 seq」对
+    // `e:`/`x:` 键 = 上游**提交时刻的 raw s:seq**(记录尾部 raw_seq,
+    // ReplRecord.raw_seq 注释钉死理由:promote 后代内 GTID seq 从 1 重计,
+    // 而上游 e:/x: 键与 delete 系 op 携带序号恒为 raw——replay 以代内
+    // seq 落键会与 delete 错位、与旧代残留碰撞)。bl: 键仍以
+    // {epoch}{代内 seq} 落(gtid,不重编号,RP3.3 不变);存量记录
+    // raw_seq=None 回退 gtid.seq(初始代链路两口径恒等,即旧行为)。
     let (op_seq, new_seq) = match mode {
         ApplyMode::Commit { .. } => (cur + 1, cur + 1),
-        ApplyMode::Replay { gtid, .. } => (gtid.seq, cur.max(gtid.seq)),
+        ApplyMode::Replay { gtid, record } => {
+            let raw = record.raw_seq.unwrap_or(gtid.seq);
+            (raw, cur.max(raw))
+        }
     };
     let seq = op_seq;
 
@@ -6299,6 +6384,10 @@ fn apply_ops(
                 // M15 N2(ADR-18 D-E1):事件键 seq = 当前事务 seq;值与
                 // 数据操作同事务落盘(崩溃零漂移)。单事务至多一条事件
                 // (多事件入队 = 多原语多事务,引擎侧保证)。
+                // M21 E4:Replay 时 seq = 上游 raw s:seq(record.raw_seq,
+                // 见上方 op_seq 裁决注释)——与上游 e: 键逐键镜像,后续
+                // EventDelete/EventMarkDead(op 携带 raw seq)精确命中,
+                // 跨 promote 代际不碰撞。
                 debug_assert!(record.seq == 0 || record.seq == seq);
                 let mut rec = record.clone();
                 rec.seq = seq;
@@ -6316,7 +6405,9 @@ fn apply_ops(
             }
             Op::RestoreJobPut { job } => {
                 // M16 A2(ADR-19 DA2.3):作业键 seq = 当前事务 seq(与
-                // 事件同口径;入队与挂起标记同事务,崩溃零漂移)
+                // 事件同口径;入队与挂起标记同事务,崩溃零漂移)。
+                // M21 E4:Replay 时 seq = 上游 raw s:seq(同 EventEnqueue
+                // 臂的镜像裁决;RestoreJobDelete 携带 raw seq 精确命中)。
                 tinsert(tx, restore_job_key(seq), encode(job)?)?;
             }
             Op::RestoreJobDelete { seq } => {
@@ -6896,6 +6987,9 @@ fn apply_ops(
             // M21 A3:提交墙钟,repl_retain_hours 软上限的年龄输入(截断侧
             // 双读:A1 存量记录 ts=None 保守保数据)。
             rec.ts = Some(now_ts());
+            // M21 E4:raw s:seq 原值随记录落盘——replay 侧 e:/x: 键镜像锚
+            // (跨代碰撞裁决见 ReplRecord.raw_seq 与 apply_ops op_seq 注释)
+            rec.raw_seq = Some(seq);
             tinsert(tx, binlog_key(epoch, gtid_seq), rec.encode_value()?)?;
         }
         ApplyMode::Commit { repl_binlog: false } => {}
@@ -8628,6 +8722,194 @@ mod tests {
             meta.promote(false).unwrap_err(),
             PromoteError::NotStandby
         ));
+    }
+
+    /// M21 E4(ADR-33 RP2.1 旁注;TODO M21/E4 遗留复核落地):**replay 侧
+    /// `e:`/`x:` 键跨代镜像上游 raw s:seq 序号空间**——
+    /// ① 上游(本代 ebase>0 的 promote 转正节点)的提交:binlog 记录尾部
+    ///    raw_seq = 事务 raw s:seq(代内 GTID seq = raw − ebase,两者在此
+    ///    分叉);
+    /// ② 下游 replay 按 raw_seq 落 `e:`/`x:` 键(事件值 rec.seq 同),
+    ///    与上游队列**逐键一致**;EventDelete/EventMarkDead/RestoreJobDelete
+    ///    (op 携带 raw seq)精确命中——旧口径(gtid.seq 落键)下新代
+    ///    EventEnqueue 会覆盖旧代残留 e:{同序号} 且 delete 系全部漏击;
+    /// ③ s:seq 按 raw 推进(下游 promote 的 ebase ≥ 全部镜像键,未来本地
+    ///    commit 永不碰撞);
+    /// ④ 存量记录(raw_seq=None)回退 gtid.seq(初始代两口径恒等);
+    /// ⑤ fencing 锚点 = 游标代序:本地 epoch 已推进(hello)而游标仍在旧
+    ///    代时,旧代尾段续流必须收下(级联 promote 下游重握手路径,
+    ///    设计稿 §5.1.4);已跨代后旧代记录由幂等/ fencing 兜住。
+    #[test]
+    fn repl_replay_queues_mirror_upstream_raw_seq_across_promote() {
+        let ev = |key: &str| fs3_core::EventRecord {
+            seq: 0,
+            ts: 1_700_000_000,
+            bucket: "b1".into(),
+            key: key.into(),
+            event: "s3:ObjectCreated:Put".into(),
+            etag: None,
+            size: Some(1),
+            version_id: None,
+            delete_marker: false,
+            dead: false,
+            sse: None,
+        };
+        let job = |key: &str| fs3_core::RestoreJob {
+            bucket: "b1".into(),
+            key: key.into(),
+            vk: None,
+            enqueued_at: 1_700_000_000,
+            days: 1,
+            tier: "Bulk".into(),
+        };
+        // 上游 U:standby 起步,重放旧主 3 条初始代记录(raw_seq = Some
+        // (1..=3),初始代 raw == 代内;E4 起 Commit 落盘恒带)——建桶 b1、
+        // 事件 E1(raw 2)、恢复作业 J1(raw 3)
+        let u_dir = tempfile::tempdir().unwrap();
+        let u = MetaStore::open(
+            u_dir.path(),
+            &MetaConfig {
+                repl_binlog: true,
+                ..MetaConfig::default()
+            },
+        )
+        .unwrap();
+        u.set_repl_role(ReplRole::Standby).unwrap();
+        let g1 = |seq: u64| Gtid { epoch: 1, seq };
+        let replayed = [
+            ReplRecord::new(
+                1,
+                &[Op::BucketPut {
+                    name: "b1".into(),
+                    meta: bucket_meta("b1"),
+                    location: None,
+                }],
+            ),
+            ReplRecord::new(1, &[Op::EventEnqueue { record: ev("k1") }]),
+            ReplRecord::new(1, &[Op::RestoreJobPut { job: job("k1") }]),
+        ];
+        for (i, rec) in replayed.iter().enumerate() {
+            let rec = ReplRecord {
+                raw_seq: Some(i as u64 + 1),
+                ..rec.clone()
+            };
+            assert_eq!(
+                u.apply_repl_record(g1(i as u64 + 1), &rec).unwrap(),
+                ReplApplyOutcome::Applied
+            );
+        }
+        // U promote → epoch 2,ebase = 3(raw 与代内自此分叉);本地提交:
+        // E2(raw 5 / 代内 {2,2})、J2(raw 6 / {2,3})、删 E1(raw 7 /
+        // {2,4})、J2 完成(raw 8 / {2,5})、E2 死信(raw 9 / {2,6})
+        let out = u.promote(false).unwrap();
+        assert_eq!(out.epoch, 2);
+        assert_eq!(u.repl_ebase().unwrap(), 3);
+        let e2_seq = u.commit_with_event(&[], &ev("k2")).unwrap();
+        assert_eq!(e2_seq, 5, "barrier 消耗 raw 4");
+        let j2_seq = u.commit(&[Op::RestoreJobPut { job: job("k2") }]).unwrap();
+        assert_eq!(j2_seq, 6);
+        u.delete_event(2).unwrap(); // E1 投递完成(旧代重放事件,raw 2)
+        u.commit(&[Op::RestoreJobDelete { seq: 6 }]).unwrap();
+        u.mark_event_dead(e2_seq).unwrap();
+        // ① 上游侧自检:binlog 尾部记录带 raw_seq 且与代内 seq 分叉
+        let entries = u.repl_binlog_entries().unwrap();
+        let e2_rec = &entries
+            .iter()
+            .find(|(g, _)| *g == Gtid { epoch: 2, seq: 2 })
+            .unwrap()
+            .1;
+        assert_eq!(e2_rec.raw_seq, Some(5), "① Commit 落盘 raw_seq = raw s:seq");
+        let u_events = u.event_seqs().unwrap();
+        assert!(
+            u_events.contains(&5) && !u_events.contains(&2),
+            "E2 在队,E1 已删"
+        );
+
+        // 下游 D:全量重放 U 的 binlog(GTID 序,含 barrier 跨代)
+        let d_dir = tempfile::tempdir().unwrap();
+        let d = MetaStore::open(d_dir.path(), &MetaConfig::default()).unwrap();
+        d.set_repl_role(ReplRole::Standby).unwrap();
+        for (g, rec) in &entries {
+            assert_eq!(
+                d.apply_repl_record(*g, rec).unwrap(),
+                ReplApplyOutcome::Applied,
+                "replay {g:?}"
+            );
+        }
+        // ② 队列逐键镜像:e: 剩 E2(raw 5,死信;E1 已删),x: 剩 J1(raw 3)
+        assert_eq!(d.event_seqs().unwrap(), u_events, "e: 键集逐键一致");
+        let d_e2 = d.pending_events(10, None).unwrap();
+        assert!(d_e2.is_empty(), "E2 死信不进 pending(与上游同态)");
+        // E2 键在 raw 5 而非代内 2——若落代内序号会覆盖 E1 的 e:{2} 残留位
+        // (E1 已被 raw 2 的 delete 清掉;旧口径下 delete{2} 反而误删新事件)
+        assert!(d.event_seqs().unwrap().contains(&5));
+        // x: 镜像:J1(raw 3)留存,J2(raw 6)精确删除
+        let d_jobs: Vec<u64> =
+            d.db.iterator(IteratorMode::From(PREFIX_RESTORE_JOB, Direction::Forward))
+                .map(|item| parse_restore_job_seq(&item.unwrap().0).unwrap())
+                .collect();
+        assert_eq!(d_jobs, vec![3]);
+        // ③ s:seq 按 raw 推进(= 上游水位 9),不是代内尾 6
+        assert_eq!(d.last_seq().unwrap(), 9);
+        assert_eq!(d.repl_epoch().unwrap(), 2, "代际随 barrier apply 落定");
+
+        // ④ 存量记录(raw_seq=None)回退 gtid.seq:初始代两口径恒等
+        let f_dir = tempfile::tempdir().unwrap();
+        let f = MetaStore::open(f_dir.path(), &MetaConfig::default()).unwrap();
+        f.set_repl_role(ReplRole::Standby).unwrap();
+        let old = ReplRecord::new(1, &[Op::EventEnqueue { record: ev("k9") }]);
+        assert!(old.raw_seq.is_none());
+        f.apply_repl_record(g1(7), &old).unwrap();
+        assert!(f.event_seqs().unwrap().contains(&7), "回退 = gtid.seq 落键");
+        assert_eq!(f.last_seq().unwrap(), 7);
+
+        // ⑤ fencing 锚点 = 游标代序:本地 epoch 经 hello 预提为 2,游标仍
+        // 在旧代 {1,3}——旧代尾段 {1,4} 续流必须 Applied(级联 promote
+        // 下游重握手后的合法路径);跨代后游标 {2,1},旧代记录幂等兜住
+        let c_dir = tempfile::tempdir().unwrap();
+        let c = MetaStore::open(c_dir.path(), &MetaConfig::default()).unwrap();
+        c.set_repl_role(ReplRole::Standby).unwrap();
+        for (i, rec) in replayed.iter().enumerate() {
+            c.apply_repl_record(g1(i as u64 + 1), rec).unwrap();
+        }
+        c.set_repl_epoch(2).unwrap(); // hello 预提(B4 语义)
+        let tail = ReplRecord::new(
+            1,
+            &[Op::BucketPut {
+                name: "b2".into(),
+                meta: bucket_meta("b2"),
+                location: None,
+            }],
+        );
+        assert_eq!(
+            c.apply_repl_record(g1(4), &tail).unwrap(),
+            ReplApplyOutcome::Applied,
+            "游标代序 fencing:旧代尾段续流不拒"
+        );
+        // 跨代:barrier {2,1} 后,伪造旧代新写 {1,9} 由幂等兜住(字典序
+        // {1,9} < 游标 {2,1}),epoch 0 记录仍被 fencing 显式拒
+        let barrier = u.repl_record(Gtid { epoch: 2, seq: 1 }).unwrap().unwrap();
+        assert_eq!(
+            c.apply_repl_record(Gtid { epoch: 2, seq: 1 }, &barrier)
+                .unwrap(),
+            ReplApplyOutcome::Applied
+        );
+        let forged = ReplRecord::new(1, &[]);
+        assert_eq!(
+            c.apply_repl_record(g1(9), &forged).unwrap(),
+            ReplApplyOutcome::SkippedDuplicate,
+            "跨代后旧代记录幂等丢弃(不双写)"
+        );
+        // epoch 0(初始代之前的畸形代)由 fencing 显式拒:需游标未越过
+        // 该 GTID 才能走到 fencing 分支(否则先被幂等兜住),用全新库
+        let z_dir = tempfile::tempdir().unwrap();
+        let z = MetaStore::open(z_dir.path(), &MetaConfig::default()).unwrap();
+        z.set_repl_role(ReplRole::Standby).unwrap();
+        let mut epoch0 = ReplRecord::new(1, &[]);
+        epoch0.epoch = 0;
+        assert!(z
+            .apply_repl_record(Gtid { epoch: 0, seq: 9 }, &epoch0)
+            .is_err());
     }
 
     /// ranges 辅助:GTID 集 → (epoch, start, end) 升序表(测试断言用)。

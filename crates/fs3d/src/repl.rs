@@ -160,7 +160,7 @@
 //! `FS3D_REPL_SERVER_CERT`/`FS3D_REPL_SERVER_KEY` 必须同设(缺任一项 =
 //! 启动显式报错,不静默降级);`FS3D_REPL_LISTEN` 覆盖监听地址。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
@@ -580,7 +580,7 @@ impl ReplServer {
                         StatusCode::BAD_REQUEST,
                         "bad_gtid",
                         "after must be \"{epoch}-{seq}\"",
-                    )
+                    );
                 }
             },
             None => Gtid { epoch: 0, seq: 0 },
@@ -589,7 +589,7 @@ impl ReplServer {
             Some(s) => match s.parse::<usize>() {
                 Ok(n) => n.clamp(1, MAX_BINLOG_LIMIT),
                 Err(_) => {
-                    return json_err(StatusCode::BAD_REQUEST, "bad_limit", "limit must be int")
+                    return json_err(StatusCode::BAD_REQUEST, "bad_limit", "limit must be int");
                 }
             },
             None => DEFAULT_BINLOG_LIMIT,
@@ -598,7 +598,7 @@ impl ReplServer {
             Some(s) => match s.parse::<u64>() {
                 Ok(n) => n.min(MAX_BINLOG_WAIT_MS),
                 Err(_) => {
-                    return json_err(StatusCode::BAD_REQUEST, "bad_wait", "wait must be int (ms)")
+                    return json_err(StatusCode::BAD_REQUEST, "bad_wait", "wait must be int (ms)");
                 }
             },
             None => 0,
@@ -616,7 +616,7 @@ impl ReplServer {
                             StatusCode::GONE,
                             "ErrBinlogGone",
                             "slot marked stale; explicit rebuild required (ADR-33 RP8)",
-                        )
+                        );
                     }
                     Ok(Some(s)) => s.filters,
                     Ok(None) => {
@@ -624,7 +624,7 @@ impl ReplServer {
                             StatusCode::NOT_FOUND,
                             "ErrSlotUnknown",
                             "no such slot; register via hello or POST /v1/repl/v1/slots first",
-                        )
+                        );
                     }
                     Err(e) => return internal_err("slot lookup", &e),
                 }
@@ -634,7 +634,7 @@ impl ReplServer {
                     StatusCode::BAD_REQUEST,
                     "bad_request",
                     "slot is required (binlog is served per-slot, D2; replication-design §3.2)",
-                )
+                );
             }
         };
         // C2 断档检查(设计稿 §3.4;hello ③同口径,拉取路径兜底——截断可能
@@ -779,7 +779,7 @@ impl ReplServer {
                     StatusCode::BAD_REQUEST,
                     "bad_param",
                     "space must be \"stream\" when present",
-                )
+                );
             }
         };
         self.throttle_wait().await;
@@ -988,6 +988,39 @@ impl ReplServer {
             Ok(g) => g,
             Err(e) => return internal_err("hello watermark", &e),
         };
+        // ⑤ 槽 stale(硬上限强截越过,RP8)= 等同 ErrBinlogGone;先于 ④
+        // 包含性检查——槽已被硬上限判死,无论 GTID 集形如何唯一出路都是
+        // 显式重建(binlog 截空后包含性必假分歧,先报 stale 口径更准)。
+        let slot = match self.meta.repl_slot(&hello.slot_name) {
+            Ok(s) => s,
+            Err(e) => return internal_err("slot lookup", &e),
+        };
+        if let Some(s) = &slot {
+            if s.stale {
+                return json_err(
+                    StatusCode::GONE,
+                    "ErrBinlogGone",
+                    "slot marked stale by hard-cap truncation; explicit rebuild required (ADR-33 RP8)",
+                );
+            }
+        }
+        // ④ executed ⊆ 上游 GTID 集(§2.2 ②,口径 = 本机 executed ∪ 本机
+        // binlog 覆盖,见模块注释)→ 否 = ErrDiverged(确定性分歧检出)。
+        // M21 E4:本检查先于 ③ 位点下界——旧主/多落后下游的 GTID 集含
+        // 上游没有的记录时,分歧是更准的诊断(§5.2:旧主重加入握手必然
+        // ErrDiverged);仅滞后的下游因上游集按代区间填充(1..=hi),包含
+        // 性必过,落到 ③ 报 ErrBinlogGone,两口径不错位。
+        let upstream = match self.upstream_gtid_set() {
+            Ok(s) => s,
+            Err(e) => return internal_err("upstream gtid set", &e),
+        };
+        if !executed.is_subset(&upstream) {
+            return json_err(
+                StatusCode::CONFLICT,
+                "ErrDiverged",
+                "downstream executed set not a subset of upstream; explicit rebuild required (ADR-33 RP2.3)",
+            );
+        }
         // ③ 起始位点可用(§2.2 ①):续流所需的下一个 GTID 必须仍在 binlog
         // 内——位点+1 低于可用下界 = 中间已被截断 → ErrBinlogGone
         if let Some(cursor) = cursor {
@@ -1008,35 +1041,6 @@ impl ReplServer {
                 Ok(None) => {}
                 Err(e) => return internal_err("binlog floor", &e),
             }
-        }
-        // ⑤ 槽 stale(硬上限强截越过,RP8)= 等同 ErrBinlogGone;先于 ④
-        // 包含性检查——槽已被硬上限判死,无论 GTID 集形如何唯一出路都是
-        // 显式重建(binlog 截空后包含性必假分歧,先报 stale 口径更准)。
-        let slot = match self.meta.repl_slot(&hello.slot_name) {
-            Ok(s) => s,
-            Err(e) => return internal_err("slot lookup", &e),
-        };
-        if let Some(s) = &slot {
-            if s.stale {
-                return json_err(
-                    StatusCode::GONE,
-                    "ErrBinlogGone",
-                    "slot marked stale by hard-cap truncation; explicit rebuild required (ADR-33 RP8)",
-                );
-            }
-        }
-        // ④ executed ⊆ 上游 GTID 集(§2.2 ②,口径 = 本机 executed ∪ 本机
-        // binlog 覆盖,见模块注释)→ 否 = ErrDiverged(确定性分歧检出)
-        let upstream = match self.upstream_gtid_set() {
-            Ok(s) => s,
-            Err(e) => return internal_err("upstream gtid set", &e),
-        };
-        if !executed.is_subset(&upstream) {
-            return json_err(
-                StatusCode::CONFLICT,
-                "ErrDiverged",
-                "downstream executed set not a subset of upstream; explicit rebuild required (ADR-33 RP2.3)",
-            );
         }
         // ⑥ 已登记槽:归属他节点 = 冲突;过滤器不一致禁原地改(R9,须
         // drop + 重建);一致则复用
@@ -1067,7 +1071,7 @@ impl ReplServer {
                             StatusCode::FORBIDDEN,
                             "ErrSlotLimit",
                             "max_slots hard cap reached (ADR-33 RP3.1)",
-                        )
+                        );
                     }
                     Ok(false) => {}
                     Err(e) => return internal_err("slots list", &e),
@@ -1157,7 +1161,7 @@ impl ReplServer {
                         StatusCode::BAD_REQUEST,
                         "bad_request",
                         "confirmed_gtid must be \"{epoch}-{seq}\"",
-                    )
+                    );
                 }
             },
             // 缺省 = 当前水位(预登记自登记时刻起消费;从零消费须显式
@@ -1173,7 +1177,7 @@ impl ReplServer {
                     StatusCode::CONFLICT,
                     "ErrSlotExists",
                     "slot exists; drop + recreate to change filters/owner (R9)",
-                )
+                );
             }
             Ok(None) => {}
             Err(e) => return internal_err("slot lookup", &e),
@@ -1184,7 +1188,7 @@ impl ReplServer {
                     StatusCode::FORBIDDEN,
                     "ErrSlotLimit",
                     "max_slots hard cap reached (ADR-33 RP3.1)",
-                )
+                );
             }
             Ok(false) => {}
             Err(e) => return internal_err("slots list", &e),
@@ -1300,27 +1304,9 @@ impl ReplServer {
     /// 下游形成假分歧。握手为低频路径,分页全扫 retained binlog(规模
     /// 受 retain 水位约束;同 truncate_binlog 的全扫先例)。
     fn upstream_gtid_set(&self) -> Result<GtidSet, fs3_core::Error> {
-        let mut set = self.meta.repl_executed()?;
-        let mut max_per_epoch: BTreeMap<u64, u64> = BTreeMap::new();
-        let mut after = Gtid { epoch: 0, seq: 0 };
-        loop {
-            let page = self.meta.repl_binlog_scan(after, MAX_BINLOG_LIMIT)?;
-            if page.is_empty() {
-                break;
-            }
-            for (gtid, _) in &page {
-                let m = max_per_epoch.entry(gtid.epoch).or_insert(0);
-                *m = (*m).max(gtid.seq);
-                after = *gtid;
-            }
-            if page.len() < MAX_BINLOG_LIMIT {
-                break;
-            }
-        }
-        for (epoch, hi) in max_per_epoch {
-            set.insert_range(epoch, 1, hi);
-        }
-        Ok(set)
+        // executed ∪ 本地 binlog 覆盖(E4 起实现收拢到 MetaStore 侧,
+        // 与 hello 自报口径同一来源)
+        Ok(self.meta.repl_local_gtid_set()?)
     }
 
     /// 上游当前水位 = {当前 epoch, 代内最新 GTID seq}(E3 起 = s:seq −
@@ -1399,7 +1385,7 @@ impl ReplServer {
                     StatusCode::SERVICE_UNAVAILABLE,
                     "ErrDataPending",
                     "relay has unmaterialized segments (data_pending); retry after backfill drains",
-                )
+                );
             }
             Ok(_) => {}
             Err(e) => return internal_err("pending probe", &e),
@@ -1763,11 +1749,12 @@ fn record_in_scope(rec: &ReplRecord, filters: &BucketFilter) -> bool {
 
 /// 心跳条目形态(M21 D2;设计稿 §3.2「被过滤的 seq 以 heartbeat 条目
 /// 带过」):同 seq 原位的空 ops/空 data_refs/空 bucket_scope 记录。
-/// epoch/ts 保留——epoch 供下游 fencing 一致性校验(apply 断言
+/// epoch/ts/raw_seq 保留——epoch 供下游 fencing 一致性校验(apply 断言
 /// gtid.epoch == rec.epoch),ts 供 D1 lag 估算「首条未消费记录」口径
-/// 在过滤流上仍可读。下游 B4 apply:零元数据变更、bl: 原样落盘、游标
-/// 推进、executed 并入——GTID 集无洞(fs3-meta apply_repl_record 注释
-/// 口径)。
+/// 在过滤流上仍可读,raw_seq 供下游 s:seq 水位按上游 raw 口径推进
+/// (E4 镜像锚,无 ops 时仅水位语义)。下游 B4 apply:零元数据变更、
+/// bl: 原样落盘、游标推进、executed 并入——GTID 集无洞(fs3-meta
+/// apply_repl_record 注释口径)。
 fn heartbeat_of(rec: &ReplRecord) -> ReplRecord {
     ReplRecord {
         epoch: rec.epoch,
@@ -1781,6 +1768,7 @@ fn heartbeat_of(rec: &ReplRecord) -> ReplRecord {
         // EpochBarrier 标记原样透传(barrier 恒 has_unscoped 不会被过滤,
         // 此路径防御性保留;E3)
         epoch_barrier: rec.epoch_barrier,
+        raw_seq: rec.raw_seq,
     }
 }
 
@@ -5181,6 +5169,244 @@ mod tests {
         );
     }
 
+    /// M21 E4(ADR-33 RP5.2/RP5.4;设计稿 §2.2/§5.1;TODO M21/E4 具名用例):
+    /// **旧主重加入被拒 + 显式重建归队**——
+    /// ① A(旧主)/B(备)追平;B promote(经 RebuildService 编排 = 生产
+    ///    停 worker 纪律同路径)转主 epoch 2;
+    /// ② A 在分歧后仍写 o2({1,3},B 从未见过)→ A 以 standby 身份向 B
+    ///    hello:executed {1,1..3} ⊄ B 的 GTID 集 → 409 ErrDiverged →
+    ///    worker 侧分类 Fatal(**不自动重试/不自动重建**,RP2.3 红线);
+    /// ③ 显式 rebuild(唯一入口):清空 A 的分歧尾 + 复制面元数据 →
+    ///    C1/C2 快照重建 → 追平 B 新水位 {2,1};终局 A role=standby、
+    ///    epoch=2、o1 逐字节一致、分歧尾 o2 消失(不静默并存)。
+    #[test]
+    fn old_primary_rejoin_rejected_then_rebuilt() {
+        use crate::repl_rebuild::RebuildService;
+        use crate::repl_worker::{build_client_tls, hello, PullError, PullWorker};
+        let dir = tempfile::tempdir().unwrap();
+        // A:旧主,binlog 开;桶 + 内联对象 o1(seq 1..=2;内联 = 无回填
+        // 通道,promote 前置零 pending 由对象形态保证)
+        let a_engine = test_engine_opts(&dir.path().join("a"), 4 * 1024 * 1024, true);
+        let o1 = b"o1-before-failover".to_vec();
+        let o2 = b"o2-divergent-tail".to_vec();
+        {
+            let mut e = a_engine.write();
+            e.create_bucket_with_quota("b0", None).unwrap();
+            e.put("b0", "o1", &mut &o1[..]).unwrap();
+        }
+        let a_meta = a_engine.read().meta_arc();
+        let fa = start_server_on(a_engine.clone(), a_meta.clone());
+
+        // B:备,pull A 追平 {1,2};RebuildService 收养 worker → promote
+        // 走生产编排(停 worker → MetaStore::promote 单事务)
+        let b_engine = test_engine(&dir.path().join("b"));
+        let b_meta = b_engine.read().meta_arc();
+        b_meta.set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
+        let b_tls_dir = dir.path().join("b_tls");
+        std::fs::create_dir_all(&b_tls_dir).unwrap();
+        let cfg_b = pull_cfg(&b_tls_dir, &fa, "s-b", "node-b");
+        let wb = PullWorker::spawn(b_engine.clone(), b_meta.clone(), cfg_b.clone()).unwrap();
+        wait_repl_cursor(&b_meta, Gtid { epoch: 1, seq: 2 });
+        let fb = start_server_on(b_engine.clone(), b_meta.clone());
+        let svc_b = Arc::new(fs3_s3::S3Service::new(
+            b_engine.clone(),
+            vec![],
+            "us-east-1".into(),
+            false,
+        ));
+        let rb = RebuildService::new(b_engine.clone(), svc_b, b_meta.clone(), cfg_b.clone(), None);
+        rb.adopt(Some(wb), None);
+        let v = rb.promote(false, false).unwrap();
+        assert_eq!(v["status"], serde_json::json!("promoted"), "{v}");
+        assert_eq!(v["epoch"], serde_json::json!(2), "{v}");
+        assert_eq!(b_meta.repl_role().unwrap(), fs3_meta::ReplRole::Primary);
+        assert_eq!(b_meta.repl_epoch().unwrap(), 2);
+
+        // ② A 不知 failover,续写分歧尾 o2({1,3})→ 重加入 hello 必拒
+        a_engine.write().put("b0", "o2", &mut &o2[..]).unwrap();
+        assert_eq!(a_meta.last_seq().unwrap(), 3);
+        let a_tls_dir = dir.path().join("a_tls");
+        std::fs::create_dir_all(&a_tls_dir).unwrap();
+        let cfg_a = pull_cfg(&a_tls_dir, &fb, "s-a", "node-a");
+        let tls_a = build_client_tls(&cfg_a).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(hello(&a_meta, &cfg_a, &tls_a))
+            .expect_err("分歧旧主的 executed ⊄ 新主 GTID 集,hello 必拒");
+        assert!(
+            matches!(&err, PullError::Fatal(m) if m.contains("ErrDiverged")),
+            "ErrDiverged → Fatal(不自动重建的红线分类): {err}"
+        );
+        drop(rt);
+
+        // ③ 显式 rebuild:清分歧尾 → 快照重建 → 追平 B 水位(barrier
+        //    {2,1} 即 B 当前 tip)
+        let svc_a = Arc::new(fs3_s3::S3Service::new(
+            a_engine.clone(),
+            vec![],
+            "us-east-1".into(),
+            false,
+        ));
+        let ra = RebuildService::new(a_engine.clone(), svc_a, a_meta.clone(), cfg_a.clone(), None);
+        let v = ra.rebuild(None, None).unwrap();
+        assert_eq!(v["status"], serde_json::json!("rebuilding"), "{v}");
+        wait_repl_cursor(&a_meta, Gtid { epoch: 2, seq: 1 });
+        ra.shutdown();
+        rb.shutdown();
+
+        // 终局:A 归队为 B 的备;数据以新主为准,分歧尾不残留
+        assert_eq!(a_meta.repl_role().unwrap(), fs3_meta::ReplRole::Standby);
+        assert_eq!(a_meta.repl_epoch().unwrap(), 2, "hello 随 B 推进代际");
+        let mut out = Vec::new();
+        a_engine
+            .read()
+            .get_to("b0", "o1", 0..u64::MAX, &mut out)
+            .unwrap();
+        assert_eq!(out, o1, "重建后 o1 逐字节一致(快照重拉)");
+        assert!(
+            a_meta.get_object("b0", "o2").unwrap().is_none(),
+            "分歧尾 o2 随重建清空(不静默并存)"
+        );
+        let cur = a_meta.repl_cursor().unwrap();
+        assert_eq!(cur, Gtid { epoch: 2, seq: 1 }, "游标 = B 导出位点");
+    }
+
+    /// M21 E4(设计稿 §5.1.4;ADR-33 RP5.3;TODO M21/E4 具名用例):**级联
+    /// 下游自动跟随被 promote 的中继**——三级 A→B→C:
+    /// ① A 写 obj1,B/C 追平;C 停(滞后),A 写 obj2,B 追平(C 落后
+    ///    旧代尾 {1,3});
+    /// ② B 停 worker → promote(epoch 2)→ 本地写 obj3({2,2},B 的
+    ///    binlog 开 = promote 后本地写入 binlog 供 C 续拉);
+    /// ③ C 重启 worker:hello 把 C 本地 epoch 预提到 2 而游标仍在旧代
+    ///    {1,2}——正中「游标代序 fencing」修正路径:旧代尾 {1,3}
+    ///    (obj2)必须照常收下,随后跨 barrier {2,1} 收 obj3({2,2});
+    /// ④ 终局:C 自动续流零人工介入,三对象逐字节一致(obj1/obj2 段
+    ///    数据经 B 的 extent-data + rmap 翻译回填,obj3 是 B 本地段)。
+    #[test]
+    fn cascade_downstreams_follow_promoted_relay() {
+        use crate::repl_backfill::{BackfillConfig, BackfillService};
+        use crate::repl_worker::PullWorker;
+        let dir = tempfile::tempdir().unwrap();
+        let bf_cfg = |pull: crate::repl_worker::PullConfig| BackfillConfig {
+            pull,
+            data_pull_concurrency: 4,
+            pool_enabled: true,
+            read_fetch_timeout: std::time::Duration::from_secs(30),
+            traffic: None,
+        };
+        let wait_drained = |meta: &MetaStore| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let pend = meta.list_repl_pending(100).unwrap();
+                if pend.is_empty() {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "pending 未在限时内排空: {pend:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        // A:主,binlog 开
+        let a_engine = test_engine_opts(&dir.path().join("a"), 4 * 1024 * 1024, true);
+        {
+            let mut e = a_engine.write();
+            e.create_bucket_with_quota("b0", None).unwrap();
+        }
+        let a_meta = a_engine.read().meta_arc();
+        let fa = start_server_on(a_engine.clone(), a_meta.clone());
+
+        // B:中继(standby + pull + 回填池 + 对下复制口;binlog 开 —
+        //    promote 后本地写进 binlog 供 C 续拉)
+        let b_engine = test_engine_opts(&dir.path().join("b"), 4 * 1024 * 1024, true);
+        let b_meta = b_engine.read().meta_arc();
+        b_meta.set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
+        let b_tls = dir.path().join("b_tls");
+        std::fs::create_dir_all(&b_tls).unwrap();
+        let cfg_b = pull_cfg(&b_tls, &fa, "s-b", "node-b");
+        let wb = PullWorker::spawn(b_engine.clone(), b_meta.clone(), cfg_b.clone()).unwrap();
+        wait_repl_cursor(&b_meta, Gtid { epoch: 1, seq: 1 });
+        let bfb = BackfillService::spawn(b_engine.clone(), b_meta.clone(), bf_cfg(cfg_b)).unwrap();
+        let fb = start_server_on(b_engine.clone(), b_meta.clone());
+
+        // C:末端备(pull B + 回填池)
+        let c_engine = test_engine(&dir.path().join("c"));
+        let c_meta = c_engine.read().meta_arc();
+        c_meta.set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
+        let c_tls = dir.path().join("c_tls");
+        std::fs::create_dir_all(&c_tls).unwrap();
+        let cfg_c = pull_cfg(&c_tls, &fb, "s-c", "node-c");
+        let wc = PullWorker::spawn(c_engine.clone(), c_meta.clone(), cfg_c.clone()).unwrap();
+        wait_repl_cursor(&c_meta, Gtid { epoch: 1, seq: 1 });
+        let bfc = BackfillService::spawn(c_engine.clone(), c_meta.clone(), bf_cfg(cfg_c.clone()))
+            .unwrap();
+
+        // ① A 写 obj1(段对象)→ B/C 追平 {1,2} 且数据回填完成
+        let obj1: Vec<u8> = (0..1024 * 1024usize).map(|i| (i % 251) as u8).collect();
+        a_engine.write().put("b0", "obj1", &mut &obj1[..]).unwrap();
+        wait_repl_cursor(&b_meta, Gtid { epoch: 1, seq: 2 });
+        wait_repl_cursor(&c_meta, Gtid { epoch: 1, seq: 2 });
+        wait_drained(&b_meta);
+        wait_drained(&c_meta);
+
+        // C 停(滞后);A 写 obj2 → 仅 B 追平 {1,3}(C 落后旧代尾)
+        wc.shutdown();
+        let obj2: Vec<u8> = (0..1024 * 1024usize).map(|i| (i % 239) as u8).collect();
+        a_engine.write().put("b0", "obj2", &mut &obj2[..]).unwrap();
+        wait_repl_cursor(&b_meta, Gtid { epoch: 1, seq: 3 });
+        wait_drained(&b_meta);
+        assert_eq!(
+            c_meta.repl_cursor().unwrap(),
+            Gtid { epoch: 1, seq: 2 },
+            "C 停在旧代 {{1,2}}(滞后 obj2)"
+        );
+
+        // ② B 停 pull → promote(纪律:先停 worker)→ 本地写 obj3
+        wb.shutdown();
+        bfb.shutdown();
+        let out = b_meta.promote(false).unwrap();
+        assert_eq!(out.epoch, 2);
+        assert_eq!(b_meta.repl_role().unwrap(), fs3_meta::ReplRole::Primary);
+        let obj3: Vec<u8> = (0..1024 * 1024usize).map(|i| (i % 227) as u8).collect();
+        b_engine.write().put("b0", "obj3", &mut &obj3[..]).unwrap();
+        assert_eq!(
+            b_meta.last_seq().unwrap(),
+            5,
+            "B: 重放 raw 1..=3 + barrier raw 4 + obj3 raw 5(代内 {{2,2}})"
+        );
+        assert!(
+            b_meta
+                .repl_record(Gtid { epoch: 2, seq: 2 })
+                .unwrap()
+                .is_some(),
+            "obj3 以新代 GTID {{2,2}} 落 B 的 binlog(供 C 续拉)"
+        );
+
+        // ③ C 重启 worker:hello 预提 C 本地 epoch=2(游标仍 {1,2})→
+        //    续流收旧代尾 {1,3} 再跨 barrier 收 {2,2},全程零人工介入
+        let wc2 = PullWorker::spawn(c_engine.clone(), c_meta.clone(), cfg_c.clone()).unwrap();
+        wait_repl_cursor(&c_meta, Gtid { epoch: 2, seq: 2 });
+        wait_drained(&c_meta);
+        assert_eq!(c_meta.repl_epoch().unwrap(), 2, "C 代际随 B 推进");
+        wc2.shutdown();
+        bfc.shutdown();
+
+        // ④ 终局:三对象逐字节一致(两跳段翻译 + promote 后本地段)
+        for (k, p) in [("obj1", &obj1), ("obj2", &obj2), ("obj3", &obj3)] {
+            let mut got = Vec::new();
+            c_engine
+                .read()
+                .get_to("b0", k, 0..u64::MAX, &mut got)
+                .unwrap();
+            assert_eq!(&got, p, "C: {k} 逐字节一致(跨 promote 续流)");
+        }
+    }
+
     /// subject CN 提取:rcgen 证书正/反向 + 垃圾输入不 panic。
     #[test]
     fn subject_cn_extraction() {
@@ -5688,6 +5914,7 @@ mod tests {
                 },
                 ts: Some(now_unix_secs()),
                 epoch_barrier: None,
+                raw_seq: None,
             },
         )
         .unwrap();

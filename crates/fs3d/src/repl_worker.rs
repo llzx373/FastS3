@@ -189,7 +189,7 @@ impl PullWorker {
                     "replication pull worker requires role=standby (set FS3D_REPL_ROLE=standby); \
                      refusing to pull into a primary (ADR-33 RP4)"
                         .into(),
-                )
+                );
             }
         }
         let stop = Arc::new(AtomicBool::new(false));
@@ -439,7 +439,10 @@ fn executed_is_empty(meta: &MetaStore) -> bool {
     meta.repl_executed().map(|s| s.is_empty()).unwrap_or(false)
 }
 
-/// hello 握手:自报 executed 集(B2 线格式区间表)+ node_id + 槽过滤器
+/// hello 握手:自报**本机 GTID 集**(B2 线格式区间表;E4 起 =
+/// executed ∪ 本地 binlog 覆盖,`MetaStore::repl_local_gtid_set`——纯主
+/// 端 executed 恒空,只报它会被当全新下游静默 bootstrap,§5.2 旧主重
+/// 加入检出依赖 binlog 段并入)+ node_id + 槽过滤器
 /// (D2:cfg.filters——桶级槽以此登记/比对,不一致 = ErrFilterMismatch
 /// 须 drop + 重建)+ chain = [](直连上游;级联链路上溯属 E1)。成功:
 /// ① 上游 epoch 推进本地 s:repl_epoch(fencing 锚点,§2.3);② 桶级
@@ -454,8 +457,8 @@ pub(crate) async fn hello(
     tls: &Arc<rustls::ClientConfig>,
 ) -> Result<(), PullError> {
     let executed: Vec<serde_json::Value> = meta
-        .repl_executed()
-        .map_err(|e| PullError::Transient(format!("read executed set: {e}")))?
+        .repl_local_gtid_set()
+        .map_err(|e| PullError::Transient(format!("read local gtid set: {e}")))?
         .ranges()
         .map(|(epoch, start, end)| serde_json::json!({"epoch": epoch, "start": start, "end": end}))
         .collect();

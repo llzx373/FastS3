@@ -95,6 +95,7 @@ GTID 集合 = 按 epoch 分段的连续区间集     # 例:{1:[1,500], 2:[1,120]
 ```
 
 - **②是 GTID 机制的核心价值**:旧主带未复制的本地写(epoch 相同、seq 超出)或以旧主身份直连新主(executed 含新主没有的 GTID)都会在握手时被**确定性检出**,而不是静默写冲突。
+- **落地澄清(M21 E4)**:HELLO 的 `executed_gtid_set` 自报口径 = 本机 executed ∪ 本地 binlog 覆盖——纯主端 executed 恒空(它是下游 apply 侧状态),只报它会被当全新下游静默走 §3.1 快照流程;并入 binlog 段后「旧主含新主没有的 GTID」才被 ② 检出。上游校验顺序为 ② 先于 ①:含上游没有的 GTID 时报 ErrDiverged(更准的诊断);仅滞后下游因上游 GTID 集按代区间填充(1..=hi)②必过,落 ① 报 ErrBinlogGone。
 - 级联场景同理:中继对下游执行相同校验,分歧沿链路上抛。
 - 分歧修复策略**只有一种:显式重建**(运维确认后 `fasts3d replication rebuild` 走 §3.1 全量流程)——不做自动回退、不做冲突合并,与意见 4 一致。
 
@@ -102,6 +103,7 @@ GTID 集合 = 按 epoch 分段的连续区间集     # 例:{1:[1,500], 2:[1,120]
 
 - 备端/中继只接受 `epoch >= 本地 epoch` 的流;promote 后旧 epoch 的一切写入被全网络拒绝。
 - promote/demote/rebuild 均为**本地裁决动作**(fs3-admin 通道),center 只下发意图(沿用"配置源 vs 引擎裁决"分层)。
+- **落地澄清(M21 E4)**:apply 侧 fencing 的锚点 = **游标代序**(floor = max(游标 epoch, 初始代)),而非本地 `s:repl_epoch`——hello 会把本地 epoch 预提到新代而游标仍在旧代,以本地 epoch 为锚会误杀级联 promote 后旧代尾段的合法续流(见 §5.1);本地 epoch 随更高代记录在 apply 事务内落定取大。
 
 ---
 

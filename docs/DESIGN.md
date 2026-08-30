@@ -2038,8 +2038,7 @@ s3-tests kms 族出集或逐名;`kms_context_binding_rejects_transplant` 绿。
 > = promote 前一刻 `s:seq`;初始代缺席 = 0,原口径不变)——`s:seq`
 > 自身全局不回退(`a:`/`t:`/`e:` 键内序号以它为锚)。promote 的
 > epoch+1 / EpochBarrier(`bl:{新epoch}{1}`)/ role=primary 单事务
-> 落盘 + 无条件 WAL fsync(R12)。**E4 待办**:replay 侧 `e:`/`x:` 键
-> 内序号以上游原 seq 落键,上游 promote 重计后跨代碰撞的复核归 E4。
+> 落盘 + 无条件 WAL fsync(R12)。E4 复核结论见 RP5 后旁注。
 
 **RP3(拓扑 = 一主多备 + 桶级槽位 + 级联)**:
 
@@ -2083,6 +2082,24 @@ s3-tests kms 族出集或逐名;`kms_context_binding_rejects_transplant` 绿。
    复制状态后走全量流程;不做尾事务抢救;
 5. 级联 promote 后下游自动重握手续流(executed 含旧 epoch 段,新主 GTID
    集继承包含);仅 `--force` 丢弃过数据时受影响分支需对应桶重建(R10)。
+
+> **旁注(2026-08-31,M21 E4 落地形态)**:① fencing 锚点 = **游标
+> 代序**(floor = max(游标 epoch, 初始代))而非本地
+> `s:repl_epoch`——hello 把本地 epoch 预提到新代时游标仍在旧代,以
+> 本地 epoch 为锚会误杀 RP5.5 旧代尾段续流;本地 epoch 随更高代记录
+> 在 apply 事务内落定(取大,promote 的 epoch 分配基线不重用上游在途
+> 代)。② replay 侧 `e:`/`x:` 键内序号镜像上游 **raw `s:seq`**:
+> `ReplRecord` 尾部追加 `raw_seq`(commit 恒写;存量 None 回退
+> `gtid.seq`,初始代两口径恒等),replay 按
+> `raw_seq.unwrap_or(gtid.seq)` 落键并把 `s:seq` 推进到 raw——与上游
+> 队列逐键一致,跨 promote 重计不碰撞,delete 系 op(携带 raw seq)
+> 精确命中。③ hello 自报口径 = **executed ∪ 本地 binlog 覆盖**
+> (`repl_local_gtid_set`):纯主端 executed 恒空,只报它会被当全新
+> 下游静默 bootstrap(快照导入覆盖本地数据),RP5.4 的「握手必中
+> ErrDiverged」依赖 binlog 段并入。④ hello 检查序:分歧包含性
+> (④)**先于**位点下界(③)——旧主/多落后下游的 GTID 集含上游没
+> 有的记录时报 ErrDiverged(更准的诊断);仅滞后下游因上游集按代区间
+> 填充(1..=hi)包含性必过,落到 ③ 报 ErrBinlogGone,两口径不错位。
 
 **RP6(信道 = 独立复制口,mTLS 强制)**:
 
