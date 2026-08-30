@@ -2944,6 +2944,15 @@ impl MetaStore {
     /// §5.2「握手必然触发 ErrDiverged」;并上 binlog 覆盖后「有新主没
     /// 有的 GTID」在 ② 包含性检查被确定性检出。备端 bl: ⊆ executed
     /// (replay 同事务落),并集对纯备端零行为差。
+    ///
+    /// 水位兜底(**仅主端**):binlog 开启前的历史提交(init 基线等)不进
+    /// `bl:` 但已计入 `s:seq`——纯主 executed 恒空、bl: 扫描只覆盖已记录
+    /// 条目,不补则快照导出位点 P(= 当时水位)对上游形成假分歧(M21 双机
+    /// 演练实测:全新主端空库首 bootstrap 后重握手必中 ErrDiverged)。备端
+    /// 不补:executed ∪ bl: 即其全量历史(rebuild 清空保留 s:seq,水位填
+    /// 充会把已清空历史虚报回来 → 重建后 hello 永假分歧,同演练实测)。
+    /// 填充语义与 binlog 覆盖一致(按代区间 1..=hi),取两者最大值;检测
+    /// 能力不受影响(旧主多出的 GTID 仍超出新主水位,② 必拒)。
     pub fn repl_local_gtid_set(&self) -> Result<GtidSet> {
         let mut set = self.repl_executed()?;
         let mut max_per_epoch: std::collections::BTreeMap<u64, u64> =
@@ -2961,6 +2970,20 @@ impl MetaStore {
             }
             if page.len() < 1024 {
                 break;
+            }
+        }
+        // 当前代水位 = last_seq − ebase(与 ReplServer::high_watermark 同式)。
+        // **仅主端兜底**:备端/重建后节点(rebuild 清空保留 s:seq,RP5.4
+        // 口径)的历史 = executed ∪ bl: 即全集,再按水位填充会把已清空的
+        // 旧历史虚报回来(重建后 hello 永假分歧,M21 双机演练实测);主端
+        // binlog 开启前的历史提交(init 基线等)不进 bl: 但已计入 s:seq,
+        // 不补则快照导出位点 P 对上游形成假分歧(空库首 bootstrap 实测)。
+        if self.repl_role()? != ReplRole::Standby {
+            let wm = self.last_seq()?.saturating_sub(self.repl_ebase()?);
+            if wm >= 1 {
+                let epoch = self.repl_epoch()?;
+                let m = max_per_epoch.entry(epoch).or_insert(0);
+                *m = (*m).max(wm);
             }
         }
         for (epoch, hi) in max_per_epoch {
@@ -6567,11 +6590,20 @@ fn apply_ops(
                     Some(st) => remap(&st.restored_extents),
                     None => (Vec::new(), 0),
                 };
-                if n_ext + n_rest != old_segments.len() {
+                if n_ext + n_rest != old_segments.len()
+                    && !matches!(mode, ApplyMode::Replay { .. })
+                {
                     return Err(Error::ObjectChanged(format!(
                         "{bucket}/{key} segments changed during compaction"
                     )));
                 }
+                // Replay 容失配(M21 门禁双机演练阶段 6 实测):§4.3 布局
+                // 独立——备端段表经 C2 快照导入/C3 回填本地化后已是**本地
+                // 坐标**,上游 old_segments 恒不匹配;压缩迁移对备端仅
+                // 「未本地化段改挂新坐标」有意义(匹配项照 remap,新引用随
+                // data_refs 入队回填),已本地化段字节已在本地,恒等失配
+                // 属正常形态。Commit 侧仍全量校验(并发覆盖/删除检出);
+                // Replay 侧报错只会让 pull worker 无限重握手(流卡死)。
                 meta.extents = ext;
                 if let Some(st) = meta.restore_state.as_mut() {
                     st.restored_extents = rest;
@@ -6606,11 +6638,13 @@ fn apply_ops(
                         out.push(s.clone());
                     }
                 }
-                if ptr != old_segments.len() {
+                if ptr != old_segments.len() && !matches!(mode, ApplyMode::Replay { .. }) {
                     return Err(Error::ObjectChanged(format!(
                         "part {part_no} of upload {upload_id} segments changed during compaction"
                     )));
                 }
+                // Replay 容失配:同 ObjectMigrate 臂(§4.3 布局独立,已本地
+                // 化的分片段字节已在本地,上游压缩只是放置变更)。
                 meta.extents = out;
                 tinsert(tx, k, encode(&meta)?)?;
             }
@@ -8211,6 +8245,145 @@ mod tests {
             assert!(!meta.repl_object_data_pending("b1", "big").unwrap());
             assert_eq!(meta.list_alloc_records(0).unwrap().len(), 1);
         }
+    }
+
+    /// M21 门禁双机演练阶段 6 实测回归:Replay 的 ObjectMigrate/PartMigrate
+    /// 对**已本地化**对象(段表 = 本地坐标,与上游 old_segments 恒不等)
+    /// 必须容错应用(§4.3 布局独立:上游压缩是放置变更,已本地化的段
+    /// 字节已在本地;匹配项仍改挂新上游坐标供回填),不得报
+    /// ObjectChanged——否则 pull worker 无限重握手,复制流卡死。
+    /// Commit 路径的全量校验不变(并发覆盖/删除检出)。
+    #[test]
+    fn repl_replay_migrate_tolerates_localized_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
+        meta.set_repl_role(ReplRole::Standby).unwrap();
+        let g = |seq: u64| Gtid { epoch: 1, seq };
+        let up_seg = Segment {
+            extent_id: 7,
+            offset: 4096,
+            len: 8192,
+            crcs: vec![0xAAAA],
+        };
+        let local_seg = Segment {
+            extent_id: 2,
+            offset: 0,
+            len: 8192,
+            crcs: vec![0xBBBB],
+        };
+        let new_up_seg = Segment {
+            extent_id: 8,
+            offset: 0,
+            len: 8192,
+            crcs: vec![0xCCCC],
+        };
+        meta.apply_repl_record(
+            g(1),
+            &ReplRecord::new(
+                1,
+                &[Op::BucketPut {
+                    name: "b1".into(),
+                    meta: bucket_meta("b1"),
+                    location: None,
+                }],
+            ),
+        )
+        .unwrap();
+        // ① 对象以本地坐标在册(快照导入/回填清算后的形态),上游压缩
+        //    记录(old = 上游旧坐标)重放 → Applied,段表保持本地坐标
+        let mut big = object_meta(8192);
+        big.extents = vec![local_seg.clone()];
+        meta.apply_repl_record(
+            g(2),
+            &ReplRecord::new(
+                1,
+                &[Op::ObjectPut {
+                    bucket: "b1".into(),
+                    key: "big".into(),
+                    meta: big,
+                }],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            meta.apply_repl_record(
+                g(3),
+                &ReplRecord::new(
+                    1,
+                    &[Op::ObjectMigrate {
+                        bucket: "b1".into(),
+                        key: "big".into(),
+                        vk: None,
+                        old_segments: vec![up_seg.clone()],
+                        new_segments: vec![new_up_seg.clone()],
+                    }],
+                ),
+            )
+            .unwrap(),
+            ReplApplyOutcome::Applied,
+            "已本地化对象的上游压缩重放不得报失配"
+        );
+        assert_eq!(
+            meta.get_object("b1", "big").unwrap().unwrap().extents,
+            vec![local_seg.clone()],
+            "已本地化段表不被上游坐标覆盖"
+        );
+        // ② 段表仍挂上游旧坐标(回填未清算)→ 照常 remap 到新上游坐标
+        let mut big2 = object_meta(8192);
+        big2.extents = vec![up_seg.clone()];
+        meta.apply_repl_record(
+            g(4),
+            &ReplRecord::new(
+                1,
+                &[Op::ObjectPut {
+                    bucket: "b1".into(),
+                    key: "big2".into(),
+                    meta: big2,
+                }],
+            ),
+        )
+        .unwrap();
+        meta.apply_repl_record(
+            g(5),
+            &ReplRecord::new(
+                1,
+                &[Op::ObjectMigrate {
+                    bucket: "b1".into(),
+                    key: "big2".into(),
+                    vk: None,
+                    old_segments: vec![up_seg.clone()],
+                    new_segments: vec![new_up_seg.clone()],
+                }],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            meta.get_object("b1", "big2").unwrap().unwrap().extents,
+            vec![new_up_seg.clone()],
+            "未本地化段改挂新坐标(回填按新引用拉取)"
+        );
+        // ③ Commit 路径全量校验不变:本地压缩遇并发变更仍 ObjectChanged
+        let p_dir = tempfile::tempdir().unwrap();
+        let pri = MetaStore::open(p_dir.path(), &MetaConfig::default()).unwrap();
+        pri.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
+        let mut big3 = object_meta(8192);
+        big3.extents = vec![local_seg.clone()];
+        pri.commit_object_put("b1", "big3", &big3, AllocDraft::default(), StatsDelta::default())
+            .unwrap();
+        let err = pri
+            .commit_object_migrate(
+                "b1",
+                "big3",
+                None,
+                std::slice::from_ref(&up_seg),
+                std::slice::from_ref(&new_up_seg),
+                AllocDraft::default(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::ObjectChanged(_)),
+            "Commit 全量校验不变: {err}"
+        );
     }
 
     /// M21 C4:repl_object_entries 范围 = base 键 + 该 key 全部版本键;

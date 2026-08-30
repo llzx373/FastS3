@@ -189,12 +189,24 @@ impl RebuildService {
         //    永拒 410,§3.3)。失败 = fail-fast:本地状态未清,恢复原
         //    worker/回填池后返回(重建幂等,可重试)。
         let tls = crate::repl_worker::build_client_tls(&old_cfg).map_err(RebuildError::Failed)?;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()
-            .map_err(|e| RebuildError::Failed(format!("rebuild runtime: {e}")))?;
-        if let Err(e) = rt.block_on(crate::repl_worker::drop_upstream_slot(&old_cfg, &tls)) {
+        // 调用方 = fs3-admin 处理器线程(寄宿在 admin tokio runtime 内),
+        // 就地建 runtime block_on 必 panic("Cannot start a runtime from
+        // within a runtime";M21 双机演练实测 admin 线程崩溃)。挪到专用
+        // OS 线程上跑独立 current_thread runtime——该线程无宿主 runtime,
+        // block_on 合法;调用方阻塞等 join(同步语义不变)。
+        let drop_cfg = old_cfg.clone();
+        let drop_res = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+                .map_err(|e| format!("rebuild runtime: {e}"))?;
+            rt.block_on(crate::repl_worker::drop_upstream_slot(&drop_cfg, &tls))
+                .map_err(|e| e.to_string())
+        })
+        .join()
+        .map_err(|_| RebuildError::Failed("rebuild drop-slot thread panicked".into()))?;
+        if let Err(e) = drop_res {
             let note = match self.start_stack(&old_cfg) {
                 Ok((w, bf)) => {
                     inner.pull = Some(w);

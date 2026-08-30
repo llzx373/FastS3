@@ -1451,6 +1451,27 @@ impl ReplServer {
             Ok(_) => {}
             Err(e) => return internal_err("pending probe", &e),
         }
+        // E1 同源护栏(M21 级联演练实测):**未完成首轮 bootstrap/apply 的
+        // 中继**(standby 且 executed 空)位点 P 只被本机 init 基线撑到
+        // 1-1,hello 的包含性口径(executed ∪ bl:,备端无水位兜底)却为
+        // 空集——此刻开出快照,下游按 P 落定 executed 后重握手必中
+        // ErrDiverged 假分歧(_fatal_,不再重试)。拒开新会话(503;
+        // 下游 bootstrap Transient 重试,本端首轮 apply 落定后天然收敛)。
+        // 主端不在此列:空库主端 P=1-1 由水位兜底在 hello 侧自洽(纯主
+        // 首 bootstrap 路径,双机演练阶段 1)。
+        if matches!(self.meta.repl_role(), Ok(fs3_meta::ReplRole::Standby)) {
+            match self.meta.repl_executed() {
+                Ok(s) if s.is_empty() => {
+                    return json_err(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "ErrNoReplicatedHistory",
+                        "standby relay has no replicated history yet; retry after first apply",
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => return internal_err("executed probe", &e),
+            }
+        }
         self.sweep_snapshots();
         if self.snapshots.lock().len() >= MAX_SNAPSHOT_SESSIONS {
             return json_err(
@@ -5128,6 +5149,58 @@ mod tests {
         consume(3);
         let got = binlog_get(&fx, (&cli.0, &cli.1), "s1", "1-2").await;
         assert_eq!(got, vec!["1-3", "1-4"], "全部回填完成后续流放行");
+    }
+
+    /// M21 E1 同源护栏(级联演练实测回归):**executed 为空的中继**(首轮
+    /// bootstrap/apply 未完成)位点 P 只被本机 init 基线撑住,hello 包含
+    /// 性口径(executed ∪ bl:,备端无水位兜底)却是空集——此刻开快照 =
+    /// 给下游递一个本机 GTID 集不含的位点,下游按 P 落定 executed 后重
+    /// 握手必中 ErrDiverged 假分歧(fatal,不再重试)。守卫 = 拒开会话
+    /// (503 ErrNoReplicatedHistory;下游 bootstrap Transient 重试,首轮
+    /// apply 落定后天然收敛)。主端不在此列(空库主端 P=1-1 由水位兜底
+    /// 自洽)。
+    #[tokio::test]
+    async fn relay_snapshot_requires_replicated_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(&dir.path().join("relay"));
+        let meta = engine.read().meta_arc();
+        meta.set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
+        let fx = start_server_on(engine.clone(), meta.clone());
+        let cli = fx.client_cert(Some("node-c"));
+        let snap_req = |body: &str| post_json_req("/v1/repl/v1/snapshot", body);
+
+        // ① executed 空 → 503 ErrNoReplicatedHistory
+        let Ok((st, _, raw)) = mtls_request(
+            fx.addr,
+            &fx.ca_pem,
+            Some((&cli.0, &cli.1)),
+            &snap_req("{}"),
+        )
+        .await
+        else {
+            panic!("snapshot request transport error");
+        };
+        assert_eq!(st, 503, "{raw:?}");
+        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(v["error"], "ErrNoReplicatedHistory");
+
+        // ② 首轮 apply 落定(心跳形态空 ops 记录,executed 并入)→ 放行
+        meta.apply_repl_record(
+            Gtid { epoch: 1, seq: 1 },
+            &fs3_meta::repl::ReplRecord::new(1, &[]),
+        )
+        .unwrap();
+        let Ok((st, _, raw)) = mtls_request(
+            fx.addr,
+            &fx.ca_pem,
+            Some((&cli.0, &cli.1)),
+            &snap_req("{}"),
+        )
+        .await
+        else {
+            panic!("snapshot request transport error");
+        };
+        assert_eq!(st, 200, "{raw:?}");
     }
 
     /// M21 E1(设计稿 §3.5/§3.6;TODO M21/E1 具名用例):**三级链路
