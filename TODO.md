@@ -197,7 +197,7 @@
 - [x] F3 配置段:`[replication]` 全字段(设计 §6.1 toml)照 `[batch]` 样板;
   `fasts3.example.toml` + wizard.rs 问询;settings 页 restart_required 标注
   - 用例:`repl_config_settings_patch_restart_required`
-- [ ] F4 文档收口:DESIGN.md §1 非目标注解(ADR-33 链接)+ ADR-20 旁注;
+- [x] F4 文档收口:DESIGN.md §1 非目标注解(ADR-33 链接)+ ADR-20 旁注;
   `m14-center-contract.md` §6 注明内置复制替代 `sync.run` 占位(编排视图二期);
   `docs/replication-design.md` 标记为已立项;README 能力清单
   - 用例:文档链接互查;`?replication` 501 口径不变回归
