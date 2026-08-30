@@ -5,6 +5,29 @@
 > 详细发布记录见 [RELEASES.md](./RELEASES.md);RC/GA 候选流程见
 > [docs/ga/rc-flow.md](./docs/ga/rc-flow.md)。
 
+## v2.6.0 — M20 SSE-KMS 密钥托管(2026-08-30)
+
+M20 全部任务与门禁完成(TODO.md M20 全勾选);ADR-29 落盘 DESIGN.md §3.3
+(Vault/OpenBao transit,KEK 永不出 KMS 进程,明文 DEK 不缓存,禁止空壳 KMS);
+workspace + web console/server 版本 **2.6.0**。git tag / `tools/package/`
+属执行期步骤(**本版本不打 tag**,与 v2.5.0 同口径)。
+
+- **SSE-KMS 协议**(D/E):`aws:kms` 头与桶默认加密(+ 可选 KMSMasterKeyID)、
+  PUT/GET/HEAD/Copy/multipart/UploadPartCopy/ingest 全 op 接线;停 KMS →
+  `KMS.UnavailableException`;轮换靠 transit 版本历史,旧对象可读,**不用
+  rewrap**。
+- **fs3-kms**:vaultrs + reqwest(rustls);managed 子进程监督 vault/bao
+  (init/unseal 一次性交付,token_file 0600);external 填 addr + token_file。
+- **横切**:`fasts3_kms_*` 指标;事件/通知 `sse` 字段;admin
+  `/v1/admin/kms/status` 与 key CRUD/rotate(`admin:*`,无 `kms:` 动作族)。
+- **控制台**:`[kms]` backend 三态 + settings 重启标注;KMS 页与托管向导
+  (OpenBao/Vault flavor、config.hcl 预览、unseal key 一次性下载);桶默认
+  加密支持 aws:kms。
+- **安全断言**:同明文两次写密文不同;盘上无明文 DEK;Vault 停机阻断解密;
+  崩溃 ≥200 轮可解。s3-tests kms 宽 token 出集,残余逐名记账。
+- **门禁**:`cargo test --workspace`;clippy -D warnings;cargo audit;
+  **本版本不打 tag**。
+
 ## v2.5.0 — M19 好用的私有化(2026-08-29)
 
 M19 全部任务与门禁完成(TODO.md M19 全勾选);ADR-24(迁入保真)/ADR-25(Kafka

@@ -5622,7 +5622,7 @@ impl S3Service {
         // M20 D3(ADR-29):KMS 写密钥 mint(写锁之外;RTT 不占引擎写锁)
         let kms_key = match &intent {
             crate::sse::SseWriteIntent::SseKms(h) => {
-                Some(self.mint_kms_write_key(&bucket, &key, h)?)
+                Some(self.mint_kms_write_key(bucket, key, h)?)
             }
             _ => None,
         };
@@ -6452,7 +6452,7 @@ impl S3Service {
         // 会话绑定复用本次 mint,不二次往返)
         let kms_key = match &intent {
             crate::sse::SseWriteIntent::SseKms(h) => {
-                Some(self.mint_kms_write_key(&bucket, &key, h)?)
+                Some(self.mint_kms_write_key(bucket, key, h)?)
             }
             _ => None,
         };
@@ -7319,7 +7319,7 @@ impl S3Service {
         // M20 D3(ADR-29 KR6.4):copy 目标 KMS 写密钥(上下文绑定目标对象)
         let dst_kms_key = match &dst_intent {
             crate::sse::SseWriteIntent::SseKms(h) => {
-                Some(self.mint_kms_write_key(&bucket, &key, h)?)
+                Some(self.mint_kms_write_key(bucket, key, h)?)
             }
             _ => None,
         };

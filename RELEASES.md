@@ -1,5 +1,24 @@
 # FastS3 发布记录
 
+## v2.6.0 — M20 SSE-KMS 密钥托管(2026-08-30)
+
+> 发布状态:与 M20 交付同步;git tag/发布流水线属执行期步骤(与 v2.5.0
+> 同口径,**本版本不打 tag**)。决策记录:ADR-29(docs/DESIGN.md §3.3,
+> 与实现无偏离)。
+
+### 变更(TODO M20 全项:A~H + 门禁)
+
+- **SSE-KMS**:对象/桶默认 `aws:kms`,Vault/OpenBao transit;KEK 永不出
+  KMS 进程;明文 DEK 逐次在线 unwrap,禁止缓存与空壳 KMS。
+- **托管向导**:无 KMS 企业从控制台拉起 OpenBao 或 Vault;已有集群填
+  vault_addr + token_file。
+- **门禁实测**:
+  - `ssekms_rotate_key_old_objects_readable` / 密文抽样 / 无明文 DEK /
+    Vault 停机阻断 / 200 轮崩溃可解;
+  - `kms_wizard_console_flow`(OpenBao 与 Vault flavor)+ `kms_console_readonly_403`;
+  - s3-tests kms 族宽 token 出集,逐名残余见 tests/s3-tests/README.md;
+  - **本版本不打 tag**。
+
 ## v2.5.0 — M19 好用的私有化(2026-08-29)
 
 > 发布状态:与 M19 交付同步;git tag/发布流水线属执行期步骤(与 v2.4.0

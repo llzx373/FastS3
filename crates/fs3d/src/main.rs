@@ -603,12 +603,12 @@ fn read_kms_token_file(path: &std::path::Path) -> fs3_core::Result<String> {
     Ok(token)
 }
 
-fn assemble_kms(
-    cfg: &config::RootConfig,
-) -> fs3_core::Result<(
+type AssembledKms = (
     Option<Arc<fs3_kms::KmsServiceManager>>,
     Option<Arc<fs3_kms::VaultKms>>,
-)> {
+);
+
+fn assemble_kms(cfg: &config::RootConfig) -> fs3_core::Result<AssembledKms> {
     use config::KmsBackendMode;
     cfg.kms.validate_for_serve()?;
     match cfg.kms.mode()? {
@@ -708,6 +708,7 @@ fn assemble_kms(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_serve(
     config_path: Option<PathBuf>,
     engine_cfg: &EngineConfig,

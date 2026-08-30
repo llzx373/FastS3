@@ -48,7 +48,7 @@
 
 | 里程碑 | 版本 | 工期(2 人并行) | 核心交付 | 状态 |
 | --- | --- | --- | --- | --- |
-| [M20 SSE-KMS 密钥托管](#m20-v260-sse-kms-密钥托管) | v2.6.0 | ≈6 周 | SSE-KMS 全协议 + Vault/OpenBao 双后端 + 控制台托管向导(无 KMS 企业一键获得完整 KMS) | 进行中 |
+| [M20 SSE-KMS 密钥托管](#m20-v260-sse-kms-密钥托管) | v2.6.0 | ≈6 周 | SSE-KMS 全协议 + Vault/OpenBao 双后端 + 控制台托管向导(无 KMS 企业一键获得完整 KMS) | ✅ 已交付 |
 
 已交付底座(不占排期,门禁不得回退):S3 核心读写、版本、Object Lock、SSE-S3/C、生命周期、
 归档 Restore、Webhook、Kafka 通知、STS、Inventory、LDAP/OIDC、IAM 多租户、中心纳管、
@@ -216,16 +216,16 @@
 
 ### M20 门禁(退出条件)
 
-- [ ] ADR-29 落盘,与实现无偏离
-- [ ] `cargo test --workspace` 全绿;本清单具名用例全部执行(H1/H2 全绿;
+- [x] ADR-29 落盘,与实现无偏离
+- [x] `cargo test --workspace` 全绿;本清单具名用例全部执行(H1/H2 全绿;
   `kms_wizard_console_flow` 走通 OpenBao 与 Vault 两种 flavor)
-- [ ] s3-tests 全量意外失败 0;kms 族出集或逐名(README 记账)
-- [ ] aws cli 实测:`put-object --server-side-encryption aws:kms --ssekms-key-id` 往返、
+- [x] s3-tests 全量意外失败 0;kms 族出集或逐名(README 记账)
+- [x] aws cli 实测:`put-object --server-side-encryption aws:kms --ssekms-key-id` 往返、
   `head-object` 回显、`put-bucket-encryption` aws:kms 默认加密生效、停 KMS →
   `KMS.UnavailableException`、轮换后旧对象可读
-- [ ] 控制台演练:企业无 KMS 场景从零向导拉起 OpenBao 完成写读删轮换,全程不进 shell
-- [ ] clippy -D warnings;覆盖率不回退 >1pt;cargo audit 清零(vaultrs/reqwest 入审计)
-- [ ] 发布记录 v2.6.0:CHANGELOG/RELEASES + 版本 bump(**不打 tag / 不公网 Release**)
+- [x] 控制台演练:企业无 KMS 场景从零向导拉起 OpenBao 完成写读删轮换,全程不进 shell
+- [x] clippy -D warnings;覆盖率不回退 >1pt;cargo audit 清零(vaultrs/reqwest 入审计)
+- [x] 发布记录 v2.6.0:CHANGELOG/RELEASES + 版本 bump(**不打 tag / 不公网 Release**)
 
 ---
 
