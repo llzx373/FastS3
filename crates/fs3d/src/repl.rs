@@ -239,8 +239,8 @@ pub struct ReplConfig {
     /// 缺省 serve=100/backfill=50/on_demand=10)。
     pub traffic_weights: TrafficWeights,
     /// binlog 两级水位参数(M21 A3;[replication].repl_retain_* 收口,F3)。
-    /// 消费点 = binlog 周期截断循环(fs3-meta truncate_binlog API 已备,
-    /// 周期循环的装配属后续任务,参数先随本配置承载,不留第二入口)。
+    /// 消费点 = binlog 周期截断循环(fs3d repl_truncate.rs,复制口启用
+    /// 时随 ReplServer 装配)。
     pub retain: fs3_meta::ReplRetainConfig,
     /// 装配注入的中继流量共享桶(E2;main.rs cmd_serve 在复制口或
     /// pull/backfill 任一启用时建桶并注入,serve/backfill/on_demand
@@ -408,8 +408,8 @@ pub struct ReplServer {
     /// 共享同一预算,实现形态见 repl_traffic.rs 模块注释)。
     traffic: Arc<ReplTraffic>,
     /// binlog 两级水位参数(A3;[replication].repl_retain_*,F3 收口)。
-    /// 当前消费 = 启动日志公示实际生效值;周期截断循环
-    /// (truncate_binlog 调用方)装配属后续任务,届时直接读本字段。
+    /// 消费 = 启动日志公示实际生效值 + binlog 周期截断循环
+    /// (fs3d repl_truncate.rs,复制口启用时装配,读同一配置值)。
     retain: fs3_meta::ReplRetainConfig,
     /// 在线快照导出会话注册表(C1;snapshot_id → 会话;空闲 TTL 回收)。
     snapshots: Mutex<HashMap<u64, Arc<SnapshotSession>>>,

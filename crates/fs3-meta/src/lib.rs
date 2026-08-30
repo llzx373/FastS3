@@ -231,7 +231,8 @@ impl Default for MetaConfig {
 }
 
 /// binlog 两级水位参数(M21 A3;ADR-33 RP8;设计稿 §3.4,风险 R7)。
-/// [replication] 配置段接线在 TODO M21/F3;truncate_binlog 以本结构为输入。
+/// [replication] 配置段接线 = TODO M21/F3(已收口);周期消费点 = fs3d
+/// repl_truncate(binlog 周期截断循环);truncate_binlog 以本结构为输入。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplRetainConfig {
     /// 软上限:binlog 保留时长(小时;默认 24h)。与 retain_bytes 同时
@@ -4129,7 +4130,8 @@ impl MetaStore {
         Ok(seed)
     }
 
-    /// binlog 软上限保槽告警计数(M21 A3;指标导出在 TODO M21/D4 接线)。
+    /// binlog 软上限保槽告警计数(M21 A3;指标导出 = fs3d repl_metrics
+    /// `fasts3_repl_soft_cap_alerts`,D4 口径)。
     pub fn repl_soft_cap_alerts(&self) -> u64 {
         self.repl_soft_cap_alerts.load(Ordering::Relaxed)
     }

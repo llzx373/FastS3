@@ -26,6 +26,7 @@ mod repl_backfill;
 mod repl_metrics;
 mod repl_rebuild;
 mod repl_traffic;
+mod repl_truncate;
 mod repl_worker;
 mod rewrite;
 mod settings;
@@ -1282,14 +1283,31 @@ fn cmd_serve(
     // 强制)。配置 = [replication] 段(F3 收口;env FS3D_REPL_* 仅测试
     // 钩子回退)。TLS 材料装配期装载,坏材料 = 启动显式失败(不静默降级
     // 为无 mTLS,红线 RP6.2)。
+    let mut repl_truncate_worker = None;
     if let Some(mut repl_cfg) = repl_cfg_env {
         repl_cfg.traffic = repl_traffic.clone();
         let meta = engine.read().meta_arc();
-        let handle = repl::ReplServer::new(engine.clone(), meta, repl_cfg)
+        let retain = repl_cfg.retain;
+        let handle = repl::ReplServer::new(engine.clone(), meta.clone(), repl_cfg)
             .map_err(fs3_core::Error::InvalidArgument)?
             .spawn()
             .map_err(fs3_core::Error::Io)?;
         tracing::info!("replication port bound on {}", handle.local_addr);
+        // M21 A3 补线(F3 遗留;ADR-33 RP8):binlog 周期截断循环——复制口
+        // 启用(binlog 开)即装配,周期 = repl_truncate::truncate_interval()
+        // (默认 60s;env FS3D_REPL_TRUNCATE_SECS 测试钩子)。只读引擎不启动
+        // (同其它后台 worker 口径)。worker 形态照 fs3-engine worker.rs
+        // BackgroundWorker 先例;软上限告警计数经 D4 指标面导出
+        // (fasts3_repl_soft_cap_alerts,repl_metrics.rs)。
+        if !engine_cfg.read_only {
+            let throttle = engine.read().throttle();
+            repl_truncate_worker = Some(fs3_engine::worker::WorkerHandle::spawn(
+                "fs3-repl-truncate",
+                repl_truncate::BinlogTruncateWorker::new(meta, retain),
+                throttle,
+                repl_truncate::truncate_interval(),
+            ));
+        }
     }
 
     // M21 B4(ADR-33 RP4.2;设计稿 §4.1):下游 pull worker。role 取值 =
@@ -1553,6 +1571,11 @@ fn cmd_serve(
     }
     // M19 J:Batch worker 停止(游标已持久化,重启续跑)
     if let Some(mut h) = batch_worker.take() {
+        h.stop();
+    }
+    // M21 A3 补线:binlog 周期截断 worker 停止(纯 meta 删除批,先于
+    // 引擎收尾,避免与 meta 关闭竞写)
+    if let Some(mut h) = repl_truncate_worker.take() {
         h.stop();
     }
     // M21 B4:复制 pull worker 停止(游标/executed 同事务落盘,重启从
