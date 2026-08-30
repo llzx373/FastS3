@@ -41,12 +41,110 @@ pub struct RootConfig {
     pub kms: KmsConfig,
 }
 
-/// M20 A2(ADR-29 KR5):`[kms]` 段。
+/// M20 G1(ADR-29 KR5):`[kms]` 段。
+/// `backend = none|external|managed`(缺省 none);仅有 `[kms.deploy]`
+/// 而无 backend 时按 A2 兼容视为 managed。token 永不进 toml。
 #[derive(Debug, Default, Clone, serde::Deserialize)]
 pub struct KmsConfig {
-    /// `[kms.deploy]` 托管子段(配置 = fs3d 托管 vault/bao;None = 不托管)。
+    /// none | external | managed。省略时:有 deploy → managed,否则 none。
+    #[serde(default)]
+    pub backend: Option<String>,
+    /// external:Vault/OpenBao 地址(如 `https://vault.corp:8200`)。
+    #[serde(default)]
+    pub vault_addr: Option<String>,
+    /// service token 路径(0600;token 明文不进本文件)。
+    #[serde(default)]
+    pub token_file: Option<String>,
+    /// TLS CA PEM 路径。
+    #[serde(default)]
+    pub tls_ca: Option<String>,
+    /// mTLS 客户端证书 PEM(含私钥;0600)。
+    #[serde(default)]
+    pub tls_client: Option<String>,
+    /// 客户端超时毫秒(默认 3000)。
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// 未指定 key-id 时的默认 transit key(默认 `fasts3-default`)。
+    #[serde(default)]
+    pub default_key: Option<String>,
+    /// `[kms.deploy]` 托管子段(backend=managed)。
     #[serde(default)]
     pub deploy: Option<KmsDeployConfig>,
+}
+
+impl KmsConfig {
+    /// 解析后端模式(缺省/A2 兼容;非法值显式报错)。
+    pub fn mode(&self) -> Result<KmsBackendMode> {
+        match self
+            .backend
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "" => {
+                if self.deploy.is_some() {
+                    Ok(KmsBackendMode::Managed)
+                } else {
+                    Ok(KmsBackendMode::None)
+                }
+            }
+            "none" => Ok(KmsBackendMode::None),
+            "managed" => Ok(KmsBackendMode::Managed),
+            "external" => Ok(KmsBackendMode::External),
+            other => Err(Error::InvalidArgument(format!(
+                "[kms].backend must be none|external|managed, got {other}"
+            ))),
+        }
+    }
+
+    /// serve 装配前校验(缺 token_file / vault_addr 显式失败,不静默)。
+    pub fn validate_for_serve(&self) -> Result<()> {
+        match self.mode()? {
+            KmsBackendMode::None => Ok(()),
+            KmsBackendMode::Managed => {
+                if self.deploy.is_none() {
+                    Err(Error::InvalidArgument(
+                        "[kms].backend=managed requires [kms.deploy]".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            KmsBackendMode::External => {
+                if self
+                    .vault_addr
+                    .as_deref()
+                    .map(|s| s.trim().is_empty())
+                    .unwrap_or(true)
+                {
+                    return Err(Error::InvalidArgument(
+                        "[kms].backend=external requires vault_addr".into(),
+                    ));
+                }
+                if self
+                    .token_file
+                    .as_deref()
+                    .map(|s| s.trim().is_empty())
+                    .unwrap_or(true)
+                {
+                    return Err(Error::InvalidArgument(
+                        "[kms].backend=external requires token_file (0600; token 不进 toml)".into(),
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// `[kms].backend` 三态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KmsBackendMode {
+    None,
+    External,
+    Managed,
 }
 
 /// M20 A2:`[kms.deploy]` —— fs3d 子进程监督 vault/bao。
@@ -368,5 +466,35 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.audit.persist, Some(false));
         assert_eq!(cfg.audit.max_entries, Some(1000));
+    }
+
+    /// M20 G1:`[kms]` backend 三态 + A2 兼容(仅 deploy → managed)。
+    #[test]
+    fn kms_config_backend_modes() {
+        let none: RootConfig = toml::from_str("[storage]\ndevices=[\"/d\"]\n").unwrap();
+        assert_eq!(none.kms.mode().unwrap(), KmsBackendMode::None);
+        let ext: RootConfig = toml::from_str(
+            "[storage]\ndevices=[\"/d\"]\n[kms]\nbackend=\"external\"\nvault_addr=\"http://127.0.0.1:8200\"\n",
+        )
+        .unwrap();
+        assert_eq!(ext.kms.mode().unwrap(), KmsBackendMode::External);
+        assert!(ext.kms.token_file.is_none(), "token 不进 toml");
+        let managed: RootConfig = toml::from_str(
+            "[storage]\ndevices=[\"/d\"]\n[kms.deploy]\nflavor=\"openbao\"\ndata_dir=\"/var/lib/fasts3/kms\"\n",
+        )
+        .unwrap();
+        assert_eq!(managed.kms.mode().unwrap(), KmsBackendMode::Managed);
+        let bad: RootConfig =
+            toml::from_str("[storage]\ndevices=[\"/d\"]\n[kms]\nbackend=\"kes\"\n").unwrap();
+        assert!(bad.kms.mode().is_err());
+        let missing_tok: RootConfig = toml::from_str(
+            "[storage]\ndevices=[\"/d\"]\n[kms]\nbackend=\"external\"\nvault_addr=\"http://127.0.0.1:8200\"\n",
+        )
+        .unwrap();
+        let err = missing_tok.kms.validate_for_serve().unwrap_err().to_string();
+        assert!(
+            err.contains("token_file"),
+            "缺 token_file 必须显式失败: {err}"
+        );
     }
 }

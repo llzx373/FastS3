@@ -81,6 +81,30 @@ impl SettingsProvider {
             },
             "log_level": log_level,
             "hot": ["limits.key_rps", "auth.allow_anonymous", "log_level"],
+            // M20 G1:KMS 视图(token 只回显路径,永不回显明文)
+            "kms": {
+                "backend": match cfg.kms.mode() {
+                    Ok(crate::config::KmsBackendMode::None) => "none",
+                    Ok(crate::config::KmsBackendMode::External) => "external",
+                    Ok(crate::config::KmsBackendMode::Managed) => "managed",
+                    Err(_) => "none",
+                },
+                "vault_addr": cfg.kms.vault_addr,
+                "token_file": cfg.kms.token_file,
+                "tls_ca": cfg.kms.tls_ca,
+                "tls_client": cfg.kms.tls_client,
+                "timeout_ms": cfg.kms.timeout_ms.unwrap_or(3000),
+                "default_key": cfg.kms.default_key,
+                "deploy": cfg.kms.deploy.as_ref().map(|d| json!({
+                    "flavor": d.flavor,
+                    "binary": d.binary,
+                    "port": d.port.unwrap_or(8200),
+                    "data_dir": d.data_dir,
+                    "init_key_shares": d.init_key_shares.unwrap_or(5),
+                    "auto_unseal": d.auto_unseal.unwrap_or(false),
+                    "key_file": d.key_file,
+                })),
+            },
         }))
     }
 
@@ -157,6 +181,18 @@ impl SettingsProvider {
                 ][..],
             ),
             ("auth", &["region"][..]),
+            (
+                "kms",
+                &[
+                    "backend",
+                    "vault_addr",
+                    "token_file",
+                    "tls_ca",
+                    "tls_client",
+                    "timeout_ms",
+                    "default_key",
+                ][..],
+            ),
         ] {
             if let Some(sec) = obj.get(section) {
                 for k in keys {
@@ -166,6 +202,12 @@ impl SettingsProvider {
                     }
                 }
             }
+        }
+
+        // M20 G1:`[kms.deploy]` 整表写入(flavor/data_dir/port 等需重启)
+        if let Some(dep) = obj.get("kms").and_then(|k| k.get("deploy")) {
+            file_fields.push(("kms.deploy".into(), dep.clone()));
+            restart.push("kms.deploy".into());
         }
 
         // 写入配置文件
@@ -285,5 +327,75 @@ mod tests {
         // 关键逻辑在 get() 内 —— 通过构造一个空 service 代价高,跳过。
         // (集成行为由 drill/控制台验证)
         let _ = RootConfig::default();
+    }
+
+    /// M20 G1:PATCH [kms] 字段写入配置并标记 restart_required;token 不进 toml。
+    #[test]
+    fn kms_config_settings_patch_restart_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("disk.img");
+        std::fs::File::create(&img)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
+        let cfg = fs3_engine::EngineConfig {
+            devices: vec![img.clone()],
+            meta_dir: dir.path().join("meta"),
+            compaction: fs3_engine::CompactionConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let engine = std::sync::Arc::new(parking_lot::RwLock::new(
+            fs3_engine::Engine::open(&cfg).unwrap(),
+        ));
+        let svc = std::sync::Arc::new(fs3_s3::S3Service::new(
+            engine,
+            vec![fs3_s3::auth::Credentials {
+                access_key: "ak".into(),
+                secret_key: "sk".into(),
+            }],
+            "us-east-1".into(),
+            false,
+        ));
+        let toml_path = dir.path().join("fasts3.toml");
+        std::fs::write(&toml_path, "[storage]\ndevices=[\"/d\"]\nmeta_dir=\"/m\"\n").unwrap();
+        let p = SettingsProvider::new(Some(toml_path.clone()), svc);
+        let out = p
+            .patch(&json!({
+                "kms": {
+                    "backend": "external",
+                    "vault_addr": "http://127.0.0.1:8200",
+                    "token_file": "/etc/fasts3/kms.token"
+                }
+            }))
+            .unwrap();
+        let restart: Vec<String> = out["restart_required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        assert!(restart.iter().any(|s| s == "kms.backend"), "{restart:?}");
+        assert!(restart.iter().any(|s| s == "kms.vault_addr"), "{restart:?}");
+        assert!(restart.iter().any(|s| s == "kms.token_file"), "{restart:?}");
+        let text = std::fs::read_to_string(&toml_path).unwrap();
+        assert!(text.contains("backend") && text.contains("external"), "{text}");
+        assert!(
+            !text.contains("hvs.") && !text.contains("vault:v1:"),
+            "token 明文不得进 toml: {text}"
+        );
+        // 缺 token_file 的 external 装配显式失败
+        let loaded = crate::config::load_config(Some(&toml_path)).unwrap();
+        assert_eq!(
+            loaded.kms.mode().unwrap(),
+            crate::config::KmsBackendMode::External
+        );
+        assert_eq!(
+            loaded.kms.token_file.as_deref(),
+            Some("/etc/fasts3/kms.token")
+        );
     }
 }

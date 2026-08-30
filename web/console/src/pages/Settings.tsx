@@ -19,6 +19,10 @@ interface Draft {
   key_rps: string;
   log_level: string;
   allow_anonymous: boolean;
+  kms_backend: string;
+  kms_vault_addr: string;
+  kms_token_file: string;
+  kms_timeout_ms: string;
 }
 
 const emptyDraft = (): Draft => ({
@@ -33,6 +37,10 @@ const emptyDraft = (): Draft => ({
   key_rps: "0",
   log_level: "info",
   allow_anonymous: false,
+  kms_backend: "none",
+  kms_vault_addr: "",
+  kms_token_file: "",
+  kms_timeout_ms: "3000",
 });
 
 /** 展示校验错误,返回是否可提交。 */
@@ -48,6 +56,10 @@ function validate(d: Draft): string[] {
   n(d.checkpoint_interval, "checkpoint_interval");
   n(d.group_commit_ms, "group_commit_ms");
   n(d.key_rps, "key_rps");
+  n(d.kms_timeout_ms, "kms.timeout_ms");
+  if (!["none", "external", "managed"].includes(d.kms_backend)) {
+    errs.push("kms.backend 必须是 none/external/managed");
+  }
   return errs;
 }
 
@@ -76,6 +88,10 @@ export default function Settings() {
         key_rps: String(c.limits?.key_rps ?? 0),
         log_level: c.log_level ?? "info",
         allow_anonymous: c.auth?.allow_anonymous ?? false,
+        kms_backend: c.kms?.backend ?? "none",
+        kms_vault_addr: c.kms?.vault_addr ?? "",
+        kms_token_file: c.kms?.token_file ?? "",
+        kms_timeout_ms: String(c.kms?.timeout_ms ?? 3000),
       });
       setValidErr([]);
       setError(null);
@@ -112,6 +128,12 @@ export default function Settings() {
         limits: { key_rps: Number(draft.key_rps) },
         log_level: draft.log_level,
         auth: { allow_anonymous: draft.allow_anonymous },
+        kms: {
+          backend: draft.kms_backend,
+          vault_addr: draft.kms_vault_addr.trim() === "" ? null : draft.kms_vault_addr,
+          token_file: draft.kms_token_file.trim() === "" ? null : draft.kms_token_file,
+          timeout_ms: Number(draft.kms_timeout_ms),
+        },
       };
       const r = await api.updateConfig(patch);
       setResult(r);
@@ -420,6 +442,44 @@ function OpsPanels() {
         >
           轮换密钥
         </button>
+      </div>
+
+      <div className="card">
+        <div className="title">{t("SSE-KMS", "SSE-KMS")}</div>
+        <p className="muted" style={{ fontSize: 12 }}>
+          {t(
+            "需重启生效。token 只填文件路径(0600),明文不进配置。完整向导见 KMS 页。",
+            "Requires restart. Put the token path only (mode 0600); never the token itself. Full wizard is on the KMS page."
+          )}
+        </p>
+        <div className="form-row">
+          <label>backend</label>
+          <select value={draft.kms_backend} onChange={(e) => set("kms_backend", e.target.value)}>
+            <option value="none">none</option>
+            <option value="external">external</option>
+            <option value="managed">managed</option>
+          </select>
+        </div>
+        <div className="form-row">
+          <label>vault_addr</label>
+          <input
+            value={draft.kms_vault_addr}
+            onChange={(e) => set("kms_vault_addr", e.target.value)}
+            placeholder="https://vault.example:8200"
+          />
+        </div>
+        <div className="form-row">
+          <label>token_file</label>
+          <input
+            value={draft.kms_token_file}
+            onChange={(e) => set("kms_token_file", e.target.value)}
+            placeholder="/etc/fasts3/kms.token"
+          />
+        </div>
+        <div className="form-row">
+          <label>timeout_ms</label>
+          <input value={draft.kms_timeout_ms} onChange={(e) => set("kms_timeout_ms", e.target.value)} />
+        </div>
       </div>
 
       <div className="card">

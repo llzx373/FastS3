@@ -135,6 +135,25 @@ export interface AdminConfig {
   log_level?: string;
   /** 可热重载字段;其余字段改动需重启 */
   hot?: string[];
+  /** M20 G1:SSE-KMS(`[kms]`;token 只回显路径) */
+  kms?: {
+    backend?: "none" | "external" | "managed";
+    vault_addr?: string | null;
+    token_file?: string | null;
+    tls_ca?: string | null;
+    tls_client?: string | null;
+    timeout_ms?: number;
+    default_key?: string | null;
+    deploy?: {
+      flavor?: string;
+      binary?: string | null;
+      port?: number;
+      data_dir?: string;
+      init_key_shares?: number;
+      auto_unseal?: boolean;
+      key_file?: string | null;
+    } | null;
+  };
 }
 
 /** PATCH /api/config 返回:applied 已热生效 / restart_required 需重启。 */

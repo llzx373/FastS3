@@ -571,14 +571,54 @@ impl fs3_engine::lifecycle::EngineAccess for SharedEngine {
 /// M20 E(ADR-29):装配 KMS 托管子进程(可选)+ VaultKms 客户端。
 /// 托管在场但拉起失败 = 启动失败(不静默降级)。token 自 token_file
 /// 读取,不进日志。G1 补 external 后端(addr + token_file 无 deploy)。
+fn read_kms_token_file(path: &std::path::Path) -> fs3_core::Result<String> {
+    let meta = std::fs::metadata(path).map_err(|e| {
+        fs3_core::Error::InvalidArgument(format!(
+            "kms token_file {}: {e}(缺文件显式报错,不静默)",
+            path.display()
+        ))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            tracing::warn!(
+                "kms token_file {} mode {:o} (expect 0600)",
+                path.display(),
+                mode
+            );
+        }
+    }
+    let token = std::fs::read_to_string(path).map_err(|e| {
+        fs3_core::Error::InvalidArgument(format!("kms token_file {}: {e}", path.display()))
+    })?;
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return Err(fs3_core::Error::InvalidArgument(format!(
+            "kms token_file {} is empty",
+            path.display()
+        )));
+    }
+    Ok(token)
+}
+
 fn assemble_kms(
     cfg: &config::RootConfig,
 ) -> fs3_core::Result<(
     Option<Arc<fs3_kms::KmsServiceManager>>,
     Option<Arc<fs3_kms::VaultKms>>,
 )> {
-    let manager: Option<Arc<fs3_kms::KmsServiceManager>> = match &cfg.kms.deploy {
-        Some(d) => {
+    use config::KmsBackendMode;
+    cfg.kms.validate_for_serve()?;
+    match cfg.kms.mode()? {
+        KmsBackendMode::None => Ok((None, None)),
+        KmsBackendMode::Managed => {
+            let d = cfg.kms.deploy.as_ref().ok_or_else(|| {
+                fs3_core::Error::InvalidArgument(
+                    "[kms].backend=managed requires [kms.deploy]".into(),
+                )
+            })?;
             let shares = d.init_key_shares.unwrap_or(5);
             let mc = fs3_kms::ManagedConfig {
                 flavor: fs3_kms::Flavor::parse(&d.flavor)
@@ -590,7 +630,7 @@ fn assemble_kms(
                 init_key_threshold: shares.min(3),
                 auto_unseal: d.auto_unseal.unwrap_or(false),
                 key_file: d.key_file.clone().map(std::path::PathBuf::from),
-                timeout_ms: 3000,
+                timeout_ms: cfg.kms.timeout_ms.unwrap_or(3000),
             };
             let mgr = Arc::new(
                 fs3_kms::KmsServiceManager::new(mc)
@@ -620,34 +660,52 @@ fn assemble_kms(
                     st.restarts
                 );
             }
-            Some(mgr)
+            let token = read_kms_token_file(&mgr.config().token_file())?;
+            let v = fs3_kms::VaultKms::new(fs3_kms::VaultKmsConfig {
+                addr: mgr.addr(),
+                token,
+                tls_ca: cfg.kms.tls_ca.as_ref().map(std::path::PathBuf::from),
+                tls_client: cfg.kms.tls_client.as_ref().map(std::path::PathBuf::from),
+                timeout_ms: cfg.kms.timeout_ms.unwrap_or(3000),
+                default_key: cfg
+                    .kms
+                    .default_key
+                    .clone()
+                    .unwrap_or_else(|| fs3_kms::managed::DEFAULT_TRANSIT_KEY.into()),
+                ..Default::default()
+            })
+            .map_err(|e| fs3_core::Error::InvalidArgument(e.to_string()))?;
+            Ok((Some(mgr), Some(Arc::new(v))))
         }
-        None => None,
-    };
-    let client = if let Some(mgr) = &manager {
-        let token = std::fs::read_to_string(mgr.config().token_file()).map_err(|e| {
-            fs3_core::Error::InvalidArgument(format!(
-                "kms token_file {}: {e}",
-                mgr.config().token_file().display()
-            ))
-        })?;
-        let token = token.trim().to_string();
-        if token.is_empty() {
-            return Err(fs3_core::Error::InvalidArgument(
-                "kms token_file empty after deploy".into(),
-            ));
+        KmsBackendMode::External => {
+            let addr = cfg.kms.vault_addr.as_deref().filter(|s| !s.is_empty()).ok_or_else(|| {
+                fs3_core::Error::InvalidArgument(
+                    "[kms].backend=external requires vault_addr".into(),
+                )
+            })?;
+            let token_path = cfg.kms.token_file.as_deref().filter(|s| !s.is_empty()).ok_or_else(|| {
+                fs3_core::Error::InvalidArgument(
+                    "[kms].backend=external requires token_file (0600; token 不进 toml)".into(),
+                )
+            })?;
+            let token = read_kms_token_file(std::path::Path::new(token_path))?;
+            let v = fs3_kms::VaultKms::new(fs3_kms::VaultKmsConfig {
+                addr: addr.to_string(),
+                token,
+                tls_ca: cfg.kms.tls_ca.as_ref().map(std::path::PathBuf::from),
+                tls_client: cfg.kms.tls_client.as_ref().map(std::path::PathBuf::from),
+                timeout_ms: cfg.kms.timeout_ms.unwrap_or(3000),
+                default_key: cfg
+                    .kms
+                    .default_key
+                    .clone()
+                    .unwrap_or_else(|| fs3_kms::managed::DEFAULT_TRANSIT_KEY.into()),
+                ..Default::default()
+            })
+            .map_err(|e| fs3_core::Error::InvalidArgument(e.to_string()))?;
+            Ok((None, Some(Arc::new(v))))
         }
-        let v = fs3_kms::VaultKms::new(fs3_kms::VaultKmsConfig {
-            addr: mgr.addr(),
-            token,
-            ..Default::default()
-        })
-        .map_err(|e| fs3_core::Error::InvalidArgument(e.to_string()))?;
-        Some(Arc::new(v))
-    } else {
-        None
-    };
-    Ok((manager, client))
+    }
 }
 
 fn cmd_serve(

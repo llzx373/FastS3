@@ -253,6 +253,11 @@ token = "{admin_token}"
 
 [limits]
 key_rps = 0                    # 每密钥每秒请求上限(0 = 关闭)
+
+# M20 SSE-KMS:默认 none。已有 Vault 填 backend=external + vault_addr + token_file(0600);
+# 无 KMS 企业走控制台托管向导(backend=managed + [kms.deploy])。token 不进本文件。
+# [kms]
+# backend = "none"
 "#,
         device = device.display(),
         meta = meta_dir.display(),

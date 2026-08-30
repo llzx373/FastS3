@@ -96,3 +96,27 @@ key_rps = 0
 # enabled = true
 # 生成周期秒(默认 3600 = 1h;Daily/Weekly 配置的观测粒度;测试可调小)
 # interval_secs = 3600
+
+# ── M20 SSE-KMS(ADR-29)──
+# backend = none(默认,不接 KMS)| external(已有 Vault/OpenBao)| managed(fs3d 托管子进程)
+# token 明文永不进本文件,只写 token_file 路径(0600)
+#
+# [kms]
+# backend = "none"
+# # external:
+# # vault_addr = "https://vault.corp:8200"
+# # token_file = "/etc/fasts3/kms.token"
+# # tls_ca = "/etc/fasts3/kms-ca.pem"
+# # tls_client = "/etc/fasts3/kms-client.pem"
+# # timeout_ms = 3000
+# # default_key = "fasts3-default"
+#
+# [kms.deploy]
+# flavor = "openbao"          # vault | openbao
+# data_dir = "/var/lib/fasts3/kms"
+# port = 8200
+# # binary = "/usr/local/bin/bao"
+# # init_key_shares = 5
+# # auto_unseal = false
+# # key_file = "/etc/fasts3/kms-unseal.key"
+
