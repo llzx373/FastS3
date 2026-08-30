@@ -27,7 +27,8 @@ FastS3 v0.5 的协议一致性门禁 = **已实现特性的完整兼容**。跑 
 | 条件写(PUT/Complete/DELETE 的 If-Match/If-None-Match/LastModifiedTime/Size,版本化寻址) | s3-tests ifmatch/ifnonmatch/if_match/conditional_write 族 | ✅ v1.1(M10 V3-4,V6-1 出集) |
 | checksum 五族(CRC32/CRC32C/SHA1/SHA256/CRC64NVME:header+trailer 验算、x-amz-decoded-content-length 强制对照、multipart 逐分片 + Composite(-N)/FULL_OBJECT 对象级、Create 会话算法代算)+ GetObjectAttributes(五属性、ObjectParts 分页、版本寻址)+ x-amz-checksum-mode 门控回显 | s3-tests checksum/use_cksum/get_object_attributes 族 | ✅ v1.2(M11 C1 出集) |
 | SSE-C(分块 AES-256-GCM;三头校验/key-MD5 比对/解密读/multipart 逐片/复制重加密/预签名组合) | s3-tests sse_c/encrypted_transfer/get_part 族 | ✅ v1.2(M11 E1,G-1 出集) |
-| SSE-S3 + 桶默认加密(KEK/DEK、?encryption CRUD、AES256 头、桶默认自动加密、复制语义;SSE-KMS 显式拒绝) | s3-tests sse_s3/bucket_encryption 族 | ✅ v1.2(M11 K1,G-1 出集) |
+| SSE-S3 + 桶默认加密(KEK/DEK、?encryption CRUD、AES256 头、桶默认自动加密、复制语义) | s3-tests sse_s3/bucket_encryption 族 | ✅ v1.2(M11 K1,G-1 出集) |
+| SSE-KMS(aws:kms 头/桶默认/multipart/copy;Vault/OpenBao transit,ADR-29) | s3-tests sse_kms/encryption kms 族 | ✅ v2.6(M20 H3 出集;逐名残余见排除矩阵) |
 | Lifecycle(规则 CRUD/执行器四动作/版本化分叉/审计/指标/x-amz-expiration 头) | s3-tests lifecycle/delete_marker_expiration 族(时间墙 11+botocore 漂移 2+ObjectSize 501 2 = 15 逐名残余除外) | ✅ v1.2(M11 L1~L5,G-1 出集) |
 | Object Lock(治理/合规/法定保留/legal-hold;CreateBucket 锁头、Put/GetObjectLockConfiguration、Retention/LegalHold、强制矩阵、bypass) | s3-tests object_lock 族 39 例 | ✅ v1.3(M12 W5-1 出集) |
 | 公共响应头(请求 ID/Last-Modified/x-amz-*) | s3-tests 头断言 | ✅ |
@@ -39,7 +40,8 @@ FastS3 v0.5 的协议一致性门禁 = **已实现特性的完整兼容**。跑 
 | Versioning 全部落地(PutBucketVersioning 状态机/版本键空间/删除标记/ListObjectVersions 分页/版本寻址 GET·HEAD·DELETE·CopyObject/版本化条件写) | ✅ v1.1(M10 V2~V4,V6-1 出集) | 残余排除项仅 4 个文档化 token:口径裁决 3(RGW/目录桶 vs AWS,取 AWS——return_version_id:Suspended 写回 `VersionId:"null"`;delete_marker_nonversioned:未版本化删除 404 不带标记头;delete_object_current_if_match:版本化桶 DELETE 不存在键插入标记;均 fails_on_aws 族/目录桶语义)+ lifecycle 依附 1(delete_marker_expiration);multipart_copy_versioned 已随 M15 C2 出集(UploadPartCopy 源 ?versionId 寻址交付),versioned_object_attributes 已随 M11 C1 出集 |
 | 版本化条件写(PUT/DELETE If-Match/If-None-Match×version/current、LastModifiedTime、Size) | ✅ v1.1(M10 V3-4,V6-1 出集) | V6-1 修复:DeleteObjects 条件元素 LastModifiedTime 按 RFC 7231 解析(botocore 实测线格式,此前误 ISO8601→InvalidArgument);D1a 同秒裁决双边保序(null 族写侧 +1s、next_vk 基址含 null 族 mtime) |
 | SSE-C(E1 全栈:分块 AES-256-GCM/三头校验/key-MD5 比对/GET·HEAD 解密/multipart 逐片加密/CopyObject·UploadPartCopy 重加密/预签名组合) | ✅ v1.2(M11 E1,G-1 出集) | 残余逐名(G-1 实测):**post_object_sse_c**(DE4 裁决:POST 表单不支持 SSE-C,显式 400;用例期望 204 = RGW 口径)+ **policy 两例**(enforced/deny_algo_with_bucket_policy,Null/StringNotEquals × sse 键 = Condition 超集,显式 MalformedPolicy 红线)+ **copy sse-c→unencrypted 5 例**(DE3 裁决:加密源目标未指定加密 = 显式 400 红线,用例期望成功 = RGW 口径)。token:sse_c_post_object_authenticated_request/sse_c_enforced_with_bucket_policy/sse_c_deny_algo_with_bucket_policy/copy_enc\[sse-c-unencrypted/copy_part_enc\[sse-c-unencrypted |
-| SSE-S3 + 桶默认加密(K1:KEK/DEK 两级/Put·Get·DeleteBucketEncryption/AES256 头处理/桶默认自动加密/复制语义) | ✅ v1.2(M11 K1,G-1 出集) | 残余逐名(G-1 实测):**incorrect_algo_sse_s3**(StringNotEquals × s3:x-amz-server-side-encryption = Condition 超集 MalformedPolicy 红线)+ **copy sse-s3→unencrypted 5 例**(同 DE3 裁决)。SSE-KMS 不做(参数显式拒绝,DESIGN-FUTURE §4.3 DS4),kms 族恒排除。token:incorrect_algo_sse_s3/copy_enc\[sse-s3-unencrypted/copy_part_enc\[sse-s3-unencrypted/kms |
+| SSE-S3 + 桶默认加密(K1:KEK/DEK 两级/Put·Get·DeleteBucketEncryption/AES256 头处理/桶默认自动加密/复制语义) | ✅ v1.2(M11 K1,G-1 出集) | 残余逐名(G-1 实测):**incorrect_algo_sse_s3**(StringNotEquals × s3:x-amz-server-side-encryption = Condition 超集 MalformedPolicy 红线)+ **copy sse-s3→unencrypted 5 例**(同 DE3 裁决)。token:incorrect_algo_sse_s3/copy_enc\[sse-s3-unencrypted/copy_part_enc\[sse-s3-unencrypted |
+| SSE-KMS(aws:kms PUT/GET/HEAD/multipart/copy、桶默认加密 + KMSMasterKeyID;M20 ADR-29) | ✅ v2.6(M20 H3 出集) | 宽 token `kms` 已移除。逐名残余:**test_sse_kms_no_key**(RGW 强制 key-id;FastS3/AWS 允许省略=默认 key)+ **POST 表单 2 例**(DE4,同 SSE-C POST)+ **policy 3 例**(Condition 超集 MalformedPolicy)+ **copy sse-kms→unencrypted**(DE3)。token:test_sse_kms_no_key/test_sse_kms_post_object_authenticated_request/test_sse_kms_default_post_object_authenticated_request/test_bucket_policy_put_obj_s3_kms/test_bucket_policy_put_obj_kms_noenc/test_bucket_policy_put_obj_kms_s3/copy_enc\[sse-kms-unencrypted/copy_part_enc\[sse-kms-unencrypted。缺 conf kms_keyid 时上游 skip,skip ≠ 排除失败 |
 | checksum family(x-amz-checksum-*,trailer,CRC32/CRC32C/SHA*/CRC64NVME,GetObjectAttributes) | ✅ v1.2(M11 C1-1~C1-4 出集) | 五族验算/复合/FULL_OBJECT/GetObjectAttributes 全量交付并出集(token checksum/use_cksum/get_object_attributes/multipart_object_attributes/versioned_object_attributes 已移除)。残余:① SSE-C 组合用例 test_get_sse_c_encrypted_object_attributes 已于 G-1 随 E1 出集转绿;② 非默认 ChecksumType 组合(SHA 族+FULL_OBJECT、CRC32/CRC32C+COMPOSITE)显式 400 InvalidRequest 不静默(类型恒取算法默认,不落盘;CRC64NVME+COMPOSITE 与 AWS 同口径拒绝),无 s3-tests 覆盖,属文档化限制 |
 | Lifecycle(规则 CRUD/执行器/审计已交付) | ✅ v1.2(M11 L1~L5,G-1 出集) | 残余排除逐名 15(L5-1 定向实测 + G-1 全量复核,出集 = 其余全绿;`lifecycle`/`delete_marker_expiration` token 已于 G-1 收窄为 15 个锚定逐名 token):**时间墙 11**(DL4 午夜语义需真实跨天;用例依赖 RGW lc_debug_interval 天压缩,均 fails_on_aws 族)——test_lifecycle_expiration、test_lifecyclev2_expiration、test_lifecycle_expiration_tags1/tags2/versioned_tags2(此 3 个另叠加 Filter 直下多子元素 MalformedXML,与 AWS 同口径拒绝)、test_lifecycle_expiration_noncur_tags1、test_lifecycle_noncur_expiration、test_lifecycle_deletemarker_expiration、test_lifecycle_deletemarker_expiration_with_days_tag、test_lifecycle_multipart_expiration、test_delete_marker_expiration;**botocore 版本漂移 2**——test_lifecycle_set_invalid_date、test_lifecycle_transition_set_invalid_date(botocore 1.43 将非 ISO 日期串按 epoch 秒改写为合法 ISO 时刻,线上字节合法,400 期望服务端不可达,AWS 配此客户端同样失败;后者另叠加 Transition 显式 501 红线);**显式 501 未排期 2**——test_lifecycle_expiration_size_gt/size_lt(ObjectSize* 过滤器,L1 设计红线) |
 | 归档族:存储类真实分层 + RestoreObject + 生命周期 Transition(M16 A;ADR-19) | ✅ v2.2(权威 = 自有集成测试,A5-1;**不以 s3-tests 100% 声称**) | 上游无专测/配置 skip:① **存储类配置缺失跳过 13+**——test_lifecycle_transition 等需 [s3 main] storage_classes ≥3 与 [s3 cloud](RGW 形态,与实现无关);② **时间墙** Days 族需真实跨天;③ test_restore_object_* = [s3 cloud] 缺失跳过。FastS3 归档语义由 `tests/m16_archive_smoke.sh` + service_integration a1_2/a2_*/lifecycle_transition_flow + 引擎单测覆盖。EXCLUDE 无归档专 token(失败不再豁免 ≠ 上游测过 100%)。 |
@@ -208,8 +210,9 @@ S3TEST_CONF=/tmp/s3-tests/s3tests.conf bash tests/s3-tests/run_s3tests.sh
 
 - 出集(逐用例核对后移除 token):`encryption|sse|lifecycle|copy_enc|`
   `copy_part_enc|encrypted_transfer|delete_marker_expiration`(7 个;族交付 =
-  E1 SSE-C / K1 SSE-S3+桶默认加密 / L1~L5 生命周期);`kms` 恒留(DS4
-  SSE-KMS 显式拒绝)。保留逐名残余 token 见 run_s3tests.sh 注释 ⑦ 与排除
+  E1 SSE-C / K1 SSE-S3+桶默认加密 / L1~L5 生命周期);当时 `kms` 恒留(DS4
+  SSE-KMS 显式拒绝)。**M20 H3 已移除宽 token `kms`**,改为逐名(见排除矩阵
+  SSE-KMS 行与 run_s3tests.sh 注释 ⑭)。保留逐名残余 token 见 run_s3tests.sh 注释 ⑦ 与排除
   矩阵 SSE-C/SSE-S3/lifecycle 行。
 - 复测中发现并修复的服务端真实缺陷(各补回归测试):
   1. **SSE-C × SSE-S3 头同现错误码**:InvalidRequest → **InvalidArgument**
@@ -249,7 +252,8 @@ S3TEST_CONF=/tmp/s3-tests/s3tests.conf bash tests/s3-tests/run_s3tests.sh
   暴露 5 个意外失败(即上列修复 2 + 裁决 3),处置后复跑两轮一致:
   **passed=457 skipped=94 excluded_failures=287 unexpected_failures=0 →
   RESULT: PASS**(较 C 轮基线 passed+84 / excluded−84 = 出集族转绿净额;
-  排除集构成:kms 族 61 + lifecycle 逐名 15 + copy DE3 10 + sse 逐名 4 +
+  排除集构成:lifecycle 逐名 15 + copy DE3(含 sse-kms→unencrypted)+ sse 逐名 4 +
+  kms 逐名残余(no_key/POST/policy/copy,见 SSE-KMS 行)+
   误掩裁决 3 + 既有排除 194)。
 - **干净复测(2026-08-24,G-2 hang/overwrite 修复后)**:独立 2GiB 镜像,
   同上配置,**TZ=UTC**,两轮同数 `457/94/287/0`。非 UTC 下

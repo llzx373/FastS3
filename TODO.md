@@ -210,7 +210,7 @@
   崩溃恢复后加密对象可解(m4 工具链,≥200 轮混载)
   - 用例:`ssekms_ciphertext_on_disk_sampling`;`ssekms_no_plaintext_dek_on_disk`;
     `ssekms_vault_down_blocks_decrypt`;`ssekms_crash_recovery_roundtrip_200_rounds`
-- [ ] H3 s3-tests 解锁:kms 族 token(`sse_kms` 等)从恒排除(README.md:42,211-212、
+- [x] H3 s3-tests 解锁:kms 族 token(`sse_kms` 等)从恒排除(README.md:42,211-212、
   run_s3tests.sh:94)改为逐名记账/出集;summarize_junit.py `sse_kms` token 已备
   - 用例:README 排除矩阵更新;gate 意外失败 0
 
