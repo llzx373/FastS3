@@ -587,6 +587,12 @@ impl AdminServer {
             ("POST", ["kms", "service", "start"]) => self.handle_kms_service("start", body),
             ("POST", ["kms", "service", "stop"]) => self.handle_kms_service("stop", body),
             ("GET", ["kms", "service", "status"]) => self.handle_kms_service("status", b""),
+            // M20 F3(ADR-29 (e)):key 面走 admin:* 族,转调 transit;未配置 = 501
+            ("GET", ["kms", "status"]) => self.handle_kms_status(),
+            ("GET", ["kms", "keys"]) => self.handle_kms_keys_list(),
+            ("POST", ["kms", "keys"]) => self.handle_kms_key_create(body),
+            ("GET", ["kms", "keys", name]) => self.handle_kms_key_get(name),
+            ("POST", ["kms", "keys", name, "rotate"]) => self.handle_kms_key_rotate(name, body),
             _ => json::err(StatusCode::NOT_FOUND, "not_found", "unknown admin endpoint"),
         }
     }
@@ -628,6 +634,84 @@ impl AdminServer {
             }
             Err(e) => json::err(StatusCode::INTERNAL_SERVER_ERROR, "kms_service_error", &e),
         }
+    }
+
+    fn kms_admin_result(r: Result<serde_json::Value, String>) -> Response<String> {
+        match r {
+            Ok(v) => json::ok(v),
+            Err(e) if e.contains("not configured") => json::err(
+                StatusCode::NOT_IMPLEMENTED,
+                "not_implemented",
+                &e,
+            ),
+            Err(e) if e.to_ascii_lowercase().contains("not found") => {
+                json::err(StatusCode::NOT_FOUND, "not_found", &e)
+            }
+            Err(e) => json::err(StatusCode::BAD_REQUEST, "kms_error", &e),
+        }
+    }
+
+    fn kms_operator(body: &[u8]) -> String {
+        serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| {
+                v.get("operator")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| "admin".into())
+    }
+
+    /// M20 F3:`GET /v1/admin/kms/status`(连通/默认 key/token 余期)。
+    fn handle_kms_status(&self) -> Response<String> {
+        Self::kms_admin_result(self.engine.read().kms_admin_status())
+    }
+
+    fn handle_kms_keys_list(&self) -> Response<String> {
+        Self::kms_admin_result(self.engine.read().kms_admin_list_keys())
+    }
+
+    fn handle_kms_key_create(&self, body: &[u8]) -> Response<String> {
+        let v: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(e) => {
+                return json::err(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_json",
+                    &e.to_string(),
+                )
+            }
+        };
+        let Some(name) = v.get("name").and_then(|n| n.as_str()).filter(|s| !s.is_empty()) else {
+            return json::err(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                "name is required",
+            );
+        };
+        let operator = Self::kms_operator(body);
+        let r = self.engine.read().kms_admin_create_key(name);
+        if r.is_ok() {
+            self.service
+                .audit()
+                .push(&operator, "KmsCreateKey", "", name, 200, "");
+        }
+        Self::kms_admin_result(r)
+    }
+
+    fn handle_kms_key_get(&self, name: &str) -> Response<String> {
+        Self::kms_admin_result(self.engine.read().kms_admin_describe_key(name))
+    }
+
+    fn handle_kms_key_rotate(&self, name: &str, body: &[u8]) -> Response<String> {
+        let operator = Self::kms_operator(body);
+        let r = self.engine.read().kms_admin_rotate_key(name);
+        if r.is_ok() {
+            self.service
+                .audit()
+                .push(&operator, "KmsRotateKey", "", name, 200, "");
+        }
+        Self::kms_admin_result(r)
     }
 
     /// M18 I1(ADR-28 DI8):`/v1/iam/*` 路由。admin 通道 = root 可信

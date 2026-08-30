@@ -209,6 +209,9 @@ fn admin_status_metrics_and_auth() {
         !body.contains("fasts3_kms_mint_total"),
         "metrics body: {body}"
     );
+    // M20 F3:未配置 KMS → 501(不静默)
+    let (code, body) = http_unix(sock, "GET", "/v1/admin/kms/status", None, "sekret");
+    assert_eq!(code, 501, "{body}");
 
     let _ = handle;
 }
@@ -244,6 +247,72 @@ fn kms_metrics_ops_attribution() {
     );
     assert!(body.contains("fasts3_kms_error_total 1"), "{body}");
     assert!(!body.contains("key_id"), "key_id 不得进标签: {body}");
+    let _ = handle;
+}
+
+/// M20 F3:admin key CRUD + rotate;权限走 admin 通道(非 kms: 动作族)。
+#[test]
+fn kms_admin_key_crud_and_rotate() {
+    let (_d, img) = setup();
+    let kms = std::sync::Arc::new(fs3_kms::MemoryKms::new());
+    let cfg = EngineConfig {
+        devices: vec![img.clone()],
+        meta_dir: img.parent().unwrap().join("meta"),
+        kms: Some(kms),
+        ..Default::default()
+    };
+    let (sock, handle) = start_admin(&cfg, "t");
+    let sock = sock.trim_start_matches("unix://");
+
+    let (code, body) = http_unix(sock, "GET", "/v1/admin/kms/status", None, "t");
+    assert_eq!(code, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["reachable"], true);
+    assert_eq!(v["default_key"], "fasts3-default");
+
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/admin/kms/keys",
+        Some(r#"{"name":"app-key","operator":"alice"}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["name"], "app-key");
+    assert_eq!(v["latest_version"], 1);
+
+    let (code, body) = http_unix(sock, "GET", "/v1/admin/kms/keys", None, "t");
+    assert_eq!(code, 200, "{body}");
+    assert!(
+        body.contains("app-key") && body.contains("fasts3-default"),
+        "{body}"
+    );
+
+    let (code, body) = http_unix(sock, "GET", "/v1/admin/kms/keys/app-key", None, "t");
+    assert_eq!(code, 200, "{body}");
+
+    let (code, body) = http_unix(
+        sock,
+        "POST",
+        "/v1/admin/kms/keys/app-key/rotate",
+        Some(r#"{"operator":"alice"}"#),
+        "t",
+    );
+    assert_eq!(code, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["latest_version"], 2);
+
+    let (code, body) = http_unix(sock, "GET", "/v1/admin/kms/keys/nope", None, "t");
+    assert_eq!(code, 404, "{body}");
+
+    let (code, body) = http_unix(sock, "GET", "/v1/admin/audit?op=KmsCreateKey", None, "t");
+    assert_eq!(code, 200, "{body}");
+    assert!(body.contains("KmsCreateKey") && body.contains("alice"), "{body}");
+    assert!(!body.contains("mem:v1"), "{body}");
+
+    let (code, _) = http_unix(sock, "GET", "/v1/admin/kms/status", None, "wrong");
+    assert_eq!(code, 401);
     let _ = handle;
 }
 

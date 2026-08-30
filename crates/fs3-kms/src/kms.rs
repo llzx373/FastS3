@@ -100,6 +100,9 @@ pub trait RootKms: Send + Sync {
     /// 后端连通/密封/token 余期(status 探测,不签发任何密钥材料)。
     fn status(&self) -> KmsStatus;
 
+    /// 未指定 key-id 时使用的默认 transit key 名(F3 status 回显)。
+    fn default_key_name(&self) -> &str;
+
     /// M20 F1:Prometheus 文本(key_id 不进标签)。默认空 = 无指标后端。
     fn render_metrics(&self) -> String {
         String::new()

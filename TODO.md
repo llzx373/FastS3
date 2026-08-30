@@ -177,11 +177,11 @@
 - [x] F1 指标:`fasts3_kms_{mint,unwrap,error}_total` + 延迟(裸 AtomicU64 先例
   engine lib.rs:379);分账按 op+result,key_id 不进标签(防高基数)
   - 用例:`kms_metrics_ops_attribution`;admin `/metrics` 可见
-- [ ] F2 审计与通知:对象请求照旧 `audit_record`;密钥材料零落盘/零日志/不进审计(红线);
+- [x] F2 审计与通知:对象请求照旧 `audit_record`;密钥材料零落盘/零日志/不进审计(红线);
   KMS 侧 file audit = 双审计(文档写清各自覆盖面);通知载荷增 sse 字段
   (notify.rs:565 向后兼容)
   - 用例:`kms_audit_no_key_material`;`kafka_payload_carries_sse_fields`
-- [ ] F3 admin key 面:`GET /v1/admin/kms/status`(后端连通/默认 key/token 余期)、
+- [x] F3 admin key 面:`GET /v1/admin/kms/status`(后端连通/默认 key/token 余期)、
   key CRUD + rotate(转调 transit);权限 = `admin:*` 族(ADR-29 (e):`kms:` 动作族不做)
   - 用例:`kms_admin_key_crud_and_rotate`
 

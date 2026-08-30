@@ -3782,6 +3782,62 @@ impl Engine {
             .unwrap_or_default()
     }
 
+    fn kms_backend(&self) -> std::result::Result<&dyn fs3_kms::RootKms, String> {
+        self.kms
+            .as_ref()
+            .map(|a| a.as_ref())
+            .ok_or_else(|| "kms backend is not configured".into())
+    }
+
+    /// M20 F3:admin `/kms/status`(连通/密封/默认 key/token 余期;零密钥材料)。
+    pub fn kms_admin_status(&self) -> std::result::Result<serde_json::Value, String> {
+        let k = self.kms_backend()?;
+        let s = k.status();
+        Ok(serde_json::json!({
+            "reachable": s.reachable,
+            "sealed": s.sealed,
+            "token_ttl_secs": s.token_ttl_secs,
+            "detail": s.detail,
+            "default_key": k.default_key_name(),
+        }))
+    }
+
+    /// M20 F3:transit key 列表。
+    pub fn kms_admin_list_keys(&self) -> std::result::Result<serde_json::Value, String> {
+        let keys = self.kms_backend()?.list_keys().map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "keys": keys }))
+    }
+
+    /// M20 F3:创建 transit key。
+    pub fn kms_admin_create_key(&self, name: &str) -> std::result::Result<serde_json::Value, String> {
+        let m = self
+            .kms_backend()?
+            .create_key(name)
+            .map_err(|e| e.to_string())?;
+        serde_json::to_value(m).map_err(|e| e.to_string())
+    }
+
+    /// M20 F3:描述 transit key(代数/能力;零密钥材料)。
+    pub fn kms_admin_describe_key(
+        &self,
+        name: &str,
+    ) -> std::result::Result<serde_json::Value, String> {
+        let m = self
+            .kms_backend()?
+            .describe_key(name)
+            .map_err(|e| e.to_string())?;
+        serde_json::to_value(m).map_err(|e| e.to_string())
+    }
+
+    /// M20 F3:轮换 transit key(旧 wrapped_dek 靠版本历史可解,不 rewrap)。
+    pub fn kms_admin_rotate_key(&self, name: &str) -> std::result::Result<serde_json::Value, String> {
+        let m = self
+            .kms_backend()?
+            .rotate_key(name)
+            .map_err(|e| e.to_string())?;
+        serde_json::to_value(m).map_err(|e| e.to_string())
+    }
+
     /// KEK 代状态(admin 状态端点数据源;只含代数/时间戳,零密钥材料)。
     pub fn sse_s3_kek_state(&self) -> Result<fs3_meta::SseKekGenState> {
         self.meta.sse_kek_gen_state()

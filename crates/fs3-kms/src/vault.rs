@@ -557,4 +557,8 @@ impl RootKms for VaultKms {
     fn render_metrics(&self) -> String {
         self.metrics.render()
     }
+
+    fn default_key_name(&self) -> &str {
+        &self.cfg.default_key
+    }
 }
