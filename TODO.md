@@ -141,7 +141,7 @@
   (单请求超时 `read_fetch_timeout_secs` 默认 30s);上游不可达且数据未到 →
   503 + `Retry-After`
   - 用例:`read_pending_object_blocks_then_serves`;`read_pending_upstream_down_503`
-- [ ] C5 断档重建:`ErrBinlogGone` → 显式 `fasts3d replication rebuild`(CLI + admin API);
+- [x] C5 断档重建:`ErrBinlogGone` → 显式 `fasts3d replication rebuild`(CLI + admin API);
   清空复制状态 → 走 C1/C2;**不自动触发**(运维确认红线)
   - 用例:`binlog_gone_requires_explicit_rebuild`
 
