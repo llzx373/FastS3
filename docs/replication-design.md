@@ -254,6 +254,7 @@ traffic_weights = { serve = 100, backfill = 50, on_demand = 10 }   # 中继流�
 - **方案 A(一期):主备共享同一 KMS(Vault/OpenBao 集群)**。`fs3-kms` 的 wrapped DEK 绑定 `canonical(bucket,key)` AAD 且 unwrap 必须打同一 transit;实例级复制桶键名不变,`SseInfo` 随 binlog 原样落盘即可解。**零重加密,明文 DEK 永不出 KMS**。同城 HA 场景 Vault 自有 HA/DR 形态。
 - **方案 B(二期,异构 KMS)**:源端 unwrap → mTLS 信道传 DEK → 备端本地 mint 重包;复制 worker 内遵守"明文 DEK 用毕 zeroize"红线。显式开关,默认关。
 - SSE-S3 的种子/KEK 代(`s:` 族)纳入 binlog;SSE-C 密钥客户端持有,密文直接搬;桶默认加密配置(`bc:` 等)在 Op 覆盖内。桶级槽位:只复制命中桶的 SSE 对象,SSE-S3 KEK 若在过滤器外需强制随同(实现细节:s: 族系统键对桶级槽**始终全量**)。
+  - **F1 实现注解**:`s:sse_kek_seed` / `s:sse_kek_gen` 经两条复制信道下发——① binlog Op(`SseKekSeedPut`/`SseKekGenPut`,种子生成/轮换同事务落 `bl:`);② 快照导出豁免(s: 排除表的唯一例外:binlog 种子记录可能被两级水位截断,快照是迟到/重建备端的唯一种子来源)。复制信道(mTLS 复制口)与 rocksdb 内 s: 键同等级;零日志/零审计/零 meta-export 红线不变。
 
 ### 6.3 凭证
 

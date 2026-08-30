@@ -911,6 +911,23 @@ pub enum Op {
     TenantDelete {
         tenant_id: String,
     },
+    /// SSE-S3 KEK 种子随同(M21 F1;ADR-33 RP7.3;replication-design
+    /// §6.2):种子(惰性)生成走事务提交,repl_binlog 开时同事务落
+    /// binlog;备端 replay 原样覆盖落盘(收敛语义:备端任何本地误生成
+    /// 的 seed 被上游权威值纠正)。无桶上下文 → has_unscoped,桶级槽
+    /// 强制随同(§6.2 实现细节:s: 族系统键对桶级槽始终全量)。
+    /// **红线不变**:seed 零日志/零审计/零 meta-export;binlog 落盘与
+    /// rocksdb 内 `s:` 键同等级(RP7.3 裁定),仅经 mTLS 复制口下发。
+    SseKekSeedPut {
+        /// 恒 64 字节(serde 无 [u8;64] 实装,Vec 承载;apply 臂校验
+        /// 长度,错长 = Corrupt)。
+        seed: Vec<u8>,
+    },
+    /// SSE-S3 KEK 代状态随同(轮换/重包裹收敛;覆盖语义,同
+    /// SseKekSeedPut;值无密钥材料,见 SseKekGenState 注释)。
+    SseKekGenPut {
+        state: SseKekGenState,
+    },
 }
 
 /// 元数据层运行统计(H2 指标:WAL 组提交)。
@@ -2765,6 +2782,11 @@ impl MetaStore {
     /// 读 KEK 种子(不存在 → 生成 64 字节随机并持久化,返回;幂等,
     /// 与 key_seed_salt 相互独立)。**红线:seed 及其派生 KEK/DEK 明文
     /// 零导出、零日志、永不下发**;本访问器是唯一出口,返回值不出引擎域。
+    ///
+    /// M21 F1(ADR-33 RP7.3;§6.2):生成改走事务提交(Op::SseKekSeedPut),
+    /// repl_binlog 开时种子随同 binlog 复制到备端(桶级槽强制随同);
+    /// 「永不下发」的唯一例外 = mTLS 复制信道(RP7.3 裁定,binlog 与
+    /// rocksdb 内 s: 键同等级;meta-export/日志/审计红线不变)。
     pub fn sse_kek_seed(&self) -> Result<[u8; 64]> {
         if let Some(v) = self.db.get(SYS_SSE_KEK_SEED).map_err(rocks_err)? {
             return v.as_slice().try_into().map_err(|_| {
@@ -2773,8 +2795,11 @@ impl MetaStore {
         }
         let mut seed = [0u8; 64];
         fs3_core::random_bytes(&mut seed)?;
-        // 直写 + fsync(照 seed_salt 先例;调用点均持引擎写锁/单点,幂等)
-        self.db.put(SYS_SSE_KEK_SEED, seed).map_err(rocks_err)?;
+        // 事务提交(binlog 随同)+ 显式 fsync 保原「落盘后才可用」口径
+        // (调用点均持引擎写锁/单点,幂等;seed 一生一次,fsync 非热路径)
+        self.commit(&[Op::SseKekSeedPut {
+            seed: seed.to_vec(),
+        }])?;
         self.db.flush_wal(true).map_err(rocks_err)?;
         Ok(seed)
     }
@@ -2792,11 +2817,11 @@ impl MetaStore {
         }
     }
 
-    /// 写 KEK 代状态(直写 + fsync,同 seed_salt 先例;调用方持引擎写锁)。
+    /// 写 KEK 代状态(M21 F1 起走事务提交 Op::SseKekGenPut:repl_binlog
+    /// 开时随同 binlog 复制到备端;显式 fsync 保原口径;调用方持引擎
+    /// 写锁)。
     fn put_sse_kek_gen_state(&self, st: &SseKekGenState) -> Result<()> {
-        self.db
-            .put(SYS_SSE_KEK_GEN, encode(st)?)
-            .map_err(rocks_err)?;
+        self.commit(&[Op::SseKekGenPut { state: *st }])?;
         self.db.flush_wal(true).map_err(rocks_err)
     }
 
@@ -6957,6 +6982,25 @@ fn apply_ops(
                 }
                 tremove(tx, &k)?;
             }
+            // M21 F1(ADR-33 RP7.3;§6.2):SSE-S3 seed/代状态原样落盘,
+            // 覆盖语义(收敛:备端本地误生成的 seed 被上游权威值纠正);
+            // Commit 与 Replay 同臂——两态都是「写 s: 系统键」,无冲突集
+            // 诉求(单写者种子,轮换由主端串行发起)。**错误信息不得含
+            // seed 字节**(零日志红线)。
+            Op::SseKekSeedPut { seed } => {
+                if seed.len() != 64 {
+                    return Err(Error::Corrupt(format!(
+                        "sse kek seed op must be 64 bytes, got {}",
+                        seed.len()
+                    )));
+                }
+                tget(tx, SYS_SSE_KEK_SEED)?;
+                tinsert(tx, SYS_SSE_KEK_SEED.to_vec(), seed.clone())?;
+            }
+            Op::SseKekGenPut { state } => {
+                tget(tx, SYS_SSE_KEK_GEN)?;
+                tinsert(tx, SYS_SSE_KEK_GEN.to_vec(), encode(state)?)?;
+            }
         }
     }
 
@@ -7917,6 +7961,110 @@ mod tests {
                 .unwrap();
             assert_eq!(s, 3, "promote 转正后 seq 自原 seq+1 续,防回退");
         }
+    }
+
+    /// M21 F1(ADR-33 RP7.3;设计 §6.2;TODO M21/F1):SSE-S3 seed/代状态
+    /// 随同 binlog——
+    /// ① 主端 repl_binlog 开:seed 惰性生成与 KEK 轮换各以同事务落
+    ///    bl: 记录(Op::SseKekSeedPut/SseKekGenPut);
+    /// ② 记录 bucket_scope.has_unscoped = true(无桶上下文 → 桶级槽
+    ///    强制随同,§6.2 实现细节);
+    /// ③ 备端按流序 apply 后 seed/gen 与主端一致,派生 KEK 跨实例互认
+    ///    (主端签发的 wrapped DEK 备端可解 = 「可解」的密码学断言);
+    /// ④ 覆盖收敛:备端预先误生成的本地 seed 被上游权威值纠正;
+    /// ⑤ 错长 seed 记录显式 Corrupt 拒绝(流损坏不静默)。
+    #[test]
+    fn sse_kek_seed_gen_shipped_via_binlog_for_bucket_scoped_slots() {
+        let dir_p = tempfile::tempdir().unwrap();
+        let pri = MetaStore::open(
+            dir_p.path(),
+            &MetaConfig {
+                repl_binlog: true,
+                ..MetaConfig::default()
+            },
+        )
+        .unwrap();
+        // ④ 备端毒态:本地误生成 seed(正确流程下不会发生——备端只读,
+        //    此处专验 apply 的覆盖收敛语义)
+        let dir_s = tempfile::tempdir().unwrap();
+        let stb = MetaStore::open(dir_s.path(), &MetaConfig::default()).unwrap();
+        let wrong = stb.sse_kek_seed().unwrap();
+
+        // ① 主端:seed 生成 + 一次轮换(gen 1→2)
+        let seed = pri.sse_kek_seed().unwrap();
+        let gen_st = pri.rotate_sse_kek().unwrap();
+        assert_ne!(seed, wrong, "测试前提:两端独立随机种子必不同");
+        assert_eq!(gen_st.gen, 2);
+
+        let entries = pri
+            .repl_binlog_scan(Gtid { epoch: 0, seq: 0 }, 100)
+            .unwrap();
+        assert_eq!(entries.len(), 2, "seed 生成 + 轮换 = 两条 binlog 记录");
+        let mut saw_seed = false;
+        let mut saw_gen = false;
+        for (_g, rec) in &entries {
+            // ② 无桶上下文 → has_unscoped(桶级槽强制随行的上游过滤输入)
+            assert!(
+                rec.bucket_scope.has_unscoped,
+                "s: 族记录必须 has_unscoped(桶级槽恒放行)"
+            );
+            assert!(rec.bucket_scope.buckets.is_empty());
+            assert!(rec.data_refs.is_empty(), "seed/代记录无数据段引用");
+            for op in &rec.ops {
+                match op {
+                    Op::SseKekSeedPut { seed: s } => {
+                        assert_eq!(s.as_slice(), seed.as_slice());
+                        saw_seed = true;
+                    }
+                    Op::SseKekGenPut { state } => {
+                        assert_eq!(*state, gen_st);
+                        saw_gen = true;
+                    }
+                    // 不得 {other:?}:seed 变体若漏配,Debug 会把种子
+                    // 字节打进 panic 信息(零日志红线同口径约束测试)
+                    _ => panic!("seed/gen 记录含意外 op 变体"),
+                }
+            }
+        }
+        assert!(saw_seed && saw_gen);
+
+        // ③ 备端按流序 apply:seed/gen 落定,误生成的本地 seed 被纠正
+        for (g, rec) in &entries {
+            assert_eq!(
+                stb.apply_repl_record(*g, rec).unwrap(),
+                ReplApplyOutcome::Applied
+            );
+        }
+        let seed_s = stb.sse_kek_seed().unwrap();
+        assert_eq!(seed_s, seed, "备端 seed = 主端权威值(覆盖收敛)");
+        assert_eq!(stb.sse_kek_gen_state().unwrap(), gen_st);
+        // 幂等重放不漂移
+        for (g, rec) in &entries {
+            assert_eq!(
+                stb.apply_repl_record(*g, rec).unwrap(),
+                ReplApplyOutcome::SkippedDuplicate
+            );
+        }
+        assert_eq!(stb.sse_kek_seed().unwrap(), seed);
+
+        // ③ 跨实例可解:主端 seed 签发的 wrapped DEK,备端 seed 可解
+        let wk = fs3_core::mint_sse_s3_write_key(&seed, gen_st.gen).unwrap();
+        let dek = fs3_core::unwrap_sse_s3_dek(&seed_s, wk.kek_id(), wk.wrapped_dek()).unwrap();
+        assert_eq!(dek, wk.data_key());
+        // 旧毒态 seed 必不可解(反事实:种子未随同 = 数据不可读)
+        assert!(fs3_core::unwrap_sse_s3_dek(&wrong, wk.kek_id(), wk.wrapped_dek()).is_err());
+
+        // ⑤ 错长 seed 记录 = 流损坏,显式拒绝(不半截落盘)
+        let bad = ReplRecord::new(
+            1,
+            &[Op::SseKekSeedPut {
+                seed: vec![0u8; 32],
+            }],
+        );
+        assert!(stb
+            .apply_repl_record(Gtid { epoch: 1, seq: 3 }, &bad)
+            .is_err());
+        assert_eq!(stb.sse_kek_seed().unwrap(), seed, "拒绝后 seed 不被污染");
     }
 
     /// M21 C3(ADR-33 RP4.2;设计稿 §3.2/§4.2):段回填清算事务——

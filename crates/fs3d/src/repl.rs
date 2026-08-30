@@ -5359,6 +5359,422 @@ mod tests {
         assert_eq!(cur, Gtid { epoch: 2, seq: 1 }, "游标 = B 导出位点");
     }
 
+    // ── M21 F1:SSE 跨实例保全(ADR-33 RP7;设计稿 §6.2;TODO M21/F1) ──
+
+    /// 带 KMS 的引擎夹具。共享 KMS 两种形态:MemoryKms 单测共享同一
+    /// Arc 实例;真 Vault 车道主备各持指向同一集群的客户端(生产形态)。
+    fn test_engine_kms(
+        dir: &Path,
+        repl_binlog: bool,
+        kms: Arc<dyn fs3_kms::RootKms>,
+    ) -> Arc<RwLock<Engine>> {
+        std::fs::create_dir_all(dir).unwrap();
+        let img = dir.join("disk.img");
+        std::fs::File::create(&img)
+            .unwrap()
+            .set_len(128 * 1024 * 1024)
+            .unwrap();
+        fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
+        let cfg = fs3_engine::EngineConfig {
+            devices: vec![img],
+            meta_dir: dir.join("meta"),
+            repl_binlog,
+            kms: Some(kms),
+            ..Default::default()
+        };
+        Arc::new(RwLock::new(Engine::open(&cfg).unwrap()))
+    }
+
+    /// 主端写 SSE-KMS 内联对象(内联随 binlog 直达,零回填依赖)。
+    fn put_ssekms_objects(engine: &Arc<RwLock<Engine>>, objs: &[(&str, Vec<u8>)]) {
+        let mut e = engine.write();
+        for (k, data) in objs {
+            let wk = e.kms_mint_write_key("b0", k, None, None).unwrap();
+            let wk_ref = fs3_core::SseWriteKey::SseKms(wk);
+            e.put_with_meta(
+                "b0",
+                k,
+                &mut &data[..],
+                None,
+                vec![],
+                vec![],
+                vec![],
+                None,
+                None,
+                Some(&wk_ref),
+            )
+            .unwrap();
+            drop(wk_ref);
+        }
+    }
+
+    /// 备端在线 unwrap 解密,逐字节一致断言。
+    fn assert_ssekms_decryptable(engine: &Arc<RwLock<Engine>>, objs: &[(&str, Vec<u8>)]) {
+        for (k, want) in objs {
+            let mut out = Vec::new();
+            engine
+                .read()
+                .get_to("b0", k, 0..u64::MAX, &mut out)
+                .unwrap();
+            assert_eq!(&out, want, "备端 {k} 解密逐字节一致");
+        }
+    }
+
+    /// F1 公共剧本:主(共享 KMS + binlog 开)写 SSE-KMS 对象 → 备
+    /// (同 KMS)pull 追平。调用方继续断言/promote。
+    struct SsekmsReplPair {
+        // 仅持生命周期(tempdir 回收 / 复制口 fixture Drop),不读
+        _dir: tempfile::TempDir,
+        _fa: Fixture,
+        a_meta: Arc<MetaStore>,
+        b_engine: Arc<RwLock<Engine>>,
+        b_meta: Arc<MetaStore>,
+        cfg_b: crate::repl_worker::PullConfig,
+        wb: crate::repl_worker::PullWorker,
+        objs: Vec<(String, Vec<u8>)>,
+    }
+
+    fn setup_ssekms_pair(mk_kms: &dyn Fn() -> Arc<dyn fs3_kms::RootKms>) -> SsekmsReplPair {
+        use crate::repl_worker::PullWorker;
+        let dir = tempfile::tempdir().unwrap();
+        let a_engine = test_engine_kms(&dir.path().join("a"), true, mk_kms());
+        a_engine
+            .write()
+            .create_bucket_with_quota("b0", None)
+            .unwrap();
+        let objs: Vec<(String, Vec<u8>)> = vec![
+            ("kms-inline".into(), b"f1-shared-kms-inline".to_vec()),
+            ("kms-inline-2".into(), vec![7u8; 4096]),
+        ];
+        let refs: Vec<(&str, Vec<u8>)> =
+            objs.iter().map(|(k, d)| (k.as_str(), d.clone())).collect();
+        put_ssekms_objects(&a_engine, &refs);
+        let a_meta = a_engine.read().meta_arc();
+        let fa = start_server_on(a_engine.clone(), a_meta.clone());
+        let tip = a_meta.last_seq().unwrap();
+
+        let b_engine = test_engine_kms(&dir.path().join("b"), false, mk_kms());
+        let b_meta = b_engine.read().meta_arc();
+        b_meta.set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
+        let b_tls = dir.path().join("b_tls");
+        std::fs::create_dir_all(&b_tls).unwrap();
+        let cfg_b = pull_cfg(&b_tls, &fa, "s-b", "node-b");
+        let wb = PullWorker::spawn(b_engine.clone(), b_meta.clone(), cfg_b.clone()).unwrap();
+        wait_repl_cursor(&b_meta, Gtid { epoch: 1, seq: tip });
+        SsekmsReplPair {
+            _dir: dir,
+            _fa: fa,
+            a_meta,
+            b_engine,
+            b_meta,
+            cfg_b,
+            wb,
+            objs,
+        }
+    }
+
+    /// SseInfo 原样落盘断言(RP7.1 零重加密:wrapped_dek 密文逐字节一致)。
+    fn assert_sseinfo_carried(p: &SsekmsReplPair) {
+        for (k, _) in &p.objs {
+            let am = p.a_meta.get_object("b0", k).unwrap().unwrap();
+            let bm = p.b_meta.get_object("b0", k).unwrap().unwrap();
+            assert_eq!(bm.sse, am.sse, "{k} SseInfo 原样(binlog 透传)");
+        }
+    }
+
+    /// M21 F1:MemoryKms 共享实例单测(共享 KMS 语义的进程内形态;真
+    /// Vault 车道见 ssekms_objects_decryptable_on_standby)。附红线断言:
+    /// KMS 停机 → 备端解密失败(Unavailable,不降级)。
+    #[test]
+    fn ssekms_shared_memorykms_standby_decrypts() {
+        let kms = Arc::new(fs3_kms::MemoryKms::new());
+        let mk = {
+            let kms = kms.clone();
+            move || -> Arc<dyn fs3_kms::RootKms> { kms.clone() }
+        };
+        let p = setup_ssekms_pair(&mk);
+        assert_sseinfo_carried(&p);
+        let refs: Vec<(&str, Vec<u8>)> = p
+            .objs
+            .iter()
+            .map(|(k, d)| (k.as_str(), d.clone()))
+            .collect();
+        assert_ssekms_decryptable(&p.b_engine, &refs);
+        // 红线:KMS 停机 = 主备同败(备侧口径;主侧 M20 E1 已覆盖)
+        kms.set_unavailable(true);
+        let mut out = Vec::new();
+        let err = p
+            .b_engine
+            .read()
+            .get_to("b0", "kms-inline", 0..u64::MAX, &mut out)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                fs3_core::Error::Kms {
+                    fault: fs3_core::KmsFault::Unavailable,
+                    ..
+                }
+            ),
+            "KMS 停机解密必须失败(不降级): {err}"
+        );
+        kms.set_unavailable(false);
+        p.wb.shutdown();
+    }
+
+    /// M20 真车道夹具(fs3-kms/tests/real_lane.rs 同形):自起
+    /// `vault server -dev`(动态端口)。vault 不在 PATH(含
+    /// ~/.local/bin)时返回 None = 车道 SKIP(跳过 ≠ 通过,门禁机器
+    /// 保证真车道实际执行)。
+    struct DevVault {
+        child: std::process::Child,
+        addr: String,
+    }
+
+    impl Drop for DevVault {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn find_vault_bin() -> Option<PathBuf> {
+        for dir in std::env::var("PATH").unwrap_or_default().split(':') {
+            let p = PathBuf::from(dir).join("vault");
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        let local = std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default()
+            .join(".local/bin/vault");
+        local.is_file().then_some(local)
+    }
+
+    fn spawn_dev_vault() -> Option<DevVault> {
+        let bin = find_vault_bin()?;
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind :0")
+            .local_addr()
+            .expect("addr")
+            .port();
+        let addr = format!("http://127.0.0.1:{port}");
+        let child = std::process::Command::new(&bin)
+            .args([
+                "server",
+                "-dev",
+                "-dev-root-token-id=fasts3-test-root",
+                "-dev-no-store-token",
+                &format!("-dev-listen-address=127.0.0.1:{port}"),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        // 等就绪(最长 10s;status 探测复用客户端,零新增依赖)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let ready = loop {
+            let k = vault_kms(&addr);
+            let st = k.status();
+            if st.reachable && st.sealed == Some(false) {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        if !ready {
+            let mut child = child;
+            let _ = child.kill();
+            return None;
+        }
+        // dev server 默认不挂 transit;root 手工挂载(生产 bootstrap/A2 负责)
+        let ok = std::process::Command::new(&bin)
+            .env("VAULT_ADDR", &addr)
+            .env("VAULT_TOKEN", "fasts3-test-root")
+            .args(["secrets", "enable", "transit"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            let mut child = child;
+            let _ = child.kill();
+            return None;
+        }
+        Some(DevVault { child, addr })
+    }
+
+    fn vault_kms(addr: &str) -> Arc<dyn fs3_kms::RootKms> {
+        Arc::new(
+            fs3_kms::VaultKms::new(fs3_kms::VaultKmsConfig {
+                addr: addr.into(),
+                token: "fasts3-test-root".into(),
+                timeout_ms: 2000,
+                retry_max: 0,
+                breaker_threshold: 100,
+                ..Default::default()
+            })
+            .expect("VaultKms::new"),
+        )
+    }
+
+    /// M21 F1(ADR-33 RP7.1;设计稿 §6.2;TODO M21/F1 具名用例,**真
+    /// Vault 车道**,H 组纪律):**主备共享 KMS,SSE-KMS 对象经 binlog
+    /// 复制到备端可解**——主备各持指向同一 dev Vault 的客户端(同
+    /// transit key 名);备端追平后 SseInfo 原样(wrapped_dek 逐字节
+    /// 一致,零重加密),在线 unwrap 解密逐字节一致。
+    #[test]
+    fn ssekms_objects_decryptable_on_standby() {
+        let Some(v) = spawn_dev_vault() else {
+            eprintln!("[SKIP] ssekms_objects_decryptable_on_standby:vault 二进制不可用(真车道需要 vault 在 PATH)");
+            return;
+        };
+        let addr = v.addr.clone();
+        let mk = move || vault_kms(&addr);
+        let p = setup_ssekms_pair(&mk);
+        assert_sseinfo_carried(&p);
+        // 真车道自证:wrapped DEK = 真 transit 密文(非 MemoryKms 桩形态)
+        let sse = p
+            .b_meta
+            .get_object("b0", "kms-inline")
+            .unwrap()
+            .unwrap()
+            .sse
+            .unwrap();
+        assert!(
+            sse.kms_parts().unwrap().ciphertext.starts_with("vault:v1:"),
+            "真 Vault 车道密文形态"
+        );
+        let refs: Vec<(&str, Vec<u8>)> = p
+            .objs
+            .iter()
+            .map(|(k, d)| (k.as_str(), d.clone()))
+            .collect();
+        assert_ssekms_decryptable(&p.b_engine, &refs);
+        p.wb.shutdown();
+    }
+
+    /// M21 F1(ADR-33 RP7.1;TODO M21/F1 具名用例,真 Vault 车道):
+    /// **promote 后仍可解**——备端追平 → RebuildService 生产编排
+    /// promote 接管(epoch 2)→ 既有 SSE-KMS 对象仍在线可解;转正后
+    /// 新写 SSE-KMS 对象写读往返(全功能恢复,E5 联动)。
+    #[test]
+    fn ssekms_promoted_standby_decrypts_after_takeover() {
+        use crate::repl_rebuild::RebuildService;
+        let Some(v) = spawn_dev_vault() else {
+            eprintln!("[SKIP] ssekms_promoted_standby_decrypts_after_takeover:vault 二进制不可用(真车道需要 vault 在 PATH)");
+            return;
+        };
+        let addr = v.addr.clone();
+        let mk = move || vault_kms(&addr);
+        let p = setup_ssekms_pair(&mk);
+        assert_sseinfo_carried(&p);
+
+        // promote(走生产编排:停 worker → MetaStore::promote 单事务)
+        let svc_b = Arc::new(fs3_s3::S3Service::new(
+            p.b_engine.clone(),
+            vec![],
+            "us-east-1".into(),
+            false,
+        ));
+        let rb = RebuildService::new(
+            p.b_engine.clone(),
+            svc_b,
+            p.b_meta.clone(),
+            p.cfg_b.clone(),
+            None,
+            None,
+        );
+        rb.adopt(Some(p.wb), None);
+        let v = rb.promote(false, false).unwrap();
+        assert_eq!(v["status"], serde_json::json!("promoted"), "{v}");
+        assert_eq!(p.b_meta.repl_role().unwrap(), fs3_meta::ReplRole::Primary);
+        assert_eq!(p.b_meta.repl_epoch().unwrap(), 2);
+
+        // 接管后:既有对象仍可解(同一 Vault 集群在线 unwrap)
+        let refs: Vec<(&str, Vec<u8>)> = p
+            .objs
+            .iter()
+            .map(|(k, d)| (k.as_str(), d.clone()))
+            .collect();
+        assert_ssekms_decryptable(&p.b_engine, &refs);
+
+        // 转正后新写 SSE-KMS 对象写读往返
+        let data = b"f1-post-takeover-write".to_vec();
+        put_ssekms_objects(&p.b_engine, &[("kms-post-takeover", data.clone())]);
+        assert_ssekms_decryptable(&p.b_engine, &[("kms-post-takeover", data)]);
+        rb.shutdown();
+    }
+
+    /// M21 F1(ADR-33 RP7.3;设计稿 §6.2):**SSE-S3 种子/代随同 binlog**
+    /// ——主端 SSE-S3 对象复制到备端,种子与 KEK 代状态随同落盘(桶级
+    /// 槽强制随同的上游过滤输入 = has_unscoped,由 fs3-meta 单测
+    /// sse_kek_seed_gen_shipped_via_binlog_for_bucket_scoped_slots 覆盖),
+    /// 备端对象在线可解。
+    #[test]
+    fn sses3_seed_accompanies_binlog_decryptable_on_standby() {
+        use crate::repl_worker::PullWorker;
+        let dir = tempfile::tempdir().unwrap();
+        let a_engine = test_engine_opts(&dir.path().join("a"), 4 * 1024 * 1024, true);
+        let data = b"sses3-seed-accompanies-binlog".to_vec();
+        {
+            let mut e = a_engine.write();
+            e.create_bucket_with_quota("b0", None).unwrap();
+            let wk = e.sse_s3_mint_write_key().unwrap();
+            let r = fs3_core::SseWriteKey::SseS3(&wk);
+            e.put_with_meta(
+                "b0",
+                "s1",
+                &mut &data[..],
+                None,
+                vec![],
+                vec![],
+                vec![],
+                None,
+                None,
+                Some(&r),
+            )
+            .unwrap();
+            drop(r);
+            // KEK 轮换(gen 1→2):代状态随同通道一并覆盖
+            e.meta().rotate_sse_kek().unwrap();
+        }
+        let a_meta = a_engine.read().meta_arc();
+        let tip = a_meta.last_seq().unwrap();
+        let a_seed = a_meta.sse_kek_seed().unwrap();
+        let a_gen = a_meta.sse_kek_gen_state().unwrap();
+        let fa = start_server_on(a_engine.clone(), a_meta.clone());
+
+        let b_engine = test_engine(&dir.path().join("b"));
+        let b_meta = b_engine.read().meta_arc();
+        b_meta.set_repl_role(fs3_meta::ReplRole::Standby).unwrap();
+        let b_tls = dir.path().join("b_tls");
+        std::fs::create_dir_all(&b_tls).unwrap();
+        let cfg_b = pull_cfg(&b_tls, &fa, "s-b", "node-b");
+        let wb = PullWorker::spawn(b_engine.clone(), b_meta.clone(), cfg_b).unwrap();
+        wait_repl_cursor(&b_meta, Gtid { epoch: 1, seq: tip });
+
+        // 种子/代随同落盘(值一致;备端此前无本地种子)
+        assert_eq!(
+            b_meta.sse_kek_seed().unwrap(),
+            a_seed,
+            "种子随同 binlog 落备端"
+        );
+        assert_eq!(b_meta.sse_kek_gen_state().unwrap(), a_gen, "代状态随同");
+        // 备端 SSE-S3 对象在线可解
+        let mut out = Vec::new();
+        b_engine
+            .read()
+            .get_to("b0", "s1", 0..u64::MAX, &mut out)
+            .unwrap();
+        assert_eq!(out, data, "备端 SSE-S3 解密逐字节一致");
+        wb.shutdown();
+    }
+
     /// M21 E4(设计稿 §5.1.4;ADR-33 RP5.3;TODO M21/E4 具名用例):**级联
     /// 下游自动跟随被 promote 的中继**——三级 A→B→C:
     /// ① A 写 obj1,B/C 追平;C 停(滞后),A 写 obj2,B 追平(C 落后

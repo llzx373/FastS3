@@ -381,7 +381,8 @@ fn op_bucket(op: &Op) -> Option<&str> {
         // 无桶上下文:分片/会话 Op 只带 upload_id(桶解析需会话查找,
         // 提交热路径不做);ObjectMetaRewrite 持原始键为维护通道;事件
         // 死信/删除、restore/batch 作业簿记、分配器/密钥/IAM/会话为
-        // 系统键族(s: 口径,桶级槽强制随同,设计稿 §6.2)。
+        // 系统键族(s: 口径,桶级槽强制随同,设计稿 §6.2);SSE-S3
+        // seed/代(F1)= s: 族同口径(has_unscoped → 桶级槽恒放行)。
         Op::PartMigrate { .. }
         | Op::PartPut { .. }
         | Op::PartDelete { .. }
@@ -408,7 +409,9 @@ fn op_bucket(op: &Op) -> Option<&str> {
         | Op::IamPolicyPut { .. }
         | Op::IamPolicyDelete { .. }
         | Op::IamRolePut { .. }
-        | Op::IamRoleDelete { .. } => None,
+        | Op::IamRoleDelete { .. }
+        | Op::SseKekSeedPut { .. }
+        | Op::SseKekGenPut { .. } => None,
     }
 }
 
@@ -506,6 +509,8 @@ fn data_refs_of(ops: &[Op]) -> Vec<DataRef> {
             | Op::IamPolicyDelete { .. }
             | Op::IamRolePut { .. }
             | Op::IamRoleDelete { .. } => {}
+            // F1:SSE-S3 seed/代随同——纯 s: 系统键,无数据段引用。
+            Op::SseKekSeedPut { .. } | Op::SseKekGenPut { .. } => {}
         }
     }
     out.sort();
@@ -525,16 +530,20 @@ fn data_refs_of(ops: &[Op]) -> Vec<DataRef> {
 // rocksdb MVCC 保证(导出期间并发写不进快照)。
 //
 // 导出口径(键族取舍钉死,改动须走 ADR):
-// - **排除**:`s:`(系统键族:sse_kek_seed 红线不导出,repl_*/session/
-//   audit/pool 为本机状态)、`a:`/`t:`(上游分配记录,下游布局独立
+// - **排除**:`s:`(系统键族:repl_*/session/audit/pool 为本机状态)、
+//   `a:`/`t:`(上游分配记录,下游布局独立
 //   §4.3)、`bl:`(binlog 本体,增量从 P 经 binlog 端点续拉)、
 //   `e:`/`x:`/`ij:`/`jb:`(事件/恢复/迁入/批作业 = 运维瞬态队列,
 //   同 meta-export DTO 不导出口径);
+//   **F1 例外(RP7.3 裁定,§6.2)**:`s:sse_kek_seed` / `s:sse_kek_gen`
+//   随同导出——种子 binlog 记录可能被水位截断,快照是迟到/重建备端
+//   的唯一种子来源;复制信道(mTLS)与 rocksdb s: 键同等级,meta-export
+//   /日志/审计红线不变(见 export_key_excluded);
 // - **导出**:其余全部键族原始键值直出(桶/对象/分段/桶配置/IAM/会话;
 //   值字节原样,含对象值版本字节与内联小对象载荷;SSE-KMS wrapped_dek
 //   为密文随对象值自然携带,RP7.1);
 // - **桶级过滤**(D2 联动):能解析出桶名的键族按过滤器判定;无法归属
-// 桶的键(`p:`/`u:`/IAM 等)保守随同(同 BucketScope.has_unscoped
+// 桶的键(`p:`/`u:`/IAM/`s:sse_kek_*` 等)保守随同(同 BucketScope.has_unscoped
 //   口径,§3.2)。
 //
 // 活段清单:会话开启时从同一快照扫描 `o:`/`p:` 段引用(含恢复副本段),
@@ -842,6 +851,15 @@ fn build_manifest(
 /// 导出键族排除表(模块注释钉死):`s:`/`a:`/`t:`/`bl:` 为本机/上游
 /// 状态,`e:`/`x:`/`ij:`/`jb:` 为运维瞬态队列。
 fn export_key_excluded(key: &[u8]) -> bool {
+    // M21 F1(ADR-33 RP7.3;设计 §6.2):`s:sse_kek_seed` / `s:sse_kek_gen`
+    // 例外随同——binlog 内的种子记录可能被两级水位截断,快照是迟到/
+    // 重建备端(C5 rebuild 唯一路径)获取 SSE-S3 种子的唯一来源;缺席
+    // 则备端 SSE-S3 对象永不可解。复制快照走 mTLS 复制口,与 binlog
+    // 落盘/rocksdb s: 键同等级(RP7.3 裁定);红线(零日志/零审计/零
+    // meta-export——fs3d meta-export DTO 不含复制快照路径)不变。
+    if key == crate::keys::SYS_SSE_KEK_SEED || key == crate::keys::SYS_SSE_KEK_GEN {
+        return false;
+    }
     key.starts_with(crate::keys::PREFIX_SYS)
         || key.starts_with(crate::keys::PREFIX_ALLOC)
         || key.starts_with(crate::keys::PREFIX_TXN)
@@ -1093,5 +1111,62 @@ mod tests {
         assert!(!cred.filters.allows_bucket("b2"));
         assert!(BucketFilter::Exclude(vec!["b2".into()]).allows_bucket("b1"));
         assert!(!BucketFilter::Exclude(vec!["b2".into()]).allows_bucket("b2"));
+    }
+
+    /// M21 F1(ADR-33 RP7.3;设计 §6.2;TODO M21/F1):快照导出随同
+    /// SSE-S3 seed/代状态——
+    /// ① `s:sse_kek_seed` / `s:sse_kek_gen` 进导出页(种子 binlog 记录
+    ///    被两级水位截断后,快照是迟到/重建备端的唯一种子来源);
+    /// ② 桶级 Include/Exclude 过滤器均不裁剪(不可归属桶 → 保守随同
+    ///    = 桶级槽强制随同);
+    /// ③ 其余 s: 系统键(seed_salt/repl_* 本机状态)仍排除;
+    ///    meta-export DTO 红线口径不变(fs3d export_never_leaks_sse_kek_seed
+    ///    是另一条独立路径,本例外只作用复制快照)。
+    #[test]
+    fn snapshot_export_carries_sse_kek_seed_across_bucket_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = std::sync::Arc::new(
+            crate::MetaStore::open(dir.path(), &crate::MetaConfig::default()).unwrap(),
+        );
+        let seed = meta.sse_kek_seed().unwrap();
+        let gen_st = meta.rotate_sse_kek().unwrap();
+        // ③ 的对照材料:本机状态键存在但不得导出
+        let _salt = meta.seed_salt().unwrap();
+        meta.set_repl_role(crate::ReplRole::Standby).unwrap();
+
+        for f in [
+            BucketFilter::All,
+            BucketFilter::Include(vec!["b1".into()]),
+            BucketFilter::Exclude(vec!["b1".into()]),
+        ] {
+            let sess = meta.repl_export_open(f.clone()).unwrap();
+            let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            let mut after = None;
+            loop {
+                let page = sess.meta_page(after, 100, 1 << 20).unwrap();
+                entries.extend(page.entries.iter().cloned());
+                if page.done {
+                    break;
+                }
+                after = page.next;
+            }
+            let seed_kv = entries
+                .iter()
+                .find(|(k, _)| k.as_slice() == crate::keys::SYS_SSE_KEK_SEED)
+                .unwrap_or_else(|| panic!("seed 必须随同导出(过滤器 {f:?}"));
+            assert_eq!(seed_kv.1.as_slice(), seed.as_slice());
+            let gen_kv = entries
+                .iter()
+                .find(|(k, _)| k.as_slice() == crate::keys::SYS_SSE_KEK_GEN)
+                .unwrap_or_else(|| panic!("gen 必须随同导出(过滤器 {f:?}"));
+            let st: crate::SseKekGenState = postcard::from_bytes(&gen_kv.1).unwrap();
+            assert_eq!(st, gen_st);
+            // ③ 其余 s: 键仍排除
+            assert!(
+                entries.iter().all(|(k, _)| !k.starts_with(b"s:repl_")
+                    && k.as_slice() != crate::keys::SYS_KEY_SEED_SALT),
+                "本机 s: 状态键不得导出(过滤器 {f:?})"
+            );
+        }
     }
 }

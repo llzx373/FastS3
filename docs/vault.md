@@ -134,3 +134,26 @@ vault server -config=deploy/vault/config.hcl &
 deploy/vault/bootstrap.sh
 # 预期:transit 往返 OK(fasts3-smoke);audit 留痕 OK;token_file 0600
 ```
+
+## 11. 主备复制的共享 KMS 前置(TODO M21/F1;ADR-33 RP7)
+
+M21 主备复制下,SSE 加密语义跨实例保全的**一期方案 = 主备共享同一
+Vault/OpenBao 集群**(方案 A;异构 KMS 重加密为二期显式开关,默认关):
+
+- **主备 `[kms]` 必须指向同一 Vault/OpenBao 集群**(同一 transit 挂载点、
+  同 key 名集合):wrapped DEK 绑定 `canonical(bucket,key)` AAD,实例级复制
+  桶键名不变,`SseInfo` 随 binlog 原样落盘备端即可在线 unwrap——
+  **零重加密,明文 DEK 永不出 KMS**。
+- **主备场景禁用 `[kms.deploy]` 各自托管**:托管子进程是单机本地 KMS,
+  两机各起各的 = 异构 KMS,备端 wrapped DEK 不可解。主备须
+  `backend = "external"` 指向共享集群;同城 HA 由 **Vault 集群自身**
+  (raft integrated storage / OpenBao 同构)承担,FastS3 不做 KMS 面 HA。
+- **SSE-S3 种子/KEK 代随同复制**(`s:sse_kek_seed` / `s:sse_kek_gen`):
+  经 binlog 记录与快照导出两条信道下发(桶级槽强制随同);种子零日志/
+  零审计/零 meta-export 红线不变——复制信道走 mTLS 复制口,与 rocksdb
+  内 `s:` 键同等级。
+- **红线不变:KMS 停机 = 主备同败**——任一侧解密显式失败
+  (`KMS.UnavailableException` 503),不降级、不缓存明文 DEK。
+- 演练口径(门禁):`ssekms_objects_decryptable_on_standby` /
+  `ssekms_promoted_standby_decrypts_after_takeover`(真 Vault 车道,
+  `cargo test -p fs3d ssekms`,需 vault 二进制在 PATH)。
