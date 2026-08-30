@@ -134,10 +134,10 @@
 - [x] C2 下游导入:逻辑段拷贝(非块镜像),本地分配器重建布局(设备异构可,容量 ≥ 用量);
   CRC 端到端校验;导入完成从 `P` 转增量追赶
   - 用例:`standby_bootstrap_from_empty_catches_up`;`bootstrap_on_different_extent_size`
-- [ ] C3 段回填池:`data_pending` 标记 + 并发回填(`data_pull_concurrency` 默认 8);
+- [x] C3 段回填池:`data_pending` 标记 + 并发回填(`data_pull_concurrency` 默认 8);
   extent-data 接口 Range 读 + CRC + ReadPin;小对象内联随 binlog 直达零往返
   - 用例:`backfill_pool_parallel_fetch_crc_verified`;`inline_objects_arrive_with_binlog`
-- [ ] C4 缺数据等待:读命中 `data_pending` 段 → 同步向上游即时拉取、落盘校验后服务
+- [x] C4 缺数据等待:读命中 `data_pending` 段 → 同步向上游即时拉取、落盘校验后服务
   (单请求超时 `read_fetch_timeout_secs` 默认 30s);上游不可达且数据未到 →
   503 + `Retry-After`
   - 用例:`read_pending_object_blocks_then_serves`;`read_pending_upstream_down_503`
