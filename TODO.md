@@ -108,11 +108,11 @@
   key_file 并在文档写明代价(单机便利 vs 密钥进程隔离弱化)
   - 用例:`kms_service_deploy_openbao_end_to_end`;`kms_service_deploy_vault_end_to_end`;
     `kms_supervisor_restarts_after_kill`;`kms_unseal_keys_delivered_once_not_logged`
-- [ ] A3 admin API:`POST /v1/admin/kms/service/{deploy,start,stop}` +
+- [x] A3 admin API:`POST /v1/admin/kms/service/{deploy,start,stop}` +
   `GET /v1/admin/kms/service/status`(flavor/健康/sealed/token 余期);
   审计 who 归属控制台操作者(沿 M19 J3 先例);路由沿 fs3-admin `match (method, segs)` 样板
   - 用例:admin 往返;审计可检索 service deploy 事件;未授权 403
-- [ ] A4 后端描述符:vault/bao 差异(二进制名/默认路径/版本探测)收敛为 descriptor,
+- [x] A4 后端描述符:vault/bao 差异(二进制名/默认路径/版本探测)收敛为 descriptor,
   transit 调用面共用;版本探测不兼容时显式报错(不静默)
   - 用例:同一 `[kms]` 配置切换 flavor 仅改 binary/port;descriptor 单测
 
