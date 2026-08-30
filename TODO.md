@@ -147,10 +147,10 @@
 
 ### D. 一主多备与桶级(≈2 pw;设计 §3.3/§5.4/§6.3;ADR-33)
 
-- [ ] D1 fan-out:多槽并发服务互不干扰;扇出上限 16(配置 `max_slots`);槽位观测端点
+- [x] D1 fan-out:多槽并发服务互不干扰;扇出上限 16(配置 `max_slots`);槽位观测端点
   `GET /v1/repl/v1/slots`(每槽 confirmed_gtid/lag_seq/lag_bytes/延迟秒)
   - 用例:`three_standbys_independent_cursors`;`slots_endpoint_reports_lag`
-- [ ] D2 桶级过滤:槽位 BucketFilter(include/exclude)上游侧过滤;被过滤 seq 心跳带过;
+- [x] D2 桶级过滤:槽位 BucketFilter(include/exclude)上游侧过滤;被过滤 seq 心跳带过;
   过滤器变更 = drop + 重建槽(admin 强制,禁原地改)
   - 用例:`bucket_filter_ships_only_scoped_buckets`;`filter_change_requires_slot_rebuild`
 - [ ] D3 上游委派凭证:admin 为槽位签发绑定 `{slot_name, bucket_scope}` 只读 HMAC 凭证,
