@@ -169,7 +169,7 @@
 - [x] E2 流量优先级:令牌桶权重 投递 > 回填 > 按需拉取(`traffic_weights` 可配),
   饥饿测试:下游读流量打满时回填/投递仍前进
   - 用例:`relay_priority_prevents_read_starvation`
-- [ ] E3 promote(dry-run 前置):`POST /v1/admin/replication/promote?dry_run=true` 返回
+- [x] E3 promote(dry-run 前置):`POST /v1/admin/replication/promote?dry_run=true` 返回
   丢弃对象清单 + 影响桶 + GTID 范围 + 受影响下游分支;真实 promote = 停 apply →
   校验无 `data_pending`(或 `--force`,清单与 dry-run 一致)→ epoch+1 →
   EpochBarrier 同事务落盘 → role=primary → 开写路径
