@@ -398,6 +398,16 @@ pub struct Engine {
     trusted_clock_divergence_events: std::sync::atomic::AtomicU64,
 }
 
+/// M21 A5 开发态开关(风格仿 fs3-agent `FS3_SYNC_MC_WORKERS` env 先例):
+/// env `FS3D_REPL_BINLOG` 为 `1`/`true` 时返回 true。
+/// 仅 M21 期 binlog 写放大 perf 验证/演练使用,非产品配置面。
+fn repl_binlog_env_enabled() -> bool {
+    matches!(
+        std::env::var("FS3D_REPL_BINLOG").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
 impl Engine {
     /// 打开引擎(含完整恢复流程);设备未初始化返回 NotInitialized。
     ///
@@ -416,8 +426,16 @@ impl Engine {
             flush_every_ms: cfg.group_commit_ms,
             sync_mode: cfg.sync_mode,
             cache_capacity: None,
+            // M21 A5:开发态开关 — env `FS3D_REPL_BINLOG=1` 时开启 binlog
+            // 记录(apply_ops 同事务写 `bl:{seq}`)。仅用于 M21 期性能验证/
+            // 演练(perf-m21-binlog-compare.sh);正式引擎/[replication]
+            // 配置接线属后续 B/F 组任务,届时本 env 入口由配置取代。
+            repl_binlog: repl_binlog_env_enabled(),
             ..Default::default()
         };
+        if meta_cfg.repl_binlog {
+            tracing::info!("repl_binlog enabled via FS3D_REPL_BINLOG (M21 A5 dev switch)");
+        }
         let meta = Arc::new(MetaStore::open(&cfg.meta_dir, &meta_cfg)?);
 
         // 1. 打开全部配置设备 + 读超块(容错收集:打开失败暂存;
