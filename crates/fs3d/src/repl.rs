@@ -1306,7 +1306,7 @@ impl ReplServer {
     fn upstream_gtid_set(&self) -> Result<GtidSet, fs3_core::Error> {
         // executed ∪ 本地 binlog 覆盖(E4 起实现收拢到 MetaStore 侧,
         // 与 hello 自报口径同一来源)
-        Ok(self.meta.repl_local_gtid_set()?)
+        self.meta.repl_local_gtid_set()
     }
 
     /// 上游当前水位 = {当前 epoch, 代内最新 GTID seq}(E3 起 = s:seq −
