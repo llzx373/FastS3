@@ -363,6 +363,8 @@ export interface IamCapabilities {
   can_ingest?: boolean;
   /** M19 J3:Batch Operations(consoleAdmin 域) */
   can_batch?: boolean;
+  /** M20 G2:SSE-KMS 页(consoleAdmin 域;unseal key 不对 diagnostics 开放) */
+  can_kms?: boolean;
 }
 
 /** M19 J1(ADR-26):Batch 任务。 */
@@ -706,11 +708,16 @@ export const api = {
   deleteLifecycle: (bucket: string) =>
     request<Record<string, unknown>>("DELETE", `/api/buckets/${encodeURIComponent(bucket)}/lifecycle`),
   getEncryption: (bucket: string) =>
-    request<{ SSEAlgorithm: string }>("GET", `/api/buckets/${encodeURIComponent(bucket)}/encryption`),
-  putEncryption: (bucket: string) =>
-    request<{ SSEAlgorithm: string }>("PUT", `/api/buckets/${encodeURIComponent(bucket)}/encryption`, {
-      SSEAlgorithm: "AES256",
-    }),
+    request<{ SSEAlgorithm: string; KMSMasterKeyID?: string }>(
+      "GET",
+      `/api/buckets/${encodeURIComponent(bucket)}/encryption`
+    ),
+  putEncryption: (bucket: string, algorithm: "AES256" | "aws:kms" = "AES256", kmsKeyId?: string) =>
+    request<{ SSEAlgorithm: string; KMSMasterKeyID?: string }>(
+      "PUT",
+      `/api/buckets/${encodeURIComponent(bucket)}/encryption`,
+      kmsKeyId ? { SSEAlgorithm: algorithm, KMSMasterKeyID: kmsKeyId } : { SSEAlgorithm: algorithm }
+    ),
   deleteEncryption: (bucket: string) =>
     request<Record<string, unknown>>("DELETE", `/api/buckets/${encodeURIComponent(bucket)}/encryption`),
 
@@ -852,6 +859,18 @@ export const api = {
   sseRotate: () => request<Record<string, unknown>>("POST", "/api/sse/rotate"),
   deviceAdd: (path: string, force = false) =>
     request<Record<string, unknown>>("POST", "/api/devices/add", { path, force }),
+
+  kmsStatus: () => request<Record<string, unknown>>("GET", "/api/kms/status"),
+  kmsKeys: () => request<{ keys: string[] }>("GET", "/api/kms/keys"),
+  kmsCreateKey: (name: string) => request<Record<string, unknown>>("POST", "/api/kms/keys", { name }),
+  kmsDescribeKey: (name: string) =>
+    request<Record<string, unknown>>("GET", `/api/kms/keys/${encodeURIComponent(name)}`),
+  kmsRotateKey: (name: string) =>
+    request<Record<string, unknown>>("POST", `/api/kms/keys/${encodeURIComponent(name)}/rotate`),
+  kmsServiceStatus: () => request<Record<string, unknown>>("GET", "/api/kms/service/status"),
+  kmsServiceDeploy: () => request<Record<string, unknown>>("POST", "/api/kms/service/deploy"),
+  kmsServiceStart: () => request<Record<string, unknown>>("POST", "/api/kms/service/start"),
+  kmsServiceStop: () => request<Record<string, unknown>>("POST", "/api/kms/service/stop"),
 
   ldapStatus: () => request<LdapStatus>("GET", "/api/ldap/status"),
   identityEvents: (limit = 100) =>

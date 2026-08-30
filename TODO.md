@@ -187,12 +187,12 @@
 
 ### G. 配置 + 控制台(≈1.5 pw;ADR-29)
 
-- [ ] G1 `[kms]` 配置段(照 `[batch]` 样板 config.rs:41-50):`backend = external|managed|none`;
+- [x] G1 `[kms]` 配置段(照 `[batch]` 样板 config.rs:41-50):`backend = external|managed|none`;
   external:vault_addr / token_file(0600,token 不进 toml)/ tls_ca / tls_client(PEM 路径)/
   timeout;managed = `[kms.deploy]`;settings 页视图 + restart_required 标注;
   `fasts3.example.toml` + `wizard.rs` 问询
   - 用例:`kms_config_settings_patch_restart_required`;缺 token_file 显式报错不静默
-- [ ] G2 控制台 KMS 页 + 托管向导(照 Batch 页五件套样板):`pages/Kms.tsx`(后端状态 /
+- [x] G2 控制台 KMS 页 + 托管向导(照 Batch 页五件套样板):`pages/Kms.tsx`(后端状态 /
   key 列表 / 轮换 / 服务启停)+ 向导(flavor 二选一 vault|openbao → 二进制来源:本地路径
   探测或离线上传/下载 + SHA256 校验 → config.hcl 预览 → 拉起 → init → unseal key
   一次性展示+下载 → token 落盘 → `[kms]` 切换确认);App.tsx `can_kms` 能力位 + api.ts +

@@ -101,6 +101,16 @@ export interface AdminApi {
   sseStatus(): Promise<Record<string, unknown>>;
   /** SSE-S3 KEK 轮换 + 后台重包裹。 */
   sseRotate(): Promise<Record<string, unknown>>;
+  /** M20 G2:SSE-KMS 后端状态(连通/密封/默认 key/token 余期;零密钥材料)。 */
+  kmsStatus(): Promise<Record<string, unknown>>;
+  kmsKeys(): Promise<{ keys: string[] }>;
+  kmsCreateKey(body: { name: string; operator?: string }): Promise<Record<string, unknown>>;
+  kmsDescribeKey(name: string): Promise<Record<string, unknown>>;
+  kmsRotateKey(name: string, body?: { operator?: string }): Promise<Record<string, unknown>>;
+  kmsServiceStatus(): Promise<Record<string, unknown>>;
+  kmsServiceDeploy(body?: { operator?: string }): Promise<Record<string, unknown>>;
+  kmsServiceStart(body?: { operator?: string }): Promise<Record<string, unknown>>;
+  kmsServiceStop(body?: { operator?: string }): Promise<Record<string, unknown>>;
   /** 在线加盘。 */
   deviceAdd(path: string, force?: boolean): Promise<Record<string, unknown>>;
   // M18 S1(ADR-28 DI2.4/DI8):IAM 用户查询 + 服务账号 CRUD(自助/代管)
@@ -718,6 +728,34 @@ export class AdminClient implements AdminApi {
 
   sseRotate(): Promise<Record<string, unknown>> {
     return this.expect("POST", "/v1/admin/sse/rotate");
+  }
+
+  kmsStatus(): Promise<Record<string, unknown>> {
+    return this.expect("GET", "/v1/admin/kms/status");
+  }
+  kmsKeys(): Promise<{ keys: string[] }> {
+    return this.expect("GET", "/v1/admin/kms/keys");
+  }
+  kmsCreateKey(body: { name: string; operator?: string }): Promise<Record<string, unknown>> {
+    return this.expect("POST", "/v1/admin/kms/keys", body);
+  }
+  kmsDescribeKey(name: string): Promise<Record<string, unknown>> {
+    return this.expect("GET", `/v1/admin/kms/keys/${encodeURIComponent(name)}`);
+  }
+  kmsRotateKey(name: string, body?: { operator?: string }): Promise<Record<string, unknown>> {
+    return this.expect("POST", `/v1/admin/kms/keys/${encodeURIComponent(name)}/rotate`, body ?? {});
+  }
+  kmsServiceStatus(): Promise<Record<string, unknown>> {
+    return this.expect("GET", "/v1/admin/kms/service/status");
+  }
+  kmsServiceDeploy(body?: { operator?: string }): Promise<Record<string, unknown>> {
+    return this.expect("POST", "/v1/admin/kms/service/deploy", body ?? {});
+  }
+  kmsServiceStart(body?: { operator?: string }): Promise<Record<string, unknown>> {
+    return this.expect("POST", "/v1/admin/kms/service/start", body ?? {});
+  }
+  kmsServiceStop(body?: { operator?: string }): Promise<Record<string, unknown>> {
+    return this.expect("POST", "/v1/admin/kms/service/stop", body ?? {});
   }
 
   deviceAdd(path: string, force = false): Promise<Record<string, unknown>> {

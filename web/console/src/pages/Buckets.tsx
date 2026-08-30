@@ -979,7 +979,9 @@ function LifecycleRuleForm({
 /** M11:桶默认加密(仅 SSE-S3 AES256,不含 KMS;无 ↔ AES256 即 DELETE/PUT)。 */
 function EncryptionPane({ bucket }: { bucket: BucketInfo }) {
   const [current, setCurrent] = useState<string | null>(null);
-  const [target, setTarget] = useState<"" | "AES256">("");
+  const [currentKid, setCurrentKid] = useState<string>("");
+  const [target, setTarget] = useState<"" | "AES256" | "aws:kms">("");
+  const [kmsKeyId, setKmsKeyId] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -988,7 +990,9 @@ function EncryptionPane({ bucket }: { bucket: BucketInfo }) {
     try {
       const r = await api.getEncryption(bucket.name);
       setCurrent(r.SSEAlgorithm);
-      setTarget(r.SSEAlgorithm === "AES256" ? "AES256" : "");
+      setCurrentKid(r.KMSMasterKeyID ?? "");
+      setTarget(r.SSEAlgorithm === "AES256" || r.SSEAlgorithm === "aws:kms" ? r.SSEAlgorithm : "");
+      setKmsKeyId(r.KMSMasterKeyID ?? "");
       setError(null);
     } catch (e) {
       setError((e as Error).message);
@@ -1003,7 +1007,9 @@ function EncryptionPane({ bucket }: { bucket: BucketInfo }) {
     setSaving(true);
     try {
       if (target === "AES256") {
-        await api.putEncryption(bucket.name);
+        await api.putEncryption(bucket.name, "AES256");
+      } else if (target === "aws:kms") {
+        await api.putEncryption(bucket.name, "aws:kms", kmsKeyId.trim() || undefined);
       } else {
         await api.deleteEncryption(bucket.name);
       }
@@ -1016,12 +1022,27 @@ function EncryptionPane({ bucket }: { bucket: BucketInfo }) {
     }
   };
 
-  const currentLabel = current === null ? t("加载中…", "Loading…") : current === "" ? t("无默认加密", "No default encryption") : current;
+  const currentLabel =
+    current === null
+      ? t("加载中…", "Loading…")
+      : current === ""
+        ? t("无默认加密", "No default encryption")
+        : current === "aws:kms"
+          ? currentKid
+            ? `aws:kms (${currentKid})`
+            : "aws:kms"
+          : current;
+  const unchanged =
+    target === (current === "AES256" || current === "aws:kms" ? current : "") &&
+    (target !== "aws:kms" || kmsKeyId === currentKid);
   return (
     <div>
       {error && <div className="alert">{error}</div>}
       <p className="muted" style={{ fontSize: 12, marginTop: 0 }}>
-        {t("桶默认加密(SSE-S3):新写入未显式指定加密的对象自动以 AES256 加密;不含 KMS(aws:kms 不受理)。", "Bucket default encryption (SSE-S3): writes without explicit encryption are automatically AES256 encrypted; no KMS (aws:kms not accepted).")}
+        {t(
+          "桶默认加密:新写入未显式指定加密的对象自动加密。AES256 = SSE-S3;aws:kms = SSE-KMS(可选 KMSMasterKeyID,空则用后端默认 key)。",
+          "Bucket default encryption: writes without explicit encryption are encrypted automatically. AES256 = SSE-S3; aws:kms = SSE-KMS (optional KMSMasterKeyID; empty uses the backend default key)."
+        )}
       </p>
       <div className="form-row">
         <label>{t("当前配置", "Current configuration")}</label>
@@ -1029,7 +1050,7 @@ function EncryptionPane({ bucket }: { bucket: BucketInfo }) {
       </div>
       <div className="form-row">
         <label>{t("设置为", "Set to")}</label>
-        <div style={{ display: "flex", gap: 14 }}>
+        <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
           <label style={{ margin: 0, display: "flex", alignItems: "center", gap: 4 }}>
             <input type="radio" name="enc-mode" checked={target === ""} onChange={() => setTarget("")} />
             {t("无默认加密", "No default encryption")}
@@ -1043,10 +1064,29 @@ function EncryptionPane({ bucket }: { bucket: BucketInfo }) {
             />
             AES256(SSE-S3)
           </label>
+          <label style={{ margin: 0, display: "flex", alignItems: "center", gap: 4 }}>
+            <input
+              type="radio"
+              name="enc-mode"
+              checked={target === "aws:kms"}
+              onChange={() => setTarget("aws:kms")}
+            />
+            aws:kms(SSE-KMS)
+          </label>
         </div>
       </div>
+      {target === "aws:kms" && (
+        <div className="form-row">
+          <label>KMSMasterKeyID</label>
+          <input
+            value={kmsKeyId}
+            onChange={(e) => setKmsKeyId(e.target.value)}
+            placeholder={t("可空=后端默认 key", "optional = backend default key")}
+          />
+        </div>
+      )}
       <div className="toolbar">
-        <button onClick={save} disabled={saving || current === null || target === (current === "AES256" ? "AES256" : "")}>
+        <button onClick={save} disabled={saving || current === null || unchanged}>
           {saving ? t("保存中…", "Saving…") : t("保存", "Save")}
         </button>
         {saved && <span style={{ color: "var(--green)", fontSize: 12 }}>{t("✓ 已保存", "✓ Saved")}</span>}

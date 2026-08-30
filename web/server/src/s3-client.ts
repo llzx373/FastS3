@@ -779,12 +779,16 @@ export function renderLifecycleXml(rules: LifecycleRule[]): string {
   return `<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">${inner}</LifecycleConfiguration>`;
 }
 
-/** 渲染 ServerSideEncryptionConfiguration 请求体(仅 AES256 单 Rule)。 */
-function renderEncryptionXml(algorithm: string): string {
+/** 渲染 ServerSideEncryptionConfiguration 请求体(AES256 或 aws:kms + 可选 KMSMasterKeyID)。 */
+function renderEncryptionXml(algorithm: string, kmsKeyId?: string): string {
+  const kms =
+    algorithm === "aws:kms" && kmsKeyId && kmsKeyId.trim() !== ""
+      ? `<KMSMasterKeyID>${escapeXml(kmsKeyId.trim())}</KMSMasterKeyID>`
+      : "";
   return (
     `<ServerSideEncryptionConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">` +
     `<Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>${escapeXml(algorithm)}</SSEAlgorithm>` +
-    `</ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>`
+    `${kms}</ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>`
   );
 }
 
@@ -989,21 +993,29 @@ export class S3M10Client {
     await this.call("DELETE", `/${bucket}?lifecycle`);
   }
 
-  /** GetBucketEncryption:SSEAlgorithm;未配置(ServerSideEncryptionConfigurationNotFoundError 404)→ ""。 */
-  async getBucketEncryption(bucket: string): Promise<string> {
+  /** GetBucketEncryption;未配置(ServerSideEncryptionConfigurationNotFoundError 404)→ SSEAlgorithm ""。 */
+  async getBucketEncryption(bucket: string): Promise<{ SSEAlgorithm: string; KMSMasterKeyID?: string }> {
     const signed = signRequest(this.cfg, "GET", `/${bucket}?encryption`, Buffer.alloc(0), {});
     const res = await doRequest(this.cfg, signed);
-    if (res.status === 404 && res.body.includes("ServerSideEncryptionConfigurationNotFoundError")) return "";
+    if (res.status === 404 && res.body.includes("ServerSideEncryptionConfigurationNotFoundError")) {
+      return { SSEAlgorithm: "" };
+    }
     if (res.status !== 200) {
       throw new Error(`GetBucketEncryption ${bucket}: HTTP ${res.status} ${res.body.toString().slice(0, 300)}`);
     }
-    const m = /<SSEAlgorithm>([^<]*)<\/SSEAlgorithm>/.exec(res.body.toString("utf8"));
-    return m ? m[1] : "";
+    const xml = res.body.toString("utf8");
+    const algo = /<SSEAlgorithm>([^<]*)<\/SSEAlgorithm>/.exec(xml)?.[1] ?? "";
+    const kid = /<KMSMasterKeyID>([^<]*)<\/KMSMasterKeyID>/.exec(xml)?.[1];
+    return kid ? { SSEAlgorithm: algo, KMSMasterKeyID: kid } : { SSEAlgorithm: algo };
   }
 
-  /** PutBucketEncryption(仅 SSE-S3 AES256;aws:kms 由数据面 InvalidEncryptionAlgorithmError 拒绝)。 */
-  async putBucketEncryption(bucket: string, algorithm: "AES256"): Promise<void> {
-    await this.call("PUT", `/${bucket}?encryption`, Buffer.from(renderEncryptionXml(algorithm)), {
+  /** PutBucketEncryption(AES256 或 aws:kms;后者可带 KMSMasterKeyID)。 */
+  async putBucketEncryption(
+    bucket: string,
+    algorithm: "AES256" | "aws:kms",
+    kmsKeyId?: string
+  ): Promise<void> {
+    await this.call("PUT", `/${bucket}?encryption`, Buffer.from(renderEncryptionXml(algorithm, kmsKeyId)), {
       "content-type": "application/xml",
     });
   }

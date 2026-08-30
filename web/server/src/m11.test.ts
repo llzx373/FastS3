@@ -112,12 +112,14 @@ test("PUT lifecycle 校验与透传;DELETE 代理", async () => {
   assert.ok(calls.includes("del-lifecycle"));
 });
 
-test("加密端点:GET/PUT/DELETE 代理,非 AES256 拒绝", async () => {
+test("加密端点:GET/PUT/DELETE 代理,AES256 与 aws:kms", async () => {
   const calls: string[] = [];
+  const putArgs: { algo: string; kid?: string }[] = [];
   const fake = {
-    getBucketEncryption: async () => "AES256",
-    putBucketEncryption: async () => {
+    getBucketEncryption: async () => ({ SSEAlgorithm: "AES256" }),
+    putBucketEncryption: async (_b: string, algorithm: "AES256" | "aws:kms", kmsKeyId?: string) => {
       calls.push("put-encryption");
+      putArgs.push({ algo: algorithm, kid: kmsKeyId });
     },
     deleteBucketEncryption: async () => {
       calls.push("del-encryption");
@@ -129,10 +131,16 @@ test("加密端点:GET/PUT/DELETE 代理,非 AES256 拒绝", async () => {
   r = await authReq(app, "PUT", "/api/buckets/b1/encryption", { SSEAlgorithm: "AES256" });
   assert.equal(r.statusCode, 200);
   assert.ok(calls.includes("put-encryption"));
-  // aws:kms → 400,不透传到数据面
-  r = await authReq(app, "PUT", "/api/buckets/b1/encryption", { SSEAlgorithm: "aws:kms" });
+  // M20 G2:aws:kms 透传到数据面(可选 KMSMasterKeyID)
+  r = await authReq(app, "PUT", "/api/buckets/b1/encryption", {
+    SSEAlgorithm: "aws:kms",
+    KMSMasterKeyID: "app-key",
+  });
+  assert.equal(r.statusCode, 200, r.body);
+  assert.equal(putArgs[1]?.algo, "aws:kms");
+  assert.equal(putArgs[1]?.kid, "app-key");
+  r = await authReq(app, "PUT", "/api/buckets/b1/encryption", { SSEAlgorithm: "not-a-real-algo" });
   assert.equal(r.statusCode, 400);
-  assert.equal(calls.filter((c) => c === "put-encryption").length, 1);
   r = await authReq(app, "DELETE", "/api/buckets/b1/encryption");
   assert.equal(r.statusCode, 200);
   assert.ok(calls.includes("del-encryption"));

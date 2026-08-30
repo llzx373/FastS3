@@ -21,7 +21,8 @@
  *   M10:GET /api/buckets/{name}/versions;POST .../versions/action(restore/delete)
  *   M10:GET/PUT /api/buckets/{name}/versioning;GET/PUT/DELETE .../cors;GET/PUT/DELETE .../policy
  *   M10:GET /api/buckets/{name}/object-tags;POST .../object-tags/action(put)
- *   M11:GET/PUT/DELETE /api/buckets/{name}/lifecycle;GET/PUT/DELETE .../encryption(仅 AES256)
+ *   M11:GET/PUT/DELETE /api/buckets/{name}/lifecycle;GET/PUT/DELETE .../encryption(AES256|aws:kms)
+ *   M20 G2:GET/POST /api/kms[...](KMS 状态/key CRUD/rotate/托管服务;consoleAdmin)
  *   M12:GET/PUT /api/buckets/{name}/object-lock;GET/PUT .../object-lock/{retention,legal-hold}
  *   GET/POST/DELETE /api/keys[/{id}]      密钥管理(代理;C1 起映射 SA 动作族)
  *   PUT  /api/keys/{access}/policy        密钥策略文档(代理 admin PATCH)
@@ -983,27 +984,35 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       }
     );
 
-    // M11:桶默认加密(仅 SSE-S3 AES256,不含 KMS;未配置时 GET 返回 SSEAlgorithm: "")
+    // M11/M20 G2:桶默认加密(AES256 或 aws:kms;未配置时 GET 返回 SSEAlgorithm: "")
     app.get<{ Params: { name: string } }>("/api/buckets/:name/encryption", async (req, reply) => {
       try {
-        return { SSEAlgorithm: await m10.getBucketEncryption(req.params.name) };
+        return await m10.getBucketEncryption(req.params.name);
       } catch (e) {
         return m10Error(e, reply, req.params.name);
       }
     });
 
-    app.put<{ Params: { name: string }; Body: { SSEAlgorithm?: unknown } }>(
+    app.put<{ Params: { name: string }; Body: { SSEAlgorithm?: unknown; KMSMasterKeyID?: unknown } }>(
       "/api/buckets/:name/encryption",
       { preHandler: requireIamAction(admin, "admin:UpdateBucket", ownTenant) },
       async (req, reply) => {
-        if (req.body?.SSEAlgorithm !== "AES256") {
+        const algo = req.body?.SSEAlgorithm;
+        if (algo !== "AES256" && algo !== "aws:kms") {
           return reply.code(400).send({
-            error: { code: "bad_request", message: "SSEAlgorithm must be AES256 (SSE-S3; KMS not supported)" },
+            error: { code: "bad_request", message: "SSEAlgorithm must be AES256 or aws:kms" },
+          });
+        }
+        const kidRaw = req.body?.KMSMasterKeyID;
+        const kmsKeyId = typeof kidRaw === "string" && kidRaw.trim() !== "" ? kidRaw.trim() : undefined;
+        if (algo === "AES256" && kmsKeyId) {
+          return reply.code(400).send({
+            error: { code: "bad_request", message: "KMSMasterKeyID is only valid with aws:kms" },
           });
         }
         try {
-          await m10.putBucketEncryption(req.params.name, "AES256");
-          return { SSEAlgorithm: "AES256" };
+          await m10.putBucketEncryption(req.params.name, algo, kmsKeyId);
+          return kmsKeyId ? { SSEAlgorithm: algo, KMSMasterKeyID: kmsKeyId } : { SSEAlgorithm: algo };
         } catch (e) {
           return m10Error(e, reply, req.params.name);
         }
@@ -1521,6 +1530,108 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     },
   );
 
+  // ── M20 G2:SSE-KMS(代理 admin /v1/admin/kms/*;ADR-29 (e):无 kms: 动作族)──
+  // consoleAdmin 域(admin:ListTenants;不可用 admin:Get* —— diagnostics 有 get*)。
+  // unseal/init key 仅本通道一次性回显,审计零密钥材料(admin 侧已保证)。
+  const kmsAllow = "admin:ListTenants";
+  const kmsProxyErr = (e: unknown, reply: FastifyReply) => {
+    const msg = (e as Error).message;
+    const m = /HTTP (\d{3})/.exec(msg);
+    const status = m && ["400", "404", "409", "501"].includes(m[1]) ? Number(m[1]) : 502;
+    return reply.code(status).send({ error: { code: "kms_proxy_error", message: msg } });
+  };
+  app.get("/api/kms/status", { preHandler: requireIamAction(admin, kmsAllow) }, async (_req, reply) => {
+    try {
+      return await admin.kmsStatus();
+    } catch (e) {
+      return kmsProxyErr(e, reply);
+    }
+  });
+  app.get("/api/kms/keys", { preHandler: requireIamAction(admin, kmsAllow) }, async (_req, reply) => {
+    try {
+      return await admin.kmsKeys();
+    } catch (e) {
+      return kmsProxyErr(e, reply);
+    }
+  });
+  app.post<{ Body: { name?: string } }>(
+    "/api/kms/keys",
+    { preHandler: requireIamAction(admin, kmsAllow, ownTenant) },
+    async (req, reply) => {
+      const name = req.body?.name?.trim();
+      if (!name) {
+        return reply.code(400).send({ error: { code: "bad_request", message: "name is required" } });
+      }
+      try {
+        return await admin.kmsCreateKey({ name, operator: requestSub(req) || "admin" });
+      } catch (e) {
+        return kmsProxyErr(e, reply);
+      }
+    },
+  );
+  app.get<{ Params: { name: string } }>(
+    "/api/kms/keys/:name",
+    { preHandler: requireIamAction(admin, kmsAllow) },
+    async (req, reply) => {
+      try {
+        return await admin.kmsDescribeKey(req.params.name);
+      } catch (e) {
+        return kmsProxyErr(e, reply);
+      }
+    },
+  );
+  app.post<{ Params: { name: string } }>(
+    "/api/kms/keys/:name/rotate",
+    { preHandler: requireIamAction(admin, kmsAllow, ownTenant) },
+    async (req, reply) => {
+      try {
+        return await admin.kmsRotateKey(req.params.name, { operator: requestSub(req) || "admin" });
+      } catch (e) {
+        return kmsProxyErr(e, reply);
+      }
+    },
+  );
+  app.get("/api/kms/service/status", { preHandler: requireIamAction(admin, kmsAllow) }, async (_req, reply) => {
+    try {
+      return await admin.kmsServiceStatus();
+    } catch (e) {
+      return kmsProxyErr(e, reply);
+    }
+  });
+  app.post(
+    "/api/kms/service/deploy",
+    { preHandler: requireIamAction(admin, kmsAllow, ownTenant) },
+    async (req, reply) => {
+      try {
+        return await admin.kmsServiceDeploy({ operator: requestSub(req) || "admin" });
+      } catch (e) {
+        return kmsProxyErr(e, reply);
+      }
+    },
+  );
+  app.post(
+    "/api/kms/service/start",
+    { preHandler: requireIamAction(admin, kmsAllow, ownTenant) },
+    async (req, reply) => {
+      try {
+        return await admin.kmsServiceStart({ operator: requestSub(req) || "admin" });
+      } catch (e) {
+        return kmsProxyErr(e, reply);
+      }
+    },
+  );
+  app.post(
+    "/api/kms/service/stop",
+    { preHandler: requireIamAction(admin, kmsAllow, ownTenant) },
+    async (req, reply) => {
+      try {
+        return await admin.kmsServiceStop({ operator: requestSub(req) || "admin" });
+      } catch (e) {
+        return kmsProxyErr(e, reply);
+      }
+    },
+  );
+
   // ── 密钥管理(M18 C1:legacy 无属主密钥映射 SA 动作族;见 compat) ──
   app.get(
     "/api/keys",
@@ -1926,6 +2037,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       can_ingest: await probe("admin:CreateIngestJob"),
       // M19 J3:Batch Operations(consoleAdmin 域)
       can_batch: await probe("admin:CreateBatchJob"),
+      // M20 G2:KMS 页(consoleAdmin 域;admin:ListTenants,不走 diagnostics Get*)
+      can_kms: await probe("admin:ListTenants"),
     };
   });
 
