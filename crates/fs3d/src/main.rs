@@ -15,6 +15,7 @@ use fs3_meta::SyncMode;
 use tracing_subscriber::prelude::*;
 
 mod admin_cli;
+mod admin_ops;
 mod bench;
 mod config;
 mod doctor;
@@ -175,6 +176,12 @@ enum Cmd {
     /// 主备复制运维动作(M21 C5 起:断档/旧主重加入的显式重建;经运行中
     /// 实例的 admin API 执行,不自动触发——ADR-33 RP5.4 红线)
     Replication(repl_rebuild::ReplicationArgs),
+    /// 运行期密钥 CRUD(经 admin 通道;secret 仅 create 回显一次)
+    Keys(admin_ops::KeysArgs),
+    /// IAM 用户/组/策略/角色/租户/服务账号(经 admin 通道)
+    Iam(admin_ops::IamArgs),
+    /// 审计检索与 JSONL 导出(经 admin 通道)
+    Audit(admin_ops::AuditArgs),
     /// 启动 S3 数据面 HTTP 服务
     Serve {
         /// 监听地址(如 0.0.0.0:9000)
@@ -526,6 +533,21 @@ fn run(cli: Cli) -> fs3_core::Result<()> {
                 cfg.admin.token.as_deref(),
             )
         }
+        Cmd::Keys(args) => admin_ops::run_keys(
+            &args,
+            cfg.admin.listen.as_deref(),
+            cfg.admin.token.as_deref(),
+        ),
+        Cmd::Iam(args) => admin_ops::run_iam(
+            &args,
+            cfg.admin.listen.as_deref(),
+            cfg.admin.token.as_deref(),
+        ),
+        Cmd::Audit(args) => admin_ops::run_audit(
+            &args,
+            cfg.admin.listen.as_deref(),
+            cfg.admin.token.as_deref(),
+        ),
         Cmd::Serve {
             listen,
             workers,

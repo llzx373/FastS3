@@ -621,3 +621,145 @@ fn replication_help_lists_ops_and_status_needs_admin() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("primary"), "{stdout}");
 }
+
+#[test]
+fn keys_iam_audit_help_and_admin_required() {
+    for (cmd, needles) in [
+        (
+            "keys",
+            &["list", "create", "enable", "disable", "delete", "policy"][..],
+        ),
+        (
+            "iam",
+            &["users", "groups", "policies", "roles", "tenants", "sa"][..],
+        ),
+        ("audit", &["query", "export"][..]),
+    ] {
+        let out = run(&[cmd, "--help"]);
+        assert!(out.status.success(), "{cmd} --help failed");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        for n in needles {
+            assert!(text.contains(n), "{cmd} help missing {n}: {text}");
+        }
+    }
+
+    let out = run(&["keys", "list"]);
+    assert!(!out.status.success(), "keys list without admin must fail");
+    let err = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        err.contains("admin") && (err.contains("listen") || err.contains("通道")),
+        "must mention missing admin channel: {err}"
+    );
+}
+
+#[test]
+fn keys_list_and_audit_export_against_mock_admin() {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let n = s.read(&mut buf).unwrap_or(0);
+        let req = String::from_utf8_lossy(&buf[..n]);
+        let (status, ctype, body) = if req.contains("/v1/admin/audit/export") {
+            (
+                200,
+                "application/x-ndjson",
+                "{\"op\":\"PutObject\"}\n{\"op\":\"GetObject\"}\n",
+            )
+        } else {
+            (
+                200,
+                "application/json",
+                r#"{"ok":true,"data":{"keys":[{"access_key":"AK1"}]}}"#,
+            )
+        };
+        let extra = if req.contains("/v1/admin/audit/export") {
+            "x-fasts3-truncated: true\r\nx-fasts3-matched: 9\r\nx-fasts3-limit: 2\r\nx-fasts3-returned: 2\r\n"
+        } else {
+            ""
+        };
+        let _ = s.write_all(
+            format!(
+                "HTTP/1.1 {status} OK\r\ncontent-type: {ctype}\r\n{extra}\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+    });
+
+    let out = run(&[
+        "keys",
+        "list",
+        "--admin-listen",
+        &addr,
+        "--admin-token",
+        "t",
+    ]);
+    assert!(
+        out.status.success(),
+        "keys list mock failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("AK1"), "{stdout}");
+}
+
+#[test]
+fn audit_export_writes_jsonl_and_warns_truncated() {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        let mut buf = [0u8; 8192];
+        let n = s.read(&mut buf).unwrap_or(0);
+        let req = String::from_utf8_lossy(&buf[..n]);
+        assert!(req.contains("/v1/admin/audit/export"), "{req}");
+        assert!(req.contains("bucket=demo"), "{req}");
+        let body = "{\"op\":\"PutObject\"}\n";
+        let _ = s.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\n\
+                 x-fasts3-truncated: true\r\nx-fasts3-matched: 99\r\n\
+                 x-fasts3-limit: 1\r\nx-fasts3-returned: 1\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("a.jsonl");
+    let out = run(&[
+        "audit",
+        "export",
+        "--bucket",
+        "demo",
+        "--output",
+        dest.to_str().unwrap(),
+        "--admin-listen",
+        &addr,
+        "--admin-token",
+        "t",
+    ]);
+    assert!(
+        out.status.success(),
+        "audit export mock failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let file = std::fs::read_to_string(&dest).unwrap();
+    assert!(file.contains("PutObject"), "{file}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("truncated"), "{err}");
+}

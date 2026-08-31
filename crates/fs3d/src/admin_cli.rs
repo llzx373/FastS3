@@ -28,30 +28,43 @@ impl AdminConnArgs {
         cfg_listen: Option<&'a str>,
         cfg_token: Option<&'a str>,
     ) -> fs3_core::Result<(&'a str, &'a str)> {
-        let listen = self
-            .admin_listen
-            .as_deref()
-            .or(cfg_listen)
-            .ok_or_else(|| {
-                fs3_core::Error::InvalidArgument(
-                    "admin 通道未配置:--admin-listen 或配置 admin.listen 必填\
+        let listen = self.admin_listen.as_deref().or(cfg_listen).ok_or_else(|| {
+            fs3_core::Error::InvalidArgument(
+                "admin 通道未配置:--admin-listen 或配置 admin.listen 必填\
                      (经运行中实例的 admin API 执行)"
-                        .into(),
-                )
-            })?;
+                    .into(),
+            )
+        })?;
         let token = self.admin_token.as_deref().or(cfg_token).unwrap_or("");
         Ok((listen, token))
     }
 }
 
-/// 阻塞请求;GET 时 `body` 为 None(不发送 JSON 体)。
-pub fn request(
+/// 原始 admin 响应(审计 JSONL 等非 JSON 体用)。
+#[derive(Debug)]
+pub struct AdminResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl AdminResponse {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// 阻塞请求;GET 时 `body` 为 None(不发送 JSON 体)。返回原始字节,不强制 JSON。
+pub fn request_raw(
     listen: &str,
     token: &str,
     method: &str,
     path: &str,
     body: Option<&Value>,
-) -> Result<(u16, Value), String> {
+) -> Result<AdminResponse, String> {
     use std::io::{Read, Write};
     let payload = match body {
         Some(v) => serde_json::to_vec(v).map_err(|e| e.to_string())?,
@@ -103,23 +116,43 @@ pub fn request(
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse().ok())
         .ok_or("bad admin response status line")?;
+    let mut headers = Vec::new();
     let mut content_length = 0usize;
     for l in head.lines().skip(1) {
         if let Some((k, v)) = l.split_once(':') {
-            if k.eq_ignore_ascii_case("content-length") {
-                content_length = v.trim().parse().unwrap_or(0);
+            let key = k.trim().to_string();
+            let val = v.trim().to_string();
+            if key.eq_ignore_ascii_case("content-length") {
+                content_length = val.parse().unwrap_or(0);
             }
+            headers.push((key, val));
         }
     }
     let body_bytes = &raw[head_end + 4..];
-    let body_bytes = &body_bytes[..content_length.min(body_bytes.len())];
-    let json = if body_bytes.is_empty() {
+    let body_bytes = body_bytes[..content_length.min(body_bytes.len())].to_vec();
+    Ok(AdminResponse {
+        status,
+        headers,
+        body: body_bytes,
+    })
+}
+
+/// 阻塞请求;GET 时 `body` 为 None(不发送 JSON 体)。
+pub fn request(
+    listen: &str,
+    token: &str,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> Result<(u16, Value), String> {
+    let r = request_raw(listen, token, method, path, body)?;
+    let json = if r.body.is_empty() {
         Value::Null
     } else {
-        serde_json::from_slice(body_bytes)
-            .map_err(|e| format!("bad admin response json (HTTP {status}): {e}"))?
+        serde_json::from_slice(&r.body)
+            .map_err(|e| format!("bad admin response json (HTTP {}): {e}", r.status))?
     };
-    Ok((status, json))
+    Ok((r.status, json))
 }
 
 /// 2xx 则返回 JSON;否则带 HTTP 状态与响应体报错(给 CLI 打印)。
@@ -130,8 +163,8 @@ pub fn request_ok(
     path: &str,
     body: Option<&Value>,
 ) -> fs3_core::Result<Value> {
-    let (status, resp) = request(listen, token, method, path, body)
-        .map_err(fs3_core::Error::InvalidArgument)?;
+    let (status, resp) =
+        request(listen, token, method, path, body).map_err(fs3_core::Error::InvalidArgument)?;
     if !(200..300).contains(&status) {
         return Err(fs3_core::Error::InvalidArgument(format!(
             "admin {method} {path} rejected (HTTP {status}): {resp}"
@@ -192,5 +225,14 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("501"), "{msg}");
         assert!(msg.contains("not_implemented"), "{msg}");
+    }
+
+    #[test]
+    fn request_raw_keeps_ndjson() {
+        let body = "{\"a\":1}\n{\"b\":2}\n";
+        let addr = serve_one(200, body);
+        let r = request_raw(&addr, "", "GET", "/v1/admin/audit/export", None).unwrap();
+        assert_eq!(r.status, 200);
+        assert_eq!(r.body, body.as_bytes());
     }
 }

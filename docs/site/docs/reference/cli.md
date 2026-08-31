@@ -171,6 +171,30 @@ fasts3d replication rebuild --as-standby --from https://host:9445 [--slot NAME]
 旧主重加入的唯一入口(ADR-33 RP5.4,不自动触发);`promote --dry-run` 只打印
 丢弃清单。
 
+## keys / iam / audit —— 运行期密钥、IAM、审计(经 admin API)
+
+与 Web 控制台同通道;CLI 不直接开库。`--admin-listen` / `--admin-token` 缺省取配置。
+
+```bash
+fasts3d keys list
+fasts3d keys create --access-key AKID [--note "..."]   # secret 只打印一次
+fasts3d keys enable|disable|delete <access-key>
+fasts3d keys policy <access-key> --document '{...}' | --file p.json | --clear
+
+fasts3d iam users list [--tenant default]
+fasts3d iam users create --name alice [--tenant default] [--password ...]
+fasts3d iam users get|delete --tenant default --name alice
+fasts3d iam users update --tenant default --name alice --enable|--disable [--policies a,b]
+fasts3d iam groups|policies|roles list|create|get|update|delete ...
+fasts3d iam tenants list|create|get|update|delete ...
+fasts3d iam sa list [--tenant] [--owner alice]
+fasts3d iam sa create --owner-user alice [--tenant default] [--name ci]
+fasts3d iam sa get|delete <access-key>
+
+fasts3d audit query [--limit 100] [--since UNIX] [--until UNIX] [--op] [--bucket] [--key] [--who] [--status] [--bypass]
+fasts3d audit export [--output audit.jsonl]   # 缺省 stdout;截断时 stderr 告警
+```
+
 ## 其它
 
 ```bash
