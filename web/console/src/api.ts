@@ -554,8 +554,13 @@ export function clearToken(): void {
   localStorage.removeItem(TOKEN_KEY);
 }
 
-async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
-  const headers: Record<string, string> = {};
+async function request<T>(
+  method: string,
+  path: string,
+  body?: unknown,
+  extraHeaders?: Record<string, string>
+): Promise<T> {
+  const headers: Record<string, string> = { ...extraHeaders };
   const token = getToken();
   if (token) headers["Authorization"] = `Bearer ${token}`;
   let payload: string | undefined;
@@ -629,16 +634,24 @@ export const api = {
         sseCustomerKey: extra?.sseCustomerKey,
       }
     ),
-  multipartInit: (bucket: string, key: string, storageClass?: string) =>
+  multipartInit: (bucket: string, key: string, storageClass?: string, sseCustomerKey?: string) =>
     request<{ uploadId: string }>("POST", `/api/buckets/${encodeURIComponent(bucket)}/multipart/init`, {
       key,
       storageClass,
+      sseCustomerKey,
     }),
-  multipartComplete: (bucket: string, key: string, uploadId: string, parts: { etag: string; partNumber: number }[]) =>
+  multipartComplete: (
+    bucket: string,
+    key: string,
+    uploadId: string,
+    parts: { etag: string; partNumber: number }[],
+    sseCustomerKey?: string
+  ) =>
     request<{ etag: string }>("POST", `/api/buckets/${encodeURIComponent(bucket)}/multipart/complete`, {
       key,
       uploadId,
       parts,
+      sseCustomerKey,
     }),
   multipartAbort: (bucket: string, key: string, uploadId: string) =>
     request<{ aborted: boolean }>("POST", `/api/buckets/${encodeURIComponent(bucket)}/multipart/abort`, {
@@ -1090,10 +1103,12 @@ export const api = {
       `/api/buckets/${encodeURIComponent(bucket)}/inventory?id=${encodeURIComponent(id)}`
     ),
 
-  objectHead: (bucket: string, key: string) =>
+  objectHead: (bucket: string, key: string, sseCustomerKey?: string) =>
     request<ObjectHead>(
       "GET",
-      `/api/buckets/${encodeURIComponent(bucket)}/object-head?key=${encodeURIComponent(key)}`
+      `/api/buckets/${encodeURIComponent(bucket)}/object-head?key=${encodeURIComponent(key)}`,
+      undefined,
+      sseCustomerKey ? { "x-fasts3-sse-c-key": sseCustomerKey } : undefined
     ),
   objectAttributes: (bucket: string, key: string) =>
     request<{ xml: string }>(

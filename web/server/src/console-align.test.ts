@@ -290,6 +290,54 @@ test("presign 接受 storageClass 与 32 字节 SSE-C 密钥", async () => {
   assert.equal(body.headers["x-amz-server-side-encryption-customer-algorithm"], "AES256");
   assert.equal(body.headers["x-amz-server-side-encryption-customer-key"], key);
   assert.ok(body.headers["x-amz-server-side-encryption-customer-key-md5"]);
+
+  const get = await auth(app, "POST", "/api/buckets/b1/presign", {
+    key: "obj",
+    method: "GET",
+    sseCustomerKey: key,
+  });
+  assert.equal(get.statusCode, 200, get.body);
+  const gh = (get.json() as { headers: Record<string, string> }).headers;
+  assert.equal(gh["x-amz-server-side-encryption-customer-key"], key);
+});
+
+test("object-head 转发 SSE-C 客户密钥", async () => {
+  const seen: string[] = [];
+  const app = makeApp({
+    s3: {
+      headObject: async (_b: string, k: string, sse?: string) => {
+        seen.push(`${k}:${sse ?? ""}`);
+        return {
+          status: 200,
+          contentType: "text/plain",
+          contentLength: 3,
+          etag: "abc",
+          lastModified: "",
+          storageClass: "STANDARD",
+          restore: "",
+          sse: "",
+          versionId: "",
+          metadata: {},
+          checksum: {},
+        };
+      },
+    },
+    s3m10: {},
+  });
+  const key = Buffer.alloc(32, 9).toString("base64");
+  const login = await app.inject({
+    method: "POST",
+    url: "/api/login",
+    payload: { username: "admin", password: "admin123" },
+  });
+  const token = (login.json() as { token: string }).token;
+  const r = await app.inject({
+    method: "GET",
+    url: "/api/buckets/b1/object-head?key=secret.txt",
+    headers: { authorization: `Bearer ${token}`, "x-fasts3-sse-c-key": key },
+  });
+  assert.equal(r.statusCode, 200, r.body);
+  assert.equal(seen[0], `secret.txt:${key}`);
 });
 
 test("通知 XML 往返(TopicConfiguration = webhook URL)", () => {

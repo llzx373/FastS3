@@ -92,6 +92,19 @@ function signRequest(cfg: S3ClientCfg, method: string, path: string, body: Buffe
   return { method, path, headers, body };
 }
 
+/** SSE-C 客户密钥 → 三个 x-amz-server-side-encryption-customer-* 头;非法长度报错。 */
+export function sseCustomerHeaders(b64: string): Record<string, string> {
+  const buf = Buffer.from(b64, "base64");
+  if (buf.length !== 32) {
+    throw new Error("sseCustomerKey must be 32-byte base64");
+  }
+  return {
+    "x-amz-server-side-encryption-customer-algorithm": "AES256",
+    "x-amz-server-side-encryption-customer-key": b64,
+    "x-amz-server-side-encryption-customer-key-md5": createHash("md5").update(buf).digest("base64"),
+  };
+}
+
 function doRequest(
   cfg: S3ClientCfg,
   signed: SignedRequest
@@ -229,7 +242,8 @@ export class S3Client {
     bucket: string,
     key: string,
     uploadId: string,
-    parts: { etag: string; partNumber: number }[]
+    parts: { etag: string; partNumber: number }[],
+    extraHeaders: Record<string, string> = {}
   ): Promise<string> {
     const xml =
       "<CompleteMultipartUpload>" +
@@ -242,13 +256,10 @@ export class S3Client {
         .join("") +
       "</CompleteMultipartUpload>";
     const path = `/${bucket}/${this.encodeKey(key)}?uploadId=${encodeURIComponent(uploadId)}`;
-    const signed = signRequest(
-      this.cfg,
-      "POST",
-      path,
-      Buffer.from(xml),
-      { "content-type": "application/xml" }
-    );
+    const signed = signRequest(this.cfg, "POST", path, Buffer.from(xml), {
+      "content-type": "application/xml",
+      ...extraHeaders,
+    });
     const res = await doRequest(this.cfg, signed);
     if (res.status !== 200) {
       throw new Error(`CompleteMultipartUpload: HTTP ${res.status} ${res.body.toString().slice(0, 300)}`);
@@ -299,10 +310,11 @@ export class S3Client {
     await this.callSigned("POST", `/${bucket}?delete`, Buffer.from(xml), { "content-type": "application/xml" });
   }
 
-  /** HEAD Object:元数据/存储类/restore 状态/checksum。 */
-  async headObject(bucket: string, key: string): Promise<ObjectHead> {
+  /** HEAD Object:元数据/存储类/restore 状态/checksum。SSE-C 对象须带客户密钥。 */
+  async headObject(bucket: string, key: string, sseCustomerKey?: string): Promise<ObjectHead> {
     const path = `/${bucket}/${this.encodeKey(key)}`;
-    const signed = signRequest(this.cfg, "HEAD", path, Buffer.alloc(0), {});
+    const extra = sseCustomerKey ? sseCustomerHeaders(sseCustomerKey) : {};
+    const signed = signRequest(this.cfg, "HEAD", path, Buffer.alloc(0), extra);
     const res = await doRequest(this.cfg, signed);
     if (res.status !== 200 && res.status !== 403) {
       throw new Error(`HeadObject ${bucket}/${key}: HTTP ${res.status}`);

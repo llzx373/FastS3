@@ -62,8 +62,7 @@ import {
   type CallerIdentity,
 } from "./iam-authz.js";
 import { AdminWsClient } from "./admin-ws.js";
-import { S3Client, S3M10Client, type BucketCorsRule, type LifecycleRule, type ObjectLockConfig, type S3Tag, type NotificationRule, type InventoryRule, type PublicAccessBlock } from "./s3-client.js";
-import { createHash } from "node:crypto";
+import { S3Client, S3M10Client, sseCustomerHeaders, type BucketCorsRule, type LifecycleRule, type ObjectLockConfig, type S3Tag, type NotificationRule, type InventoryRule, type PublicAccessBlock } from "./s3-client.js";
 import { presignUrl } from "./presign.js";
 import { buildDashboard, buildSnapshot, dashboardFromSnapshot, lastDashboardFrame } from "./dashboard.js";
 import { MetricsHistory } from "./metrics-history.js";
@@ -540,13 +539,11 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       if (contentType) headers["content-type"] = contentType;
       if (storageClass) headers["x-amz-storage-class"] = storageClass;
       if (sseCustomerKey) {
-        const buf = Buffer.from(sseCustomerKey, "base64");
-        if (buf.length !== 32) {
-          return reply.code(400).send({ error: { code: "bad_request", message: "sseCustomerKey must be 32-byte base64" } });
+        try {
+          Object.assign(headers, sseCustomerHeaders(sseCustomerKey));
+        } catch (e) {
+          return reply.code(400).send({ error: { code: "bad_request", message: (e as Error).message } });
         }
-        headers["x-amz-server-side-encryption-customer-algorithm"] = "AES256";
-        headers["x-amz-server-side-encryption-customer-key"] = sseCustomerKey;
-        headers["x-amz-server-side-encryption-customer-key-md5"] = createHash("md5").update(buf).digest("base64");
       }
       const extraQuery: Record<string, string> = {};
       if (partNumber !== undefined) extraQuery["partNumber"] = String(partNumber);
@@ -568,7 +565,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // ── multipart 编排(I3:大文件分片直传) ──
   app.post<{
     Params: { name: string; action: string };
-    Body: { key: string; uploadId?: string; partSize?: number; parts?: { etag: string; partNumber: number }[]; storageClass?: string };
+    Body: { key: string; uploadId?: string; partSize?: number; parts?: { etag: string; partNumber: number }[]; storageClass?: string; sseCustomerKey?: string };
   }>("/api/buckets/:name/multipart/:action", async (req, reply) => {
     const { name, action } = req.params;
     const body = req.body ?? {};
@@ -577,6 +574,13 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         if (!body.key) return reply.code(400).send({ error: { code: "bad_request", message: "missing key" } });
         const extra: Record<string, string> = {};
         if (body.storageClass) extra["x-amz-storage-class"] = body.storageClass;
+        if (body.sseCustomerKey) {
+          try {
+            Object.assign(extra, sseCustomerHeaders(body.sseCustomerKey));
+          } catch (e) {
+            return reply.code(400).send({ error: { code: "bad_request", message: (e as Error).message } });
+          }
+        }
         const uploadId = await s3.createMultipart(name, body.key, extra);
         return { uploadId };
       }
@@ -586,7 +590,15 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
             error: { code: "bad_request", message: "need key, uploadId, parts" },
           });
         }
-        const etag = await s3.completeMultipart(name, body.key, body.uploadId, body.parts);
+        const extra: Record<string, string> = {};
+        if (body.sseCustomerKey) {
+          try {
+            Object.assign(extra, sseCustomerHeaders(body.sseCustomerKey));
+          } catch (e) {
+            return reply.code(400).send({ error: { code: "bad_request", message: (e as Error).message } });
+          }
+        }
+        const etag = await s3.completeMultipart(name, body.key, body.uploadId, body.parts, extra);
         return { etag };
       }
       if (action === "abort") {
@@ -1436,8 +1448,9 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       async (req, reply) => {
         const key = req.query.key;
         if (!key) return reply.code(400).send({ error: { code: "bad_request", message: "missing key" } });
+        const sse = (req.headers["x-fasts3-sse-c-key"] as string | undefined)?.trim();
         try {
-          return await s3.headObject(req.params.name, key);
+          return await s3.headObject(req.params.name, key, sse || undefined);
         } catch (e) {
           return m10Error(e, reply, req.params.name);
         }

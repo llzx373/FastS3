@@ -6,6 +6,37 @@ import { decidePreview, looksLikeSseCError, type PreviewDecision } from "../lib/
 const PART_SIZE = 8 * 1024 * 1024; // 8MiB/片(>5MiB 下限)
 const STORAGE_CLASSES = ["STANDARD", "GLACIER_IR", "GLACIER", "DEEP_ARCHIVE"] as const;
 
+function sseExtra(sseKey: string): { sseCustomerKey?: string } {
+  const k = sseKey.trim();
+  return k ? { sseCustomerKey: k } : {};
+}
+
+/** 预签名 GET 后用返回头 fetch(SSE-C 密钥在 SignedHeaders 里,不能只开 <a href>)。 */
+async function fetchPresignedGet(
+  bucket: string,
+  key: string,
+  sseKey: string,
+  expires = 3600
+): Promise<Response> {
+  const extra = sseExtra(sseKey);
+  const u = await api.presign(bucket, key, "GET", expires, undefined, undefined, undefined, extra);
+  const res = await fetch(u.url, { headers: u.headers });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res;
+}
+
+async function savePresignedBlob(bucket: string, key: string, sseKey: string): Promise<void> {
+  const res = await fetchPresignedGet(bucket, key, sseKey);
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = key.split("/").pop() ?? key;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(a.href);
+}
+
 interface UploadTask {
   name: string;
   progress: number;
@@ -89,29 +120,28 @@ export default function Objects() {
       const key = prefix + file.name;
       const extra = {
         storageClass: uploadClass !== "STANDARD" ? uploadClass : undefined,
-        sseCustomerKey: sseKey.trim() || undefined,
+        ...sseExtra(sseKey),
       };
       if (file.size <= PART_SIZE) {
         const u = await api.presign(bucket, key, "PUT", 3600, file.type || "application/octet-stream", undefined, undefined, extra);
         await fetch(u.url, { method: "PUT", body: file, headers: u.headers });
         update(100, { status: "done" });
       } else {
-        // multipart:init → 每片预签名(带 uploadId/partNumber,命中 UploadPart)直传 → complete
-        const { uploadId } = await api.multipartInit(bucket, key, extra.storageClass);
+        const { uploadId } = await api.multipartInit(bucket, key, extra.storageClass, extra.sseCustomerKey);
         const partCount = Math.ceil(file.size / PART_SIZE);
         const parts: { etag: string; partNumber: number }[] = [];
         for (let i = 1; i <= partCount; i++) {
           const start = (i - 1) * PART_SIZE;
           const end = Math.min(start + PART_SIZE, file.size);
           const blob = file.slice(start, end);
-          const u = await api.presign(bucket, key, "PUT", 3600, "application/octet-stream", uploadId, i);
+          const u = await api.presign(bucket, key, "PUT", 3600, "application/octet-stream", uploadId, i, extra);
           const r = await fetch(u.url, { method: "PUT", body: blob, headers: u.headers });
           if (!r.ok) throw new Error(`part ${i} failed: HTTP ${r.status}`);
           const etag = (r.headers.get("ETag") ?? "").replace(/^"|"$/g, "");
           parts.push({ etag, partNumber: i });
           update(Math.round((i / partCount) * 100));
         }
-        await api.multipartComplete(bucket, key, uploadId, parts);
+        await api.multipartComplete(bucket, key, uploadId, parts, extra.sseCustomerKey);
         update(100, { status: "done" });
       }
       await load();
@@ -126,14 +156,7 @@ export default function Objects() {
 
   const download = async (key: string) => {
     try {
-      const u = await api.presign(bucket, key, "GET", 3600);
-      // 用 <a> 触发浏览器下载(预签名 URL 直连数据面,流量不过 Node)
-      const a = document.createElement("a");
-      a.href = u.url;
-      a.download = key.split("/").pop() ?? key;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
+      await savePresignedBlob(bucket, key, sseKey);
     } catch (e) {
       setError((e as Error).message);
     }
@@ -509,11 +532,14 @@ export default function Objects() {
           size={metaObj.size}
           etag={metaObj.etag}
           lastModified={metaObj.lastModified}
+          sseKey={sseKey}
           onClose={() => setMetaObj(null)}
         />
       )}
 
-      {previewKey && <PreviewModal bucket={bucket} objKey={previewKey} onClose={() => setPreviewKey(null)} />}
+      {previewKey && (
+        <PreviewModal bucket={bucket} objKey={previewKey} sseKey={sseKey} onClose={() => setPreviewKey(null)} />
+      )}
 
       {versionKey && <VersionsModal bucket={bucket} objKey={versionKey} onClose={() => setVersionKey(null)} />}
     </div>
@@ -526,6 +552,7 @@ function ObjectMeta({
   size,
   etag,
   lastModified,
+  sseKey,
   onClose,
 }: {
   bucket: string;
@@ -533,6 +560,7 @@ function ObjectMeta({
   size?: number;
   etag?: string;
   lastModified?: string;
+  sseKey: string;
   onClose: () => void;
 }) {
   const [presign, setPresign] = useState<string | null>(null);
@@ -542,13 +570,17 @@ function ObjectMeta({
 
   useEffect(() => {
     api
-      .objectHead(bucket, key)
+      .objectHead(bucket, key, sseKey.trim() || undefined)
       .then(setHead)
       .catch((e) => setError((e as Error).message));
-  }, [bucket, key]);
+  }, [bucket, key, sseKey]);
 
   const gen = async () => {
     try {
+      if (sseKey.trim()) {
+        await savePresignedBlob(bucket, key, sseKey);
+        return;
+      }
       const u = await api.presign(bucket, key, "GET", 3600);
       setPresign(u.url);
     } catch (e) {
@@ -617,8 +649,10 @@ function ObjectMeta({
             )}
           </>
         )}
-        <button className="ghost" onClick={gen}>
-          {t("生成预签名下载链接(1 小时)", "Generate presigned download link (1 hour)")}
+        <button className="ghost" onClick={() => void gen()}>
+          {sseKey.trim()
+            ? t("用工具栏密钥下载(SSE-C)", "Download with toolbar key (SSE-C)")
+            : t("生成预签名下载链接(1 小时)", "Generate presigned download link (1 hour)")}
         </button>
         <button
           className="ghost"
@@ -971,11 +1005,21 @@ function LockPanel({ bucket, objKey }: { bucket: string; objKey: string }) {
 }
 
 /**
- * M19 U1:对象预览弹窗(图片/文本/PDF)。
- * 元数据经 HEAD 判定;正文经预签名 URL 直连数据面(流量不过 Node)。
- * SSE-C 对象(无密钥 HEAD 即 400)不预览,仅提示下载;超大小阈值只给下载。
+ * 对象预览弹窗(图片/文本/PDF)。
+ * 元数据经 HEAD 判定;正文经预签名 URL fetch(带 SignedHeaders,SSE-C 才能过)。
+ * 无密钥的 SSE-C 对象不预览,提示在工具栏填密钥;有密钥则与普通对象同路径预览。
  */
-function PreviewModal({ bucket, objKey, onClose }: { bucket: string; objKey: string; onClose: () => void }) {
+function PreviewModal({
+  bucket,
+  objKey,
+  sseKey,
+  onClose,
+}: {
+  bucket: string;
+  objKey: string;
+  sseKey: string;
+  onClose: () => void;
+}) {
   const [head, setHead] = useState<ObjectHead | null>(null);
   const [headErr, setHeadErr] = useState<string | null>(null);
   const [text, setText] = useState<string | null>(null);
@@ -983,25 +1027,26 @@ function PreviewModal({ bucket, objKey, onClose }: { bucket: string; objKey: str
 
   useEffect(() => {
     api
-      .objectHead(bucket, objKey)
-      .then(setHead)
+      .objectHead(bucket, objKey, sseKey.trim() || undefined)
+      .then((h) => {
+        setHead(h);
+        setHeadErr(null);
+      })
       .catch((e) => setHeadErr((e as Error).message));
-  }, [bucket, objKey]);
+  }, [bucket, objKey, sseKey]);
 
+  const isSseC = !!headErr && looksLikeSseCError(headErr) && !sseKey.trim();
   const decision: PreviewDecision | null = head
     ? decidePreview({ contentType: head.contentType, size: head.contentLength, key: objKey })
-    : null;
+    : isSseC
+      ? { kind: "sse-c" }
+      : null;
 
   useEffect(() => {
     if (decision?.kind !== "text") return;
     let cancelled = false;
-    api
-      .presign(bucket, objKey, "GET", 600)
-      .then((u) => fetch(u.url))
-      .then((r) => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        return r.text();
-      })
+    fetchPresignedGet(bucket, objKey, sseKey, 600)
+      .then((r) => r.text())
       .then((t) => {
         if (!cancelled) setText(t);
       })
@@ -1011,49 +1056,58 @@ function PreviewModal({ bucket, objKey, onClose }: { bucket: string; objKey: str
     return () => {
       cancelled = true;
     };
-  }, [decision?.kind, bucket, objKey]);
+  }, [decision?.kind, bucket, objKey, sseKey]);
 
   const downloadNow = async () => {
     try {
-      const u = await api.presign(bucket, objKey, "GET", 600);
-      const a = document.createElement("a");
-      a.href = u.url;
-      a.download = objKey.split("/").pop() ?? objKey;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
+      await savePresignedBlob(bucket, objKey, sseKey);
     } catch (e) {
       setError((e as Error).message);
     }
   };
 
   let body: React.ReactNode;
-  if (headErr) {
+  if (headErr && !isSseC) {
     body = looksLikeSseCError(headErr) ? (
       <div className="muted">
-        {t("该对象为 SSE-C 加密,控制台不以预览通道读取明文。请使用「下载」并在上方工具栏提供 SSE-C 密钥。", "This object is SSE-C encrypted; the console does not read plaintext through the preview channel. Use Download and provide the SSE-C key in the toolbar.")}
+        {t(
+          "SSE-C 密钥不正确或未填写。请在工具栏填入 32 字节 base64 密钥后再预览/下载。",
+          "SSE-C key is missing or incorrect. Enter the 32-byte base64 key in the toolbar, then preview or download."
+        )}
       </div>
     ) : (
       <div className="alert">{headErr}</div>
     );
+  } else if (decision?.kind === "sse-c") {
+    body = (
+      <div className="muted">
+        {t(
+          "该对象为 SSE-C 加密。在上方工具栏填入客户密钥后即可预览或下载。",
+          "This object is SSE-C encrypted. Enter the customer key in the toolbar to preview or download."
+        )}
+      </div>
+    );
   } else if (!head || !decision) {
     body = <div className="muted">{t("加载中…", "Loading…")}</div>;
   } else if (decision.kind === "image") {
-    body = (
-      <PreviewImage bucket={bucket} objKey={objKey} onError={setError} />
-    );
+    body = <PreviewImage bucket={bucket} objKey={objKey} sseKey={sseKey} onError={setError} />;
   } else if (decision.kind === "pdf") {
-    body = <PreviewFrame bucket={bucket} objKey={objKey} onError={setError} />;
+    body = <PreviewFrame bucket={bucket} objKey={objKey} sseKey={sseKey} onError={setError} />;
   } else if (decision.kind === "text") {
-    body = text === null ? <div className="muted">{t("加载中…", "Loading…")}</div> : <pre className="mono" style={{ maxHeight: 420, overflow: "auto", whiteSpace: "pre-wrap" }}>{text}</pre>;
-  } else if (decision.kind === "sse-c") {
-    body = <div className="muted">{t("该对象为 SSE-C 加密,控制台不以预览通道读取明文。请使用「下载」并自备密钥。", "This object is SSE-C encrypted; the console does not read plaintext through the preview channel. Use Download with your own key.")}</div>;
+    body =
+      text === null ? (
+        <div className="muted">{t("加载中…", "Loading…")}</div>
+      ) : (
+        <pre className="mono" style={{ maxHeight: 420, overflow: "auto", whiteSpace: "pre-wrap" }}>
+          {text}
+        </pre>
+      );
   } else {
     body = (
       <div className="muted">
         {decision.kind === "download" && decision.reason === "over-limit"
           ? tf("对象超过预览大小上限({size}),请下载后查看。", "Object exceeds the preview size limit ({size}); please download it.", { size: fmtBytes(head.contentLength) })
-          : "该类型不支持预览,请下载后查看。"}
+          : t("该类型不支持预览,请下载后查看。", "This type cannot be previewed; please download it.")}
         <div style={{ marginTop: 8 }}>
           <button className="ghost small" onClick={() => void downloadNow()}>
             {t("下载", "Download")}
@@ -1075,6 +1129,9 @@ function PreviewModal({ bucket, objKey, onClose }: { bucket: string; objKey: str
         {error && <div className="alert">{error}</div>}
         {body}
         <div className="actions">
+          <button className="ghost" onClick={() => void downloadNow()}>
+            {t("下载", "Download")}
+          </button>
           <button className="ghost" onClick={onClose}>
             {t("关闭", "Close")}
           </button>
@@ -1084,35 +1141,62 @@ function PreviewModal({ bucket, objKey, onClose }: { bucket: string; objKey: str
   );
 }
 
-/** 图片预览:预签名 URL 交 <img>,加载失败转提示。 */
-function PreviewImage({ bucket, objKey, onError }: { bucket: string; objKey: string; onError: (m: string) => void }) {
+/** 图片预览:fetch 带 SignedHeaders 后用 blob URL(SSE-C 不能直接 <img src>)。 */
+function PreviewImage({
+  bucket,
+  objKey,
+  sseKey,
+  onError,
+}: {
+  bucket: string;
+  objKey: string;
+  sseKey: string;
+  onError: (m: string) => void;
+}) {
   const [src, setSrc] = useState<string | null>(null);
   useEffect(() => {
-    api
-      .presign(bucket, objKey, "GET", 600)
-      .then((u) => setSrc(u.url))
+    let url: string | null = null;
+    fetchPresignedGet(bucket, objKey, sseKey, 600)
+      .then((r) => r.blob())
+      .then((b) => {
+        url = URL.createObjectURL(b);
+        setSrc(url);
+      })
       .catch((e) => onError((e as Error).message));
-  }, [bucket, objKey, onError]);
+    return () => {
+      if (url) URL.revokeObjectURL(url);
+    };
+  }, [bucket, objKey, sseKey, onError]);
   if (!src) return <div className="muted">{t("加载中…", "Loading…")}</div>;
-  return (
-    <img
-      src={src}
-      alt={objKey}
-      style={{ maxWidth: "100%", maxHeight: 480 }}
-      onError={() => onError(t("图片加载失败(对象可能不可读)", "Image failed to load (object may be unreadable)"))}
-    />
-  );
+  return <img src={src} alt={objKey} style={{ maxWidth: "100%", maxHeight: 480 }} />;
 }
 
-/** PDF 预览:浏览器原生查看器(iframe 直连数据面)。 */
-function PreviewFrame({ bucket, objKey, onError }: { bucket: string; objKey: string; onError: (m: string) => void }) {
+/** PDF 预览:blob URL 交给 iframe(同样带头 fetch)。 */
+function PreviewFrame({
+  bucket,
+  objKey,
+  sseKey,
+  onError,
+}: {
+  bucket: string;
+  objKey: string;
+  sseKey: string;
+  onError: (m: string) => void;
+}) {
   const [src, setSrc] = useState<string | null>(null);
   useEffect(() => {
-    api
-      .presign(bucket, objKey, "GET", 600)
-      .then((u) => setSrc(u.url))
+    let url: string | null = null;
+    fetchPresignedGet(bucket, objKey, sseKey, 600)
+      .then((r) => r.blob())
+      .then((b) => {
+        url = URL.createObjectURL(b);
+        setSrc(url);
+      })
       .catch((e) => onError((e as Error).message));
-  }, [bucket, objKey, onError]);
+    return () => {
+      if (url) URL.revokeObjectURL(url);
+    };
+  }, [bucket, objKey, sseKey, onError]);
   if (!src) return <div className="muted">{t("加载中…", "Loading…")}</div>;
   return <iframe src={src} title={objKey} style={{ width: "100%", height: 480, border: "1px solid var(--border)" }} />;
 }
