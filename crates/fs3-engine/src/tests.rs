@@ -7535,21 +7535,30 @@ fn rebalance_moves_high_water_to_low_water_and_converges() -> Result<()> {
     e.device_add(&img3, false).unwrap();
     assert!(usage(&e, 2) < 0.05, "new device is the low-water target");
 
-    // 再平衡收敛(前台逐轮;预算节流下每轮 ≤ 突发额度)
-    let mut rounds = 0;
-    loop {
+    // 再平衡收敛(前台逐轮;预算节流下每轮 ≤ 突发额度)。
+    // 竞态修复(M21 全量门禁实测):device_add 重启后台 rebalancer 后,
+    // 后台批次与前台 rebalance_once 抢同一把批次互斥锁(try_lock 撞锁
+    // 返回零报告,见 compact_batch「已有批次在跑」)——单轮零候选 ≠
+    // 收敛;以水位差 <10%(rebalance_plan 自身收敛口径)作退出条件,
+    // 零报告轮让出片刻等后台批次放锁。
+    let mut converged = false;
+    for _ in 0..200 {
         let r = e.rebalance_once().unwrap();
-        rounds += 1;
-        if rounds > 200 {
-            panic!("rebalance did not converge after 200 rounds: {r:?}");
-        }
-        if r.candidates == 0 && r.copied_bytes == 0 {
-            break;
-        }
         if r.errors > 0 {
             panic!("rebalance errors: {r:?}");
         }
+        let usages = [usage(&e, 0), usage(&e, 1), usage(&e, 2)];
+        let max = usages.iter().cloned().fold(0.0f64, f64::max);
+        let min = usages.iter().cloned().fold(1.0f64, f64::min);
+        if max - min < 0.10 {
+            converged = true;
+            break;
+        }
+        if r.candidates == 0 && r.copied_bytes == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
+    assert!(converged, "rebalance did not converge after 200 rounds");
     // 收敛:全部设备水位 < 高水位阈值(0.85),两两差 <10%
     let usages = [usage(&e, 0), usage(&e, 1), usage(&e, 2)];
     assert!(
