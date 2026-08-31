@@ -9,6 +9,7 @@
 | 项 | 默认行为 | 校验命令 |
 | --- | --- | --- |
 | admin 通道 | unix socket `/run/fasts3/admin.sock`(0600)或 TCP 仅回环 + Bearer token | `fasts3d serve --admin-listen` 配置检查 |
+| 复制口 | 启用时默认 9445,**mTLS 强制**,证书 CN = `node_id`;不走 S3 :9000 | `[replication]` 段 / `fasts3d replication status` |
 | S3 访问凭据 | `fasts3d init` 生成、哈希入库、**仅打印一次** | init 输出;admin 密钥页 |
 | TLS | init 向导自签引导(CN+SAN,私钥 0600);支持 ACME 与证书热加载 | `deploy/tls/` |
 | 匿名访问 | 默认关闭(`allow_anonymous=false`) | 配置检查 |
@@ -35,6 +36,8 @@
 9. **NTP/chrony 常开**(Object Lock 部署硬门槛):保证运行期墙钟不回拨。
    FastS3 保证运行期内单调(回拨不解除保留);**跨停机拨时钟**只以持久化
    `last_wall` 为下界,不能证明停机窗外墙钟未被拨快——见 ADR-13 承诺边界。
+10. 若启用主备复制:复制口仅内网、mTLS 证书与 CA 就位;主备共享同一 KMS;
+    promote 纪律见 [主备复制](replication.md)。
 
 ## 3. CVE 响应流程(SLA ≤ 7 天)
 
@@ -149,7 +152,16 @@
   登录/JIT 事件(内存环形缓冲 ≤500 条,进程重启即失,文档化;需要
   持久化请接日志采集)。
 
-## 5. 发布产物信任链
+## 5. 加密与客户密钥
+
+- **SSE-C**:客户密钥只在请求头出现,控制台 HEAD 用 `x-fasts3-sse-c-key`
+  转发、**不进 query/审计明文**;预签名 SignedHeaders 必须随下载/预览请求。
+- **SSE-S3**:`GET /v1/admin/sse/status` / `POST .../rotate` 只暴露代数与进度,
+  零密钥材料。
+- **SSE-KMS**(v2.6):KEK 永不出 Vault/OpenBao 进程;明文 DEK 不缓存;停 KMS
+  → `KMS.UnavailableException`。复制拓扑主备须共享同一 KMS。
+
+## 6. 发布产物信任链
 
 - **签名**:minisign 优先,openssl pkeyutl ed25519 回退(`tools/package/sign.sh`);
   公钥随 RELEASES 发布;校验:`tools/package/verify-release.sh`。

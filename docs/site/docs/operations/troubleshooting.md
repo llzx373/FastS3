@@ -18,8 +18,9 @@ error: metadata error: rocksdb: IO error: While lock file: .../meta/LOCK: Resour
 
 ### 1.2 端口占用
 
-`error: ... Address already in use`(SO_REUSEPORT 绑定失败)。检查 9000/
-9001/9090 占用:`ss -ltnp | grep 9000`;systemd 场景确认旧单元已停。
+`error: ... Address already in use`(SO_REUSEPORT 绑定失败)。检查 9000
+(S3)/9001(admin TCP)/9090 或 8080(Web)/9445(复制口)占用:
+`ss -ltnp | grep -E '9000|9001|9090|8080|9445'`;systemd 场景确认旧单元已停。
 
 ### 1.3 prepare(init)报「设备未初始化/无有效检查点」
 
@@ -62,7 +63,25 @@ error: metadata error: rocksdb: IO error: While lock file: .../meta/LOCK: Resour
 - `416 InvalidRange` + `x-amz-actual-object-size`:范围越界(与 AWS 一致);
 - `412 PreconditionFailed` / `304 Not Modified`:条件头
   (If-Match/If-None-Match/If-Modified-Since)判定失败属正常语义;
-- 版本不存在:`NoSuchVersion`(v1.0 前未启用版本控制,`VersionId"null"` 除外)。
+- 版本不存在:`NoSuchVersion`(未启用版本控制时除 `null` 外)。
+
+### 2.5 SSE-C 下载/预览失败
+
+对象用客户密钥加密后,控制台必须在工具栏填 **同一把 32 字节 base64 密钥**。
+预签名 URL 本身不够——SSE-C 头在 SignedHeaders 里,须用返回的 `headers`
+做 `fetch`。密钥错误常见 403/400;zip 打包对 SSE-C 对象直接 400。
+
+### 2.6 备端写入 501 ReplicationStandby
+
+该节点是复制拓扑里的 standby。写入应打到主;本节点只读。响应头
+`X-FastS3-Repl-Applied-Gtid` 表示已应用位点。切换见
+[主备复制运维](replication.md)。
+
+### 2.7 SSE-KMS 503 `KMS.UnavailableException`
+
+Vault/OpenBao 不可达或 transit 密钥缺失。控制台「KMS」页看托管状态;
+复制拓扑主备须共享同一 KMS。无托管后端时桶默认加密 `aws:kms` 仍显式拒绝
+(不是静默忽略)。
 
 ## 3. 数据一致性与崩溃
 
@@ -128,24 +147,29 @@ rocksdb 自带 WAL/校验;极端损坏时启动报错。恢复路径(不要手�
 ## 6. FAQ
 
 **Q: FastS3 支持多副本/集群吗?**
-不支持(也不打算做)。前提是底层块设备已 HA 且一致(EBS/RBD/RAID/双活卷),
-FastS3 只做单机 S3 语义层,把省下的开销全部转化为性能。
+不做 Raft/EC 数据面集群。前提仍是底层块设备已 HA(EBS/RBD/RAID/双活卷)。
+**实例级主备异步复制**(v2.7 M21,binlog + GTID)用于 DR:一主多备或级联,
+手动 promote,备端只读。这不是 AWS `PUT Bucket replication` XML(该子资源
+维持 501)。多台机器的配置编排走 [中心纳管](center.md)(agent 出站 mTLS),
+也不是共享存储集群。
 
 **Q: 能跑在普通文件系统目录上吗?**
 能:镜像文件模式(`init --device /path/disk.img`),全程 O_DIRECT + 4KiB
 对齐,文件系统只当容器。性能低于裸盘(少了直通),但语义一致。
 
 **Q: 支持纠删码/压缩吗?**
-EC 不做(见上);对象级压缩在远期规划(v1.4 评估)。
+EC 不做。归档类 `GLACIER` / `GLACIER_IR` / `DEEP_ARCHIVE` 用 zstd 压缩落盘;
+STANDARD 不透明压缩对象正文。另有惰性 extent 压缩(`fasts3d compact`)。
 
-**Q: 支持版本控制/生命周期/Object Lock 吗?**
-v1.0 前不支持(键空间 `v:` 前缀已预留);v1.1 版本控制、v1.2 生命周期与
-加密、v1.3 Object Lock 见仓库 [docs/ROADMAP.md](https://github.com/example/fasts3/blob/main/docs/ROADMAP.md)。
+**Q: 支持版本控制/生命周期/Object Lock / 加密吗?**
+都已交付:桶版本化、Lifecycle(含 Transition 到归档类)、Object Lock WORM、
+SSE-S3 / SSE-C / SSE-KMS、checksum 五族、归档 Restore。控制台桶页与对象页
+可配;协议口径见 [兼容性矩阵](../reference/compat.md)。
 
 **Q: 兼容哪些客户端?**
-aws cli / boto3 / mc / rclone / s3cmd / Hadoop S3A / 浏览器 SDK,
-SigV4 签名四件套全绿;`tests/smoke/client_smoke.sh` 冒烟,CEPHE s3-tests
-核心子集 68/68(M1 起)。
+aws cli / boto3 / mc / rclone / s3cmd(无 SigV2) / Hadoop S3A / 浏览器 SDK
+走预签名直传。冒烟 `tests/smoke/client_smoke.sh`;s3-tests 支持子集按排除
+矩阵收敛(见仓库 `tests/s3-tests/README.md`),不以「完整 S3」声称。
 
 **Q: 出现 P0/P1 缺陷怎么报?**
 走 Beta 反馈通道(见 [Beta 计划](../beta/index.md)):GitHub issue 模板

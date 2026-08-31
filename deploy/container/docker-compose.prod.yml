@@ -3,14 +3,14 @@
 #   docker compose -f deploy/container/docker-compose.prod.yml up -d --build
 # POC 单容器默认见 docker-compose.yml。
 #
-# 镜像标签与 Cargo.toml workspace.package.version 对齐(现 2.5.0)。
+# 镜像标签与 Cargo.toml workspace.package.version 对齐(现 2.7.0)。
 
 services:
   fasts3:
     build:
       context: ../..
       dockerfile: deploy/container/Dockerfile
-    image: fasts3:2.5.0
+    image: fasts3:2.7.0
     ports:
       - "9000:9000"
     volumes:
@@ -29,7 +29,7 @@ services:
     restart: unless-stopped
 
   fasts3-web:
-    image: fasts3:2.5.0
+    image: fasts3:2.7.0
     build:
       context: ../..
       dockerfile: deploy/container/Dockerfile

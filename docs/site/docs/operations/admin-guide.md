@@ -10,9 +10,9 @@ FastS3 由两个进程 + 一个浏览器入口组成:
 
 | 组件 | 进程 | 端口(示例) | 职责 |
 | --- | --- | --- | --- |
-| 数据面 | `fasts3d serve`(Rust) | 9000(S3) | 全部数据读写、S3 协议、admin API、检查点/压缩 |
-| 管理面 | `fasts3-web`(Node) | 9090 | 控制台静态资源 + 管理 API 代理(无状态、可多实例) |
-| 控制台 | 浏览器 | — | 仪表盘/桶/对象/密钥/策略/审计/设置 |
+| 数据面 | `fasts3d serve`(Rust) | 9000(S3)·9001 admin(回环)·9445 复制(mTLS) | S3、admin API、检查点/压缩、主备复制口 |
+| 管理面 | `fasts3-web`(Node) | 9090(容器 POC 常映 8080) | 控制台静态资源 + 管理 API 代理(无状态、可多实例) |
+| 控制台 | 浏览器 | — | 仪表盘/桶/对象/上传/密钥/STS/审计/IAM/迁入/Batch/KMS/复制/设置 |
 
 链路:
 
@@ -89,12 +89,15 @@ systemctl start fasts3
 
 ### 3.1 访问密钥
 
-- 创建:`POST /v1/admin/keys`(或控制台「密钥」页);secret **只下发一次**;
+- 创建:`POST /v1/admin/keys`、控制台「密钥」页、或 `fasts3d keys create --access-key AK`;
+  secret **只下发一次**;
 - 存储:secret 加盐哈希 + AES-256-GCM 密文;服务重启自动恢复明文校验;
-- 禁用/启用:`PATCH /v1/admin/keys/{access} {"enabled":false}`(立即生效);
-- 审计:密钥增删改均有审计记录(op=key_create/key_delete/key_enable/...)。
+- 禁用/启用:`PATCH /v1/admin/keys/{access} {"enabled":false}` 或
+  `fasts3d keys disable AK`(立即生效);
+- 策略:`fasts3d keys policy AK --file p.json` / `--clear`;
+- 审计:密钥增删改均有审计记录。
 
-最小权限建议:每应用一密钥 + [策略 JSON](../reference/web-api.md#密钥与策略)(AWS 策略语法
+最小权限建议:每应用一密钥 + [策略 JSON](../reference/web-api.md)(AWS 策略语法
 子集,`s3:GetObject`/`s3:PutObject`/桶范围);存储型密钥策略化,管理型密钥
 仅保留在管理面。
 
@@ -112,7 +115,22 @@ curl -sS --unix-socket /run/fasts3/admin.sock \
 配额为桶级软上限(超限拒绝写入 `QuotaExceeded`,读不受影响);`PATCH` 可改,
 `?force=true` 可删非空桶(先审计确认)。
 
-### 3.3 在途 multipart 管理
+桶页另有 **Public Access Block**(四开关)与 **PolicyStatus(`IsPublic`)**;数据面
+`Get/Put/DeletePublicAccessBlock` 与控制台 BPA 页同源。匿名读默认关,BPA 可
+进一步挡住误配的公共策略。
+
+### 3.3 控制台对象上传/下载
+
+对象浏览页上传可选:存储类、SSE-C 客户密钥(32 字节 base64)、checksum 算法
+(CRC32 / CRC32C / SHA1 / SHA256 / CRC64NVME)、用户元数据(`key=value`)、
+If-Match ETag、「仅当键不存在」(If-None-Match:`*`)。大文件走 multipart,
+条件写在 Complete 上判定(Create 携带条件头会被数据面拒绝)。
+
+SSE-C 对象的下载与预览必须在工具栏填同一密钥:浏览器用预签名返回的
+SignedHeaders `fetch`,不能依赖裸 `<a href>` / `<img src>`。无密钥时预览页
+提示输入;zip 打包拒绝 SSE-C 对象(不把明文绕到浏览器以外)。
+
+### 3.4 在途 multipart 管理
 
 `GET /v1/admin/uploads` 列出全部会话;`POST /v1/admin/uploads/{id}/abort`
 强制中止(释放分片空间)。僵尸会话由引擎按 TTL 自动清扫。
@@ -131,7 +149,12 @@ curl -sS --unix-socket /run/fasts3/admin.sock \
 `degraded=true` 立即处理(设备 I/O 故障只读降级)。
 
 访问日志交接(代替 `?logging`):见
-[用审计导出代替 S3 Server Access Logging](audit-export.md)。
+[用审计导出代替 S3 Server Access Logging](audit-export.md)
+(`fasts3d audit export` 或控制台下载 JSONL)。
+
+主备复制观测与切换:[主备复制运维](replication.md)。
+多节点编排:[中心纳管](center.md)(控制台 `#/center`,与单机复制口独立)。
+KMS 托管、保 mtime 迁入、Batch 任务均在控制台对应页(需 `admin:*` 能力位)。
 
 ## 5. 升级
 
@@ -177,7 +200,8 @@ fasts3d serve --config fasts3.toml --web-root /usr/share/fasts3/web/console/dist
 - [调优](tuning.md):系统级调优清单(IRQ 亲和/scheduler/内存锁);
 - [故障排查](troubleshooting.md):FAQ 与常见问题处置;
 - [备份/恢复](backup-restore.md)与[迁移](migration.md);
-- [admin API 参考](../reference/admin-api.md) / [错误码速查](../reference/errors.md)。
+- [admin API 参考](../reference/admin-api.md) / [错误码速查](../reference/errors.md);
+- [主备复制](replication.md) / [IAM](iam.md) / [中心纳管](center.md)。
 
 ## Kafka 事件通知(M19;ADR-25)
 

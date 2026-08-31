@@ -11,7 +11,8 @@ FastS3 **不实现** `/minio/admin/v3` 线协议,`mc admin user/group/policy/
 svcacct` 等子命令对本服务**无效**(ADR-28 DI8.3/DI10,红线不做)。对齐的
 是**概念与 canned 策略名**(User/Group/Policy/Service Account、`readonly`/
 `readwrite`/…),不是 wire protocol——运维习惯可平移,二进制不可平移。
-日常身份管理走控制台 IAM 页面或 `/api/iam/*` REST API(见下表)。
+日常身份管理走控制台 IAM 页面、`/api/iam/*` REST,或 **`fasts3d iam`**
+(经运行中实例的 admin 通道,与控制台同 API;见 [CLI](../reference/cli.md))。
 
 ## 2. 登录与身份来源
 
@@ -36,22 +37,22 @@ svcacct` 等子命令对本服务**无效**(ADR-28 DI8.3/DI10,红线不做)。�
 控制台页面均在 Web 控制台(9090)导航「IAM」分组下;API 列为 Node 管理面
 代理路径(`/api/iam/*`,Rust admin 侧对应 `/v1/iam/*`,回环/unix 可信通道)。
 
-| MinIO 操作 | FastS3 控制台 | FastS3 API |
-| --- | --- | --- |
-| `mc admin user add` | 用户页 → 新建 | `POST /api/iam/users` |
-| `mc admin user list` / `info` | 用户页列表 | `GET /api/iam/users[?tenant=]` |
-| `mc admin user enable` / `disable` | 用户页 → 启停开关 | `PATCH /api/iam/users/{tenant}/{name}`(`enabled` 布尔) |
-| `mc admin user remove` | 用户页 → 删除(须先吊销其全部 SA) | `DELETE /api/iam/users/{tenant}/{name}` |
-| `mc admin user policy`(改挂载) | 用户页 → 编辑策略 | `PATCH .../users/{tenant}/{name}`(`policies` 整表替换) |
-| `mc admin group add/enable/disable/info` | 组页 | `POST /api/iam/groups`、`GET .../groups`、`PATCH .../groups/{tenant}/{name}`(members/policies 整表替换) |
-| `mc admin group remove` | 组页 → 删除(同事务清理成员 groups) | `DELETE /api/iam/groups/{tenant}/{name}` |
-| `mc admin policy create` | 策略页 → 新建(IAM JSON 文档) | `POST /api/iam/policies` |
-| `mc admin policy list` / `info` | 策略页列表(含 canned 只读视图) | `GET /api/iam/policies[?tenant=]` |
-| `mc admin policy attach` / `detach` | 用户/组页改 `policies` 列表(整表替换语义) | 同上 PATCH users/groups |
-| `mc admin policy remove` | 策略页 → 删除(仍被挂载 → 409,先解挂) | `DELETE /api/iam/policies/{tenant}/{name}` |
-| `mc admin svcacct add/list/remove` | 服务账号页(自助:owner=自己;tenantAdmin 可代管本租户) | `GET/POST/DELETE /api/iam/service-accounts[/{access}]` |
-| MinIO STS `AssumeRole` | —(客户端直调) | `POST /v1/iam/assume-role`;Node 兼容入口 `POST /api/sts?Action=AssumeRole` |
-| `mc admin` 其余子命令(server info/heal/trace…) | 仪表盘 / 审计页 / `fasts3d doctor`、`check` | `/v1/admin/status` 等,见 [admin API 参考](../reference/admin-api.md) |
+| MinIO 操作 | FastS3 控制台 | FastS3 API | CLI(`fasts3d`) |
+| --- | --- | --- | --- |
+| `mc admin user add` | 用户页 → 新建 | `POST /api/iam/users` | `iam users create --name …` |
+| `mc admin user list` / `info` | 用户页列表 | `GET /api/iam/users[?tenant=]` | `iam users list` / `get` |
+| `mc admin user enable` / `disable` | 用户页 → 启停开关 | `PATCH /api/iam/users/{tenant}/{name}`(`enabled` 布尔) | `iam users update --enable\|--disable` |
+| `mc admin user remove` | 用户页 → 删除(须先吊销其全部 SA) | `DELETE /api/iam/users/{tenant}/{name}` | `iam users delete` |
+| `mc admin user policy`(改挂载) | 用户页 → 编辑策略 | `PATCH .../users/{tenant}/{name}`(`policies` 整表替换) | `iam users update --policies a,b` |
+| `mc admin group add/enable/disable/info` | 组页 | `POST /api/iam/groups`、`GET .../groups`、`PATCH .../groups/{tenant}/{name}` | `iam groups list\|create\|get\|update\|delete` |
+| `mc admin group remove` | 组页 → 删除 | `DELETE /api/iam/groups/{tenant}/{name}` | `iam groups delete` |
+| `mc admin policy create` | 策略页 → 新建 | `POST /api/iam/policies` | `iam policies create --name … --file p.json` |
+| `mc admin policy list` / `info` | 策略页列表(含 canned 只读) | `GET /api/iam/policies[?tenant=]` | `iam policies list` / `get` |
+| `mc admin policy attach` / `detach` | 用户/组页改 `policies` | 同上 PATCH users/groups | `iam users\|groups update --policies` |
+| `mc admin policy remove` | 策略页 → 删除(仍被挂载 → 409) | `DELETE /api/iam/policies/{tenant}/{name}` | `iam policies delete` |
+| `mc admin svcacct add/list/remove` | 服务账号页 | `GET/POST/DELETE /api/iam/service-accounts[/{access}]` | `iam sa list\|create\|get\|delete` |
+| MinIO STS `AssumeRole` | —(客户端直调) | `POST /v1/iam/assume-role`;Node `POST /api/sts?Action=AssumeRole` | — |
+| `mc admin` 其余 | 仪表盘 / 审计 / doctor | `/v1/admin/status` 等 | `audit query` / `keys list` / `doctor` |
 
 字段命名沿用 MinIO 运维习惯(`accessKey`/`policy`/`members`),路径不抄
 (ADR-28 DI8.1)。SA secret **仅创建响应一次回显**,与 `mc admin svcacct add`

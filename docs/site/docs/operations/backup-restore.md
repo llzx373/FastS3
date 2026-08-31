@@ -41,6 +41,10 @@ systemctl start fasts3
   (extent_size/extent_count/layout_version),先恢复同一份卷快照即可满足;
 - 频率建议:卷快照按数据重要度(每日/每周),元数据导出随卷快照执行;
 - 元数据很小(索引 + inline 小对象),导出文件远小于数据卷。
+- **复制/KMS**:meta-export 含密钥哈希、IAM、SSE-S3 种子与复制状态;SSE-KMS
+  明文 DEK 不在导出里(主备须仍能连同一 Vault/OpenBao)。备节点恢复后角色
+  仍以导出时拓扑为准,切换走 [主备复制](replication.md) 的 promote/rebuild,
+  不要把旧主当新主直接写。
 
 ## 3. 恢复(灾难)
 

@@ -5,6 +5,18 @@
 > 详细发布记录见 [RELEASES.md](./RELEASES.md);RC/GA 候选流程见
 > [docs/ga/rc-flow.md](./docs/ga/rc-flow.md)。
 
+## Unreleased
+
+控制台与 CLI 对齐近期数据面/管理面能力(不升版本号):
+
+- 桶 Public Access Block / PolicyStatus 控制台入口;
+- SSE-C 下载、预览、分片上传带客户密钥(`fetch` + SignedHeaders);
+- 对象上传 checksum 五族、用户元数据、If-Match / If-None-Match;
+- `fasts3d keys` / `iam` / `audit query|export`(经 admin 通道);
+- `fasts3d replication` 全套运维动作(status/slots/pause/resume/promote/demote/rebuild)。
+
+用户文档站(v2.7.0 口径)已同步:复制运维页、中心纳管页、web/admin API、IAM/审计 CLI、兼容矩阵 SSE-KMS 与实例级复制。
+
 ## v2.7.0 — M21 主备复制(2026-08-31)
 
 M21 全部任务与门禁完成(TODO.md M21 全勾选);ADR-33 落盘 DESIGN.md §3.3

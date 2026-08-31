@@ -18,12 +18,12 @@ FastS3 的对策:**不做底层已经做过的事**。工程力量全部投入�
 ## 特性
 
 - **存储底座**:裸块设备(`/dev/nvme0n1`)与磁盘镜像文件两种模式,同一套引擎与磁盘布局,差异仅在零拷贝路径
-- **S3 语义(与 [兼容矩阵](./docs/site/docs/reference/compat.md) 同口径)**:桶 / 对象 CRUD、Multipart、服务端复制(COW 零数据搬运)、预签名 URL、POST 表单上传、SigV4 鉴权、密钥级 IAM 策略 × 桶策略(Deny 优先、最小 Condition 键集)、Range / 条件头、版本化 / Object Lock / SSE / 归档 Restore / 事件通知 / STS / Inventory;停售与定位性不做项见兼容矩阵,不以「完整 S3」声称
+- **S3 语义(与 [兼容矩阵](./docs/site/docs/reference/compat.md) 同口径)**:桶 / 对象 CRUD、Multipart、服务端复制(COW 零数据搬运)、预签名 URL、POST 表单上传、SigV4 鉴权、密钥级 IAM 策略 × 桶策略(Deny 优先、最小 Condition 键集)、Range / 条件头、版本化 / Object Lock / SSE-S3·SSE-C·SSE-KMS / checksum 五族 / 归档 Restore / 事件通知 / STS / Inventory / Public Access Block;停售与定位性不做项见兼容矩阵,不以「完整 S3」声称
 - **强一致**:元数据单点序列化,强 read-after-write 一致性,比 S3 官方语义更强
-- **主备复制(M21 进行中,ADR-33)**:实例级/桶级异步复制(binlog + GTID + 复制槽),一主多备/级联拓扑、备端只读、手动 promote 切换;AWS `?replication` 桶复制配置语义维持 501 排除(设计权威:[docs/replication-design.md](./docs/replication-design.md))
+- **主备复制(v2.7 M21,ADR-33)**:实例级/桶级异步复制(binlog + GTID + 复制槽),一主多备/级联、备端只读、手动 promote;AWS `?replication` 桶复制 XML 维持 501。运维见 [文档站 · 主备复制](./docs/site/docs/operations/replication.md)
 - **崩溃安全**:进程任意时刻 kill -9 / 断电,不撕裂对象、不丢已应答数据、空间账目不漂移
 - **极低资源**:空载内存 < 256MiB,单一二进制(glibc 动态链接;C 运行时依赖见容器文档),无 GC 停顿,边缘设备可用
-- **开箱即用**:systemd / 容器双形态,Web 控制台,`fasts3 init` 交互向导 5 分钟内装好配好用起来
+- **开箱即用**:systemd / 容器双形态,Web 控制台(对象预览/zip/SSE-C 下载、BPA、复制拓扑、KMS 向导、迁入/Batch),`fasts3d` 运维命令含 `keys` / `iam` / `audit` / `replication`(经运行中 admin 通道)
 - **兼容主流客户端**:aws cli、boto3、mc、rclone 零配置对接;浏览器 SDK 走预签名直传(分体部署需配置数据面 `cors_allow_origins`);s3cmd(SigV2 未实现);**Hadoop S3A 冒烟通过**(JDK 21 + Hadoop 3.4.1,`tests/lakehouse/s3a_smoke.sh`),详见兼容性矩阵
 
 ## 架构一览
@@ -40,6 +40,7 @@ FastS3 的对策:**不做底层已经做过的事**。工程力量全部投入�
    │  S3 协议(SigV4/XML)     │  admin 通道 │  + React 控制台(静态)    │
    │  存储引擎(每核直通)     │◄──────────►│  (数据流永不经过 Node)   │
    │  io_uring + O_DIRECT    │  unix/TCP  │                          │
+   │  复制口 :9445 (mTLS)    │            │                          │
    └──────────┬──────────────┘            └──────────────────────────┘
               │
    ┌──────────▼──────────────────────────────────────┐
@@ -51,7 +52,7 @@ FastS3 的对策:**不做底层已经做过的事**。工程力量全部投入�
 
 - 数据面(Rust):thread-per-core + 每核独立 io_uring ring + O_DIRECT + 注册缓冲;读路径 sendfile / splice 零拷贝
 - 管理面(Node.js):无状态、可重启、可多实例,永不进入数据热路径;浏览器上传/下载走预签名 URL 直连数据面
-- 端口:9000 S3 数据面 · 9001 admin(仅回环)· 9090 Web 管理
+- 端口:9000 S3 数据面 · 9001 admin(仅回环)· 9090 Web 管理 · 9445 复制口(mTLS)
 
 ## 性能目标(相对 fio 裸盘基线)
 
@@ -94,9 +95,13 @@ FastS3 的对策:**不做底层已经做过的事**。工程力量全部投入�
 
 ✅ **M17 可交付私有化完成(v2.3.0)。** Apache-2.0 口径、单容器首启、退出路径演练、mc 高并发死锁根治、桶级 Public Access Block、Hadoop S3A 冒烟、审计 JSONL 导出(代替 Logging)。任务见 [TODO.md](./TODO.md)。
 
-✅ **M18 IAM 多租户完成(v2.4.0)。** MinIO 熟悉的用户/组/策略/服务账号 + 租户隔离,部门管理员自助不依赖 root;控制台授权切 IAM `admin:*`,STS AssumeRole 本租户角色实体,LDAP/OIDC 映射 IAM User;s3-tests alt 身份出集,崩溃演练 ≥200 轮零孤儿。任务见 [TODO.md](./TODO.md)。
+✅ **M18 IAM 多租户完成(v2.4.0)。** MinIO 熟悉的用户/组/策略/服务账号 + 租户隔离,部门管理员自助不依赖 root;控制台授权切 IAM `admin:*`,STS AssumeRole 本租户角色实体,LDAP/OIDC 映射 IAM User;s3-tests alt 身份出集,崩溃演练 ≥200 轮零孤儿。CHANGELOG v2.4.0。
 
-✅ **M19 好用的私有化完成(v2.5.0)。** 控制台文件柜(对象预览/勾选打包 zip/版本回滚/中英 i18n)、保 mtime/元数据迁入向导(ADR-24,第二实例真源端对账夹具)、Condition Date*×aws:CurrentTime 与 ${aws:username} 展开(ADR-27)、Kafka 通知(ADR-25,零新依赖线协议生产者)、S3 Batch Operations(ADR-26,CSV/Inventory manifest + 四操作 + 报告状态机 + Object Lock 不绕过)。任务见 [TODO.md](./TODO.md)。
+✅ **M19 好用的私有化完成(v2.5.0)。** 控制台文件柜(对象预览/勾选打包 zip/版本回滚/中英 i18n)、保 mtime/元数据迁入向导(ADR-24)、Condition Date*×aws:CurrentTime 与 ${aws:username} 展开(ADR-27)、Kafka 通知(ADR-25)、S3 Batch Operations(ADR-26)。CHANGELOG v2.5.0。
+
+✅ **M20 SSE-KMS 密钥托管完成(v2.6.0)。** Vault/OpenBao transit;控制台托管向导。CHANGELOG v2.6.0。
+
+✅ **M21 主备复制完成(v2.7.0)。** 实例级异步复制(binlog/GTID/复制槽/mTLS 复制口)、一主多备与级联、手动 promote、断档显式 rebuild;控制台复制页 + `fasts3d replication`。报告 [docs/perf-M21.md](./docs/perf-M21.md)。CHANGELOG v2.7.0。
 
 ✅ **M8 GA 发布(v1.0.0)。** 全量回归资产与本地实测(`tests/m8/regression.sh`:客户端 × OS × 内核 × 设备形态逐轴编排 + 汇总;CI 接入 regression.yml);RC1→RC2→GA 候选流程(`tests/m8/rc-gate.sh` + docs/ga/rc-flow.md + CHANGELOG.md);安全审计(自审 14 项全绿 + 外部审计范围,见 docs/ga/security-audit.md);发布流水线复核(签名 + SBOM 229 组件 + 供应链锁定,`tools/package/verify-release.sh` 实测 PASS,版本源统一为 Cargo.toml);官网与公告(文档站新增兼容矩阵/安全基线 CVE 响应/v1.0.0 公告页,mkdocs 0 警告);§1.1 开箱清单逐项证据表(docs/ga/checklist.md)+ 内置示例 `deploy/examples/backup-dir.sh`(实测);GA 检查单复核 → **v1.0.0 发布**(版本号全仓同步)。执行期门禁(真 NVMe §6.8 数值 / 外部审计执行 / rpm·ARM64 真机构建 / Beta 窗口)按 checklist.md 如实标注。RELEASES.md v1.0.0。
 
@@ -110,7 +115,7 @@ FastS3 的对策:**不做底层已经做过的事**。工程力量全部投入�
 | --- | --- |
 | [docs/DESIGN.md](./docs/DESIGN.md) | 总体架构、存储引擎、S3 协议、性能方案、管理面设计(含 ADR-1~5) |
 | [docs/ROADMAP.md](./docs/ROADMAP.md) | 实现规划、WBS 工作分解、里程碑计划、开箱即用验收标准 |
-| [TODO.md](./TODO.md) | 执行清单:M19 v2.5.0 已交付(M17–M19 私有化三部曲完成);M15~v2.2.1 已归档 docs/archive/TODO-v2.2.1.md |
+| [TODO.md](./TODO.md) | 执行清单:M21 v2.7.0 已交付;M15~v2.6 见 CHANGELOG / docs/archive |
 
 路线图:9 个里程碑(M0~M8,合计约 7 个月)→ v1.0 GA;v0.1 起逐版本发布(引擎 PoC → S3 核心 → 高级语义 → 管理面 → 加固 → 性能冲刺 → 打包开箱 → 文档与 Beta → GA)。
 

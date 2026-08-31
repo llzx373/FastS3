@@ -1,9 +1,8 @@
-# FastS3 文档站骨架(M6/L1)
-# 完整内容在 M7(L2/L3/L5)。本骨架目标是:mkdocs build 可跑、导航结构定型、
-# Quickstart 可照做(5 分钟开箱门禁配套)。
+# FastS3 用户文档站(与 workspace 版本对齐,现 v2.7.0)
+# 构建:pip install mkdocs && mkdocs build -f docs/site/mkdocs.yml
 
-site_name: "FastS3 文档"          # 占位;GA 前换成正式名称(如 FastS3 Docs)
-site_description: FastS3 单机高性能 S3 服务 —— 安装、部署、运维、参考
+site_name: "FastS3 文档"
+site_description: FastS3 单机高性能 S3 服务 —— 安装、部署、运维、参考(v2.7.0)
 site_url: https://example.com/fasts3/docs   # 占位:替换为真实文档站 URL
 repo_url: https://github.com/example/fasts3 # 占位:替换为真实仓库
 edit_uri: blob/main/docs/site/docs/
@@ -30,6 +29,8 @@ nav:
   - 运维:
       - 管理员指南: operations/admin-guide.md
       - IAM 多租户运维: operations/iam.md
+      - 主备复制: operations/replication.md
+      - 中心纳管: operations/center.md
       - 升级与回滚: operations/upgrade.md
       - 备份/恢复: operations/backup-restore.md
       - 审计导出(代替 Logging): operations/audit-export.md
@@ -45,7 +46,7 @@ nav:
       - 错误码速查: reference/errors.md
       - 兼容性矩阵: reference/compat.md
   - 发布:
-      - v1.0.0 GA 公告: release/v1.0.0.md
+      - v1.0.0 GA 公告(历史): release/v1.0.0.md
   - Beta:
       - Beta 计划与反馈: beta/index.md
       - Beta 评审清单: beta/review.md

@@ -1,4 +1,4 @@
-# fasts3d 命令速查(M6/L1)
+# fasts3d 命令速查
 
 > 以当前实际命令为准(读 `crates/fs3d/src/main.rs`);v0.7 已含交互 init 向导
 > 与 `upgrade` 迁移命令。
@@ -70,7 +70,9 @@ fasts3d serve --config fasts3.toml \
 ```
 
 worker 0 = 自动(线程数);密钥未配置时使用开发默认 `fasts3dev/fasts3dev` 并告警;
-TLS 由配置 `server.tls_cert/tls_key` 启用(热加载)。
+TLS 由配置 `server.tls_cert/tls_key` 启用(热加载)。复制口(默认 9445,mTLS)
+由 `fasts3.toml` `[replication]` 启用,不是 serve 的命令行开关;运维动作见
+[主备复制](../operations/replication.md) 与 `fasts3d replication`。
 
 **`--web-root <dir>`(M7/I5 内嵌形态)**:托管 Web 控制台静态产物(SPA 回退
 index.html)。路由区分:带 `Authorization`/预签名查询的请求、或首段为既有桶
@@ -120,8 +122,6 @@ fasts3d rewrite-values --config fasts3.toml [--rate 500] [--pause-file /tmp/paus
 
 ## bench —— 引擎级基准(设备层直测)
 
-## bench —— 引擎级基准(设备层直测)
-
 ```bash
 fasts3d bench --device disk.img --meta-dir meta [--io-backend uring|pread] \
        --rw randread|read|write|randwrite --block 4KiB/64KiB/128KiB \
@@ -129,7 +129,7 @@ fasts3d bench --device disk.img --meta-dir meta [--io-backend uring|pread] \
 ```
 
 不经 S3 协议;输出 IOPS / MB/s / p99(性能门禁脚本 tests/bench/ci-perf-gate.sh 依赖)。
-另见 `bench-md5`(MD5 多缓冲吞吐对比,SIMD 4 路)。
+另见 `bench-md5`(MD5 多缓冲吞吐,SIMD 4 路)、`bench-lock`(Object Lock 判定微基准)。
 
 ## loadgen —— 协议层负载生成器
 
@@ -193,6 +193,14 @@ fasts3d iam sa get|delete <access-key>
 
 fasts3d audit query [--limit 100] [--since UNIX] [--until UNIX] [--op] [--bucket] [--key] [--who] [--status] [--bypass]
 fasts3d audit export [--output audit.jsonl]   # 缺省 stdout;截断时 stderr 告警
+```
+
+## device-add / device-remove / rebalance —— 多设备池(M13)
+
+```bash
+fasts3d device-add --config f.toml --new-device /dev/nvme1n1   # 离线;在线走 POST /v1/admin/devices/add
+fasts3d device-remove --config f.toml --remove-device /dev/nvme1n1  # 须已迁空的尾盘
+fasts3d rebalance --config f.toml --rounds 0   # 0 = 循环至水位差收敛
 ```
 
 ## 其它

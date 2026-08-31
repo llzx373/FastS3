@@ -27,7 +27,8 @@ ACL 全矩阵(2023-04 起新桶默认禁用 ACL;维持 GetObjectAcl 私有桩 +
 Put*Acl 显式 501)。
 **定位性不做(AWS 仍在提供)**:Website / Logging / RequesterPays、Transfer
 Acceleration、Access Points、Directory Buckets / S3 Express、SigV2、
-SSE-KMS / DSSE(无 KMS 托管,参数显式拒绝)。
+DSSE(双层 KMS)。**SSE-KMS 已交付**(v2.6 M20,Vault/OpenBao transit;
+无托管后端时 `aws:kms` 仍显式拒绝,不是静默忽略)。
 **Logging 替代**:不实现 `?logging` XML(`PUT/GET/DELETE ?logging` 维持 501);
 访问日志交接见专节[用审计导出代替 S3 Server Access Logging](../operations/audit-export.md)
 (`GET /v1/admin/audit/export` JSONL)。
@@ -73,14 +74,15 @@ meta-export/import 可见并可往返;真实类独立落 ObjectMeta v7 `storage_
   事件;锁定对象跳过;NoncurrentVersionTransition 显式 NotImplemented。
 - **复制**:源归档未恢复且目标类 ≠ 源类 → 403 InvalidObjectState;同存储类
   复制豁免(COW 段共享);复制目标不继承恢复状态;归档对象删除无需先
-  restore(主段 + 恢复副本段一并释放)。**跨节点复制不内置**
-  (`PUT Bucket replication` → 501 NotImplemented,ADR-20):企业 DR 经
-  中心纳管同步任务落地(控制台「同步任务」页;mirror = mc mirror 含删除
-  传播 / incremental = rclone copy 只增不删;中心调度 + 节点本地执行 +
-  对账视图,见 docs/m14-center-contract.md §6)。同步执行器默认
+  restore(主段 + 恢复副本段一并释放)。**AWS `PUT Bucket replication` XML
+  不实现**(→ 501 NotImplemented,定位):企业跨节点 DR 走 **M21 实例级主备
+  复制**(binlog + GTID,一主多备/级联,见 [主备复制运维](../operations/replication.md);
+  `?replication` 公网动词维持排除)。中心纳管「同步任务」(mc mirror /
+  rclone copy)仍可用于异构源。同步执行器默认
   `--max-workers`/`--transfers` = 4(可配,上限 32),不要求串行才能稳定。
-- **SSE**:SSE-S3 归档可恢复(服务端 KEK 自持解密);SSE-C 归档恢复显式
-  400(客户密钥零落盘);SSE + 归档 + multipart 显式 400。
+- **SSE**:SSE-S3 / SSE-C / **SSE-KMS**(v2.6,共享 KMS 方可复制);归档恢复:
+  SSE-S3 可恢复,SSE-C 归档恢复显式 400(客户密钥零落盘);SSE + 归档 +
+  multipart 显式 400。控制台 SSE-C 下载/预览须带客户密钥(SignedHeaders)。
 - 存储类分账:`BucketStats.by_class`(对象数/逻辑字节 × 四类;Σ == 桶统计),
   admin `/v1/admin/buckets/{name}/stats` 与列表视图可见;恢复副本不占
   统计(非独立对象)。
@@ -139,6 +141,10 @@ meta-export/import 可见并可往返;真实类独立落 ObjectMeta v7 `storage_
 | UploadPartCopy 源 `?versionId` | 对齐 CopyObject(ADR-11 §3.4.5):`null` → null 族;32 hex → 精确版本;非法 → 400 InvalidArgument;版本不存在 → NoSuchVersion;响应回显 `x-amz-copy-source-version-id`;range 直灌按所寻址版本取数(s3-tests `multipart_copy_versioned` 出集) |
 | `x-amz-expected-bucket-owner` | 单账号模型语义:头值 = 桶属主(`fasts3`)→ 放行;≠ 自身 → 403 AccessDenied(显式,不静默);桶级/对象级 op 通用。s3-tests 同名用例仍排除:前置 `PutBucketAcl(public-read-write)` = Put*Acl 501 红线 |
 | 密钥状态语义(S3-GAP §3.7 #7) | 禁用 vs 不存在在 admin/审计面可区分:认证失败审计条目落 `auth_note`(`key_disabled` / `key_not_found` / `session_token_invalid`);**协议错误码维持 AWS 同义**(禁用/不存在均 InvalidAccessKeyId,会话失效 InvalidToken),侧写仅落 admin/审计面 |
+| Public Access Block(v2.3 M17) | `Get/Put/DeletePublicAccessBlock` + `GetBucketPolicyStatus`;控制台桶页 BPA 标签与 Policy 页 `IsPublic` |
+| checksum 五族 | PUT/UploadPart `x-amz-checksum-{crc32,crc32c,sha1,sha256,crc64nvme}`;CreateMultipart `x-amz-checksum-algorithm`;控制台上传可选计算并带头 |
+| 条件写 | PutObject / CompleteMultipartUpload 受理 If-Match / If-None-Match(`*` 或 ETag 列表);控制台「仅当键不存在」= `If-None-Match: *` |
+| SSE-C 控制台 | 上传/分片/HEAD/下载/预览均须客户密钥;预签名 GET 的 SignedHeaders 必须随 `fetch` 发送,不能只用 URL |
 
 ## IAM 多租户(v2.4 M18 起)
 

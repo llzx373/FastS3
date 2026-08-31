@@ -20,6 +20,11 @@
 时间窗 + 可选桶 / 键前缀:
 
 ```bash
+# 推荐:CLI(截断时 stderr 告警;缺省 stdout)
+fasts3d audit export --since $(date -d '1 day ago' +%s) --until $(date +%s) \
+  --output /var/log/fasts3/audit-$(date +%F).jsonl
+
+# 或 curl admin
 curl -sS --unix-socket /run/fasts3/admin.sock \
   -H "Authorization: Bearer $TOKEN" \
   -D - -o /var/log/fasts3/audit-$(date +%F).jsonl \
@@ -38,8 +43,9 @@ TCP admin 同路径。查询参数与 `GET /v1/admin/audit` 对齐:`since`/`unti
 | `X-FastS3-Matched` | 过滤后总条数 |
 | `X-FastS3-Limit` | 本响应 limit |
 
-控制台「审计日志」页提供 **下载 JSONL**(同源过滤)。行内**无密钥明文**
-(secret 只在创建密钥时下发一次,不进审计)。
+控制台「审计日志」页提供 **下载 JSONL**(同源过滤)。无浏览器时用
+`fasts3d audit query` / `audit export`(见 [CLI](../reference/cli.md))。
+行内**无密钥明文**。
 
 API 形状见 [admin API](../reference/admin-api.md) 与
 [兼容性矩阵](../reference/compat.md) 同名专节。

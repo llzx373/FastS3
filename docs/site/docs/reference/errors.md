@@ -34,7 +34,7 @@ AWS 客户端按规范映射。
 | `EntityTooSmall` / `EntityTooLarge` | 400 | 分片 <5MiB / 对象超限 |
 | `InvalidRange` | 416 | Range 越界(带 `x-amz-actual-object-size`;多段 Range → 206 multipart/byteranges) |
 | `XAmzContentSHA256Mismatch` | 400 | `x-amz-content-sha256` 声明与实际载荷不符(M9;BadDigest 仅用于 Content-MD5) |
-| `InvalidStorageClass` | 400 | `x-amz-storage-class` 非 STANDARD(M9 显式拒绝,不静默) |
+| `InvalidStorageClass` | 400 | `x-amz-storage-class` 非接受矩阵中的值(M9 起显式拒绝,不静默) |
 | `KeyTooLongError` / `MetadataTooLarge` | 400 | 对象键 >1024 字节 / `x-amz-meta-*` 总量 >2KiB(M11 H1-1 起强制,AWS 上限口径) |
 | `PreconditionFailed` | 412 | 条件头(If-Match 等)失败 |
 | `NotModified` | 304 | If-None-Match 命中 |
@@ -51,7 +51,10 @@ AWS 客户端按规范映射。
 | `InvalidRequest` / `MalformedXML` / `MissingContentLength` / `IncompleteBody` | 400 | 请求/XML/体错误;DeleteObjects 键数 >1000 亦为 400(M9) |
 | `BadDigest` | 400 | Content-MD5 不符(Content-SHA256 不符用 `XAmzContentSHA256Mismatch`) |
 | `MethodNotAllowed` | 405 | 方法不支持 |
-| `NotImplemented` | 501 | 未实现特性(版本控制/加密等);**携带 SSE/tagging/Object Lock/网站重定向等未实现头的请求显式拒绝(M9),不静默忽略** |
+| `NotImplemented` | 501 | 定位性不做的子资源(Website/Logging/`?replication` XML/ACL 全矩阵等);**未实现头显式拒绝,不静默忽略** |
+| `ReplicationStandby` | 501 | 备端拒绝写入;响应可带 `X-FastS3-Repl-Applied-Gtid` |
+| `KMS.UnavailableException` | 503 | SSE-KMS 后端不可达(停 Vault/OpenBao) |
+| `InvalidObjectState` | 403 | 归档未 restore 即读/跨类复制源 |
 
 ## 2. admin API 错误码(JSON)
 
@@ -82,7 +85,7 @@ AWS 客户端按规范映射。
 | --- | --- | --- |
 | `invalid_credentials` | 401 | 用户名/密码错误 |
 | `unauthorized` | 401 | 无/失效 token |
-| `forbidden` | 403 | 角色不足(仅 admin 的端点) |
+| `forbidden` | 403 | IAM `admin:*` 求值拒绝(JWT 只证明身份) |
 | `admin_unreachable` | 502 | Rust admin 通道不可达/超时 |
 | `s3_error` | 502 | 数据面 S3 调用失败(消息含原始码) |
 | `presign_error` | 500 | 预签名签发失败 |
