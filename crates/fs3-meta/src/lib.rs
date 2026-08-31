@@ -200,7 +200,12 @@ pub struct ReplLocalizeItem {
     /// 上游段身份 → 本地段表(调用方已把字节经本地分配器落盘;按对象
     /// 字节序)。替换按 (extent_id, offset, len) 身份精确匹配,允许
     /// 一项替换表覆盖 extents 与 restore_state.restored_extents 两侧。
-    pub subs: Vec<(repl::DataRef, Vec<fs3_core::Segment>)>,
+    /// 第三元 = 引用所在 binlog 记录的 **epoch**(流坐标的坐标系身份;
+    /// `s:repl_rmap` 键的 epoch 维度——promote 后新主自写坐标可与备期
+    /// 映射数值碰撞,键若无 epoch 会跨代错译,见 keys.rs
+    /// PREFIX_REPL_RMAP)。同一目标键内的上游引用恒同代(键由单条记录
+    /// 写入),按项携带即可。
+    pub subs: Vec<(repl::DataRef, Vec<fs3_core::Segment>, u64)>,
 }
 
 #[derive(Debug, Clone)]
@@ -3117,19 +3122,24 @@ impl MetaStore {
     }
 
     /// 中继段映射查询(M21 E1;设计稿 §3.5;键族语义见 keys.rs
-    /// PREFIX_REPL_RMAP):在 `s:repl_rmap\0{extent_id}` 前缀内找**包含**
-    /// 请求区间 [offset, offset+len) 的流坐标引用,命中返回
+    /// PREFIX_REPL_RMAP):在 `s:repl_rmap\0{epoch}{extent_id}` 前缀内找
+    /// **包含**请求区间 [offset, offset+len) 的流坐标引用,命中返回
     /// (流坐标 DataRef, 本地段表);未命中 = None(调用方回退本地池
     /// 直读——直连主端/promote 后本端自写记录的坐标即本地坐标)。
+    /// `epoch` = 引用所在记录的代(坐标系身份):promote 后新代自写坐标
+    /// 与备期旧代映射条目数值可碰撞,代间必须隔离(崩溃注入实测:无
+    /// epoch 维度时新代请求命中旧代条目 → 静默读出陈旧字节)。
     pub fn repl_rmap_lookup(
         &self,
+        epoch: u64,
         extent_id: u32,
         offset: u64,
         len: u64,
     ) -> Result<Option<(repl::DataRef, Vec<fs3_core::Segment>)>> {
-        for item in scan_prefix(&self.db, &repl_rmap_extent_prefix(extent_id)) {
+        for item in scan_prefix(&self.db, &repl_rmap_extent_prefix(epoch, extent_id)) {
             let (k, v) = item?;
-            let (eid, roff, rlen) = parse_repl_rmap_key(&k)?;
+            let (kepoch, eid, roff, rlen) = parse_repl_rmap_key(&k)?;
+            debug_assert_eq!(kepoch, epoch);
             debug_assert_eq!(eid, extent_id);
             let (start, end) = (u64::from(roff), u64::from(roff) + u64::from(rlen));
             if start <= offset && offset + len <= end {
@@ -3241,7 +3251,7 @@ impl MetaStore {
                 let mut out = Vec::with_capacity(list.len());
                 for s in list {
                     let mut hit = false;
-                    for (i, (dref, local)) in item.subs.iter().enumerate() {
+                    for (i, (dref, local, _epoch)) in item.subs.iter().enumerate() {
                         if dref.extent_id == s.extent_id
                             && dref.offset == s.offset
                             && dref.len == s.len
@@ -3310,12 +3320,14 @@ impl MetaStore {
             }
             // E1 级联中继(§3.5/RP3.3):「流坐标 → 本地段表」映射与段表
             // 替换同事务落盘(s:repl_rmap,零漂移)——中继对下服务
-            // extent-data 的翻译底座;仅在全匹配替换成功的同一条件下写
-            // (部分匹配 = 上行已 rollback 返回,不可达)。
+            // extent-data 的翻译底座;键含记录 epoch(坐标系身份,隔离
+            // promote 前后数值碰撞,见 keys.rs PREFIX_REPL_RMAP)。仅在
+            // 全匹配替换成功的同一条件下写(部分匹配 = 上行已 rollback
+            // 返回,不可达)。
             if matched.iter().all(|m| *m) && !item.subs.is_empty() {
-                for (dref, local) in &item.subs {
+                for (dref, local, epoch) in &item.subs {
                     tx.put(
-                        repl_rmap_key(dref.extent_id, dref.offset, dref.len),
+                        repl_rmap_key(*epoch, dref.extent_id, dref.offset, dref.len),
                         encode(local)?,
                     )
                     .map_err(rocks_err)?;
@@ -4296,19 +4308,21 @@ impl MetaStore {
         // 的 bl: 记录仍可被下游续拉」的窗口——记录被截断(全部活跃槽已
         // 确认越过;强截 = 槽 stale 唯一出路重建)后映射失效。COW 共享
         // 段(同一上游引用出现于多条记录)只删「不被任何 retained 记录
-        // 引用」的条目,防截断早记录误删晚记录仍在用的映射。
+        // 引用」的条目,防截断早记录误删晚记录仍在用的映射。回收身份
+        // 含记录 epoch(rmap 键的代维度:同数值坐标跨代是不同映射,
+        // 见 keys.rs PREFIX_REPL_RMAP)。
         {
-            let id_of = |r: &repl::DataRef| (r.extent_id, r.offset, r.len);
-            let retained: std::collections::HashSet<(u32, u32, u32)> = entries[cut..]
+            let id_of = |e: &Entry, r: &repl::DataRef| (e.gtid.epoch, r.extent_id, r.offset, r.len);
+            let retained: std::collections::HashSet<(u64, u32, u32, u32)> = entries[cut..]
                 .iter()
-                .flat_map(|e| e.refs.iter().map(id_of))
+                .flat_map(|e| e.refs.iter().map(|r| id_of(e, r)))
                 .collect();
             let mut dropped = std::collections::HashSet::new();
             for e in &entries[..cut] {
                 for r in &e.refs {
-                    let id = id_of(r);
+                    let id = id_of(e, r);
                     if !retained.contains(&id) && dropped.insert(id) {
-                        batch.delete(repl_rmap_key(r.extent_id, r.offset, r.len));
+                        batch.delete(repl_rmap_key(e.gtid.epoch, r.extent_id, r.offset, r.len));
                         stats.rmap_deleted += 1;
                     }
                 }
@@ -8188,7 +8202,7 @@ mod tests {
                 .repl_localize_segments(
                     &[ReplLocalizeItem {
                         key: object_key("b1", "big"),
-                        subs: vec![(stale, vec![local_seg.clone()])],
+                        subs: vec![(stale, vec![local_seg.clone()], 1)],
                     }],
                     &[],
                     None,
@@ -8217,7 +8231,7 @@ mod tests {
                 .repl_localize_segments(
                     &[ReplLocalizeItem {
                         key: object_key("b1", "big"),
-                        subs: vec![(dref, vec![local_seg.clone()])],
+                        subs: vec![(dref, vec![local_seg.clone()], 1)],
                     }],
                     &[(g(2), dref)],
                     Some(&alloc),
@@ -8256,6 +8270,130 @@ mod tests {
             assert!(!meta.repl_object_data_pending("b1", "big").unwrap());
             assert_eq!(meta.list_alloc_records(0).unwrap().len(), 1);
         }
+    }
+
+    /// M21 崩溃注入实测回归(promote 跨 epoch 坐标碰撞):`s:repl_rmap`
+    /// 键含记录 epoch——
+    /// ① 清算落盘的映射以记录 epoch 入键,同代查询:精确区间/包含子区间
+    ///    均命中并返回本地段表;
+    /// ② **跨代必 MISS**:新代自写坐标数值落入旧代映射条目区间(promote
+    ///    后新主本地分配可与备期映射碰撞)时不得翻译——无 epoch 维度时
+    ///    该查询命中旧代条目,extent-data 静默供出陈旧字节(CRC 自洽,
+    ///    下游逐块校验无法检出);
+    /// ③ 异 extent 同代不命中;
+    /// ④ binlog 截断同批回收按 (epoch, extent, off, len) 身份删键。
+    #[test]
+    fn repl_rmap_epoch_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaStore::open(
+            dir.path(),
+            &MetaConfig {
+                repl_binlog: true,
+                ..MetaConfig::default()
+            },
+        )
+        .unwrap();
+        let up_seg = Segment {
+            extent_id: 7,
+            offset: 4096,
+            len: 8192,
+            crcs: vec![0xAAAA],
+        };
+        let dref = DataRef {
+            extent_id: 7,
+            offset: 4096,
+            len: 8192,
+            crc32c: None,
+        };
+        let local_seg = Segment {
+            extent_id: 2,
+            offset: 0,
+            len: 8192,
+            crcs: vec![0xBBBB],
+        };
+        let g = |seq: u64| Gtid { epoch: 1, seq };
+        meta.apply_repl_record(
+            g(1),
+            &ReplRecord::new(
+                1,
+                &[Op::BucketPut {
+                    name: "b1".into(),
+                    meta: bucket_meta("b1"),
+                    location: None,
+                }],
+            ),
+        )
+        .unwrap();
+        let mut big = object_meta(8192);
+        big.extents = vec![up_seg.clone()];
+        meta.apply_repl_record(
+            g(2),
+            &ReplRecord::new(
+                1,
+                &[Op::ObjectPut {
+                    bucket: "b1".into(),
+                    key: "big".into(),
+                    meta: big,
+                }],
+            ),
+        )
+        .unwrap();
+        // 清算:映射以记录 epoch=1 落盘
+        meta.repl_localize_segments(
+            &[ReplLocalizeItem {
+                key: object_key("b1", "big"),
+                subs: vec![(dref, vec![local_seg.clone()], 1)],
+            }],
+            &[(g(2), dref)],
+            None,
+            2,
+            &[],
+        )
+        .unwrap();
+
+        // ① 同代:精确区间与包含子区间均命中,返回本地段表
+        let (hit, local) = meta
+            .repl_rmap_lookup(1, 7, 4096, 8192)
+            .unwrap()
+            .expect("同代精确区间必命中");
+        assert_eq!(hit.extent_id, 7);
+        assert_eq!(local, vec![local_seg.clone()]);
+        assert!(
+            meta.repl_rmap_lookup(1, 7, 4096 + 1024, 1024)
+                .unwrap()
+                .is_some(),
+            "同代包含子区间必命中"
+        );
+        // ② 跨代 MISS(promote 后新代自写坐标碰撞旧代条目区间亦不翻译)
+        assert!(
+            meta.repl_rmap_lookup(2, 7, 4096, 1024).unwrap().is_none(),
+            "跨代坐标碰撞必须 MISS(回退本地直读)"
+        );
+        assert!(
+            meta.repl_rmap_lookup(0, 7, 4096, 8192).unwrap().is_none(),
+            "异代同坐标必须 MISS"
+        );
+        // ③ 异 extent 同代 MISS
+        assert!(meta.repl_rmap_lookup(1, 8, 4096, 1024).unwrap().is_none());
+
+        // ④ 截断同批回收:无槽约束 + 硬上限归零 → 记录全截,rmap 同批删
+        let stats = meta
+            .truncate_binlog(
+                now_ts(),
+                &ReplRetainConfig {
+                    retain_hours: 24 * 365,
+                    retain_bytes: 1 << 60,
+                    retain_bytes_hard: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(stats.truncated, 2);
+        assert_eq!(stats.rmap_deleted, 1, "rmap 随引用记录同批回收");
+        assert!(meta.repl_rmap_lookup(1, 7, 4096, 8192).unwrap().is_none());
+        // 键编解码往返(epoch 在前,字典序 = 数值序)
+        let k = repl_rmap_key(1, 7, 4096, 8192);
+        assert_eq!(parse_repl_rmap_key(&k).unwrap(), (1, 7, 4096, 8192));
+        assert!(repl_rmap_key(2, 7, 4096, 8192) > repl_rmap_key(1, 7, 4096, 8192));
     }
 
     /// M21 门禁双机演练阶段 6 实测回归:Replay 的 ObjectMigrate/PartMigrate

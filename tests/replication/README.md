@@ -20,6 +20,7 @@
 | `m21_cascade_drill.sh` | 三级级联 a→b→c | 链路追平逐字节;中继水位纪律(逐拍 C applied ≤ B applied,只发数据齐备 GTID);C 全程无悬空引用;B promote 后 C 不重启自动续流、无分歧误拒 |
 | `m21_bucket_drill.sh` | 桶级复制(Include b-in) | b-in 追平逐字节;b-out 零数据(NoSuchBucket);委派凭证一次性下发(mTLS 旁路 tee 代理取证:`access_key=REPL-<slot>`)——范围内 GET 200、越界桶/PUT/ListBuckets 均 403;桶级备 promote 409 bucket-scoped |
 | `m21_ssekms_drill.sh` | SSE-KMS 共享 Vault | dev Vault(transit)双节点共指;SSE-KMS 对象备端可解(wrapped DEK 原样随 binlog);promote 接管后可解 + 新写往返;**红线:KMS 停机 = 主备同败**(503 `KMS.UnavailableException`,不降级) |
+| `run_crash_m21.sh` | 崩溃注入 ≥200 轮混载(TODO M21 门禁;默认 200 轮,`M21_CRASH_ROUNDS` 覆盖) | 每轮随机 kill -9 主或备(内联/MiB 级混合 put/覆盖/删除);①主端重启后已应答对象逐字节 + check 零泄漏;②备端追平后抽样逐字节、终局全量名单+ETag+计数相等(零漂移/apply 幂等);③随机轮次 promote 并发 kill -9,重启后状态唯一(standby/E 或 primary/E+1+barrier)。前置 `python3+boto3` |
 
 ## 跑法
 

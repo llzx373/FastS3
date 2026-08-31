@@ -813,6 +813,13 @@ async fn rewrite_entry(
     }
 }
 
+/// 导入暂存互斥(M21 崩溃注入实测):`repl_import_begin→feed*→finish` 跨多次
+/// engine.write() 短临界区,而开放 extent 水位全引擎共享——两个并发导入
+/// 写者(快照导入 / 回填池 / 读路径按需拉取)的 feed 交错会把字节落到对方
+/// 段区间(段表合法、字节串台,GET 校验和不符)。整对象暂存串行,与 S3 put
+/// 路径整对象持 engine 写锁同模型。进程级全局:互斥域 = 本进程引擎。
+pub(crate) static IMPORT_STAGE_MU: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// 一组上游段的字节拉取 + 本地落盘(按对象字节序顺次 feed;extent-data
 /// 响应头 CRC32C 逐块校验)。返回导入暂存(本地段表 + 分配草稿)。
 async fn import_segments(
@@ -821,6 +828,8 @@ async fn import_segments(
     tls: &Arc<rustls::ClientConfig>,
     segs: &[Segment],
 ) -> Result<ReplImportStaged, PullError> {
+    // 导入暂存串行:见 IMPORT_STAGE_MU 注释(M21 崩溃注入实测)。
+    let _stage = IMPORT_STAGE_MU.lock().await;
     let mut w: ReplImportWriter = engine
         .write()
         .repl_import_begin()

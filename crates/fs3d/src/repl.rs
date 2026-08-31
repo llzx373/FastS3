@@ -40,7 +40,8 @@
 //!   校验(§3.2「Range 读 + CRC32C + ReadPin」);单请求 len 上限
 //!   `MAX_EXTENT_DATA_LEN`(下游回填池分块拉取,超大对象不产生巨型缓冲)。
 //!   坐标系(E1 级联):缺省 = 服务端本地池坐标(快照/引导路径);
-//!   `space=stream` = binlog 流坐标(原始生产端坐标系),经 `s:repl_rmap`
+//!   `space=stream&epoch=` = binlog 流坐标(原始生产端坐标系 + 记录代,
+//!   代是坐标系身份——promote 跨代同数值坐标隔离),经 `s:repl_rmap`
 //!   翻译到本地段后供数,未命中回退本地直读(handle_extent_data 注释)。
 //! - query 参数不做百分号解码:slot 名/GTID/数值均为 URL 安全字符(B3 若
 //!   放开槽名字符集再补解码)。
@@ -808,8 +809,9 @@ impl ReplServer {
     /// `GET /v1/repl/v1/extent-data?extent_id=&offset=&len=`(DataRef 三件套,
     /// §3.2):Range 读 + ReadPin(引擎 read_extent_range 内钉扎)+ 整段
     /// CRC32C 响应头(线格式见模块注释)。C1 起经共享令牌桶限速(R11:
-    /// extent-data 走只读路径 + 令牌桶)。`space=stream`(E1 级联):
-    /// 坐标按 binlog 流坐标系经 `s:repl_rmap` 翻译到本地段(口径见下)。
+    /// extent-data 走只读路径 + 令牌桶)。`space=stream&epoch=`(E1 级联):
+    /// 坐标按 binlog 流坐标系经 `s:repl_rmap` 翻译到本地段,epoch 为
+    /// 必传(坐标系身份,跨代碰撞隔离;口径见下)。
     async fn handle_extent_data(&self, req: &Request<Incoming>) -> Response<Full<Bytes>> {
         let query = req.uri().query().unwrap_or("");
         let parse = |name: &str| query_param(query, name).and_then(|s| s.parse::<u64>().ok());
@@ -843,18 +845,36 @@ impl ReplServer {
                 );
             }
         };
+        // 流坐标必带记录 epoch(坐标系身份;s:repl_rmap 按键 epoch 维度
+        // 隔离,promote 后新代自写坐标与备期映射数值碰撞不得跨代错译——
+        // M21 崩溃注入实测:无 epoch 时该场景静默供出陈旧字节)
+        let epoch = if stream {
+            match query_param(query, "epoch").map(|s| s.parse::<u64>()) {
+                Some(Ok(e)) => e,
+                _ => {
+                    return json_err(
+                        StatusCode::BAD_REQUEST,
+                        "bad_param",
+                        "space=stream requires numeric epoch (record epoch of the stream coordinates)",
+                    );
+                }
+            }
+        } else {
+            0
+        };
         self.throttle_wait().await;
         // E1 级联翻译(§3.5/RP3.3):`space=stream` = 请求坐标是 binlog
         // 流坐标(原始生产端坐标系——记录沿链原样转发,中下游的回填/
         // 按需拉取以此坐标落到本节点)。命中 `s:repl_rmap`(本节点回填
-        // 清算时落盘的「流坐标 → 本地段表」映射)→ 按本地段拼读切片
-        // 返回;未命中 → 回退本地池直读(直连主端:主端无 rmap,流坐标
-        // 即其本地坐标;promote 后本端自写记录的坐标同理)。水位规则
+        // 清算时落盘的「流坐标 → 本地段表」映射,按记录 epoch 隔离)→
+        // 按本地段拼读切片返回;未命中 → 回退本地池直读(直连主端:主端
+        // 无 rmap,流坐标即其本地坐标;promote 后本端自写记录的坐标同理
+        // ——新代 epoch 与备期旧代映射天然不撞键)。水位规则
         // (handle_binlog)保证中下游只会在映射已存在后发起流坐标拉取。
         // 快照/引导路径(本节点本地坐标)不带 space 参数,恒走本地直读,
         // 两坐标系不相混。
         let bytes = if stream {
-            match self.meta.repl_rmap_lookup(extent_id, offset, len) {
+            match self.meta.repl_rmap_lookup(epoch, extent_id, offset, len) {
                 Ok(Some((dref, local))) => match self.read_translated(&dref, &local, offset, len) {
                     Ok(b) => b,
                     Err(e) => return internal_err("translated extent read", &e),

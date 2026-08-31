@@ -126,7 +126,11 @@ pub trait BackgroundWorker: Send + 'static {
 /// 后台 worker 句柄(语义对齐原压缩 `CompactorHandle`):
 /// - `set_paused(true)`:worker 空转——线程仍按 poll 节律循环,但不
 ///   调用 `run_batch`(零消费);
-/// - `stop`:置停止位并 join 回收线程(幂等);
+/// - `stop`:置停止位并 join 回收线程(幂等);停止延迟 ≤10ms——
+///   轮询睡眠按 10ms 分片检查停止位(整块 `sleep(poll)` 会让 stop/join
+///   最坏阻塞一整个 poll 周期:binlog 截断 worker 周期 60s,启动期
+///   错误路径(RP4 角色矛盾 fail-fast)曾在 drop 回收处挂死整周期,
+///   进程呈现「admin/复制口活、S3 不绑」僵尸态,M21 崩溃门禁实测);
 /// - `Drop` 自动 `stop`。
 pub struct WorkerHandle {
     stop: Arc<AtomicBool>,
@@ -152,13 +156,21 @@ impl WorkerHandle {
         let join = std::thread::Builder::new()
             .name(name.clone())
             .spawn(move || {
-                while !s.load(Ordering::Acquire) {
+                'outer: while !s.load(Ordering::Acquire) {
                     if !p.load(Ordering::Acquire) {
                         if let Err(e) = worker.run_batch(&throttle) {
                             tracing::warn!("{name} batch failed: {e}");
                         }
                     }
-                    std::thread::sleep(poll);
+                    // 分片睡眠(对齐 lib.rs 检查点 ticker 先例):停止位
+                    // 10ms 粒度可见,stop()/join 不被 poll 周期放大
+                    let start = std::time::Instant::now();
+                    while start.elapsed() < poll {
+                        if s.load(Ordering::Acquire) {
+                            break 'outer;
+                        }
+                        std::thread::sleep(Duration::from_millis(10).min(poll));
+                    }
                 }
             })
             .expect("spawn background worker thread");
@@ -299,6 +311,26 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(rounds.load(Ordering::Relaxed), r2, "stop 后线程已回收");
         h.stop();
+    }
+
+    /// 长 poll 周期下 stop() 必须快速返回(分片睡眠;回归:整块
+    /// `sleep(poll)` 时代 stop/join 最坏阻塞一个完整 poll 周期——
+    /// binlog 截断 worker 周期 60s,启动期错误路径曾在 drop 回收处
+    /// 挂死整周期,进程呈「admin/复制口活、S3 不绑」僵尸态)。
+    #[test]
+    fn worker_stop_not_blocked_by_poll_sleep() {
+        let t = Throttle::new(1 << 20);
+        let (w, _, rounds) = MeteredWorker::new(1024);
+        let mut h = WorkerHandle::spawn("fs3-test-stop", w, t, Duration::from_secs(60));
+        // 等线程进过首轮批处理(随后即进入 60s 轮询睡眠)
+        wait_until(|| rounds.load(Ordering::Relaxed) >= 1);
+        let start = std::time::Instant::now();
+        h.stop();
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "stop 被 poll 睡眠阻塞 {:?}(须 ≤10ms 粒度)",
+            start.elapsed()
+        );
     }
 
     /// 批处理错误只告警,不杀死调度线程。

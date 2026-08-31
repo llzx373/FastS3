@@ -242,19 +242,22 @@ pub const SYS_REPL_BUCKET_SCOPED: &[u8] = b"s:repl_bscoped";
 /// 持有,天然安全(同 PREFIX_BINLOG 登记口径)。
 pub const PREFIX_REPL_PENDING: &[u8] = b"s:repl_pending\x00";
 /// 中继段映射(M21 E1;ADR-33 RP3.3;设计稿 §3.5 级联数据可用性):
-/// `s:repl_rmap\0{extent_id be32}{offset be32}{len be32}` → postcard
-/// `Vec<Segment>`。键 = **binlog 流坐标**(原始生产端的段引用——记录沿
-/// 链原样转发,任何中继收到的流引用都是同一坐标系);值 = 本节点回填
-/// 清算(repl_localize_segments)时该上游段字节在**本地**池的落点段表
-/// (同事务写入,与 o:/p: 段表替换零漂移)。用途:中继对下服务
-/// extent-data 时把流坐标翻译成本地段(级联链条上中下游的回填/按需
-/// 拉取永远落在数据确实存在的节点上)。生命期 = 引用它的 bl: 记录
-/// 保留期(truncate_binlog 同批回收;强截越过 = 槽 stale → 显式重建,
-/// 映射随之失效);重建清空(clear_for_rebuild)整族删除。直写持久
-/// (重启后级联续拉可用);meta-export **显式不导出**(库迁移 = 复制
-/// 状态按新位点重建,同 `s:repl_pending` 口径);check 可达性扫描不相交
-/// (值内 Segment 是 o:/p: 段表已持有分配的重复引用,本身不持分配,
-/// 同 PREFIX_REPL_PENDING 登记口径)。
+/// `s:repl_rmap\0{epoch be64}{extent_id be32}{offset be32}{len be32}` →
+/// postcard `Vec<Segment>`。键 = **binlog 流坐标四件套**(原始生产端的
+/// 段引用 + 引用所在记录的 epoch——记录沿链原样转发,任何中继收到的
+/// 流引用都是同一坐标系;epoch 是坐标系身份的一部分:promote 后新主
+/// 自写记录的 DataRef 是其本地坐标,数值可与备期映射条目碰撞,无
+/// epoch 维度会把新代坐标错译到旧代字节——M21 崩溃注入实测静默串
+/// 数据);值 = 本节点回填清算(repl_localize_segments)时该上游段字节
+/// 在**本地**池的落点段表(同事务写入,与 o:/p: 段表替换零漂移)。
+/// 用途:中继对下服务 extent-data 时把流坐标翻译成本地段(级联链条
+/// 上中下游的回填/按需拉取永远落在数据确实存在的节点上)。生命期 =
+/// 引用它的 bl: 记录保留期(truncate_binlog 同批回收;强截越过 = 槽
+/// stale → 显式重建,映射随之失效);重建清空(clear_for_rebuild)整族
+/// 删除。直写持久(重启后级联续拉可用);meta-export **显式不导出**
+/// (库迁移 = 复制状态按新位点重建,同 `s:repl_pending` 口径);check
+/// 可达性扫描不相交(值内 Segment 是 o:/p: 段表已持有分配的重复引用,
+/// 本身不持分配,同 PREFIX_REPL_PENDING 登记口径)。
 pub const PREFIX_REPL_RMAP: &[u8] = b"s:repl_rmap\x00";
 /// 对象级 data-pending 旁路索引(M21 C4;ADR-33 RP4.2;设计稿 §4.2):
 /// `s:repl_pdobj\0{bucket}\0{esc(key)}` → 空值标记。apply_repl_record
@@ -850,39 +853,43 @@ pub fn parse_repl_pending_key(raw: &[u8]) -> Result<fs3_core::Gtid> {
     })
 }
 
-/// 中继段映射键:`s:repl_rmap\0{extent_id be32}{offset be32}{len be32}`
-/// (M21 E1;键 = binlog 流坐标三件套,be32 字典序 = 数值序,extent 内
-/// 按 offset 升序,extent-data 翻译的包含性区间查找以此为扫描序)。
-pub fn repl_rmap_key(extent_id: u32, offset: u32, len: u32) -> Vec<u8> {
-    let mut k = Vec::with_capacity(PREFIX_REPL_RMAP.len() + 12);
+/// 中继段映射键:`s:repl_rmap\0{epoch be64}{extent_id be32}{offset be32}{len be32}`
+/// (M21 E1;键 = binlog 流坐标四件套,be 字典序 = 数值序,epoch 在最前
+/// ——同 epoch 内 extent 内按 offset 升序,extent-data 翻译的包含性区间
+/// 查找以此为扫描序;整族清空/重建仍按裸前缀收口,与 epoch 无关)。
+pub fn repl_rmap_key(epoch: u64, extent_id: u32, offset: u32, len: u32) -> Vec<u8> {
+    let mut k = Vec::with_capacity(PREFIX_REPL_RMAP.len() + 20);
     k.extend_from_slice(PREFIX_REPL_RMAP);
+    k.extend_from_slice(&epoch.to_be_bytes());
     k.extend_from_slice(&extent_id.to_be_bytes());
     k.extend_from_slice(&offset.to_be_bytes());
     k.extend_from_slice(&len.to_be_bytes());
     k
 }
 
-/// 单 extent 的映射扫描前缀:`s:repl_rmap\0{extent_id be32}`(E1
-/// extent-data 翻译按 extent 收口扫描范围)。
-pub fn repl_rmap_extent_prefix(extent_id: u32) -> Vec<u8> {
-    let mut k = Vec::with_capacity(PREFIX_REPL_RMAP.len() + 4);
+/// 单 (epoch, extent) 的映射扫描前缀:`s:repl_rmap\0{epoch be64}{extent_id be32}`
+/// (E1 extent-data 翻译按坐标系 epoch + extent 收口扫描范围)。
+pub fn repl_rmap_extent_prefix(epoch: u64, extent_id: u32) -> Vec<u8> {
+    let mut k = Vec::with_capacity(PREFIX_REPL_RMAP.len() + 12);
     k.extend_from_slice(PREFIX_REPL_RMAP);
+    k.extend_from_slice(&epoch.to_be_bytes());
     k.extend_from_slice(&extent_id.to_be_bytes());
     k
 }
 
-/// 解析 `s:repl_rmap\0` 键 → (extent_id, offset, len)(E1 翻译/回收用)。
-pub fn parse_repl_rmap_key(raw: &[u8]) -> Result<(u32, u32, u32)> {
+/// 解析 `s:repl_rmap\0` 键 → (epoch, extent_id, offset, len)(E1 翻译/回收用)。
+pub fn parse_repl_rmap_key(raw: &[u8]) -> Result<(u64, u32, u32, u32)> {
     let body = raw
         .strip_prefix(PREFIX_REPL_RMAP)
         .ok_or_else(|| Error::Corrupt("repl rmap key missing prefix".into()))?;
-    if body.len() != 12 {
+    if body.len() != 20 {
         return Err(Error::Corrupt("repl rmap key malformed".into()));
     }
     Ok((
-        u32::from_be_bytes(body[..4].try_into().unwrap()),
-        u32::from_be_bytes(body[4..8].try_into().unwrap()),
+        u64::from_be_bytes(body[..8].try_into().unwrap()),
         u32::from_be_bytes(body[8..12].try_into().unwrap()),
+        u32::from_be_bytes(body[12..16].try_into().unwrap()),
+        u32::from_be_bytes(body[16..20].try_into().unwrap()),
     ))
 }
 

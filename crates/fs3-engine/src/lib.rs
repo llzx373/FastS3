@@ -2751,7 +2751,21 @@ impl Engine {
                     break; // 该设备无空闲
                 };
                 self.note_alloc(1);
+                // 分配器与引擎开放表失协的哨兵:开放中的 extent 位图位
+                // 绝不应空闲(resume 漏 mark_open 曾导致此处分回同一 id,
+                // 水位回退覆写未提交段,M21 崩溃注入实测)。
+                debug_assert!(
+                    !self
+                        .open_extents
+                        .iter()
+                        .flatten()
+                        .any(|oe| oe.extent_id as u64 == id),
+                    "allocated extent {id} is currently open"
+                );
                 let (max_end, live_sum, holders) = self.live_extent_occupancy(id as u32)?;
+                tracing::info!(
+                    "open_new_extent: extent={id} max_end={max_end} live_sum={live_sum} holders={holders}"
+                );
                 if max_end == 0 {
                     self.alloc.mark_open(id);
                     self.open_open_extent(id, 0, 0, 1);
@@ -7523,6 +7537,12 @@ impl Engine {
 /// 所有权恒由 o:/p: 表达),Slot/role/epoch/executed/cursor 为纯
 /// 状态值;本扫描只读 o:/p:,对复制前缀天然安全,零误报(keys.rs
 /// PREFIX_BINLOG/PREFIX_REPL_SLOT/PREFIX_REPL_PENDING 注释互引)。
+/// M21 复核补记:standby data-pending 对象的 o:/p: 段表携带**上游
+/// 坐标**(与待回填 DataRef 同身份)——本函数**维持超集不剔除**:
+/// mark-sweep 超收只会暂掩「上游 id 与本地 extent 同号」的巧合泄漏,
+/// 而剔除一旦误伤本地活段,check --fix 会把它当泄漏释放(数据丢失);
+/// 位图派生重建侧(heal/水位,会主动置位)的剔除在
+/// rebuild_segment_state 完成,两函数口径分工见该函数注释。
 fn collect_reachable_extents(meta: &MetaStore) -> Result<HashSet<u64>> {
     let mut out = HashSet::new();
     for (_, _, _, m) in meta.snapshot_all_objects()? {
@@ -8620,21 +8640,30 @@ fn monotonic_ns() -> i64 {
 /// (泄漏列表, 每 extent 活段最大 end)。泄漏 = 位图已分配但无活段。
 fn acc_scan_segments(
     segs: &[Segment],
+    pending: &HashSet<(u32, u32, u32)>,
     lists: &mut Vec<Vec<Segment>>,
     max_end: &mut HashMap<u64, u32>,
 ) {
     if segs.is_empty() {
         return;
     }
+    let mut live: Vec<Segment> = Vec::with_capacity(segs.len());
     for s in segs {
+        // data-pending 上游坐标段剔除(见 rebuild_segment_state 注释)
+        if pending.contains(&(s.extent_id, s.offset, s.len)) {
+            continue;
+        }
         let e = s.extent_id as u64;
         let end = s.offset + s.len;
         max_end
             .entry(e)
             .and_modify(|v| *v = (*v).max(end))
             .or_insert(end);
+        live.push(s.clone());
     }
-    lists.push(segs.to_vec());
+    if !live.is_empty() {
+        lists.push(live);
+    }
 }
 
 fn rebuild_segment_state(
@@ -8643,14 +8672,37 @@ fn rebuild_segment_state(
 ) -> Result<(Vec<u64>, HashMap<u64, u32>)> {
     let mut lists: Vec<Vec<Segment>> = Vec::new();
     let mut max_end: HashMap<u64, u32> = HashMap::new();
+    // M21 复核(ADR-33 RP4.4 布局独立的恢复侧缺口):standby 上
+    // data-pending 对象/分片的 o:/p: 段表携带的是**上游坐标**(与待回填
+    // 队列 `s:repl_pending` 的 DataRef 同身份;C3 清算才改写为本地段),
+    // 不是本地 extent 所有权。位图派生重建(live_bytes/水位/heal)必须
+    // 按段身份剔除——否则:① heal_bitmap 把从未本地分配的上游 id 置位,
+    //    本地化/删除后成幻影泄漏(extent 头全零,从未写过数据);
+    // ② 上游 id ≥ 本地池 extent 数时 rebuild_derived 索引越界;
+    // ③ 水位/开放 extent 识别被上游布局污染。
+    // 剔除粒度与 `MetaStore::repl_localize_segments` 的身份匹配同口径
+    // (extent_id+offset+len)。泄漏 mark-sweep(collect_reachable_extents)
+    // 维持超集口径**不剔**——宁可暂掩同号巧合,不可把本地活段误判不可达
+    // (check --fix 会误释放)。
+    let mut pending_refs: HashSet<(u32, u32, u32)> = HashSet::new();
+    for (_, refs) in meta.list_repl_pending(usize::MAX)? {
+        for r in refs {
+            pending_refs.insert((r.extent_id, r.offset, r.len));
+        }
+    }
     for (_, _, _, m) in meta.snapshot_all_objects()? {
-        acc_scan_segments(&m.extents, &mut lists, &mut max_end);
+        acc_scan_segments(&m.extents, &pending_refs, &mut lists, &mut max_end);
         if let Some(st) = &m.restore_state {
-            acc_scan_segments(&st.restored_extents, &mut lists, &mut max_end);
+            acc_scan_segments(
+                &st.restored_extents,
+                &pending_refs,
+                &mut lists,
+                &mut max_end,
+            );
         }
     }
     for (_, _, p) in meta.snapshot_all_parts()? {
-        acc_scan_segments(&p.extents, &mut lists, &mut max_end);
+        acc_scan_segments(&p.extents, &pending_refs, &mut lists, &mut max_end);
     }
     alloc.rebuild_derived(lists);
     // M13 修复(自愈):有活段但位图未置位(历史 ref_dec 误清感染)→ 置位;
@@ -8774,6 +8826,11 @@ fn resume_open_extent(
         // 水位——否则崩溃后首个追加落在非 4KiB 对齐偏移,O_DIRECT 在
         // ext4/xfs 上 EINVAL 触发只读降级(tmpfs 不强制对齐,曾长期掩盖)。
         let me = align_up(max_end.get(&id).copied().unwrap_or(0) as u64, SECTOR_SIZE) as u32;
+        tracing::info!(
+            "recovery open-extent candidate: extent={id} live={} max_end={} wm={me}",
+            alloc.live_bytes_of(id),
+            max_end.get(&id).copied().unwrap_or(0)
+        );
         if me as u64 >= capacity {
             // 写满未封口:补写头(独占:重算 CRC;打包:空表)
             seal_at_recovery(alloc, dev, sb, local)?;
@@ -8788,11 +8845,20 @@ fn resume_open_extent(
             seal_at_recovery(alloc, dev, sb, local)?;
         }
     }
-    Ok(resumed.map(|(id, wm)| OpenExtent {
-        extent_id: id as u32,
-        watermark: wm,
-        committed_end: wm,
-        participants: alloc.refcount(id).max(1),
+    Ok(resumed.map(|(id, wm)| {
+        // M21 门禁实测缺陷(崩溃注入单节点复现):恢复选中的开放 extent 必须
+        // 在分配器里置 Open——否则状态停留在 Sealed,compaction_candidates
+        // 会把它当普通稀疏 extent 迁空并释放位图位,而引擎仍在向其追加;
+        // 位图位一旦被清,open_new_extent 可能把同一 id 重新分出,G-2 的
+        // live_extent_occupancy 只看已提交段,看不到本会话刚写入但未提交的
+        // 段 → 水位回退、覆写活数据(段表出现同 extent 同偏移的双段)。
+        alloc.mark_open(id);
+        OpenExtent {
+            extent_id: id as u32,
+            watermark: wm,
+            committed_end: wm,
+            participants: alloc.refcount(id).max(1),
+        }
     }))
 }
 

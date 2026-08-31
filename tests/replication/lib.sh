@@ -123,6 +123,17 @@ m21_wait_admin() {
   return 1
 }
 
+# ── S3 数据口就绪等待(40×0.25s;照 tests/crash/run_crash_m15.sh
+#    start_server 先例:任意 HTTP 应答即活,连接拒绝对轮询)──
+m21_wait_s3() {
+  local port="${1:?port}" i
+  for i in $(seq 1 40); do
+    curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$port/" && return 0
+    sleep 0.25
+  done
+  return 1
+}
+
 # ── admin 通道调用(响应体上 stdout;HTTP 码另取见 m21_admin_code)──
 m21_admin() {
   local sock="${1:?sock}" token="${2:?token}" method="${3:?method}" path="${4:?path}"

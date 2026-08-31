@@ -3324,6 +3324,146 @@ fn check_scans_repl_prefixes() {
     }
 }
 
+/// M21 复核(恢复侧;口径权威 = `rebuild_segment_state` 注释):standby
+/// data-pending 对象的 o: 段表携带**上游坐标**——恢复位图派生重建必须
+/// 按段身份剔除待回填引用:① heal_bitmap 不得把从未本地分配的上游 id
+/// 置位(幻影泄漏:位图置位 + extent 头全零 + 本地化/删除后显形,崩溃
+/// 注入门禁实测);② 上游 id 超出本地池 extent 数时 rebuild_derived 不
+/// 得索引越界;③ 本地化清算(段表改本地 + pending 摘除)后恢复账面
+/// 正常(heal 对真实本地引用仍生效)。check mark-sweep
+/// (collect_reachable_extents)维持超集不剔,两口径分工见上述注释。
+#[test]
+fn recovery_excludes_pending_upstream_segments() {
+    let (_d, cfg) = setup();
+    {
+        let mut e = open_engine(&cfg);
+        e.close().unwrap();
+    }
+    // 构造 standby 现场:o: 携带上游坐标 + 待回填队列(apply_repl_record)
+    // 池 = 64MiB/4MiB ≈ 15 extents;上游坐标取 7(池内)与 4097(池外)
+    let put = |extent_id: u32, key: &str| Op::ObjectPut {
+        bucket: "b1".into(),
+        key: key.into(),
+        meta: ObjectMeta {
+            extents: vec![Segment {
+                extent_id,
+                offset: 0,
+                len: 8192,
+                crcs: vec![],
+            }],
+            ..object_meta_for_precond(8192, 1)
+        },
+    };
+    let g = |seq: u64| fs3_core::Gtid { epoch: 1, seq };
+    {
+        let m = MetaStore::open(&cfg.meta_dir, &MetaConfig::default()).unwrap();
+        m.apply_repl_record(
+            g(1),
+            &fs3_meta::ReplRecord::new(1, &[put(7, "big-in"), put(4097, "big-out")]),
+        )
+        .unwrap();
+        m.flush().unwrap();
+    }
+    // 恢复:上游坐标不参与位图派生重建——不越界(②)、heal 不置位(①)、
+    // mark-sweep 超集口径下零泄漏
+    let e = Engine::open(&cfg).unwrap();
+    assert!(
+        !e.allocator().test_bit(7),
+        "heal 不得置位上游坐标 extent(幻影泄漏)"
+    );
+    assert!(e.check_report().unwrap().leaks.is_empty());
+    e.abort();
+
+    // ③ 本地化清算:段表改写本地 extent 3 + pending 摘除( alloc None,
+    // 账目精度非本用例主题;heal 会把被真实引用的 extent 3 置位)
+    {
+        let m = MetaStore::open(&cfg.meta_dir, &MetaConfig::default()).unwrap();
+        let local = || {
+            vec![Segment {
+                extent_id: 3,
+                offset: 0,
+                len: 8192,
+                crcs: vec![],
+            }]
+        };
+        let mut items = Vec::new();
+        let mut consumed = Vec::new();
+        for (g2, refs) in m.list_repl_pending(10).unwrap() {
+            for r in refs {
+                let key = match r.extent_id {
+                    7 => fs3_meta::keys::object_key("b1", "big-in"),
+                    4097 => fs3_meta::keys::object_key("b1", "big-out"),
+                    other => panic!("unexpected pending ref extent {other}"),
+                };
+                items.push(fs3_meta::ReplLocalizeItem {
+                    key,
+                    subs: vec![(r, local(), g2.epoch)],
+                });
+                consumed.push((g2, r));
+            }
+        }
+        assert_eq!(items.len(), 2);
+        m.repl_localize_segments(&items, &consumed, None, 100, &[])
+            .unwrap();
+        assert!(m.list_repl_pending(10).unwrap().is_empty());
+        m.flush().unwrap();
+    }
+    let e = Engine::open(&cfg).unwrap();
+    assert!(
+        e.allocator().test_bit(3),
+        "heal 对真实本地引用仍生效(防过度剔除)"
+    );
+    assert!(e.check_report().unwrap().leaks.is_empty());
+    e.abort();
+}
+
+/// M21 崩溃注入实测缺陷:恢复续写的开放 extent 必须在分配器里置 Open。
+/// 否则其状态停留在 Sealed,压缩把它当普通稀疏 extent 迁空并释放位图位,
+/// 而引擎仍在向其追加;位图位被清后 open_new_extent 可能分回同一 id,
+/// G-2 的 live_extent_occupancy 只看已提交段,看不到本会话未提交段 →
+/// 水位回退、覆写活数据(段表出现同 extent 同偏移的双段)。
+/// 触发无需空洞:崩溃时密集但低于 50% 活段阈值的开放 extent 即是候选。
+#[test]
+fn resumed_open_extent_is_not_compaction_source() {
+    let (_d, cfg) = setup();
+    let keep = rnd(100_000, 31);
+    let big = rnd(1_500_000, 32);
+    let open_id = {
+        let mut e = open_engine(&cfg);
+        e.put("b1", "keep", &mut Cursor::new(keep.clone())).unwrap();
+        e.put("b1", "big", &mut Cursor::new(big.clone())).unwrap();
+        // 密集但活段仅 ~38%(< 50% 阈值);崩溃不封口
+        let id = e.open_extent_snapshot()[0].map(|(id, _)| id).unwrap();
+        e.abort();
+        id
+    };
+    let mut e = open_engine(&cfg);
+    assert_eq!(
+        e.allocator().state_of(open_id as u64),
+        fs3_alloc::ExtentState::Open,
+        "恢复续写的开放 extent 须在分配器里置 Open"
+    );
+    let rep = e.compact_once().unwrap();
+    assert_eq!(
+        rep.migrated_objects, 0,
+        "开放 extent 不得成为压缩迁移源(迁空 → 释放 → 重分配覆写)"
+    );
+    // 追加写入后既有对象逐字节无损
+    let after = rnd(120_000, 33);
+    e.put("b1", "after", &mut Cursor::new(after.clone()))
+        .unwrap();
+    let mut out = Vec::new();
+    e.get_to("b1", "keep", 0..u64::MAX, &mut out).unwrap();
+    assert_eq!(out, keep);
+    out.clear();
+    e.get_to("b1", "big", 0..u64::MAX, &mut out).unwrap();
+    assert_eq!(out, big);
+    out.clear();
+    e.get_to("b1", "after", 0..u64::MAX, &mut out).unwrap();
+    assert_eq!(out, after);
+    e.close().unwrap();
+}
+
 // ─────────────────────────── M4 D4 故障注入 ───────────────────────────
 
 /// 故障注入 I/O 引擎:前 `budget` 次写 submit 成功,其后写操作失败(errno)。
@@ -8667,7 +8807,9 @@ fn ssekms_ingest_channel_default_encryption() {
 }
 
 fn bytes_contain(hay: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty() && hay.len() >= needle.len() && hay.windows(needle.len()).any(|w| w == needle)
+    !needle.is_empty()
+        && hay.len() >= needle.len()
+        && hay.windows(needle.len()).any(|w| w == needle)
 }
 
 fn tree_contains(root: &Path, needle: &[u8]) -> bool {
@@ -8719,7 +8861,10 @@ fn ssekms_ciphertext_on_disk_sampling() {
     plain[..32].copy_from_slice(b"PLAINTEXT-MARKER-SSEKMS-H2-TEST!");
     let m1 = put_kms(&mut e, "kms-a", &plain);
     let m2 = put_kms(&mut e, "kms-b", &plain);
-    assert!(m1.inline.is_none() && m2.inline.is_none(), "80KiB 走 extent");
+    assert!(
+        m1.inline.is_none() && m2.inline.is_none(),
+        "80KiB 走 extent"
+    );
     let c1 = m1.sse.as_ref().unwrap().kms_parts().unwrap().ciphertext;
     let c2 = m2.sse.as_ref().unwrap().kms_parts().unwrap().ciphertext;
     assert_ne!(c1, c2, "两次 mint DEK 独立,wrapped_dek 必不同");

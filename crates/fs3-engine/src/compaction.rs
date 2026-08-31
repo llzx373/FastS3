@@ -403,6 +403,7 @@ impl Compactor {
         };
         let mut batch_alloc = Some(rd.alloc.clone());
         self.alloc.mark_open(eid as u64);
+        tracing::info!("compaction batch: target extent={eid} items={}", plan.len());
         let mut wm: u32 = 0;
         let mut first_committed = false;
 
@@ -488,6 +489,12 @@ impl Compactor {
             match migrate {
                 Ok(_) => {
                     first_committed = true;
+                    tracing::debug!(
+                        "compaction migrate committed: target={:?} old={:?} new={:?}",
+                        item.target,
+                        item.old_segments,
+                        item.new_segments
+                    );
                     match &item.target {
                         PlanTarget::Object { .. } => report.migrated_objects += 1,
                         PlanTarget::Part { .. } => report.migrated_parts += 1,

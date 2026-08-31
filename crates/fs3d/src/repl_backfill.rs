@@ -526,7 +526,12 @@ async fn localize_target(
         // 拉取(锁外并发;重复拉取浪费由清算锁内复查兜底)
         let mut staged: Vec<(DataRef, ReplImportStaged)> = Vec::with_capacity(matched.len());
         for r in &matched {
-            match fetch_data_ref(inner, r, TrafficClass::Backfill).await {
+            let expect_crcs: &[u32] = segs
+                .iter()
+                .find(|s| s.extent_id == r.extent_id && s.offset == r.offset && s.len == r.len)
+                .map(|s| s.crcs.as_slice())
+                .unwrap_or(&[]);
+            match fetch_data_ref(inner, gtid.epoch, r, expect_crcs, TrafficClass::Backfill).await {
                 Ok(st) => staged.push((*r, st)),
                 Err(e) => {
                     // 已取到的暂存精确逆转账目
@@ -537,9 +542,9 @@ async fn localize_target(
                 }
             }
         }
-        let subs: Vec<(DataRef, Vec<fs3_core::Segment>)> = staged
+        let subs: Vec<(DataRef, Vec<fs3_core::Segment>, u64)> = staged
             .iter()
-            .map(|(r, st)| (*r, st.segments.clone()))
+            .map(|(r, st)| (*r, st.segments.clone(), gtid.epoch))
             .collect();
         let alloc = staged
             .iter()
@@ -647,23 +652,32 @@ async fn fetch_object(inner: &Arc<Inner>, bucket: &str, key: &str) -> Result<(),
                 Err(e) => return Err(format!("clear pending marker: {e}")),
             }
         }
-        // 去重(COW 跨条目/跨版本共享同一上游段):按身份只拉一次
-        let mut uniq: Vec<DataRef> = Vec::new();
-        for (_, r) in &matched {
+        // 去重(COW 跨条目/跨版本共享同一上游段):按身份只拉一次,epoch 取
+        // 首个命中记录之代(同数值身份跨代共存 = promote 后新代自写坐标与
+        // 旧代碰撞的病理形态,段表无 epoch 维度无法分辨,取首个并依赖
+        // serve 端按代翻译兜底)
+        let mut uniq: Vec<(u64, DataRef)> = Vec::new();
+        for (g, r) in &matched {
             if !uniq
                 .iter()
-                .any(|u| u.extent_id == r.extent_id && u.offset == r.offset && u.len == r.len)
+                .any(|(_, u)| u.extent_id == r.extent_id && u.offset == r.offset && u.len == r.len)
             {
-                uniq.push(*r);
+                uniq.push((g.epoch, *r));
             }
         }
         // 锁外拉取(失败:已取暂存精确逆转账目)
-        let mut staged: Vec<(DataRef, ReplImportStaged)> = Vec::with_capacity(uniq.len());
-        for r in &uniq {
-            match fetch_data_ref(inner, r, TrafficClass::OnDemand).await {
-                Ok(st) => staged.push((*r, st)),
+        let mut staged: Vec<(u64, DataRef, ReplImportStaged)> = Vec::with_capacity(uniq.len());
+        for (epoch, r) in &uniq {
+            let expect_crcs: &[u32] = entry_segs
+                .iter()
+                .flat_map(|(_, segs)| segs.iter())
+                .find(|s| s.extent_id == r.extent_id && s.offset == r.offset && s.len == r.len)
+                .map(|s| s.crcs.as_slice())
+                .unwrap_or(&[]);
+            match fetch_data_ref(inner, *epoch, r, expect_crcs, TrafficClass::OnDemand).await {
+                Ok(st) => staged.push((*epoch, *r, st)),
                 Err(e) => {
-                    for (_, st) in staged {
+                    for (_, _, st) in staged {
                         inner.engine.write().repl_import_abort(st);
                     }
                     return Err(format!("fetch segment {r:?}: {e}"));
@@ -673,14 +687,14 @@ async fn fetch_object(inner: &Arc<Inner>, bucket: &str, key: &str) -> Result<(),
         // 按条目组替换表(同一暂存段可被多条目/版本引用,各引一份)
         let mut items: Vec<ReplLocalizeItem> = Vec::new();
         for (k, segs) in &entry_segs {
-            let subs: Vec<(DataRef, Vec<fs3_core::Segment>)> = staged
+            let subs: Vec<(DataRef, Vec<fs3_core::Segment>, u64)> = staged
                 .iter()
-                .filter(|(r, _)| {
+                .filter(|(_, r, _)| {
                     segs.iter().any(|s| {
                         s.extent_id == r.extent_id && s.offset == r.offset && s.len == r.len
                     })
                 })
-                .map(|(r, st)| (*r, st.segments.clone()))
+                .map(|(epoch, r, st)| (*r, st.segments.clone(), *epoch))
                 .collect();
             if !subs.is_empty() {
                 items.push(ReplLocalizeItem {
@@ -691,7 +705,7 @@ async fn fetch_object(inner: &Arc<Inner>, bucket: &str, key: &str) -> Result<(),
         }
         let alloc = staged
             .iter()
-            .fold(fs3_core::AllocDraft::default(), |acc, (_, s)| {
+            .fold(fs3_core::AllocDraft::default(), |acc, (_, _, s)| {
                 acc.merge(s.alloc.clone())
             });
         // 分配记录挂命中条目的最大 seq(同池路径 gtid.seq 口径)
@@ -708,20 +722,20 @@ async fn fetch_object(inner: &Arc<Inner>, bucket: &str, key: &str) -> Result<(),
         };
         match res {
             Ok(_) => {
-                for (_, st) in staged {
+                for (_, _, st) in staged {
                     inner.engine.write().repl_import_committed(st);
                 }
                 return Ok(());
             }
             Err(fs3_core::Error::ObjectChanged(m)) => {
                 tracing::debug!("repl read-fetch localize recompute: {m}");
-                for (_, st) in staged {
+                for (_, _, st) in staged {
                     inner.engine.write().repl_import_abort(st);
                 }
                 continue;
             }
             Err(e) => {
-                for (_, st) in staged {
+                for (_, _, st) in staged {
                     inner.engine.write().repl_import_abort(st);
                 }
                 return Err(format!("localize txn: {e}"));
@@ -734,12 +748,26 @@ async fn fetch_object(inner: &Arc<Inner>, bucket: &str, key: &str) -> Result<(),
 /// 单上游段的字节拉取 + 本地落盘(C2 import_segments 同口径:
 /// 64MiB 分块,extent-data 响应头 CRC32C 逐块端到端校验;DataRef.
 /// crc32c 预留位非空时追加整段校验)。ReadPin 上游侧已管(服务端
-/// extent-data 端点口径)。
+/// extent-data 端点口径)。`epoch` = 引用所在记录的代(流坐标系身份,
+/// 随 URL 传递;serve 端按 (epoch, extent, off, len) 查 s:repl_rmap,
+/// 隔离 promote 前后同数值坐标的跨代碰撞)。`expect_crcs` = 记录内上游
+/// 段的 64KiB 网格 CRC(打包段;经 matched Segment 带入):serve 端
+/// CRC 响应头只证明「服务端发了什么」,不证明「发的是记录所指的字节」
+/// ——主端压缩迁移后旧流坐标空间可被复用,滞后/竞态拉取读到复用字节
+/// 且 CRC 自洽(M21 崩溃注入 promote 车道实测:静默串数据,备端全段
+/// 字节错)。按段内网格逐单元校验把该场景变成显式 Transient 重试
+/// (上游迁移落定后经 migrate 回放收敛;独占段 crcs 为空 = 无网格可
+/// 校验,维持原口径,残留缺口见 TODO 注记)。
 async fn fetch_data_ref(
     inner: &Arc<Inner>,
+    epoch: u64,
     dref: &DataRef,
+    expect_crcs: &[u32],
     class: TrafficClass,
 ) -> Result<ReplImportStaged, PullError> {
+    // 导入暂存串行:见 repl_worker::IMPORT_STAGE_MU 注释(M21 崩溃注入
+    // 实测:并发导入写者 feed 交错 → 字节串台)。
+    let _stage = crate::repl_worker::IMPORT_STAGE_MU.lock().await;
     let mut w = inner
         .engine
         .write()
@@ -748,6 +776,11 @@ async fn fetch_data_ref(
     let mut off = u64::from(dref.offset);
     let mut remaining = u64::from(dref.len);
     let mut crc_acc: Option<u32> = dref.crc32c.map(|_| 0);
+    // 段内 64KiB 网格校验状态(见函数注释;空网格 = 独占段,跳过):
+    // carry 攒跨响应块的不足一单元尾部,满一单元即验
+    let grid_unit = fs3_core::consts::SEGMENT_CRC_GRID as usize;
+    let mut grid_idx = 0usize;
+    let mut carry: Vec<u8> = Vec::new();
     while remaining > 0 {
         // E2 流量门:开下一块前查桶,透支即制动等回充(块原子口径:
         // 块内不受限,记账允许透支;语义见 repl_traffic.rs)
@@ -760,9 +793,11 @@ async fn fetch_data_ref(
         }
         let chunk = remaining.min(crate::repl_worker::EXTENT_DATA_CHUNK);
         // space=stream(E1):DataRef 是 binlog 流坐标(原始生产端坐标系);
-        // 上游是中继时经其 s:repl_rmap 翻译供数,是主端时回退本地直读
+        // epoch 随传(坐标系身份,serve 端按代隔离翻译,promote 后新代
+        // 自写坐标与旧代映射数值碰撞不得串代)。上游是中继时经其
+        // s:repl_rmap 翻译供数,是主端/新代自写时回退本地直读
         let path = format!(
-            "/v1/repl/v1/extent-data?extent_id={}&offset={off}&len={chunk}&space=stream",
+            "/v1/repl/v1/extent-data?extent_id={}&offset={off}&len={chunk}&space=stream&epoch={epoch}",
             dref.extent_id
         );
         inner.extent_data_requests.fetch_add(1, Ordering::Relaxed);
@@ -799,6 +834,31 @@ async fn fetch_data_ref(
         if let Some(acc) = &mut crc_acc {
             *acc = fs3_core::crc32c::crc32c(&bytes, *acc);
         }
+        // 段内网格逐单元校验(记录所指字节的内容证据;复用字节在此显式
+        // 失败 → Transient 重试,等 migrate 回放把引用改挂新坐标收敛)
+        if !expect_crcs.is_empty() {
+            carry.extend_from_slice(&bytes);
+            while carry.len() >= grid_unit {
+                let Some(&want) = expect_crcs.get(grid_idx) else {
+                    inner.engine.write().repl_import_abort_writer(w);
+                    return Err(PullError::Transient(format!(
+                        "extent-data grid overflow: more than {} units for ref {dref:?}",
+                        expect_crcs.len()
+                    )));
+                };
+                let got = fs3_core::crc32c::crc32c(&carry[..grid_unit], 0);
+                if want != got {
+                    inner.engine.write().repl_import_abort_writer(w);
+                    return Err(PullError::Transient(format!(
+                        "extent-data segment grid crc32c mismatch at unit {grid_idx} \
+                         (ref {dref:?}): record {want} != fetched {got} \
+                         (stale/reused stream coordinates)"
+                    )));
+                }
+                carry.drain(..grid_unit);
+                grid_idx += 1;
+            }
+        }
         if let Err(e) = inner.engine.write().repl_import_feed(&mut w, &bytes) {
             inner.engine.write().repl_import_abort_writer(w);
             return Err(PullError::Transient(format!("repl import feed: {e}")));
@@ -806,6 +866,32 @@ async fn fetch_data_ref(
         inner.traffic.consume(class, bytes.len() as u64);
         off += chunk;
         remaining -= chunk;
+    }
+    // 网格尾单元(不足 64KiB 按实际数据 CRC)+ 单元数闭环:段长必须
+    // 恰好被网格覆盖,多/少单元都是「拉到的不是记录所指段」
+    if !expect_crcs.is_empty() {
+        if !carry.is_empty() {
+            let got = fs3_core::crc32c::crc32c(&carry, 0);
+            match expect_crcs.get(grid_idx) {
+                Some(&want) if want == got => grid_idx += 1,
+                _ => {
+                    inner.engine.write().repl_import_abort_writer(w);
+                    return Err(PullError::Transient(format!(
+                        "extent-data segment grid crc32c mismatch at tail unit {grid_idx} \
+                         ({} bytes, ref {dref:?}) (stale/reused stream coordinates)",
+                        carry.len()
+                    )));
+                }
+            }
+        }
+        if grid_idx != expect_crcs.len() {
+            inner.engine.write().repl_import_abort_writer(w);
+            return Err(PullError::Transient(format!(
+                "extent-data segment grid unit count mismatch: fetched {grid_idx} units, \
+                 record expects {} (ref {dref:?})",
+                expect_crcs.len()
+            )));
+        }
     }
     // DataRef.crc32c 预留位:非空时整段校验(A1 提取恒 None,演进
     // 开启后此处即端到端整段口径)
