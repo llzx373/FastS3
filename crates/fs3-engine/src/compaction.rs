@@ -159,10 +159,11 @@ pub struct Compactor {
     mode: CompactorMode,
     /// 串行化批量执行(后台 worker 与前台 compact_once 互斥)。
     running: Mutex<()>,
-    /// 本压缩器创建的 extent(防抖动:自产 extent 不立即成为候选,否则
-    /// 迁移 → 新 extent → 再迁移无限循环;仅当活段显著恶化(删除)才重新
-    /// 进入候选)。
-    recent: Mutex<Vec<u64>>,
+    /// 本压缩器创建的 extent:(extent_id, 封口时活字节数)。防抖动:自产
+    /// extent 仅当活字节较封口时**显著下降**(删除真的发生)才重新成为
+    /// 候选;绝对阈值口径会让"本来就稀疏"的 lone 对象 extent 在阈值内
+    /// 无限乒乓互迁(净回收恒为零;M21 演练/崩溃注入实测,binlog 搅动)。
+    recent: Mutex<Vec<(u64, u64)>>,
 }
 
 /// 全局 extent id → (设备序, 本地 id) 推导(ADR-15 DM1';与 Engine 同表)。
@@ -268,13 +269,14 @@ impl Compactor {
                 .into_iter()
                 .filter(|&id| {
                     let recent = self.recent.lock().unwrap();
-                    if recent.contains(&id) {
-                        // 防抖动:自产 extent 仅当活段降到阈值一半以下(删除显著)
-                        // 才重新成为候选
-                        let lb = self.alloc.live_bytes_of(id) as f64;
-                        lb < capacity as f64 * self.cfg.threshold * 0.5
-                    } else {
-                        true
+                    match recent.iter().find(|&&(rid, _)| rid == id) {
+                        // 防抖动:自产 extent 仅当活字节较封口时下降过半(删除
+                        // 真的发生)才重新成为候选——相对判据;绝对阈值口径下
+                        // "本来就稀疏"的 lone 对象 extent 会无限乒乓互迁。
+                        Some(&(_, live_at_seal)) => {
+                            (self.alloc.live_bytes_of(id) as u64) < live_at_seal / 2
+                        }
+                        None => true,
                     }
                 })
                 .collect::<Vec<u64>>(),
@@ -529,9 +531,11 @@ impl Compactor {
             // 封口压缩 extent(打包头;各段 CRC 已随对象元数据)
             self.write_packed_header(eid)?;
             self.alloc.mark_sealed(eid as u64);
-            // 防抖动:自产 extent 进入 recent(上限 64,防无限增长)
+            // 防抖动:自产 extent 连同封口时活字节数入 recent(上限 64,防
+            // 无限增长);再准入判据 = 活字节较封口时下降过半(相对判据)
+            let live_at_seal = self.alloc.live_bytes_of(eid as u64) as u64;
             let mut recent = self.recent.lock().unwrap();
-            recent.push(eid as u64);
+            recent.push((eid as u64, live_at_seal));
             if recent.len() > 64 {
                 recent.remove(0);
             }
@@ -810,6 +814,135 @@ mod tests {
         assert!(!e.allocator().test_bit(0), "unpinned extent can compact");
         out.clear();
         e.get_to("b1", "k2", 0..u64::MAX, &mut out).unwrap();
+        assert_eq!(out, data);
+        assert!(e.leaks().unwrap().is_empty());
+        e.close().unwrap();
+    }
+
+    /// M21 遗留修复:防抖动窗改相对判据(活字节较封口时下降过半才再准入)。
+    /// lone 稀疏对象 extent(活字节远低于阈值)在旧的绝对阈值口径下会被
+    /// 反复接纳为候选——每次迁移产出一个同样稀疏的新 extent,净回收恒为
+    /// 零,无限乒乓互迁(M21 演练/崩溃注入实测,binlog 搅动)。新口径下
+    /// 第一次迁移(合法)之后,无真实删除即零候选。
+    #[test]
+    fn compaction_sparse_lone_extent_no_pingpong() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("disk.img");
+        std::fs::File::create(&img)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
+        let cfg = crate::EngineConfig {
+            devices: vec![img],
+            meta_dir: dir.path().join("meta"),
+            compaction: CompactionConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut e = crate::Engine::open(&cfg).unwrap();
+        e.ensure_bucket("b1").unwrap();
+
+        // 单个 100KiB 对象:extent 活字节 ≈2.4%,远低于 50% 阈值——旧的
+        // 绝对判据(封口后 live < threshold×0.5×容量)会放行 → 乒乓。
+        // (pad 对象 64KiB > 内联阈值 + seal-on-delete:让 extent 进入
+        //  Sealed 才可为候选)
+        let data = pattern_bytes(100 * 1024, 0x42);
+        e.put("b1", "pad", &mut Cursor::new(vec![0u8; 64 * 1024])).unwrap();
+        e.put("b1", "k1", &mut Cursor::new(data.clone())).unwrap();
+        assert_eq!(e.head("b1", "k1").unwrap().unwrap().extents[0].extent_id, 0);
+        e.delete("b1", "pad").unwrap();
+        assert_eq!(e.allocator().live_bytes_of(0), 100 * 1024);
+
+        // 第一次压缩:合法迁移(对象迁入新 extent,旧 extent 释放)
+        let r = e.compact_once().unwrap();
+        assert_eq!(r.candidates, 1);
+        assert_eq!(r.migrated_objects, 1);
+        assert_eq!(r.freed_extents, 1);
+        assert!(!e.allocator().test_bit(0), "旧 extent 应释放");
+
+        // 之后无真实删除:相对判据下不再成为候选(旧代码这里会反复迁移)
+        for round in 1..=3 {
+            let r = e.compact_once().unwrap();
+            assert_eq!(
+                r.candidates, 0,
+                "第 {round} 轮:lone 稀疏 extent 不应乒乓互迁(净回收恒为零)"
+            );
+            assert_eq!(r.migrated_objects, 0);
+        }
+
+        // 数据完好、无泄漏
+        let mut out = Vec::new();
+        e.get_to("b1", "k1", 0..u64::MAX, &mut out).unwrap();
+        assert_eq!(out, data);
+        assert!(e.leaks().unwrap().is_empty());
+        e.close().unwrap();
+    }
+
+    /// M21 遗留修复(相对判据的另一半):真实删除把自产 extent 的活字节
+    /// 压到封口时一半以下后,必须重新接纳为候选——防抖动不误伤正常回收。
+    #[test]
+    fn compaction_recent_readmitted_after_real_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("disk.img");
+        std::fs::File::create(&img)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
+        let cfg = crate::EngineConfig {
+            devices: vec![img],
+            meta_dir: dir.path().join("meta"),
+            compaction: CompactionConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut e = crate::Engine::open(&cfg).unwrap();
+        e.ensure_bucket("b1").unwrap();
+
+        // 10 × 300KiB ≈ 3MiB 进一个 extent(活 75%,非候选);删 7 个 →
+        // 活 900KiB ≈22% → 候选。
+        let data = pattern_bytes(300 * 1024, 0x77);
+        for i in 0..10 {
+            e.put("b1", &format!("k{i}"), &mut Cursor::new(data.clone()))
+                .unwrap();
+        }
+        assert_eq!(e.head("b1", "k0").unwrap().unwrap().extents[0].extent_id, 0);
+        for i in 0..7 {
+            e.delete("b1", &format!("k{i}")).unwrap();
+        }
+        assert_eq!(e.allocator().live_bytes_of(0), 900 * 1024);
+
+        // 第一次压缩:迁移 k7..k9 到新 extent,recent 记录 (新id, 900KiB)
+        let r = e.compact_once().unwrap();
+        assert_eq!(r.candidates, 1);
+        assert_eq!(r.migrated_objects, 3);
+        assert_eq!(r.freed_extents, 1);
+        assert!(!e.allocator().test_bit(0), "旧 extent 应释放");
+        let new_id = e.head("b1", "k9").unwrap().unwrap().extents[0].extent_id as u64;
+        assert_ne!(new_id, 0);
+
+        // 无进一步删除:活 900KiB 未低于封口值一半(450KiB) → 不乒乓
+        let r2 = e.compact_once().unwrap();
+        assert_eq!(r2.candidates, 0, "未显著删除,自产 extent 不应再迁");
+
+        // 真实删除:k7、k8 删掉 → 活 300KiB < 900KiB/2 → 重新接纳为候选
+        e.delete("b1", "k7").unwrap();
+        e.delete("b1", "k8").unwrap();
+        assert_eq!(e.allocator().live_bytes_of(new_id), 300 * 1024);
+        let r3 = e.compact_once().unwrap();
+        assert_eq!(r3.candidates, 1, "删除过半后应重新接纳");
+        assert_eq!(r3.migrated_objects, 1);
+        assert_eq!(r3.freed_extents, 1);
+        assert!(!e.allocator().test_bit(new_id), "二次迁移后旧 extent 应释放");
+
+        // 数据完好、无泄漏
+        let mut out = Vec::new();
+        e.get_to("b1", "k9", 0..u64::MAX, &mut out).unwrap();
         assert_eq!(out, data);
         assert!(e.leaks().unwrap().is_empty());
         e.close().unwrap();
