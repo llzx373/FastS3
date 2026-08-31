@@ -545,11 +545,12 @@ impl fs3_admin::ReplicationControl for RebuildService {
     }
 }
 
-// ─────────────────── CLI(`fasts3d replication rebuild`)───────────────────
+// ─────────────────── CLI(`fasts3d replication …`)───────────────────
 
-/// `fasts3d replication` 子命令面(M21 C5 起;F2 已落 status/slots/
-/// pause/resume/demote 的 admin 管理面,其 CLI 面暂不加——console 与
-/// curl 已覆盖,需要时按 rebuild 先例补)。
+/// `fasts3d replication` 子命令面:观测 + 本地裁决动作一律经运行中
+/// 实例的 admin API(CLI 不直接开库)。rebuild 是断档唯一入口
+/// (ADR-33 RP5.4);status/slots/pause/resume/promote/demote 与 Web
+/// 控制台同通道。
 #[derive(clap::Args)]
 pub struct ReplicationArgs {
     #[command(subcommand)]
@@ -558,6 +559,42 @@ pub struct ReplicationArgs {
 
 #[derive(clap::Subcommand)]
 pub enum ReplicationAction {
+    /// 复制拓扑状态(role/epoch/cursor/水位/上下游摘要)
+    Status {
+        #[command(flatten)]
+        admin: crate::admin_cli::AdminConnArgs,
+    },
+    /// 下游槽位观测(与复制口 GET /v1/repl/v1/slots 同口径)
+    Slots {
+        #[command(flatten)]
+        admin: crate::admin_cli::AdminConnArgs,
+    },
+    /// 暂停 pull worker 与回填池(幂等;只停流入,role 不动)
+    Pause {
+        #[command(flatten)]
+        admin: crate::admin_cli::AdminConnArgs,
+    },
+    /// 恢复 pull worker 与回填池(幂等;断档恢复不走本动作,须 rebuild)
+    Resume {
+        #[command(flatten)]
+        admin: crate::admin_cli::AdminConnArgs,
+    },
+    /// 备→主手动转正(`--dry-run` 纯读丢弃清单;`--force` 丢弃 pending 尾事务)
+    Promote {
+        /// 纯读丢弃清单,不停 worker、零副作用
+        #[arg(long)]
+        dry_run: bool,
+        /// 丢弃 data_pending 尾事务后转正
+        #[arg(long)]
+        force: bool,
+        #[command(flatten)]
+        admin: crate::admin_cli::AdminConnArgs,
+    },
+    /// 主→备只读(再接上游须 rebuild)
+    Demote {
+        #[command(flatten)]
+        admin: crate::admin_cli::AdminConnArgs,
+    },
     /// 断档/旧主重加入的显式重建(C5;ADR-33 RP5.4):清空本地复制状态
     /// 与复制面元数据,以 standby 从 --from 全量重建(快照导入 + 从
     /// 导出位点 P 追赶)。**不自动触发**——ErrBinlogGone/ErrDiverged 后
@@ -576,24 +613,110 @@ pub struct RebuildArgs {
     /// 复制槽名(缺省 = 节点现配置 [replication].slot_name/node_id)
     #[arg(long)]
     pub slot: Option<String>,
-    /// 本机 admin 通道(unix:///path 或 127.0.0.1:9001;缺省取配置
-    /// admin.listen)
-    #[arg(long)]
-    pub admin_listen: Option<String>,
-    /// admin Bearer token(缺省取配置 admin.token)
-    #[arg(long)]
-    pub admin_token: Option<String>,
+    #[command(flatten)]
+    pub admin: crate::admin_cli::AdminConnArgs,
 }
 
-/// CLI 入口:参数校验 → admin 通道 POST /v1/admin/replication/rebuild →
-/// 打印结果。重建本体在运行中的守护进程内执行(本地裁决 + worker 停启
-/// 编排只在进程内成立),CLI 不直接开库。
+/// CLI 入口:参数校验 → admin 通道 → 打印 JSON。重建/promote/demote
+/// 本体在运行中的守护进程内执行(本地裁决 + worker 停启编排只在进程内
+/// 成立),CLI 不直接开库。
 pub fn run_cli(
     args: &ReplicationArgs,
     cfg_admin_listen: Option<&str>,
     cfg_admin_token: Option<&str>,
 ) -> fs3_core::Result<()> {
+    use crate::admin_cli::{print_ok, request_ok, AdminConnArgs};
+
+    fn go(
+        admin: &AdminConnArgs,
+        cfg_listen: Option<&str>,
+        cfg_token: Option<&str>,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> fs3_core::Result<()> {
+        let (listen, token) = admin.resolve(cfg_listen, cfg_token)?;
+        print_ok(&request_ok(listen, token, method, path, body)?);
+        Ok(())
+    }
+
     match &args.action {
+        ReplicationAction::Status { admin } => go(
+            admin,
+            cfg_admin_listen,
+            cfg_admin_token,
+            "GET",
+            "/v1/admin/replication/status",
+            None,
+        ),
+        ReplicationAction::Slots { admin } => go(
+            admin,
+            cfg_admin_listen,
+            cfg_admin_token,
+            "GET",
+            "/v1/admin/replication/slots",
+            None,
+        ),
+        ReplicationAction::Pause { admin } => {
+            let body = serde_json::json!({ "operator": "cli:replication-pause" });
+            go(
+                admin,
+                cfg_admin_listen,
+                cfg_admin_token,
+                "POST",
+                "/v1/admin/replication/pause",
+                Some(&body),
+            )
+        }
+        ReplicationAction::Resume { admin } => {
+            let body = serde_json::json!({ "operator": "cli:replication-resume" });
+            go(
+                admin,
+                cfg_admin_listen,
+                cfg_admin_token,
+                "POST",
+                "/v1/admin/replication/resume",
+                Some(&body),
+            )
+        }
+        ReplicationAction::Promote {
+            dry_run,
+            force,
+            admin,
+        } => {
+            let mut q = Vec::new();
+            if *dry_run {
+                q.push("dry_run=true");
+            }
+            if *force {
+                q.push("force=true");
+            }
+            let path = if q.is_empty() {
+                "/v1/admin/replication/promote".to_string()
+            } else {
+                format!("/v1/admin/replication/promote?{}", q.join("&"))
+            };
+            let body = serde_json::json!({ "operator": "cli:replication-promote" });
+            go(
+                admin,
+                cfg_admin_listen,
+                cfg_admin_token,
+                "POST",
+                &path,
+                Some(&body),
+            )
+        }
+        ReplicationAction::Demote { admin } => {
+            let body = serde_json::json!({ "operator": "cli:replication-demote" });
+            go(
+                admin,
+                cfg_admin_listen,
+                cfg_admin_token,
+                "POST",
+                "/v1/admin/replication/demote",
+                Some(&body),
+            )
+        }
         ReplicationAction::Rebuild(a) => {
             if !a.as_standby {
                 return Err(fs3_core::Error::InvalidArgument(
@@ -606,18 +729,6 @@ pub fn run_cli(
                     a.from
                 )));
             }
-            let listen = a
-                .admin_listen
-                .as_deref()
-                .or(cfg_admin_listen)
-                .ok_or_else(|| {
-                    fs3_core::Error::InvalidArgument(
-                        "admin 通道未配置:--admin-listen 或配置 admin.listen 必填\
-                         (rebuild 经运行中实例的 admin API 执行)"
-                            .into(),
-                    )
-                })?;
-            let token = a.admin_token.as_deref().or(cfg_admin_token).unwrap_or("");
             let mut body = serde_json::json!({
                 "from": a.from,
                 "operator": "cli:replication-rebuild",
@@ -625,84 +736,14 @@ pub fn run_cli(
             if let Some(s) = &a.slot {
                 body["slot"] = serde_json::json!(s);
             }
-            let (status, resp) = admin_post(listen, token, "/v1/admin/replication/rebuild", &body)
-                .map_err(fs3_core::Error::InvalidArgument)?;
-            if !(200..300).contains(&status) {
-                return Err(fs3_core::Error::InvalidArgument(format!(
-                    "rebuild rejected (HTTP {status}): {resp}"
-                )));
-            }
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&resp).unwrap_or_default()
-            );
-            Ok(())
+            go(
+                &a.admin,
+                cfg_admin_listen,
+                cfg_admin_token,
+                "POST",
+                "/v1/admin/replication/rebuild",
+                Some(&body),
+            )
         }
     }
-}
-
-/// admin 通道最小客户端(阻塞;unix socket 免 token 语义 = 服务端
-/// token_ok 的 unix 分支;TCP 必须带 token)。响应读至连接关闭
-/// (connection: close),解析状态行 + content-length 切片 JSON。
-fn admin_post(
-    listen: &str,
-    token: &str,
-    path: &str,
-    body: &serde_json::Value,
-) -> Result<(u16, serde_json::Value), String> {
-    use std::io::{Read, Write};
-    let payload = serde_json::to_vec(body).map_err(|e| e.to_string())?;
-    let req = format!(
-        "POST {path} HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\n\
-         content-length: {}\r\nconnection: close\r\n{}\r\n",
-        payload.len(),
-        if token.is_empty() {
-            String::new()
-        } else {
-            format!("authorization: Bearer {token}\r\n")
-        }
-    );
-    let mut raw = Vec::new();
-    if let Some(sock) = listen.strip_prefix("unix://") {
-        let mut s = std::os::unix::net::UnixStream::connect(sock)
-            .map_err(|e| format!("connect admin unix {listen}: {e}"))?;
-        s.write_all(req.as_bytes())
-            .and_then(|()| s.write_all(&payload))
-            .and_then(|()| s.read_to_end(&mut raw))
-            .map_err(|e| format!("admin unix io: {e}"))?;
-    } else {
-        let addr: std::net::SocketAddr = listen
-            .parse()
-            .map_err(|e| format!("bad admin listen {listen}: {e}"))?;
-        let mut s = std::net::TcpStream::connect(addr)
-            .map_err(|e| format!("connect admin tcp {listen}: {e}"))?;
-        s.write_all(req.as_bytes())
-            .and_then(|()| s.write_all(&payload))
-            .and_then(|()| s.read_to_end(&mut raw))
-            .map_err(|e| format!("admin tcp io: {e}"))?;
-    }
-    let head_end = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or("bad admin response (no header terminator)")?;
-    let head = String::from_utf8_lossy(&raw[..head_end]).into_owned();
-    let status: u16 = head
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse().ok())
-        .ok_or("bad admin response status line")?;
-    let mut content_length = 0usize;
-    for l in head.lines().skip(1) {
-        if let Some((k, v)) = l.split_once(':') {
-            if k.eq_ignore_ascii_case("content-length") {
-                content_length = v.trim().parse().unwrap_or(0);
-            }
-        }
-    }
-    let body_bytes = &raw[head_end + 4..];
-    let body_bytes = &body_bytes[..content_length.min(body_bytes.len())];
-    let json = serde_json::from_slice(body_bytes)
-        .map_err(|e| format!("bad admin response json (HTTP {status}): {e}"))?;
-    Ok((status, json))
 }

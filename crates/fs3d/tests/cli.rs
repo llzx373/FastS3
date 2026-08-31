@@ -557,3 +557,67 @@ fn device_add_cli_cycle() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn replication_help_lists_ops_and_status_needs_admin() {
+    let out = run(&["replication", "--help"]);
+    assert!(out.status.success(), "replication --help failed");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for cmd in [
+        "status", "slots", "pause", "resume", "promote", "demote", "rebuild",
+    ] {
+        assert!(text.contains(cmd), "help missing {cmd}: {text}");
+    }
+
+    let out = run(&["replication", "status"]);
+    assert!(
+        !out.status.success(),
+        "status without admin listen must fail"
+    );
+    let err = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        err.contains("admin") && (err.contains("listen") || err.contains("通道")),
+        "must mention missing admin channel: {err}"
+    );
+
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let (mut s, _) = l.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = s.read(&mut buf);
+        let body = r#"{"ok":true,"data":{"role":"primary"}}"#;
+        let _ = s.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+    });
+    let out = run(&[
+        "replication",
+        "status",
+        "--admin-listen",
+        &addr,
+        "--admin-token",
+        "t",
+    ]);
+    assert!(
+        out.status.success(),
+        "status against mock admin failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("primary"), "{stdout}");
+}

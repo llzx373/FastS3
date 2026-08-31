@@ -155,6 +155,22 @@ fasts3d compact --config fasts3.toml --rounds 1   # 0 = 直到无候选
 > 压缩收益(安全地不回收,绝不误写);版本条目段迁移(ObjectMigrateVersion)
 > 留 v1.x 跟进。
 
+## replication —— 主备复制运维(经运行中实例的 admin API)
+
+```bash
+fasts3d replication status [--admin-listen unix:///run/fasts3/admin.sock]
+fasts3d replication slots
+fasts3d replication pause | resume
+fasts3d replication promote [--dry-run] [--force]
+fasts3d replication demote
+fasts3d replication rebuild --as-standby --from https://host:9445 [--slot NAME]
+```
+
+全部动作走运行中守护进程的 admin 通道(CLI 不直接开库);`--admin-listen` /
+`--admin-token` 缺省取配置 `admin.listen` / `admin.token`。`rebuild` 是断档/
+旧主重加入的唯一入口(ADR-33 RP5.4,不自动触发);`promote --dry-run` 只打印
+丢弃清单。
+
 ## 其它
 
 ```bash

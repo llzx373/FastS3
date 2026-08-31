@@ -14,6 +14,7 @@ use fs3_engine::{Engine, EngineConfig};
 use fs3_meta::SyncMode;
 use tracing_subscriber::prelude::*;
 
+mod admin_cli;
 mod bench;
 mod config;
 mod doctor;
