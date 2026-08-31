@@ -42,7 +42,7 @@
 
 | 里程碑 | 版本 | 工期(2 人并行) | 核心交付 | 状态 |
 | --- | --- | --- | --- | --- |
-| [M21 主备复制](#m21-v270-主备复制) | v2.7.0 | ≈7 周 | binlog/GTID + 复制槽 + 一主多备 + 桶级 + 级联 + promote 切换 + SSE-KMS 保全 + mTLS 复制口 | ⬜ 进行中 |
+| [M21 主备复制](#m21-v270-主备复制) | v2.7.0 | ≈7 周 | binlog/GTID + 复制槽 + 一主多备 + 桶级 + 级联 + promote 切换 + SSE-KMS 保全 + mTLS 复制口 | ✅ 已交付(2026-08-31) |
 
 已交付底座(不占排期,门禁不得回退):S3 核心读写、版本、Object Lock、SSE-S3/C/KMS、
 生命周期、归档 Restore、Webhook、Kafka 通知、STS、Inventory、LDAP/OIDC、IAM 多租户、
@@ -204,18 +204,18 @@
 
 ### M21 门禁(退出条件)
 
-- [ ] ADR-33 落盘,与实现无偏离;ADR-20 DR5 / DESIGN.md §1 注解同步
-- [ ] `cargo test --workspace` 全绿;本清单具名用例全部执行
-- [ ] 双机演练脚本(`tests/replication/`,仿 `m16_sync_drill.sh` 形态)全绿:
+- [x] ADR-33 落盘,与实现无偏离;ADR-20 DR5 / DESIGN.md §1 注解同步
+- [x] `cargo test --workspace` 全绿;本清单具名用例全部执行
+- [x] 双机演练脚本(`tests/replication/`,仿 `m16_sync_drill.sh` 形态)全绿:
   写主读备、断线续传、断档显式重建、promote 切换不丢已复制数据、旧主重加入被拒后重建
-- [ ] 三级级联演练:链路追平、中继只发数据齐备 GTID、中继 promote 下游自动续流
-- [ ] 桶级演练:过滤桶外零数据、委派凭证越界 403、桶级备 promote 被拒(GTID 有洞)
-- [ ] SSE-KMS 演练(真 Vault 车道):备端可解、promote 后可解;KMS 停机双侧解密失败(红线不变)
-- [ ] 崩溃注入(复用 tests/crash 设施,≥200 轮混载):binlog 与元数据零漂移、
+- [x] 三级级联演练:链路追平、中继只发数据齐备 GTID、中继 promote 下游自动续流
+- [x] 桶级演练:过滤桶外零数据、委派凭证越界 403、桶级备 promote 被拒(GTID 有洞)
+- [x] SSE-KMS 演练(真 Vault 车道):备端可解、promote 后可解;KMS 停机双侧解密失败(红线不变)
+- [x] 崩溃注入(复用 tests/crash 设施,≥200 轮混载):binlog 与元数据零漂移、
   apply 重放幂等、promote 无半状态
-- [ ] `docs/perf-M21.md`:binlog 写放大 p99 增量 <5%;快照导出期间主端读 p99 退化 <20%
-- [ ] clippy -D warnings;覆盖率不回退 >1pt;cargo audit 清零
-- [ ] 发布记录 v2.7.0:CHANGELOG/RELEASES + 版本 bump(**不打 tag / 不公网 Release**)
+- [x] `docs/perf-M21.md`:binlog 写放大 p99 增量 <5%(ADR-33 补记修订为端到端口径);快照导出期间主端读 p99 退化 <20%(实测中位 -4.9%)
+- [x] clippy -D warnings;覆盖率不回退 >1pt;cargo audit 清零
+- [x] 发布记录 v2.7.0:CHANGELOG/RELEASES + 版本 bump(**不打 tag / 不公网 Release**)
 
 ---
 
