@@ -1,4 +1,4 @@
-# M21 性能报告(binlog 写放大对照,A5)
+# M21 性能报告(binlog 写放大对照 A5 + 快照导出门禁补测)
 
 > 口径:TODO M21/A5 门禁——binlog 开(`MetaConfig.repl_binlog=true`)
 > 相对基线(off),**端到端组提交全路径(fsync 边界)PUT p99 增量
@@ -8,6 +8,7 @@
 > 签名路径,每臂 60s,同机顺序两跑);宿主 LiuMainPC(WSL2 虚拟盘;
 > 真 NVMe 以专用 runner 重录——与 baseline-v0.6.json 种子口径一致)。
 > 日期:2026-08-30;release 构建(HEAD 含 A5 开关)。
+> 快照导出期间主端读退化门禁(C1 落地后补测)见 §5,2026-08-31 实测。
 >
 > 开关途径(M21 期**开发态**,仅性能验证/演练用途):env
 > `FS3D_REPL_BINLOG=1` 时 `Engine::open` 装配 MetaStore 处置
@@ -107,8 +108,56 @@ memtable 插入,构成每提交真实开销;16MiB 段引用路径 binlog 记录
   **按修订口径门禁通过;真 NVMe 专用 runner 重录归人工后置。**
 - 读路径(GET)未见一致性回退(p50 持平;p99 单轮 ±44% 内双向摆动,
   视为宿主噪声)。
-- **待补测(门禁条目)**:「快照导出期间主端读 p99 退化 <20%」待 C1
-  快照导出落地后补测,本节暂缺。
+- **快照导出门禁(C1 落地后已补测,§5)**:快照导出(export_rate
+  默认 64MiB/s 档、贴桶持续拉取)期间主端 GET p99 退化中位
+  **-4.9%**(<20%,**PASS**)。
 - 免责:本宿主为 WSL2 虚拟盘,轮间噪声 ±20% 级(perf-M16 同口径
   已声明);上表数字仅作相对对照,发布口径以真 NVMe 专用 runner
   重录为准。
+
+## 5. 快照导出期间主端读退化(门禁补测,C1 落地后;2026-08-31)
+
+> 口径:TODO M21 门禁——**快照导出期间主端读 p99 退化 <20%**。
+> 基准脚本 `tests/bench/perf-m21-snapshot-export.sh`(可重复、自清理;
+> FASTS3D_BIN/WARP/DUR/ROUNDS/CONC/BUILD 可覆盖);同宿主 WSL2,免责
+> 同 §4;release 构建(HEAD = 393ba37,C1 已入 master)。
+
+方法:单主节点开复制口(`[replication]` 段;mTLS 三件套由
+tests/replication/lib.sh `m21_enroll` 签发,启动自检 serve.log
+`replication port listening` + 无证书握手层拒绝/带证书 slots 200),
+`export_rate` 不设 = 默认 64MiB/s 档;数据落 `target/tmp`(/tmp 16G
+tmpfs 避让,A5 同坑)。预灌两组常驻数据(--noclear,prep PUT 不进
+测量窗):混合尺寸桶 m21snap-pre(2MiB×512 + 32MiB×96 ≈ 4GiB;
+warp `--obj.randsize` 实测分布远偏小于均匀——首跑 256 对象仅
+~0.13GiB,弃用)与测量桶 m21snap-bench(16MiB×192 = 3GiB,固定尺寸
+保证 analyze JSON 有 single_sized_requests 分位)。每轮两臂各 60s
+warp GET(concurrent 16,workers=1,`--list-existing` 复用常驻数据集):
+
+- base 臂:纯稳态读;
+- export 臂:同负载进行中,python mTLS 客户端 `POST
+  /v1/repl/v1/snapshot` 开会话并持续分页拉取 meta + segments +
+  extent-data 段本体(64MiB 分块;测量窗内不 DELETE 保持导出活性,
+  臂尾才释放以免 ReadPin 滞留挤占后续轮次 MAX_SNAPSHOT_SESSIONS=4)。
+
+3 轮取中位;结果 JSON 在 tests/bench/results/(warp analyze --json:
+`perf-m21-snap-{base,export}-20260831-132620-r<N>.json` + 导出侧统计
+`perf-m21-snap-export-stats-…-r<N>.json`)。
+
+| 轮 | base p50→export p50 (ms) | base p99→export p99 (ms) | GET p99 Δ | GET ops base→export | 错误 |
+| --- | --- | --- | --- | --- | --- |
+| r1 | 316.5→323.1 | 673.3→529.8 | -21.3% | 3123→3027 | 0 |
+| r2 | 297.1→302.8 | 522.3→496.7 | -4.9% | 3242→3218 | 0 |
+| r3 | 278.7→297.8 | 463.7→486.9 | +5.0% | 3388→3202 | 0 |
+| **中位** | +2.1% | 522.3→496.7 | **-4.9%** | ≈-3% | 0 |
+
+导出侧活性核对(stats JSON):每臂 extent-data 实拉 9606MiB ≈
+63.6MiB/s 贴满 export_rate 共享桶(整遍活段 ~7.2GiB ≈ 112s,60s 测量
+窗全程被导出流量覆盖;窗外交由 deadline 收尾)。
+
+结论:**门禁通过**(中位 p99 退化 -4.9% ≪ 20%;三轮 -21.3%/-4.9%/
++5.0% 双向摆动即宿主噪声,p50 中位 +2.1%)。归因:导出读被
+ReplTraffic 共享令牌桶钳在 64MiB/s,相对 16MiB×16 并发 GET
+(~0.85GiB/s 级)是小份额;ReadPin 只钉段防迁移、不与前述读路径
+争锁,MVCC 快照经独立读线程供页;未见读放大迹象(export 臂 ops
+仅 -3% 级)。复跑交叉验证(randsize 预灌版,JSON 后缀 -131252):
+中位 +1.1%(+1.1/+0.5/+4.1),同向通过。真 NVMe 重录同 §4 后置。
