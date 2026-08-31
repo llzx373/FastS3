@@ -11,6 +11,7 @@ import {
   parsePublicAccessBlockXml,
   renderNotificationXml,
   renderPublicAccessBlockXml,
+  objectWriteHeaders,
   type InventoryRule,
   type NotificationRule,
   type PublicAccessBlock,
@@ -365,4 +366,91 @@ test("PublicAccessBlock XML 往返", () => {
   const xml = renderPublicAccessBlockXml(block);
   assert.match(xml, /<BlockPublicAcls>false<\/BlockPublicAcls>/);
   assert.deepEqual(parsePublicAccessBlockXml(xml), block);
+});
+
+test("objectWriteHeaders put 签 checksum/元数据/条件头", () => {
+  const h = objectWriteHeaders(
+    {
+      metadata: { Color: "red", owner: "alice" },
+      checksumAlgorithm: "sha256",
+      checksumValue: "AAAA",
+      ifNoneMatch: "*",
+      ifMatch: "abc",
+    },
+    "put"
+  );
+  assert.equal(h["x-amz-meta-color"], "red");
+  assert.equal(h["x-amz-meta-owner"], "alice");
+  assert.equal(h["x-amz-checksum-sha256"], "AAAA");
+  assert.equal(h["if-none-match"], "*");
+  assert.equal(h["if-match"], "abc");
+  const create = objectWriteHeaders({ metadata: { a: "1" }, checksumAlgorithm: "CRC32C" }, "create");
+  assert.equal(create["x-amz-checksum-algorithm"], "CRC32C");
+  assert.equal(create["x-amz-meta-a"], "1");
+  assert.equal(create["if-none-match"], undefined);
+  const part = objectWriteHeaders({ checksumAlgorithm: "SHA256", checksumValue: "BBBB", ifNoneMatch: "*" }, "part");
+  assert.equal(part["x-amz-checksum-sha256"], "BBBB");
+  assert.equal(part["if-none-match"], undefined);
+});
+
+test("presign PUT 带 checksum/元数据/If-None-Match", async () => {
+  const app = makeApp({});
+  const r = await auth(app, "POST", "/api/buckets/b1/presign", {
+    key: "obj",
+    method: "PUT",
+    metadata: { color: "red" },
+    checksumAlgorithm: "SHA256",
+    checksumValue: "uUwb+I8Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=",
+    ifNoneMatch: "*",
+  });
+  assert.equal(r.statusCode, 200, r.body);
+  const h = (r.json() as { headers: Record<string, string> }).headers;
+  assert.equal(h["x-amz-meta-color"], "red");
+  assert.equal(h["x-amz-checksum-sha256"], "uUwb+I8Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=");
+  assert.equal(h["if-none-match"], "*");
+  const signed = new URL((r.json() as { url: string }).url).searchParams.get("X-Amz-SignedHeaders") ?? "";
+  assert.match(signed, /x-amz-meta-color/);
+  assert.match(signed, /x-amz-checksum-sha256/);
+  assert.match(signed, /if-none-match/);
+});
+
+test("multipart init/complete 转发 checksum 算法与条件头", async () => {
+  const inits: Record<string, string>[] = [];
+  const completes: Record<string, string>[] = [];
+  const app = makeApp({
+    s3: {
+      createMultipart: async (_b: string, _k: string, extra: Record<string, string> = {}) => {
+        inits.push(extra);
+        return "uid-1";
+      },
+      completeMultipart: async (
+        _b: string,
+        _k: string,
+        _id: string,
+        _parts: unknown,
+        extra: Record<string, string> = {}
+      ) => {
+        completes.push(extra);
+        return "etag";
+      },
+    },
+  });
+  let r = await auth(app, "POST", "/api/buckets/b1/multipart/init", {
+    key: "big.bin",
+    metadata: { owner: "alice" },
+    checksumAlgorithm: "CRC32C",
+  });
+  assert.equal(r.statusCode, 200, r.body);
+  assert.equal((r.json() as { uploadId: string }).uploadId, "uid-1");
+  assert.equal(inits[0]?.["x-amz-meta-owner"], "alice");
+  assert.equal(inits[0]?.["x-amz-checksum-algorithm"], "CRC32C");
+
+  r = await auth(app, "POST", "/api/buckets/b1/multipart/complete", {
+    key: "big.bin",
+    uploadId: "uid-1",
+    parts: [{ etag: "p1", partNumber: 1 }],
+    ifNoneMatch: "*",
+  });
+  assert.equal(r.statusCode, 200, r.body);
+  assert.equal(completes[0]?.["if-none-match"], "*");
 });

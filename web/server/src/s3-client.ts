@@ -105,6 +105,63 @@ export function sseCustomerHeaders(b64: string): Record<string, string> {
   };
 }
 
+const CHECKSUM_ALGS = new Set(["CRC32", "CRC32C", "SHA1", "SHA256", "CRC64NVME"]);
+
+export type ObjectWriteMode = "put" | "create" | "complete" | "part";
+
+export interface ObjectWriteOpts {
+  metadata?: Record<string, string>;
+  checksumAlgorithm?: string;
+  checksumValue?: string;
+  ifMatch?: string;
+  ifNoneMatch?: string;
+}
+
+/** PutObject / CreateMultipart / Complete / UploadPart 的 checksum、用户元数据、条件写头。 */
+export function objectWriteHeaders(opts: ObjectWriteOpts, mode: ObjectWriteMode): Record<string, string> {
+  const headers: Record<string, string> = {};
+  const alg = opts.checksumAlgorithm?.trim();
+  if (alg) {
+    const up = alg.toUpperCase();
+    if (!CHECKSUM_ALGS.has(up)) {
+      throw new Error(`unsupported checksum algorithm: ${alg}`);
+    }
+    if (mode === "create") {
+      headers["x-amz-checksum-algorithm"] = up;
+    } else if (mode === "put" || mode === "part") {
+      const val = opts.checksumValue?.trim();
+      if (!val) throw new Error("checksumValue required for PUT/UploadPart");
+      headers[`x-amz-checksum-${up.toLowerCase()}`] = val;
+    }
+  } else if ((mode === "put" || mode === "part") && opts.checksumValue?.trim()) {
+    throw new Error("checksumAlgorithm required when checksumValue is set");
+  }
+
+  if (mode === "put" || mode === "create") {
+    let total = 0;
+    for (const [rawK, rawV] of Object.entries(opts.metadata ?? {})) {
+      const k = rawK.trim().toLowerCase();
+      const v = String(rawV);
+      if (!k) continue;
+      if (!/^[a-z0-9._-]+$/.test(k)) {
+        throw new Error(`invalid metadata key: ${rawK}`);
+      }
+      const hk = `x-amz-meta-${k}`;
+      total += hk.length + Buffer.byteLength(v);
+      if (total > 2048) throw new Error("user metadata exceeds 2KiB");
+      headers[hk] = v;
+    }
+  }
+
+  if (mode === "put" || mode === "complete") {
+    const im = opts.ifMatch?.trim();
+    const inm = opts.ifNoneMatch?.trim();
+    if (im) headers["if-match"] = im;
+    if (inm) headers["if-none-match"] = inm;
+  }
+  return headers;
+}
+
 function doRequest(
   cfg: S3ClientCfg,
   signed: SignedRequest

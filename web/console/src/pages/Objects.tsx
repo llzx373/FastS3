@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, fmtBytes, type ListResult, type BucketInfo, type ObjectVersion, type S3Tag, type ObjectRetention, type ObjectHead } from "../api";
 import { t, tf } from "../i18n";
 import { decidePreview, looksLikeSseCError, type PreviewDecision } from "../lib/preview";
+import { CHECKSUM_ALGS, checksumB64, parseUserMeta, type ChecksumAlg } from "../lib/checksum";
 
 const PART_SIZE = 8 * 1024 * 1024; // 8MiB/片(>5MiB 下限)
 const STORAGE_CLASSES = ["STANDARD", "GLACIER_IR", "GLACIER", "DEEP_ARCHIVE"] as const;
@@ -68,6 +69,10 @@ export default function Objects() {
   const [selected, setSelected] = useState<string[]>([]);
   const [uploadClass, setUploadClass] = useState("STANDARD");
   const [sseKey, setSseKey] = useState("");
+  const [uploadChecksum, setUploadChecksum] = useState("");
+  const [uploadMeta, setUploadMeta] = useState("");
+  const [uploadIfMatch, setUploadIfMatch] = useState("");
+  const [uploadIfNone, setUploadIfNone] = useState(false);
   const [restoreKey, setRestoreKey] = useState<string | null>(null);
   const [restoreDays, setRestoreDays] = useState("1");
   const [restoreTier, setRestoreTier] = useState("Standard");
@@ -118,30 +123,55 @@ export default function Objects() {
       setTasks((ts) => ts.map((t) => (t === task ? { ...t, progress: p, ...s } : t)));
     try {
       const key = prefix + file.name;
-      const extra = {
-        storageClass: uploadClass !== "STANDARD" ? uploadClass : undefined,
-        ...sseExtra(sseKey),
-      };
+      const metadata = parseUserMeta(uploadMeta);
+      const checksumAlgorithm = (uploadChecksum || undefined) as ChecksumAlg | undefined;
+      const ifMatch = uploadIfMatch.trim() || undefined;
+      const ifNoneMatch = uploadIfNone ? "*" : undefined;
+      const sse = sseExtra(sseKey);
+      const storageClass = uploadClass !== "STANDARD" ? uploadClass : undefined;
+      const metaExtra = Object.keys(metadata).length ? metadata : undefined;
       if (file.size <= PART_SIZE) {
-        const u = await api.presign(bucket, key, "PUT", 3600, file.type || "application/octet-stream", undefined, undefined, extra);
-        await fetch(u.url, { method: "PUT", body: file, headers: u.headers });
+        const buf = await file.arrayBuffer();
+        const checksumValue = checksumAlgorithm ? await checksumB64(checksumAlgorithm, buf) : undefined;
+        const u = await api.presign(bucket, key, "PUT", 3600, file.type || "application/octet-stream", undefined, undefined, {
+          storageClass,
+          ...sse,
+          metadata: metaExtra,
+          checksumAlgorithm,
+          checksumValue,
+          ifMatch,
+          ifNoneMatch,
+        });
+        const r = await fetch(u.url, { method: "PUT", body: buf, headers: u.headers });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
         update(100, { status: "done" });
       } else {
-        const { uploadId } = await api.multipartInit(bucket, key, extra.storageClass, extra.sseCustomerKey);
+        const { uploadId } = await api.multipartInit(bucket, key, {
+          storageClass,
+          ...sse,
+          metadata: metaExtra,
+          checksumAlgorithm,
+        });
         const partCount = Math.ceil(file.size / PART_SIZE);
         const parts: { etag: string; partNumber: number }[] = [];
         for (let i = 1; i <= partCount; i++) {
           const start = (i - 1) * PART_SIZE;
           const end = Math.min(start + PART_SIZE, file.size);
           const blob = file.slice(start, end);
-          const u = await api.presign(bucket, key, "PUT", 3600, "application/octet-stream", uploadId, i, extra);
-          const r = await fetch(u.url, { method: "PUT", body: blob, headers: u.headers });
+          const buf = await blob.arrayBuffer();
+          const checksumValue = checksumAlgorithm ? await checksumB64(checksumAlgorithm, buf) : undefined;
+          const u = await api.presign(bucket, key, "PUT", 3600, "application/octet-stream", uploadId, i, {
+            ...sse,
+            checksumAlgorithm,
+            checksumValue,
+          });
+          const r = await fetch(u.url, { method: "PUT", body: buf, headers: u.headers });
           if (!r.ok) throw new Error(`part ${i} failed: HTTP ${r.status}`);
           const etag = (r.headers.get("ETag") ?? "").replace(/^"|"$/g, "");
           parts.push({ etag, partNumber: i });
           update(Math.round((i / partCount) * 100));
         }
-        await api.multipartComplete(bucket, key, uploadId, parts, extra.sseCustomerKey);
+        await api.multipartComplete(bucket, key, uploadId, parts, { ...sse, ifMatch, ifNoneMatch });
         update(100, { status: "done" });
       }
       await load();
@@ -288,6 +318,38 @@ export default function Objects() {
           multiple
           hidden
           onChange={(e) => e.target.files && onFiles(e.target.files)}
+        />
+      </div>
+      <div className="toolbar" style={{ marginTop: -6 }}>
+        <select
+          value={uploadChecksum}
+          onChange={(e) => setUploadChecksum(e.target.value)}
+          title={t("上传 checksum 算法", "Upload checksum algorithm")}
+        >
+          <option value="">{t("无 checksum", "No checksum")}</option>
+          {CHECKSUM_ALGS.map((a) => (
+            <option key={a} value={a}>
+              {a}
+            </option>
+          ))}
+        </select>
+        <input
+          value={uploadIfMatch}
+          onChange={(e) => setUploadIfMatch(e.target.value)}
+          placeholder={t("If-Match ETag(可选)", "If-Match ETag (optional)")}
+          style={{ width: 180 }}
+          spellCheck={false}
+        />
+        <label style={{ display: "flex", alignItems: "center", gap: 6, color: "var(--muted)", whiteSpace: "nowrap" }}>
+          <input type="checkbox" checked={uploadIfNone} onChange={(e) => setUploadIfNone(e.target.checked)} />
+          {t("仅当键不存在", "Only if key does not exist")}
+        </label>
+        <input
+          value={uploadMeta}
+          onChange={(e) => setUploadMeta(e.target.value)}
+          placeholder={t("用户元数据 key=value;key=value", "User metadata key=value;key=value")}
+          style={{ flex: 1, minWidth: 180 }}
+          spellCheck={false}
         />
       </div>
 

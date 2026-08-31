@@ -618,7 +618,15 @@ export const api = {
     contentType?: string,
     uploadId?: string,
     partNumber?: number,
-    extra?: { storageClass?: string; sseCustomerKey?: string }
+    extra?: {
+      storageClass?: string;
+      sseCustomerKey?: string;
+      metadata?: Record<string, string>;
+      checksumAlgorithm?: string;
+      checksumValue?: string;
+      ifMatch?: string;
+      ifNoneMatch?: string;
+    }
   ) =>
     request<{ url: string; headers: Record<string, string>; expiresAt: number }>(
       "POST",
@@ -632,26 +640,44 @@ export const api = {
         partNumber,
         storageClass: extra?.storageClass,
         sseCustomerKey: extra?.sseCustomerKey,
+        metadata: extra?.metadata,
+        checksumAlgorithm: extra?.checksumAlgorithm,
+        checksumValue: extra?.checksumValue,
+        ifMatch: extra?.ifMatch,
+        ifNoneMatch: extra?.ifNoneMatch,
       }
     ),
-  multipartInit: (bucket: string, key: string, storageClass?: string, sseCustomerKey?: string) =>
+  multipartInit: (
+    bucket: string,
+    key: string,
+    extra?: {
+      storageClass?: string;
+      sseCustomerKey?: string;
+      metadata?: Record<string, string>;
+      checksumAlgorithm?: string;
+    }
+  ) =>
     request<{ uploadId: string }>("POST", `/api/buckets/${encodeURIComponent(bucket)}/multipart/init`, {
       key,
-      storageClass,
-      sseCustomerKey,
+      storageClass: extra?.storageClass,
+      sseCustomerKey: extra?.sseCustomerKey,
+      metadata: extra?.metadata,
+      checksumAlgorithm: extra?.checksumAlgorithm,
     }),
   multipartComplete: (
     bucket: string,
     key: string,
     uploadId: string,
     parts: { etag: string; partNumber: number }[],
-    sseCustomerKey?: string
+    extra?: { sseCustomerKey?: string; ifMatch?: string; ifNoneMatch?: string }
   ) =>
     request<{ etag: string }>("POST", `/api/buckets/${encodeURIComponent(bucket)}/multipart/complete`, {
       key,
       uploadId,
       parts,
-      sseCustomerKey,
+      sseCustomerKey: extra?.sseCustomerKey,
+      ifMatch: extra?.ifMatch,
+      ifNoneMatch: extra?.ifNoneMatch,
     }),
   multipartAbort: (bucket: string, key: string, uploadId: string) =>
     request<{ aborted: boolean }>("POST", `/api/buckets/${encodeURIComponent(bucket)}/multipart/abort`, {

@@ -62,7 +62,7 @@ import {
   type CallerIdentity,
 } from "./iam-authz.js";
 import { AdminWsClient } from "./admin-ws.js";
-import { S3Client, S3M10Client, sseCustomerHeaders, type BucketCorsRule, type LifecycleRule, type ObjectLockConfig, type S3Tag, type NotificationRule, type InventoryRule, type PublicAccessBlock } from "./s3-client.js";
+import { S3Client, S3M10Client, sseCustomerHeaders, objectWriteHeaders, type BucketCorsRule, type LifecycleRule, type ObjectLockConfig, type S3Tag, type NotificationRule, type InventoryRule, type PublicAccessBlock } from "./s3-client.js";
 import { presignUrl } from "./presign.js";
 import { buildDashboard, buildSnapshot, dashboardFromSnapshot, lastDashboardFrame } from "./dashboard.js";
 import { MetricsHistory } from "./metrics-history.js";
@@ -521,11 +521,29 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       partNumber?: number;
       storageClass?: string;
       sseCustomerKey?: string;
+      metadata?: Record<string, string>;
+      checksumAlgorithm?: string;
+      checksumValue?: string;
+      ifMatch?: string;
+      ifNoneMatch?: string;
     };
   }>("/api/buckets/:name/presign", async (req, reply) => {
     const { name } = req.params;
-    const { key, method = "PUT", expires = 3600, contentType, uploadId, partNumber, storageClass, sseCustomerKey } =
-      req.body ?? {};
+    const {
+      key,
+      method = "PUT",
+      expires = 3600,
+      contentType,
+      uploadId,
+      partNumber,
+      storageClass,
+      sseCustomerKey,
+      metadata,
+      checksumAlgorithm,
+      checksumValue,
+      ifMatch,
+      ifNoneMatch,
+    } = req.body ?? {};
     if (!key) {
       return reply.code(400).send({ error: { code: "bad_request", message: "missing key" } });
     }
@@ -541,6 +559,17 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       if (sseCustomerKey) {
         try {
           Object.assign(headers, sseCustomerHeaders(sseCustomerKey));
+        } catch (e) {
+          return reply.code(400).send({ error: { code: "bad_request", message: (e as Error).message } });
+        }
+      }
+      if (method === "PUT") {
+        const writeMode = uploadId !== undefined ? "part" : "put";
+        try {
+          Object.assign(
+            headers,
+            objectWriteHeaders({ metadata, checksumAlgorithm, checksumValue, ifMatch, ifNoneMatch }, writeMode)
+          );
         } catch (e) {
           return reply.code(400).send({ error: { code: "bad_request", message: (e as Error).message } });
         }
@@ -565,7 +594,18 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // ── multipart 编排(I3:大文件分片直传) ──
   app.post<{
     Params: { name: string; action: string };
-    Body: { key: string; uploadId?: string; partSize?: number; parts?: { etag: string; partNumber: number }[]; storageClass?: string; sseCustomerKey?: string };
+    Body: {
+      key: string;
+      uploadId?: string;
+      partSize?: number;
+      parts?: { etag: string; partNumber: number }[];
+      storageClass?: string;
+      sseCustomerKey?: string;
+      metadata?: Record<string, string>;
+      checksumAlgorithm?: string;
+      ifMatch?: string;
+      ifNoneMatch?: string;
+    };
   }>("/api/buckets/:name/multipart/:action", async (req, reply) => {
     const { name, action } = req.params;
     const body = req.body ?? {};
@@ -580,6 +620,14 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
           } catch (e) {
             return reply.code(400).send({ error: { code: "bad_request", message: (e as Error).message } });
           }
+        }
+        try {
+          Object.assign(
+            extra,
+            objectWriteHeaders({ metadata: body.metadata, checksumAlgorithm: body.checksumAlgorithm }, "create")
+          );
+        } catch (e) {
+          return reply.code(400).send({ error: { code: "bad_request", message: (e as Error).message } });
         }
         const uploadId = await s3.createMultipart(name, body.key, extra);
         return { uploadId };
@@ -597,6 +645,11 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
           } catch (e) {
             return reply.code(400).send({ error: { code: "bad_request", message: (e as Error).message } });
           }
+        }
+        try {
+          Object.assign(extra, objectWriteHeaders({ ifMatch: body.ifMatch, ifNoneMatch: body.ifNoneMatch }, "complete"));
+        } catch (e) {
+          return reply.code(400).send({ error: { code: "bad_request", message: (e as Error).message } });
         }
         const etag = await s3.completeMultipart(name, body.key, body.uploadId, body.parts, extra);
         return { etag };
