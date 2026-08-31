@@ -1124,6 +1124,31 @@ export class S3M10Client {
     return m ? m[1] : "BucketOwnerEnforced";
   }
 
+  /** GetPublicAccessBlock:无 `ba:` 键 → 数据面默认四开关全 true(不 404)。 */
+  async getPublicAccessBlock(bucket: string): Promise<PublicAccessBlock> {
+    const res = await this.call("GET", `/${bucket}?publicAccessBlock`);
+    return parsePublicAccessBlockXml(res.body.toString("utf8"));
+  }
+
+  /** PutPublicAccessBlock:四开关整份替换;缺字段由数据面 MalformedXML。 */
+  async putPublicAccessBlock(bucket: string, block: PublicAccessBlock): Promise<void> {
+    await this.call("PUT", `/${bucket}?publicAccessBlock`, Buffer.from(renderPublicAccessBlockXml(block)), {
+      "content-type": "application/xml",
+    });
+  }
+
+  /** DeletePublicAccessBlock:删键回到默认全 Block(不是全开)。 */
+  async deletePublicAccessBlock(bucket: string): Promise<void> {
+    await this.call("DELETE", `/${bucket}?publicAccessBlock`);
+  }
+
+  /** GetBucketPolicyStatus:IsPublic 与四开关 + 策略求交。 */
+  async getBucketPolicyStatus(bucket: string): Promise<{ IsPublic: boolean }> {
+    const res = await this.call("GET", `/${bucket}?policyStatus`);
+    const m = /<IsPublic>(true|false)<\/IsPublic>/.exec(res.body.toString("utf8"));
+    return { IsPublic: m?.[1] === "true" };
+  }
+
   async putBucketOwnership(bucket: string, ownership: string): Promise<void> {
     const xml =
       `<OwnershipControls xmlns="${S3_XMLNS}"><Rule><ObjectOwnership>${escapeXml(ownership)}</ObjectOwnership></Rule></OwnershipControls>`;
@@ -1185,6 +1210,42 @@ export class S3M10Client {
     }
     return res.body.toString("utf8");
   }
+}
+
+export interface PublicAccessBlock {
+  BlockPublicAcls: boolean;
+  IgnorePublicAcls: boolean;
+  BlockPublicPolicy: boolean;
+  RestrictPublicBuckets: boolean;
+}
+
+export const PUBLIC_ACCESS_BLOCK_DEFAULT: PublicAccessBlock = {
+  BlockPublicAcls: true,
+  IgnorePublicAcls: true,
+  BlockPublicPolicy: true,
+  RestrictPublicBuckets: true,
+};
+
+export function parsePublicAccessBlockXml(xml: string): PublicAccessBlock {
+  const flag = (tag: string) => new RegExp(`<${tag}>(true|false)</${tag}>`).exec(xml)?.[1] === "true";
+  return {
+    BlockPublicAcls: flag("BlockPublicAcls"),
+    IgnorePublicAcls: flag("IgnorePublicAcls"),
+    BlockPublicPolicy: flag("BlockPublicPolicy"),
+    RestrictPublicBuckets: flag("RestrictPublicBuckets"),
+  };
+}
+
+export function renderPublicAccessBlockXml(b: PublicAccessBlock): string {
+  const f = (v: boolean) => (v ? "true" : "false");
+  return (
+    `<PublicAccessBlockConfiguration xmlns="${S3_XMLNS}">` +
+    `<BlockPublicAcls>${f(b.BlockPublicAcls)}</BlockPublicAcls>` +
+    `<IgnorePublicAcls>${f(b.IgnorePublicAcls)}</IgnorePublicAcls>` +
+    `<BlockPublicPolicy>${f(b.BlockPublicPolicy)}</BlockPublicPolicy>` +
+    `<RestrictPublicBuckets>${f(b.RestrictPublicBuckets)}</RestrictPublicBuckets>` +
+    `</PublicAccessBlockConfiguration>`
+  );
 }
 
 export interface NotificationRule {

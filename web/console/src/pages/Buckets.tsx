@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, fmtBytes, fmtTime, type BucketInfo, type BucketCorsRule, type LifecycleRule, type ObjectLockConfig } from "../api";
 import { t, tf } from "../i18n";
-import { InventoryPane, NotificationPane, OwnershipPane, TagsPane } from "./BucketExtras";
+import { BpaPane, InventoryPane, NotificationPane, OwnershipPane, TagsPane } from "./BucketExtras";
 import { validatePolicy } from "./Keys";
 
 /** M16 A1:存储类分布紧凑展示("G:2/1.2KB D:1/4B";空 = "—")。 */
@@ -179,6 +179,7 @@ type SettingsTab =
   | "lock"
   | "tags"
   | "ownership"
+  | "bpa"
   | "notify"
   | "inventory";
 
@@ -187,6 +188,7 @@ const TAB_LABELS: { id: SettingsTab; label: string }[] = [
   { id: "versioning", label: t("版本化", "Versioning") },
   { id: "cors", label: "CORS" },
   { id: "policy", label: t("桶策略", "Policy") },
+  { id: "bpa", label: "BPA" },
   { id: "lifecycle", label: t("生命周期", "Lifecycle") },
   { id: "encryption", label: t("加密", "Encryption") },
   { id: "lock", label: t("对象锁", "Object Lock") },
@@ -226,6 +228,7 @@ function BucketSettings({
         {tab === "versioning" && <VersioningPane bucket={bucket} />}
         {tab === "cors" && <CorsPane bucket={bucket} />}
         {tab === "policy" && <PolicyPane bucket={bucket} />}
+        {tab === "bpa" && <BpaPane bucket={bucket} />}
         {tab === "lifecycle" && <LifecyclePane bucket={bucket} />}
         {tab === "encryption" && <EncryptionPane bucket={bucket} />}
         {tab === "lock" && <ObjectLockPane bucket={bucket} />}
@@ -506,6 +509,7 @@ function PolicyPane({ bucket }: { bucket: BucketInfo }) {
   const [errors, setErrors] = useState<string[]>([]);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [isPublic, setIsPublic] = useState<boolean | null>(null);
 
   useEffect(() => {
     api
@@ -520,6 +524,10 @@ function PolicyPane({ bucket }: { bucket: BucketInfo }) {
         setText(t);
       })
       .catch((e) => setErrors([(e as Error).message]));
+    api
+      .getPolicyStatus(bucket.name)
+      .then((s) => setIsPublic(s.IsPublic))
+      .catch(() => setIsPublic(null));
   }, [bucket.name]);
 
   const save = async () => {
@@ -557,6 +565,14 @@ function PolicyPane({ bucket }: { bucket: BucketInfo }) {
       <p className="muted" style={{ fontSize: 12, marginTop: 0 }}>
         支持 AWS 策略子集:Version / Statement[].{"{"}Effect, Action[], Resource[], Condition?{"}"}
         {t("。留空保存 = 删除策略。Resource 建议形如 arn:aws:s3:::桶名/*。", ". Save empty to delete the policy. Resource should look like arn:aws:s3:::bucket/*.")}
+        {isPublic !== null && (
+          <>
+            {" "}
+            {t("当前 IsPublic=", "Current IsPublic=")}
+            {String(isPublic)}
+            {t("（由 BPA 与策略求交，见 BPA 页）。", " (BPA ∩ policy; see the BPA tab).")}
+          </>
+        )}
       </p>
       <textarea
         value={text}

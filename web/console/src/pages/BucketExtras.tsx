@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, type BucketInfo, type InventoryRule, type NotificationRule, type S3Tag } from "../api";
+import {
+  api,
+  type BucketInfo,
+  type InventoryRule,
+  type NotificationRule,
+  type PublicAccessBlock,
+  type S3Tag,
+} from "../api";
+import { t } from "../i18n";
 
 export function TagsPane({ bucket }: { bucket: BucketInfo }) {
   const [tags, setTags] = useState<S3Tag[]>([]);
@@ -252,6 +260,110 @@ export function InventoryPane({ bucket }: { bucket: BucketInfo }) {
       >
         保存配置
       </button>
+    </div>
+  );
+}
+
+const BPA_DEFAULT: PublicAccessBlock = {
+  BlockPublicAcls: true,
+  IgnorePublicAcls: true,
+  BlockPublicPolicy: true,
+  RestrictPublicBuckets: true,
+};
+
+const BPA_FLAGS: { key: keyof PublicAccessBlock; zh: string; en: string }[] = [
+  { key: "BlockPublicAcls", zh: "阻止公开 ACL", en: "Block public ACLs" },
+  { key: "IgnorePublicAcls", zh: "忽略公开 ACL", en: "Ignore public ACLs" },
+  { key: "BlockPublicPolicy", zh: "阻止公开策略", en: "Block public bucket policies" },
+  { key: "RestrictPublicBuckets", zh: "限制公开桶", en: "Restrict public buckets" },
+];
+
+export function BpaPane({ bucket }: { bucket: BucketInfo }) {
+  const [block, setBlock] = useState<PublicAccessBlock>(BPA_DEFAULT);
+  const [isPublic, setIsPublic] = useState<boolean | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const load = useCallback(async () => {
+    try {
+      const [b, st] = await Promise.all([
+        api.getPublicAccessBlock(bucket.name),
+        api.getPolicyStatus(bucket.name).catch(() => ({ IsPublic: false })),
+      ]);
+      setBlock(b);
+      setIsPublic(st.IsPublic);
+      setError(null);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }, [bucket.name]);
+  useEffect(() => {
+    void load();
+  }, [load]);
+  const save = async () => {
+    setBusy(true);
+    try {
+      await api.putPublicAccessBlock(bucket.name, block);
+      await load();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const reset = async () => {
+    if (
+      !confirm(
+        t(
+          "恢复默认(四开关全开 Block)?DeletePublicAccessBlock 回到默认全 Block,不是全开。",
+          "Reset to defaults (all four Block switches on)? DeletePublicAccessBlock restores all-block, not all-open."
+        )
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    try {
+      await api.deletePublicAccessBlock(bucket.name);
+      await load();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div>
+      {error && <div className="alert">{error}</div>}
+      <p className="muted" style={{ fontSize: 12 }}>
+        {t(
+          "桶级 Public Access Block(ADR-23)。新桶默认四开关全 true;删除配置回到默认全 Block。",
+          "Bucket Public Access Block (ADR-23). New buckets default to all four flags true; deleting the config restores all-block defaults."
+        )}
+      </p>
+      <p className="muted" style={{ fontSize: 12 }}>
+        {t("策略公开状态", "Policy status")}:{" "}
+        {isPublic === null ? "…" : isPublic ? t("公开 (IsPublic=true)", "Public (IsPublic=true)") : t("非公开", "Not public")}
+      </p>
+      {BPA_FLAGS.map((f) => (
+        <div className="form-row" key={f.key}>
+          <label>
+            <input
+              type="checkbox"
+              checked={block[f.key]}
+              onChange={(e) => setBlock({ ...block, [f.key]: e.target.checked })}
+            />{" "}
+            {t(f.zh, f.en)}
+          </label>
+        </div>
+      ))}
+      <div className="actions">
+        <button className="ghost" onClick={() => void reset()} disabled={busy}>
+          {t("恢复默认", "Reset defaults")}
+        </button>
+        <button onClick={() => void save()} disabled={busy}>
+          {t("保存", "Save")}
+        </button>
+      </div>
     </div>
   );
 }

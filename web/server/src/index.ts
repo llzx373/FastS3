@@ -21,6 +21,7 @@
  *   M10:GET /api/buckets/{name}/versions;POST .../versions/action(restore/delete)
  *   M10:GET/PUT /api/buckets/{name}/versioning;GET/PUT/DELETE .../cors;GET/PUT/DELETE .../policy
  *   M10:GET /api/buckets/{name}/object-tags;POST .../object-tags/action(put)
+ *   M17:GET/PUT/DELETE /api/buckets/{name}/public-access-block;GET .../policy-status
  *   M11:GET/PUT/DELETE /api/buckets/{name}/lifecycle;GET/PUT/DELETE .../encryption(AES256|aws:kms)
  *   M20 G2:GET/POST /api/kms[...](KMS 状态/key CRUD/rotate/托管服务;consoleAdmin)
  *   M12:GET/PUT /api/buckets/{name}/object-lock;GET/PUT .../object-lock/{retention,legal-hold}
@@ -61,7 +62,7 @@ import {
   type CallerIdentity,
 } from "./iam-authz.js";
 import { AdminWsClient } from "./admin-ws.js";
-import { S3Client, S3M10Client, type BucketCorsRule, type LifecycleRule, type ObjectLockConfig, type S3Tag, type NotificationRule, type InventoryRule } from "./s3-client.js";
+import { S3Client, S3M10Client, type BucketCorsRule, type LifecycleRule, type ObjectLockConfig, type S3Tag, type NotificationRule, type InventoryRule, type PublicAccessBlock } from "./s3-client.js";
 import { createHash } from "node:crypto";
 import { presignUrl } from "./presign.js";
 import { buildDashboard, buildSnapshot, dashboardFromSnapshot, lastDashboardFrame } from "./dashboard.js";
@@ -1292,6 +1293,60 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         }
       }
     );
+
+    app.get<{ Params: { name: string } }>("/api/buckets/:name/public-access-block", async (req, reply) => {
+      try {
+        return await m10.getPublicAccessBlock(req.params.name);
+      } catch (e) {
+        return m10Error(e, reply, req.params.name);
+      }
+    });
+    app.put<{ Params: { name: string }; Body: Partial<PublicAccessBlock> }>(
+      "/api/buckets/:name/public-access-block",
+      { preHandler: requireIamAction(admin, "admin:UpdateBucket", ownTenant) },
+      async (req, reply) => {
+        const b = req.body ?? {};
+        const flags: (keyof PublicAccessBlock)[] = [
+          "BlockPublicAcls",
+          "IgnorePublicAcls",
+          "BlockPublicPolicy",
+          "RestrictPublicBuckets",
+        ];
+        for (const k of flags) {
+          if (typeof b[k] !== "boolean") {
+            return reply.code(400).send({
+              error: { code: "bad_request", message: `${k} must be boolean` },
+            });
+          }
+        }
+        const block = b as PublicAccessBlock;
+        try {
+          await m10.putPublicAccessBlock(req.params.name, block);
+          return block;
+        } catch (e) {
+          return m10Error(e, reply, req.params.name);
+        }
+      }
+    );
+    app.delete<{ Params: { name: string } }>(
+      "/api/buckets/:name/public-access-block",
+      { preHandler: requireIamAction(admin, "admin:UpdateBucket", ownTenant) },
+      async (req, reply) => {
+        try {
+          await m10.deletePublicAccessBlock(req.params.name);
+          return { deleted: req.params.name };
+        } catch (e) {
+          return m10Error(e, reply, req.params.name);
+        }
+      }
+    );
+    app.get<{ Params: { name: string } }>("/api/buckets/:name/policy-status", async (req, reply) => {
+      try {
+        return await m10.getBucketPolicyStatus(req.params.name);
+      } catch (e) {
+        return m10Error(e, reply, req.params.name);
+      }
+    });
 
     app.get<{ Params: { name: string } }>("/api/buckets/:name/notification", async (req, reply) => {
       try {

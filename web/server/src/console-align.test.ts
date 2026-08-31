@@ -8,9 +8,12 @@ import { buildServer } from "./index.js";
 import { loadConfig } from "./config.js";
 import {
   parseNotificationXml,
+  parsePublicAccessBlockXml,
   renderNotificationXml,
+  renderPublicAccessBlockXml,
   type InventoryRule,
   type NotificationRule,
+  type PublicAccessBlock,
   type S3M10Client,
   type S3Tag,
 } from "./s3-client.js";
@@ -171,6 +174,58 @@ test("桶标签 / 所有权 / 通知 / 清单 桥接 s3m10", async () => {
   assert.equal(r.statusCode, 200);
 });
 
+test("PublicAccessBlock / policy-status 桥接 s3m10", async () => {
+  let block: PublicAccessBlock = {
+    BlockPublicAcls: true,
+    IgnorePublicAcls: true,
+    BlockPublicPolicy: true,
+    RestrictPublicBuckets: true,
+  };
+  let isPublic = false;
+  const fake: Partial<S3M10Client> = {
+    getPublicAccessBlock: async () => block,
+    putPublicAccessBlock: async (_b, next) => {
+      block = next;
+    },
+    deletePublicAccessBlock: async () => {
+      block = {
+        BlockPublicAcls: true,
+        IgnorePublicAcls: true,
+        BlockPublicPolicy: true,
+        RestrictPublicBuckets: true,
+      };
+    },
+    getBucketPolicyStatus: async () => ({ IsPublic: isPublic }),
+  };
+  const app = makeApp({ s3m10: fake });
+  let r = await auth(app, "GET", "/api/buckets/b1/public-access-block");
+  assert.equal(r.statusCode, 200);
+  assert.equal((r.json() as PublicAccessBlock).BlockPublicAcls, true);
+
+  r = await auth(app, "PUT", "/api/buckets/b1/public-access-block", {
+    BlockPublicAcls: false,
+    IgnorePublicAcls: true,
+    BlockPublicPolicy: true,
+    RestrictPublicBuckets: true,
+  });
+  assert.equal(r.statusCode, 200, r.body);
+  assert.equal((r.json() as PublicAccessBlock).BlockPublicAcls, false);
+
+  r = await auth(app, "PUT", "/api/buckets/b1/public-access-block", { BlockPublicAcls: true });
+  assert.equal(r.statusCode, 400);
+
+  r = await auth(app, "GET", "/api/buckets/b1/policy-status");
+  assert.equal((r.json() as { IsPublic: boolean }).IsPublic, false);
+  isPublic = true;
+  r = await auth(app, "GET", "/api/buckets/b1/policy-status");
+  assert.equal((r.json() as { IsPublic: boolean }).IsPublic, true);
+
+  r = await auth(app, "DELETE", "/api/buckets/b1/public-access-block");
+  assert.equal(r.statusCode, 200);
+  r = await auth(app, "GET", "/api/buckets/b1/public-access-block");
+  assert.equal((r.json() as PublicAccessBlock).BlockPublicAcls, true);
+});
+
 test("deleteMany / 跨桶 copy / object-head 走数据面客户端", async () => {
   const deleted: string[][] = [];
   const copies: Array<{ src: string; dstB: string; dstK: string }> = [];
@@ -250,4 +305,16 @@ test("通知 XML 往返(TopicConfiguration = webhook URL)", () => {
   const xml = renderNotificationXml(rules);
   assert.match(xml, /<Topic>https:\/\/hooks.example\/fs3<\/Topic>/);
   assert.deepEqual(parseNotificationXml(xml), rules);
+});
+
+test("PublicAccessBlock XML 往返", () => {
+  const block: PublicAccessBlock = {
+    BlockPublicAcls: false,
+    IgnorePublicAcls: true,
+    BlockPublicPolicy: true,
+    RestrictPublicBuckets: false,
+  };
+  const xml = renderPublicAccessBlockXml(block);
+  assert.match(xml, /<BlockPublicAcls>false<\/BlockPublicAcls>/);
+  assert.deepEqual(parsePublicAccessBlockXml(xml), block);
 });

@@ -272,6 +272,14 @@ export interface S3Tag {
   value: string;
 }
 
+/** 桶级 PublicAccessBlock 四开关(AWS 同名;新桶/Delete 后默认全 true)。 */
+export interface PublicAccessBlock {
+  BlockPublicAcls: boolean;
+  IgnorePublicAcls: boolean;
+  BlockPublicPolicy: boolean;
+  RestrictPublicBuckets: boolean;
+}
+
 /**
  * M11:桶级生命周期规则(AWS Rule 子集;Expiration 三字段互斥恰选其一;
  * Filter 单 Tag 起步,缺省 = 全部对象)。
@@ -1052,6 +1060,18 @@ export const api = {
     request<{ ObjectOwnership: string }>("PUT", `/api/buckets/${encodeURIComponent(bucket)}/ownership`, {
       ObjectOwnership,
     }),
+
+  getPublicAccessBlock: (bucket: string) =>
+    request<PublicAccessBlock>("GET", `/api/buckets/${encodeURIComponent(bucket)}/public-access-block`),
+  putPublicAccessBlock: (bucket: string, block: PublicAccessBlock) =>
+    request<PublicAccessBlock>("PUT", `/api/buckets/${encodeURIComponent(bucket)}/public-access-block`, block),
+  deletePublicAccessBlock: (bucket: string) =>
+    request<Record<string, unknown>>(
+      "DELETE",
+      `/api/buckets/${encodeURIComponent(bucket)}/public-access-block`
+    ),
+  getPolicyStatus: (bucket: string) =>
+    request<{ IsPublic: boolean }>("GET", `/api/buckets/${encodeURIComponent(bucket)}/policy-status`),
 
   getNotification: (bucket: string) =>
     request<{ rules: NotificationRule[] }>("GET", `/api/buckets/${encodeURIComponent(bucket)}/notification`),
