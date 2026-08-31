@@ -5,6 +5,40 @@
 > 详细发布记录见 [RELEASES.md](./RELEASES.md);RC/GA 候选流程见
 > [docs/ga/rc-flow.md](./docs/ga/rc-flow.md)。
 
+## v2.7.0 — M21 主备复制(2026-08-31)
+
+M21 全部任务与门禁完成(TODO.md M21 全勾选);ADR-33 落盘 DESIGN.md §3.3
+(正面修订 ADR-20 DR5 与 §1.3 非目标注解,主备复制由非目标转正为内置能力);
+workspace + web console/server 版本 **2.7.0**。git tag / `tools/package/`
+属执行期步骤(**本版本不打 tag / 不公网 Release**,与 v2.6.0 同口径);
+`?replication` S3 公网动词维持 501 排除不变。
+
+- **复制日志**(A):binlog `bl:{epoch}{seq}` + ReplRecord(postcard + 版本字节)
+  与元数据同事务落盘;GTID{epoch,seq}(seq = s:seq − ebase 代内重计);
+  executed 区间集;两级水位截断(软保槽 / 硬截 stale);meta-export 携带
+  复制状态。
+- **复制通道**(B):独立复制口 9445 mTLS 强制(CN = node_id);HELLO 三件套
+  握手(位点 / 包含性 / 过滤器)+ 环检测;复制槽(max_slots = 16 硬限);
+  下游 pull worker(长轮询 / 幂等 apply / 游标同事务)。
+- **追平与导入**(C):在线快照导出(MVCC + ReadPin + 限速 + 断点续);逻辑段
+  导入(异构设备);段回填池(8 并发);读路径缺数据同步拉取(30s 超时 /
+  503 + Retry-After);断档显式 rebuild(CLI + admin)。
+- **拓扑与观测**(D):一主多备 fan-out + 逐槽 lag 观测;桶级过滤(心跳带过);
+  上游委派只读凭证(删槽即吊销);逐槽 Prometheus 指标。
+- **切换与降级**(E):级联中继(发送水位 ≤ 数据水位);流量优先级令牌桶
+  (serve > backfill > on_demand);手动 promote(dry-run 丢弃清单 +
+  EpochBarrier 同事务);epoch fencing;旧主显式 rebuild 唯一重加入路径;
+  备端只读 501 `ReplicationStandby` + `X-FastS3-Repl-Applied-Gtid` 响应头。
+- **KMS/管理面/文档**(F):SSE-KMS 共享 KMS 保全(真 Vault 车道);SSE-S3
+  种子随同;admin API `/v1/admin/replication/*`(status/slots/pause/resume/
+  promote/demote/rebuild);console 复制拓扑页;`[replication]` 配置段。
+- **门禁**:`cargo test --workspace` 945 测试全绿;clippy `-D warnings`
+  零告警;cargo audit 0 漏洞;覆盖率 llvm-cov 行 **84.27%**(相对 v2.6.0
+  84.35% -0.08pt,不回退 >1pt 达标);双机/级联/桶级/SSE-KMS 演练脚本
+  (tests/replication/)全绿;崩溃注入 200 轮混载 356 断言(promote 并发
+  kill 16 次)零漂移;perf-M21(binlog 端到端口径达标;快照导出期间主端读
+  p99 中位 -4.9% 无退化);**本版本不打 tag / 不公网 Release**。
+
 ## v2.6.0 — M20 SSE-KMS 密钥托管(2026-08-30)
 
 M20 全部任务与门禁完成(TODO.md M20 全勾选);ADR-29 落盘 DESIGN.md §3.3

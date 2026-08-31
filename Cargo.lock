@@ -625,7 +625,7 @@ dependencies = [
 
 [[package]]
 name = "fs3-admin"
-version = "2.6.0"
+version = "2.7.0"
 dependencies = [
  "fs3-core",
  "fs3-device",
@@ -650,7 +650,7 @@ dependencies = [
 
 [[package]]
 name = "fs3-agent"
-version = "2.6.0"
+version = "2.7.0"
 dependencies = [
  "base64",
  "bytes",
@@ -673,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "fs3-alloc"
-version = "2.6.0"
+version = "2.7.0"
 dependencies = [
  "fs3-core",
  "fs3-device",
@@ -683,7 +683,7 @@ dependencies = [
 
 [[package]]
 name = "fs3-core"
-version = "2.6.0"
+version = "2.7.0"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -702,7 +702,7 @@ dependencies = [
 
 [[package]]
 name = "fs3-device"
-version = "2.6.0"
+version = "2.7.0"
 dependencies = [
  "fs3-core",
  "libc",
@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "fs3-engine"
-version = "2.6.0"
+version = "2.7.0"
 dependencies = [
  "fs3-alloc",
  "fs3-core",
@@ -733,7 +733,7 @@ dependencies = [
 
 [[package]]
 name = "fs3-http"
-version = "2.6.0"
+version = "2.7.0"
 dependencies = [
  "bytes",
  "fs3-core",
@@ -771,7 +771,7 @@ dependencies = [
 
 [[package]]
 name = "fs3-kms"
-version = "2.6.0"
+version = "2.7.0"
 dependencies = [
  "base64",
  "fs3-core",
@@ -789,7 +789,7 @@ dependencies = [
 
 [[package]]
 name = "fs3-meta"
-version = "2.6.0"
+version = "2.7.0"
 dependencies = [
  "fs3-core",
  "postcard",
@@ -802,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "fs3-s3"
-version = "2.6.0"
+version = "2.7.0"
 dependencies = [
  "base64",
  "fs3-core",
@@ -828,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "fs3d"
-version = "2.6.0"
+version = "2.7.0"
 dependencies = [
  "base64",
  "bytes",

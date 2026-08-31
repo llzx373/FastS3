@@ -1559,7 +1559,8 @@ mod tests {
         );
     }
 
-    /// M20 门禁:CHANGELOG/RELEASES v2.6.0;workspace 2.6.0;不打 tag;M20 门禁勾选。
+    /// M20 门禁:CHANGELOG/RELEASES v2.6.0;不打 tag;M20 门禁勾选。
+    /// (workspace 版本钉由最新发布条目承担,历史条目不钉版本——同 g6 口径)
     #[test]
     fn m20_changelog_releases_v260_no_tag() {
         let cl = include_str!("../../../CHANGELOG.md");
@@ -1576,15 +1577,6 @@ mod tests {
         let rel = include_str!("../../../RELEASES.md");
         assert!(rel.contains("## v2.6.0 — M20"));
         assert!(rel.contains("本版本不打 tag"));
-        let cargo = include_str!("../../../Cargo.toml");
-        assert!(
-            cargo.contains("version = \"2.6.0\""),
-            "workspace.package.version = 2.6.0"
-        );
-        let cons = include_str!("../../../web/console/package.json");
-        let srv = include_str!("../../../web/server/package.json");
-        assert!(cons.contains("\"version\": \"2.6.0\""));
-        assert!(srv.contains("\"version\": \"2.6.0\""));
         let todo = include_str!("../../../docs/archive/TODO-v2.6.0.md");
         assert!(
             todo.contains("- [x] A0-1 ADR-29")
@@ -1593,6 +1585,41 @@ mod tests {
                 && todo.contains("- [x] H3 ")
                 && todo.contains("### M20 门禁"),
             "M20 ADR-29 与 H1/H2/H3 须已勾;门禁节须存在"
+        );
+    }
+
+    /// M21 门禁:CHANGELOG/RELEASES v2.7.0;workspace 2.7.0;不打 tag;M21 门禁节存在。
+    /// 注意:TODO.md M21 勾选由发布收口时完成,本用例只断言章节存在与文件内容,
+    /// 不断言勾选状态(勾选前后均须成立)。
+    #[test]
+    fn m21_changelog_releases_v270_no_tag() {
+        let cl = include_str!("../../../CHANGELOG.md");
+        let v27 = cl
+            .split("## v2.7.0")
+            .nth(1)
+            .and_then(|s| s.split("\n## ").next())
+            .expect("CHANGELOG v2.7.0");
+        assert!(v27.contains("本版本不打 tag"), "v2.7.0 须声明不打 tag");
+        assert!(
+            v27.contains("ADR-33") && v27.contains("主备复制"),
+            "v2.7.0 须引用 ADR-33"
+        );
+        let rel = include_str!("../../../RELEASES.md");
+        assert!(rel.contains("## v2.7.0 — M21"));
+        assert!(rel.contains("本版本不打 tag"));
+        let cargo = include_str!("../../../Cargo.toml");
+        assert!(
+            cargo.contains("version = \"2.7.0\""),
+            "workspace.package.version = 2.7.0"
+        );
+        let cons = include_str!("../../../web/console/package.json");
+        let srv = include_str!("../../../web/server/package.json");
+        assert!(cons.contains("\"version\": \"2.7.0\""));
+        assert!(srv.contains("\"version\": \"2.7.0\""));
+        let todo = include_str!("../../../TODO.md");
+        assert!(
+            todo.contains("### M21 门禁") && todo.contains("发布记录 v2.7.0"),
+            "TODO.md 的 M21 门禁节须存在并含 v2.7.0 发布记录条目(勾选状态由发布收口断言,此处不钉)"
         );
     }
 

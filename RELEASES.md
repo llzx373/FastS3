@@ -1,5 +1,49 @@
 # FastS3 发布记录
 
+## v2.7.0 — M21 主备复制(2026-08-31)
+
+> 发布状态:与 M21 交付同步;git tag/发布流水线属执行期步骤(与 v2.6.0
+> 同口径,**本版本不打 tag / 不公网 Release**)。决策记录:ADR-33
+> (docs/DESIGN.md §3.3,与实现无偏离;正面修订 ADR-20 DR5 与 §1.3
+> 非目标注解,主备复制转正为内置能力;`?replication` S3 公网动词维持
+> 501 排除不变)。
+
+### 变更(TODO M21 全项:A~F + 门禁)
+
+- **复制日志**:binlog `bl:{epoch}{seq}` 与元数据同事务落盘(postcard +
+  版本字节 ReplRecord);GTID{epoch,seq} 代内重计;executed 区间集;两级
+  水位截断;meta-export 携带复制状态。
+- **复制通道**:独立复制口 9445 mTLS 强制(CN = node_id);HELLO 三件套
+  握手 + 环检测;复制槽硬限 16;下游 pull worker 幂等 apply。
+- **追平与导入**:在线快照导出(MVCC + ReadPin + 限速 + 断点续);逻辑段
+  导入支持异构设备;段回填池 8 并发;缺数据读同步拉取(30s 超时 / 503 +
+  Retry-After);断档显式 rebuild。
+- **拓扑与观测**:一主多备 fan-out + 逐槽 lag;桶级过滤(心跳带过);上游
+  委派只读凭证(删槽即吊销);逐槽 Prometheus 指标。
+- **切换与降级**:级联中继(发送水位 ≤ 数据水位);流量优先级令牌桶
+  (serve > backfill > on_demand);手动 promote(dry-run 丢弃清单 +
+  EpochBarrier 同事务);epoch fencing;旧主显式 rebuild 唯一重加入路径;
+  备端只读 501 + `X-FastS3-Repl-Applied-Gtid`。
+- **KMS/管理面/文档**:SSE-KMS 共享 KMS 保全(真 Vault 车道);SSE-S3 种子
+  随同;admin `/v1/admin/replication/*` 七端点;console 复制拓扑页;
+  `[replication]` 配置段 + wizard + settings 重启标注。
+- **门禁实测**:
+  - `cargo test --workspace` 全绿(2026-08-31 门禁复跑,**945 测试**;
+    本清单具名用例全部执行,含 `m21_changelog_releases_v270_no_tag`);
+  - clippy `-D warnings` 零告警;cargo audit 0 漏洞;
+  - 覆盖率 llvm-cov workspace 行 **84.27%**(相对 v2.6.0 84.35% -0.08pt,
+    回退 ≤1pt 达标);
+  - 演练脚本(tests/replication/)全绿:`m21_drill.sh` 双机(13 断言)、
+    `m21_cascade_drill.sh` 三级级联(7 断言)、`m21_bucket_drill.sh` 桶级
+    (10 断言)、`m21_ssekms_drill.sh` 真 Vault 车道(7 断言);
+  - 崩溃注入 `run_crash_m21.sh`:200 轮混载 356 断言(promote 并发 kill
+    16 次)binlog 与元数据零漂移、apply 重放幂等、promote 无半状态;
+  - perf-M21(docs/perf-M21.md):binlog 端到端口径达标(写放大 p99 增量
+    <5%);快照导出期间主端读 p99 中位 **-4.9%**(退化 <20% 达标,实测
+    无退化);
+  - s3-tests:M21 无新增 S3 API;`?replication` 501 口径不变回归通过;
+  - **本版本不打 tag / 不公网 Release**。
+
 ## v2.6.0 — M20 SSE-KMS 密钥托管(2026-08-30)
 
 > 发布状态:与 M20 交付同步;git tag/发布流水线属执行期步骤(与 v2.5.0
