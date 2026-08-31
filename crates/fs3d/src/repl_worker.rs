@@ -12,7 +12,8 @@
 //!   POST snapshot 开会话 → 分页拉 meta(o:/p: 条目的上游段经
 //!   extent-data 分块拉取、CRC 响应头逐块校验、本地分配器原样落盘后段
 //!   引用改写为本地段)→ `import_repl_batch` 批量落库(a: 记录挂
-//!   import_seq=P.seq)→ `finalize_repl_import(P)` 重置游标/executed 集
+//!   import_seq=上游 raw_seq)→ `finalize_repl_import(P, GTID 集, raw, ebase)`
+//!   按快照完整集重置游标/executed/水位
 //!   → 释放会话 + 强制 checkpoint → 从 P 续流追赶。hello/binlog 返回
 //!   ErrBinlogGone 且本地 executed 为空 = 同一路径;**非空库的
 //!   ErrBinlogGone 保持 Fatal 退出**(C5 显式 rebuild 红线不抢跑)。
@@ -25,7 +26,10 @@
 //!   (唯一出路 = 运维显式 rebuild,C5;CLI/admin 是唯一入口,本模块
 //!   永不自调);is_alive() 可观测。
 //! - **epoch fencing**(§2.3):hello 成功响应的上游 epoch 推进本地
-//!   `s:repl_epoch`(取大),apply 层拒绝低于本地 epoch 的流。
+//!   `s:repl_epoch`(取大,promote 分配基线);apply 层锚点 = **游标代序**
+//!   (floor = max(游标 epoch, 初始代)),不是本地 `s:repl_epoch`——hello
+//!   预提新代时游标仍在旧代,以本地 epoch 为锚会误杀级联 promote 后旧
+//!   代尾段的合法续流。
 //! - **委派凭证(D3;裁定 1/§6.3)**:桶级槽的只读凭证随 hello 一次性
 //!   下发,落本地 `s:repl_dcred_in`(持久化供重启后验签;覆盖写 = 上游
 //!   删槽重签发后的吊销生效点;槽转全量 = 删键本地吊销)。备端 S3 层
@@ -62,7 +66,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use fs3_core::{AllocDraft, Gtid, Segment};
+use fs3_core::{AllocDraft, Gtid, GtidSet, Segment};
 use fs3_engine::{Engine, ReplImportStaged, ReplImportWriter};
 use fs3_meta::{BucketFilter, MetaStore, ReplRecord};
 use http_body_util::BodyExt;
@@ -487,8 +491,10 @@ fn executed_is_empty(meta: &MetaStore) -> bool {
 /// 端 executed 恒空,只报它会被当全新下游静默 bootstrap,§5.2 旧主重
 /// 加入检出依赖 binlog 段并入)+ node_id + 槽过滤器
 /// (D2:cfg.filters——桶级槽以此登记/比对,不一致 = ErrFilterMismatch
-/// 须 drop + 重建)+ chain = [](直连上游;级联链路上溯属 E1)。成功:
-/// ① 上游 epoch 推进本地 s:repl_epoch(fencing 锚点,§2.3);② 桶级
+/// 须 drop + 重建)+ chain = 本地 upchain 去掉首元(immediate parent,
+/// 对端已知自己)+ ever_primary(RP5.4:旧主重加入必须 rebuild)。成功:
+/// ① 上游 epoch 推进本地 s:repl_epoch(promote 分配基线;apply fencing
+/// 锚点仍是游标代序,§2.3);② 桶级
 /// 备端打标落本地 `s:repl_bscoped`(D2/§5.4:filters != All 的槽其
 /// 下游 GTID 集有洞,**不可 promote**——E3 校验输入;每次握手按上游
 /// 槽实况覆写,drop + 重建为全量槽后标记随之复位);③ D3 委派只读
@@ -505,19 +511,41 @@ pub(crate) async fn hello(
         .ranges()
         .map(|(epoch, start, end)| serde_json::json!({"epoch": epoch, "start": start, "end": end}))
         .collect();
+    let upchain = meta
+        .repl_upchain()
+        .map_err(|e| PullError::Transient(format!("read upchain: {e}")))?;
+    let ever_primary = meta
+        .repl_ever_primary()
+        .map_err(|e| PullError::Transient(format!("read ever_primary: {e}")))?;
     let body = serde_json::json!({
         "node_id": cfg.node_id,
         "slot_name": cfg.slot_name,
         "executed_gtid_set": executed,
         "want_filters": cfg.filters,
-        "chain": Vec::<String>::new(),
+        "chain": outgoing_hello_chain(&upchain),
+        "ever_primary": ever_primary,
     });
     let (status, json) = call(cfg, tls, "POST", "/v1/repl/v1/hello", Some(&body)).await?;
     if status != 200 {
         return Err(classify(status, &json, "hello"));
     }
-    // fencing 锚点:本地 epoch 跟随上游水位推进(取大;promote E3 在
-    // 此基础上 +1)
+    // 级联拓扑:本端 upchain = [immediate parent = 响应 node_id] + 对端
+    // 自报 chain(对端自己的祖先)。下次 hello 去掉首元回传,环检测在
+    // 服务端(含 A↔B:hello.node_id == 本端 upchain[0])。
+    if let Some(parent) = json["node_id"].as_str() {
+        let mut chain = vec![parent.to_string()];
+        if let Some(rest) = json["chain"].as_array() {
+            for n in rest {
+                if let Some(s) = n.as_str() {
+                    chain.push(s.to_string());
+                }
+            }
+        }
+        meta.set_repl_upchain(&chain)
+            .map_err(|e| PullError::Transient(format!("persist upchain: {e}")))?;
+    }
+    // fencing 预提:本地 epoch 跟随上游水位推进(取大;promote E3 在
+    // 此基础上 +1)。apply 锚点仍是游标代序,此处不替代。
     let epoch = json["epoch"].as_u64().unwrap_or(0);
     let local = meta
         .repl_epoch()
@@ -669,7 +697,37 @@ async fn bootstrap(
             .ok_or_else(|| PullError::Transient("snapshot response missing point".into()))?,
     )
     .ok_or_else(|| PullError::Transient("snapshot response bad point".into()))?;
-    let r = import_snapshot(engine, meta, cfg, tls, id, point).await;
+    let raw_seq = json["raw_seq"].as_u64().unwrap_or(point.seq);
+    let ebase = json["ebase"].as_u64().unwrap_or(0);
+    let mut executed = GtidSet::new();
+    match json["gtid_set"].as_array() {
+        Some(arr) => {
+            for r in arr {
+                let epoch = r["epoch"].as_u64().ok_or_else(|| {
+                    PullError::Transient("snapshot gtid_set entry missing epoch".into())
+                })?;
+                let start = r["start"].as_u64().ok_or_else(|| {
+                    PullError::Transient("snapshot gtid_set entry missing start".into())
+                })?;
+                let end = r["end"].as_u64().ok_or_else(|| {
+                    PullError::Transient("snapshot gtid_set entry missing end".into())
+                })?;
+                if start == 0 || start > end {
+                    return Err(PullError::Transient(
+                        "snapshot gtid_set ranges must satisfy 1 <= start <= end".into(),
+                    ));
+                }
+                executed.insert_range(epoch, start, end);
+            }
+        }
+        None if point.seq >= 1 => {
+            // 旧上游兼容:仅 P 代 [1..=P.seq](缺先前 epoch,cascade 会
+            // 在下一跳 hello 上暴露;新上游必带 gtid_set)
+            executed.insert_range(point.epoch, 1, point.seq);
+        }
+        None => {}
+    }
+    let r = import_snapshot(engine, meta, cfg, tls, id, point, raw_seq).await;
     // 释放会话(成败都放;本侧失败泄漏由服务端空闲 TTL 兜底回收)
     let _ = call(
         cfg,
@@ -680,10 +738,10 @@ async fn bootstrap(
     )
     .await;
     r?;
-    // 收口:游标/executed 按 P 重置(R12;崩溃于此前 = 下次启动游标仍
-    // {0,0} → 重 bootstrap,raw put 覆盖幂等;重复导入的段分配泄漏由
-    // 启动可达性扫描报告,不悬空)
-    meta.finalize_repl_import(point)
+    // 收口:游标/executed 按快照完整 GTID 集重置(R12;含先前 epoch,
+    // 否则从已 promote 主引导的下游 cascade 会在下一跳 hello 假分歧)。
+    // 崩溃于此前 = 下次启动游标仍 {0,0} → 重 bootstrap,raw put 覆盖幂等。
+    meta.finalize_repl_import(point, &executed, raw_seq, ebase)
         .map_err(|e| PullError::Transient(format!("finalize repl import: {e}")))?;
     engine
         .write()
@@ -693,7 +751,7 @@ async fn bootstrap(
 }
 
 /// 分页拉 meta 并逐批落库(每页一个事务;a: 分配记录挂 import_seq =
-/// P.seq,多页 RMW 合并)。
+/// 上游 raw_seq,多页 RMW 合并)。
 async fn import_snapshot(
     engine: &Arc<RwLock<Engine>>,
     meta: &Arc<MetaStore>,
@@ -701,6 +759,7 @@ async fn import_snapshot(
     tls: &Arc<rustls::ClientConfig>,
     id: u64,
     point: Gtid,
+    raw_seq: u64,
 ) -> Result<(), PullError> {
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD;
@@ -741,7 +800,7 @@ async fn import_snapshot(
             .iter()
             .fold(AllocDraft::default(), |acc, s| acc.merge(s.alloc.clone()));
         let alloc = (!alloc.is_empty()).then_some(alloc);
-        match meta.import_repl_batch(&batch, alloc.as_ref(), point.seq) {
+        match meta.import_repl_batch(&batch, alloc.as_ref(), raw_seq) {
             Ok(()) => {
                 for s in stagings {
                     engine.write().repl_import_committed(s);
@@ -1073,4 +1132,29 @@ async fn request(
         .map_err(|e| tr(format!("collect response: {e}")))?
         .to_bytes();
     Ok((status, crc_hdr, collected.to_vec()))
+}
+
+/// HELLO 自报 chain = 本地 upchain 去掉 immediate parent(对端已知自己)。
+/// upchain 形 = `[parent, grandparent, ...]`;空/单元素 → `[]`。
+pub(crate) fn outgoing_hello_chain(upchain: &[String]) -> Vec<String> {
+    upchain.get(1..).unwrap_or(&[]).to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::outgoing_hello_chain;
+
+    #[test]
+    fn outgoing_hello_chain_strips_immediate_parent() {
+        assert!(outgoing_hello_chain(&[]).is_empty());
+        assert!(outgoing_hello_chain(&["a".into()]).is_empty());
+        assert_eq!(
+            outgoing_hello_chain(&["b".into(), "a".into()]),
+            vec!["a".to_string()]
+        );
+        assert_eq!(
+            outgoing_hello_chain(&["c".into(), "b".into(), "a".into()]),
+            vec!["b".to_string(), "a".to_string()]
+        );
+    }
 }

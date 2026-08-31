@@ -46,7 +46,7 @@
                           │ mTLS(现有 agent 信道)
         ┌─────────────────┴──────────────────┐
         │            主 (primary)             │
-        │  bl:{seq} binlog + 复制槽管理        │
+        │  bl:{epoch}{seq} binlog + 复制槽管理  │
         │  复制口 :9445(mTLS 强制)            │
         └───▲──────────▲────────────▲────────┘
      slot=s1 │   slot=s2 │   slot=s3 │        备端主动 pull,各自独立位点
@@ -101,7 +101,7 @@ GTID 集合 = 按 epoch 分段的连续区间集     # 例:{1:[1,500], 2:[1,120]
 
 ### 2.3 fencing
 
-- 备端/中继只接受 `epoch >= 本地 epoch` 的流;promote 后旧 epoch 的一切写入被全网络拒绝。
+- 备端/中继只接受 `epoch >= 游标代序` 的流(floor = max(游标 epoch, 初始代));promote 后旧 epoch 的一切写入被全网络拒绝。
 - promote/demote/rebuild 均为**本地裁决动作**(fs3-admin 通道),center 只下发意图(沿用"配置源 vs 引擎裁决"分层)。
 - **落地澄清(M21 E4)**:apply 侧 fencing 的锚点 = **游标代序**(floor = max(游标 epoch, 初始代)),而非本地 `s:repl_epoch`——hello 会把本地 epoch 预提到新代而游标仍在旧代,以本地 epoch 为锚会误杀级联 promote 后旧代尾段的合法续流(见 §5.1);本地 epoch 随更高代记录在 apply 事务内落定取大。
 

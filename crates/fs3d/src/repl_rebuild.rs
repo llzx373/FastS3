@@ -428,19 +428,21 @@ impl RebuildService {
         force: bool,
     ) -> Result<serde_json::Value, fs3_admin::PromoteError> {
         use fs3_admin::PromoteError;
-        // 停 pull worker 与回填池(promote 事务的「无在途复制流」前提;
-        // 读路径探针/按需拉取通道一并摘除——force 丢弃后不再有可回填态,
-        // 转正后读路径回主端口径)
+        // 停 pull worker 与回填池(promote 事务的「无在途复制流」前提)。
+        // C4 探针保持到事务成功(见下)。
         if let Some(w) = inner.pull.take() {
             w.shutdown();
         }
         if let Some(bf) = inner.backfill.take() {
             bf.shutdown();
         }
-        self.engine.write().set_repl_pending_probe(None);
-        self.service.clear_repl_data_fetch();
+        // C4 探针/按需拉取通道保持到 promote 事务成功:force 丢弃窗口内
+        // GET 仍 503,失败路径 start_stack 换绑新探针。提前摘除会在半
+        // 状态窗口吐上游悬空引用。
         match self.meta.promote(force) {
             Ok(out) => {
+                self.engine.write().set_repl_pending_probe(None);
+                self.service.clear_repl_data_fetch();
                 // M21 E5:S3 层角色缓存热翻转(promote 成功 = 本端转主,
                 // 写路径 501 拦截解除;失败路径不动缓存——角色未变)
                 self.service.set_repl_role(fs3_meta::ReplRole::Primary);

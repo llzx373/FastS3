@@ -9,7 +9,7 @@
 # 形态:node-a/node-b 双节点(复制口独立 mTLS,[replication] 段),
 # sync_mode=full(kill -9 下「已应答 = 已落盘」前提,同 m15)。每轮:
 #   1) boto3 对当前主混载:随机 put(≤32KiB 内联 / 32KiB~256KiB / 0.5~1.5MiB
-#      非内联)/覆盖/删除,应答即记账(ledger 有序追加「P key size md5」/
+#      非内联 / ~3% 独占段 ≈extent_size 以覆盖 64KiB 网格 CRC)/覆盖/删除,应答即记账(ledger 有序追加「P key size md5」/
 #      「D key」;主端 kill 只在混载进程退出后随机 0~0.4s 触发——m15 口径,
 #      保证「应答 ⇒ 已提交」记账边界干净;备端另有 30% 概率在混载进行中
 #      kill,覆盖 apply/回填中途崩溃);
@@ -70,8 +70,9 @@
 #      复用 extent 后,备端持有的流式坐标(space=stream)悬空:serve
 #      端坐标合法、数据 CRC 自洽(校验的是错字节本身),静默写串数据
 #      (本门禁实测:主端对同对象连续迁移在 extent 间乒乓,备端拉到
-#      复用后的字节)。残留缺口:独占段(≥extent_size 对象)无网格可
-#      验,坐标悬空防护待后续。
+#      复用后的字节)。独占段现亦携带 64KiB 网格 CRC(与打包段同口径,
+#      fetch_data_ref 按 Segment.crcs 逐单元校验);本脚本 ~3% put 覆盖
+#      ≈extent_size 对象(固定键 excl-grid 覆盖写,不堆积撑盘)。
 #   F. fs3-engine WorkerHandle 轮询睡眠分片化(10ms 粒度查停止位)——
 #      此前整块 sleep(poll) 使 stop/join 最坏阻塞一整个 poll 周期:
 #      binlog 截断 worker 周期 60s,启动期 RP4 角色矛盾 fail-fast 在
@@ -81,6 +82,11 @@
 #      未监听的 S3 口。回归用例 worker_stop_not_blocked_by_poll_sleep。
 #      harness 侧同步兜底:start_node 就绪口径 = admin 通道且 S3 数据口
 #      (m21_wait_s3,照 m15 start_server 先例)。
+#   G. promote 事务摘除 s:repl_upchain——备期 upchain 指向旧主,转正后
+#      若不摘,旧主 rebuild 归队 HELLO 被「peer is this node's upstream」
+#      误判成 A↔B 环(Fatal,游标卡 0-0)。回归用例
+#      repl_hello_accepts_former_upstream_after_promote /
+#      promote_crash_no_half_state(重开 upchain 空)。
 #
 # 用法: ./run_crash_m21.sh [轮数]   (默认 200;M21 门禁 ≥200)
 # 环境: M21_CRASH_ROUNDS(轮数覆盖;CI 冒烟可用低轮数,本机提交前须 ≥200
@@ -256,6 +262,8 @@ random.shuffle(ops)
 
 def pick_size():
     r = random.random()
+    if r < 0.03:
+        return random.randint(4 * 1024 * 1024 - 4096, 4 * 1024 * 1024)  # 独占段
     if r < 0.55:
         return random.randint(256, 32768)        # ≤32KiB 内联
     if r < 0.85:
@@ -267,9 +275,12 @@ for op in ops:
     try:
         if op in ("put", "overwrite"):
             seq += 1
-            key = (f"r{rnd}-{seq}-{os.urandom(3).hex()}" if op == "put"
-                   else random.choice(live_keys))
             size = pick_size()
+            if size >= 4 * 1024 * 1024 - 4096:
+                key = "excl-grid"  # 固定键覆盖写,不堆积独占段
+            else:
+                key = (f"r{rnd}-{seq}-{os.urandom(3).hex()}" if op == "put"
+                       else random.choice(live_keys))
             body = os.urandom(size)
             md5 = hashlib.md5(body).hexdigest()
             r = s3.put_object(Bucket=bucket, Key=key, Body=body)

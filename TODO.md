@@ -85,7 +85,7 @@
 
 ### A. binlog 与 GTID(≈1.5 pw;设计 §2/§3.2/§3.4;ADR-33)
 
-- [x] A1 `bl:{seq be64} → ReplRecord`(postcard + 值版本字节):`apply_ops` 同事务写入,
+- [x] A1 `bl:{epoch be64}{seq be64} → ReplRecord`(postcard + 值版本字节;A1 初形 `bl:{seq}`,E3 起 epoch 入键,代内 seq = `s:seq` − `s:repl_ebase`):`apply_ops` 同事务写入,
   字段 epoch/ops/data_refs/bucket_scope;`s:` 族系统键纳入;**不增组提交 fsync 次数**
   - 用例:`repl_binlog_committed_atomically_with_meta`(崩溃重放:binlog 与元数据零漂移,
     照 `e:` 队列用例样板)

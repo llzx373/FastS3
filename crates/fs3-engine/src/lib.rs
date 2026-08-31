@@ -3900,7 +3900,10 @@ impl Engine {
     }
 
     /// M20 F3:创建 transit key。
-    pub fn kms_admin_create_key(&self, name: &str) -> std::result::Result<serde_json::Value, String> {
+    pub fn kms_admin_create_key(
+        &self,
+        name: &str,
+    ) -> std::result::Result<serde_json::Value, String> {
         let m = self
             .kms_backend()?
             .create_key(name)
@@ -3921,7 +3924,10 @@ impl Engine {
     }
 
     /// M20 F3:轮换 transit key(旧 wrapped_dek 靠版本历史可解,不 rewrap)。
-    pub fn kms_admin_rotate_key(&self, name: &str) -> std::result::Result<serde_json::Value, String> {
+    pub fn kms_admin_rotate_key(
+        &self,
+        name: &str,
+    ) -> std::result::Result<serde_json::Value, String> {
         let m = self
             .kms_backend()?
             .rotate_key(name)
@@ -8933,8 +8939,9 @@ impl Engine {
     }
 
     /// 段结束(extent 写满,对象尾部跨界续写):按参与数判定封口类型
-    /// (ADR-9 §5.2)——仅 1 个对象且写满 → 独占(头 CRC 表,段元数据 crcs
-    /// 为空);其余 → 打包(段 CRC 随元数据)。
+    /// (ADR-9 §5.2)——仅 1 个对象且写满 → 独占(头 CRC 表;**M21 起段元
+    /// 数据 crcs 同步写入同一 64KiB 网格**,供复制流式拉取内容绑定);
+    /// 其余 → 打包(段 CRC 随元数据)。
     fn end_segment(&mut self, w: &mut ExtentWriter) -> Result<()> {
         if w.seg_fill > 0 {
             w.seg_crcs.push(w.seg_partial);
@@ -8967,7 +8974,9 @@ impl Engine {
                 extent_id: oe.extent_id,
                 offset: w.seg_offset,
                 len,
-                crcs: vec![],
+                // 与头表同网格:binlog/快照携带此表,备端 fetch 按记录
+                // 校验「所指字节」(防 compaction 复用 extent 后静默串数据)。
+                crcs: header_crcs.clone(),
             });
             self.write_extent_header(oe.extent_id, false, &header_crcs)?;
         } else {

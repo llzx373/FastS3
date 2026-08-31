@@ -274,7 +274,9 @@ key_rps = 0                    # 每密钥每秒请求上限(0 = 关闭)
 # primary_url = "https://node-a:9445"
 # slot_name = "node-b"             # 缺省 = client_cert 的 CN(node_id)
 # bucket_include = []              # 与 bucket_exclude 互斥;皆空 = 实例级全量
+# bucket_exclude = []
 # repl_retain_hours = 24
+# repl_retain_bytes = "8GiB"
 # repl_retain_bytes_hard = "32GiB"
 # max_slots = 16
 # data_pull_concurrency = 8

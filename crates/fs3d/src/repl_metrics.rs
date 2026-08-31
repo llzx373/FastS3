@@ -18,6 +18,7 @@
 //!
 //! 下游侧(role = standby):
 //! - `fasts3_repl_applied_gtid` = 本地复制游标 seq(apply 位点);
+//! - `fasts3_repl_applied_gtid_epoch` = 本地复制游标 epoch;
 //! - `fasts3_repl_data_pending_bytes` = 待回填队列段字节合计(与 C3
 //!   BackfillService 的 data_pending_bytes gauge 同式:list_repl_pending
 //!   全量扫描现算,不依赖 BackfillService 句柄——primary/未配 pull 的
@@ -126,6 +127,11 @@ impl ReplMetricsProvider {
                         );
                         out.push_str("# TYPE fasts3_repl_applied_gtid gauge\n");
                         out.push_str(&format!("fasts3_repl_applied_gtid {}\n", c.seq));
+                        out.push_str(
+                            "# HELP fasts3_repl_applied_gtid_epoch Last applied replication GTID epoch (standby cursor)\n",
+                        );
+                        out.push_str("# TYPE fasts3_repl_applied_gtid_epoch gauge\n");
+                        out.push_str(&format!("fasts3_repl_applied_gtid_epoch {}\n", c.epoch));
                     }
                     Err(e) => tracing::warn!("repl metrics cursor: {e}"),
                 }

@@ -11,7 +11,7 @@
 //!   不产生 DataRef;
 //! - 写放大预算见 A5(perf-M21);本模块只做编码与提取,不碰 I/O。
 
-use fs3_core::{Error, ObjectMeta, Result, Segment};
+use fs3_core::{Error, GtidSet, ObjectMeta, Result, Segment};
 use serde::{Deserialize, Serialize};
 
 use crate::{Op, PartMeta};
@@ -344,6 +344,41 @@ impl ReplRecord {
             raw_seq: None,
         })
     }
+
+    /// 槽过滤器下的记录投影(M21 D2 零泄漏):无桶 Op 恒留(s: 族强制随同);
+    /// 有桶 Op 按 Include/Exclude 逐条取舍;剩余 ops 重算 data_refs/
+    /// bucket_scope。跨桶事务不再整条下发范围外桶。空 ops = 心跳形态
+    /// (游标仍前进)。All = 原样克隆。
+    pub fn scoped_for(&self, filters: &BucketFilter) -> Self {
+        if matches!(filters, BucketFilter::All) {
+            return self.clone();
+        }
+        let ops: Vec<Op> = self
+            .ops
+            .iter()
+            .filter(|op| match op_bucket(op) {
+                None => true,
+                Some(b) => match filters {
+                    BucketFilter::All => true,
+                    BucketFilter::Include(list) => list.iter().any(|x| x == b),
+                    BucketFilter::Exclude(list) => !list.iter().any(|x| x == b),
+                },
+            })
+            .cloned()
+            .collect();
+        if ops.len() == self.ops.len() {
+            return self.clone();
+        }
+        ReplRecord {
+            epoch: self.epoch,
+            data_refs: data_refs_of(&ops),
+            bucket_scope: bucket_scope_of(&ops),
+            ops,
+            ts: self.ts,
+            epoch_barrier: self.epoch_barrier,
+            raw_seq: self.raw_seq,
+        }
+    }
 }
 
 /// 提取 Op 显式携带的桶名;None = 无桶上下文(系统键类或需会话查找的
@@ -573,12 +608,24 @@ pub struct ReplExportPage {
     pub done: bool,
 }
 
+/// 快照位点及 R12 重置输入(开启时自同一 MVCC 快照读定)。
+/// `gtid_set` = P 时刻完整 executed ∪ binlog 覆盖(含先前 epoch 段);
+/// `raw_seq`/`ebase` 把下游 `s:seq` 对齐到上游 raw 尺度(代内 P.seq
+/// 不足以锚定 a:/e: 键)。
+#[derive(Debug, Clone)]
+pub struct ReplExportPoint {
+    pub point: fs3_core::Gtid,
+    pub raw_seq: u64,
+    pub ebase: u64,
+    pub gtid_set: GtidSet,
+}
+
 /// 导出会话(rocksdb MVCC 快照 + 专用读线程;位点 P 与活段清单在开启
 /// 时一次性确定)。线程安全:分页方法内部经通道串行化,多调用方并发
 /// 安全(复制口按 snapshot_id 单下游续拉,正常为顺序调用)。
 pub struct ReplExportSession {
-    /// 导出位点 P = 快照时刻的 (s:repl_epoch, s:seq 水位)。
-    point: fs3_core::Gtid,
+    /// 导出位点 P + 完整 GTID 集 / raw 水位(R12 重置输入)。
+    point: ReplExportPoint,
     /// 快照内活段清单(排序去重;ReadPin 钉扎在复制口侧,会话只管清单)。
     manifest: Vec<ReplSegmentRef>,
     /// 页请求通道(Drop = 关通道 → 读线程退出 → 快照释放)。
@@ -605,7 +652,7 @@ impl ReplExportSession {
     ) -> Result<Self> {
         let (req_tx, req_rx) = std::sync::mpsc::channel::<ExportReq>();
         let (ready_tx, ready_rx) =
-            std::sync::mpsc::channel::<Result<(fs3_core::Gtid, Vec<ReplSegmentRef>)>>();
+            std::sync::mpsc::channel::<Result<(ReplExportPoint, Vec<ReplSegmentRef>)>>();
         let join = std::thread::Builder::new()
             .name("fs3-repl-export".into())
             .spawn(move || export_thread(db, filters, req_rx, ready_tx))
@@ -623,7 +670,12 @@ impl ReplExportSession {
 
     /// 导出位点 P(开启时自快照读定)。
     pub fn point(&self) -> fs3_core::Gtid {
-        self.point
+        self.point.point
+    }
+
+    /// R12 重置输入(完整 GTID 集 + raw 水位;与 P 同快照)。
+    pub fn export_point(&self) -> &ReplExportPoint {
+        &self.point
     }
 
     /// 活段清单(复制口钉扎/分页服务用)。
@@ -675,12 +727,12 @@ fn export_thread(
     db: std::sync::Arc<rocksdb::OptimisticTransactionDB>,
     filters: BucketFilter,
     rx: std::sync::mpsc::Receiver<ExportReq>,
-    ready: std::sync::mpsc::Sender<Result<(fs3_core::Gtid, Vec<ReplSegmentRef>)>>,
+    ready: std::sync::mpsc::Sender<Result<(ReplExportPoint, Vec<ReplSegmentRef>)>>,
 ) {
     use rocksdb::{Direction, IteratorMode};
     let snap = db.snapshot();
-    let point = (|| -> Result<fs3_core::Gtid> {
-        let seq = snap
+    let point = (|| -> Result<ReplExportPoint> {
+        let raw_seq = snap
             .get(crate::keys::SYS_SEQ)
             .map_err(crate::rocks_err)?
             .map(|v| u64::from_be_bytes(v.as_slice().try_into().unwrap()))
@@ -714,10 +766,55 @@ fn export_thread(
             }
             None => 0,
         };
-        let seq = seq
+        let gtid_seq = raw_seq
             .checked_sub(ebase)
-            .ok_or_else(|| Error::Corrupt(format!("s:repl_ebase {ebase} > s:seq {seq}")))?;
-        Ok(fs3_core::Gtid { epoch, seq })
+            .ok_or_else(|| Error::Corrupt(format!("s:repl_ebase {ebase} > s:seq {raw_seq}")))?;
+        let mut gtid_set = match snap
+            .get(crate::keys::SYS_REPL_EXECUTED)
+            .map_err(crate::rocks_err)?
+        {
+            Some(v) => GtidSet::decode(&v)?,
+            None => GtidSet::new(),
+        };
+        let mut max_per_epoch: std::collections::BTreeMap<u64, u64> =
+            std::collections::BTreeMap::new();
+        let mut iter = snap.iterator(IteratorMode::From(
+            crate::keys::PREFIX_BINLOG,
+            Direction::Forward,
+        ));
+        for item in &mut iter {
+            let (k, _) = item.map_err(crate::rocks_err)?;
+            if !k.starts_with(crate::keys::PREFIX_BINLOG) {
+                break;
+            }
+            let g = crate::keys::parse_binlog_gtid(&k)?;
+            let m = max_per_epoch.entry(g.epoch).or_insert(0);
+            *m = (*m).max(g.seq);
+        }
+        let standby = matches!(
+            snap.get(crate::keys::SYS_REPL_ROLE)
+                .map_err(crate::rocks_err)?
+                .as_deref(),
+            Some(b) if b == b"standby"
+        );
+        if !standby && gtid_seq >= 1 {
+            let m = max_per_epoch.entry(epoch).or_insert(0);
+            *m = (*m).max(gtid_seq);
+        }
+        for (e, hi) in max_per_epoch {
+            if hi >= 1 {
+                gtid_set.insert_range(e, 1, hi);
+            }
+        }
+        Ok(ReplExportPoint {
+            point: fs3_core::Gtid {
+                epoch,
+                seq: gtid_seq,
+            },
+            raw_seq,
+            ebase,
+            gtid_set,
+        })
     })();
     let point = match point {
         Ok(p) => p,
@@ -1168,5 +1265,45 @@ mod tests {
                 "本机 s: 状态键不得导出(过滤器 {f:?})"
             );
         }
+    }
+
+    #[test]
+    fn scoped_for_drops_out_of_scope_bucket_ops() {
+        let bm = |name: &str| fs3_core::BucketMeta {
+            created: 1,
+            owner: name.into(),
+            stats: Default::default(),
+            quota: None,
+            created_with_acl: false,
+            versioning: Default::default(),
+            default_encryption: None,
+            object_lock: false,
+            default_retention: None,
+            default_kms_key: None,
+        };
+        let rec = ReplRecord::new(
+            1,
+            &[
+                Op::BucketPut {
+                    name: "b1".into(),
+                    meta: bm("b1"),
+                    location: None,
+                },
+                Op::BucketPut {
+                    name: "b2".into(),
+                    meta: bm("b2"),
+                    location: None,
+                },
+            ],
+        );
+        assert_eq!(
+            rec.bucket_scope.buckets,
+            vec!["b1".to_string(), "b2".to_string()]
+        );
+        let scoped = rec.scoped_for(&BucketFilter::Include(vec!["b1".into()]));
+        assert_eq!(scoped.ops.len(), 1);
+        assert!(matches!(&scoped.ops[0], Op::BucketPut { name, .. } if name == "b1"));
+        assert_eq!(scoped.bucket_scope.buckets, vec!["b1".to_string()]);
+        assert!(!scoped.bucket_scope.has_unscoped);
     }
 }

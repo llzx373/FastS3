@@ -229,6 +229,21 @@ pub const SYS_REPL_CURSOR: &[u8] = b"s:repl_cursor";
 /// 前缀;meta-export 不导出(s: 系统键不入导出)、check 可达性扫描不
 /// 相交(同 SYS_REPL_ROLE 口径)。
 pub const SYS_REPL_BUCKET_SCOPED: &[u8] = b"s:repl_bscoped";
+/// 上游链路 node_id 列表(M21 环检测生产路径;ADR-33 RP3.3;设计稿 §3.6):
+/// 值 = postcard `Vec<String>` = `[immediate_upstream, …, root]`;
+/// 键缺席 = 空(直连尚未握手 / 主端)。pull worker 每次 hello 成功按
+/// 响应 `node_id` + 上游自报 chain 覆写;HELLO 请求 strip 首元(本跳
+/// 目的)后上送,服务端「chain 含本节点」才能在真级联上触发。
+/// `hello.node_id == upchain[0]` = 二节点互拉,另闸。promote 事务删键
+/// (本节点已是新根,无上游;否则旧主 rebuild 归队 HELLO 被误判成环)。
+/// clear_for_rebuild 删键。s: 既有前缀;meta-export 不导出;check 扫描
+/// 不相交。
+pub const SYS_REPL_UPCHAIN: &[u8] = b"s:repl_upchain";
+/// 本节点曾经是 primary(M21 E4;ADR-33 RP5.4):值 = `b"1"`;键缺席 =
+/// false。promote 事务置位;仅 clear_for_rebuild 清除。HELLO 自报此
+/// 标记,上游拒收(`ErrDiverged`)——干净追平的旧主重加入也必须显式
+/// 重建,不得靠 GTID 子集误过。s: 既有前缀;meta-export 不导出。
+pub const SYS_REPL_EVER_PRIMARY: &[u8] = b"s:repl_ever_primary";
 /// 待回填队列(M21 B4;ADR-33 RP4.2;设计稿 §4.2/§4.3 布局独立):
 /// `s:repl_pending\0{epoch be64}{seq be64}` → postcard `Vec<DataRef>`。
 /// 上游 Op 的段引用指向**上游 extent**,备端本地分配器不认识——apply

@@ -308,7 +308,10 @@ fn kms_admin_key_crud_and_rotate() {
 
     let (code, body) = http_unix(sock, "GET", "/v1/admin/audit?op=KmsCreateKey", None, "t");
     assert_eq!(code, 200, "{body}");
-    assert!(body.contains("KmsCreateKey") && body.contains("alice"), "{body}");
+    assert!(
+        body.contains("KmsCreateKey") && body.contains("alice"),
+        "{body}"
+    );
     assert!(!body.contains("mem:v1"), "{body}");
 
     let (code, _) = http_unix(sock, "GET", "/v1/admin/kms/status", None, "wrong");

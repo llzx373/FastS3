@@ -659,7 +659,11 @@ on_demand = 10
             "[storage]\ndevices=[\"/d\"]\n[kms]\nbackend=\"external\"\nvault_addr=\"http://127.0.0.1:8200\"\n",
         )
         .unwrap();
-        let err = missing_tok.kms.validate_for_serve().unwrap_err().to_string();
+        let err = missing_tok
+            .kms
+            .validate_for_serve()
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("token_file"),
             "缺 token_file 必须显式失败: {err}"

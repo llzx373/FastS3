@@ -35,8 +35,9 @@ pub mod repl;
 
 pub use audit::AuditStore;
 pub use repl::{
-    BucketFilter, BucketScope, DataRef, DelegatedCred, ReplExportPage, ReplExportSession,
-    ReplRecord, ReplSegmentRef, Slot, DELEGATED_ACCESS_PREFIX, REPL_RECORD_VERSION,
+    BucketFilter, BucketScope, DataRef, DelegatedCred, ReplExportPage, ReplExportPoint,
+    ReplExportSession, ReplRecord, ReplSegmentRef, Slot, DELEGATED_ACCESS_PREFIX,
+    REPL_RECORD_VERSION,
 };
 
 /// 元数据同步模式(DESIGN §4.4 / E2)。
@@ -2896,6 +2897,33 @@ impl MetaStore {
         }
     }
 
+    /// 上游链路 `[immediate, …, root]`(缺席 = 空)。
+    pub fn repl_upchain(&self) -> Result<Vec<String>> {
+        match self.db.get(SYS_REPL_UPCHAIN).map_err(rocks_err)? {
+            Some(v) => {
+                postcard::from_bytes(&v).map_err(|e| Error::Corrupt(format!("s:repl_upchain: {e}")))
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// 覆写上游链路(hello 成功后;直写 + fsync)。
+    pub fn set_repl_upchain(&self, chain: &[String]) -> Result<()> {
+        let v = postcard::to_allocvec(chain)
+            .map_err(|e| Error::Meta(format!("postcard encode upchain: {e}")))?;
+        self.db.put(SYS_REPL_UPCHAIN, v).map_err(rocks_err)?;
+        self.db.flush_wal(true).map_err(rocks_err)
+    }
+
+    /// 本节点曾经是 primary(缺席 = false)。
+    pub fn repl_ever_primary(&self) -> Result<bool> {
+        Ok(self
+            .db
+            .get(SYS_REPL_EVER_PRIMARY)
+            .map_err(rocks_err)?
+            .is_some())
+    }
+
     /// 写复制角色(直写 + fsync,照 trusted_clock 先例;promote/demote
     /// 为本地裁决动作,E3 接线,调用方持单点)。
     pub fn set_repl_role(&self, role: ReplRole) -> Result<()> {
@@ -3541,13 +3569,14 @@ impl MetaStore {
     // - **导入 ≠ apply**:快照条目是 P 位点的权威历史,不经 binlog——
     //   import_repl_batch **不增 s:seq、不写 bl:**(seq 水位与游标由
     //   finalize_repl_import 收口时一并裁决);
-    // - **导入段的分配记录挂 import_seq(= P.seq)**:a:/t: 多批 RMW 合并
-    //   (同一位点键碰撞时 alloc/ref_inc/ref_dec 直拼,与 AllocDraft::merge
-    //   同口径),启动恢复重放等价;
+    // - **导入段的分配记录挂 import_seq(= 上游 raw s:seq)**:a:/t: 多批
+    //   RMW 合并(同一位点键碰撞时 alloc/ref_inc/ref_dec 直拼,与
+    //   AllocDraft::merge 同口径),启动恢复重放等价;
     // - **finalize 重置而非累加**(R12):s:repl_cursor = P、s:repl_executed
-    //   = {P.epoch:[1..=P.seq]}、s:repl_epoch = max(本地, P.epoch)、s:seq =
-    //   max(本地, P.seq)(防 promote 转正后 seq 回退与既有 bl: 键碰撞,
-    //   同 apply_repl_record 口径)。
+    //   = 快照携带的完整 GTID 集(含先前 epoch 段,不是只 {P.epoch:[1..=P.seq]}
+    //   )、s:repl_epoch = max(本地, P.epoch)、s:seq = max(本地, raw_seq_at_p)、
+    //   s:repl_ebase = 上游 ebase(对齐代内折算;防 promote 转正后 seq 回退
+    //   与既有 bl:/a: 键碰撞)。
 
     /// 快照导入批量落库(单个乐观事务,同 commit 重试口径)。entries 为
     /// (原始键, 段引用已改写为本地段的值);同键已存在 = 快照权威覆盖
@@ -3609,19 +3638,23 @@ impl MetaStore {
         }
     }
 
-    /// 导入收口(单事务):游标/executed 集/epoch/seq 水位按导出位点 P
-    /// 重置落定(语义见上方小节注释)。调用方保证导入批已全部落库。
-    pub fn finalize_repl_import(&self, point: Gtid) -> Result<()> {
+    /// 导入收口(单事务):游标/executed 集/epoch/seq 水位/ebase 按导出
+    /// 位点 P **及快照携带的完整 GTID 集**重置落定(R12;调用方保证导入
+    /// 批已全部落库)。`executed` 必须是 P 时刻上游集(含先前 epoch);
+    /// `raw_seq`/`ebase` 把 s:seq 对齐到上游 raw 尺度。
+    pub fn finalize_repl_import(
+        &self,
+        point: Gtid,
+        executed: &GtidSet,
+        raw_seq: u64,
+        ebase: u64,
+    ) -> Result<()> {
         const MAX_TXN_RETRIES: u32 = 10_000;
         let mut retries = 0u32;
         loop {
             let tx = self.db.transaction_opt(&self.write_opts, &self.txn_opts);
             tx.put(SYS_REPL_CURSOR, repl_cursor_value(point))
                 .map_err(rocks_err)?;
-            let mut executed = GtidSet::new();
-            if point.seq >= 1 {
-                executed.insert_range(point.epoch, 1, point.seq);
-            }
             tx.put(SYS_REPL_EXECUTED, executed.encode()?)
                 .map_err(rocks_err)?;
             let local_epoch = match tx.get(SYS_REPL_EPOCH).map_err(rocks_err)? {
@@ -3642,7 +3675,9 @@ impl MetaStore {
                 ),
                 None => 0,
             };
-            tx.put(SYS_SEQ, cur_seq.max(point.seq).to_be_bytes())
+            tx.put(SYS_SEQ, cur_seq.max(raw_seq).to_be_bytes())
+                .map_err(rocks_err)?;
+            tx.put(SYS_REPL_EBASE, ebase.to_be_bytes())
                 .map_err(rocks_err)?;
             match tx.commit() {
                 Ok(()) => {
@@ -3709,6 +3744,9 @@ impl MetaStore {
         batch.delete(SYS_REPL_EBASE);
         // 桶级备端标记(D2)一并复位:重建后 hello 按新槽实况重落
         batch.delete(SYS_REPL_BUCKET_SCOPED);
+        // 上游链路 / 曾经为主 标记随重建清(环检测与 RP5.4 重加入闸)
+        batch.delete(SYS_REPL_UPCHAIN);
+        batch.delete(SYS_REPL_EVER_PRIMARY);
         self.db
             .write_opt(batch, &self.write_opts)
             .map_err(rocks_err)?;
@@ -4005,8 +4043,16 @@ impl MetaStore {
             barrier.bucket_scope.has_unscoped = true;
             barrier.ts = Some(now_ts());
             barrier.epoch_barrier = Some(old_epoch);
+            // E4:commit 路径恒写 raw_seq;barrier 消耗 cur_seq+1,与
+            // SYS_SEQ 推进同值,级联 apply 不得回退到 gtid.seq=1。
+            barrier.raw_seq = Some(cur_seq + 1);
             tx.put(binlog_key(new_epoch, 1), barrier.encode_value()?)
                 .map_err(rocks_err)?;
+            tx.put(SYS_REPL_EVER_PRIMARY, b"1").map_err(rocks_err)?;
+            // 转正 = 本节点成为新根:备期 upchain 指向旧主,若不摘除,
+            // 旧主 rebuild 归队 HELLO 会被「peer is this node's
+            // upstream」误判成 A↔B 环(M21 崩溃换边实测:游标卡 0-0)。
+            tx.delete(SYS_REPL_UPCHAIN).map_err(rocks_err)?;
             // executed 并入 {新epoch, 1}(同批;GTID 集无洞)
             let mut executed = match tx.get(SYS_REPL_EXECUTED).map_err(rocks_err)? {
                 Some(v) => GtidSet::decode(&v)?,
@@ -4058,6 +4104,93 @@ impl MetaStore {
             .put(repl_slot_key(&slot.name)?, slot.encode()?)
             .map_err(rocks_err)?;
         self.db.flush_wal(true).map_err(rocks_err)
+    }
+
+    /// 回执更新(乐观事务):拒绝 stale / 回退 confirmed;与硬截断标
+    /// stale 并发时冲突重试,读到的 confirmed 为提交时点实值。
+    pub fn ack_repl_slot(&self, name: &str, confirmed: Gtid, now: i64) -> Result<Slot> {
+        const MAX_TXN_RETRIES: u32 = 10_000;
+        let mut retries = 0u32;
+        loop {
+            let tx = self.db.transaction_opt(&self.write_opts, &self.txn_opts);
+            let mut slot = match tx.get(repl_slot_key(name)?).map_err(rocks_err)? {
+                Some(v) => Slot::decode(&v)?,
+                None => {
+                    let _ = tx.rollback();
+                    return Err(Error::NotFound(format!("repl slot {name}")));
+                }
+            };
+            if slot.stale {
+                let _ = tx.rollback();
+                return Err(Error::InvalidArgument("slot stale".into()));
+            }
+            if confirmed < slot.confirmed_gtid {
+                let _ = tx.rollback();
+                return Err(Error::InvalidArgument(
+                    "confirmed_gtid must not regress".into(),
+                ));
+            }
+            slot.confirmed_gtid = confirmed;
+            slot.last_ack_at = now;
+            tx.put(repl_slot_key(&slot.name)?, slot.encode()?)
+                .map_err(rocks_err)?;
+            match tx.commit() {
+                Ok(()) => {
+                    self.db.flush_wal(true).map_err(rocks_err)?;
+                    return Ok(slot);
+                }
+                Err(e) if e.kind() == ErrorKind::Busy || e.kind() == ErrorKind::TryAgain => {
+                    retries += 1;
+                    if retries > MAX_TXN_RETRIES {
+                        return Err(Error::Meta(format!(
+                            "rocksdb txn retries exhausted after {MAX_TXN_RETRIES}: {e}"
+                        )));
+                    }
+                    continue;
+                }
+                Err(e) => return Err(rocks_err(e)),
+            }
+        }
+    }
+
+    /// 硬截断越过槽位点 → 标 stale(乐观事务重读 confirmed,不回退
+    /// 已推进的 ack)。已 stale 或已越过 cut = 无操作。
+    pub fn mark_repl_slot_stale_if_behind(&self, name: &str, cut_through: Gtid) -> Result<bool> {
+        const MAX_TXN_RETRIES: u32 = 10_000;
+        let mut retries = 0u32;
+        loop {
+            let tx = self.db.transaction_opt(&self.write_opts, &self.txn_opts);
+            let mut slot = match tx.get(repl_slot_key(name)?).map_err(rocks_err)? {
+                Some(v) => Slot::decode(&v)?,
+                None => {
+                    let _ = tx.rollback();
+                    return Ok(false);
+                }
+            };
+            if slot.stale || slot.confirmed_gtid >= cut_through {
+                let _ = tx.rollback();
+                return Ok(false);
+            }
+            slot.stale = true;
+            tx.put(repl_slot_key(&slot.name)?, slot.encode()?)
+                .map_err(rocks_err)?;
+            match tx.commit() {
+                Ok(()) => {
+                    self.db.flush_wal(true).map_err(rocks_err)?;
+                    return Ok(true);
+                }
+                Err(e) if e.kind() == ErrorKind::Busy || e.kind() == ErrorKind::TryAgain => {
+                    retries += 1;
+                    if retries > MAX_TXN_RETRIES {
+                        return Err(Error::Meta(format!(
+                            "rocksdb txn retries exhausted after {MAX_TXN_RETRIES}: {e}"
+                        )));
+                    }
+                    continue;
+                }
+                Err(e) => return Err(rocks_err(e)),
+            }
+        }
     }
 
     /// 读单槽(缺席 → None)。
@@ -4329,18 +4462,9 @@ impl MetaStore {
             }
         }
         if forced {
-            for s in &slots {
-                if s.confirmed_gtid < cut_through {
-                    let mut s = s.clone();
-                    s.stale = true;
-                    batch.put(repl_slot_key(&s.name)?, s.encode()?);
-                    stats.stale_marked += 1;
-                }
-            }
             tracing::warn!(
                 cut_through = ?cut_through,
-                stale_marked = stats.stale_marked,
-                "repl binlog hard cap exceeded; forced truncation past slot floor, overtaken slots marked stale (R7)"
+                "repl binlog hard cap exceeded; forced truncation past slot floor (R7)"
             );
         }
         stats.truncated = cut as u64;
@@ -4350,6 +4474,18 @@ impl MetaStore {
             .map_err(rocks_err)?;
         if self.sync_mode == SyncMode::Full {
             self.db.flush_wal(true).map_err(rocks_err)?;
+        }
+        if forced {
+            // 标 stale 与 ack 并发走乐观事务(重读 confirmed,不覆盖已
+            // 推进的回执);与删除分提交:崩溃窗口要么已截未标(下次握手
+            // 位点下界仍 ErrBinlogGone)要么已标。
+            for s in &slots {
+                if s.confirmed_gtid < cut_through
+                    && self.mark_repl_slot_stale_if_behind(&s.name, cut_through)?
+                {
+                    stats.stale_marked += 1;
+                }
+            }
         }
         Ok(stats)
     }
@@ -4728,6 +4864,26 @@ impl MetaStore {
             total = total.saturating_add(v.len() as u64);
         }
         Ok(total)
+    }
+
+    /// retained binlog 中 GTID > after 的条数(跨代 lag_seq 精确计数)。
+    pub fn repl_binlog_count_after(&self, after: Gtid) -> Result<u64> {
+        let mut n = 0u64;
+        let start = binlog_key(after.epoch, after.seq.saturating_add(1));
+        for item in self
+            .db
+            .iterator(IteratorMode::From(&start, Direction::Forward))
+        {
+            let (k, _) = item.map_err(rocks_err)?;
+            if !k.starts_with(PREFIX_BINLOG) {
+                break;
+            }
+            if parse_binlog_gtid(&k)? <= after {
+                continue;
+            }
+            n = n.saturating_add(1);
+        }
+        Ok(n)
     }
 
     /// 归档恢复作业队列读取(M16 A2,ADR-19 DA2.3):从 `after_seq` 之后
@@ -6615,8 +6771,7 @@ fn apply_ops(
                     Some(st) => remap(&st.restored_extents),
                     None => (Vec::new(), 0),
                 };
-                if n_ext + n_rest != old_segments.len()
-                    && !matches!(mode, ApplyMode::Replay { .. })
+                if n_ext + n_rest != old_segments.len() && !matches!(mode, ApplyMode::Replay { .. })
                 {
                     return Err(Error::ObjectChanged(format!(
                         "{bucket}/{key} segments changed during compaction"
@@ -8517,8 +8672,14 @@ mod tests {
         pri.commit_bucket_put("b1", &bucket_meta("b1")).unwrap();
         let mut big3 = object_meta(8192);
         big3.extents = vec![local_seg.clone()];
-        pri.commit_object_put("b1", "big3", &big3, AllocDraft::default(), StatsDelta::default())
-            .unwrap();
+        pri.commit_object_put(
+            "b1",
+            "big3",
+            &big3,
+            AllocDraft::default(),
+            StatsDelta::default(),
+        )
+        .unwrap();
         let err = pri
             .commit_object_migrate(
                 "b1",
@@ -8595,8 +8756,8 @@ mod tests {
     /// ① import_repl_batch:raw put 原样落键,**不增 s:seq、不写 bl:**;
     /// ② a:{import_seq}/t:{import_seq} 多批 RMW 合并(两批同位点 →
     ///    alloc/ref_inc 直拼,一笔记录);
-    /// ③ finalize_repl_import(P):游标 = P、executed = {P.epoch:[1..=P.seq]}
-    ///    **重置不累加**(预置旧历史段被覆盖)、s:seq = max(当前, P.seq);
+    /// ③ finalize_repl_import(P, set, raw, ebase):游标 = P、executed =
+    ///    完整集 **重置不累加**(预置旧历史段被覆盖)、s:seq = max(当前, raw);
     /// ④ 崩溃重放:重开后游标/executed/导入键保持。
     #[test]
     fn repl_import_batch_and_finalize() {
@@ -8640,14 +8801,17 @@ mod tests {
             assert_eq!(recs[0].ref_inc, vec![9]);
 
             // ③ finalize:游标/executed 重置;s:seq = max(1, 7) = 7
-            meta.finalize_repl_import(p).unwrap();
+            let mut executed = GtidSet::new();
+            executed.insert_range(1, 1, 7);
+            meta.finalize_repl_import(p, &executed, 7, 0).unwrap();
             assert_eq!(meta.repl_cursor().unwrap(), p);
             assert_eq!(
                 meta.repl_executed().unwrap().ranges().collect::<Vec<_>>(),
                 vec![(1, 1, 7)],
                 "executed 按 P 重置(R12)"
             );
-            assert_eq!(meta.last_seq().unwrap(), 7, "s:seq 推进至 P.seq 防回退");
+            assert_eq!(meta.last_seq().unwrap(), 7, "s:seq 推进至 raw_seq 防回退");
+            assert_eq!(meta.repl_ebase().unwrap(), 0);
             meta.flush().unwrap();
         }
         // ④ 崩溃重放:重开后保持
@@ -8661,6 +8825,27 @@ mod tests {
             assert!(meta.get_bucket("b0").unwrap().is_some());
             assert_eq!(meta.list_alloc_records(0).unwrap().len(), 1);
         }
+    }
+
+    /// R12:从已 promote 主引导时 executed 必须含先前 epoch,s:seq/ebase
+    /// 对齐上游 raw 尺度(不可只写 {P.epoch:[1..=P.seq]} / 代内 P.seq)。
+    #[test]
+    fn finalize_repl_import_preserves_prior_epochs_and_raw_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = Gtid { epoch: 2, seq: 5 };
+        let meta = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
+        let mut executed = GtidSet::new();
+        executed.insert_range(1, 1, 100);
+        executed.insert_range(2, 1, 5);
+        meta.finalize_repl_import(p, &executed, 1005, 1000).unwrap();
+        assert_eq!(meta.repl_cursor().unwrap(), p);
+        assert_eq!(
+            meta.repl_executed().unwrap().ranges().collect::<Vec<_>>(),
+            vec![(1, 1, 100), (2, 1, 5)]
+        );
+        assert_eq!(meta.last_seq().unwrap(), 1005);
+        assert_eq!(meta.repl_ebase().unwrap(), 1000);
+        assert_eq!(meta.repl_epoch().unwrap(), 2);
     }
 
     /// M21 B4(ADR-33 RP3.2/RP4.2;设计稿 §4.1;TODO M21/B4 具名用例):
@@ -9039,6 +9224,7 @@ mod tests {
         {
             let meta = MetaStore::open(dir.path(), &MetaConfig::default()).unwrap();
             meta.set_repl_role(ReplRole::Standby).unwrap();
+            meta.set_repl_upchain(&["old-primary".into()]).unwrap();
             let g = |seq: u64| Gtid { epoch: 1, seq };
             for seq in 1..=2 {
                 let rec = ReplRecord::new(
@@ -9086,11 +9272,30 @@ mod tests {
                 vec![(1, 1, 2), (2, 1, 1)]
             );
             assert_eq!(meta.repl_cursor().unwrap(), g(2), "游标不动");
+            assert_eq!(barrier.raw_seq, Some(3), "barrier raw_seq = cur_seq+1");
+            assert!(
+                meta.repl_ever_primary().unwrap(),
+                "promote 置位 ever_primary(RP5.4 HELLO 输入)"
+            );
+            assert!(
+                meta.repl_upchain().unwrap().is_empty(),
+                "promote 摘除备期 upchain(新根;旧主归队 HELLO 不得误判成环)"
+            );
             // 幂等护栏:已转正,再 promote → NotStandby
             assert!(matches!(
                 meta.promote(false).unwrap_err(),
                 PromoteError::NotStandby
             ));
+            let meta = std::sync::Arc::new(meta);
+            let export = meta.repl_export_open(BucketFilter::All).unwrap();
+            let ep = export.export_point();
+            assert_eq!(
+                ep.gtid_set.ranges().collect::<Vec<_>>(),
+                vec![(1, 1, 2), (2, 1, 1)],
+                "快照 GTID 集须含先前 epoch(R12 cascade)"
+            );
+            assert_eq!(ep.raw_seq, 3);
+            assert_eq!(ep.ebase, 2);
         }
 
         // ③ binlog 开启库:promote 后本地写走代内 seq 重计 + 跨代扫描

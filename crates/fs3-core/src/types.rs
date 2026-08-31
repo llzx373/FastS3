@@ -12,8 +12,10 @@ use sha2::Digest as _;
 
 /// 段(ADR-9 §4.1):对象 → 设备的引用单位(替代 v1 的 ExtentRef;offset 语义化)。
 ///
-/// - 独占段(整 extent 属于一个对象且写满):`offset == 0`,`crcs` 为空,
-///   校验走 extent 头 CRC 表;
+/// - 独占段(整 extent 属于一个对象且写满):`offset == 0`;本地读校验走
+///   extent 头 CRC 表(`crcs` 空 = 存量);**M21 起 `crcs` 同步携带 64KiB
+///   网格**(与头表同口径,随 ObjectMeta 进 binlog)——备端流式拉取用它
+///   绑定「记录所指字节」,防主端 compaction 复用 extent 后静默串数据;
 /// - 打包段:4KiB 对齐的变长区间(≥ 4KiB,按 O_DIRECT 对齐),`crcs` 为
 ///   段内 64KiB 网格 CRC(≤ 64 项 = 256B),校验走元数据。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,7 +25,8 @@ pub struct Segment {
     pub offset: u32,
     /// 段长度(4KiB 倍数)。
     pub len: u32,
-    /// 仅打包段:段内 64KiB 网格 CRC(尾部按实际数据 CRC);独占段为空。
+    /// 段内 64KiB 网格 CRC(尾部按实际数据 CRC)。打包段恒有;独占段
+    /// M21 起同步写入(存量空表 = 读路径回退 extent 头)。
     pub crcs: Vec<u32>,
 }
 

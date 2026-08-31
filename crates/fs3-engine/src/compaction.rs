@@ -250,10 +250,18 @@ impl Compactor {
         // 活段 = 本地 commit 新 extent,会污染复制不变量(段布局与
         // `s:repl_rmap` 翻译表漂移;备端分配只许发生在 apply/回填通道)。
         // promote 后 role 翻转,本门控自动恢复;Compaction/Rebalance 双
-        // 模式与前台 compact_once/后台 worker 同走此口。meta 读失败按
-        // 非备端放行(fail-open,不阻塞主端维护)。
-        if matches!(self.meta.repl_role(), Ok(fs3_meta::ReplRole::Standby)) {
-            return Ok(CompactionReport::default());
+        // 模式与前台 compact_once/后台 worker 同走此口。meta 读失败
+        // fail-closed(跳过本轮):角色不可读时迁段会在备端静默破不变量,
+        // 主端 meta 已坏时 compaction 也不是安全维护窗口。
+        match self.meta.repl_role() {
+            Ok(fs3_meta::ReplRole::Standby) => return Ok(CompactionReport::default()),
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "compaction skipped: repl_role unreadable ({e}); fail-closed (ADR-33 RP4.4)"
+                );
+                return Ok(CompactionReport::default());
+            }
         }
         let _guard = match self.running.try_lock() {
             Ok(g) => g,
@@ -532,7 +540,8 @@ impl Compactor {
             self.write_packed_header(eid)?;
             self.alloc.mark_sealed(eid as u64);
             // 防抖动:自产 extent 连同封口时活字节数入 recent(上限 64,防
-            // 无限增长);再准入判据 = 活字节较封口时下降过半(相对判据)
+            // 无限增长);再准入判据 = 活字节较封口时下降过半(相对判据)。
+            // 进程内记忆即可:重启后至多一次额外迁出(有界),不持久化。
             let live_at_seal = self.alloc.live_bytes_of(eid as u64) as u64;
             let mut recent = self.recent.lock().unwrap();
             recent.push((eid as u64, live_at_seal));
@@ -850,7 +859,8 @@ mod tests {
         // (pad 对象 64KiB > 内联阈值 + seal-on-delete:让 extent 进入
         //  Sealed 才可为候选)
         let data = pattern_bytes(100 * 1024, 0x42);
-        e.put("b1", "pad", &mut Cursor::new(vec![0u8; 64 * 1024])).unwrap();
+        e.put("b1", "pad", &mut Cursor::new(vec![0u8; 64 * 1024]))
+            .unwrap();
         e.put("b1", "k1", &mut Cursor::new(data.clone())).unwrap();
         assert_eq!(e.head("b1", "k1").unwrap().unwrap().extents[0].extent_id, 0);
         e.delete("b1", "pad").unwrap();
@@ -938,7 +948,10 @@ mod tests {
         assert_eq!(r3.candidates, 1, "删除过半后应重新接纳");
         assert_eq!(r3.migrated_objects, 1);
         assert_eq!(r3.freed_extents, 1);
-        assert!(!e.allocator().test_bit(new_id), "二次迁移后旧 extent 应释放");
+        assert!(
+            !e.allocator().test_bit(new_id),
+            "二次迁移后旧 extent 应释放"
+        );
 
         // 数据完好、无泄漏
         let mut out = Vec::new();

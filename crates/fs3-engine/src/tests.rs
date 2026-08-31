@@ -134,9 +134,12 @@ fn put_get_delete_roundtrip() {
     let m = e.put("b1", "big", &mut Cursor::new(big.clone())).unwrap();
     assert_eq!(m.size, big.len() as u64);
     assert!(m.extents.len() >= 2, "expected >=2 segments");
-    // 首个段:独占(整块,元数据 crcs 为空);尾段:打包(带 crcs)
+    // 首个段:独占(整块;M21 起元数据 crcs 与头表同网格);尾段:打包
     assert_eq!(m.extents[0].offset, 0);
-    assert!(m.extents[0].crcs.is_empty(), "exclusive segment crcs empty");
+    assert!(
+        !m.extents[0].crcs.is_empty(),
+        "exclusive segment carries 64KiB grid crcs for replication binding"
+    );
     assert!(!m.extents[1].crcs.is_empty(), "packed tail segment crcs");
 
     // 小对象(单段内):与 big 的打包尾段共享同一开放 extent
@@ -2289,10 +2292,14 @@ fn seal_conditions_and_types() {
     assert_eq!(m.extents.len(), 1);
     let s0 = &m.extents[0];
     assert_eq!(s0.offset, 0);
-    assert!(s0.crcs.is_empty(), "独占段元数据 crcs 为空");
+    assert!(
+        !s0.crcs.is_empty(),
+        "独占段元数据 crcs 与头表同网格(M21 复制内容绑定)"
+    );
     let h = e.read_extent_header(s0.extent_id as u64).unwrap().unwrap();
     assert!(!h.is_packed(), "独占头非 packed");
     assert!(!h.chunk_crcs.is_empty(), "独占头带完整 CRC 表");
+    assert_eq!(s0.crcs, h.chunk_crcs, "独占段网格 == 头 CRC 表");
     assert_eq!(h.generation, e.allocator().generation(s0.extent_id as u64));
 
     // 下一个对象 → 新开放 extent

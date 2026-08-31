@@ -284,6 +284,8 @@ async fn supervisor(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         if inner.stop.load(Ordering::Relaxed) {
+            while tasks.join_next().await.is_some() {}
+            while fetch_tasks.join_next().await.is_some() {}
             return;
         }
         tokio::select! {
@@ -298,6 +300,8 @@ async fn supervisor(
             req = fetch_rx.recv() => {
                 let Some(req) = req else {
                     // 全部发送方析构 = 服务关停
+                    while tasks.join_next().await.is_some() {}
+                    while fetch_tasks.join_next().await.is_some() {}
                     return;
                 };
                 let inner2 = inner.clone();

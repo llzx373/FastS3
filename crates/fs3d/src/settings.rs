@@ -455,7 +455,10 @@ mod tests {
         assert!(restart.iter().any(|s| s == "kms.vault_addr"), "{restart:?}");
         assert!(restart.iter().any(|s| s == "kms.token_file"), "{restart:?}");
         let text = std::fs::read_to_string(&toml_path).unwrap();
-        assert!(text.contains("backend") && text.contains("external"), "{text}");
+        assert!(
+            text.contains("backend") && text.contains("external"),
+            "{text}"
+        );
         assert!(
             !text.contains("hvs.") && !text.contains("vault:v1:"),
             "token 明文不得进 toml: {text}"
