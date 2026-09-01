@@ -101,8 +101,9 @@ fasts3d check --fix                       # 有泄漏:回收不可达 extent 后
 
 ### 3.2 掉盘/设备 I/O 故障(degraded)
 
-检测到设备 I/O 错误 → 引擎进入**只读降级**并置 `degraded=true`(状态/指标
-可见):写请求返回错误,读仍尽力服务。**处置**:修复底层设备(RAID/云盘/
+检测到**掉盘类**设备 I/O 错误(EIO/ENXIO/ENODEV/EBADF 等)→ 引擎进入**只读降级**
+并置 `degraded=true`(状态/指标可见):写请求返回错误,读仍尽力服务。
+对齐错误(EINVAL)与磁盘满(ENOSPC)不降级。**处置**:修复底层设备(RAID/云盘/
 重新挂载)→ 重启 fasts3d → `doctor` + `check` 确认恢复。底层设备已 HA 是
 FastS3 的前提假设,掉盘属上游故障,不尝试本地自愈。
 

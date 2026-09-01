@@ -7373,7 +7373,8 @@ impl Engine {
         self.zc_fds.clone()
     }
 
-    /// 设备降级标志(M4 D4):掉盘/连续 IO 故障 → true;粘性,重启清除。
+    /// 设备降级标志(M4 D4):掉盘类 IO 故障 → true;粘性,重启清除。
+    /// EINVAL/ENOSPC 等非掉盘错误不置位。
     pub fn degraded(&self) -> bool {
         self.degraded.load(std::sync::atomic::Ordering::Relaxed)
     }

@@ -440,7 +440,13 @@ impl Compactor {
             // 候选 extent 数(top_k)不约束累计活段字节;本对象/分片的段放不进
             // 剩余空间就整体跳过(留给下一轮的新 extent),绝不溢出写到相邻
             // extent(debug 下 copy_segment 的 debug_assert 即此哨兵)。
-            let need: u64 = item.old_segments.iter().map(|s| s.len as u64).sum();
+            // 物理占用 = 每段 4KiB 对齐跨度(尾垫死区,与 flush_acc 同口径);
+            // 用逻辑 len 求和会在非对齐对象上低估,后续 copy 溢出或 O_DIRECT EINVAL。
+            let need: u64 = item
+                .old_segments
+                .iter()
+                .map(|s| packed_span(s.len) as u64)
+                .sum();
             if wm as u64 + need > capacity {
                 continue;
             }
@@ -564,6 +570,16 @@ impl Compactor {
         let src_slot = &self.devices[src_di];
         let src_base =
             src_slot.data_offset(old.extent_id as u64 - src_slot.base) + old.offset as u64;
+        debug_assert_eq!(
+            src_base % SECTOR_SIZE,
+            0,
+            "source segment offset must be 4KiB aligned"
+        );
+        debug_assert_eq!(
+            *wm as u64 % SECTOR_SIZE,
+            0,
+            "compaction watermark must stay 4KiB aligned (O_DIRECT)"
+        );
         let mut crcs: Vec<u32> = Vec::new();
         let mut partial: u32 = 0;
         let mut partial_len: usize = 0;
@@ -611,14 +627,26 @@ impl Compactor {
         if partial_len > 0 {
             crcs.push(partial);
         }
-        debug_assert!(*wm as u64 + total <= capacity, "compaction extent overflow");
+        let span = packed_span(total as u32);
+        debug_assert!(
+            *wm as u64 + span as u64 <= capacity,
+            "compaction extent overflow"
+        );
+        debug_assert_eq!(
+            *wm as u64 % SECTOR_SIZE,
+            0,
+            "compaction watermark must stay 4KiB aligned (O_DIRECT)"
+        );
         let seg = Segment {
             extent_id: eid,
             offset: *wm,
             len: total as u32,
             crcs,
         };
-        *wm += total as u32;
+        // 与 flush_acc 同口径:水位按物理对齐推进,段长仍记逻辑字节。
+        // 旧实现 `*wm += total` 在非 4KiB 倍数对象后把下一笔写推到未对齐
+        // 偏移 → ext4/xfs 上 O_DIRECT EINVAL,再被 DegradeAware 误伤成整池只读。
+        *wm += span;
         Ok(seg)
     }
 
@@ -638,6 +666,12 @@ impl Compactor {
         write_all(&mut **io, slot.dev.raw_fd(), hbuf.as_slice(), off)?;
         Ok(())
     }
+}
+
+/// 段在压缩 extent 上占用的物理字节(4KiB 对齐尾垫;ADR-9 D1 / flush_acc)。
+#[inline]
+fn packed_span(len: u32) -> u32 {
+    align_up(len as u64, SECTOR_SIZE) as u32
 }
 
 /// 压缩 worker = `BackgroundWorker` 抽象的首个实例(ADR-12 DL2):
@@ -723,6 +757,69 @@ mod tests {
         assert_eq!(m.extents.len(), 1);
         assert_ne!(m.extents[0].extent_id, 0);
         assert!(m.extents[0].offset < cap as u32);
+        e.close().unwrap();
+    }
+
+    /// 回归:逻辑段长非 4KiB 倍数时,压缩水位必须按物理对齐推进。
+    /// 旧实现 `wm += len` 让后续段写偏移未对齐 → ext4/xfs O_DIRECT EINVAL。
+    /// tmpfs 不强制对齐,所以用新段 offset 对齐 + GET 完好作为门禁。
+    #[test]
+    fn compaction_packs_unaligned_segment_lengths() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("disk.img");
+        std::fs::File::create(&img)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        fs3_device::init_device(&img, 4 * 1024 * 1024, 0, false).unwrap();
+        let cfg = crate::EngineConfig {
+            devices: vec![img],
+            meta_dir: dir.path().join("meta"),
+            compaction: CompactionConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut e = crate::Engine::open(&cfg).unwrap();
+        e.ensure_bucket("b1").unwrap();
+        // > 内联阈值,且故意不是 4KiB 倍数(与 flush_acc 尾垫死区同形)
+        let sizes = [32 * 1024 + 100, 32 * 1024 + 2500, 32 * 1024 + 7];
+        let bodies: Vec<Vec<u8>> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| vec![(0x40 + i) as u8; n])
+            .collect();
+        for (i, body) in bodies.iter().enumerate() {
+            e.put("b1", &format!("k{i}"), &mut Cursor::new(body.clone()))
+                .unwrap();
+        }
+        // 删一个制造空洞,留下两个非对齐活段同 extent → compact 必连续拷贝
+        e.delete("b1", "k0").unwrap();
+        let r = e.compact_once().unwrap();
+        assert_eq!(r.errors, 0, "unaligned lens must not fail compaction copy");
+        assert!(
+            r.migrated_objects >= 2,
+            "both survivors should migrate: {r:?}"
+        );
+        assert!(
+            !e.degraded(),
+            "software-alignment I/O must not degrade the pool"
+        );
+        for i in 1..3 {
+            let m = e.head("b1", &format!("k{i}")).unwrap().unwrap();
+            for s in &m.extents {
+                assert_eq!(
+                    s.offset as u64 % SECTOR_SIZE,
+                    0,
+                    "compacted segment offset must be 4KiB aligned (k{i} {s:?})"
+                );
+            }
+            let mut out = Vec::new();
+            e.get_to("b1", &format!("k{i}"), 0..u64::MAX, &mut out)
+                .unwrap();
+            assert_eq!(out, bodies[i]);
+        }
         e.close().unwrap();
     }
 

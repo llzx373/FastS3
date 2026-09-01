@@ -7,6 +7,8 @@
 
 ## Unreleased
 
+- **fix(engine)**: compaction 按 4KiB 物理跨度推进水位(与 `flush_acc` 同口径),非对齐对象不再在 ext4/xfs 上触发 O_DIRECT `EINVAL`;`DegradeAware` 仅对掉盘类 errno(EIO/ENXIO/…)置只读,EINVAL 等软件错误不再把整池写死。
+
 控制台与 CLI 对齐近期数据面/管理面能力(不升版本号):
 
 - 桶 Public Access Block / PolicyStatus 控制台入口;

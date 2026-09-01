@@ -3561,6 +3561,21 @@ fn enospc_does_not_mark_degraded() {
     assert!(!e.degraded(), "ENOSPC must NOT mark degraded");
 }
 
+/// EINVAL 是 O_DIRECT 对齐/参数错误,不是掉盘:不得只读降级。
+#[test]
+fn einval_does_not_mark_degraded() {
+    let (_d, mut cfg) = setup();
+    let flaky = Arc::new(Mutex::new(
+        Box::new(FlakyIo::new(0, libc::EINVAL)) as Box<dyn IoEngine>
+    ));
+    cfg.debug_io = Some(flaky);
+    let mut e = Engine::open(&cfg).unwrap();
+    e.ensure_bucket("b1").unwrap();
+    let r = e.put("b1", "k", &mut Cursor::new(rnd(64 * 1024, 7)));
+    assert!(r.is_err());
+    assert!(!e.degraded(), "EINVAL must NOT mark degraded");
+}
+
 /// Drop 注入:掉盘后读仍可(只读模式保留),写持续失败且 flag 保持粘性。
 #[test]
 fn degraded_is_sticky_across_failures() {

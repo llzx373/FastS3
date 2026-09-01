@@ -2,7 +2,9 @@
 //!
 //! ADR-2:存储 I/O 完全旁路运行时,引擎自持 io_uring ring;
 //! 内核不支持时自动降级 pread/pwrite(功能完整、性能降级,老内核兜底雏形)。
-//! M4 D4:任何非「磁盘满」的设备 I/O 错误 → 降级标志(掉盘只读降级 + 告警)。
+//! M4 D4:掉盘类设备 I/O 错误(EIO/ENXIO/ENODEV/EBADF 等)→ 降级标志
+//! (只读降级 + 告警)。磁盘满(ENOSPC)与软件/对齐错误(EINVAL/EFAULT)
+//! 不降级——后者是调用方缺陷,compaction 失败只应减慢空间回收(ADR-9 §6.1)。
 
 use std::io;
 use std::os::fd::RawFd;
@@ -107,8 +109,22 @@ pub fn open_io_engine_opts(
     Ok(Box::new(PreadEngine))
 }
 
-/// 设备故障检测包装(M4 D4):submit 失败且非「磁盘满」→ 置降级标志。
-/// 掉盘(ENXIO/EBADF/EIO 等)多次 IO 失败后,S3 层写方法拒绝(只读降级 + 告警)。
+/// 运行期 I/O 错误是否视为设备故障(掉盘 → 只读降级,粘性,重启清除)。
+///
+/// 白名单对齐 M4 D4 原意(EIO/ENXIO/ENODEV/EBADF 等介质/句柄丢失)。
+/// ENOSPC 是容量耗尽(507);EINVAL/EFAULT/EINTR 是对齐/缓冲/瞬时软件错误,
+/// 不得把整池打成只读(StarRocks 灌数时 compaction 一次 EINVAL 写死实例)。
+pub fn is_device_failure(err: &io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(
+            libc::EIO | libc::ENXIO | libc::ENODEV | libc::EBADF | libc::EREMOTEIO | libc::EUCLEAN
+        )
+    )
+}
+
+/// 设备故障检测包装(M4 D4):submit 失败且属掉盘类 errno → 置降级标志。
+/// 掉盘后 S3 层写方法拒绝(只读降级 + 告警);读路径仍尽力服务。
 pub struct DegradeAware {
     inner: Box<dyn IoEngine>,
     degraded: Arc<AtomicBool>,
@@ -125,10 +141,7 @@ impl IoEngine for DegradeAware {
         match self.inner.submit(ops) {
             Ok(()) => Ok(()),
             Err(e) => {
-                // 磁盘满(ENOSPC)≠ 设备故障:507 语义,不降级
-                let disk_full = e.kind() == io::ErrorKind::StorageFull
-                    || e.raw_os_error() == Some(libc::ENOSPC);
-                if !disk_full && !self.degraded.swap(true, Ordering::Relaxed) {
+                if is_device_failure(&e) && !self.degraded.swap(true, Ordering::Relaxed) {
                     tracing::error!(
                         "DEVICE DEGRADED: device I/O failed ({e}); switching to read-only mode"
                     );
@@ -615,5 +628,43 @@ mod tests {
             Some(11),
             "must keep first error after draining rest"
         );
+    }
+
+    struct FailErrno(i32);
+    impl IoEngine for FailErrno {
+        fn submit(&mut self, _: &[IoOp]) -> io::Result<()> {
+            Err(io::Error::from_raw_os_error(self.0))
+        }
+        fn name(&self) -> &'static str {
+            "fail-errno"
+        }
+    }
+
+    #[test]
+    fn is_device_failure_whitelist() {
+        let eio = io::Error::from_raw_os_error(libc::EIO);
+        let enxio = io::Error::from_raw_os_error(libc::ENXIO);
+        let einval = io::Error::from_raw_os_error(libc::EINVAL);
+        let enospc = io::Error::from_raw_os_error(libc::ENOSPC);
+        let efault = io::Error::from_raw_os_error(libc::EFAULT);
+        assert!(is_device_failure(&eio));
+        assert!(is_device_failure(&enxio));
+        assert!(!is_device_failure(&einval));
+        assert!(!is_device_failure(&enospc));
+        assert!(!is_device_failure(&efault));
+        assert!(!is_device_failure(&io::Error::other("software")));
+    }
+
+    #[test]
+    fn degrade_aware_ignores_einval_marks_eio() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut d = DegradeAware::new(Box::new(FailErrno(libc::EINVAL)), flag.clone());
+        assert!(d.submit(&[]).is_err());
+        assert!(!flag.load(Ordering::Relaxed), "EINVAL must not degrade");
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut d = DegradeAware::new(Box::new(FailErrno(libc::EIO)), flag.clone());
+        assert!(d.submit(&[]).is_err());
+        assert!(flag.load(Ordering::Relaxed), "EIO must degrade");
     }
 }
