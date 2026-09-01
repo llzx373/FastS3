@@ -71,7 +71,7 @@ cargo test --workspace
 
 ## 提交与 PR
 
-1. 基于仓库**默认分支**开分支（当前为 `master`；若托管平台设为 `main` 则以其为准）。
+1. 基于仓库**默认分支**开分支（`main`）。
 2. 提交信息使用约定式前缀：`feat` / `fix` / `docs` / `test` / `perf` / `refactor` / `chore`。
    例：`fix(engine): compaction watermark uses 4KiB packed span`
 3. 一个 PR 只做一件事。用户可见行为变更须同步文档（`docs/site/` 或 `CHANGELOG.md` Unreleased）。

@@ -136,7 +136,7 @@ fio 基线脚本、crash harness、loadgen、warp、s3-tests 配置
 
 - 前缀:`feat` / `fix` / `docs` / `test` / `perf` / `refactor` / `chore`
 - 关联 TODO 条目(见 §4.5);修复缺陷注明根因与验证方式
-- 默认分支永远可发布：PR + review + CI 全绿方可合入（ROADMAP §3.1）。当前默认分支为 `master`（CI 同时监听 `main`）。
+- 默认分支永远可发布：PR + review + CI 全绿方可合入（ROADMAP §3.1）。当前默认分支为 `main`。
 
 ## 11. 文档同步义务
 
