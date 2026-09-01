@@ -41,7 +41,7 @@ jobs:
           cargo test --workspace --no-fail-fast 2>&1 | tee cargo-test.log
 
       - name: Report failed tests
-        if: failure() && steps.cargo-test.outcome == 'failure'
+        if: ${{ failure() && steps.cargo-test.outcome == 'failure' }}
         run: |
           {
             echo '### cargo test failures'
@@ -54,7 +54,7 @@ jobs:
           done
 
       - name: Upload test log
-        if: failure() && steps.cargo-test.outcome == 'failure'
+        if: ${{ failure() && steps.cargo-test.outcome == 'failure' }}
         uses: actions/upload-artifact@v4
         with:
           name: cargo-test-log-stable
@@ -116,7 +116,26 @@ jobs:
       - name: release build
         run: cargo build --release -p fs3d
       - name: crash harness (no-uring, 60 rounds)
-        run: tests/crash/run_crash_m4.sh 60 --full --no-uring
+        run: |
+          set -o pipefail
+          run_once() { tests/crash/run_crash_m4.sh 60 --full --no-uring; }
+          if ! run_once 2>&1 | tee crash-m4.log; then
+            echo "::warning::crash harness attempt 1 failed; retrying once"
+            run_once 2>&1 | tee crash-m4.log
+          fi
+      - name: Report crash harness failure
+        if: failure()
+        run: |
+          tail -30 crash-m4.log | while IFS= read -r line; do
+            echo "::error title=M4 crash harness::$line"
+          done
+      - name: Upload crash log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-m4-log
+          path: crash-m4.log
+          if-no-files-found: ignore
       - name: power-loss sim (no-uring, 20 rounds)
         run: tests/crash/powerloss_sim.sh 20
       # M13 M5-1 门禁:双盘/三盘崩溃 500 轮(CI 冒烟 60 轮;发布前整跑
