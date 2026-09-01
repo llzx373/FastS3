@@ -56,6 +56,9 @@ install -m 0640 etc/fasts3/fasts3.toml %{buildroot}/etc/fasts3/fasts3.example.to
 # 文档
 install -d %{buildroot}%{_docdir}/fasts3
 install -m 0644 share/fasts3/README.md %{buildroot}%{_docdir}/fasts3/README.md
+# 数据目录(空占位;%files 声明 %dir;卸载不删用户数据)
+install -d -m 0750 %{buildroot}/var/lib/fasts3
+install -d -m 0750 %{buildroot}/var/lib/fasts3/meta
 %if 0%{?with_sbom:1}
 install -m 0644 share/fasts3/SBOM.json %{buildroot}%{_docdir}/fasts3/SBOM.json
 %endif
