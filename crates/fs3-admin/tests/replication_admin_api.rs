@@ -16,8 +16,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fs3_admin::{
-    AdminConfig, AdminServer, PromoteError, PromoteRequest, RebuildError, RebuildRequest,
-    ReplActionError, ReplAdminControl, ReplicationControl,
+    AdminConfig, AdminServeGuard, AdminServer, PromoteError, PromoteRequest, RebuildError,
+    RebuildRequest, ReplActionError, ReplAdminControl, ReplicationControl,
 };
 use fs3_engine::{Engine, EngineConfig};
 use fs3_s3::auth::Credentials;
@@ -135,7 +135,7 @@ fn http_unix(
 fn start_admin(
     pull: Option<Arc<StubPull>>,
     topo: Option<Arc<StubAdmin>>,
-) -> (tempfile::TempDir, String, Arc<S3Service>) {
+) -> (tempfile::TempDir, String, Arc<S3Service>, AdminServeGuard) {
     let dir = tempfile::tempdir().unwrap();
     let img = dir.path().join("disk.img");
     std::fs::File::create(&img)
@@ -172,16 +172,14 @@ fn start_admin(
     )
     .with_replication_control(pull.map(|c| c as Arc<dyn ReplicationControl>))
     .with_repl_admin_control(topo.map(|c| c as Arc<dyn ReplAdminControl>));
-    std::thread::spawn(move || {
-        let _ = admin.serve();
-    });
+    let _guard = admin.spawn();
     for _ in 0..100 {
         if sock.exists() {
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    (dir, sock.display().to_string(), service)
+    (dir, sock.display().to_string(), service, _guard)
 }
 
 /// M21 F2(TODO M21/F2):admin 复制面全端点往返——501(未注入)/200 +
@@ -190,7 +188,7 @@ fn start_admin(
 #[test]
 fn repl_admin_roundtrip() {
     // ① 未注入 → 501(观测面与动作面各自独立注入,均不静默)
-    let (_d, sock, _svc) = start_admin(None, None);
+    let (_d, sock, _svc, _admin) = start_admin(None, None);
     for (method, path) in [
         ("GET", "/v1/admin/replication/status"),
         ("GET", "/v1/admin/replication/slots"),
@@ -207,7 +205,7 @@ fn repl_admin_roundtrip() {
     // ② 注入 stub:全面 200 + 审计口径
     let pull = Arc::new(StubPull { reject: false });
     let topo = Arc::new(StubAdmin { reject: false });
-    let (_d2, sock2, service) = start_admin(Some(pull), Some(topo));
+    let (_d2, sock2, service, _admin2) = start_admin(Some(pull), Some(topo));
     let post = |path: &str, who: &str| {
         http_unix(
             &sock2,
@@ -310,7 +308,7 @@ fn repl_admin_roundtrip() {
     // ③ 控制面 Rejected → 409 / Failed → 500
     let pull_rej = Arc::new(StubPull { reject: true });
     let topo_rej = Arc::new(StubAdmin { reject: true });
-    let (_d3, sock3, _s3) = start_admin(Some(pull_rej), Some(topo_rej));
+    let (_d3, sock3, _s3, _admin3) = start_admin(Some(pull_rej), Some(topo_rej));
     let (code, body) = http_unix(
         &sock3,
         "POST",

@@ -144,9 +144,7 @@ fn kms_admin_service_roundtrip_audit_and_authz() {
         },
     )
     .with_kms_service(Some(Arc::new(TestAdapter(mgr.clone()))));
-    std::thread::spawn(move || {
-        let _ = admin.serve();
-    });
+    let _admin = admin.spawn();
     for _ in 0..100 {
         if sock.exists() {
             break;

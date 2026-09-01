@@ -83,6 +83,24 @@ mod ws;
 
 pub use json::ApiError;
 
+/// 后台 admin 服务句柄。Drop 时通知退出并 join 线程。
+#[must_use = "dropping shuts down the admin server immediately"]
+pub struct AdminServeGuard {
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for AdminServeGuard {
+    fn drop(&mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// 管理服务配置。
 #[derive(Debug, Clone)]
 pub struct AdminConfig {
@@ -404,8 +422,19 @@ impl AdminServer {
         self
     }
 
-    /// 启动(阻塞)。unix socket 监听设置 0600 权限。
+    /// 启动(阻塞)。unix socket 监听设置 0600 权限。进程级生命周期用。
     pub fn serve(&self) -> std::io::Result<()> {
+        self.serve_with_shutdown(std::future::pending())
+    }
+
+    /// 与 [`serve`] 相同,但 `shutdown` 完成后退出 accept 循环。
+    ///
+    /// 测试应优先用 [`AdminServer::spawn`]:Drop 时取消并 join,避免进程退出
+    /// 时 rocksdb/aws-lc C++ 静态析构竞态(`pure virtual method called` / SIGABRT)。
+    pub fn serve_with_shutdown<F>(&self, shutdown: F) -> std::io::Result<()>
+    where
+        F: std::future::Future<Output = ()> + Send,
+    {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_io()
@@ -414,6 +443,7 @@ impl AdminServer {
             .build()
             .expect("admin runtime");
         rt.block_on(async {
+            tokio::pin!(shutdown);
             if let Some(path) = self.cfg.listen.strip_prefix("unix://") {
                 let path = PathBuf::from(path);
                 if path.exists() {
@@ -425,20 +455,25 @@ impl AdminServer {
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
                 tracing::info!("admin api listening on unix:{}", path.display());
                 loop {
-                    match listener.accept().await {
-                        Ok((stream, _)) => {
-                            let server = self.clone_handle();
-                            tokio::spawn(async move {
-                                let io = TokioIo::new(stream);
-                                let _ = server.serve_conn_unix(io).await;
-                            });
-                        }
-                        Err(e) => {
-                            tracing::warn!("admin unix accept error: {e}");
-                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    tokio::select! {
+                        _ = &mut shutdown => break,
+                        acc = listener.accept() => match acc {
+                            Ok((stream, _)) => {
+                                let server = self.clone_handle();
+                                tokio::spawn(async move {
+                                    let io = TokioIo::new(stream);
+                                    let _ = server.serve_conn_unix(io).await;
+                                });
+                            }
+                            Err(e) => {
+                                tracing::warn!("admin unix accept error: {e}");
+                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            }
                         }
                     }
                 }
+                let _ = std::fs::remove_file(&path);
+                Ok(())
             } else {
                 let addr: std::net::SocketAddr = self
                     .cfg
@@ -448,22 +483,43 @@ impl AdminServer {
                 let listener = tokio::net::TcpListener::bind(addr).await?;
                 tracing::info!("admin api listening on tcp {addr}");
                 loop {
-                    match listener.accept().await {
-                        Ok((stream, _)) => {
-                            let server = self.clone_handle();
-                            tokio::spawn(async move {
-                                let io = TokioIo::new(stream);
-                                let _ = server.serve_conn_tcp(io).await;
-                            });
-                        }
-                        Err(e) => {
-                            tracing::warn!("admin tcp accept error: {e}");
-                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    tokio::select! {
+                        _ = &mut shutdown => break,
+                        acc = listener.accept() => match acc {
+                            Ok((stream, _)) => {
+                                let server = self.clone_handle();
+                                tokio::spawn(async move {
+                                    let io = TokioIo::new(stream);
+                                    let _ = server.serve_conn_tcp(io).await;
+                                });
+                            }
+                            Err(e) => {
+                                tracing::warn!("admin tcp accept error: {e}");
+                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            }
                         }
                     }
                 }
+                Ok(())
             }
         })
+    }
+
+    /// 后台线程运行 admin;句柄 Drop 时停服并 join。
+    pub fn spawn(self) -> AdminServeGuard {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let thread = std::thread::Builder::new()
+            .name("fs3-admin".into())
+            .spawn(move || {
+                let _ = self.serve_with_shutdown(async move {
+                    let _ = rx.await;
+                });
+            })
+            .expect("spawn admin thread");
+        AdminServeGuard {
+            shutdown: Some(tx),
+            thread: Some(thread),
+        }
     }
 
     /// 自引用句柄(hyper 服务闭包用)。

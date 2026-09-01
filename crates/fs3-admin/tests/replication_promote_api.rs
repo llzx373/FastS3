@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fs3_admin::{
-    AdminConfig, AdminServer, PromoteError, PromoteRequest, RebuildError, RebuildRequest,
-    ReplicationControl,
+    AdminConfig, AdminServeGuard, AdminServer, PromoteError, PromoteRequest, RebuildError,
+    RebuildRequest, ReplicationControl,
 };
 use fs3_engine::{Engine, EngineConfig};
 use fs3_s3::auth::Credentials;
@@ -96,7 +96,9 @@ fn http_unix(
 }
 
 /// 引擎 + service + admin(unix socket)夹具;`ctrl` None = 不注入(501 面)。
-fn start_admin(ctrl: Option<Arc<StubControl>>) -> (tempfile::TempDir, String, Arc<S3Service>) {
+fn start_admin(
+    ctrl: Option<Arc<StubControl>>,
+) -> (tempfile::TempDir, String, Arc<S3Service>, AdminServeGuard) {
     let dir = tempfile::tempdir().unwrap();
     let img = dir.path().join("disk.img");
     std::fs::File::create(&img)
@@ -132,16 +134,14 @@ fn start_admin(ctrl: Option<Arc<StubControl>>) -> (tempfile::TempDir, String, Ar
         },
     )
     .with_replication_control(ctrl.map(|c| c as Arc<dyn ReplicationControl>));
-    std::thread::spawn(move || {
-        let _ = admin.serve();
-    });
+    let _guard = admin.spawn();
     for _ in 0..100 {
         if sock.exists() {
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    (dir, sock.display().to_string(), service)
+    (dir, sock.display().to_string(), service, _guard)
 }
 
 /// M21 E3(TODO M21/E3):admin promote 端面——未注入 501 / dry_run 与
@@ -150,7 +150,7 @@ fn start_admin(ctrl: Option<Arc<StubControl>>) -> (tempfile::TempDir, String, Ar
 #[test]
 fn replication_promote_api_roundtrip() {
     // ① 未注入 → 501(不静默)
-    let (_d, sock, _svc) = start_admin(None);
+    let (_d, sock, _svc, _admin) = start_admin(None);
     let (code, body) = http_unix(
         &sock,
         "POST",
@@ -165,7 +165,7 @@ fn replication_promote_api_roundtrip() {
         last: std::sync::Mutex::new(None),
         outcome: StubOutcome::Ok,
     });
-    let (_d2, sock2, service) = start_admin(Some(ctrl.clone()));
+    let (_d2, sock2, service, _admin2) = start_admin(Some(ctrl.clone()));
     let (code, body) = http_unix(
         &sock2,
         "POST",
@@ -228,7 +228,7 @@ fn replication_promote_api_roundtrip() {
         last: std::sync::Mutex::new(None),
         outcome: StubOutcome::Rejected,
     });
-    let (_d3, sock3, _s3) = start_admin(Some(rej));
+    let (_d3, sock3, _s3, _admin3) = start_admin(Some(rej));
     let (code, body) = http_unix(
         &sock3,
         "POST",
@@ -244,7 +244,7 @@ fn replication_promote_api_roundtrip() {
         last: std::sync::Mutex::new(None),
         outcome: StubOutcome::Failed,
     });
-    let (_d4, sock4, _s4) = start_admin(Some(fail));
+    let (_d4, sock4, _s4, _admin4) = start_admin(Some(fail));
     let (code, body) = http_unix(
         &sock4,
         "POST",

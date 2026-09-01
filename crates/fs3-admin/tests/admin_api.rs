@@ -5,7 +5,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fs3_admin::{AdminConfig, AdminServer};
+use fs3_admin::{AdminConfig, AdminServeGuard, AdminServer};
 use fs3_engine::{Engine, EngineConfig};
 use fs3_kms::RootKms;
 use fs3_s3::auth::Credentials;
@@ -23,8 +23,8 @@ fn setup() -> (tempfile::TempDir, PathBuf) {
     (dir, img)
 }
 
-/// 启动 admin 服务线程;返回 (socket 路径, 停止句柄)。
-fn start_admin(cfg: &EngineConfig, token: &str) -> (String, std::thread::JoinHandle<()>) {
+/// 启动 admin 服务线程;返回 (socket 路径, Drop 即停服的句柄)。
+fn start_admin(cfg: &EngineConfig, token: &str) -> (String, AdminServeGuard) {
     let engine = Arc::new(RwLock::new(Engine::open(cfg).unwrap()));
     let service = Arc::new(S3Service::new(
         engine.clone(),
@@ -46,7 +46,7 @@ fn start_admin_with(
     service: Arc<S3Service>,
     token: &str,
     lifecycle_stats: Option<Arc<fs3_engine::lifecycle::LifecycleStats>>,
-) -> (String, std::thread::JoinHandle<()>) {
+) -> (String, AdminServeGuard) {
     let sock = cfg
         .meta_dir
         .parent()
@@ -62,9 +62,7 @@ fn start_admin_with(
         },
     )
     .with_lifecycle_stats(lifecycle_stats);
-    let handle = std::thread::spawn(move || {
-        let _ = admin.serve();
-    });
+    let handle = admin.spawn();
     // 等待 socket 就绪
     for _ in 0..100 {
         if sock.exists() {
@@ -1727,9 +1725,7 @@ fn sse_rotate_and_status() {
             token: "sekret".into(),
         },
     );
-    let handle = std::thread::spawn(move || {
-        let _ = admin.serve();
-    });
+    let _handle = admin.spawn();
     for _ in 0..100 {
         if sock.exists() {
             break;
@@ -1794,7 +1790,6 @@ fn sse_rotate_and_status() {
         assert!(!body.to_lowercase().contains("wrapped_dek"), "{path}");
         assert!(!body.contains("sse_kek_seed"), "{path}");
     }
-    let _ = handle;
 }
 
 /// 静默编译检查:确保 curl 可用(测试前提)。

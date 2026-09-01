@@ -6717,9 +6717,7 @@ mod tests {
             Arc::new(crate::repl_metrics::ReplMetricsProvider::new(meta.clone()))
                 as Arc<dyn fs3_admin::ReplMetricsSource>,
         ));
-        std::thread::spawn(move || {
-            let _ = admin.serve();
-        });
+        let _admin = admin.spawn();
         for _ in 0..100 {
             if sock.exists() {
                 break;
