@@ -20,7 +20,7 @@
 ## 文档
 
 - [ ] 无需文档
-- [ ] 已更新 `docs/site/` 和/或 `CHANGELOG.md` Unreleased
+- [ ] 已更新 `docs/site/`（英文 `*.md` + 中文 `*.zh.md`）和/或 `CHANGELOG.md` Unreleased
 - [ ] 设计变更已写入 `docs/DESIGN.md`（ADR）
 
 ## 风险

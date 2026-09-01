@@ -1,13 +1,13 @@
-# 如何贡献
+# Contributing
 
-克隆本仓库后阅读根目录 `CONTRIBUTING.md`（构建约定、测试门禁、提交规范与范围红线）。行为准则见根目录 `CODE_OF_CONDUCT.md`。
+After cloning, read `CONTRIBUTING.md` at the repository root (build rules, test gates, commit style, red lines). Code of conduct: `CODE_OF_CONDUCT.md`.
 
-摘要：
+Summary:
 
-1. 在 **Linux** 上安装 Rust 1.88+、Clang / libclang、pnpm 9。
-2. `cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace` 必须通过。
-3. 用户可见变更同步本目录或仓库 `CHANGELOG.md`。
-4. 与实现冲突时以 `docs/DESIGN.md` 为准，先补 ADR。
-5. 不要提交密钥或本地数据盘。
+1. On **Linux**, install Rust 1.88+, Clang / libclang, pnpm 9.
+2. `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` must pass.
+3. User-visible changes update this site (English `*.md` and Chinese `*.zh.md`) or `CHANGELOG.md`.
+4. When implementation conflicts with design, `docs/DESIGN.md` wins — add an ADR first.
+5. Do not commit secrets or local data disks.
 
-Issue / PR 模板在 `.github/`。
+Issue / PR templates live in `.github/`.

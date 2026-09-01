@@ -1,57 +1,57 @@
-# 用审计导出代替 S3 Server Access Logging
+# Use audit export instead of S3 Server Access Logging
 
-等保与交接常点名「访问日志」。FastS3 **不实现** S3 `?logging` XML
-（Put/Get/DeleteBucketLogging → **501**）。访问记录走审计环形缓冲 + **JSONL 导出**。
+Compliance and handoff often ask for “access logs.” FastS3 **does not implement** S3 `?logging` XML
+(Put/Get/DeleteBucketLogging → **501**). Access records go through the audit ring buffer + **JSONL export**.
 
-## 为什么不做 Logging API
+## Why there is no Logging API
 
-- AWS Server Access Logging 把访问日志写成目标桶里的对象,依赖投递账号、
-  前缀约定与延迟;单机产品里这套 XML 与投递语义对运维交接没有额外价值。
-- 网关 / 反代(nginx、LB)若需要 HTTP 访问日志,在入口层采集即可。
-- FastS3 数据面每条 S3 操作已写入审计(who / op / bucket / key / status /
-  peer),管理面可检索、可导出,满足「谁在何时对哪个对象做了什么」。
+- AWS Server Access Logging writes access logs as objects in a target bucket, with a delivery account,
+  prefix convention, and delay; on a single-node product that XML and delivery semantics add no extra value for ops handoff.
+- If a gateway / reverse proxy (nginx, LB) needs HTTP access logs, collect them at the ingress layer.
+- FastS3 already writes every data-plane S3 operation to audit (who / op / bucket / key / status /
+  peer); the management plane can search and export, covering “who did what to which object when.”
 
-`GET/PUT/DELETE /{bucket}?logging` 维持 501,错误信息指向本页与
-`GET /v1/admin/audit/export`。不实现 Logging XML,也不静默忽略该子资源。
+`GET/PUT/DELETE /{bucket}?logging` stays 501; the error message points at this page and
+`GET /v1/admin/audit/export`. Logging XML is not implemented, and the subresource is not silently ignored.
 
-## 导出访问日志(JSONL)
+## Export access logs (JSONL)
 
-时间窗 + 可选桶 / 键前缀:
+Time window plus optional bucket / key prefix:
 
 ```bash
-# 推荐:CLI(截断时 stderr 告警;缺省 stdout)
+# Recommended: CLI (stderr warning on truncation; default stdout)
 fasts3d audit export --since $(date -d '1 day ago' +%s) --until $(date +%s) \
   --output /var/log/fasts3/audit-$(date +%F).jsonl
 
-# 或 curl admin
+# or curl admin
 curl -sS --unix-socket /run/fasts3/admin.sock \
   -H "Authorization: Bearer $TOKEN" \
   -D - -o /var/log/fasts3/audit-$(date +%F).jsonl \
   "http://localhost/v1/admin/audit/export?since=$(date -d '1 day ago' +%s)&until=$(date +%s)"
 ```
 
-TCP admin 同路径。查询参数与 `GET /v1/admin/audit` 对齐:`since`/`until`
-(unix 秒)、`bucket`、`key`(前缀)、`op`、`who`、`status`、`bypass`;
-`limit` 默认 10000、封顶 50000。
+TCP admin uses the same path. Query parameters align with `GET /v1/admin/audit`: `since`/`until`
+(unix seconds), `bucket`, `key` (prefix), `op`, `who`, `status`, `bypass`;
+`limit` defaults to 10000, cap 50000.
 
-超限截断头(必须看,不要当全量):
+Truncation headers (must inspect; do not treat the file as complete):
 
-| 头 | 含义 |
+| Header | Meaning |
 | --- | --- |
-| `X-FastS3-Truncated` | `true` = 本文件不是过滤结果全量 |
-| `X-FastS3-Matched` | 过滤后总条数 |
-| `X-FastS3-Limit` | 本响应 limit |
+| `X-FastS3-Truncated` | `true` = this file is not the full filtered result |
+| `X-FastS3-Matched` | Total matching count after filters |
+| `X-FastS3-Limit` | This response's limit |
 
-控制台「审计日志」页提供 **下载 JSONL**(同源过滤)。无浏览器时用
-`fasts3d audit query` / `audit export`(见 [CLI](../reference/cli.md))。
-行内**无密钥明文**。
+The console “Audit log” page provides **Download JSONL** (same filters). Without a browser, use
+`fasts3d audit query` / `audit export` (see [CLI](../reference/cli.md)).
+Lines contain **no key plaintext**.
 
-API 形状见 [admin API](../reference/admin-api.md) 与
-[兼容性矩阵](../reference/compat.md) 同名专节。
+API shape: [admin API](../reference/admin-api.md) and the same-named section in the
+[Compatibility matrix](../reference/compat.md).
 
-## 口径
+## Contract
 
-- 审计是内存环形(可选持久化冷备);导出 = 当前检索面快照,不是 AWS
-  那种异步投递到另一个桶。
-- 需要更长保留:打开 `[audit]` 持久化,或把 JSONL 拷到日志系统 / 对象桶。
-- `?logging` 出集不在计划内;s3-tests `logging` token 维持排除(定位,不是缺陷)。
+- Audit is an in-memory ring (optional persistent cold backup); export = a snapshot of the current search surface, not AWS-style
+  async delivery into another bucket.
+- For longer retention: enable `[audit]` persistence, or copy JSONL into a log system / object bucket.
+- Shipping a `?logging` implementation is not planned; the s3-tests `logging` token stays excluded (a stated non-goal, not a defect).

@@ -1,7 +1,7 @@
-# 安全披露
+# Security disclosure
 
-请勿在公开 Issue 中报告可利用的安全问题。
+Do not report exploitable security issues in public issues.
 
-完整渠道与响应口径见仓库根目录 `SECURITY.md`。部署侧检查单与 CVE 流程见 [安全基线](../operations/security.md)。
+Channels and response policy: repository root `SECURITY.md`. Deployment checklist and CVE process: [security baseline](../operations/security.md).
 
-优先使用代码托管平台的**私有漏洞报告**。报告中请包含版本、部署形态、影响面与最小复现，不要附带公开可复制的完整利用。
+Prefer the code host’s **private vulnerability report**. Include version, deployment shape, impact, and a minimal reproduction. Do not attach a public, copy-pasteable full exploit.

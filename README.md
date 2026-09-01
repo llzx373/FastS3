@@ -1,80 +1,83 @@
 # FastS3
 
-**Linux 单机 S3 服务。** 面向已经具备高可用与一致性的裸块设备（或磁盘镜像），用 Rust + io_uring + O_DIRECT 把协议层开销压到接近裸盘。
+**A single-node S3 server for Linux.** Built for block devices (or disk images) that already provide HA and consistency. Rust + io_uring + O_DIRECT keeps protocol overhead close to the raw disk.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
 [![Version](https://img.shields.io/badge/version-2.7.0-informational)](./CHANGELOG.md)
 [![Rust](https://img.shields.io/badge/rustc-1.88%2B-orange.svg)](./Cargo.toml)
 [![Platform](https://img.shields.io/badge/platform-Linux%20only-lightgrey.svg)](#requirements)
 
-> 原生 macOS / Windows 服务端不在范围内。开发机可用 Docker 或 WSL2（Linux 内核）运行。
+[English](./README.md) · [中文](./README.zh-CN.md)
 
-## 为什么是 FastS3
+> Native macOS / Windows servers are out of scope. Use Docker or WSL2 (Linux kernel) on a development machine.
 
-许多边缘设备和云上卷（EBS、RBD、RAID、双活）已经在块层做完 HA 与一致性。再套一层通用分布式对象存储，会重复支付副本 / 纠删码、文件系统二次缓冲、Raft/Paxos 和运行时 GC 的成本。
+## Why FastS3
 
-FastS3 **不做底层已经做过的事**：数据只写一份，全程 `O_DIRECT`，每核独立 io_uring，单机写放大 = 1。可靠性由底层块设备承担；站点级容灾走内置的[主备异步复制](./docs/site/docs/operations/replication.md)（binlog + GTID），不是 AWS `?replication` 桶复制 XML。
+Many edge devices and cloud volumes (EBS, RBD, RAID, active-active arrays) already do HA and consistency at the block layer. Putting a general-purpose distributed object store on top pays again for replicas / erasure coding, a second filesystem buffer, Raft/Paxos, and runtime GC.
 
-## 特性
+FastS3 **does not redo what the block layer already did**: one copy of the data, `O_DIRECT` end to end, one io_uring ring per core, write amplification = 1 on a single node. Reliability sits with the block device. Site disaster recovery uses built-in [async primary/standby replication](./docs/site/docs/operations/replication.md) (binlog + GTID), not AWS `?replication` bucket XML.
 
-- **存储底座** — 裸块设备（`/dev/nvme0n1`）与稀疏镜像文件同一套引擎与磁盘布局
-- **S3 语义** — 桶 / 对象 CRUD、Multipart、CopyObject（COW）、预签名 URL、POST 表单、SigV4、IAM × 桶策略、Range / 条件头、版本化、Object Lock、SSE-S3 · SSE-C · SSE-KMS、checksum 五族、归档 Restore、事件通知、STS、Inventory、Public Access Block。完整口径与停售项见 [兼容矩阵](./docs/site/docs/reference/compat.md)
-- **强一致** — 元数据单点序列化，read-after-write 强于公有云 S3 的最终一致模型
-- **崩溃安全** — 任意时刻 `kill -9` / 掉电：不撕裂已应答对象、账目不漂移
-- **主备复制** — 实例级 / 桶级异步复制，一主多备与级联、备端只读、手动 promote（v2.7，ADR-33）
-- **运维面** — systemd / 容器；Web 控制台；Prometheus；`fasts3d doctor` / `check` / `keys` / `iam` / `replication`
-- **客户端** — aws cli、boto3、mc、rclone 零配置对接；Hadoop S3A 冒烟通过
+## Features
 
-## 架构
+- **Storage** — Bare devices (`/dev/nvme0n1`) and sparse image files share the same engine and on-disk layout
+- **S3** — Bucket / object CRUD, Multipart, CopyObject (COW), presigned URLs, POST forms, SigV4, IAM × bucket policy, Range / conditional headers, versioning, Object Lock, SSE-S3 · SSE-C · SSE-KMS, five checksum algorithms, Glacier Restore, event notifications, STS, Inventory, Public Access Block. See the [compatibility matrix](./docs/site/docs/reference/compat.md) for the full surface and explicit non-goals
+- **Strong consistency** — Metadata is serialized at a single point; read-after-write is stronger than public-cloud S3 eventual consistency
+- **Crash safety** — `kill -9` or power loss at any time: acknowledged objects are not torn, accounts do not drift
+- **Replication** — Instance- or bucket-scoped async replication, one primary with many standbys and cascading, read-only standbys, manual promote (v2.7, ADR-33)
+- **Ops** — systemd / containers; web console; Prometheus; `fasts3d doctor` / `check` / `keys` / `iam` / `replication`
+- **Clients** — aws CLI, boto3, mc, rclone with no extra adapters; Hadoop S3A smoke tests pass
+
+## Architecture
 
 ```
-                     aws cli / boto3 / mc / rclone / 浏览器
+                     aws cli / boto3 / mc / rclone / browser
                                    │
            ┌───────────────────────┴────────────────────┐
-    S3 数据面 :9000                               Web/管理 :9090
+    S3 data plane :9000                           Web/admin :9090
            │                                           │
   ┌────────▼──────────────┐              ┌───────────▼─────────────┐
   │     fasts3d (Rust)    │              │    fasts3-web (Node.js)   │
-  │  HTTP/1.1 + HTTP/2    │  admin 通道    │  Fastify + React 控制台     │
-  │  SigV4 / S3 XML       │◄────────────►│  数据流永不经过 Node        │
+  │  HTTP/1.1 + HTTP/2    │  admin       │  Fastify + React console    │
+  │  SigV4 / S3 XML       │◄────────────►│  object data never through Node │
   │  io_uring + O_DIRECT  │  unix / TCP  │                            │
-  │  复制口 :9445 (mTLS)  │              │                            │
+  │  replication :9445    │              │                            │
+  │  (mTLS)               │              │                            │
   └────────┬──────────────┘              └────────────────────────────┘
            │
   ┌────────▼─────────────────────────────────────┐
-  │  /dev/nvme0n1 或磁盘镜像                       │
-  │  [超块 | 检查点 | 数据区 extent …]             │
+  │  /dev/nvme0n1 or a disk image                 │
+  │  [superblock | checkpoint | data extents …]   │
   └──────────────────────────────────────────────┘
 ```
 
-| 端口 | 用途 |
+| Port | Role |
 | --- | --- |
-| 9000 | S3 数据面（可与内嵌控制台共用，`--web-root`） |
-| 9001 | admin API（仅回环或 unix socket） |
-| 9090 | 独立 Node 管理面（容器 POC 常映 8080） |
-| 9445 | 主备复制口（mTLS 强制） |
+| 9000 | S3 data plane (can also serve the embedded console via `--web-root`) |
+| 9001 | admin API (loopback or unix socket only) |
+| 9090 | Standalone Node management plane (container POC often maps 8080) |
+| 9445 | Primary/standby replication (mTLS required) |
 
 ## Requirements
 
-| 项 | 要求 |
+| Item | Requirement |
 | --- | --- |
-| 操作系统 | Linux；内核 ≥ 5.15（推荐 6.1 LTS）。4.x 走 `pread`/`pwrite` 兜底，功能完整、性能降级 |
-| 架构 | x86_64 / aarch64 |
-| 数据盘 | 底层已 HA 且一致的块设备，或测试用镜像文件 |
-| 编译 | Rust 1.88+、Clang/libclang（rocksdb bindgen）、C++17、pnpm 9（管理面） |
+| OS | Linux; kernel ≥ 5.15 (6.1 LTS recommended). 4.x uses `pread`/`pwrite` fallback — full features, lower performance |
+| Arch | x86_64 / aarch64 |
+| Data disk | An HA-consistent block device, or an image file for tests |
+| Build | Rust 1.88+, Clang/libclang (rocksdb bindgen), C++17, pnpm 9 (management plane) |
 
-## 快速开始
+## Quick start
 
-开发默认密钥 `fasts3dev` / `fasts3dev`，**生产必须更换**。更完整的路径见 [内网一天跑起来](./docs/site/docs/getting-started/quickstart.md)。
+Dev credentials are `fasts3dev` / `fasts3dev`. **Change them in production.** A fuller path is in [Run it in a day](./docs/site/docs/getting-started/quickstart.md).
 
-### Docker Compose（推荐试用）
+### Docker Compose (recommended for a trial)
 
 ```bash
 docker compose -f deploy/container/docker-compose.yml up -d --build
 
 curl -sf http://127.0.0.1:9000/health
-# S3:      http://127.0.0.1:9000
-# 控制台:  http://127.0.0.1:8080
+# S3:       http://127.0.0.1:9000
+# Console:  http://127.0.0.1:8080
 
 export AWS_ACCESS_KEY_ID=fasts3dev AWS_SECRET_ACCESS_KEY=fasts3dev
 export AWS_DEFAULT_REGION=us-east-1 AWS_EC2_METADATA_DISABLED=true
@@ -82,15 +85,15 @@ aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://demo
 aws --endpoint-url http://127.0.0.1:9000 s3 cp README.md s3://demo/README.md
 ```
 
-空数据卷会在首启自动 `fasts3d init`。镜像标签与 workspace 版本一致（`fasts3:2.7.0`）。生产拆分、裸设备与 systemd 见 [容器部署](./docs/site/docs/deployment/container.md) 与 [systemd 部署](./docs/site/docs/deployment/systemd.md)。
+An empty data volume runs `fasts3d init` on first start. Image tags match the workspace version (`fasts3:2.7.0`). Production split, bare devices, and systemd: [containers](./docs/site/docs/deployment/container.md) and [systemd](./docs/site/docs/deployment/systemd.md).
 
-### 从源码构建
+### Build from source
 
 ```bash
-# 数据面
+# Data plane
 cargo build --release -p fs3d
 
-# 控制台静态资源（可选；`--web-root` 同源托管）
+# Console static assets (optional; same origin with `--web-root`)
 cd web && pnpm install && pnpm --filter @fasts3/console build && cd ..
 
 mkdir -p ./data
@@ -102,67 +105,67 @@ mkdir -p ./data
   --web-root web/console/dist --listen 127.0.0.1:9000
 ```
 
-浏览器打开 `http://127.0.0.1:9000/`（控制台与 S3 同端口）。一致性检查：
+Open `http://127.0.0.1:9000/` (console and S3 on the same port). Consistency check:
 
 ```bash
 ./target/release/fasts3d check --device ./data/disk.img --meta-dir ./data/meta
 ```
 
-发布用 deb / rpm / tarball 由 `tools/package/` 在本地或 CI 打出；没有公网下载站时请用源码或 Compose，不要对占位域名执行 `curl | sh`。
+Release deb / rpm / tarball artifacts are built by `tools/package/` locally or in CI. If there is no public download site, use source or Compose — do not `curl | sh` a placeholder domain.
 
-## 文档
+## Documentation
 
-用户文档源码在 [`docs/site/`](./docs/site/)（MkDocs）。本地预览：
+User docs live in [`docs/site/`](./docs/site/) (MkDocs). **English is the default**; Chinese is at `/zh/` when you serve the site.
 
 ```bash
-pip install mkdocs
+pip install -r docs/site/requirements.txt
 mkdocs serve -f docs/site/mkdocs.yml
 ```
 
-| 文档 | 内容 |
+| Doc | Contents |
 | --- | --- |
-| [快速开始](./docs/site/docs/getting-started/quickstart.md) | Compose / 单二进制 / systemd |
-| [兼容矩阵](./docs/site/docs/reference/compat.md) | 已实现 / 停售 / 定位性不做 |
-| [管理员指南](./docs/site/docs/operations/admin-guide.md) | 日常运维、密钥、监控 |
-| [主备复制](./docs/site/docs/operations/replication.md) | 拓扑、promote、rebuild |
-| [故障排查](./docs/site/docs/operations/troubleshooting.md) | FAQ 与常见错误 |
-| [CLI 速查](./docs/site/docs/reference/cli.md) | `fasts3d` 子命令 |
-| [CHANGELOG](./CHANGELOG.md) | 版本记录 |
-| [DESIGN.md](./docs/DESIGN.md) | 架构与 ADR（设计事实源） |
-| [CONTRIBUTING.md](./CONTRIBUTING.md) | 构建、测试、PR |
+| [Quick start](./docs/site/docs/getting-started/quickstart.md) | Compose / single binary / systemd |
+| [Compatibility matrix](./docs/site/docs/reference/compat.md) | Implemented / discontinued / explicit non-goals |
+| [Administrator guide](./docs/site/docs/operations/admin-guide.md) | Day-2 ops, keys, monitoring |
+| [Replication](./docs/site/docs/operations/replication.md) | Topology, promote, rebuild |
+| [Troubleshooting](./docs/site/docs/operations/troubleshooting.md) | FAQ and common errors |
+| [CLI](./docs/site/docs/reference/cli.md) | `fasts3d` subcommands |
+| [CHANGELOG](./CHANGELOG.md) | Release notes |
+| [DESIGN.md](./docs/DESIGN.md) | Architecture and ADRs (source of truth for design; Chinese) |
+| [CONTRIBUTING.md](./CONTRIBUTING.md) | Build, test, PRs |
 
-设计与规划文档（`DESIGN.md`、`ROADMAP.md`、`TODO.md`）面向实现者；新用户从「快速开始」进入即可。
+Design and planning docs (`DESIGN.md`, `ROADMAP.md`, `TODO.md`) are for implementers; new users can start at Quick start.
 
-## 性能目标
+## Performance targets
 
-相对单块 PCIe Gen4 NVMe 裸盘基线（约 4KiB 随机读 1M IOPS、128KiB 顺序读 7 GB/s）：
+Relative to a single PCIe Gen4 NVMe baseline (~1M IOPS 4KiB random read, 7 GB/s 128KiB sequential read):
 
-| 指标 | 目标 |
+| Metric | Target |
 | --- | --- |
-| 4KiB 随机读 | ≥ 700k IOPS |
-| 128KiB 顺序读 | ≥ 6.3 GB/s |
-| 4KiB 随机写 | ≥ 200k IOPS |
-| 128KiB 顺序写 | ≥ 4.5 GB/s |
-| GET p99（小对象） | < 1 ms |
-| 空载内存 | < 256 MiB |
+| 4KiB random read | ≥ 700k IOPS |
+| 128KiB sequential read | ≥ 6.3 GB/s |
+| 4KiB random write | ≥ 200k IOPS |
+| 128KiB sequential write | ≥ 4.5 GB/s |
+| GET p99 (small objects) | < 1 ms |
+| Idle memory | < 256 MiB |
 
-数值验收依赖真 NVMe 环境；方法与报告见 `docs/perf-*.md` 与 [调优](./docs/site/docs/operations/tuning.md)。
+Numbers need a real NVMe box; method and reports are in `docs/perf-*.md` and [tuning](./docs/site/docs/operations/tuning.md).
 
-## 项目结构
+## Layout
 
 ```
 FastS3/
-├── crates/          # Rust workspace：core / device / alloc / engine / meta /
-│                    # s3 / http / admin / kms / agent / fs3d(fasts3d)
-├── web/             # Node 管理 API + React 控制台
-├── deploy/          # systemd、容器、Grafana、示例配置
-├── tools/           # 打包、SBOM、签名
-├── tests/           # s3-tests、crash、loadgen、复制演练
-├── docs/site/       # 用户文档（MkDocs）
-└── install.sh       # 自建制品仓库时的 tarball 安装器
+├── crates/          # Rust workspace: core / device / alloc / engine / meta /
+│                    # s3 / http / admin / kms / agent / fs3d (fasts3d)
+├── web/             # Node management API + React console
+├── deploy/          # systemd, containers, Grafana, sample config
+├── tools/           # packaging, SBOM, signing
+├── tests/           # s3-tests, crash, loadgen, replication drills
+├── docs/site/       # User docs (MkDocs; English default)
+└── install.sh       # tarball installer when you host your own artifacts
 ```
 
-## 构建与测试
+## Build and test
 
 ```bash
 cargo fmt --all -- --check
@@ -173,24 +176,24 @@ cargo build --release -p fs3d
 cd web && pnpm install && pnpm -r build
 ```
 
-协议冒烟：`tests/smoke/`。崩溃 harness：`tests/crash/`。CEPH s3-tests 排除矩阵见 [`tests/s3-tests/README.md`](./tests/s3-tests/README.md)。
+Protocol smoke: `tests/smoke/`. Crash harness: `tests/crash/`. CEPH s3-tests skip matrix: [`tests/s3-tests/README.md`](./tests/s3-tests/README.md).
 
-rocksdb 需要 libclang。Debian/Ubuntu 示例：`sudo apt install clang libclang-dev g++`。
+rocksdb needs libclang. Debian/Ubuntu: `sudo apt install clang libclang-dev g++`.
 
-## 当前状态
+## Status
 
-**v2.7.0**（M21 主备复制已交付）。版本号以 [`Cargo.toml`](./Cargo.toml) workspace 为准。里程碑历史见 [CHANGELOG](./CHANGELOG.md) 与 [RELEASES.md](./RELEASES.md)。
+**v2.7.0** (M21 primary/standby replication shipped). Version is the [`Cargo.toml`](./Cargo.toml) workspace version. History: [CHANGELOG](./CHANGELOG.md) and [RELEASES.md](./RELEASES.md).
 
-不是「完整 AWS S3」。未实现项显式失败（多为 501），不以静默忽略客户端头的方式假装兼容。
+This is not “complete AWS S3”. Unimplemented APIs fail explicitly (usually 501). The server does not pretend compatibility by silently ignoring client headers.
 
-## 贡献
+## Contributing
 
-欢迎 Issue 与 Pull Request。开始前请阅读 [CONTRIBUTING.md](./CONTRIBUTING.md)。行为准则见 [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md)。
+Issues and pull requests are welcome. Read [CONTRIBUTING.md](./CONTRIBUTING.md) first. Code of conduct: [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md).
 
-## 安全
+## Security
 
-请勿在公开 Issue 中报告漏洞。披露流程见 [SECURITY.md](./SECURITY.md) 与 [安全基线](./docs/site/docs/operations/security.md)。
+Do not report vulnerabilities in public issues. See [SECURITY.md](./SECURITY.md) and the [security baseline](./docs/site/docs/operations/security.md).
 
-## 许可证
+## License
 
-Apache License 2.0（`Apache-2.0`）。全文见 [LICENSE](./LICENSE)。
+Apache License 2.0 (`Apache-2.0`). Full text: [LICENSE](./LICENSE).

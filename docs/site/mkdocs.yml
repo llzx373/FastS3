@@ -1,52 +1,106 @@
-# FastS3 用户文档
-
-# 构建: pip install mkdocs && mkdocs serve -f docs/site/mkdocs.yml
-# 公开托管后填写 site_url / repo_url（GitHub Pages 或任意静态站）。
+# FastS3 user docs
+#
+# Build: pip install -r docs/site/requirements.txt
+#        mkdocs serve -f docs/site/mkdocs.yml
+# Default locale is English; Chinese is /zh/. After a public host exists,
+# set site_url / repo_url (GitHub Pages or any static host).
 
 site_name: FastS3
-site_description: Linux 单机高性能 S3 服务 — 安装、部署、运维与协议参考
+site_description: Single-node high-performance S3 on Linux — install, deploy, operate, protocol reference
 copyright: Licensed under the Apache License, Version 2.0.
 
 theme:
   name: readthedocs
+  locale: en
+
+plugins:
+  - search
+  - i18n:
+      docs_structure: suffix
+      fallback_to_default: true
+      reconfigure_material: false
+      languages:
+        - locale: en
+          default: true
+          name: English
+          build: true
+          site_name: FastS3
+        - locale: zh
+          name: 中文
+          build: true
+          site_name: FastS3
+          nav_translations:
+            Home: 首页
+            Getting started: 快速开始
+            Run it in a day: 内网一天跑起来
+            Deploy: 部署
+            Operations: 运维
+            Administrator guide: 管理员指南
+            IAM multi-tenant ops: IAM 多租户运维
+            Primary/standby replication: 主备复制
+            Central management: 中心纳管
+            Upgrade and rollback: 升级与回滚
+            Backup and restore: 备份/恢复
+            Audit export (instead of Logging): 审计导出(代替 Logging)
+            Exit path: 退出路径
+            Migrate (MinIO / public cloud): 迁移(MinIO/公有云)
+            Performance tuning: 性能调优
+            Troubleshooting and FAQ: 故障排查与 FAQ
+            Security baseline and CVE response: 安全基线与 CVE 响应
+            Reference: 参考
+            fasts3d command cheat sheet: fasts3d 命令速查
+            admin API reference: admin API 参考
+            Node management API: Node 管理 API 参考
+            Error codes: 错误码速查
+            Compatibility matrix: 兼容性矩阵
+            Community: 社区
+            Contributing: 如何贡献
+            Security disclosure: 安全披露
+            Releases: 发布
+            v1.0.0 GA announcement (historical): v1.0.0 GA 公告(历史)
+            Beta plan and feedback: Beta 计划与反馈
+            Beta review checklist: Beta 评审清单
 
 nav:
-  - 首页: index.md
-  - 快速开始:
-      - 内网一天跑起来: getting-started/quickstart.md
-  - 部署:
+  - Home: index.md
+  - Getting started:
+      - Run it in a day: getting-started/quickstart.md
+  - Deploy:
       - systemd: deployment/systemd.md
-      - 容器: deployment/container.md
-  - 运维:
-      - 管理员指南: operations/admin-guide.md
-      - IAM 多租户运维: operations/iam.md
-      - 主备复制: operations/replication.md
-      - 中心纳管: operations/center.md
-      - 升级与回滚: operations/upgrade.md
-      - 备份/恢复: operations/backup-restore.md
-      - 审计导出(代替 Logging): operations/audit-export.md
-      - 退出路径: operations/exit.md
-      - 迁移(MinIO/公有云): operations/migration.md
-      - 性能调优: operations/tuning.md
-      - 故障排查与 FAQ: operations/troubleshooting.md
-      - 安全基线与 CVE 响应: operations/security.md
-  - 参考:
-      - fasts3d 命令速查: reference/cli.md
-      - admin API 参考: reference/admin-api.md
-      - Node 管理 API 参考: reference/web-api.md
-      - 错误码速查: reference/errors.md
-      - 兼容性矩阵: reference/compat.md
-  - 社区:
-      - 如何贡献: community/contributing.md
-      - 安全披露: community/security.md
-  - 发布:
-      - v1.0.0 GA 公告(历史): release/v1.0.0.md
+      - Containers: deployment/container.md
+  - Operations:
+      - Administrator guide: operations/admin-guide.md
+      - IAM multi-tenant ops: operations/iam.md
+      - Primary/standby replication: operations/replication.md
+      - Central management: operations/center.md
+      - Upgrade and rollback: operations/upgrade.md
+      - Backup and restore: operations/backup-restore.md
+      - Audit export (instead of Logging): operations/audit-export.md
+      - Exit path: operations/exit.md
+      - Migrate (MinIO / public cloud): operations/migration.md
+      - Performance tuning: operations/tuning.md
+      - Troubleshooting and FAQ: operations/troubleshooting.md
+      - Security baseline and CVE response: operations/security.md
+  - Reference:
+      - fasts3d command cheat sheet: reference/cli.md
+      - admin API reference: reference/admin-api.md
+      - Node management API: reference/web-api.md
+      - Error codes: reference/errors.md
+      - Compatibility matrix: reference/compat.md
+  - Community:
+      - Contributing: community/contributing.md
+      - Security disclosure: community/security.md
+  - Releases:
+      - v1.0.0 GA announcement (historical): release/v1.0.0.md
   - Beta:
-      - Beta 计划与反馈: beta/index.md
-      - Beta 评审清单: beta/review.md
+      - Beta plan and feedback: beta/index.md
+      - Beta review checklist: beta/review.md
 
 markdown_extensions:
   - admonition
   - toc:
       permalink: true
   - fenced_code
+
+extra_javascript:
+  - js/lang-switch.js

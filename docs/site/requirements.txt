@@ -1,3 +1,3 @@
-# mkdocs
-# 用户文档站。构建：mkdocs build -f docs/site/mkdocs.yml
+# User docs site. Build: mkdocs build -f docs/site/mkdocs.yml
 mkdocs>=1.6,<2
+mkdocs-static-i18n>=1.2,<2

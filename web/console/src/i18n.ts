@@ -4,9 +4,9 @@
  * 采用「双语就地」模式:t(中文, English) 在调用点直接给出两语文案,
  * 无需键值字典文件;新文案天然双语,漏翻不会产生键缺失。
  *
- * - 默认语言随浏览器(navigator.language,zh* → 中文,其余 → 英文);
- * - 可手动覆盖并存 localStorage("fasts3_lang"),设置页/顶栏可切换;
- * - React 侧 useLocale() 订阅切换;非组件上下文(confirm/alert)用 t() 直接取值。
+ * - Default language is English. Manual override is stored in
+ *   localStorage("fasts3_lang"); the settings page / sidebar can switch to 中文.
+ * - React: useLocale() subscribes to switches; non-component code (confirm/alert) uses t().
  *
  * 覆盖范围(TODO M19/U4 验收):导航、删除确认、告警文案、锁/合规文案
  * 全量双语;各页面主体文案渐进双语(见各文件调用点)。
@@ -19,12 +19,8 @@ const LANG_KEY = "fasts3_lang";
 let current: Locale = detectDefault();
 const listeners = new Set<() => void>();
 
-/** 纯函数版默认语言探测(测试钩子):zh* → 中文,其余(含未知)→ 英文。 */
-export function detectDefaultForTest(langs: (string | undefined)[]): Locale {
-  for (const l of langs) {
-    if (l && l.toLowerCase().startsWith("zh")) return "zh";
-    if (l && l.toLowerCase().startsWith("en")) return "en";
-  }
+/** Default locale is English. Browser language is ignored until the user picks 中文. */
+export function detectDefaultForTest(_langs: (string | undefined)[]): Locale {
   return "en";
 }
 
@@ -33,13 +29,9 @@ function detectDefault(): Locale {
     const saved = localStorage.getItem(LANG_KEY);
     if (saved === "zh" || saved === "en") return saved;
   } catch {
-    /* localStorage 不可用时按浏览器语言 */
+    /* no localStorage: stay English */
   }
-  const langs: string[] =
-    typeof navigator !== "undefined" && navigator.languages
-      ? [...navigator.languages, navigator.language]
-      : [typeof navigator !== "undefined" ? navigator.language : "zh"];
-  return detectDefaultForTest(langs);
+  return "en";
 }
 
 export function getLocale(): Locale {

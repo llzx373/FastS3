@@ -1,63 +1,63 @@
-# Beta 评审清单(Beta Review Checklist)
+# Beta review checklist
 
-> M7/L6 门禁配套。v0.9 公开 Beta 满 2 周后按本清单逐项复核;全部满足 →
-> 文档覆盖/缺陷/NPS 达标 → 进入 RC 流程。任何一项未满足须如实报告,
-> 不得勾选(纪律见 AGENT.md §4.4)。
+> Companion gate for M7/L6. Two weeks after v0.9 public Beta, review item by item against this list; if everything is met →
+> docs coverage / defects / NPS pass → enter the RC flow. Any unmet item must be reported honestly
+> and must not be checked (discipline: AGENT.md §4.4).
 
-## A. 用户与使用(证据驱动)
+## A. Users and usage (evidence-driven)
 
-- [ ] Beta 注册用户 ≥ 10 位;
-- [ ] ≥ 10 位**真实使用满 2 周**(证据:遥测同意用户请求计数 / 访谈记录,
-      注册不算);
-- [ ] 使用形态多样性:≥ 2 种客户端、≥ 2 种设备形态(裸盘/镜像)、
-      ≥ 2 种 OS(矩阵见 ROADMAP §8)。
+- [ ] Beta registered users ≥ 10;
+- [ ] ≥ 10 people with **real use for a full 2 weeks** (evidence: request counts from users who consented to telemetry / interview notes;
+      registration does not count);
+- [ ] Usage-form diversity: ≥ 2 clients, ≥ 2 device forms (raw disk / image),
+      ≥ 2 OS (matrix: ROADMAP §8).
 
-## B. 缺陷收敛
+## B. Defect convergence
 
-- [ ] **P0/P1 缺陷清零**(修复发布口径;P0=数据丢失/服务不可用,
-      P1=功能破损可绕行);
-- [ ] 每条已关闭缺陷有根因说明 + 验证方式(回归/演练);
-- [ ] P2/P3 有台账:分类 + 计划版本;
-- [ ] 缺陷趋势:最近 2 周新增 P0/P1 = 0。
+- [ ] **P0/P1 defects at zero** (fix-shipped contract; P0 = data loss / service down,
+      P1 = feature broken with a workaround);
+- [ ] Every closed defect has a root-cause note + verification method (regression / drill);
+- [ ] P2/P3 have a ledger: category + planned version;
+- [ ] Defect trend: new P0/P1 in the last 2 weeks = 0.
 
-## C. 反馈闭环
+## C. Feedback closed loop
 
-- [ ] 反馈清单(issues + discussions + 邮件)逐条有处置结论;
-- [ ] 聚合报告:类别(兼容/性能/文档/体验)+ Top 问题 + 趋势图;
-- [ ] 设计类反馈已走 ADR 流程(如有);
-- [ ] 无法复现/非缺陷的条目有关闭说明。
+- [ ] Feedback list (issues + discussions + email) has a disposition for every item;
+- [ ] Aggregate report: categories (compat / perf / docs / UX) + top issues + trend chart;
+- [ ] Design-class feedback has gone through the ADR process (if any);
+- [ ] Cannot-repro / not-a-bug items have a close note.
 
-## D. NPS 与满意度
+## D. NPS and satisfaction
 
-- [ ] NPS 问卷发出(全量参与用户,≤11 分制);
-- [ ] NPS ≥ 30(赞成者% - 贬损者%);
-- [ ] 定性槽点已归入反馈闭环清单。
+- [ ] NPS survey sent (all participating users, ≤11-point scale);
+- [ ] NPS ≥ 30 (promoters% − detractors%);
+- [ ] Qualitative pain points already in the feedback closed-loop list.
 
-## E. 文档覆盖率
+## E. Docs coverage
 
-- [ ] 覆盖率检查表(见 beta/index.md §5)≥ 95% 有内容;
-- [ ] 无「占位/待补/TODO」残留;命令均可照做;
-- [ ] 关键演练可重复通过:vm-drill(安装开箱)、backup-restore-drill(备份
-      恢复)、webroot-drill(内嵌)、multi-web-drill(多实例);
-- [ ] 升级路径文档与实测一致(N-1 演练:v0.8 → v1.0,vm-drill 阶段5 实测)。
+- [ ] Coverage checklist (see beta/index.md §5) ≥ 95% has content;
+- [ ] No leftover "placeholder / TBD / TODO"; commands can all be followed as written;
+- [ ] Key drills repeatably pass: vm-drill (install / out of the box), backup-restore-drill (backup
+      restore), webroot-drill (embedded), multi-web-drill (multi-instance);
+- [ ] Upgrade-path docs match what was measured (N-1 drill: v0.8 → v1.0, vm-drill phase 5 measured).
 
-## F. 质量门禁复核(自动化部分)
+## F. Quality-gate review (automated portion)
 
-- [ ] CI 全绿:clippy 0 警告、fmt 干净、`cargo test --workspace` 通过;
-- [ ] 崩溃 harness ≥ 1000 轮 + 断电模拟通过;
-- [ ] 性能门禁:基准回退 ≤5%(ci-perf-gate);MinIO 对照(compare-minio);
-- [ ] `cargo audit` / `pnpm audit` 0 漏洞;
-- [ ] 覆盖率 ≥ 80%(M4 起门禁)。
+- [ ] CI all green: clippy 0 warnings, fmt clean, `cargo test --workspace` passes;
+- [ ] Crash harness ≥ 1000 rounds + power-loss simulation pass;
+- [ ] Perf gate: baseline regression ≤5% (ci-perf-gate); MinIO comparison (compare-minio);
+- [ ] `cargo audit` / `pnpm audit` 0 vulns;
+- [ ] Coverage ≥ 80% (gate from M4).
 
-## G. 安全与合规
+## G. Security and compliance
 
-- [ ] admin 通道默认安全基准确认(unix 0600/回环 + token);
-- [ ] 发布产物签名 + SBOM 齐全(v0.9 资产);
-- [ ] CVE 响应流程就绪(48h 评估 / 7 天修复通告)。
+- [ ] admin channel default security baseline confirmed (unix 0600 / loopback + token);
+- [ ] Release artifacts signed + SBOM complete (v0.9 assets);
+- [ ] CVE response process ready (48h assess / 7-day fix announce).
 
-## 结论
+## Conclusion
 
-- [ ] Go:进入 RC1(全矩阵回归 + 外部安全审计 → GA);
-- [ ] 调整:列出缺口与补救计划,重新排期评审。
+- [ ] Go: enter RC1 (full-matrix regression + external security audit → GA);
+- [ ] Adjust: list gaps and remediation plan; reschedule the review.
 
-评审记录归档:`docs/beta/review-<date>.md`(数据 + 结论 + 缺口)。
+Review record archive: `docs/beta/review-<date>.md` (data + conclusion + gaps).

@@ -38,8 +38,8 @@ test("locale persists manual override", () => {
   assert.equal(globalThis.localStorage.getItem("fasts3_lang"), "zh");
 });
 
-test("detectDefault maps browser language", () => {
-  assert.equal(detectDefaultForTest(["zh-CN", "en"]), "zh");
+test("detectDefault is English unless overridden", () => {
+  assert.equal(detectDefaultForTest(["zh-CN", "en"]), "en");
   assert.equal(detectDefaultForTest(["en-US"]), "en");
   assert.equal(detectDefaultForTest(["ja-JP"]), "en");
   assert.equal(detectDefaultForTest([]), "en");

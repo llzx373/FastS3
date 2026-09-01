@@ -221,8 +221,8 @@ export default function App() {
             onChange={(e) => setLocale(e.target.value as "zh" | "en")}
             style={{ width: "100%" }}
           >
-            <option value="zh">中文</option>
             <option value="en">English</option>
+            <option value="zh">中文</option>
           </select>
         </div>
         <div

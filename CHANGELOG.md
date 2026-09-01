@@ -7,6 +7,7 @@
 
 ## Unreleased
 
+- **docs**: user-facing docs default to English (README, CONTRIBUTING, SECURITY, CODE_OF_CONDUCT, MkDocs site). Chinese is `README.zh-CN.md` / `*.zh.md` and `/zh/` on the docs site. Console UI defaults to English; sidebar still switches to 中文.
 - **docs**: 对外 README / 文档站首页按开源项目入口重写；新增 `CONTRIBUTING.md`、`SECURITY.md`、`CODE_OF_CONDUCT.md`；去掉假 CI 徽章与 `example.com` 下载/仓库链接；Issue/PR 模板去 Beta 口吻。
 - **fix(engine)**: compaction 按 4KiB 物理跨度推进水位(与 `flush_acc` 同口径),非对齐对象不再在 ext4/xfs 上触发 O_DIRECT `EINVAL`;`DegradeAware` 仅对掉盘类 errno(EIO/ENXIO/…)置只读,EINVAL 等软件错误不再把整池写死。
 

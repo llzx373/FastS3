@@ -1,121 +1,121 @@
-# Node 管理 API 参考
+# Node management API reference
 
-Fastify `/api/*`。除 login / OIDC discovery / bootstrap / health 外均需
-`Authorization: Bearer <jwt>`。授权走 IAM `admin:*`（见 [IAM 运维](../operations/iam.md)）。
-管理面无状态；大对象**永不经过 Node**（预签名直连数据面）。
+Fastify `/api/*`. Except login / OIDC discovery / bootstrap / health, all require
+`Authorization: Bearer <jwt>`. Authorization uses IAM `admin:*` (see [IAM operations](../operations/iam.md)).
+The management plane is stateless; large objects **never pass through Node** (presigned, straight to the data plane).
 
-## 会话与健康
+## Session and health
 
 - `POST /api/login` — `{"username","password","tenant"?}` → `{token,role,username}`;
-  顺序:本地口令用户 → LDAP bind → IAM 用户口令;
+  order: local password user → LDAP bind → IAM user password;
 - `GET /api/oidc/discovery` / `POST /api/oidc/login` — OIDC SSO;
-- `GET /api/health` — 自身存活(免认证);
-- `GET /api/bootstrap` — 首启探测(免认证):`first_run = keys==0 && buckets==0`;
-- `POST /api/repair` — 泄漏修复代理。
+- `GET /api/health` — self liveness (no auth);
+- `GET /api/bootstrap` — first-run probe (no auth): `first_run = keys==0 && buckets==0`;
+- `POST /api/repair` — leak-repair proxy.
 
-## 仪表盘与指标
+## Dashboard and metrics
 
-| 端点 | 说明 |
+| Endpoint | Description |
 | --- | --- |
-| `GET /api/dashboard` | 聚合概览(容量/水位/请求/桶/对象/密钥计数) |
-| `GET /api/metrics/history?limit=N` | 指标历史(本实例 24h×5s 环形缓冲) |
-| `WS /api/ws` | 实时推送(优先 Rust WS,断线回退轮询) |
-| `GET /api/iam/capabilities` | 当前调用者 `admin:*` 能力位(导航显隐) |
+| `GET /api/dashboard` | Aggregated overview (capacity/watermark/requests/buckets/objects/key counts) |
+| `GET /api/metrics/history?limit=N` | Metrics history (this instance 24h×5s ring buffer) |
+| `WS /api/ws` | Realtime push (prefer Rust WS; on disconnect fall back to polling) |
+| `GET /api/iam/capabilities` | Caller's `admin:*` capability bits (nav show/hide) |
 
-## 桶
+## Buckets
 
-| 方法/路径 | 说明 |
+| Method/path | Description |
 | --- | --- |
-| `GET /api/buckets` | 桶列表(非 consoleAdmin 按租户 owner 过滤) |
+| `GET /api/buckets` | Bucket list (non-consoleAdmin filtered by tenant owner) |
 | `POST /api/buckets` | `{"name","quota"?}` |
-| `PATCH /api/buckets/{name}` | `{"quota": 数字\|null}` |
-| `DELETE /api/buckets/{name}?force=true` | 删桶 |
+| `PATCH /api/buckets/{name}` | `{"quota": number\|null}` |
+| `DELETE /api/buckets/{name}?force=true` | Delete bucket |
 | `GET /api/buckets/{name}/objects?prefix&token&flat` | ListObjectsV2 |
-| `GET/PUT /api/buckets/{name}/versioning` | 版本控制 |
+| `GET/PUT /api/buckets/{name}/versioning` | Versioning |
 | `GET/PUT/DELETE /api/buckets/{name}/cors` | CORS |
-| `GET/PUT/DELETE /api/buckets/{name}/policy` | 桶策略 |
-| `GET /api/buckets/{name}/policy-status` | `{IsPublic}`(BPA + 策略综合) |
-| `GET/PUT/DELETE /api/buckets/{name}/public-access-block` | Public Access Block 四开关 |
-| `GET/PUT/DELETE /api/buckets/{name}/lifecycle` | 生命周期 |
-| `GET/PUT /api/buckets/{name}/encryption` | 默认加密(`AES256` 或 `aws:kms`) |
-| `GET/PUT /api/buckets/{name}/object-lock` | Object Lock 桶配置 |
-| `GET/PUT /api/buckets/{name}/notification` | 事件通知(Webhook / `kafka://`) |
+| `GET/PUT/DELETE /api/buckets/{name}/policy` | Bucket policy |
+| `GET /api/buckets/{name}/policy-status` | `{IsPublic}` (BPA + policy combined) |
+| `GET/PUT/DELETE /api/buckets/{name}/public-access-block` | Public Access Block four switches |
+| `GET/PUT/DELETE /api/buckets/{name}/lifecycle` | Lifecycle |
+| `GET/PUT /api/buckets/{name}/encryption` | Default encryption (`AES256` or `aws:kms`) |
+| `GET/PUT /api/buckets/{name}/object-lock` | Object Lock bucket config |
+| `GET/PUT /api/buckets/{name}/notification` | Event notification (Webhook / `kafka://`) |
 | `GET/PUT /api/buckets/{name}/inventory` | Inventory |
-| `GET/PUT /api/buckets/{name}/bucket-tags` | 桶标签 |
-| `GET/PUT /api/buckets/{name}/ownership` | 所有权控制 |
+| `GET/PUT /api/buckets/{name}/bucket-tags` | Bucket tags |
+| `GET/PUT /api/buckets/{name}/ownership` | Ownership controls |
 
-## 对象(经数据面;大对象直传)
+## Objects (via the data plane; large objects direct)
 
-| 端点 | 说明 |
+| Endpoint | Description |
 | --- | --- |
-| `POST /api/buckets/{name}/presign` | 签发 PUT/GET/DELETE。body:`key`、`method`、`expires`、`contentType`、`uploadId`+`partNumber`(分片)、`storageClass`、`sseCustomerKey`(32 字节 base64)、`metadata`(用户元数据)、`checksumAlgorithm`+`checksumValue`、`ifMatch`/`ifNoneMatch`。返回 `{url,headers,expiresAt}`;浏览器必须**带 `headers` 发起请求**(SSE-C / checksum / 条件写均在 SignedHeaders 里,不能只用 `<a href>`) |
+| `POST /api/buckets/{name}/presign` | Issue PUT/GET/DELETE. body: `key`, `method`, `expires`, `contentType`, `uploadId`+`partNumber` (parts), `storageClass`, `sseCustomerKey` (32-byte base64), `metadata` (user metadata), `checksumAlgorithm`+`checksumValue`, `ifMatch`/`ifNoneMatch`. Returns `{url,headers,expiresAt}`; the browser **must send the request with `headers`** (SSE-C / checksum / conditional write are all in SignedHeaders; an `<a href>` alone is not enough) |
 | `POST /api/buckets/{name}/multipart/init` | `{"key","storageClass"?,"sseCustomerKey"?,"metadata"?,"checksumAlgorithm"?}` |
 | `POST /api/buckets/{name}/multipart/complete` | `{"key","uploadId","parts","sseCustomerKey"?,"ifMatch"?,"ifNoneMatch"?}` |
 | `POST /api/buckets/{name}/multipart/abort` | `{"key","uploadId"}` |
 | `POST /api/buckets/{name}/objects/action` | `delete` / `copy` / `deleteMany` |
-| `POST /api/buckets/{name}/objects/zip` | 勾选对象流式 zip(超限 413;SSE-C 对象拒绝) |
-| `GET /api/buckets/{name}/object-head?key=` | HEAD 元数据;SSE-C 时请求头 `x-fasts3-sse-c-key`(不放 query,避免日志泄露) |
-| `GET /api/buckets/{name}/object-tags` + `POST .../object-tags/action` | 对象标签 |
-| `GET /api/buckets/{name}/versions` + `POST .../versions/action` | 列版本 / 回滚(copy) / 删版本 |
-| `GET/PUT .../object-lock/{retention,legal-hold}` | 对象保留与法定保留 |
-| `POST /api/buckets/{name}/objects/restore` | 归档 RestoreObject(`key`/`days`/`tier`) |
+| `POST /api/buckets/{name}/objects/zip` | Stream a zip of selected objects (over limit 413; SSE-C objects rejected) |
+| `GET /api/buckets/{name}/object-head?key=` | HEAD metadata; for SSE-C, request header `x-fasts3-sse-c-key` (not in query, avoid log leak) |
+| `GET /api/buckets/{name}/object-tags` + `POST .../object-tags/action` | Object tags |
+| `GET /api/buckets/{name}/versions` + `POST .../versions/action` | List versions / rollback (copy) / delete version |
+| `GET/PUT .../object-lock/{retention,legal-hold}` | Object retention and legal hold |
+| `POST /api/buckets/{name}/objects/restore` | Archive RestoreObject (`key`/`days`/`tier`) |
 
-控制台对象页:上传可选存储类、SSE-C 密钥、checksum 五族、用户元数据、If-Match /
-「仅当键不存在」;下载/预览对 SSE-C 对象用同一密钥 `fetch` 带头请求。
+Console object page: upload can choose storage class, SSE-C key, five checksum families, user metadata, If-Match /
+"only if the key does not exist"; download/preview of SSE-C objects `fetch`es with the same key in headers.
 
-## 密钥、IAM、STS
+## Keys, IAM, STS
 
-| 方法/路径 | 说明 |
+| Method/path | Description |
 | --- | --- |
-| `GET/POST/PATCH/DELETE /api/keys` | 运行期密钥;secret 只在 POST 回显一次 |
-| `PUT /api/keys/{access}/policy` | 密钥策略 JSON 或 null |
+| `GET/POST/PATCH/DELETE /api/keys` | Runtime keys; secret echoed only on POST |
+| `PUT /api/keys/{access}/policy` | Key policy JSON or null |
 | `GET/POST/PATCH/DELETE /api/iam/users\|groups\|policies\|roles\|tenants` | IAM CRUD |
-| `GET/POST/DELETE /api/iam/service-accounts` | SA 自助/代管 |
-| `POST /api/sts` | Query API:`GetSessionToken` / `AssumeRole` |
-| `GET/POST/DELETE /api/sessions` | 临时会话列表/签发/撤销 |
+| `GET/POST/DELETE /api/iam/service-accounts` | SA self-service / delegated |
+| `POST /api/sts` | Query API: `GetSessionToken` / `AssumeRole` |
+| `GET/POST/DELETE /api/sessions` | Temp session list / issue / revoke |
 
-无 Node 时可用 `fasts3d keys` / `fasts3d iam`(见 [CLI](cli.md))。
+Without Node, use `fasts3d keys` / `fasts3d iam` (see [CLI](cli.md)).
 
-## 复制 / KMS / SSE-S3 / 迁入 / Batch
+## Replication / KMS / SSE-S3 / ingest / Batch
 
-| 端点 | 说明 |
+| Endpoint | Description |
 | --- | --- |
-| `GET /api/replication/status\|slots` | 拓扑与槽位 |
-| `POST /api/replication/pause\|resume\|promote\|demote\|rebuild` | 与 CLI 同语义 |
-| `GET /api/kms/status`、`GET/POST /api/kms/keys`、`POST .../rotate` | SSE-KMS 状态与 key |
-| `GET/POST /api/kms/service/{status,deploy,start,stop}` | 托管 OpenBao/Vault |
-| `GET /api/sse/status`、`POST /api/sse/rotate` | SSE-S3 KEK 状态/轮换 |
-| `GET/POST /api/ingest/jobs[...]` | 保 mtime 迁入任务 |
-| `GET/POST /api/batch/jobs[...]` | S3 Batch Operations(管理面 JSON,非 s3control) |
+| `GET /api/replication/status\|slots` | Topology and slots |
+| `POST /api/replication/pause\|resume\|promote\|demote\|rebuild` | Same semantics as CLI |
+| `GET /api/kms/status`, `GET/POST /api/kms/keys`, `POST .../rotate` | SSE-KMS status and keys |
+| `GET/POST /api/kms/service/{status,deploy,start,stop}` | Managed OpenBao/Vault |
+| `GET /api/sse/status`, `POST /api/sse/rotate` | SSE-S3 KEK status/rotate |
+| `GET/POST /api/ingest/jobs[...]` | Preserve-mtime ingest jobs |
+| `GET/POST /api/batch/jobs[...]` | S3 Batch Operations (management-plane JSON, not s3control) |
 
-## 治理与配置
+## Governance and config
 
-| 端点 | 说明 |
+| Endpoint | Description |
 | --- | --- |
-| `GET /api/uploads`、`POST /api/uploads/{id}/abort` | 在途 multipart |
-| `GET /api/audit`、`GET /api/audit/export` | 审计检索 / JSONL(截断头透传) |
-| `GET/PATCH /api/config`、`POST /api/config/reload` | 运行时配置 |
-| `POST /api/devices/add` | 在线加盘 |
+| `GET /api/uploads`, `POST /api/uploads/{id}/abort` | In-flight multipart |
+| `GET /api/audit`, `GET /api/audit/export` | Audit search / JSONL (truncation headers passed through) |
+| `GET/PATCH /api/config`, `POST /api/config/reload` | Runtime config |
+| `POST /api/devices/add` | Online add-disk |
 
-## 错误形态
+## Error shape
 
-统一 `{"error":{"code","message"}}`;代理类 502(`admin_unreachable` /
-`s3_error`),业务类 400/404/409 透传 Rust。见 [错误码速查](errors.md)。
+Uniform `{"error":{"code","message"}}`; proxy-class 502 (`admin_unreachable` /
+`s3_error`); business-class 400/404/409 passed through from Rust. See [Error code quick reference](errors.md).
 
-## 配置(环境变量 / web.json)
+## Config (environment variables / web.json)
 
-| 键 | 默认 | 说明 |
+| Key | Default | Description |
 | --- | --- | --- |
-| `FS3_WEB_LISTEN` | `0.0.0.0:9090` | 监听 |
-| `FS3_WEB_STATIC` | — | 控制台静态目录 |
-| `FS3_WEB_JWT_SECRET` | dev 默认 | JWT 签名密钥(多实例必须一致) |
-| `FS3_WEB_USER/PASSWORD/ROLE` | admin/admin123 | 默认账号(启动同步为 IAM User) |
-| `FS3_ADMIN_LISTEN/TOKEN` | unix 默认 | Rust admin 通道 |
-| `FS3_S3_ENDPOINT/REGION/ACCESS_KEY/SECRET_KEY` | 本机 9000 | 数据面(浏览/编排) |
+| `FS3_WEB_LISTEN` | `0.0.0.0:9090` | Listen |
+| `FS3_WEB_STATIC` | — | Console static directory |
+| `FS3_WEB_JWT_SECRET` | dev default | JWT signing secret (must match across instances) |
+| `FS3_WEB_USER/PASSWORD/ROLE` | admin/admin123 | Default account (synced to an IAM User on start) |
+| `FS3_ADMIN_LISTEN/TOKEN` | unix default | Rust admin channel |
+| `FS3_S3_ENDPOINT/REGION/ACCESS_KEY/SECRET_KEY` | local 9000 | Data plane (browse / orchestrate) |
 
-配置优先级:环境变量 > `config.json`(`FS3_WEB_CONFIG` 可指定路径) > 内建默认。
-`ldap` / `oidc` 段见 [安全基线](../operations/security.md)。
+Config precedence: environment variables > `config.json` (`FS3_WEB_CONFIG` can set the path) > built-in defaults.
+`ldap` / `oidc` sections: [Security baseline](../operations/security.md).
 
-多节点中心进程是同仓库另一入口(`pnpm center:start`),API 前缀
-`/v2/center/*`(agent mTLS)与 `/center/api/*`(控制台 JWT),见
-[中心纳管](../operations/center.md)。
+The multi-node center process is a separate entry in the same repo (`pnpm center:start`); API prefixes
+`/v2/center/*` (agent mTLS) and `/center/api/*` (console JWT); see
+[Central management](../operations/center.md).

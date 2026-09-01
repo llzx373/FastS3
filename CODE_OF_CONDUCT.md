@@ -1,30 +1,32 @@
-# 行为准则
+# Code of conduct
 
-本项目采用 [Contributor Covenant](https://www.contributor-covenant.org/) 2.1。
-英文原文：<https://www.contributor-covenant.org/version/2/1/code_of_conduct.html>
+This project follows [Contributor Covenant](https://www.contributor-covenant.org/) 2.1.
+Official English text: <https://www.contributor-covenant.org/version/2/1/code_of_conduct.html>
 
-## 我们的承诺
+[English](./CODE_OF_CONDUCT.md) · [中文](./CODE_OF_CONDUCT.zh-CN.md)
 
-为建设开放、友好的环境，贡献者与维护者承诺：无论年龄、体型、可见或不可见的残障、族裔、性征、性别认同与表达、经验水平、教育、社会经济地位、国籍、外貌、种族、宗教或性取向，参与本项目的每个人都不受骚扰。
+## Our pledge
 
-## 鼓励的行为
+We as members, contributors, and maintainers pledge to make participation in our community a harassment-free experience for everyone, regardless of age, body size, visible or invisible disability, ethnicity, sex characteristics, gender identity and expression, level of experience, education, socio-economic status, nationality, personal appearance, race, religion, or sexual identity and orientation.
 
-- 使用包容、尊重的语言
-- 尊重不同观点与经验
-- 优雅地接受建设性批评
-- 关注对社区最有利的事情
-- 对其他社区成员表示同理
+## Encouraged behavior
 
-## 不可接受的行为
+- Use welcoming and inclusive language
+- Respect differing viewpoints and experiences
+- Accept constructive criticism gracefully
+- Focus on what is best for the community
+- Show empathy toward other community members
 
-- 性化语言或图像，以及不受欢迎的性关注或求爱
-- 钓鱼、侮辱/贬损评论，以及人身或政治攻击
-- 公开或私下骚扰
-- 未经明确许可公布他人的私人信息（如住址或电子邮箱）
-- 其他在专业场合可被合理视为不当的行为
+## Unacceptable behavior
 
-## 执行
+- Sexualized language or imagery, and unwelcome sexual attention or advances
+- Trolling, insulting or derogatory comments, and personal or political attacks
+- Public or private harassment
+- Publishing others’ private information (such as a physical or email address) without explicit permission
+- Other conduct which could reasonably be considered inappropriate in a professional setting
 
-不可接受的行为可向项目维护者报告（渠道见 [SECURITY.md](./SECURITY.md)；与安全漏洞一样，优先使用私密渠道）。维护者有义务保密报告者身份，并采取其认为适当的纠正措施，包括警告、临时或永久封禁。
+## Enforcement
 
-维护者有权删除、编辑或拒绝不符合本准则的评论、提交、代码、wiki 编辑、Issue 和其他贡献。
+Report unacceptable behavior to project maintainers (see [SECURITY.md](./SECURITY.md); prefer a private channel, as with security issues). Maintainers will keep reporters confidential and may take any action they consider appropriate, including warnings and temporary or permanent bans.
+
+Maintainers may remove, edit, or reject comments, commits, code, wiki edits, issues, and other contributions that do not follow this code of conduct.

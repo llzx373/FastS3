@@ -1,180 +1,180 @@
-# 故障排查与 FAQ
+# Troubleshooting and FAQ
 
-按「现象 → 定位 → 处置」组织。错误码见 [参考 / 错误码](../reference/errors.md)。
-第一步：`fasts3d doctor --config fasts3.toml` 与 `journalctl -u fasts3`。
+Organized as "symptom → locate → act". Error codes: [Reference / error codes](../reference/errors.md).
+First step: `fasts3d doctor --config fasts3.toml` and `journalctl -u fasts3`.
 
-## 1. 启动与部署
+## 1. Startup and deployment
 
-### 1.1 无法打开元数据目录:rocksdb 锁冲突
+### 1.1 Cannot open metadata directory: rocksdb lock conflict
 
 ```text
 error: metadata error: rocksdb: IO error: While lock file: .../meta/LOCK: Resource temporarily unavailable
 ```
 
-**原因**:meta 目录已被另一个 fasts3d 进程打开(serve 运行中又跑 CLI,或双
-实例指向同一 meta 目录)。**处置**:先停原进程;`meta-export`/`check` 等离线
-命令必须在停机窗口执行。多实例仅管理面(Node)允许,数据面单实例是设计边界。
+**Cause**: the meta directory is already opened by another fasts3d process (running CLI while serve is up, or two
+instances pointing at the same meta directory). **Action**: stop the original process first; offline commands such as `meta-export`/`check`
+must run in a downtime window. Multiple instances are allowed only for the management plane (Node); a single data-plane instance is a design boundary.
 
-### 1.2 端口占用
+### 1.2 Port in use
 
-`error: ... Address already in use`(SO_REUSEPORT 绑定失败)。检查 9000
-(S3)/9001(admin TCP)/9090 或 8080(Web)/9445(复制口)占用:
-`ss -ltnp | grep -E '9000|9001|9090|8080|9445'`;systemd 场景确认旧单元已停。
+`error: ... Address already in use` (SO_REUSEPORT bind failed). Check occupancy of 9000
+(S3) / 9001 (admin TCP) / 9090 or 8080 (Web) / 9445 (replication port):
+`ss -ltnp | grep -E '9000|9001|9090|8080|9445'`; in systemd, confirm the old unit is stopped.
 
-### 1.3 prepare(init)报「设备未初始化/无有效检查点」
+### 1.3 prepare (init) reports "device not initialized / no valid checkpoint"
 
-`error: ...: no valid checkpoint found` → 设备未经 `fasts3d init` 或超级块
-被破坏。裸盘先确认不误伤:**init 前强制校验块设备类型/文件系统签名
-(风险 R7),无二次确认绝不自动初始化**。
+`error: ...: no valid checkpoint found` → the device was never `fasts3d init`'d, or the superblock
+is corrupted. On a raw disk, first confirm you will not clobber data: **before init, forcibly validate block-device type / filesystem signature
+(risk R7); never auto-initialize without a second confirmation**.
 
-### 1.4 TLS 启动告警「证书需成对配置」
+### 1.4 TLS startup warning "cert and key must be configured as a pair"
 
-`tls_cert/tls_key` 只配了其一 → 本次以明文启动(有告警)。补全配对或
-`fasts3d init` 向导重新生成自签证书。
+Only one of `tls_cert/tls_key` is set → this start is plaintext (with a warning). Complete the pair or
+regenerate a self-signed certificate via the `fasts3d init` wizard.
 
-## 2. 客户端报错
+## 2. Client errors
 
-### 2.1 认证失败 403 AccessDenied / InvalidAccessKeyId / SignatureDoesNotMatch
+### 2.1 Auth failure 403 AccessDenied / InvalidAccessKeyId / SignatureDoesNotMatch
 
-- 密钥是否存在/启用:`GET /v1/admin/keys`;禁用密钥立即拒绝;
-- 时钟偏差:服务器与客户端 ±15 分钟外 → `RequestTimeTooSkewed`;
-- 地域:客户端 region 与 `auth.region` 一致(默认 us-east-1);
-- 签名算法:SigV4(不支持 SigV2);`x-amz-content-sha256` 用真实载荷哈希
-  (STREAMING-AWS4-HMAC-SHA256-PAYLOAD 需 SDK 正确实现);
-- 策略:密钥策略 JSON 生效后按策略判定(策略语法错误在 PATCH 时即 400)。
+- Key exists / enabled: `GET /v1/admin/keys`; a disabled key is rejected immediately;
+- Clock skew: server vs client outside ±15 minutes → `RequestTimeTooSkewed`;
+- Region: client region matches `auth.region` (default us-east-1);
+- Signature algorithm: SigV4 (SigV2 is not supported); `x-amz-content-sha256` uses the real payload hash
+  (STREAMING-AWS4-HMAC-SHA256-PAYLOAD requires a correct SDK implementation);
+- Policy: after a key policy JSON takes effect, authorization follows the policy (policy syntax errors return 400 at PATCH).
 
-### 2.2 写入 507 InsufficientStorage / 503 SlowDown
+### 2.2 Write 507 InsufficientStorage / 503 SlowDown
 
-- 507:设备空间不足(位图耗尽)。看 `GET /v1/admin/status` 的 watermark;
-  ≥95% 即应处置:删临时对象、`compact`、扩容;
-- 503 + `Retry-After: 5`:全局在途字节超限(默认 16GiB)或每密钥限速
-  (`limits.key_rps`)触发节流。客户端应退避重试(标准 SDK 行为)。
+- 507: device space exhausted (bitmap depleted). Check watermark on `GET /v1/admin/status`;
+  ≥95% should be acted on: delete temp objects, `compact`, expand;
+- 503 + `Retry-After: 5`: global in-flight bytes exceeded (default 16GiB) or per-key rate limit
+  (`limits.key_rps`) triggered throttle. Clients should back off and retry (standard SDK behavior).
 
-### 2.3 上传中途失败/碎片残留
+### 2.3 Mid-upload failure / leftover fragments
 
-- 客户端中断 → 事务回滚、段回收到水位;可见会话停在
-  `GET /v1/admin/uploads`,可 `POST .../abort` 手动清理或等 TTL 自动清扫;
-- `EntityTooSmall`/`EntityTooLarge`:multipart 分片 <5MiB 或对象 > 上限
-  (5TiB)。使用 SDK 的自动 multipart 阈值。
+- Client abort → transaction rollback, segments reclaimed to the watermark; visible sessions remain in
+  `GET /v1/admin/uploads`; you can `POST .../abort` to clean up manually or wait for TTL auto-sweep;
+- `EntityTooSmall`/`EntityTooLarge`: multipart part <5MiB or object over the limit
+  (5TiB). Use the SDK's automatic multipart threshold.
 
-### 2.4 GET 范围/条件请求
+### 2.4 GET range / conditional requests
 
-- `416 InvalidRange` + `x-amz-actual-object-size`:范围越界(与 AWS 一致);
-- `412 PreconditionFailed` / `304 Not Modified`:条件头
-  (If-Match/If-None-Match/If-Modified-Since)判定失败属正常语义;
-- 版本不存在:`NoSuchVersion`(未启用版本控制时除 `null` 外)。
+- `416 InvalidRange` + `x-amz-actual-object-size`: range out of bounds (AWS-aligned);
+- `412 PreconditionFailed` / `304 Not Modified`: condition headers
+  (If-Match/If-None-Match/If-Modified-Since) failed — expected semantics;
+- Version does not exist: `NoSuchVersion` (when versioning is not enabled, everything except `null`).
 
-### 2.5 SSE-C 下载/预览失败
+### 2.5 SSE-C download / preview failure
 
-对象用客户密钥加密后,控制台必须在工具栏填 **同一把 32 字节 base64 密钥**。
-预签名 URL 本身不够——SSE-C 头在 SignedHeaders 里,须用返回的 `headers`
-做 `fetch`。密钥错误常见 403/400;zip 打包对 SSE-C 对象直接 400。
+After an object is encrypted with a customer key, the console toolbar must supply **the same 32-byte base64 key**.
+A presigned URL alone is not enough — SSE-C headers are in SignedHeaders; you must `fetch` with the returned `headers`.
+Wrong key commonly yields 403/400; zip packing of SSE-C objects returns 400 directly.
 
-### 2.6 备端写入 501 ReplicationStandby
+### 2.6 Standby write 501 ReplicationStandby
 
-该节点是复制拓扑里的 standby。写入应打到主;本节点只读。响应头
-`X-FastS3-Repl-Applied-Gtid` 表示已应用位点。切换见
-[主备复制运维](replication.md)。
+This node is a standby in the replication topology. Writes should go to the primary; this node is read-only. Response header
+`X-FastS3-Repl-Applied-Gtid` is the applied position. For switchover, see
+[Primary/standby replication operations](replication.md).
 
 ### 2.7 SSE-KMS 503 `KMS.UnavailableException`
 
-Vault/OpenBao 不可达或 transit 密钥缺失。控制台「KMS」页看托管状态;
-复制拓扑主备须共享同一 KMS。无托管后端时桶默认加密 `aws:kms` 仍显式拒绝
-(不是静默忽略)。
+Vault/OpenBao unreachable or transit key missing. Check managed status on the console KMS page;
+primary and standby in a replication topology must share the same KMS. Without a managed backend, bucket default encryption `aws:kms` is still explicitly rejected
+(not silently ignored).
 
-## 3. 数据一致性与崩溃
+## 3. Data consistency and crashes
 
-### 3.1 进程崩溃/断电后自检
+### 3.1 Self-check after process crash / power loss
 
-FastS3 崩溃模型:数据先落盘、元数据后提交;任意 kill -9 不撕裂对象、不丢
-已应答数据。启动时自动:检查点加载 → `a:`/`t:` 记录重放 → 段级可达性重建
-→ 泄漏报告。**处置**:
+FastS3 crash model: data is flushed first, then metadata is committed; any kill -9 does not tear objects or lose
+already-acked data. On start, automatically: load checkpoint → replay `a:`/`t:` records → rebuild segment-level reachability
+→ leak report. **Action**:
 
 ```bash
-fasts3d check --config fasts3.toml        # 无泄漏 = 账目一致
-fasts3d check --fix                       # 有泄漏:回收不可达 extent 后复查
+fasts3d check --config fasts3.toml        # no leaks = accounts consistent
+fasts3d check --fix                       # leaks present: reclaim unreachable extents, then recheck
 ```
 
-泄漏≠数据丢失:泄漏 = 位图已分配但元数据无引用(崩溃窗口的暂存分配),
-回收只是归还空间。正常情况为 0。
+Leak ≠ data loss: a leak = bitmap allocated but metadata has no reference (a staging allocation in the crash window);
+reclaim only returns space. Normally 0.
 
-### 3.2 掉盘/设备 I/O 故障(degraded)
+### 3.2 Disk loss / device I/O failure (degraded)
 
-检测到**掉盘类**设备 I/O 错误(EIO/ENXIO/ENODEV/EBADF 等)→ 引擎进入**只读降级**
-并置 `degraded=true`(状态/指标可见):写请求返回错误,读仍尽力服务。
-对齐错误(EINVAL)与磁盘满(ENOSPC)不降级。**处置**:修复底层设备(RAID/云盘/
-重新挂载)→ 重启 fasts3d → `doctor` + `check` 确认恢复。底层设备已 HA 是
-FastS3 的前提假设,掉盘属上游故障,不尝试本地自愈。
+On detecting **disk-loss-class** device I/O errors (EIO/ENXIO/ENODEV/EBADF, etc.) → the engine enters **read-only degrade**
+and sets `degraded=true` (visible in status / metrics): writes return errors; reads still try to serve.
+Alignment errors (EINVAL) and disk-full (ENOSPC) do not degrade. **Action**: repair the underlying device (RAID / cloud disk /
+remount) → restart fasts3d → `doctor` + `check` to confirm recovery. Underlying-device HA is
+FastS3's premise; disk loss is an upstream failure; local self-heal is not attempted.
 
-### 3.3 元数据目录损毁(单文件级损坏)
+### 3.3 Metadata directory damage (single-file-level corruption)
 
-rocksdb 自带 WAL/校验;极端损坏时启动报错。恢复路径(不要手工改库):
+rocksdb has its own WAL / checksums; extreme corruption fails startup. Recovery path (do not hand-edit the DB):
 
 ```text
-1. 恢复底层卷快照(如无,至少保证设备数据区完好);
-2. fasts3d meta-export 备份任何可读元数据(尽力而为);
-3. fasts3d meta-import --input <快照> --force 恢复到全新 meta 目录。
+1. Restore the underlying volume snapshot (if none, at least keep the device data area intact);
+2. fasts3d meta-export any readable metadata (best-effort);
+3. fasts3d meta-import --input <snapshot> --force into a fresh meta directory.
 ```
 
-完整步骤与演练脚本:`tests/backup/backup-restore-drill.sh`,
-见 [备份/恢复指南](backup-restore.md)。
+Full steps and drill script: `tests/backup/backup-restore-drill.sh`,
+see [Backup / restore guide](backup-restore.md).
 
-## 4. 性能问题
+## 4. Performance issues
 
-- 先 `fasts3d doctor --perf` 建立基线对比;回退 >5% 查:
-  - IRQ 亲和被覆盖(irqbalance)→ 见 [调优](tuning.md) §2.1;
-  - 系统负载/邻居进程(页缓存脏回写、其他 io_uring 应用);
-  - `etag_mode` 是否被改;`sync_mode=full` 会显著降吞吐(每事务 fsync);
-  - 碎片水位:对象碎片化 → `compact`;大对象用 multipart 分片上传;
-  - 网络侧:小对象 IOPS 瓶颈在单连接 RTT,客户端并发不足。
-- 内存异常:RSS 持续上涨 → 检查 meta block cache 配置与泄漏对象
-  (`GET /v1/admin/status` 的 buckets/objects 是否与预期一致)。
+- First `fasts3d doctor --perf` to establish a baseline comparison; if regression >5%, check:
+  - IRQ affinity overwritten (irqbalance) → see [Tuning](tuning.md) §2.1;
+  - System load / neighbor processes (page-cache dirty writeback, other io_uring apps);
+  - Whether `etag_mode` was changed; `sync_mode=full` significantly cuts throughput (fsync per transaction);
+  - Fragmentation watermark: object fragmentation → `compact`; large objects use multipart part uploads;
+  - Network: small-object IOPS bottleneck is single-connection RTT; client concurrency is too low.
+- Memory anomalies: RSS steadily rising → check meta block cache config and leaked objects
+  (whether buckets/objects on `GET /v1/admin/status` match expectations).
 
-## 5. 监控/告警误报
+## 5. Monitoring / alert false positives
 
-- watermark 突增:检查 `GET /v1/admin/uploads`(僵尸 multipart 会话);
-- 时钟回拨告警(`FastS3ClockJump`):确认 NTP/chrony 正常;回拨影响 SigV4
-  时间窗与 mtime 记录;
-- 可信时钟偏离告警(`FastS3TrustedClockDivergence`):墙钟落后于
-  `s:trusted_clock` 高水位。Object Lock 到期判定使用单调推导,保留不会
-  因回拨提前解除;立即校时,禁止在停机期手动把系统时钟拨到过去。指标:
-  `fasts3_trusted_clock_divergence_seconds`(当前落后秒)、
-  `fasts3_trusted_clock_divergence_events_total`(边沿次数)。
-  承诺边界:运行期内单调;跨停机篡改依赖 NTP 基线(ADR-13 DL6)。
-- 审计缺日志:确认管理面与数据面 admin 通道连通(Node 代理层无本地存储,
-  日志全在 Rust 侧 audit ring)。
+- Sudden watermark jump: check `GET /v1/admin/uploads` (zombie multipart sessions);
+- Clock-jump alert (`FastS3ClockJump`): confirm NTP/chrony is healthy; jumps affect the SigV4
+  time window and mtime records;
+- Trusted-clock divergence alert (`FastS3TrustedClockDivergence`): wall clock lags
+  `s:trusted_clock` high-water mark. Object Lock expiry uses a monotonic derivation; retention will not
+  lift early because of a jump backward. Correct the clock immediately; never manually set the system clock into the past during downtime. Metrics:
+  `fasts3_trusted_clock_divergence_seconds` (current lag seconds),
+  `fasts3_trusted_clock_divergence_events_total` (edge count).
+  Promise boundary: monotonic during a run; cross-downtime tampering depends on the NTP baseline (ADR-13 DL6).
+- Missing audit logs: confirm the management plane can reach the data-plane admin channel (the Node proxy has no local store;
+  logs live entirely in the Rust-side audit ring).
 
 ## 6. FAQ
 
-**Q: FastS3 支持多副本/集群吗?**
-不做 Raft/EC 数据面集群。前提仍是底层块设备已 HA(EBS/RBD/RAID/双活卷)。
-**实例级主备异步复制**(v2.7 M21,binlog + GTID)用于 DR:一主多备或级联,
-手动 promote,备端只读。这不是 AWS `PUT Bucket replication` XML(该子资源
-维持 501)。多台机器的配置编排走 [中心纳管](center.md)(agent 出站 mTLS),
-也不是共享存储集群。
+**Q: Does FastS3 support multi-replica / clustering?**
+It does not do a Raft/EC data-plane cluster. The premise remains that the underlying block device is already HA (EBS/RBD/RAID/dual-active volume).
+**Instance-level primary/standby async replication** (v2.7 M21, binlog + GTID) is for DR: one primary, many standbys or cascade,
+manual promote, standbys read-only. This is not AWS `PUT Bucket replication` XML (that subresource
+stays 501). Multi-machine config orchestration uses [Central management](center.md) (agent outbound mTLS);
+that is also not a shared-storage cluster.
 
-**Q: 能跑在普通文件系统目录上吗?**
-能:镜像文件模式(`init --device /path/disk.img`),全程 O_DIRECT + 4KiB
-对齐,文件系统只当容器。性能低于裸盘(少了直通),但语义一致。
+**Q: Can it run on a regular filesystem directory?**
+Yes: image-file mode (`init --device /path/disk.img`), O_DIRECT + 4KiB
+alignment end to end; the filesystem is only a container. Performance is below raw disk (no passthrough), but semantics match.
 
-**Q: 支持纠删码/压缩吗?**
-EC 不做。归档类 `GLACIER` / `GLACIER_IR` / `DEEP_ARCHIVE` 用 zstd 压缩落盘;
-STANDARD 不透明压缩对象正文。另有惰性 extent 压缩(`fasts3d compact`)。
+**Q: Does it support erasure coding / compression?**
+No EC. Archive classes `GLACIER` / `GLACIER_IR` / `DEEP_ARCHIVE` land with zstd compression;
+STANDARD does not transparently compress object bodies. There is also lazy extent compaction (`fasts3d compact`).
 
-**Q: 支持版本控制/生命周期/Object Lock / 加密吗?**
-都已交付:桶版本化、Lifecycle(含 Transition 到归档类)、Object Lock WORM、
-SSE-S3 / SSE-C / SSE-KMS、checksum 五族、归档 Restore。控制台桶页与对象页
-可配;协议口径见 [兼容性矩阵](../reference/compat.md)。
+**Q: Does it support versioning / lifecycle / Object Lock / encryption?**
+All delivered: bucket versioning, Lifecycle (including Transition to archive classes), Object Lock WORM,
+SSE-S3 / SSE-C / SSE-KMS, five checksum families, archive Restore. Configurable on console bucket and object pages;
+protocol contract: [Compatibility matrix](../reference/compat.md).
 
-**Q: 兼容哪些客户端?**
-aws cli / boto3 / mc / rclone / s3cmd(无 SigV2) / Hadoop S3A / 浏览器 SDK
-走预签名直传。冒烟 `tests/smoke/client_smoke.sh`;s3-tests 支持子集按排除
-矩阵收敛(见仓库 `tests/s3-tests/README.md`),不以「完整 S3」声称。
+**Q: Which clients are compatible?**
+aws cli / boto3 / mc / rclone / s3cmd (no SigV2) / Hadoop S3A / browser SDKs
+via presigned direct upload. Smoke: `tests/smoke/client_smoke.sh`; the s3-tests supported subset converges by the exclusion
+matrix (see repository `tests/s3-tests/README.md`); it is not claimed as "complete S3".
 
-**Q: 出现 P0/P1 缺陷怎么报?**
-走 Beta 反馈通道(见 [Beta 计划](../beta/index.md)):GitHub issue 模板
-(含版本/内核/设备/复现步骤),SLO = 确认后 48h 评估、7 天修复发布。
+**Q: How do I report a P0/P1 defect?**
+Use the Beta feedback channel (see [Beta plan](../beta/index.md)): GitHub issue template
+(version / kernel / device / repro steps). SLO = assess within 48h of confirmation, ship a fix within 7 days.
 
-**Q: 如何确认升级安全?**
-`fasts3d upgrade --check-only` 预检;正式升级自动备份+自检+失败回滚
-(N-1 保证);升级前留 meta-export + 卷快照(见 [升级](upgrade.md))。
+**Q: How do I confirm an upgrade is safe?**
+`fasts3d upgrade --check-only` preflight; a real upgrade auto-backups + self-checks + rolls back on failure
+(N-1 guarantee); before upgrade, keep a meta-export + volume snapshot (see [Upgrade](upgrade.md)).

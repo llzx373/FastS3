@@ -1,99 +1,99 @@
-# IAM 多租户运维
+# IAM multi-tenant ops
 
-面向从 MinIO 迁过来的团队：概念对照（User / Group / Policy / Service Account）
-走控制台、REST 或 `fasts3d iam`，**不是** `mc admin` 线协议。
-协议级裁决见 [兼容性矩阵 · IAM](../reference/compat.md)。
+For teams migrating from MinIO: concept mapping (User / Group / Policy / Service Account)
+via the console, REST, or `fasts3d iam` — **not** the `mc admin` wire protocol.
+Protocol-level decisions: [Compatibility matrix · IAM](../reference/compat.md).
 
-## 1. 红线:`mc admin` 二进制不受支持
+## 1. Red line: the `mc admin` binary is not supported
 
-FastS3 **不实现** `/minio/admin/v3` 线协议,`mc admin user/group/policy/
-svcacct` 等子命令对本服务**无效**(ADR-28 DI8.3/DI10,红线不做)。对齐的
-是**概念与 canned 策略名**(User/Group/Policy/Service Account、`readonly`/
-`readwrite`/…),不是 wire protocol——运维习惯可平移,二进制不可平移。
-日常身份管理走控制台 IAM 页面、`/api/iam/*` REST,或 **`fasts3d iam`**
-(经运行中实例的 admin 通道,与控制台同 API;见 [CLI](../reference/cli.md))。
+FastS3 **does not implement** the `/minio/admin/v3` wire protocol; subcommands such as `mc admin user/group/policy/
+svcacct` are **ineffective** against this service (ADR-28 DI8.3/DI10, explicit non-goal). What is aligned
+is **concepts and canned policy names** (User/Group/Policy/Service Account, `readonly`/
+`readwrite`/…), not the wire protocol — operational habits can transfer; the binary cannot.
+Day-to-day identity management uses the console IAM pages, `/api/iam/*` REST, or **`fasts3d iam`**
+(via the running instance's admin channel, same API as the console; see [CLI](../reference/cli.md)).
 
-## 2. 登录与身份来源
+## 2. Login and identity sources
 
-控制台登录(`/api/login` 与 `/api/oidc/login`)的身份解析顺序:
+Console login (`/api/login` and `/api/oidc/login`) identity resolution order:
 
-1. **本地配置用户**(`[[web.users]]`,启动时同步为租户 `default` 的同名
-   IAM User:role=admin → 挂 `consoleAdmin`,readonly → 挂 `readonly`,
-   幂等、仅当无任何挂载时才挂载);
-2. **LDAP bind**(启用时):bind 成功仅证明目录凭据有效,身份必须是已同步
-   的 IAM User,无对应 User → 401 `no_such_user`(先同步后登录,不自动建号);
-3. **IAM 用户口令**(前两级未命中时):`POST /v1/iam/verify-password`,
-   比较恒定时间,未知用户/无本地口令/口令错同口径 401,不泄露存在性;
-4. **OIDC SSO**:`POST /api/oidc/login`,sub → IAM User,未知 sub JIT 建号
-   落入配置的默认组(JIT 永不直挂策略、永不因 claim 得 `consoleAdmin`)。
+1. **Local configured users** (`[[web.users]]`, synced at startup to same-named
+   IAM Users in tenant `default`: role=admin → attach `consoleAdmin`, readonly → attach `readonly`,
+   idempotent, attach only when there are no existing attachments);
+2. **LDAP bind** (when enabled): a successful bind only proves the directory credentials are valid; identity must be an already-synced
+   IAM User; no matching User → 401 `no_such_user` (sync first, then log in; no auto-provisioning);
+3. **IAM user password** (when the first two miss): `POST /v1/iam/verify-password`,
+   constant-time compare; unknown user / no local password / wrong password all return the same 401, no existence leak;
+4. **OIDC SSO**: `POST /api/oidc/login`, sub → IAM User; unknown sub JIT-provisions
+   into the configured default group (JIT never attaches policies directly, never grants `consoleAdmin` from a claim).
 
-**JWT 只证明「谁登录」(identity-only)**,一切授权决策经 IAM 生效策略
-(`admin:*` 动作族,`POST /v1/iam/authorize` 求值);JWT 里的 `role` claim
-仅是 UI 过渡提示。细则见 [兼容性矩阵](../reference/compat.md) M18 C1 节。
+**JWT only proves “who logged in” (identity-only)**; all authorization decisions go through IAM effective policies
+(`admin:*` action family, `POST /v1/iam/authorize` evaluation); the `role` claim in the JWT
+is only a UI transitional hint. Details: [Compatibility matrix](../reference/compat.md) M18 C1 section.
 
-## 3. MinIO 概念 → FastS3 对照表
+## 3. MinIO concepts → FastS3 mapping
 
-控制台页面均在 Web 控制台(9090)导航「IAM」分组下;API 列为 Node 管理面
-代理路径(`/api/iam/*`,Rust admin 侧对应 `/v1/iam/*`,回环/unix 可信通道)。
+Console pages are under the “IAM” group in the Web console (9090) nav; API column is the Node management-plane
+proxy path (`/api/iam/*`; Rust admin side is `/v1/iam/*`, loopback/unix trusted channel).
 
-| MinIO 操作 | FastS3 控制台 | FastS3 API | CLI(`fasts3d`) |
+| MinIO operation | FastS3 console | FastS3 API | CLI (`fasts3d`) |
 | --- | --- | --- | --- |
-| `mc admin user add` | 用户页 → 新建 | `POST /api/iam/users` | `iam users create --name …` |
-| `mc admin user list` / `info` | 用户页列表 | `GET /api/iam/users[?tenant=]` | `iam users list` / `get` |
-| `mc admin user enable` / `disable` | 用户页 → 启停开关 | `PATCH /api/iam/users/{tenant}/{name}`(`enabled` 布尔) | `iam users update --enable\|--disable` |
-| `mc admin user remove` | 用户页 → 删除(须先吊销其全部 SA) | `DELETE /api/iam/users/{tenant}/{name}` | `iam users delete` |
-| `mc admin user policy`(改挂载) | 用户页 → 编辑策略 | `PATCH .../users/{tenant}/{name}`(`policies` 整表替换) | `iam users update --policies a,b` |
-| `mc admin group add/enable/disable/info` | 组页 | `POST /api/iam/groups`、`GET .../groups`、`PATCH .../groups/{tenant}/{name}` | `iam groups list\|create\|get\|update\|delete` |
-| `mc admin group remove` | 组页 → 删除 | `DELETE /api/iam/groups/{tenant}/{name}` | `iam groups delete` |
-| `mc admin policy create` | 策略页 → 新建 | `POST /api/iam/policies` | `iam policies create --name … --file p.json` |
-| `mc admin policy list` / `info` | 策略页列表(含 canned 只读) | `GET /api/iam/policies[?tenant=]` | `iam policies list` / `get` |
-| `mc admin policy attach` / `detach` | 用户/组页改 `policies` | 同上 PATCH users/groups | `iam users\|groups update --policies` |
-| `mc admin policy remove` | 策略页 → 删除(仍被挂载 → 409) | `DELETE /api/iam/policies/{tenant}/{name}` | `iam policies delete` |
-| `mc admin svcacct add/list/remove` | 服务账号页 | `GET/POST/DELETE /api/iam/service-accounts[/{access}]` | `iam sa list\|create\|get\|delete` |
-| MinIO STS `AssumeRole` | —(客户端直调) | `POST /v1/iam/assume-role`;Node `POST /api/sts?Action=AssumeRole` | — |
-| `mc admin` 其余 | 仪表盘 / 审计 / doctor | `/v1/admin/status` 等 | `audit query` / `keys list` / `doctor` |
+| `mc admin user add` | Users page → New | `POST /api/iam/users` | `iam users create --name …` |
+| `mc admin user list` / `info` | Users page list | `GET /api/iam/users[?tenant=]` | `iam users list` / `get` |
+| `mc admin user enable` / `disable` | Users page → enable/disable switch | `PATCH /api/iam/users/{tenant}/{name}` (`enabled` boolean) | `iam users update --enable\|--disable` |
+| `mc admin user remove` | Users page → Delete (must revoke all of its SAs first) | `DELETE /api/iam/users/{tenant}/{name}` | `iam users delete` |
+| `mc admin user policy` (change attachments) | Users page → Edit policies | `PATCH .../users/{tenant}/{name}` (`policies` full-table replace) | `iam users update --policies a,b` |
+| `mc admin group add/enable/disable/info` | Groups page | `POST /api/iam/groups`, `GET .../groups`, `PATCH .../groups/{tenant}/{name}` | `iam groups list\|create\|get\|update\|delete` |
+| `mc admin group remove` | Groups page → Delete | `DELETE /api/iam/groups/{tenant}/{name}` | `iam groups delete` |
+| `mc admin policy create` | Policies page → New | `POST /api/iam/policies` | `iam policies create --name … --file p.json` |
+| `mc admin policy list` / `info` | Policies page list (includes canned, read-only) | `GET /api/iam/policies[?tenant=]` | `iam policies list` / `get` |
+| `mc admin policy attach` / `detach` | Users/groups page, change `policies` | Same PATCH users/groups | `iam users\|groups update --policies` |
+| `mc admin policy remove` | Policies page → Delete (still attached → 409) | `DELETE /api/iam/policies/{tenant}/{name}` | `iam policies delete` |
+| `mc admin svcacct add/list/remove` | Service accounts page | `GET/POST/DELETE /api/iam/service-accounts[/{access}]` | `iam sa list\|create\|get\|delete` |
+| MinIO STS `AssumeRole` | — (client calls directly) | `POST /v1/iam/assume-role`; Node `POST /api/sts?Action=AssumeRole` | — |
+| Other `mc admin` | Dashboard / audit / doctor | `/v1/admin/status` etc. | `audit query` / `keys list` / `doctor` |
 
-字段命名沿用 MinIO 运维习惯(`accessKey`/`policy`/`members`),路径不抄
-(ADR-28 DI8.1)。SA secret **仅创建响应一次回显**,与 `mc admin svcacct add`
-输出一次性 secret 的习惯一致。
+Field names follow MinIO ops habits (`accessKey`/`policy`/`members`); paths are not copied
+(ADR-28 DI8.1). SA secret is **echoed only in the create response**, consistent with `mc admin svcacct add`
+printing a one-time secret.
 
-## 4. canned 策略对照
+## 4. Canned policy mapping
 
-内置 canned 策略为代码常量:**只读、不落盘**,不可 PATCH/DELETE
-(`policy_readonly`),自定义策略撞名拒绝(`policy_name_reserved`)。
+Built-in canned policies are code constants: **read-only, not persisted**, cannot PATCH/DELETE
+(`policy_readonly`); custom policies that collide with reserved names are rejected (`policy_name_reserved`).
 
-| MinIO canned | FastS3 | 内容(FastS3 动作翻译) |
+| MinIO canned | FastS3 | Contents (FastS3 action translation) |
 | --- | --- | --- |
-| `readonly` | `readonly`(同名) | `s3:Get*/List*/Head*` |
-| `readwrite` | `readwrite`(同名) | `s3:*` |
-| `writeonly` | `writeonly`(同名) | `s3:Put*/Delete*/CreateBucket/Abort*/Restore*/Multipart` |
-| `diagnostics` | `diagnostics`(同名) | 管理面只读 `admin:List*/Get*` + s3 读 |
-| `consoleAdmin` | `consoleAdmin`(同名;**仅 root 可授**) | `admin:*` + `s3:*`,集群范围,含租户管理 |
-| —(MinIO 无对应) | `tenantAdmin`(FastS3 增补) | 本租户内用户/组/策略/SA/角色管理 + `s3:*`;跨租户由求值处强制拒绝 |
+| `readonly` | `readonly` (same name) | `s3:Get*/List*/Head*` |
+| `readwrite` | `readwrite` (same name) | `s3:*` |
+| `writeonly` | `writeonly` (same name) | `s3:Put*/Delete*/CreateBucket/Abort*/Restore*/Multipart` |
+| `diagnostics` | `diagnostics` (same name) | Management-plane read-only `admin:List*/Get*` + s3 read |
+| `consoleAdmin` | `consoleAdmin` (same name; **root-grant only**) | `admin:*` + `s3:*`, cluster-wide, including tenant management |
+| — (no MinIO equivalent) | `tenantAdmin` (FastS3 addition) | In-tenant user/group/policy/SA/role management + `s3:*`; cross-tenant is hard-denied at evaluation |
 
-Resource 一律字面 `*`(本引擎服务级动作资源语义),不写 `arn:aws:s3:::*`。
+Resource is always literal `*` (this engine's service-level action resource semantics); do not write `arn:aws:s3:::*`.
 
-## 5. 生产清单:「root 只引导」(ADR-28 DI4)
+## 5. Production checklist: “root for bootstrap only” (ADR-28 DI4)
 
-「root」= 控制台引导账号:配置文件首个 role=admin 的 `[[web.users]]` 用户,
-启动同步后挂 `consoleAdmin`(集群范围,含租户管理)。日常运维**不依赖**它:
+“root” = the console bootstrap account: the first `[[web.users]]` user with role=admin in the config file;
+after startup sync it is attached to `consoleAdmin` (cluster-wide, including tenant management). Day-to-day ops **does not depend** on it:
 
-1. **引导**:root 登录控制台 → 租户页(仅 consoleAdmin 可见)创建部门租户
-   → 在每个租户创建首个 `tenantAdmin` 用户(设强口令);
-2. **封存**:root 口令进保管库(密码保险柜),日常不使用、不分发;
-   回收路径 = 在 IAM 侧摘除该用户挂载(启动同步幂等,不会复活已回收的挂载);
-3. **日常**:部门管理员用**自己的控制台账号**(挂 `tenantAdmin`)管理本租户
-   用户/组/策略/服务账号/角色与本租户桶;普通用户在服务账号页**自助**建/吊销
-   自己的 SA(owner=自己恒放行,无需管理员);
-4. **数据面红线**:root 引导账号永不持有、永不使用数据面 AK;禁止「所有人
-   共用一把 AK 当超管」——应用密钥一律走用户自助 SA(可挂嵌入策略缩权);
-5. **审计**:数据面审计条目 `who` = 发起者 access key / 用户,逐操作可追溯;
-   控制台登录来源与身份变更(local/ldap/iam/oidc)记录于身份事件
-   (`GET /api/identity-events`);认证失败侧写落 `auth_note`
-   (`key_disabled`/`key_not_found`/`session_token_invalid`/`user_disabled`)。
-   定期复核:root 账号的登录事件应仅出现在引导/应急场景,出现日常使用
-   即视为违规信号。
+1. **Bootstrap**: root logs into the console → Tenants page (visible only to consoleAdmin) creates department tenants
+   → in each tenant create the first `tenantAdmin` user (set a strong password);
+2. **Vault**: put the root password in a vault (password manager); do not use it day-to-day, do not distribute it;
+   reclaim path = detach that user's attachments on the IAM side (startup sync is idempotent and will not resurrect reclaimed attachments);
+3. **Day-to-day**: department admins use **their own console accounts** (attached to `tenantAdmin`) to manage this tenant's
+   users/groups/policies/service accounts/roles and this tenant's buckets; ordinary users **self-serve** create/revoke
+   their own SAs on the service-account page (owner=self is always allowed, no admin needed);
+4. **Data-plane red line**: the root bootstrap account never holds and never uses a data-plane AK; forbid “everyone
+   shares one AK as super-admin” — application keys always go through user self-serve SAs (can attach an embedded policy to shrink permissions);
+5. **Audit**: data-plane audit entries `who` = initiator access key / user, per-operation traceable;
+   console login source and identity changes (local/ldap/iam/oidc) are recorded in identity events
+   (`GET /api/identity-events`); auth-failure side notes land in `auth_note`
+   (`key_disabled`/`key_not_found`/`session_token_invalid`/`user_disabled`).
+   Periodic review: root-account login events should appear only in bootstrap/emergency scenarios; day-to-day use
+   is a policy-violation signal.
 
-演练脚本 `tests/iam/delegated_admin_drill.sh`(M18/C2)覆盖本清单全程:
-root 建租户 + tenantAdmin → 管理员建用户挂 `readwrite` → 用户自助建 SA →
-SA 读写本租户桶、他租户 List/GET 失败——全程不用 root 数据面 AK。
+Drill script `tests/iam/delegated_admin_drill.sh` (M18/C2) covers this checklist end to end:
+root creates tenant + tenantAdmin → admin creates a user attached to `readwrite` → user self-serves an SA →
+SA reads/writes this tenant's buckets, List/GET on another tenant fails — no root data-plane AK used throughout.

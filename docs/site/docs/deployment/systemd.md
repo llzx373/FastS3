@@ -1,77 +1,77 @@
-# systemd 部署
+# systemd
 
-源文件：`deploy/systemd/`（`install-systemd.sh` + 两个加固单元）。
-容器路径见 [容器部署](container.md)。
+Source files: `deploy/systemd/` (`install-systemd.sh` + two hardened units).
+Container path: [Containers](container.md).
 
-## 架构
+## Architecture
 
-| 单元 | 进程 | 说明 |
+| Unit | Process | Description |
 | --- | --- | --- |
-| `fasts3.service` | `fasts3d serve --config /etc/fasts3/fasts3.toml` | 数据面:S3(9000)+ admin(unix socket);复制口默认 9445(mTLS,见配置 `[replication]`) |
-| `fasts3-web.service` | `node dist/index.js`(FS3_WEB_CONFIG=/etc/fasts3/web.json) | 管理面:仅回环 127.0.0.1:9090;无状态(状态全在 Rust 侧) |
+| `fasts3.service` | `fasts3d serve --config /etc/fasts3/fasts3.toml` | Data plane: S3(9000) + admin (unix socket); replication port default 9445 (mTLS, see `[replication]` in config) |
+| `fasts3-web.service` | `node dist/index.js`(FS3_WEB_CONFIG=/etc/fasts3/web.json) | Management plane: loopback 127.0.0.1:9090 only; stateless (all state on the Rust side) |
 
-## 加固项(数据面,注释见单元文件)
+## Hardening (data plane; comments in the unit file)
 
 ```ini
-LimitMEMLOCK=infinity        # io_uring 注册缓冲需要 mlock,默认 64KiB 上限会注册失败
-NoNewPrivileges=yes          # 禁止 setuid/文件 capability 提权
-ProtectSystem=strict         # /、/usr、/boot、/etc 只读挂载
-ProtectHome=yes              # /home /root /run/user 只读/不可见
-PrivateTmp=yes               # 独立 /tmp、/var/tmp
-ProtectKernelTunables=yes    # /proc/sys /sys 只读(防改全局内核参数)
-ProtectKernelModules=yes     # 禁止加载内核模块
-ProtectControlGroups=yes     # cgroup 只读
+LimitMEMLOCK=infinity        # io_uring registered buffers need mlock; the default 64KiB cap fails registration
+NoNewPrivileges=yes          # Forbid setuid / file-capability privilege escalation
+ProtectSystem=strict         # /, /usr, /boot, /etc mounted read-only
+ProtectHome=yes              # /home /root /run/user read-only/invisible
+PrivateTmp=yes               # Private /tmp and /var/tmp
+ProtectKernelTunables=yes    # /proc/sys /sys read-only (block changing global kernel params)
+ProtectKernelModules=yes     # Forbid loading kernel modules
+ProtectControlGroups=yes     # cgroup read-only
 ReadWritePaths=/var/lib/fasts3 /run/fasts3 /etc/fasts3
-                             # 数据路径 + admin socket + 配置热更新写路径
-UMask=0077                   # 新建文件仅属主可读写
-KillSignal=SIGTERM           # 优雅排空(在途请求 → 检查点 → 退出)
-TimeoutStopSec=10            # 排空窗口,超时 SIGKILL
-Restart=on-failure           # 崩溃自动拉起
-RestartSec=2s                # 退避
+                             # Data path + admin socket + config hot-reload write path
+UMask=0077                   # New files owner-only read/write
+KillSignal=SIGTERM           # Graceful drain (in-flight requests → checkpoint → exit)
+TimeoutStopSec=10            # Drain window; SIGKILL on timeout
+Restart=on-failure           # Auto-restart on crash
+RestartSec=2s                # Backoff
 ```
 
-- 数据面默认以 root 运行(裸设备 + io_uring 特权);非 root 形态需
-  `AmbientCapabilities=CAP_SYS_ADMIN CAP_IPC_LOCK` 与设备 ACL。
-- 管理面无写盘需求:**不配 ReadWritePaths**(全只读),`NoNewPrivileges` 等加固同样适用。
+- Data plane runs as root by default (raw device + io_uring privileges); non-root form needs
+  `AmbientCapabilities=CAP_SYS_ADMIN CAP_IPC_LOCK` and device ACLs.
+- Management plane has no disk-write requirement: **do not set ReadWritePaths** (fully read-only); the same `NoNewPrivileges` and other hardening still apply.
 
-## 安装 / 卸载
+## Install / uninstall
 
 ```bash
-# 安装(unit → /etc/systemd/system;建 /etc/fasts3、/var/lib/fasts3(+meta);
-# 首装复制配置模板;daemon-reload 并 enable --now)
+# Install (unit → /etc/systemd/system; create /etc/fasts3, /var/lib/fasts3(+meta);
+# first install copies config templates; daemon-reload and enable --now)
 sudo deploy/systemd/install-systemd.sh install
 
-# 状态 / 卸载
+# Status / uninstall
 sudo deploy/systemd/install-systemd.sh status
-sudo deploy/systemd/install-systemd.sh uninstall     # 保留数据与配置
+sudo deploy/systemd/install-systemd.sh uninstall     # keep data and config
 ```
 
-环境变量:`UNIT_DIR`(默认 /etc/systemd/system;制品形态用 /lib/systemd/system)、
-`NO_START=1`(只装不启,WSL/容器 CI)、`CONFIG`(模板路径)。
+Environment variables: `UNIT_DIR` (default /etc/systemd/system; packaged form uses /lib/systemd/system),
+`NO_START=1` (install only, do not start; WSL/container CI), `CONFIG` (template path).
 
-## 目录与权限
+## Directories and permissions
 
-| 路径 | 属主/权限 | 用途 |
+| Path | Owner/mode | Purpose |
 | --- | --- | --- |
-| `/etc/fasts3/` | root:root 0750 | 配置(`fasts3.toml` 0640、`web.json` 0600) |
-| `/var/lib/fasts3/` | root:root 0750 | 数据:磁盘镜像 + `meta/`(rocksdb) |
-| `/run/fasts3/` | systemd RuntimeDirectory 0750 | admin.sock 等运行时文件 |
+| `/etc/fasts3/` | root:root 0750 | Config (`fasts3.toml` 0640, `web.json` 0600) |
+| `/var/lib/fasts3/` | root:root 0750 | Data: disk image + `meta/` (rocksdb) |
+| `/run/fasts3/` | systemd RuntimeDirectory 0750 | Runtime files such as admin.sock |
 
-## 配置热更新
+## Config hot reload
 
-改 `/etc/fasts3/fasts3.toml` 后:
+After changing `/etc/fasts3/fasts3.toml`:
 
 ```bash
-sudo systemctl reload fasts3        # admin H3 热重载:限速/匿名读/配置密钥
-# 其余字段(存储布局等)变更需重启:
+sudo systemctl reload fasts3        # admin H3 hot reload: rate limits / anonymous read / config keys
+# Remaining fields (storage layout, etc.) require a restart:
 sudo systemctl restart fasts3
 ```
 
-## 无 systemd 环境(WSL/容器)
+## Environments without systemd (WSL/containers)
 
-单元文件与脚本仍可安装,**但没有 PID1 托管**;演练/容器场景用:
+Unit files and the script can still be installed, **but there is no PID 1 supervision**; for drills/container scenarios use:
 
 ```bash
 nohup fasts3d serve --config /etc/fasts3/fasts3.toml >/var/log/fasts3.log 2>&1 &
-# 停止: pkill -TERM -f 'fasts3d serve'
+# Stop: pkill -TERM -f 'fasts3d serve'
 ```

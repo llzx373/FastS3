@@ -1,117 +1,117 @@
-# 错误码速查
+# Error code quick reference
 
-三层：① S3 协议（与 AWS XML 对齐）；② admin API（JSON `error.code`）；
-③ Node 管理 API。处置建议见 [故障排查](../operations/troubleshooting.md)。
+Three layers: ① S3 protocol (aligned with AWS XML); ② admin API (JSON `error.code`);
+③ Node management API. Handling advice: [Troubleshooting](../operations/troubleshooting.md).
 
-## 1. S3 错误码(协议层)
+## 1. S3 error codes (protocol layer)
 
-返回 XML `Error/Code/Message/RequestId/HostId` + 对应 HTTP 状态;
-AWS 客户端按规范映射。
+Returns XML `Error/Code/Message/RequestId/HostId` + matching HTTP status;
+AWS clients map by spec.
 
-### 认证与签名
+### Auth and signing
 
-| Code | HTTP | 场景 |
+| Code | HTTP | Scenario |
 | --- | --- | --- |
-| `InvalidAccessKeyId` | 403 | access key 不存在或未启用 |
-| `SignatureDoesNotMatch` | 403 | 签名不符(密钥/区域/时间窗/载荷哈希) |
-| `AccessDenied` | 403 | 未授权(策略/匿名禁读) |
-| `RequestTimeTooSkewed` | 403 | 客户端与服务器时钟偏差 ±15 分钟 |
-| `AuthorizationHeaderMalformed` | 400 | Authorization 头格式错误 |
-| `InvalidToken` / `ExpiredToken` | 400 | 会话令牌问题(SigV4 临时凭证) |
+| `InvalidAccessKeyId` | 403 | access key does not exist or is not enabled |
+| `SignatureDoesNotMatch` | 403 | signature mismatch (key / region / time window / payload hash) |
+| `AccessDenied` | 403 | unauthorized (policy / anonymous read disabled) |
+| `RequestTimeTooSkewed` | 403 | client vs server clock skew ±15 minutes |
+| `AuthorizationHeaderMalformed` | 400 | Authorization header malformed |
+| `InvalidToken` / `ExpiredToken` | 400 | session-token problem (SigV4 temporary credentials) |
 
-### 桶与对象
+### Buckets and objects
 
-| Code | HTTP | 场景 |
+| Code | HTTP | Scenario |
 | --- | --- | --- |
-| `NoSuchBucket` | 404 | 桶不存在(或未授权,避免枚举采用同语义) |
-| `NoSuchKey` | 404 | 对象不存在 |
-| `BucketAlreadyExists` / `BucketAlreadyOwnedByYou` | 409 | 建桶重名 |
-| `BucketNotEmpty` | 409 | 删非空桶 |
-| `InvalidBucketName` | 400 | 桶名非法(长度/字符/IPv4 形) |
-| `NoSuchUpload` | 404 | multipart 会话不存在/已中止 |
-| `InvalidPart` / `InvalidPartOrder` | 400 | 分片缺失或不按序 |
-| `EntityTooSmall` / `EntityTooLarge` | 400 | 分片 <5MiB / 对象超限 |
-| `InvalidRange` | 416 | Range 越界(带 `x-amz-actual-object-size`;多段 Range → 206 multipart/byteranges) |
-| `XAmzContentSHA256Mismatch` | 400 | `x-amz-content-sha256` 声明与实际载荷不符(M9;BadDigest 仅用于 Content-MD5) |
-| `InvalidStorageClass` | 400 | `x-amz-storage-class` 非接受矩阵中的值(M9 起显式拒绝,不静默) |
-| `KeyTooLongError` / `MetadataTooLarge` | 400 | 对象键 >1024 字节 / `x-amz-meta-*` 总量 >2KiB(M11 H1-1 起强制,AWS 上限口径) |
-| `PreconditionFailed` | 412 | 条件头(If-Match 等)失败 |
-| `NotModified` | 304 | If-None-Match 命中 |
-| `NoSuchVersion` | 404 | `VersionId` 不存在(版本控制未启用) |
+| `NoSuchBucket` | 404 | bucket does not exist (or unauthorized; same semantics to avoid enumeration) |
+| `NoSuchKey` | 404 | object does not exist |
+| `BucketAlreadyExists` / `BucketAlreadyOwnedByYou` | 409 | create-bucket name collision |
+| `BucketNotEmpty` | 409 | delete a non-empty bucket |
+| `InvalidBucketName` | 400 | illegal bucket name (length / characters / IPv4-shaped) |
+| `NoSuchUpload` | 404 | multipart session does not exist / already aborted |
+| `InvalidPart` / `InvalidPartOrder` | 400 | missing part or out of order |
+| `EntityTooSmall` / `EntityTooLarge` | 400 | part <5MiB / object over limit |
+| `InvalidRange` | 416 | Range out of bounds (with `x-amz-actual-object-size`; multi-range → 206 multipart/byteranges) |
+| `XAmzContentSHA256Mismatch` | 400 | `x-amz-content-sha256` declaration does not match actual payload (M9; BadDigest is only for Content-MD5) |
+| `InvalidStorageClass` | 400 | `x-amz-storage-class` not in the accept matrix (explicit reject from M9, not silent) |
+| `KeyTooLongError` / `MetadataTooLarge` | 400 | object key >1024 bytes / `x-amz-meta-*` total >2KiB (enforced from M11 H1-1, AWS ceiling contract) |
+| `PreconditionFailed` | 412 | condition header (If-Match, etc.) failed |
+| `NotModified` | 304 | If-None-Match hit |
+| `NoSuchVersion` | 404 | `VersionId` does not exist (versioning not enabled) |
 
-### 资源与限流
+### Resources and throttling
 
-| Code | HTTP | 场景 |
+| Code | HTTP | Scenario |
 | --- | --- | --- |
-| `InsufficientStorage` | 507 | 设备空间不足(位图耗尽) |
-| `SlowDown` | 503 | 限速/准入节流;恒带 `Retry-After: 5` |
-| `ServiceUnavailable` | 503 | 读时掉盘降级等 |
-| `QuotaExceeded` | 400 | 桶配额超限(admin 侧亦同码) |
-| `InvalidRequest` / `MalformedXML` / `MissingContentLength` / `IncompleteBody` | 400 | 请求/XML/体错误;DeleteObjects 键数 >1000 亦为 400(M9) |
-| `BadDigest` | 400 | Content-MD5 不符(Content-SHA256 不符用 `XAmzContentSHA256Mismatch`) |
-| `MethodNotAllowed` | 405 | 方法不支持 |
-| `NotImplemented` | 501 | 定位性不做的子资源(Website/Logging/`?replication` XML/ACL 全矩阵等);**未实现头显式拒绝,不静默忽略** |
-| `ReplicationStandby` | 501 | 备端拒绝写入;响应可带 `X-FastS3-Repl-Applied-Gtid` |
-| `KMS.UnavailableException` | 503 | SSE-KMS 后端不可达(停 Vault/OpenBao) |
-| `InvalidObjectState` | 403 | 归档未 restore 即读/跨类复制源 |
+| `InsufficientStorage` | 507 | device space exhausted (bitmap depleted) |
+| `SlowDown` | 503 | rate-limit / admission throttle; always with `Retry-After: 5` |
+| `ServiceUnavailable` | 503 | e.g. disk-loss degrade on read |
+| `QuotaExceeded` | 400 | bucket quota exceeded (same code on the admin side) |
+| `InvalidRequest` / `MalformedXML` / `MissingContentLength` / `IncompleteBody` | 400 | request / XML / body error; DeleteObjects key count >1000 is also 400 (M9) |
+| `BadDigest` | 400 | Content-MD5 mismatch (Content-SHA256 mismatch uses `XAmzContentSHA256Mismatch`) |
+| `MethodNotAllowed` | 405 | method not supported |
+| `NotImplemented` | 501 | deliberately unimplemented subresources (Website/Logging/`?replication` XML/ACL full matrix, etc.); **unimplemented headers are explicitly rejected, not silently ignored** |
+| `ReplicationStandby` | 501 | standby rejects writes; response may carry `X-FastS3-Repl-Applied-Gtid` |
+| `KMS.UnavailableException` | 503 | SSE-KMS backend unreachable (Vault/OpenBao stopped) |
+| `InvalidObjectState` | 403 | read archive without restore / copy source across class |
 
-## 2. admin API 错误码(JSON)
+## 2. admin API error codes (JSON)
 
-通用形态:`{"ok":false,"error":{"code","message"}}`。
+Common shape: `{"ok":false,"error":{"code","message"}}`.
 
-| Code | HTTP | 场景 |
+| Code | HTTP | Scenario |
 | --- | --- | --- |
-| `unauthorized` | 401 | 缺失/非法 Bearer token |
-| `bad_request` | 400 | JSON 解析失败/缺字段/字段非法 |
-| `no_such_bucket` | 404 | 桶不存在 |
-| `no_such_key` | 404 | 密钥不存在 |
-| `no_such_upload` | 404 | 上传会话不存在 |
-| `invalid_argument` | 409 | 建桶重名/配额非法(M3 语义:业务冲突) |
-| `key_error` | 409 | 密钥已存在 |
-| `invalid_policy` | 400 | 策略 JSON 语法/语义非法 |
-| `not_implemented` | 501 | 供应器未注入(如 config 未启用) |
-| `config_error` | 400/500 | 配置读取/应用失败 |
-| `reload_failed` | 400 | 热重载失败(配置语法错误等) |
-| `repair_failed` | 500 | 泄漏修复失败 |
-| `check_failed` / `internal` | 500 | 引擎核对/内部错误 |
+| `unauthorized` | 401 | missing / illegal Bearer token |
+| `bad_request` | 400 | JSON parse failure / missing field / illegal field |
+| `no_such_bucket` | 404 | bucket does not exist |
+| `no_such_key` | 404 | key does not exist |
+| `no_such_upload` | 404 | upload session does not exist |
+| `invalid_argument` | 409 | create-bucket name collision / illegal quota (M3 semantics: business conflict) |
+| `key_error` | 409 | key already exists |
+| `invalid_policy` | 400 | policy JSON syntax / semantics illegal |
+| `not_implemented` | 501 | provider not injected (e.g. config not enabled) |
+| `config_error` | 400/500 | config read / apply failed |
+| `reload_failed` | 400 | hot-reload failed (config syntax error, etc.) |
+| `repair_failed` | 500 | leak repair failed |
+| `check_failed` / `internal` | 500 | engine check / internal error |
 
-## 3. Node 管理 API 错误码(JSON)
+## 3. Node management API error codes (JSON)
 
-统一 `{"error":{"code","message"}}`;代理层错误透传 Rust 判定码,外层
-再包一层传输码:
+Uniform `{"error":{"code","message"}}`; proxy-layer errors pass through Rust decision codes, then wrap an outer
+transport code:
 
-| Code | HTTP | 场景 |
+| Code | HTTP | Scenario |
 | --- | --- | --- |
-| `invalid_credentials` | 401 | 用户名/密码错误 |
-| `unauthorized` | 401 | 无/失效 token |
-| `forbidden` | 403 | IAM `admin:*` 求值拒绝(JWT 只证明身份) |
-| `admin_unreachable` | 502 | Rust admin 通道不可达/超时 |
-| `s3_error` | 502 | 数据面 S3 调用失败(消息含原始码) |
-| `presign_error` | 500 | 预签名签发失败 |
-| `policy_error` | 502 | 策略代理失败(非法策略 400) |
-| `no_such_bucket` / `no_such_key` | 404 | 透传业务码 |
-| `key_error` | 409 | 密钥已存在 |
-| `bad_request` | 400 | 缺字段/字段类型错误 |
-| `not_found` | 404 | 未知 multipart action 等 |
-| `bootstrap_error` | 502 | 首启探测失败 |
+| `invalid_credentials` | 401 | username / password wrong |
+| `unauthorized` | 401 | missing / expired token |
+| `forbidden` | 403 | IAM `admin:*` evaluate deny (JWT only proves identity) |
+| `admin_unreachable` | 502 | Rust admin channel unreachable / timeout |
+| `s3_error` | 502 | data-plane S3 call failed (message includes original code) |
+| `presign_error` | 500 | presign issue failed |
+| `policy_error` | 502 | policy proxy failed (illegal policy 400) |
+| `no_such_bucket` / `no_such_key` | 404 | passed-through business codes |
+| `key_error` | 409 | key already exists |
+| `bad_request` | 400 | missing field / wrong field type |
+| `not_found` | 404 | unknown multipart action, etc. |
+| `bootstrap_error` | 502 | first-run probe failed |
 
-## 4. 运维常见错误(非 HTTP)
+## 4. Common ops errors (non-HTTP)
 
-| 现象/消息 | 含义与处置 |
+| Symptom / message | Meaning and action |
 | --- | --- |
-| `meta dir locked / LOCK: Resource temporarily unavailable` | 两进程共用 meta 目录;停掉其一 |
-| `no valid checkpoint found` | 设备未 init 或超级块损坏 |
-| `layout mismatch`(meta-import) | 目标设备与导出布局不一致;先恢复卷快照 |
-| `meta dir ... not empty --force`(meta-import) | 覆盖导入需显式 `--force`(旧目录自动改名) |
-| `tls_cert/tls_key 需成对配置` | TLS 未启用,以明文启动(告警) |
-| `degraded=true`(状态/指标) | 设备 I/O 故障只读降级;修复底层后重启 |
+| `meta dir locked / LOCK: Resource temporarily unavailable` | two processes sharing a meta directory; stop one |
+| `no valid checkpoint found` | device not init'd or superblock damaged |
+| `layout mismatch` (meta-import) | target device layout does not match the export; restore the volume snapshot first |
+| `meta dir ... not empty --force` (meta-import) | overwrite import needs explicit `--force` (old directory auto-renamed) |
+| `tls_cert/tls_key 需成对配置` | TLS not enabled; started in plaintext (warning) |
+| `degraded=true` (status / metrics) | device I/O failure read-only degrade; repair the underlying device then restart |
 
-## 5. 处置速查
+## 5. Action quick reference
 
-| 错误 | 一步处置 |
+| Error | One-step action |
 | --- | --- |
-| 507 / SlowDown | 查 watermark、`GET /v1/admin/uploads` 清僵尸、`compact` |
-| 认证类 403 | `GET /v1/admin/keys` 核对密钥;校时钟;核对 region |
-| NoSuchUpload | 重新 init multipart(会话有 TTL) |
-| 416 | 客户端已应答对象大小在 `x-amz-actual-object-size` |
-| admin 502 | `GET /v1/admin/status` 直连确认数据面健康与 token |
+| 507 / SlowDown | check watermark, `GET /v1/admin/uploads` to clear zombies, `compact` |
+| Auth-class 403 | `GET /v1/admin/keys` to verify keys; sync clocks; verify region |
+| NoSuchUpload | re-init multipart (sessions have a TTL) |
+| 416 | client already has the object size in `x-amz-actual-object-size` |
+| admin 502 | `GET /v1/admin/status` direct to confirm data-plane health and token |

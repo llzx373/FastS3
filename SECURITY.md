@@ -1,29 +1,31 @@
-# 安全披露
+# Security disclosure
 
-如果认为 FastS3 存在可被利用的安全问题，请**不要**开公开 Issue 或讨论帖。
+If you believe FastS3 has an exploitable security issue, **do not** open a public issue or discussion.
 
-## 如何报告
+[English](./SECURITY.md) · [中文](./SECURITY.zh-CN.md)
 
-1. **优先**：在代码托管平台开启私有漏洞报告（GitHub / Gitea 的 Security Advisory 或等价功能）。
-2. 若平台尚未开通私有渠道，请联系仓库维护者，并在标题标明 `SECURITY`，不要附带可直接复现的完整利用细节到公开处。
+## How to report
 
-报告请尽量包含：
+1. **Preferred**: open a private vulnerability report on the code host (GitHub / Gitea Security Advisory or equivalent).
+2. If that channel is not enabled, contact a maintainer with `SECURITY` in the subject. Do not post a full, copy-pasteable exploit in public.
 
-- 受影响版本（`fasts3d --version` 或 `Cargo.toml` workspace version）
-- 部署形态（裸设备 / 镜像文件；systemd / 容器）
-- 影响（数据泄露、越权、完整性、拒绝服务）
-- 最小复现步骤与期望 / 实际行为
+Please include:
 
-## 响应口径
+- Affected version (`fasts3d --version` or `Cargo.toml` workspace version)
+- Deployment shape (bare device / image file; systemd / container)
+- Impact (data leak, privilege, integrity, denial of service)
+- Minimal reproduction and expected vs actual behavior
 
-维护者会按 [安全基线与 CVE 响应](./docs/site/docs/operations/security.md) 处理：评估定级、修复、通告。目标是发现后 7 天内完成通告级补丁（视严重程度与复现复杂度调整）。
+## Response
 
-## 范围
+Maintainers follow the [security baseline and CVE process](./docs/site/docs/operations/security.md): severity, fix, advisory. The target is an advisory-grade patch within 7 days of a confirmed finding (adjusted for severity and how hard it is to reproduce).
 
-**接受**：数据面越权、鉴权绕过、未授权读取对象、复制口/admin 通道暴露、密钥或 DEK 落盘、供应链（依赖 CVE）。
+## Scope
 
-**一般不视为安全漏洞**：未实现的 S3 API 返回 501、文档与兼容矩阵已标明的限制、需要已持有有效密钥的普通功能缺陷（请用普通 Bug 模板）。
+**In scope**: data-plane privilege issues, auth bypass, unauthorized object reads, exposed replication/admin channels, keys or DEKs on disk, supply chain (dependency CVEs).
 
-## 安全基线（部署侧）
+**Usually not a security bug**: unimplemented S3 APIs returning 501, limits already documented in the compatibility matrix, ordinary functional bugs that require a valid key (use the normal bug template).
 
-默认：admin 仅 unix socket 或回环 + Bearer token；复制口 mTLS 强制；匿名访问关闭。上线检查单见上述安全文档。
+## Deployment baseline
+
+Defaults: admin is unix socket or loopback + Bearer token only; replication port requires mTLS; anonymous access is off. The checklist is in the security doc above.

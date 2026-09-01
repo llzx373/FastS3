@@ -1,89 +1,89 @@
-# Beta 计划与反馈机制(公开 Beta v0.9,历史)
+# Beta plan and feedback (public Beta v0.9, historical)
 
-> M7/L6 过程文档。当前产品版本见首页 **v2.7.0**;本页保留当时 Beta 通道与
-> 评审清单,不代表现网版本仍停在 v0.9。
+> M7/L6 process doc. Current product version is on the home page **v2.7.0**; this page keeps the Beta channel and
+> review checklist from that time and does not mean the live version is still at v0.9.
 
-## 1. 时间线与版本
+## 1. Timeline and versions
 
-| 阶段 | 版本 | 内容 |
+| Stage | Version | Content |
 | --- | --- | --- |
-| 内部试用(种子用户) | v0.7(进行中) | 内部团队/合作方 3~5 人,收集兼容性反馈(M6 后) |
-| 公开 Beta | **v0.9** | 开放注册、公开下载页、支持通道 |
-| Beta 评审 | v0.9+2 周 | NPS 问卷、P0/P1 清零复核、文档覆盖率检查 |
-| GA 前夕 | v0.9+3~4 周 | 兼容矩阵全量回归 → RC1 → RC2 → GA v1.0.0 |
+| Internal trial (seed users) | v0.7 (in progress) | Internal team / partners, 3–5 people; collect compatibility feedback (after M6) |
+| Public Beta | **v0.9** | Open registration, public download page, support channel |
+| Beta review | v0.9+2 weeks | NPS survey, P0/P1 zero-out review, docs coverage check |
+| Eve of GA | v0.9+3–4 weeks | Compatibility-matrix full regression → RC1 → RC2 → GA v1.0.0 |
 
-节奏:每 2 周 beta 构建;patch 轨道每月(安全/严重缺陷全线发布)。
+Cadence: a beta build every 2 weeks; patch track monthly (security / severe defects ship on the full line).
 
-## 2. 注册 / 下载 / 支持通道(公开 Beta)
+## 2. Registration / download / support (public Beta)
 
-- **注册**:GitHub Discussions 「Beta 报名」帖(或类型表单):登记
-  邮箱 + 使用场景(边缘/云上/开发)+ 设备形态(裸盘/镜像文件)+ 客户端;
-- **下载**:GitHub Releases 页面(v0.9-beta 资产:tarball/deb/rpm +
-  SBOM + minisign 签名),`install.sh` 一条命令安装;镜像站按需;
-- **支持通道**(SLO):
-  - GitHub Issues(Bug 模板,见 §3)—— 缺陷主通道;
-  - GitHub Discussions —— 答疑/用法/反馈;
-  - 邮件列表(通告:发布/安全/维护窗口);
-- **升级承诺**:Beta 用户 N-1 原地升级保证与正式版一致;回滚路径同样有效。
+- **Register**: GitHub Discussions "Beta signup" thread (or a typed form): record
+  email + use case (edge / cloud / development) + device form (raw disk / image file) + client;
+- **Download**: GitHub Releases page (v0.9-beta assets: tarball/deb/rpm +
+  SBOM + minisign signature); `install.sh` one-command install; mirrors as needed;
+- **Support** (SLO):
+  - GitHub Issues (Bug template, see §3) — primary defect channel;
+  - GitHub Discussions — Q&A / usage / feedback;
+  - Mailing list (announcements: release / security / maintenance windows);
+- **Upgrade promise**: Beta users get the same N-1 in-place upgrade guarantee as GA; the rollback path is equally valid.
 
-## 3. 反馈机制(模板化)
+## 3. Feedback (templated)
 
-### 缺陷(Bug)模板必填字段
+### Bug template required fields
 
 ```text
-- FastS3 版本 / 内核版本 / 发行版 / 设备形态(裸盘|镜像文件)
-- 客户端 + 版本(aws cli|boto3|mc|rclone|s3cmd|其他)
-- 复现步骤(最小化) / 期望 vs 实际 / 相关日志与错误码
-- 影响定级(P0 数据丢失/服务不可用;P1 功能破损但可绕行;P2 体验/文档)
+- FastS3 version / kernel version / distro / device form (raw disk | image file)
+- Client + version (aws cli|boto3|mc|rclone|s3cmd|other)
+- Repro steps (minimal) / expected vs actual / related logs and error codes
+- Impact grade (P0 data loss/service down; P1 feature broken but workaround exists; P2 UX/docs)
 ```
 
-### 处理流程(SLO)
+### Handling process (SLO)
 
 ```text
-提交 → 分类定级(48h 内) → P0/P1:修复 ≤7 天发布 patch →
-   验证(回归 + 演练) → 通告(发布说明引用 issue)→ 关闭(附验证方式)
-P2/P3:进入 backlog,随 minor 发布
+Submit → classify and grade (within 48h) → P0/P1: fix ≤7 days, ship a patch →
+   verify (regression + drill) → announce (release notes cite the issue) → close (attach how it was verified)
+P2/P3: enter backlog, ship with a minor
 ```
 
-### 反馈闭环清单(评审时逐项核对)
+### Feedback closed-loop checklist (item-by-item at review)
 
-- [ ] 每条反馈有处置结论(修复/延期+理由/非缺陷+解释);
-- [ ] P0/P1 修复均带根因与验证方式;
-- [ ] 反馈聚合报告:类别(兼容/性能/文档/体验)、Top 问题、趋势;
-- [ ] 影响设计的反馈走 ADR 流程(TODO.md「使用约定」/ DESIGN.md §3.3)。
+- [ ] Every piece of feedback has a disposition (fix / defer + reason / not-a-bug + explanation);
+- [ ] Every P0/P1 fix has a root cause and a verification method;
+- [ ] Feedback aggregate report: categories (compat / perf / docs / UX), top issues, trend;
+- [ ] Feedback that affects design goes through the ADR process (TODO.md "usage conventions" / DESIGN.md §3.3).
 
-## 4. Beta 用户与退出条件(评审输入)
+## 4. Beta users and exit criteria (review inputs)
 
-- 用户数:≥ 10 位**真实使用 2 周**;使用证据 = 遥测同意用户的指标计数
-  (请求量)或访谈记录,不采纳注册即算;
-- 缺陷:P0/P1 = 0(修复发布口径);
-- NPS:≥ 30(问卷发全部参与用户,≤11 分制,赞成者比例 - 贬损者比例);
-- 文档覆盖率:按 §5 检查表 ≥ 95% 有内容、无占位符、命令可照做。
+- User count: ≥ 10 people with **real use for 2 weeks**; evidence of use = request counts from users who consented to telemetry
+  or interview notes; registration alone does not count;
+- Defects: P0/P1 = 0 (fix-shipped contract);
+- NPS: ≥ 30 (survey sent to all participating users, ≤11-point scale, promoters% − detractors%);
+- Docs coverage: per the §5 checklist, ≥ 95% has content, no placeholders, commands can be followed as written.
 
-## 5. 文档覆盖率检查表(评审用)
+## 5. Docs coverage checklist (for review)
 
-| 文档 | 内容 | 状态 |
+| Doc | Content | Status |
 | --- | --- | --- |
-| Quickstart | 5 分钟开箱,逐条可照做 | 草案 ✔ / 评审复核 |
-| Admin Guide | 运维闭环:健康/体检/密钥桶/监控/升级 | M7 交付 |
-| Tuning | 系统调优清单 + doctor --perf 核验 | M7 交付 |
-| Troubleshooting / FAQ | 常见问题 + 处置 | M7 交付 |
-| 备份/恢复 | 两层快照 + 演练脚本 | M7 交付 |
-| 迁移 | MinIO / 公有云脚本 + 指南 | M7 交付 |
-| API 参考 | admin / Node 管理面 / 错误码速查 | M7 交付 |
-| CLI 速查 | 全部命令(含 meta-export/import、--web-root) | M7 同步 |
-| 部署 | systemd / 容器(含多实例管理面) | 已交付 |
+| Quickstart | 5-minute out of the box, each step followable | draft ✔ / review |
+| Admin Guide | Ops loop: health / doctor / keys-buckets / monitor / upgrade | M7 delivered |
+| Tuning | System tuning checklist + doctor --perf verify | M7 delivered |
+| Troubleshooting / FAQ | Common issues + handling | M7 delivered |
+| Backup / restore | Two-layer snapshot + drill script | M7 delivered |
+| Migration | MinIO / public-cloud scripts + guide | M7 delivered |
+| API reference | admin / Node management plane / error-code quick reference | M7 delivered |
+| CLI quick reference | All commands (including meta-export/import, --web-root) | M7 in sync |
+| Deployment | systemd / containers (including multi-instance management plane) | delivered |
 
-检查方式:mint doc 检查 = 页面存在 + 无「占位/待补/TODO」残留 +
-关键命令在空白环境演练通过(复用 vm-drill / backup-drill 脚本)。
+How to check: mint doc check = page exists + no leftover "placeholder / TBD / TODO" +
+key commands drill successfully in a blank environment (reuse vm-drill / backup-drill scripts).
 
-## 6. 评审会议议程(第 24 周)
+## 6. Review meeting agenda (week 24)
 
-1. 数据:用户数/使用周数、NPS、缺陷收敛曲线、性能门禁 CI 结果;
-2. 文档覆盖率检查表逐项复核;
-3. 遗留 P0/P1 清单(若有)→ Go/No-Go 结论;
-4. Go → RC1(全矩阵回归 + 外部安全审计,进入 M8);
-5. 评审纪要归档到 docs/beta/review-<date>.md。
+1. Data: user count / weeks of use, NPS, defect-convergence curve, perf-gate CI results;
+2. Docs coverage checklist item-by-item;
+3. Remaining P0/P1 list (if any) → Go/No-Go;
+4. Go → RC1 (full-matrix regression + external security audit, enter M8);
+5. Review minutes archived to docs/beta/review-<date>.md.
 
-相关：[文档首页](../index.md) 与仓库 `docs/ROADMAP.md`；缺陷处置动作
-看[故障排查](../operations/troubleshooting.md)。
+Related: [docs home](../index.md) and repository `docs/ROADMAP.md`; defect-handling actions
+in [Troubleshooting](../operations/troubleshooting.md).
