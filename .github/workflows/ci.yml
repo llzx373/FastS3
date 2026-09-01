@@ -150,8 +150,16 @@ jobs:
         run: |
           truncate -s 64M /tmp/ci-doctor.img
           printf '[storage]\ndevices = ["/tmp/ci-doctor.img"]\nmeta_dir = "/tmp/ci-doctor-meta"\n' > /tmp/ci-doctor.toml
+          set +e
           ./target/release/fasts3d doctor --config /tmp/ci-doctor.toml
-        continue-on-error: true # 未初始化设备预期 fatal(exit 1);仅验证命令可运行
+          code=$?
+          set -e
+          if [ "$code" -eq 1 ]; then
+            echo "uninitialized device: fatal as expected"
+            exit 0
+          fi
+          echo "expected exit 1, got $code"
+          exit 1
 
   pnpm-workspace:
     name: pnpm workspace (lockfile frozen)

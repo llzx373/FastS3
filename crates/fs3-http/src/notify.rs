@@ -1330,7 +1330,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let got = Arc::new(std::sync::Mutex::new(0u16));
         let got2 = got.clone();
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
             };
@@ -1351,6 +1351,7 @@ mod tests {
                 Duration::from_secs(5),
             )
             .unwrap();
+        let _ = handle.join();
         assert_eq!(code, 200);
         assert_eq!(*got.lock().unwrap(), 200);
     }
