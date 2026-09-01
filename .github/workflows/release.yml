@@ -99,7 +99,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install build deps (rpm-build + Rust + rocksdb 构建依赖)
-        run: dnf install -y rpm-build gcc-c++ clang rust cargo
+        run: dnf install -y rpm-build gcc-c++ clang rust cargo systemd systemd-rpm-macros
       - name: Build fasts3d (release, inside rocky container)
         run: cargo build --release -p fs3d
       - name: Build rpm (含 tarball Source0)
