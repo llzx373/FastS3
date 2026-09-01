@@ -2201,6 +2201,12 @@ mod tests {
             devices: vec![img],
             meta_dir: dir.join("meta"),
             repl_binlog,
+            // 后台 compaction 默认开(500ms):会与 compact_once 断言竞态,
+            // CI 上常把碎 extent 先压掉。复制口测试一律前台触发。
+            compaction: fs3_engine::CompactionConfig {
+                enabled: false,
+                ..Default::default()
+            },
             ..Default::default()
         };
         Arc::new(RwLock::new(Engine::open(&cfg).unwrap()))
