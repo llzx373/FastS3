@@ -167,13 +167,21 @@ impl WebhookSender for SimpleWebhookSender {
         timeout: Duration,
     ) -> Result<u16, String> {
         let (https, host, port, path) = parse_webhook_url(url)?;
-        let addr = (host.as_str(), port)
+        let mut addr = (host.as_str(), port)
             .to_socket_addrs()
-            .map_err(|e| format!("resolve {host}:{port}: {e}"))?
-            .next()
-            .ok_or_else(|| format!("no address for {host}:{port}"))?;
-        let tcp = std::net::TcpStream::connect_timeout(&addr, timeout)
-            .map_err(|e| format!("connect {url}: {e}"))?;
+            .map_err(|e| format!("resolve {host}:{port}: {e}"))?;
+        let mut last_err = "no address".to_string();
+        let tcp = addr
+            .find_map(
+                |sa| match std::net::TcpStream::connect_timeout(&sa, timeout) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        last_err = e.to_string();
+                        None
+                    }
+                },
+            )
+            .ok_or_else(|| format!("connect {url}: {last_err}"))?;
         tcp.set_read_timeout(Some(timeout))
             .map_err(|e| format!("set read timeout: {e}"))?;
         tcp.set_write_timeout(Some(timeout))
@@ -1179,7 +1187,9 @@ mod tests {
     #[test]
     fn webhook_https_posts_signed_body() {
         crate::tls::ensure_provider();
-        let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
+                .unwrap();
         let cert_der = certified.cert.der().clone();
         let key_der =
             rustls::pki_types::PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der());
@@ -1262,7 +1272,7 @@ mod tests {
             );
         });
 
-        let hook = format!("https://localhost:{}/hooks", addr.port());
+        let hook = format!("https://127.0.0.1:{}/hooks", addr.port());
         let rule = fs3_core::NotificationRule {
             id: "rule-https".into(),
             events: vec!["s3:ObjectCreated:*".into()],
