@@ -89,16 +89,21 @@ else
     bad "cargo clippy -D warnings"
 fi
 
-if cargo test --workspace > "$WORK/cargo-test.log" 2>&1; then
+# GitHub 上 rust-stable 已经 cargo test --workspace;此处再跑会与
+# admin_api 进程退出时的 C++ 析构(pure virtual / SIGABRT)偶发撞车。
+if [ -n "${GITHUB_ACTIONS:-}" ]; then
+    skip "cargo test --workspace(由 CI rust-stable 承担)"
+elif cargo test --workspace > "$WORK/cargo-test.log" 2>&1; then
     ok "cargo test --workspace"
 else
     bad "cargo test --workspace"
-    grep -E '^test .* FAILED$|failures:' "$WORK/cargo-test.log" | tail -40 | sed 's/^/      | /'
+    grep -E '^test .* FAILED$|failures:|SIGABRT|pure virtual' "$WORK/cargo-test.log" | tail -40 | sed 's/^/      | /'
     if [ -n "${GITHUB_ACTIONS:-}" ]; then
         grep -E '^test .* FAILED$' "$WORK/cargo-test.log" | while IFS= read -r line; do
             echo "::error title=cargo test::$line"
         done
     fi
+    cp "$WORK/cargo-test.log" "$ROOT/cargo-test.log" 2>/dev/null || true
 fi
 
 # cargo audit:优先本地缓存库(离线确定性),无缓存再联网刷新
