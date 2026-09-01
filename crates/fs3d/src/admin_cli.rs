@@ -191,8 +191,31 @@ mod tests {
         let body = body.to_string();
         thread::spawn(move || {
             let (mut s, _) = l.accept().unwrap();
-            let mut buf = [0u8; 4096];
-            let _ = s.read(&mut buf);
+            // 读完请求(含 POST body)再应答,避免客户端还在写时 RST
+            let mut acc = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = match s.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                acc.extend_from_slice(&buf[..n]);
+                let Some(i) = acc.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&acc[..i]);
+                let clen: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse().ok())
+                    })
+                    .unwrap_or(0);
+                if acc.len() >= i + 4 + clen {
+                    break;
+                }
+            }
             let payload = format!(
                 "HTTP/1.1 {status} OK\r\ncontent-type: application/json\r\n\
                  content-length: {}\r\nconnection: close\r\n\r\n{body}",
