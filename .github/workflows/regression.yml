@@ -47,7 +47,7 @@ jobs:
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked || true
+        run: cargo install cargo-audit --locked
       - name: Build (release)
         run: cargo build --release -p fs3d
       - name: Setup clients (mc/rclone/aws)

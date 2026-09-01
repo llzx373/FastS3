@@ -65,9 +65,9 @@ jobs:
         run: cargo build --release -p fs3d
 
       - name: cargo audit (依赖漏洞清零门禁)
-        uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
 
   rust-nightly:
     name: Rust (nightly) build+test
