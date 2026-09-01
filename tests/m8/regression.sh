@@ -55,7 +55,12 @@ trap cleanup EXIT
 
 step() { echo; echo "═══ [$1] $2 ═══"; }
 ok()   { PASS=$((PASS + 1)); summary+=("PASS  $1"); echo "    ✓ $1"; }
-bad()  { FAIL=$((FAIL + 1)); summary+=("FAIL  $1"); echo "    ✗ $1"; }
+bad()  {
+    FAIL=$((FAIL + 1)); summary+=("FAIL  $1"); echo "    ✗ $1"
+    if [ -n "${GITHUB_ACTIONS:-}" ]; then
+        echo "::error title=M8 regression::$1"
+    fi
+}
 skip() { SKIP=$((SKIP + 1)); summary+=("SKIP  $1"); echo "    - $1 (skip)"; }
 
 finish_report() {

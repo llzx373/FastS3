@@ -48,6 +48,9 @@ jobs:
           cache-dependency-path: web/pnpm-lock.yaml
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
+      - name: Install web deps
+        run: pnpm install --frozen-lockfile
+        working-directory: web
       - name: Build (release)
         run: cargo build --release -p fs3d
       - name: Setup clients (mc/rclone/aws)
@@ -70,7 +73,16 @@ jobs:
             echo "args=" >> $GITHUB_OUTPUT
           fi
       - name: Run M8 regression
-        run: bash tests/m8/regression.sh ${{ steps.mode.outputs.args }} --rounds 200
+        run: |
+          set -o pipefail
+          bash tests/m8/regression.sh ${{ steps.mode.outputs.args }} --rounds 200 2>&1 | tee regression.log
         env:
           CLIENTS_DIR: /tmp/clients
           S3TESTS_DIR: /tmp/s3-tests
+      - name: Upload regression log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m8-regression-log
+          path: regression.log
+          if-no-files-found: ignore
