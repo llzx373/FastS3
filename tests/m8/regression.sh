@@ -84,10 +84,16 @@ else
     bad "cargo clippy -D warnings"
 fi
 
-if cargo test --workspace >/dev/null 2>&1; then
+if cargo test --workspace > "$WORK/cargo-test.log" 2>&1; then
     ok "cargo test --workspace"
 else
     bad "cargo test --workspace"
+    grep -E '^test .* FAILED$|failures:' "$WORK/cargo-test.log" | tail -40 | sed 's/^/      | /'
+    if [ -n "${GITHUB_ACTIONS:-}" ]; then
+        grep -E '^test .* FAILED$' "$WORK/cargo-test.log" | while IFS= read -r line; do
+            echo "::error title=cargo test::$line"
+        done
+    fi
 fi
 
 # cargo audit:优先本地缓存库(离线确定性),无缓存再联网刷新

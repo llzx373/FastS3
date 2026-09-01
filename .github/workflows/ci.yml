@@ -34,7 +34,32 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: test
-        run: cargo test --workspace
+        id: cargo-test
+        run: |
+          set -o pipefail
+          rustc --version
+          cargo test --workspace --no-fail-fast 2>&1 | tee cargo-test.log
+
+      - name: Report failed tests
+        if: failure() && steps.cargo-test.outcome == 'failure'
+        run: |
+          {
+            echo '### cargo test failures'
+            echo '```'
+            grep -E '^test .* FAILED$|^error:|failures:' cargo-test.log | tail -120 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          grep -E '^test .* FAILED$' cargo-test.log | while IFS= read -r line; do
+            echo "::error title=cargo test::$line"
+          done
+
+      - name: Upload test log
+        if: failure() && steps.cargo-test.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-test-log-stable
+          path: cargo-test.log
+          if-no-files-found: ignore
 
       - name: release build
         run: cargo build --release -p fs3d
@@ -57,7 +82,23 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - name: test
-        run: cargo test --workspace
+        run: |
+          set -o pipefail
+          rustc --version
+          cargo test --workspace --no-fail-fast 2>&1 | tee cargo-test.log
+      - name: Report failed tests
+        if: failure()
+        run: |
+          grep -E '^test .* FAILED$' cargo-test.log | while IFS= read -r line; do
+            echo "::error title=cargo test nightly::$line"
+          done
+      - name: Upload test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-test-log-nightly
+          path: cargo-test.log
+          if-no-files-found: ignore
       - name: build
         run: cargo build --release
 
