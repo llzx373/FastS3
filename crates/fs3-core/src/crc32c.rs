@@ -32,24 +32,22 @@ fn build_table() -> [u32; 256] {
 unsafe fn crc32c_hw(data: &[u8], seed: u32) -> u32 {
     use std::arch::x86_64::*;
     let mut crc = seed;
-    let mut chunks = data.chunks_exact(8);
-    for c in &mut chunks {
-        let v = u64::from_le_bytes(c.try_into().unwrap());
+    let (chunks8, rest) = data.as_chunks::<8>();
+    for c in chunks8 {
+        let v = u64::from_le_bytes(*c);
         crc = _mm_crc32_u64(crc as u64, v) as u32;
     }
-    let mut rest = chunks.remainder();
-    let mut it = rest.chunks_exact(4);
-    for c in &mut it {
-        let v = u32::from_le_bytes(c.try_into().unwrap());
+    let (chunks4, rest) = rest.as_chunks::<4>();
+    for c in chunks4 {
+        let v = u32::from_le_bytes(*c);
         crc = _mm_crc32_u32(crc, v);
     }
-    rest = it.remainder();
-    let mut it = rest.chunks_exact(2);
-    for c in &mut it {
-        let v = u16::from_le_bytes(c.try_into().unwrap());
+    let (chunks2, rest) = rest.as_chunks::<2>();
+    for c in chunks2 {
+        let v = u16::from_le_bytes(*c);
         crc = _mm_crc32_u16(crc, v);
     }
-    for &b in it.remainder() {
+    for &b in rest {
         crc = _mm_crc32_u8(crc, b);
     }
     crc

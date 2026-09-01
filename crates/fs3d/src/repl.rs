@@ -1866,6 +1866,7 @@ pub(crate) fn slot_lag_parts(
 }
 
 /// 读 JSON 请求体(有界;超限/IO/解析失败 = 400)。
+#[allow(clippy::result_large_err)] // Err 即 HTTP 400 响应,装箱无收益
 async fn read_json_body<T: for<'de> Deserialize<'de>>(
     req: Request<Incoming>,
     cap: usize,
@@ -2116,8 +2117,10 @@ pub(crate) fn subject_cn_from_der(der: &[u8]) -> Option<String> {
                 0x0C | 0x13 | 0x16 | 0x14 => Some(String::from_utf8_lossy(raw).into_owned()),
                 0x1E => {
                     let units: Vec<u16> = raw
-                        .chunks_exact(2)
-                        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|c| u16::from_be_bytes(*c))
                         .collect();
                     Some(String::from_utf16_lossy(&units))
                 }
