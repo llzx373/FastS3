@@ -12,6 +12,9 @@
 # 构建环境:Rocky/Alma 9 等 rpm 系(装 rpm-build;真机机构建见 build-rpm.sh 注释)。
 # 校验 spec 语法(无需环境): rpmspec -P fasts3.spec
 
+# 预构建/strip 后的 Rust 二进制没有 rpm debugsource;关掉 debuginfo 子包。
+%global debug_package %{nil}
+
 Name:           fasts3
 Version:        1.0.0
 Release:        1%{?dist}

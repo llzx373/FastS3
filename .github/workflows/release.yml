@@ -94,14 +94,24 @@ jobs:
 
   rpm-amd64:
     name: rpm amd64 (rockylinux:9)
+    needs: [build-linux-amd64]
     runs-on: ubuntu-latest
     container: rockylinux:9
     steps:
       - uses: actions/checkout@v4
-      - name: Install build deps (rpm-build + Rust + rocksdb 构建依赖)
-        run: dnf install -y rpm-build gcc-c++ clang rust cargo systemd systemd-rpm-macros
-      - name: Build fasts3d (release, inside rocky container)
-        run: cargo build --release -p fs3d
+      - name: Install rpm-build
+        run: dnf install -y rpm-build systemd systemd-rpm-macros
+      - name: Download amd64 tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: pkg-amd64
+          path: /tmp/pkg-amd64
+      - name: Stage Source0 tarball
+        run: |
+          set -euo pipefail
+          mkdir -p tools/package/dist
+          find /tmp/pkg-amd64 -name 'fasts3-*-linux-x86_64.tar.gz' -exec cp {} tools/package/dist/ \;
+          ls -la tools/package/dist
       - name: Build rpm (含 tarball Source0)
         run: tools/package/build-rpm.sh
       - name: Upload rpm artifact
