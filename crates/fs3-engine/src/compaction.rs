@@ -806,7 +806,8 @@ mod tests {
             !e.degraded(),
             "software-alignment I/O must not degrade the pool"
         );
-        for i in 1..3 {
+        // k0 已删,只核对其余活对象(k1/k2)的对齐与正文
+        for (i, body) in bodies.iter().enumerate().skip(1) {
             let m = e.head("b1", &format!("k{i}")).unwrap().unwrap();
             for s in &m.extents {
                 assert_eq!(
@@ -818,7 +819,7 @@ mod tests {
             let mut out = Vec::new();
             e.get_to("b1", &format!("k{i}"), 0..u64::MAX, &mut out)
                 .unwrap();
-            assert_eq!(out, bodies[i]);
+            assert_eq!(&out, body);
         }
         e.close().unwrap();
     }

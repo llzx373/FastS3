@@ -48,6 +48,9 @@ jobs:
     name: Rust (nightly) build+test
     runs-on: ubuntu-latest
     continue-on-error: true # nightly 轨道不承诺
+    env:
+      # 不继承 workflow 级 -D warnings:nightly lint 波动不应打红探测轨道
+      RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust nightly

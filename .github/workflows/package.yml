@@ -58,19 +58,35 @@ jobs:
       - name: Sign with dummy key (minisign, falls back to openssl ed25519)
         run: |
           set -euo pipefail
-          sudo apt-get update -qq && sudo apt-get install -y -qq minisign >/dev/null 2>&1 || true
-          if command -v minisign >/dev/null 2>&1; then
-            minisign -G -s /tmp/fasts3.key -p /tmp/fasts3.pub -W   # -W:无口令 dummy
+          dist=tools/package/dist
+          # 未匹配的 glob 保持字面量,下面的 -f 检查会报缺失
+          artifacts=("$dist"/fasts3-*.tar.gz "$dist"/SBOM.json "$dist"/fasts3_*.deb)
+          missing=0
+          for f in "${artifacts[@]}"; do
+            if [ ! -f "$f" ]; then
+              echo "error: 待签产物不存在: $f" >&2
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            ls -la "$dist" || true
+            exit 1
+          fi
+          # dummy 密钥只验证流水线;发布签名见 release.yml + MINISIGN_PRIVATE_KEY
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq minisign || true
+          signed_with=
+          if command -v minisign >/dev/null 2>&1 \
+             && printf '\n' | minisign -G -s /tmp/fasts3.key -p /tmp/fasts3.pub -W; then
+            signed_with=minisign
           else
             openssl genpkey -algorithm ED25519 -out /tmp/fasts3.key
             openssl pkey -in /tmp/fasts3.key -pubout -out /tmp/fasts3.pub
+            signed_with=openssl
           fi
-          tools/package/sign.sh /tmp/fasts3.key \
-            dist/fasts3-*.tar.gz \
-            dist/SBOM.json \
-            dist/fasts3_*.deb
-          cp /tmp/fasts3.pub dist/FASTS3_PUBKEY.pub   # 公开发钥随包(供校验)
-        working-directory: tools/package
+          echo "dummy key backend: $signed_with"
+          tools/package/sign.sh /tmp/fasts3.key "${artifacts[@]}"
+          cp /tmp/fasts3.pub "$dist/FASTS3_PUBKEY.pub"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
