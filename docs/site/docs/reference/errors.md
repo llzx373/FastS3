@@ -1,8 +1,7 @@
 # 错误码速查
 
-> M7/L3。三层错误码:①S3 协议(与 AWS 逐字节对齐,客户端 SDK 自动处理);
-> ②admin API(JSON `error.code`);③Node 管理 API(代理/业务码)。处置
-> 建议见[故障排查](../operations/troubleshooting.md)。
+三层：① S3 协议（与 AWS XML 对齐）；② admin API（JSON `error.code`）；
+③ Node 管理 API。处置建议见 [故障排查](../operations/troubleshooting.md)。
 
 ## 1. S3 错误码(协议层)
 

@@ -1,8 +1,7 @@
-# 安全基线(部署检查单)与 CVE 响应流程
+# 安全基线与 CVE 响应
 
-> GA §1.1 ④「默认安全基线 … 发布产物带签名与 SBOM;CVE 响应流程
-> (发现 → 修复 → 通告 ≤ 7 天)」。自审证据与外部审计范围见
-> `docs/ga/security-audit.md`。
+部署检查单、默认安全行为，以及漏洞披露后的响应口径（目标 ≤ 7 天通告）。
+自审与外部审计范围见仓库 `docs/ga/security-audit.md`。对外报告渠道见仓库根 `SECURITY.md`。
 
 ## 1. 默认安全基线(开箱即安全)
 
@@ -49,8 +48,9 @@
 | 通告 | 发布 patch 版本 + 公告(仓库 Security Advisories 优先;文档站同步);含受影响版本、缓解措施、升级指引 | ≤ 7 天 |
 | 收尾 | 漏洞用例入回归套件(防复发);审计日志复核;如有外部审计方,同步其复核 | 修复后 1 周内 |
 
-**联系渠道**:GitHub Security Advisory(私有报告)优先;issue 模板含
-「疑似安全缺陷」标记路径。外部安全审计计划见 GA 检查单 ④(docs/ga/checklist.md)。
+**联系渠道**：代码托管平台的私有漏洞报告优先；公开 Issue 不要贴利用细节。
+仓库根 `SECURITY.md` 与 [社区 · 安全披露](../community/security.md)。
+外部安全审计计划见 `docs/ga/checklist.md`。
 
 ## 4. 身份集成(ADR-28 DI6;LDAP 目录同步 + bind 登录 + OIDC 控制台 SSO)
 

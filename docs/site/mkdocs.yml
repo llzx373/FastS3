@@ -1,23 +1,14 @@
-# FastS3 用户文档站(与 workspace 版本对齐,现 v2.7.0)
-# 构建:pip install mkdocs && mkdocs build -f docs/site/mkdocs.yml
+# FastS3 用户文档
 
-site_name: "FastS3 文档"
-site_description: FastS3 单机高性能 S3 服务 —— 安装、部署、运维、参考(v2.7.0)
-site_url: https://example.com/fasts3/docs   # 占位:替换为真实文档站 URL
-repo_url: https://github.com/example/fasts3 # 占位:替换为真实仓库
-edit_uri: blob/main/docs/site/docs/
-copyright: FastS3 is licensed under the Apache License, Version 2.0. See LICENSE.
+# 构建: pip install mkdocs && mkdocs serve -f docs/site/mkdocs.yml
+# 公开托管后填写 site_url / repo_url（GitHub Pages 或任意静态站）。
 
-# 主题:readthedocs 占位(零依赖开箱);GA 前评估 material 换肤
-#   pip install mkdocs-material 后改 theme: name: material,
-#   并启用 features: navigation.tabs 等(见 M7)。
+site_name: FastS3
+site_description: Linux 单机高性能 S3 服务 — 安装、部署、运维与协议参考
+copyright: Licensed under the Apache License, Version 2.0.
+
 theme:
   name: readthedocs
-  # name: material
-  # features:
-  #   - navigation.tabs
-  #   - navigation.top
-  # palette: { scheme: default, primary: indigo }
 
 nav:
   - 首页: index.md
@@ -45,6 +36,9 @@ nav:
       - Node 管理 API 参考: reference/web-api.md
       - 错误码速查: reference/errors.md
       - 兼容性矩阵: reference/compat.md
+  - 社区:
+      - 如何贡献: community/contributing.md
+      - 安全披露: community/security.md
   - 发布:
       - v1.0.0 GA 公告(历史): release/v1.0.0.md
   - Beta:
@@ -56,7 +50,3 @@ markdown_extensions:
   - toc:
       permalink: true
   - fenced_code
-
-# 发布(占位):完整站点托管在 M7 定稿(静态导出 + CI 发布):
-#   pip install mkdocs && mkdocs build -f docs/site/mkdocs.yml
-#   → docs/site/site/(静态产物,可托管到任意静态站)

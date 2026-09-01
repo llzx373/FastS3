@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
   pull_request:
-    branches: [main]
+    branches: [main, master]
   schedule:
     # 每夜构建轨道(ROADMAP §3.1:nightly 不承诺)
     - cron: "0 2 * * *"

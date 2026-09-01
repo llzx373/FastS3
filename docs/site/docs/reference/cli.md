@@ -1,7 +1,6 @@
 # fasts3d 命令速查
 
-> 以当前实际命令为准(读 `crates/fs3d/src/main.rs`);v0.7 已含交互 init 向导
-> 与 `upgrade` 迁移命令。
+以当前二进制为准（`crates/fs3d/src/main.rs`）。全局选项对所有子命令生效：
 
 全局选项(对所有子命令生效):
 

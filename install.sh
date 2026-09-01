@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# FastS3 一键安装脚本(M6/A5「一条命令安装」形态 1)。
+# FastS3 一键安装脚本：从自建制品仓库拉取 tarball 并装到 /opt/fasts3。
 #
-#   用法:curl -fsSL https://download.example.com/fasts3/install.sh | sh
+#   FASTS3_BASE_URL=https://your.mirror/fasts3 ./install.sh
+#   # 或: curl -fsSL https://your.mirror/fasts3/install.sh | FASTS3_BASE_URL=... sh
 #
-#   ⚠️ 请把上面的 download.example.com 替换为真实发布宿主(本仓库所有
-#      example.com 均为占位)。脚本默认从 $FASTS3_BASE_URL 下载 tarball。
+# 没有公开下载站时，请用源码构建、Docker Compose，或先在本仓库运行
+# tools/package/build-tarball.sh 再把 dist/ 拷到目标机。
 #
 # 行为:
 #   1. 探测 OS(/etc/os-release:debian/ubuntu → deb 路径提示;rhel/fedora/
@@ -21,8 +22,8 @@
 #   --no-systemd               不写 systemd 单元(容器/无 systemd 用)
 #   --no-start                 安装后不尝试启动(默认仅打印启动指引)
 #   --dry-run                  只打印将执行的动作,不落盘(无 root 亦可跑)
-#   FASTS3_BASE_URL            发布宿主(默认 https://download.example.com/fasts3)
-#   FASTS3_VERSION             版本(默认读 Cargo.toml workspace version,M8 单一事实源)
+#   FASTS3_BASE_URL            制品 HTTPS 根（下载 tarball 时必填）
+#   FASTS3_VERSION             版本(默认读 Cargo.toml workspace version)
 #   INSTALL_ROOT               测试用假根(所有路径前加前缀,勿在生产使用)
 #
 # 仅依赖标准工具:curl 或 wget、tar、sed、id(uname/grep 随系统)。
@@ -30,8 +31,7 @@
 set -euo pipefail
 
 # ── 默认与解析 ────────────────────────────────────────────────────────────
-# 占位宿主:发布后替换为真实下载站(如 https://get.fasts3.dev/fasts3)
-BASE_URL="${FASTS3_BASE_URL:-https://download.example.com/fasts3}"
+BASE_URL="${FASTS3_BASE_URL:-}"
 WORKSPACE_VERSION="$(grep -m1 '^version' "$(dirname "$0")/Cargo.toml" 2>/dev/null | awk '{print $3}' | tr -d '"')"
 if [ -z "${FASTS3_VERSION:-}" ]; then VERSION="${WORKSPACE_VERSION:-0.0.0}"; else VERSION="$FASTS3_VERSION"; fi
 PREFIX="/opt/fasts3"
@@ -106,6 +106,14 @@ else
 fi
 
 # ── 下载与直装(tar.gz → PREFIX)───────────────────────────────────────────
+if [ -z "$BASE_URL" ]; then
+    cat >&2 <<EOF
+error: 未设置 FASTS3_BASE_URL，无法下载制品。
+  示例: FASTS3_BASE_URL=https://your.mirror/fasts3 $0
+  没有制品仓库时请从源码构建，或 docker compose -f deploy/container/docker-compose.yml up
+EOF
+    exit 1
+fi
 PKG="fasts3-$VERSION-linux-$TAR_ARCH"
 URL="$BASE_URL/$PKG.tar.gz"
 TARBALL="/tmp/$PKG.tar.gz"

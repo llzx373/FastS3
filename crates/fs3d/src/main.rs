@@ -1,4 +1,4 @@
-//! fasts3d 入口(M0 引擎 PoC + M1 S3 协议层;M6 init 向导/upgrade/优雅停机)。
+//! fasts3d：FastS3 Linux 单机 S3 服务入口（init / serve / check / doctor / replication / …）。
 //!
 //! 命令:init / put / get / del / ls / check / checkpoint / bench / serve /
 //! upgrade / doctor / compact / loadgen / stress。
@@ -51,7 +51,7 @@ static LOG_RELOAD: std::sync::OnceLock<
 #[command(
     name = "fasts3d",
     version,
-    about = "FastS3 数据面(M0 引擎 PoC):裸设备/镜像文件 PUT/GET 全链路"
+    about = "FastS3: Linux 单机 S3 服务（裸块设备或磁盘镜像，io_uring + O_DIRECT）"
 )]
 struct Cli {
     /// 配置文件(fasts3.toml);命令行参数优先

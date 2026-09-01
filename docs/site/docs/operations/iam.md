@@ -1,9 +1,8 @@
-# IAM 多租户运维指南
+# IAM 多租户运维
 
-> M18/C3(ADR-28)。面向从 MinIO 迁移运维习惯的团队:MinIO `mc admin`
-> 概念 → FastS3 控制台/API 对照、生产「root 只引导」清单。协议级裁决
-> (命名、错误码、租户边界、会话语义)一律以
-> [兼容性矩阵 · IAM 多租户节](../reference/compat.md)为准,本页不重复。
+面向从 MinIO 迁过来的团队：概念对照（User / Group / Policy / Service Account）
+走控制台、REST 或 `fasts3d iam`，**不是** `mc admin` 线协议。
+协议级裁决见 [兼容性矩阵 · IAM](../reference/compat.md)。
 
 ## 1. 红线:`mc admin` 二进制不受支持
 

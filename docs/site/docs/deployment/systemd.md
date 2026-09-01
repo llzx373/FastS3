@@ -1,6 +1,7 @@
-# systemd 部署(M6/K2)
+# systemd 部署
 
-源文件:`deploy/systemd/`(安装脚本 `install-systemd.sh` + 两个加固单元)。
+源文件：`deploy/systemd/`（`install-systemd.sh` + 两个加固单元）。
+容器路径见 [容器部署](container.md)。
 
 ## 架构
 

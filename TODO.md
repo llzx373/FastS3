@@ -1,5 +1,8 @@
 # FastS3 实现 TODO 清单(v2.7+ 主备复制)
 
+> **给外部贡献者**：请先读仓库根 [README.md](./README.md) 与
+> [CONTRIBUTING.md](./CONTRIBUTING.md)。本文件是内部执行勾选，不是产品说明书。
+>
 > 依据:用户诉求(类 MySQL 主备:**读写分离 + 高可用切换**,加密走 KMS、信道走 SSL)
 > → 设计稿 [docs/replication-design.md](./docs/replication-design.md) v1→v3 两轮评审
 > (2026-08-30):v2 并入范围五点(仅异步;一主多备/桶级/复制槽/级联/GTID;缺数据等待;

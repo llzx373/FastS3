@@ -20,8 +20,6 @@ LimitNOFILE=131072,见下);
 
 [Unit]
 Description=FastS3 数据面(S3 协议 + 裸盘引擎,io_uring/O_DIRECT)
-# 占位:替换为真实仓库/文档 URL(systemd 单元不支持行内注释,URL 独占一行)
-Documentation=https://github.com/example/fasts3
 # 等待网络就绪后再启动(管理面依赖数据面的 unix socket / TCP admin)
 Wants=network-online.target
 After=network-online.target

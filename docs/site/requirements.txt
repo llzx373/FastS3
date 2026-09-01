@@ -1,0 +1,3 @@
+# mkdocs
+# 用户文档站。构建：mkdocs build -f docs/site/mkdocs.yml
+mkdocs>=1.6,<2

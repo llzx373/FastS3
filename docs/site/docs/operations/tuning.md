@@ -1,8 +1,8 @@
-# 性能调优(Tuning)
+# 性能调优
 
-> M7/L2。把单块 NVMe 的能力榨到接近裸盘基线(fio)的系统级清单。配套脚本:
-> `deploy/tuning/setup-irq-affinity.sh`、`deploy/tuning/setup-nvme.sh`;
-> 一键核验:`fasts3d doctor`(含调优项)。里程碑性能数据见 `docs/perf-M5.md`。
+把单块 NVMe 榨到接近裸盘基线（fio）的系统级清单。
+脚本：`deploy/tuning/setup-irq-affinity.sh`、`deploy/tuning/setup-nvme.sh`。
+核验：`fasts3d doctor`。版本基准见 `docs/perf-*.md`。
 
 ## 1. 先做测量
 
@@ -109,4 +109,4 @@ group_commit_ms = 50       # 窗口越大吞吐越高,崩溃丢失窗口越大
 - `degraded=true`:设备 I/O 故障只读降级,立即处理;
 - 时钟回拨告警:影响 SigV4 时间窗与时间戳(处理:同步 NTP/chrony)。
 
-详见 [故障排查](troubleshooting.md) 与仓库 [docs/DESIGN.md](https://github.com/example/fasts3/blob/main/docs/DESIGN.md) §6 性能方案。
+详见 [故障排查](troubleshooting.md) 与仓库 `docs/DESIGN.md` §6 性能方案。

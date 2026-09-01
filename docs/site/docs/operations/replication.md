@@ -1,9 +1,9 @@
 # 主备复制运维
 
-> M21 / ADR-33。实例级异步复制(binlog + GTID + 复制槽),一主多备或级联。
-> **不是** AWS `PUT Bucket replication` XML——该 S3 子资源维持 **501
-> NotImplemented**(定位,见 [兼容性矩阵](../reference/compat.md))。
-> 设计细节见仓库 `docs/replication-design.md`;本页只写日常操作。
+实例级异步复制（binlog + GTID + 复制槽），一主多备或级联。
+**不是** AWS `PUT Bucket replication` XML——该子资源维持 **501**
+（见 [兼容性矩阵](../reference/compat.md)）。
+设计见仓库 `docs/replication-design.md`；本页只写日常操作。
 
 ## 能力与边界
 

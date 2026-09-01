@@ -1,9 +1,8 @@
 # Node 管理 API 参考
 
-> Web 管理面(Fastify)`/api/*`;除 login / OIDC discovery / bootstrap / health
-> 外均需 `Authorization: Bearer <jwt>`。授权走 IAM `admin:*`(JWT 只证明身份,
-> 见 [IAM 运维](../operations/iam.md))。管理面无状态,权威状态在 Rust admin
-> 通道或 S3 数据面。大对象**永不经过 Node**(预签名直连)。
+Fastify `/api/*`。除 login / OIDC discovery / bootstrap / health 外均需
+`Authorization: Bearer <jwt>`。授权走 IAM `admin:*`（见 [IAM 运维](../operations/iam.md)）。
+管理面无状态；大对象**永不经过 Node**（预签名直连数据面）。
 
 ## 会话与健康
 

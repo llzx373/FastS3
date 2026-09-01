@@ -1,9 +1,9 @@
 # admin API 参考
 
-> M7/L3。Rust 数据面管理通道(`fasts3d serve --admin-listen ...`),JSON
-> over HTTP;除健康检查外全部端点要求 `Authorization: Bearer <token>`。
-> 传输:unix socket(0600)或 TCP 回环。版本前缀 `/v1/admin/`。
-> WebSocket:`ws://<admin>/v1/admin/ws?token=`(仅 TCP 形态)。
+Rust 数据面管理通道（`fasts3d serve --admin-listen …`），JSON over HTTP。
+除健康检查外全部端点要求 `Authorization: Bearer <token>`。
+传输：unix socket（0600）或 TCP 回环。前缀 `/v1/admin/`。
+WebSocket：`ws://<admin>/v1/admin/ws?token=`（仅 TCP）。
 
 ## 认证与通用约定
 

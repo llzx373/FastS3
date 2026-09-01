@@ -17,7 +17,8 @@ Version:        1.0.0
 Release:        1%{?dist}
 Summary:        FastS3 单机高性能 S3 服务(io_uring/O_DIRECT 数据面 + Node 管理面)
 License:        Apache-2.0
-URL:            https://example.com/fasts3       # 占位:发布后替换真实站点
+# 公开主页就绪后: rpmbuild --define '_fasts3_url https://...'
+%{?_fasts3_url:URL: %{_fasts3_url}}
 Source0:        %{name}-%{version}-linux-%{_arch}.tar.gz
 
 # 二进制依赖:glibc ≥ 2.31(与 deb Depends 对齐);systemd 提供单元注册

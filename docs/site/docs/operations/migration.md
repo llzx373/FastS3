@@ -1,9 +1,7 @@
-# 迁移指南与脚本(minio → FastS3 / 公有云 → FastS3)
+# 迁移指南（MinIO / 公有云 → FastS3）
 
-> M19/M(ADR-24):除下述客户端 mirror 路径外,FastS3 现提供**保 LastModified
-> 的迁入向导**(控制台「迁入」页 / admin `/v1/admin/ingest/jobs`)。
-> `mc mirror`/rclone 在 S3 目标上无法还原源 LastModified;对账/合规场景
-> 请用向导任务。
+除客户端 mirror 外，控制台「迁入」向导可保留源 LastModified
+（admin `/v1/admin/ingest/jobs`）。`mc mirror` / rclone 作为 S3 目标时无法还原源 mtime。
 
 ## 0. 保 mtime 迁入向导(M19;ADR-24)
 

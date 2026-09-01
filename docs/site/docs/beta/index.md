@@ -85,5 +85,5 @@ P2/P3:进入 backlog,随 minor 发布
 4. Go → RC1(全矩阵回归 + 外部安全审计,进入 M8);
 5. 评审纪要归档到 docs/beta/review-<date>.md。
 
-相关:[M7 门禁](../index.md)与仓库 [docs/ROADMAP.md](https://github.com/example/fasts3/blob/main/docs/ROADMAP.md)(外部链接);缺陷处置动作
+相关：[文档首页](../index.md) 与仓库 `docs/ROADMAP.md`；缺陷处置动作
 看[故障排查](../operations/troubleshooting.md)。

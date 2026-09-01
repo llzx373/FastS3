@@ -36,7 +36,7 @@ case "$(uname -m)" in
 esac
 
 MAINTAINER="${MAINTAINER:-FastS3 Project}"
-HOMEPAGE="${HOMEPAGE:-https://example.com/fasts3}"       # 占位:发布后替换真实站点
+HOMEPAGE="${HOMEPAGE:-}"
 DESCRIPTION="${DESCRIPTION:-FastS3 单机高性能 S3 服务(io_uring/O_DIRECT 数据面 + Node 管理面)}"
 
 echo "== fasts3 deb: version=$VERSION arch=$DEB_ARCH out=$OUTDIR"
@@ -75,6 +75,10 @@ done
 echo "  (布局: /usr/bin/fasts3d + units + /etc/fasts3/fasts3.example.toml)"
 
 # ── 3) 控制文件 ───────────────────────────────────────────────────────────
+# ── 3) 控制文件 ───────────────────────────────────────────────────────────
+HOMEPAGE_LINE=""
+[ -n "$HOMEPAGE" ] && HOMEPAGE_LINE="Homepage: $HOMEPAGE
+"
 cat > "$WORK/deb/DEBIAN/control" <<EOF
 Package: fasts3
 Version: $VERSION
@@ -84,13 +88,12 @@ Architecture: $DEB_ARCH
 Maintainer: $MAINTAINER
 Depends: libc6 (>= 2.31)
 Recommends: systemd
-Homepage: $HOMEPAGE
-Description: $DESCRIPTION
+${HOMEPAGE_LINE}Description: $DESCRIPTION
  FastS3 是面向裸块设备/磁盘镜像的单机高性能 S3 服务:io_uring + thread-per-core
  数据面(Rust)+ Node 管理面(Fastify + 控制台)。本包提供:
   - fasts3d:数据面二进制(含 fasts3 别名)与 systemd 单元;
   - 配置模板 /etc/fasts3/fasts3.example.toml;
-  - 升级/回滚 N-1 保证与 M6 门禁(5 分钟开箱)配套。
+  - 升级/回滚 N-1 保证与开箱路径配套。
 EOF
 
 # 附带的 share 内容(SBOM 等)已在 §2 放入 /usr/share/doc/fasts3/

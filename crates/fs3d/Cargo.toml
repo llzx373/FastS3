@@ -1,6 +1,6 @@
 [package]
 name = "fs3d"
-description = "FastS3 数据面入口(M0:CLI 形态的引擎 PoC)"
+description = "FastS3 S3 server (fasts3d): io_uring + O_DIRECT Linux object store"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

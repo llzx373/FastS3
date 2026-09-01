@@ -9,8 +9,6 @@
 
 [Unit]
 Description=FastS3 管理面(Node Fastify + Web 控制台)
-# 占位:替换为真实仓库/文档 URL(systemd 单元不支持行内注释,URL 独占一行)
-Documentation=https://github.com/example/fasts3
 After=fasts3.service network-online.target
 Wants=network-online.target
 

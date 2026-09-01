@@ -1,8 +1,7 @@
-# 容器部署(M17/T1–T3)
+# 容器部署
 
-源文件:`deploy/container/`(Dockerfile / entrypoint.sh /
-`docker-compose.yml` poc / `docker-compose.prod.yml` /
-.dockerignore / README.md);完整说明见该目录 README.md。
+源文件：`deploy/container/`（Dockerfile、entrypoint、compose）。
+完整说明也见该目录 `README.md`。
 
 ## 镜像内容与形态
 

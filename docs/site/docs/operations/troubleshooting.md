@@ -1,8 +1,7 @@
 # 故障排查与 FAQ
 
-> M7/L2。按「现象 → 定位 → 处置」组织;错误码速查见
-> [参考/错误码](../reference/errors.md)。排查第一动作:
-> `fasts3d doctor --config fasts3.toml` + `journalctl -u fasts3`。
+按「现象 → 定位 → 处置」组织。错误码见 [参考 / 错误码](../reference/errors.md)。
+第一步：`fasts3d doctor --config fasts3.toml` 与 `journalctl -u fasts3`。
 
 ## 1. 启动与部署
 

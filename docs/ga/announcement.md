@@ -18,9 +18,8 @@
 
 - 文档站(本仓库 docs/site)即官网主体:首页 / 快速开始 / 部署 / 运维 /
   参考 / Beta / 发布。mkdocs build 0 警告(本地实测)。
-- **待办(外部依赖,不虚拟完成)**:
-  - `mkdocs.yml` 中 `site_url` / `repo_url` 占位替换为真实域名与仓库
-    (index.md 徽章同);
-  - 静态站点托管(如 GitHub Pages / 任意静态托管)与域名配置;
-  - 下载根(install.sh 引用的产物 URL)上线。
+- **待办（外部依赖，不虚拟完成）**：
+  - 公开文档站：在 `docs/site/mkdocs.yml` 填入真实 `site_url` / `repo_url`（用户文档已不再使用 example.com 占位徽章）；
+  - 静态站点托管（GitHub Pages 等）；
+  - 下载根：设置 `FASTS3_BASE_URL` 后再对外提供 `install.sh`。
 - 以上完成后,本公告页与渠道清单即为「官网与发布公告」交付闭环。

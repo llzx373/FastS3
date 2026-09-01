@@ -1,8 +1,7 @@
-# 备份 / 恢复指南
+# 备份 / 恢复
 
-> M7/L5。FastS3 完整备份 = **元数据快照(meta-export)+ 底层卷快照**;
-> 恢复 = 先恢复卷数据、再导入元数据。配套演练:
-> `tests/backup/backup-restore-drill.sh`(全程自动化,建议每月跑)。
+完整备份 = **元数据快照（`meta-export`）+ 底层卷快照**。
+恢复 = 先恢复卷，再导入元数据。演练：`tests/backup/backup-restore-drill.sh`。
 
 ## 1. 为什么需要两层
 

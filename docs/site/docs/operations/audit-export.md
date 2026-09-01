@@ -1,8 +1,7 @@
 # 用审计导出代替 S3 Server Access Logging
 
-> M17/G2。等保与交接常点名「访问日志」。FastS3 **不实现** S3
-> `?logging` XML(Put/Get/DeleteBucketLogging → **501 NotImplemented**)。
-> 访问记录走已有审计环形 + **JSONL 导出文件**。
+等保与交接常点名「访问日志」。FastS3 **不实现** S3 `?logging` XML
+（Put/Get/DeleteBucketLogging → **501**）。访问记录走审计环形缓冲 + **JSONL 导出**。
 
 ## 为什么不做 Logging API
 

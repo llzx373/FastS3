@@ -39,32 +39,27 @@ cat dist/sha256sums
 minisign -Vm dist/fasts3-1.0.0-linux-x86_64.tar.gz -p fasts3.pub
 ```
 
-## 「一条命令安装」三种形态(README 承诺,ROADMAP §1.1)
+## 制品怎么装到机器上
 
-1. **curl | sh(tarball 直装,任何 Linux + systemd)**
+没有公网下载站时，在本仓库打出 `dist/` 再拷到目标机。试用请优先 Docker Compose 或从源码运行（见仓库 README）。
+
+1. **本机 tarball（`install.sh`）**
    ```bash
-   curl -fsSL https://download.example.com/fasts3/install.sh | sh
-   #   将 https://download.example.com/ 换成真实发布宿主(install.sh 的
-   #   FASTS3_BASE_URL 默认值,见仓库根 install.sh 顶部注释)
+   FASTS3_BASE_URL=https://your.mirror/fasts3 ./install.sh
+   # 或直接解压 dist/fasts3-<ver>-linux-<arch>.tar.gz
    ```
-2. **apt 本地/镜像仓库(Debian/Ubuntu)**
+2. **deb（Debian/Ubuntu）**
    ```bash
-   # 一次性:把 dist 目录做成 flat repo 并发布到内网镜像,或直接:
-   sudo dpkg -i dist/fasts3_1.0.0_amd64.deb    # 依赖 libc6,apt 会补
-   # 企业形态:发布到自有 apt 仓库(如 aptly/reprepro),客户端:
-   #   echo 'deb https://repo.example.com/fasts3 bookworm main' > /etc/apt/sources.list.d/fasts3.list
-   #   sudo apt update && sudo apt install fasts3
+   sudo dpkg -i dist/fasts3_*_amd64.deb
+   # 企业 apt 仓库：把 dist 做成 flat repo，客户端指向你们的 HTTPS 源
    ```
-3. **dnf/yum(Rocky/Alma/Fedora)**
+3. **rpm（Rocky/Alma/Fedora）**
    ```bash
-   # 一次性: sudo rpm -ivh dist/rpmbuild/RPMS/x86_64/fasts3-1.0.0-1.el9.x86_64.rpm
-   # 企业形态:发布到自有 yum 仓库(createrepo),客户端:
-   #   sudo dnf config-manager --add-repo https://repo.example.com/fasts3/fasts3.repo
-   #   sudo dnf install fasts3
+   sudo rpm -ivh dist/rpmbuild/RPMS/x86_64/fasts3-*.rpm
    ```
 
-> 仓库根 `install.sh` 是形态 1 的实现(OS/arch 探测 → 下载 → 直装到 /opt/fasts3
-> → 写 systemd 单元;并给出 apt/dnf、docker run 备选提示)。
+`install.sh` 会探测 OS/arch、下载 tarball、装到 `/opt/fasts3` 并写 systemd 单元。
+必须设置 `FASTS3_BASE_URL`；未设置时默认值只是历史占位，请求会失败。
 
 ## 产物结构与升级保证
 
@@ -78,7 +73,7 @@ minisign -Vm dist/fasts3-1.0.0-linux-x86_64.tar.gz -p fasts3.pub
 
 ## 版本号
 
-脚本 `FASTS3_VERSION` 缺省读 Cargo.toml workspace version(当前 1.0.0,单一事实源);
+脚本 `FASTS3_VERSION` 缺省读 Cargo.toml workspace version（当前以 workspace 为准，单一事实源）;
 升版时改 Cargo.toml 即可,CI/发布流水线统一传 `FASTS3_VERSION` 保持对齐(见
 .github/workflows/package.yml 与 release.yml)。
 

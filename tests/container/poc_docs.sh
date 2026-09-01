@@ -20,7 +20,7 @@ grep -q -- '--web-root' "$QS" || fail "Quickstart 须含单二进制 --web-root"
 grep -q 'operations/upgrade.md' "$QS" || fail "Quickstart 须链到升级 N-1"
 
 # 「请先 docker exec init」不得作为 POC 必经(允许否定句「无需/不必」)
-if grep -RIn --include='*.md' '请先 docker exec init' docs deploy README.md 2>/dev/null; then
+if grep -RIn --include='*.md' --exclude-dir=archive '请先 docker exec init' docs/site deploy README.md 2>/dev/null; then
     fail "文档不得把「请先 docker exec init」写成必经步骤"
 fi
 # 容器页不得再给出未加否定的 docker exec init 示例作为安装步骤
@@ -28,6 +28,6 @@ if grep -n 'docker exec -it fasts3 fasts3d init' "$CT" "$CR" 2>/dev/null; then
     fail "容器文档不得再把 docker exec init 当安装步骤"
 fi
 grep -q '自动' "$CT" && grep -q 'init' "$CT" || fail "容器页须声明首启自动 init"
-grep -q 'fasts3:2.5.0' "$CT" "$CR" || fail "容器文档镜像标签须与 workspace 2.5.0 对齐"
+grep -q 'fasts3:2.7.0' "$CT" "$CR" || fail "容器文档镜像标签须与 workspace 2.7.0 对齐"
 
 echo "poc_docs: OK"

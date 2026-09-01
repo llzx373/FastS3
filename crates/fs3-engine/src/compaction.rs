@@ -1329,7 +1329,7 @@ mod tests {
         );
     }
 
-    /// F9-3:README 当前状态含 M13–M16;不以「完整 S3」声称;Hadoop S3A 冒烟通过。
+    /// README 当前状态指向已发布版本与 CHANGELOG;不以「完整 S3」声称。
     #[test]
     fn readme_status_m13_m16_compat_caliber() {
         let readme = include_str!("../../../README.md");
@@ -1338,9 +1338,14 @@ mod tests {
             .nth(1)
             .and_then(|s| s.split("\n## ").next())
             .expect("README 当前状态");
-        for m in ["M13", "M14", "M15", "M16"] {
-            assert!(status.contains(m), "当前状态须含 {m}");
-        }
+        assert!(
+            status.contains("v2.7.0") && status.contains("M21"),
+            "当前状态须标明现行版本与最近里程碑"
+        );
+        assert!(
+            status.contains("CHANGELOG"),
+            "里程碑历史须指向 CHANGELOG 而非在 README 堆叠 M0–M21"
+        );
         let features = readme
             .split("## 特性")
             .nth(1)
