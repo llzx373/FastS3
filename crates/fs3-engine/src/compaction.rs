@@ -1331,39 +1331,58 @@ mod tests {
     }
 
     /// README 当前状态指向已发布版本与 CHANGELOG;不以「完整 S3」声称。
+    /// 用户文档默认英文(`README.md`);中文译本(`README.zh-CN.md`)须同步口径。
     #[test]
     fn readme_status_m13_m16_compat_caliber() {
-        let readme = include_str!("../../../README.md");
-        let status = readme
-            .split("## 当前状态")
-            .nth(1)
-            .and_then(|s| s.split("\n## ").next())
-            .expect("README 当前状态");
-        assert!(
-            status.contains("v2.7.0") && status.contains("M21"),
-            "当前状态须标明现行版本与最近里程碑"
-        );
-        assert!(
-            status.contains("CHANGELOG"),
-            "里程碑历史须指向 CHANGELOG 而非在 README 堆叠 M0–M21"
-        );
-        let features = readme
-            .split("## 特性")
-            .nth(1)
-            .and_then(|s| s.split("\n## ").next())
-            .expect("README 特性");
-        assert!(
-            !features.contains("完整 S3 语义"),
-            "特性节不得再以完整 S3 声称"
-        );
-        assert!(
-            features.contains("兼容矩阵") || features.contains("compat"),
-            "S3 口径须指向兼容矩阵"
-        );
-        assert!(
-            features.contains("Hadoop") && features.contains("冒烟"),
-            "Hadoop S3A 须记冒烟通过(M17/C1)"
-        );
+        for (label, body, status_h, features_h, smoke) in [
+            (
+                "README.md",
+                include_str!("../../../README.md"),
+                "## Status",
+                "## Features",
+                "smoke",
+            ),
+            (
+                "README.zh-CN.md",
+                include_str!("../../../README.zh-CN.md"),
+                "## 当前状态",
+                "## 特性",
+                "冒烟",
+            ),
+        ] {
+            let status = body
+                .split(status_h)
+                .nth(1)
+                .and_then(|s| s.split("\n## ").next())
+                .unwrap_or_else(|| panic!("{label} {status_h}"));
+            assert!(
+                status.contains("v2.7.0") && status.contains("M21"),
+                "{label} 当前状态须标明现行版本与最近里程碑"
+            );
+            assert!(
+                status.contains("CHANGELOG"),
+                "{label} 里程碑历史须指向 CHANGELOG 而非在 README 堆叠 M0–M21"
+            );
+            let features = body
+                .split(features_h)
+                .nth(1)
+                .and_then(|s| s.split("\n## ").next())
+                .unwrap_or_else(|| panic!("{label} {features_h}"));
+            assert!(
+                !features.contains("完整 S3 语义"),
+                "{label} 特性节不得再以完整 S3 声称"
+            );
+            assert!(
+                features.contains("兼容矩阵")
+                    || features.contains("compat")
+                    || features.contains("compatibility matrix"),
+                "{label} S3 口径须指向兼容矩阵"
+            );
+            assert!(
+                features.contains("Hadoop") && features.contains(smoke),
+                "{label} Hadoop S3A 须记冒烟通过(M17/C1)"
+            );
+        }
     }
 
     /// M17/C2:Spark/Trino 骨架无环境不得 exit 0;发行版钉死 3.5.3 / 476。
@@ -1453,20 +1472,32 @@ mod tests {
             v21.contains("勘误") && v21.contains("M16"),
             "v2.1 存储类「统一 STANDARD」须有被 M16 覆盖的勘误"
         );
-        let compat = include_str!("../../../docs/site/docs/reference/compat.md");
-        let notify = compat
-            .split("## 事件通知")
-            .nth(1)
-            .and_then(|s| s.split("\n## ").next())
-            .expect("compat 事件通知");
-        assert!(
-            notify.contains("https") && notify.contains("rustls"),
-            "compat Webhook 须声明 https 由 rustls 直连(F6-1),不得写成仅 http"
-        );
-        assert!(
-            !notify.contains("须前置 TLS 终结"),
-            "F6-1 已实现 HTTPS,compat 不得降级为前置终结器"
-        );
+        for (label, body, heading) in [
+            (
+                "compat.md",
+                include_str!("../../../docs/site/docs/reference/compat.md"),
+                "## Event notifications",
+            ),
+            (
+                "compat.zh.md",
+                include_str!("../../../docs/site/docs/reference/compat.zh.md"),
+                "## 事件通知",
+            ),
+        ] {
+            let notify = body
+                .split(heading)
+                .nth(1)
+                .and_then(|s| s.split("\n## ").next())
+                .unwrap_or_else(|| panic!("{label} {heading}"));
+            assert!(
+                notify.contains("https") && notify.contains("rustls"),
+                "{label} Webhook 须声明 https 由 rustls 直连(F6-1),不得写成仅 http"
+            );
+            assert!(
+                !notify.contains("须前置 TLS 终结"),
+                "{label} F6-1 已实现 HTTPS,compat 不得降级为前置终结器"
+            );
+        }
     }
 
     /// M17/F1:S3-GAP §9 死锁行已修复;Hadoop/BPA/审计导出状态同步。
